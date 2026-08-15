@@ -5,6 +5,7 @@ pub mod contracts;
 pub mod durable_fs;
 pub mod event_log;
 pub mod locator;
+pub mod migration;
 pub mod repository;
 
 pub use catalog::{
@@ -38,6 +39,14 @@ pub use event_log::{
 pub use locator::{
     bounded_scan, BoundedScan, ConversationLocator, LocatedConversation, LocatorError,
     SessionWorkspaceLocator, MAX_CONVERSATIONS_PER_SCAN, MAX_DIRECTORY_ENTRIES_PER_LEVEL,
+};
+pub use migration::{
+    advance_phase, recover_cutover, ActiveLayout, ApprovalReceiptV1, BootstrapObservationReceiptV1,
+    ConversationLayoutDescriptorV1, ConversationMigrationService, CutoverRecovery,
+    HostMigrationLock, HostMigrationLockGuard, MigrationAdmissionState, MigrationCallbacks,
+    MigrationContext, MigrationControlContext, MigrationError, MigrationErrorCode,
+    MigrationHostMode, MigrationJournalV1, MigrationPhase, MigrationReport, MigrationStepOutput,
+    ObservationEvidenceV1, ReaderPrecedence, StepReceiptV1,
 };
 pub use repository::{
     ConversationMetadataUpdate, ConversationRepository, RepositoryError, RepositoryOpenReport,
