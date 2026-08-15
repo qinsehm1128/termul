@@ -4,9 +4,15 @@
 //! service journals every mutation with immediate durability, never opens mutable application
 //! stores, and changes reader behavior only through the generation-stamped layout descriptor.
 
+#[path = "../compatibility.rs"]
+pub mod compatibility;
+pub mod inventory;
 pub mod journal;
 pub mod layout;
+pub mod legacy;
 pub mod lock;
+pub mod recovery;
+pub mod verify;
 
 use std::fmt;
 use std::fs;
@@ -21,6 +27,14 @@ use uuid::Uuid;
 
 use crate::conversation::durable_fs::{DirectoryPermissions, DurableFileSystem};
 
+pub use compatibility::{
+    CompatibilityError, ConversationReader, LegacyConversationProjection, LegacyConversationReader,
+};
+pub use inventory::{
+    inventory_legacy_roots, LegacyInventoryFileV1, LegacyInventoryRootV1, LegacyInventoryV1,
+    LegacyRootConfiguration, LegacyRootSpec, LegacySourceKind, INVENTORY_FILE,
+    LEGACY_INVENTORY_SCHEMA_VERSION,
+};
 pub use journal::{
     advance_phase, ApprovalReceiptV1, BootstrapObservationReceiptV1, MigrationJournalV1,
     MigrationPhase, ObservationEvidenceV1, StepReceiptV1, FINALIZATION_ACTION, MIGRATION_ID,
@@ -30,7 +44,22 @@ pub use layout::{
     recover_cutover, ActiveLayout, ConversationLayoutDescriptorV1, CutoverRecovery,
     ReaderPrecedence, LAYOUT_DESCRIPTOR_FILE, LAYOUT_DESCRIPTOR_SCHEMA_VERSION,
 };
+pub use legacy::{
+    load_migration_map, load_staged_manifest, stage_legacy_conversations, CreatedAtSource,
+    IdentityDecision, LegacyStageConfiguration, MigrationMapEntryV1, MigrationMapV1,
+    ProjectWorktreeRecord, StageReceiptV1, StagedManifestV1, MIGRATION_MAP_FILE,
+    MIGRATION_MAP_SCHEMA_VERSION, STAGED_MANIFEST_FILE,
+};
 pub use lock::{HostMigrationLock, HostMigrationLockGuard, MIGRATION_LOCK_FILE};
+pub use recovery::{
+    AssociateConversationPayload, DismissPreservedSourcePayload, DismissReasonCode, InspectPayload,
+    RecoveryAction, RecoveryActionError, RecoveryActionErrorCode, RecoveryActionName,
+    RecoveryActionResult, RecoveryAuthorizationClass, RecoveryItemV1, RecoveryKind,
+    RecoveryProvenanceV1, RecoveryQueueV1, RecoverySeverity, RecoveryStatus,
+    ResolveRecoveryItemRequest, StartEmptyWorkspacePayload, RECOVERY_ITEMS_FILE,
+    RECOVERY_QUEUE_SCHEMA_VERSION,
+};
+pub use verify::{verify_source_snapshot, verify_staged_layout, VerificationReportV1};
 
 pub const MIGRATION_JOURNAL_FILE: &str = "conversation-layout-v2.json";
 
@@ -47,6 +76,7 @@ pub enum MigrationErrorCode {
     MigrationIllegalTransition,
     MigrationDurabilityFailed,
     MigrationVerificationFailed,
+    MigrationSourceChanged,
     MigrationJournalCorrupt,
     MigrationLayoutCorrupt,
     MigrationCrashInjected,
@@ -66,6 +96,7 @@ impl MigrationErrorCode {
             Self::MigrationIllegalTransition => "MIGRATION_ILLEGAL_TRANSITION",
             Self::MigrationDurabilityFailed => "MIGRATION_DURABILITY_FAILED",
             Self::MigrationVerificationFailed => "MIGRATION_VERIFICATION_FAILED",
+            Self::MigrationSourceChanged => "MIGRATION_SOURCE_CHANGED",
             Self::MigrationJournalCorrupt => "MIGRATION_JOURNAL_CORRUPT",
             Self::MigrationLayoutCorrupt => "MIGRATION_LAYOUT_CORRUPT",
             Self::MigrationCrashInjected => "MIGRATION_CRASH_INJECTED",
@@ -93,6 +124,7 @@ impl MigrationError {
                 | MigrationErrorCode::MigrationIdempotencyConflict
                 | MigrationErrorCode::MigrationDurabilityFailed
                 | MigrationErrorCode::MigrationVerificationFailed
+                | MigrationErrorCode::MigrationSourceChanged
                 | MigrationErrorCode::MigrationIllegalTransition
                 | MigrationErrorCode::MigrationLockInvalid
         ) {
@@ -184,6 +216,104 @@ pub trait MigrationCallbacks {
     fn sync_artifacts(&mut self, _phase: MigrationPhase) -> Result<()> {
         Ok(())
     }
+}
+
+/// Canonical TASK-005 callback implementation used by bootstrap composition.
+#[derive(Debug, Clone)]
+pub struct LegacyMigrationCallbacks {
+    pub roots: LegacyRootConfiguration,
+    pub project_worktrees: Vec<ProjectWorktreeRecord>,
+}
+
+impl LegacyMigrationCallbacks {
+    fn operation_dir(&self, operation_id: Uuid) -> PathBuf {
+        self.roots
+            .host_state_root
+            .join("conversation-migrations")
+            .join(operation_id.to_string())
+    }
+}
+
+impl MigrationCallbacks for LegacyMigrationCallbacks {
+    fn inventory(&mut self, journal: &MigrationJournalV1) -> Result<MigrationStepOutput> {
+        let operation_dir = self.operation_dir(journal.operation_id);
+        let inventory = inventory_legacy_roots(
+            &self.roots,
+            journal.operation_id,
+            journal.updated_at_utc,
+            &operation_dir,
+        )?;
+        Ok(MigrationStepOutput::new(
+            format!(
+                "{}:inventory:{}",
+                journal.operation_key, inventory.inventory_sha256
+            ),
+            inventory.inventory_sha256,
+        ))
+    }
+
+    fn stage(&mut self, journal: &MigrationJournalV1) -> Result<MigrationStepOutput> {
+        let operation_dir = self.operation_dir(journal.operation_id);
+        let inventory = inventory::load_inventory(&operation_dir)?;
+        let configuration = LegacyStageConfiguration {
+            host_state_root: self.roots.host_state_root.clone(),
+            operation_dir,
+            project_worktrees: self.project_worktrees.clone(),
+        };
+        let staged = run_stage_on_dedicated_runtime(configuration, inventory)?;
+        Ok(MigrationStepOutput::new(
+            format!(
+                "{}:stage:aggregate:{}",
+                journal.operation_key, staged.staged_manifest_sha256
+            ),
+            staged.staged_manifest_sha256,
+        ))
+    }
+
+    fn verify(&mut self, journal: &MigrationJournalV1) -> Result<MigrationStepOutput> {
+        let operation_dir = self.operation_dir(journal.operation_id);
+        let inventory = inventory::load_inventory(&operation_dir)?;
+        let report = verify_staged_layout(&self.roots.host_state_root, &operation_dir, &inventory)?;
+        Ok(MigrationStepOutput::new(
+            format!(
+                "{}:verify:{}:{}",
+                journal.operation_key,
+                journal.inventory_sha256.as_deref().unwrap_or("missing"),
+                journal
+                    .staged_manifest_sha256
+                    .as_deref()
+                    .unwrap_or("missing")
+            ),
+            report.validation_sha256,
+        ))
+    }
+}
+
+fn run_stage_on_dedicated_runtime(
+    configuration: LegacyStageConfiguration,
+    inventory: LegacyInventoryV1,
+) -> Result<StagedManifestV1> {
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                MigrationError::new(
+                    MigrationErrorCode::MigrationVerificationFailed,
+                    "stage_runtime",
+                    error.to_string(),
+                )
+            })?;
+        runtime.block_on(stage_legacy_conversations(&configuration, &inventory))
+    })
+    .join()
+    .map_err(|_| {
+        MigrationError::new(
+            MigrationErrorCode::MigrationVerificationFailed,
+            "stage_runtime",
+            "dedicated legacy staging thread panicked",
+        )
+    })?
 }
 
 pub struct MigrationContext<'a> {
@@ -1664,6 +1794,92 @@ mod tests {
             .map(|receipt| &receipt.bootstrap_run_id)
             .collect::<HashSet<_>>();
         assert_eq!(ids.len(), 1);
+    }
+
+    #[test]
+    fn canonical_legacy_callbacks_drive_inventory_stage_verify_and_cutover() {
+        let (_temp, root, lock, service) = fixture();
+        let session_id = "provider/session:abc";
+        let storage_key = "018f7a1c-1b4d-7c8a-9f01-0123456789ab";
+        let session_dir = root.join("acp-sessions").join(storage_key);
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("metadata.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 1,
+                "storageKey": storage_key,
+                "sessionId": session_id,
+                "stableAgentNamespace": "config:test",
+                "runtimeAgentId": "runtime-test",
+                "cwd": "/legacy",
+                "createdAt": 1_700_000_000_000_u64
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("messages.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "schemaVersion": 1,
+                    "sessionId": session_id,
+                    "seq": 1,
+                    "type": "user_prompt",
+                    "recordedAt": 1_700_000_001_000_u64,
+                    "payload": {"turnId": "one"}
+                })
+            ),
+        )
+        .unwrap();
+        fs::write(session_dir.join("tool-calls.jsonl"), b"").unwrap();
+
+        let guard = lock.acquire().unwrap();
+        let mut callbacks = LegacyMigrationCallbacks {
+            roots: LegacyRootConfiguration {
+                host_state_root: root.clone(),
+                ..Default::default()
+            },
+            project_worktrees: Vec::new(),
+        };
+        let report = service
+            .recover_and_run(MigrationContext {
+                lock_guard: &guard,
+                host_state_root: &root,
+                operation_key: OPERATION_KEY,
+                host_mode: MigrationHostMode::Desktop,
+                admission: MigrationAdmissionState::default(),
+                now_utc: now(),
+                callbacks: &mut callbacks,
+            })
+            .unwrap();
+        assert_eq!(report.phase, MigrationPhase::ObservationWindow);
+        assert_eq!(
+            report.reader_precedence,
+            ReaderPrecedence::ConversationV2First
+        );
+        let operation_dir = root
+            .join("conversation-migrations")
+            .join(report.operation_id.to_string());
+        assert!(operation_dir.join(INVENTORY_FILE).is_file());
+        assert!(operation_dir.join(MIGRATION_MAP_FILE).is_file());
+        assert!(operation_dir.join(RECOVERY_ITEMS_FILE).is_file());
+        assert!(operation_dir.join(STAGED_MANIFEST_FILE).is_file());
+        assert_eq!(
+            fs::read(session_dir.join("messages.jsonl")).unwrap(),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "schemaVersion": 1,
+                    "sessionId": session_id,
+                    "seq": 1,
+                    "type": "user_prompt",
+                    "recordedAt": 1_700_000_001_000_u64,
+                    "payload": {"turnId": "one"}
+                })
+            )
+            .as_bytes()
+        );
     }
 
     #[test]
