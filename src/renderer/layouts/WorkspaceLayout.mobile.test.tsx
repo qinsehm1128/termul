@@ -40,9 +40,9 @@ vi.mock('@/lib/platform', async () => {
 
 vi.mock('@/stores/project-store', () => ({
   useProjectsLoaded: () => true,
-  useProjects: () => [projectRef.current],
-  useActiveProject: () => projectRef.current,
-  useActiveProjectId: () => 'p1',
+  useProjects: () => (projectRef.current.id ? [projectRef.current] : []),
+  useActiveProject: () => (projectRef.current.id ? projectRef.current : undefined),
+  useActiveProjectId: () => projectRef.current.id ?? '',
   useProjectActions: () => ({
     selectProject: vi.fn(),
     addProject: vi.fn(),
@@ -389,6 +389,18 @@ describe('WorkspaceLayout mobile branch', () => {
     })
   })
 
+  it('keeps project-less New chat enabled while project-only tools stay gated', async () => {
+    projectRef.current = {}
+    render(
+      <MemoryRouter>
+        <WorkspaceLayout />
+      </MemoryRouter>
+    )
+
+    expect(await screen.findByLabelText('New chat')).toBeEnabled()
+    expect(screen.getByLabelText('Git changes')).toBeDisabled()
+  })
+
   it('mounts MobileChatShell and threads the command-palette + git-changes triggers', async () => {
     render(
       <MemoryRouter>
@@ -412,10 +424,12 @@ describe('WorkspaceLayout mobile branch', () => {
     )
 
     expect(await screen.findByRole('alert')).toHaveAttribute('data-conversation-id', conversationId)
-    expect(screen.getByText(/legacy_workspace_manifests\/0\/shared.json/)).toBeInTheDocument()
-    expect(screen.getByText(new RegExp(`sha256:${'e'.repeat(64)}`))).toBeInTheDocument()
+    expect(
+      screen.getAllByText(/legacy_workspace_manifests\/0\/shared.json/).length
+    ).toBeGreaterThan(0)
+    expect(screen.getAllByText(new RegExp(`sha256:${'e'.repeat(64)}`)).length).toBeGreaterThan(0)
     for (const action of mobileRecoveryItem.suggestedActions) {
-      expect(screen.getByRole('button', { name: action })).toBeVisible()
+      expect(document.querySelector(`[data-recovery-action="${action}"]`)).toBeVisible()
     }
   })
 

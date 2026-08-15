@@ -22,6 +22,7 @@
  * prepared-chat reaping) and is **not** a cross-tab isolation boundary.
  */
 
+import type { ExecutionTarget, ProjectAttachment } from '@shared/types/conversation.types'
 import type {
   ConversationLifecycleOutcome,
   ConversationReplacementRequest
@@ -131,6 +132,7 @@ import { logFrontendError } from '@/lib/log-api'
 import { isTauriContext } from '@/lib/tauri-runtime'
 import { randomUUID } from '@/lib/uuid'
 import { getTabFocusedSessionId, setTabFocusedSessionId } from '@/lib/web-tab-session'
+import { useConversationStore } from '@/stores/conversation-store'
 import { useProjectStore } from '@/stores/project-store'
 import { useWorkspaceStore } from '@/stores/workspace-store'
 import {
@@ -415,6 +417,9 @@ interface AcpState {
       /** Worktree path + branch (CAP-3) — persisted onto the durable record. */
       worktreePath?: string
       worktreeBranch?: string
+      conversationId?: string
+      projectAttachment?: ProjectAttachment
+      executionTarget?: ExecutionTarget
     }
   ) => Promise<SessionId>
   closeSession: (sessionId: SessionId) => Promise<void>
@@ -461,7 +466,13 @@ interface AcpState {
     cwd: string,
     mcpServers: McpServer[] | undefined,
     projectId: string,
-    opts?: { worktreePath?: string; worktreeBranch?: string }
+    opts?: {
+      worktreePath?: string
+      worktreeBranch?: string
+      conversationId?: string
+      projectAttachment?: ProjectAttachment
+      executionTarget?: ExecutionTarget
+    }
   ) => Promise<SessionId>
   /**
    * Take ownership of a prepared session so launcher unmount cleanup cannot
@@ -516,6 +527,9 @@ interface AcpState {
      */
     worktreePath?: string
     worktreeBranch?: string
+    conversationId?: string
+    projectAttachment?: ProjectAttachment
+    executionTarget?: ExecutionTarget
   }) => Promise<SessionId>
   /** Apply launcher pending model/mode/config selections to a live session. */
   applyPendingLauncherOptions: (
@@ -3082,11 +3096,15 @@ export const useAcpStore = create<AcpState>((set, get) => ({
           )
         })
       }
+      const hasExplicitTarget = Boolean(opts?.executionTarget)
       const outcome = await acpApi.newSession(agentId, cwd, sessionMcpServers, {
         ephemeral: opts?.backendEphemeral ?? false,
-        ...(projectId ? { projectId } : {}),
+        ...(!hasExplicitTarget && projectId ? { projectId } : {}),
         ...(opts?.worktreePath ? { worktreePath: opts.worktreePath } : {}),
-        ...(opts?.worktreeBranch ? { worktreeBranch: opts.worktreeBranch } : {})
+        ...(opts?.worktreeBranch ? { worktreeBranch: opts.worktreeBranch } : {}),
+        ...(opts?.conversationId ? { conversationId: opts.conversationId } : {}),
+        ...(opts?.projectAttachment ? { projectAttachment: opts.projectAttachment } : {}),
+        ...(opts?.executionTarget ? { executionTarget: opts.executionTarget } : {})
       })
       const sessionId = outcome.sessionId
       invalidateSessionReopen(sessionId)
@@ -3104,7 +3122,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
                   ? outcome.conversationId
                   : existing?.conversationId,
               agentId,
-              cwd,
+              cwd: outcome.persistence === 'conversation' ? outcome.executionCwd : cwd,
               projectId,
               status: existing?.status === 'closed' ? 'closed' : 'active',
               title: existing?.title ?? null,
@@ -3125,6 +3143,9 @@ export const useAcpStore = create<AcpState>((set, get) => ({
           activeSessionId: opts?.ephemeral ? s.activeSessionId : (s.activeSessionId ?? sessionId)
         }
       })
+      if (outcome.persistence === 'conversation') {
+        await useConversationStore.getState().openConversation(outcome.conversationId)
+      }
       // Track un-promoted pooled sessions so disconnect/close can drop (not persist) them.
       if (opts?.ephemeral) ephemeralSessionIds.add(sessionId)
       // Mirror to disk (index + payload). Skipped for ephemeral (pooled) sessions,
@@ -3278,12 +3299,20 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       (candidate) => candidate.conversationId === conversationId
     )
     const sessionId = session?.id ?? entry?.id
-    if (!sessionId) return
     const workspace = useWorkspaceStore.getState()
-    workspace.closeChatView(sessionId)
-    if (state.activeSessionId === sessionId) {
+    workspace.closeChatView(conversationId)
+    if (sessionId && state.activeSessionId === sessionId) {
       const activeTab = workspace.getActiveTab()
-      set({ activeSessionId: activeTab?.type === 'agent-chat' ? activeTab.sessionId : null })
+      if (activeTab?.type !== 'agent-chat') {
+        set({ activeSessionId: null })
+        return
+      }
+      const nextSessionId = activeTab.sessionId
+        ? activeTab.sessionId
+        : Object.values(get().sessions).find(
+            (candidate) => candidate.conversationId === activeTab.conversationId
+          )?.id
+      set({ activeSessionId: nextSessionId ?? null })
     }
   },
 
@@ -3502,7 +3531,8 @@ export const useAcpStore = create<AcpState>((set, get) => ({
           return
         }
         const sessionId = await get().createSession(agentId, trimmedCwd, mcpServers, projectId, {
-          ephemeral: true
+          ephemeral: true,
+          backendEphemeral: true
         })
         // Disconnect race: if the agent died mid-prepare, don't register a dead
         // session — drop it (createSession added it to `ephemeralSessionIds`) and
@@ -3610,17 +3640,23 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     for (;;) {
       const prepared = get().preparedSessions[key]
       if (prepared) {
-        promotePreparedSession(key, prepared, projectId, get, set)
-        return prepared
+        const preparedSession = get().sessions[prepared]
+        if (preparedSession?.conversationId) {
+          promotePreparedSession(key, prepared, projectId, get, set)
+          return prepared
+        }
+        get().cancelPreparedChat(key)
+        break
       }
       const inFlight = inFlightPrepared.get(key)
       if (!inFlight) break
       const sessionId = await inFlight
-      if (sessionId) {
+      if (sessionId && get().sessions[sessionId]?.conversationId) {
         promotePreparedSession(key, sessionId, projectId, get, set)
         return sessionId
       }
-      // null: cancelled or failed — re-check for a newer prepare before spawning.
+      if (sessionId) get().cancelPreparedChat(key)
+      // null or backend-ephemeral warm session: create one canonical Conversation.
     }
     const agentId = await ensureLiveAgent(get, set, configId, trimmedCwd)
     if (!agentId) throw new Error(`failed to spawn agent for config ${configId}`)
@@ -3629,7 +3665,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
 
   claimPreparedChat: (key, projectId) => {
     const sessionId = get().preparedSessions[key]
-    if (!sessionId) return null
+    if (!sessionId || !get().sessions[sessionId]?.conversationId) return null
     promotePreparedSession(key, sessionId, projectId, get, set)
     return sessionId
   },
@@ -3829,12 +3865,18 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     initialBlocks,
     adoptSession,
     worktreePath,
-    worktreeBranch
+    worktreeBranch,
+    conversationId,
+    projectAttachment,
+    executionTarget
   }) => {
     try {
       const sessionId = await get().startChat(configId, cwd, mcpServers, projectId, {
         worktreePath,
-        worktreeBranch
+        worktreeBranch,
+        conversationId,
+        projectAttachment,
+        executionTarget
       })
 
       // Move optimistic UI onto the real session, then remap the tab before send
@@ -5936,9 +5978,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     })
 
     if (sourceId && deleting) {
-      useWorkspaceStore.getState().closeChatView(sourceId)
-    } else if (sourceId && targetId && sourceId !== targetId) {
-      useWorkspaceStore.getState().remapAgentChatSession(sourceId, targetId)
+      useWorkspaceStore.getState().closeChatView(outcome.conversationId)
     }
   }
 }))

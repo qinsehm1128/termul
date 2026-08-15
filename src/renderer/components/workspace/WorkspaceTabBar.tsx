@@ -27,7 +27,7 @@ import { useBrowserSessionStore } from '@/stores/browser-session-store'
 import { useEditorStore } from '@/stores/editor-store'
 import { type GitStatusState, useGitStatusStore } from '@/stores/git-status-store'
 import { useTerminalStore } from '@/stores/terminal-store'
-import type { WorkspaceTab } from '@/stores/workspace-store'
+import type { AgentChatTab, WorkspaceTab } from '@/stores/workspace-store'
 import { editorTabId, useLeafCount, useWorkspaceStore } from '@/stores/workspace-store'
 import type { Terminal } from '@/types/project'
 import type { TabReorderPosition } from '@/types/workspace.types'
@@ -519,7 +519,7 @@ function AgentChatTabInline({
   onDragLeave,
   onDrop
 }: {
-  tab: { type: 'agent-chat'; id: string; sessionId: string }
+  tab: AgentChatTab
   isActive: boolean
   isDragging: boolean
   isDropTarget: boolean
@@ -532,16 +532,29 @@ function AgentChatTabInline({
   onDrop: (e: React.DragEvent) => void
 }) {
   const { t } = useTranslation('workspace')
-  const session = useAcpStore((s) => s.sessions[tab.sessionId])
+  const session = useAcpStore((state) => {
+    if (tab.sessionId) return state.sessions[tab.sessionId]
+    return Object.values(state.sessions).find(
+      (candidate) => candidate.conversationId === tab.conversationId
+    )
+  })
   const agentStatus = useAcpStore((s) => (session ? s.agentStatus[session.agentId] : undefined))
-  const isLaunchingSession = useAcpStore((s) => Boolean(s.launchingSessionIds[tab.sessionId]))
+  const isLaunchingSession = useAcpStore((s) =>
+    session ? Boolean(s.launchingSessionIds[session.id]) : false
+  )
   const { name: agentName } = useAgentIdentity(session?.agentId ?? null)
   // The persisted index entry carries the effective title (agent-pushed title,
   // first-message derivation, or "Untitled Chat N"). `session.title` stays null
   // until an event sets it, so fall through to the index entry for the label.
-  const indexTitle = useAcpStore(
-    (s) => s.sessionIndex.find((e) => e.id === tab.sessionId)?.title ?? null
-  )
+  const indexTitle = useAcpStore((state) => {
+    if (tab.conversationId) {
+      return (
+        state.sessionIndex.find((entry) => entry.conversationId === tab.conversationId)?.title ??
+        null
+      )
+    }
+    return state.sessionIndex.find((entry) => entry.id === tab.sessionId)?.title ?? null
+  })
   // Treat in-flight launcher handoff as connected so we don't flash a red
   // disconnected lamp on the optimistic placeholder chat.
   const connected = isLaunchingSession || isAgentConnected(session, agentStatus)
@@ -982,7 +995,7 @@ export function WorkspaceTabBar({
                     />
                   ) : tab.type === 'agent-chat' ? (
                     <AgentChatTabInline
-                      tab={tab as { type: 'agent-chat'; id: string; sessionId: string }}
+                      tab={tab as AgentChatTab}
                       isActive={tab.id === activeTabId}
                       isDragging={dragging}
                       isDropTarget={isTarget}

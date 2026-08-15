@@ -3,6 +3,7 @@ import { lazy, Suspense, useEffect } from 'react'
 import { createHashRouter, RouterProvider } from 'react-router-dom'
 import { ChatRoute } from '@/components/ChatRoute'
 import { ConversationHostStatus } from '@/components/conversation/ConversationHostStatus'
+import { ConversationRecoveryPanel } from '@/components/conversation/ConversationRecoveryPanel'
 import { ConversationRoute } from '@/components/conversation/ConversationRoute'
 import { DirectoryPicker } from '@/components/DirectoryPicker'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
@@ -246,6 +247,7 @@ const App = () => {
           <ErrorBoundary context="appRoot">
             <AppEffects />
             <ConversationHostStatus />
+            <ConversationRecoveryPanel />
             <Toaster />
             <Sonner />
             {/* Web/remote mode only: in-app directory picker registered with

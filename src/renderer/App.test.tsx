@@ -48,6 +48,10 @@ vi.mock('@/components/conversation/ConversationHostStatus', () => ({
   ConversationHostStatus: () => <div data-testid="conversation-host-status" />
 }))
 
+vi.mock('@/components/conversation/ConversationRecoveryPanel', () => ({
+  ConversationRecoveryPanel: () => <div data-testid="conversation-recovery-panel" />
+}))
+
 vi.mock('./hooks/use-conversation-lifecycle', () => ({
   useConversationLifecycle: mockConversationLifecycle
 }))
@@ -263,10 +267,11 @@ describe('App Routes', () => {
     expect(mockSessionWorkspaceBootstrap).toHaveBeenCalled()
   })
 
-  it('mounts the shared Conversation host bootstrap and status at the web root', () => {
+  it('mounts shared Conversation creation and recovery wiring at the web root', () => {
     render(<App />)
     expect(mockConversationHostBootstrap).toHaveBeenCalledTimes(1)
     expect(document.querySelector('[data-testid="conversation-host-status"]')).not.toBeNull()
+    expect(document.querySelector('[data-testid="conversation-recovery-panel"]')).not.toBeNull()
   })
 
   it('mounts Conversation lifecycle reconciliation at the web root', () => {

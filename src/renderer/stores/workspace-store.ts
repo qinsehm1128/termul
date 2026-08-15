@@ -1,6 +1,10 @@
 import { create } from 'zustand'
 import { useShallow } from 'zustand/shallow'
-import { clearChatRoute, navigateToChatSession } from '@/lib/router-navigate'
+import {
+  clearChatRoute,
+  navigateToChatSession,
+  navigateToConversation
+} from '@/lib/router-navigate'
 import { randomUUID } from '@/lib/uuid'
 import { useTerminalStore } from '@/stores/terminal-store'
 import type {
@@ -11,12 +15,16 @@ import type {
   SplitNode
 } from '@/types/workspace.types'
 
+export type AgentChatTab =
+  | { type: 'agent-chat'; id: string; conversationId: string; sessionId?: never }
+  | { type: 'agent-chat'; id: string; sessionId: string; conversationId?: never }
+
 export type WorkspaceTab =
   | { type: 'terminal'; id: string; terminalId: string }
   | { type: 'editor'; id: string; filePath: string }
   | { type: 'browser'; id: string; browserTabId: string }
   | { type: 'git'; id: string; cwd: string }
-  | { type: 'agent-chat'; id: string; sessionId: string }
+  | AgentChatTab
   | { type: 'git-history'; id: string; cwd: string }
 
 // CRITICAL: Global lock to prevent syncTerminalTabs from running multiple times concurrently
@@ -209,8 +217,16 @@ function editorTabId(filePath: string): string {
   return `edit-${filePath}`
 }
 
-function agentChatTabId(sessionId: string): string {
-  return `chat-${sessionId}`
+function agentChatTabId(conversationId: string): string {
+  return `chat-${conversationId}`
+}
+
+export function agentChatConversationId(tab: AgentChatTab): string | null {
+  return tab.conversationId ?? null
+}
+
+export function legacyAgentChatSessionId(tab: AgentChatTab): string | null {
+  return tab.sessionId ?? null
 }
 
 function resolveFullscreenPaneId(root: PaneNode, fullscreenPaneId: string | null): string | null {
@@ -630,7 +646,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => {
         agentLauncherPaneId: agentLauncherPaneId === paneId ? null : agentLauncherPaneId
       })
       if (tab && tab.type === 'agent-chat') {
-        navigateToChatSession(tab.sessionId)
+        if (tab.conversationId) navigateToConversation(tab.conversationId)
+        else if (tab.sessionId) navigateToChatSession(tab.sessionId)
       }
     },
 
@@ -844,15 +861,15 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => {
     },
 
     addAgentChatTab: (
-      sessionId: string,
+      conversationId: string,
       targetPaneId?: string,
       shouldNavigate: boolean = true
     ): void => {
-      const id = agentChatTabId(sessionId)
+      const id = agentChatTabId(conversationId)
       const { root, activePaneId, agentLauncherPaneId } = get()
       const paneId = targetPaneId ?? activePaneId
 
-      if (shouldNavigate) navigateToChatSession(sessionId)
+      if (shouldNavigate) navigateToConversation(conversationId)
 
       const existing = findPaneContainingTab(root, id)
       if (existing) {
@@ -865,62 +882,38 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => {
         return
       }
 
-      const tab: WorkspaceTab = { type: 'agent-chat', id, sessionId }
+      const tab: WorkspaceTab = { type: 'agent-chat', id, conversationId }
       get().addTabToPane(paneId, tab)
     },
 
     remapAgentChatSession: (fromSessionId, toSessionId, targetPaneId?: string): void => {
-      if (fromSessionId === toSessionId) {
-        get().addAgentChatTab(toSessionId, targetPaneId)
-        return
-      }
-      const fromId = agentChatTabId(fromSessionId)
-      const toId = agentChatTabId(toSessionId)
-      const { root, agentLauncherPaneId } = get()
-      const pane = findPaneContainingTab(root, fromId)
-      if (!pane) {
-        get().addAgentChatTab(toSessionId, targetPaneId)
-        return
-      }
-      const { fullscreenPaneId } = get()
-      const nextRoot = updateLeaf(root, pane.id, (leaf) => {
-        const tabs = leaf.tabs.map((tab) => {
-          if (tab.id !== fromId || tab.type !== 'agent-chat') return tab
-          return { type: 'agent-chat' as const, id: toId, sessionId: toSessionId }
-        })
-        // Drop a pre-existing destination tab to avoid duplicates after remap.
-        const deduped = tabs.filter(
-          (tab, index, all) =>
-            !(
-              tab.type === 'agent-chat' &&
-              tab.id === toId &&
-              all.findIndex((t) => t.id === toId) !== index
-            )
+      if (fromSessionId === toSessionId) return
+      const { root } = get()
+      const legacyPane = getAllLeafPanes(root).find((leaf) =>
+        leaf.tabs.some((tab) => tab.type === 'agent-chat' && tab.sessionId === fromSessionId)
+      )
+      if (!legacyPane) return
+      const nextRoot = updateLeaf(root, legacyPane.id, (leaf) => ({
+        ...leaf,
+        tabs: leaf.tabs.map((tab) =>
+          tab.type === 'agent-chat' && tab.sessionId === fromSessionId
+            ? { ...tab, sessionId: toSessionId }
+            : tab
         )
-        return {
-          ...leaf,
-          tabs: deduped,
-          activeTabId: leaf.activeTabId === fromId ? toId : leaf.activeTabId
-        }
-      })
-      set({
-        root: nextRoot,
-        activePaneId: resolveActivePaneId(fullscreenPaneId, pane.id),
-        agentLauncherPaneId: agentLauncherPaneId === pane.id ? null : agentLauncherPaneId
-      })
-      navigateToChatSession(toSessionId)
+      }))
+      set({ root: nextRoot, activePaneId: targetPaneId ?? legacyPane.id })
     },
 
-    closeChatView: (sessionId: string): void => {
-      const tabId = agentChatTabId(sessionId)
+    closeChatView: (conversationId: string): void => {
+      const tabId = agentChatTabId(conversationId)
       const { root } = get()
       const pane = findPaneContainingTab(root, tabId)
       if (pane) {
         void get().closeTab(pane.id, tabId)
       }
       if (
-        window.location.hash.startsWith('#/c/') ||
-        window.location.hash === `#/legacy/session/${encodeURIComponent(sessionId)}`
+        window.location.hash === `#/c/${encodeURIComponent(conversationId)}` ||
+        window.location.hash === `#/legacy/session/${encodeURIComponent(conversationId)}`
       ) {
         clearChatRoute()
       }

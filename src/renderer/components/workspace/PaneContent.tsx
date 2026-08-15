@@ -10,9 +10,10 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useMobileWebShell } from '@/hooks/use-mobile-web-shell'
 import { usePaneDnd } from '@/hooks/use-pane-dnd'
 import { cn } from '@/lib/utils'
+import { useAcpStore } from '@/stores/acp-store'
 import { useProjectStore } from '@/stores/project-store'
 import { useTerminalActions, useTerminalStore } from '@/stores/terminal-store'
-import type { WorkspaceTab } from '@/stores/workspace-store'
+import type { AgentChatTab, WorkspaceTab } from '@/stores/workspace-store'
 import { getAllLeafPanes, useWorkspaceStore } from '@/stores/workspace-store'
 import type { LeafNode } from '@/types/workspace.types'
 import { DropZoneOverlay } from './DropZoneOverlay'
@@ -43,6 +44,29 @@ const GitPanel = lazy(() =>
 /** Lightweight Suspense fallback for lazy-loaded panes (reuses Skeleton). */
 function PaneSkeleton(): React.JSX.Element {
   return <Skeleton className="h-full w-full" />
+}
+
+function ConversationAgentChatPanel({
+  tab,
+  isVisible
+}: {
+  tab: AgentChatTab
+  isVisible: boolean
+}): React.JSX.Element {
+  const sessionId = useAcpStore((state) => {
+    if (tab.sessionId) return tab.sessionId
+    const live = Object.values(state.sessions).find(
+      (session) => session.conversationId === tab.conversationId
+    )
+    return (
+      live?.id ??
+      state.sessionIndex.find((entry) => entry.conversationId === tab.conversationId)?.id ??
+      null
+    )
+  })
+
+  if (!sessionId) return <PaneSkeleton />
+  return <AgentChatPanel sessionId={sessionId} isVisible={isVisible} />
 }
 
 interface PaneContentProps {
@@ -438,7 +462,7 @@ export function PaneContent({
                     className={isVisible ? 'w-full h-full' : INACTIVE_TAB_PANE_CLASS}
                   >
                     <Suspense fallback={<PaneSkeleton />}>
-                      <AgentChatPanel sessionId={tab.sessionId} isVisible={isVisible} />
+                      <ConversationAgentChatPanel tab={tab} isVisible={isVisible} />
                     </Suspense>
                   </div>
                 )

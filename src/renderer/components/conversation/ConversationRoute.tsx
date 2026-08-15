@@ -68,7 +68,7 @@ export function ConversationRoute({
       const live = acp.sessions[sessionId]
       if (!live || live.status === 'closed') await acp.openHistorySession(sessionId)
       acp.setActiveSession(sessionId)
-      useWorkspaceStore.getState().addAgentChatTab(sessionId, undefined, false)
+      useWorkspaceStore.getState().addAgentChatTab(routeValue, undefined, false)
     } catch {
       setBindingErrorCode('CONVERSATION_BINDING_OPEN_FAILED')
       void logFrontendError({

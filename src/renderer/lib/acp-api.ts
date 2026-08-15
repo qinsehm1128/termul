@@ -14,6 +14,7 @@
  * normalize it (toast, etc.).
  */
 
+import type { ExecutionTarget, ProjectAttachment } from '@shared/types/conversation.types'
 import { getAcpTransport } from '@/lib/acp-transport'
 import type { AcpRuntimeAvailability } from '@/lib/agents/supported-acp-agents'
 
@@ -249,19 +250,8 @@ export interface AgentConfig {
   allowTerminal?: boolean
 }
 
-export type ConversationExecutionTarget =
-  | { kind: 'workspace' }
-  | { kind: 'project_root'; projectId: string; projectRoot: string }
-  | { kind: 'worktree'; projectId: string; worktreePath: string; worktreeBranch: string }
-
-export interface ConversationProjectAttachment {
-  schemaVersion: 1
-  projectId: string
-  attachedAtUtc: string
-  projectPathSnapshot: string
-  worktreePath?: string | null
-  worktreeBranch?: string | null
-}
+export type ConversationExecutionTarget = ExecutionTarget
+export type ConversationProjectAttachment = ProjectAttachment
 
 export interface NewSessionOptions {
   ephemeral?: boolean

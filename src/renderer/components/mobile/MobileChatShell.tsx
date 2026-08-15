@@ -44,7 +44,7 @@ interface MobileChatShellProps {
   children: React.ReactNode
   /** Opens the New Agent Chat launcher. */
   onNewChat: () => void
-  /** Whether a new chat can be started (active project has a path). */
+  /** Whether a new chat can be started. Conversation creation does not require a project. */
   canNewChat?: boolean
   /** Opens the command palette overlay (mounted in WorkspaceLayout appModals). */
   onOpenCommandPalette?: () => void
@@ -67,7 +67,7 @@ interface MobileChatShellProps {
 export function MobileChatShell({
   children,
   onNewChat,
-  canNewChat = false,
+  canNewChat = true,
   onOpenCommandPalette,
   onOpenGitChanges,
   onOpenGitHistory,
@@ -119,7 +119,19 @@ export function MobileChatShell({
     )
   }, [workspaceRoot])
 
-  const activeSessionId = activeTab?.type === 'agent-chat' ? activeTab.sessionId : null
+  const activeConversationId = useConversationStore((state) => state.activeConversationId)
+  const activeSessionId = useAcpStore((state) => {
+    if (activeTab?.type !== 'agent-chat') return null
+    if (activeTab.sessionId) return activeTab.sessionId
+    const conversationId = activeTab.conversationId ?? activeConversationId
+    if (!conversationId) return null
+    return (
+      Object.values(state.sessions).find((session) => session.conversationId === conversationId)
+        ?.id ??
+      state.sessionIndex.find((entry) => entry.conversationId === conversationId)?.id ??
+      null
+    )
+  })
 
   const sessionTitle = useAcpStore((s) => {
     if (!activeSessionId) return null
@@ -127,7 +139,6 @@ export function MobileChatShell({
     if (live) return live
     return s.sessionIndex.find((e) => e.id === activeSessionId)?.title ?? null
   })
-  const activeConversationId = useConversationStore((state) => state.activeConversationId)
   const conversationTerminals = useMemo(
     () =>
       activeConversationId

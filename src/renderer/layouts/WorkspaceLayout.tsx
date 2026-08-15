@@ -1,7 +1,6 @@
 import type { ShellInfo } from '@shared/types/ipc.types'
 import type { SFTPEntry } from '@shared/types/ssh.types'
 import { motion } from 'framer-motion'
-import { FolderKanban } from 'lucide-react'
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
@@ -259,6 +258,9 @@ export default function WorkspaceLayout(): React.JSX.Element {
   const activeProject = useActiveProject()
   const activeProjectId = useActiveProjectId()
   const activeConversationId = useConversationStore((state) => state.activeConversationId)
+  const activeConversation = useConversationStore((state) =>
+    activeConversationId ? state.summariesById[activeConversationId] : undefined
+  )
   const {
     selectProject,
     addProject,
@@ -487,12 +489,11 @@ export default function WorkspaceLayout(): React.JSX.Element {
       useWorkspaceStore.getState().removeTab(activeTab.id)
     } else if (activeTab.type === 'agent-chat') {
       const acp = useAcpStore.getState()
-      const conversationId = acp.sessions[activeTab.sessionId]?.conversationId
-      if (conversationId) {
-        acp.closeChatView(conversationId)
-      } else {
-        useWorkspaceStore.getState().closeChatView(activeTab.sessionId)
-      }
+      const conversationId =
+        activeTab.conversationId ??
+        (activeTab.sessionId ? acp.sessions[activeTab.sessionId]?.conversationId : undefined)
+      if (conversationId) acp.closeChatView(conversationId)
+      else if (activeTab.sessionId) useWorkspaceStore.getState().removeTab(activeTab.id)
     }
   }, [activeTab])
 
@@ -1027,7 +1028,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
   // Terminal creation callbacks - defined before keyboard shortcut useEffect
   const handleCreateTerminalInPane = useCallback(
     async (paneId: string, shellName?: string) => {
-      const cwd = getDefaultCwdForProject(activeProjectId)
+      const cwd = activeConversation?.workspaceCwd ?? getDefaultCwdForProject(activeProjectId)
 
       const result = await spawnTerminalInPane(paneId, activeProjectId, cwd, {
         shell: shellName || activeProject?.defaultShell || appDefaultShell || undefined,
@@ -1044,6 +1045,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
     [
       activeProject?.defaultShell,
       activeProject?.envVars,
+      activeConversation?.workspaceCwd,
       activeProjectId,
       appDefaultShell,
       maxTerminals
@@ -1098,7 +1100,6 @@ export default function WorkspaceLayout(): React.JSX.Element {
   }, [])
 
   const handleOpenAgentChat = useCallback(() => {
-    if (!activeProject?.path) return
     const open = (): void => {
       const paneId = useWorkspaceStore.getState().activePaneId
       if (paneId) useWorkspaceStore.getState().showAgentLauncher(paneId)
@@ -1111,7 +1112,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
     } else {
       open()
     }
-  }, [activeProject?.path, location.pathname, navigate])
+  }, [location.pathname, navigate])
 
   const handleAddGitTab = useCallback(
     (paneId?: string) => {
@@ -1686,30 +1687,6 @@ export default function WorkspaceLayout(): React.JSX.Element {
         <Suspense fallback={<ShellSkeleton />}>
           <SSHWorkspace profile={sshProfileWithPassword!} conn={sshConn} />
         </Suspense>
-      ) : projects.length === 0 && !activeConversationId && location.pathname === '/' ? (
-        <div className="flex flex-1 flex-col items-center justify-center bg-background px-6 rounded-xl">
-          <motion.div
-            initial={{ opacity: 0, scale: 0.9 }}
-            animate={{ opacity: 1, scale: 1 }}
-            transition={{ duration: 0.4, ease: 'easeOut' }}
-            className="flex max-w-md flex-col items-center text-center"
-          >
-            <div className="mb-6">
-              <FolderKanban className="h-24 w-24 text-muted-foreground/50" />
-            </div>
-            <h2 className="mb-2 text-xl font-semibold text-foreground">{t('noProjectsTitle')}</h2>
-            <p className="mb-6 text-sm leading-relaxed text-muted-foreground">
-              {t('noProjectsDescription')}
-            </p>
-            <button
-              type="button"
-              onClick={() => setIsNewProjectModalOpen(true)}
-              className="rounded-xl bg-primary px-6 py-2.5 text-sm font-medium text-primary-foreground shadow-sm transition-colors hover:bg-primary/90 hover:shadow"
-            >
-              {t('createFirstProject')}
-            </button>
-          </motion.div>
-        </div>
       ) : (
         <>
           {isWorkspaceRoute ? (
@@ -1966,7 +1943,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
         <Suspense fallback={<ShellSkeleton />}>
           <MobileChatShell
             onNewChat={handleOpenAgentChat}
-            canNewChat={Boolean(activeProject?.path)}
+            canNewChat
             onOpenCommandPalette={() => setIsCommandPaletteOpen(true)}
             onOpenGitChanges={() => setGitSheetOpen(true)}
             onOpenGitHistory={() => handleAddGitHistoryTab()}
@@ -2037,7 +2014,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
             isThemePickerOpen={isThemePickerOpen}
             onToggleThemePicker={handleToggleThemePicker}
             onOpenAgentChat={handleOpenAgentChat}
-            canOpenAgentChat={Boolean(activeProject?.path)}
+            canOpenAgentChat
           />
           <div className="flex-1 flex flex-col min-w-0">
             <TitleBar />

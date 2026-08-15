@@ -97,7 +97,7 @@ describe('ConversationRoute canonical open', () => {
       expect(conversationApi.openConversation).toHaveBeenCalledWith(conversationId)
       expect(mockLoadSessionWorkspace).toHaveBeenCalledWith(conversationId)
       expect(mockOpenHistorySession).toHaveBeenCalledWith('opaque-agent-session')
-      expect(mockAddAgentChatTab).toHaveBeenCalledWith('opaque-agent-session', undefined, false)
+      expect(mockAddAgentChatTab).toHaveBeenCalledWith(conversationId, undefined, false)
     })
     expect(useConversationStore.getState().activeConversationId).toBe(conversationId)
   })

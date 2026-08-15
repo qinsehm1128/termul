@@ -3,6 +3,7 @@ import { useEffect } from 'react'
 import { createHashRouter, RouterProvider } from 'react-router-dom'
 import { ChatRoute } from '@/components/ChatRoute'
 import { ConversationHostStatus } from '@/components/conversation/ConversationHostStatus'
+import { ConversationRecoveryPanel } from '@/components/conversation/ConversationRecoveryPanel'
 import { ConversationRoute } from '@/components/conversation/ConversationRoute'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { GlobalContextMenu } from '@/components/GlobalContextMenu'
@@ -172,6 +173,7 @@ export default function TauriApp(): React.JSX.Element {
           <ErrorBoundary context="appRoot">
             <AppEffects />
             <ConversationHostStatus />
+            <ConversationRecoveryPanel />
             <Toaster />
             <Sonner />
             <RouterProvider router={router} future={{ v7_startTransition: true }} />

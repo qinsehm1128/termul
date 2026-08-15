@@ -288,6 +288,10 @@ vi.mock('@/components/file-explorer/FileExplorer', () => ({
   FileExplorer: () => <div data-testid="file-explorer" />
 }))
 
+vi.mock('@/components/workspace/PaneRenderer', () => ({
+  PaneRenderer: () => <div data-testid="pane-renderer" />
+}))
+
 // Mock the active Tauri API seam used by WorkspaceLayout and nested components.
 const { mockApi } = vi.hoisted(() => ({
   mockApi: {
@@ -505,61 +509,33 @@ describe('WorkspaceLayout - Empty States', () => {
     })
   })
 
-  describe('No Projects Empty State', () => {
+  describe('Zero-project Conversation state', () => {
     beforeEach(() => {
-      // Ensure no projects
       mockUseProjects.mockReturnValue([])
       mockUseActiveProject.mockReturnValue(null)
       mockUseActiveProjectId.mockReturnValue('')
     })
 
-    it('should render no projects empty state when projects array is empty', () => {
+    it('keeps the workspace and global Conversation navigation usable with no projects', () => {
       renderWithRouter()
 
-      expect(screen.getByText('No Projects Yet')).toBeInTheDocument()
-      expect(
-        screen.getByText(
-          'Create your first project to organize your terminals, snapshots, and commands'
-        )
-      ).toBeInTheDocument()
+      expect(screen.getByText('Conversations')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'New Chat' })).toBeEnabled()
+      expect(screen.getByTestId('pane-renderer')).toBeInTheDocument()
     })
 
-    it('should show descriptive message about creating first project', () => {
+    it('keeps project-only file explorer and Git controls gated', () => {
       renderWithRouter()
 
-      const description = screen.getByText(
-        'Create your first project to organize your terminals, snapshots, and commands'
-      )
-      expect(description).toBeInTheDocument()
-      expect(description.tagName).toBe('P')
+      expect(screen.queryByTestId('file-explorer')).not.toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Open git changes' })).toBeDisabled()
     })
 
-    it('should have a button to create first project', () => {
-      renderWithRouter()
-
-      const button = screen.getByText('Create Your First Project')
-      expect(button).toBeInTheDocument()
-      expect(button.tagName).toBe('BUTTON')
-    })
-
-    it('shows the create-first-project CTA on web (isTauriContext false)', () => {
-      const prev = tauriRef.current
+    it('keeps project-less New Chat enabled on the web root', () => {
       tauriRef.current = false
-      try {
-        renderWithRouter()
-        const button = screen.getByText('Create Your First Project')
-        expect(button).toBeInTheDocument()
-        expect(button.tagName).toBe('BUTTON')
-      } finally {
-        tauriRef.current = prev
-      }
-    })
-
-    it('should not show terminal-related elements when no projects', () => {
       renderWithRouter()
 
-      expect(screen.queryByText('No Terminals Yet')).not.toBeInTheDocument()
-      expect(screen.queryByText('Create Your First Terminal')).not.toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'New Chat' })).toBeEnabled()
     })
   })
 
@@ -617,86 +593,29 @@ describe('WorkspaceLayout - Empty States', () => {
     })
   })
 
-  describe('Empty State Styling', () => {
-    it('should center no projects empty state', () => {
+  describe('Zero-project styling', () => {
+    it('keeps the Conversation sidebar and workspace pane visible', () => {
       mockUseProjects.mockReturnValue([])
       mockUseActiveProject.mockReturnValue(null)
       mockUseActiveProjectId.mockReturnValue('')
 
       renderWithRouter()
 
-      const emptyStateContainer = screen.getByText('No Projects Yet').closest('div')?.parentElement
-      expect(emptyStateContainer?.className).toContain('items-center')
-      expect(emptyStateContainer?.className).toContain('justify-center')
-    })
-
-    it.skip('should center empty pane hint in workspace area', () => {
-      mockUseProjects.mockReturnValue([
-        {
-          id: '1',
-          name: 'Test Project',
-          color: 'blue',
-          path: '/test/project',
-          gitBranch: 'main',
-          isActive: true
-        }
-      ])
-      mockUseActiveProject.mockReturnValue({
-        id: '1',
-        name: 'Test Project',
-        color: 'blue',
-        path: '/test/project',
-        gitBranch: 'main',
-        isActive: true
-      })
-      mockUseActiveProjectId.mockReturnValue('1')
-      mockUseTerminals.mockReturnValue([])
-      mockUseAllTerminals.mockReturnValue([])
-      mockUseActiveTerminal.mockReturnValue(null)
-      mockUseActiveTerminalId.mockReturnValue('')
-
-      renderWithRouter()
-
-      const emptyHint = screen.getByText('Drag a tab or file here')
-      const emptyStateContainer = emptyHint.closest('div')
-      expect(emptyStateContainer?.className).toContain('items-center')
-      expect(emptyStateContainer?.className).toContain('justify-center')
-    })
-
-    it('should apply correct text styling to titles', () => {
-      mockUseProjects.mockReturnValue([])
-      mockUseActiveProject.mockReturnValue(null)
-      mockUseActiveProjectId.mockReturnValue('')
-
-      renderWithRouter()
-
-      const title = screen.getByText('No Projects Yet')
-      expect(title.className).toContain('text-xl')
-      expect(title.className).toContain('font-semibold')
-    })
-
-    it('should apply muted styling to descriptions', () => {
-      mockUseProjects.mockReturnValue([])
-      mockUseActiveProject.mockReturnValue(null)
-      mockUseActiveProjectId.mockReturnValue('')
-
-      renderWithRouter()
-
-      const description = screen.getByText(/Create your first project to organize your terminals/)
-      expect(description.className).toContain('text-muted-foreground')
+      expect(screen.getByText('Conversations')).toBeVisible()
+      expect(screen.getByTestId('pane-renderer')).toBeVisible()
     })
   })
 
   describe('Transitions Between States', () => {
-    it('should show no projects state when no projects exist', () => {
+    it('keeps project-less New Chat and the workspace pane visible', () => {
       mockUseProjects.mockReturnValue([])
       mockUseActiveProject.mockReturnValue(null)
       mockUseActiveProjectId.mockReturnValue('')
 
       renderWithRouter()
 
-      expect(screen.getByText('No Projects Yet')).toBeInTheDocument()
-      expect(screen.queryByText('No Terminals Yet')).not.toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'New Chat' })).toBeEnabled()
+      expect(screen.getByTestId('pane-renderer')).toBeInTheDocument()
     })
 
     it.skip('should show empty pane hint when project exists but has no tabs', () => {

@@ -1,3 +1,4 @@
+import type { ExecutionTarget, ProjectAttachment } from '@shared/types/conversation.types'
 import type { LastSelectedAgent, PersistedComposerOptions } from '@shared/types/persistence.types'
 import { PersistenceKeys } from '@shared/types/persistence.types'
 import type { Editor } from '@tiptap/core'
@@ -44,6 +45,10 @@ import {
 } from '@/components/chat/use-composer-caret-restore'
 import { useComposerMentions } from '@/components/chat/use-composer-mentions'
 import { useOptimisticSelect } from '@/components/chat/use-optimistic-select'
+import {
+  ExecutionTargetPicker,
+  validateExecutionTarget
+} from '@/components/conversation/ExecutionTargetPicker'
 import { TermulMark } from '@/components/TermulMark'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -99,6 +104,7 @@ import {
   useAcpSession,
   useAcpStore
 } from '@/stores/acp-store'
+import { useConversationStore } from '@/stores/conversation-store'
 import { useActiveProject, useProjectStore } from '@/stores/project-store'
 import { useWorkspaceStore } from '@/stores/workspace-store'
 import type { Worktree } from '@/types/project'
@@ -151,11 +157,33 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   const mcpTools = useAcpStore((s) => s.mcpTools) ?? EMPTY_MCP_TOOLS
   const loadMcpTools = useAcpStore((s) => s.loadMcpTools)
   const activeProjectId = useProjectStore((s) => s.activeProjectId)
+  const projects = useProjectStore((s) => s.projects)
   const activeProject = useActiveProject()
-  const projectLabel = activeProject?.name ?? t('launcher.folderFallback', 'this folder')
-  const projectRoot = activeProjectId ? getDefaultCwdForProject(activeProjectId) : undefined
-  const projectIsGitRepo = Boolean(activeProject?.isGitRepo)
-  const projectGitBranch = activeProject?.gitBranch ?? null
+  const activeConversationId = useConversationStore((state) => state.activeConversationId)
+  const activeConversation = useConversationStore((state) =>
+    activeConversationId ? state.summariesById[activeConversationId] : undefined
+  )
+  const [executionTarget, setExecutionTarget] = useState<ExecutionTarget>({ kind: 'workspace' })
+  const [projectAttachment, setProjectAttachment] = useState<ProjectAttachment | null>(null)
+  const explicitProjectId = executionTarget.kind === 'workspace' ? null : executionTarget.projectId
+  const conversationProjectId = explicitProjectId ?? projectAttachment?.projectId ?? null
+  const selectedProjectId = conversationProjectId ?? activeProjectId
+  const selectedProject =
+    projects.find((project) => project.id === selectedProjectId) ?? activeProject
+  const projectLabel =
+    executionTarget.kind === 'workspace'
+      ? t('launcher.workspaceFallback', 'your Conversation workspace')
+      : (selectedProject?.name ?? t('launcher.folderFallback', 'this folder'))
+  const projectRoot = selectedProjectId ? getDefaultCwdForProject(selectedProjectId) : undefined
+  const workspaceSeedCwd = activeConversation?.workspaceCwd ?? projectRoot ?? '/'
+  const targetCwd =
+    executionTarget.kind === 'workspace'
+      ? workspaceSeedCwd
+      : executionTarget.kind === 'project_root'
+        ? executionTarget.projectRoot
+        : executionTarget.worktreePath || projectRoot || workspaceSeedCwd
+  const projectIsGitRepo = Boolean(selectedProject?.isGitRepo)
+  const projectGitBranch = selectedProject?.gitBranch ?? null
   // CAP-2: isolation mode + base-branch picker. Worktree mode requires a git
   // repo; the selector is hidden on non-repo projects. CAP — Web worktree
   // parity: the worktree mutation routes now ship over HTTP (`web/worktree_api.rs`)
@@ -165,7 +193,27 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   // the desktop (always local) and a loopback web client see it; a non-loopback
   // LAN client does not, avoiding a picker that would fail `FORBIDDEN` at launch.
   const canUseWorktree = projectIsGitRepo && isLoopbackWebClient()
-  const [isolationMode, setIsolationMode] = useState<'current' | 'worktree'>('current')
+  const isolationMode = executionTarget.kind === 'worktree' ? 'worktree' : 'current'
+  const setIsolationMode = (mode: 'current' | 'worktree'): void => {
+    if (mode === 'current') {
+      if (selectedProject?.path) {
+        setExecutionTarget({
+          kind: 'project_root',
+          projectId: selectedProject.id,
+          projectRoot: selectedProject.path
+        })
+      } else {
+        setExecutionTarget({ kind: 'workspace' })
+      }
+      return
+    }
+    setExecutionTarget({
+      kind: 'worktree',
+      projectId: selectedProject?.id ?? '',
+      worktreePath: '',
+      worktreeBranch: baseBranch ?? selectedProject?.gitBranch ?? ''
+    })
+  }
   const [baseBranch, setBaseBranch] = useState<string | null>(null)
   const [baseBranchInfo, setBaseBranchInfo] = useState<BaseBranchInfo | null>(null)
   // Local branch names for the base-branch picker (CAP-2). Sourced from
@@ -176,7 +224,7 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   // Skills live at {project.path}/.agents/skills/ which is gitignored and
   // excluded from worktree symlinks, so resolve against the main project root
   // — not the worktree CWD which has no .agents/skills/.
-  const skillsRoot = activeProjectId ? getProjectRootPath(activeProjectId) : undefined
+  const skillsRoot = selectedProjectId ? getProjectRootPath(selectedProjectId) : undefined
   const { skills } = useAgentSkills(skillsRoot)
   const supportedAgents = useResolvedSupportedAcpAgents(acpConfigs)
 
@@ -194,7 +242,7 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   const selectedConfig = selectedEntry?.config ?? null
   const activeConfigId = selectedConfig?.id ?? ''
   const preparedKey =
-    activeConfigId && projectRoot ? prepareChatKey(activeConfigId, projectRoot, undefined) : null
+    activeConfigId && targetCwd ? prepareChatKey(activeConfigId, targetCwd, undefined) : null
   const preparedSessionId = useAcpStore((s) =>
     preparedKey ? (s.preparedSessions[preparedKey] ?? null) : null
   )
@@ -207,7 +255,7 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   // Resolve the live agent for this config+cwd so an auth failure can offer a
   // Sign-in action driven by the agent's advertised method metadata. A Sign-in
   // button is only meaningful when exactly one method is advertised (P6).
-  const reuseKey = activeConfigId && projectRoot ? agentReuseKey(activeConfigId, projectRoot) : null
+  const reuseKey = activeConfigId && targetCwd ? agentReuseKey(activeConfigId, targetCwd) : null
   const liveAgentId = useAcpStore((s) =>
     reuseKey ? (s.configToLiveAgent?.[reuseKey] ?? null) : null
   )
@@ -242,8 +290,8 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
     canDropPaste
   } = useComposerAttachments({ imageCapable, embedCapable, disabled: composerDisabled })
   const { recents: mentionRecents, pushRecent: pushMentionRecent } = useMentionRecents(
-    activeProjectId,
-    projectRoot
+    selectedProjectId ?? '',
+    targetCwd
   )
   const mentions = useComposerMentions({
     rootPath: projectRoot,
@@ -303,8 +351,8 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
     return {
       id: 'options-cache-preview',
       agentId: '',
-      cwd: projectRoot ?? '',
-      projectId: activeProjectId ?? '',
+      cwd: targetCwd,
+      projectId: selectedProjectId ?? '',
       status: 'initializing',
       title: null,
       activeTurn: false,
@@ -318,8 +366,8 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   }, [
     draftSession,
     effectiveModes,
-    projectRoot,
-    activeProjectId,
+    targetCwd,
+    selectedProjectId,
     effectiveModels,
     effectiveConfigOptions,
     cachedOptions?.updatedAt
@@ -560,18 +608,8 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
         if (modelId || modeId || Object.keys(configValues).length > 0) {
           setPendingOptions({ modelId, modeId, configValues })
         }
-        if (saved.isolationMode === 'worktree' && canUseWorktree && saved.baseBranch) {
-          setIsolationMode('worktree')
-          if (
-            branches.length > 0 &&
-            !branches.includes(saved.baseBranch) &&
-            baseBranchInfo?.defaultBase
-          ) {
-            setBaseBranch(baseBranchInfo.defaultBase)
-          } else {
-            setBaseBranch(saved.baseBranch)
-          }
-        }
+        // Execution targets are always chosen explicitly for each new Conversation.
+        // Persisted composer preferences never retarget the independent workspace.
       } catch {
         // Best-effort — silent failure, launcher shows agent defaults.
       }
@@ -688,7 +726,7 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   }, [isolationMode, baseBranch, branches, baseBranchInfo])
 
   useEffect(() => {
-    if (!activeConfigId || !projectRoot || selectedEntry?.status !== 'ready' || !selectedConfig)
+    if (!activeConfigId || !targetCwd || selectedEntry?.status !== 'ready' || !selectedConfig)
       return
     let cancelled = false
     void (async () => {
@@ -703,7 +741,7 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
         // old launcher-scoped prepareChat — we do NOT cancel on close (a warm
         // session stays ready for the next chat / a project switch-back).
         useAcpStore.getState().setSelectedAgentConfigId(activeConfigId)
-        useAcpStore.getState().retargetWarmPool(activeConfigId, projectRoot, activeProjectId)
+        useAcpStore.getState().retargetWarmPool(activeConfigId, targetCwd, selectedProjectId ?? '')
       } catch (err) {
         console.warn('[acp] failed to retarget warm pool for', activeConfigId, err)
       }
@@ -714,11 +752,11 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   }, [
     activeConfigId,
     acpConfigs,
-    projectRoot,
+    targetCwd,
     saveAgentConfig,
     selectedConfig,
     selectedEntry?.status,
-    activeProjectId
+    selectedProjectId
   ])
 
   const handleSelectAgent = useCallback(
@@ -735,13 +773,13 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
       // Reset worktree isolation + base branch; the restore effect on
       // `[activeConfigId]` will re-seed them from the persisted record for
       // the new agent (or leave them at 'current'/null if no record exists).
-      setIsolationMode('current')
+      if (executionTarget.kind === 'worktree') setExecutionTarget({ kind: 'workspace' })
       setBaseBranch(null)
       setSelectedConfigId(entry.configId)
       persistSelection(entry.configId)
       editorRef.current?.commands.focus(undefined, { scrollIntoView: false })
     },
-    [persistSelection, selectedConfigId]
+    [executionTarget.kind, persistSelection, selectedConfigId]
   )
 
   const handleInstallAgent = useCallback(
@@ -826,11 +864,11 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   )
 
   const handleRetryPrepare = useCallback(() => {
-    if (!activeConfigId || !projectRoot || !preparedKey) return
+    if (!activeConfigId || !targetCwd || !preparedKey) return
     const store = useAcpStore.getState()
     store.cancelPreparedChat(preparedKey)
-    store.prepareChat(activeConfigId, projectRoot, undefined, activeProjectId)
-  }, [activeConfigId, preparedKey, projectRoot, activeProjectId])
+    store.prepareChat(activeConfigId, targetCwd, undefined, selectedProjectId ?? '')
+  }, [activeConfigId, preparedKey, targetCwd, selectedProjectId])
 
   // Run the agent-advertised authenticate for a chosen method, then re-prepare
   // so the session is created now that the provider login is complete. The
@@ -901,8 +939,9 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   }, [preparedSessionId, pendingOptions, t])
 
   const launch = useCallback(async () => {
-    if (!activeProjectId || !projectRoot) {
-      toast.error(t('launcher.errors.noProject', 'No active project'))
+    const targetError = validateExecutionTarget(executionTarget)
+    if (targetError) {
+      toast.error(t(`launcher.errors.${targetError}`, 'Select a valid execution target'))
       return
     }
     if (!selectedConfig || selectedEntry?.status !== 'ready' || launchInFlightRef.current) return
@@ -914,11 +953,12 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
     const modelsSnapshot = effectiveModels
     const modesSnapshot = effectiveModes
     const configOptionsSnapshot = effectiveConfigOptions
-    const preparedKeySnapshot = preparedKey
     const configSnapshot = selectedConfig
     const paneSnapshot = paneId
-    const projectIdSnapshot = activeProjectId
-    const projectRootSnapshot = projectRoot
+    const projectIdSnapshot = conversationProjectId ?? ''
+    const projectRootSnapshot = projectRoot ?? ''
+    const targetSnapshot = executionTarget
+    const attachmentSnapshot = projectAttachment
     const needsSave = !acpConfigs.some((config) => config.id === selectedConfig.id)
 
     // Build the wire text (skills framed by path under `# Agent Skills`, then
@@ -947,10 +987,20 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
     // BEFORE opening the chat placeholder so the agent's cwd is the worktree
     // path from the first turn. Branch is `chat/{id}` (deterministic, id-scoped
     // — collision-retry-friendly). Collision-retry appends `-2` once.
-    let worktreePath: string | undefined
-    let worktreeBranch: string | undefined
-    let launchCwd = projectRootSnapshot
-    if (isolationMode === 'worktree' && canUseWorktree) {
+    let worktreePath: string | undefined =
+      targetSnapshot.kind === 'worktree' && targetSnapshot.worktreePath
+        ? targetSnapshot.worktreePath
+        : undefined
+    let worktreeBranch: string | undefined =
+      targetSnapshot.kind === 'worktree' ? targetSnapshot.worktreeBranch : undefined
+    let launchCwd = targetCwd
+    let finalExecutionTarget: ExecutionTarget = targetSnapshot
+    if (targetSnapshot.kind === 'worktree' && !worktreePath) {
+      if (!canUseWorktree || !projectRootSnapshot) {
+        toast.error(t('launcher.errors.projectRootRequired', 'Select a Git project'))
+        launchInFlightRef.current = false
+        return
+      }
       if (!baseBranch) {
         toast.error(t('launcher.errors.pickBase', 'Pick a base branch for the worktree'))
         launchInFlightRef.current = false
@@ -1028,6 +1078,12 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
           worktreePath = worktreePathResult
           worktreeBranch = worktreeBranchResult
           launchCwd = worktreePathResult
+          finalExecutionTarget = {
+            kind: 'worktree',
+            projectId: projectIdSnapshot,
+            worktreePath: worktreePathResult,
+            worktreeBranch: worktreeBranchResult
+          }
           // CAP-5: carry over untracked files listed in `.worktree-include`.
           // Symlink/path-escape/already-present defenses run on the host.
           // Best-effort: a copy failure must not orphan the freshly created
@@ -1114,14 +1170,11 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
       setWorktreeCreating(false)
     }
 
-    // Open the chat immediately; ACP spawn/session/send continue in the chat view.
+    // The placeholder is renderer-only. Durable navigation waits for the canonical
+    // ConversationId returned by the facade; opaque ACP SessionId never becomes a tab key.
     const store = useAcpStore.getState()
-    let sessionId =
-      preparedKeySnapshot != null && isolationMode !== 'worktree'
-        ? store.claimPreparedChat(preparedKeySnapshot, projectIdSnapshot)
-        : null
-    let usedPlaceholder = false
-    let seededOptimistic = false
+    let sessionId: string | null = null
+    const usedPlaceholder = true
 
     // Sync first-turn content so the chat can paint like a normal send. The
     // optimistic syncBlocks carry the DISPLAY (token) text so the timeline
@@ -1134,31 +1187,18 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
     } else if (syncTrimmed.length > 0) {
       syncBlocks.push({ type: 'text', text: displayWithCommand })
     }
+    const seededOptimistic = syncBlocks.length > 0
 
-    if (!sessionId) {
-      sessionId = store.createLaunchPlaceholder({
-        cwd: launchCwd,
-        projectId: projectIdSnapshot,
-        models: modelsSnapshot,
-        modes: modesSnapshot,
-        configOptions: configOptionsSnapshot,
-        initialUserBlocks: syncBlocks.length > 0 ? syncBlocks : undefined,
-        worktreePath,
-        worktreeBranch
-      })
-      usedPlaceholder = true
-      seededOptimistic = syncBlocks.length > 0
-    } else if (syncBlocks.length > 0) {
-      store.seedLaunchUserMessage(sessionId, syncBlocks)
-      seededOptimistic = true
-    }
-    useWorkspaceStore.getState().addAgentChatTab(sessionId, paneSnapshot)
-    useWorkspaceStore.getState().hideAgentLauncher()
-    setPendingOptions(emptyPendingLauncherOptions())
-    skillPathsRef.current = {}
-    clearAttachments()
-    resetMentions()
-    setPrompt('')
+    sessionId = store.createLaunchPlaceholder({
+      cwd: launchCwd,
+      projectId: projectIdSnapshot,
+      models: modelsSnapshot,
+      modes: modesSnapshot,
+      configOptions: configOptionsSnapshot,
+      initialUserBlocks: syncBlocks.length > 0 ? syncBlocks : undefined,
+      worktreePath,
+      worktreeBranch
+    })
 
     void (async () => {
       try {
@@ -1194,6 +1234,28 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
         }
 
         const liveStore = useAcpStore.getState()
+        let handedOffConversationId: string | null = null
+        const completeCanonicalHandoff = (realSessionId: string): void => {
+          const canonicalConversationId =
+            useAcpStore.getState().sessions[realSessionId]?.conversationId
+          if (!canonicalConversationId) {
+            throw new Error('CONVERSATION_CREATE_FAILED: canonical ConversationId missing')
+          }
+          if (handedOffConversationId === canonicalConversationId) return
+          handedOffConversationId = canonicalConversationId
+          useWorkspaceStore.getState().addAgentChatTab(canonicalConversationId, paneSnapshot)
+          useWorkspaceStore.getState().hideAgentLauncher()
+          setPendingOptions(emptyPendingLauncherOptions())
+          skillPathsRef.current = {}
+          clearAttachments()
+          resetMentions()
+          setPrompt('')
+          registerSessionTempFiles(realSessionId, appOwnedPaths)
+          console.info(
+            `[agentLauncher.launch] conversationId=${canonicalConversationId} target=${finalExecutionTarget.kind}${projectIdSnapshot ? ` projectId=${projectIdSnapshot}` : ''}`
+          )
+        }
+
         let realId = sessionId
         if (usedPlaceholder) {
           realId = await liveStore.finalizeChatLaunch({
@@ -1205,11 +1267,13 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
             pending: hasPendingLauncherOptions(pendingSnapshot) ? pendingSnapshot : null,
             initialText: null,
             initialBlocks: blocks.length > 0 ? blocks : null,
-            adoptSession: (from, to) => {
-              useWorkspaceStore.getState().remapAgentChatSession(from, to, paneSnapshot)
+            adoptSession: (_placeholderId, realSessionId) => {
+              completeCanonicalHandoff(realSessionId)
             },
             worktreePath,
-            worktreeBranch
+            worktreeBranch,
+            projectAttachment: attachmentSnapshot ?? undefined,
+            executionTarget: finalExecutionTarget
           })
         } else {
           await liveStore.applyPendingLauncherOptions(
@@ -1223,7 +1287,7 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
           }
           liveStore.clearLaunchingSession(realId)
         }
-        registerSessionTempFiles(realId, appOwnedPaths)
+        completeCanonicalHandoff(realId)
       } catch (err) {
         toast.error(
           err instanceof Error
@@ -1235,8 +1299,11 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
       }
     })()
   }, [
-    activeProjectId,
+    executionTarget,
+    projectAttachment,
     projectRoot,
+    conversationProjectId,
+    targetCwd,
     selectedConfig,
     selectedEntry?.status,
     acpConfigs,
@@ -1248,7 +1315,6 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
     appOwnedTempPaths,
     resetMentions,
     pendingOptions,
-    preparedKey,
     effectiveModels,
     effectiveModes,
     effectiveConfigOptions,
@@ -1297,6 +1363,7 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   const canLaunch =
     Boolean(selectedConfig) &&
     selectedEntry?.status === 'ready' &&
+    validateExecutionTarget(executionTarget) === null &&
     (prompt.trim().length > 0 || attachments.length > 0) &&
     // CAP-2: worktree mode requires an explicit base branch before launch —
     // covers detached HEAD (no current) and any case where the picker has
@@ -1344,6 +1411,19 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
       </div>
 
       <div className="flex min-w-0 w-full max-w-4xl flex-col gap-4">
+        <ExecutionTargetPicker
+          projects={projects}
+          value={executionTarget}
+          attachment={projectAttachment}
+          conversation={activeConversation}
+          workspaceCwd={activeConversation?.workspaceCwd}
+          onChange={(target) => {
+            setExecutionTarget(target)
+            if (target.kind !== 'worktree') setBaseBranch(null)
+            else if (target.worktreeBranch) setBaseBranch(target.worktreeBranch)
+          }}
+          onAttachmentChange={setProjectAttachment}
+        />
         <div className="relative">
           {slashOpen && (
             <SlashCommandMenu
@@ -1489,10 +1569,15 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
                         // registry, so the warm session now holds a stale MCP
                         // selection. Cancel + re-prepare so the next launch
                         // resolves MCP from the updated registry.
-                        if (!preparedKey || !activeConfigId || !projectRoot) return
+                        if (!preparedKey || !activeConfigId || !targetCwd) return
                         const store = useAcpStore.getState()
                         store.cancelPreparedChat(preparedKey)
-                        store.prepareChat(activeConfigId, projectRoot, undefined, activeProjectId)
+                        store.prepareChat(
+                          activeConfigId,
+                          targetCwd,
+                          undefined,
+                          selectedProjectId ?? ''
+                        )
                       })
                       .catch(() => {
                         toast.error(

@@ -222,6 +222,23 @@ describe('MobileChatShell', () => {
     expect(screen.getByLabelText('Open menu')).toHaveAttribute('aria-expanded', 'false')
   })
 
+  it('enables project-less New chat by default', () => {
+    projectRef.current = {}
+    const onNewChat = vi.fn()
+    render(
+      <MemoryRouter>
+        <MobileChatShell onNewChat={onNewChat}>
+          <div>chat body</div>
+        </MobileChatShell>
+      </MemoryRouter>
+    )
+
+    const newChat = screen.getByLabelText('New chat')
+    expect(newChat).toBeEnabled()
+    fireEvent.click(newChat)
+    expect(onNewChat).toHaveBeenCalledTimes(1)
+  })
+
   it('invokes onNewChat from the header action', () => {
     const onNewChat = vi.fn()
     render(

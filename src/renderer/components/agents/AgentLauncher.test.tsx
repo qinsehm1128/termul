@@ -139,34 +139,39 @@ const {
   }
 }))
 
-const { mockSkills, mockToastError, mockResolvedAgentsOverride, mockProjectOverride } = vi.hoisted(
-  () => ({
-    // Override-able skills list (defaults to [] — web/no-skills parity). Skill
-    // tests push entries here so useAgentSkills surfaces them in the slash menu.
-    // `path` is required so the launch wire prompt can cite it.
-    mockSkills: {
-      current: [] as Array<{
-        name: string
-        description: string
-        scope: string
-        path: string
-      }>
-    },
-    mockToastError: vi.fn(),
-    // CAP-6 / Story 8: the launcher resolves supported agents from the host
-    // catalog via `useResolvedSupportedAcpAgents`. Component tests mock the hook
-    // to the synchronous offline-first derivation so they can exercise launch
-    // behavior without the async catalog fetch. Set this to inject a specific
-    // entry list (e.g. the manual-install agent).
-    mockResolvedAgentsOverride: { current: null as SupportedAcpAgentEntry[] | null },
-    // CAP-2/3 worktree-mode override: the default project mock is a non-git
-    // folder so the worktree selector is hidden. Worktree tests push a git
-    // project + branch here so `canUseWorktree` becomes true.
-    mockProjectOverride: {
-      current: null as { isGitRepo?: boolean; gitBranch?: string | null } | null
-    }
-  })
-)
+const {
+  mockSkills,
+  mockToastError,
+  mockResolvedAgentsOverride,
+  mockProjectOverride,
+  mockProjectsRef
+} = vi.hoisted(() => ({
+  // Override-able skills list (defaults to [] — web/no-skills parity). Skill
+  // tests push entries here so useAgentSkills surfaces them in the slash menu.
+  // `path` is required so the launch wire prompt can cite it.
+  mockSkills: {
+    current: [] as Array<{
+      name: string
+      description: string
+      scope: string
+      path: string
+    }>
+  },
+  mockToastError: vi.fn(),
+  // CAP-6 / Story 8: the launcher resolves supported agents from the host
+  // catalog via `useResolvedSupportedAcpAgents`. Component tests mock the hook
+  // to the synchronous offline-first derivation so they can exercise launch
+  // behavior without the async catalog fetch. Set this to inject a specific
+  // entry list (e.g. the manual-install agent).
+  mockResolvedAgentsOverride: { current: null as SupportedAcpAgentEntry[] | null },
+  // CAP-2/3 worktree-mode override: the default project mock is a non-git
+  // folder so the worktree selector is hidden. Worktree tests push a git
+  // project + branch here so `canUseWorktree` becomes true.
+  mockProjectOverride: {
+    current: null as { isGitRepo?: boolean; gitBranch?: string | null } | null
+  },
+  mockProjectsRef: { current: null as Array<Record<string, unknown>> | null }
+}))
 
 vi.mock('sonner', () => ({
   toast: { error: mockToastError, success: vi.fn() }
@@ -364,7 +369,10 @@ vi.mock('@/stores/project-store', () => {
   }
   const withOverride = () => ({
     ...state,
-    projects: state.projects.map((p) => ({ ...p, ...(mockProjectOverride.current ?? {}) }))
+    activeProjectId: mockProjectsRef.current?.length === 0 ? '' : state.activeProjectId,
+    projects:
+      mockProjectsRef.current ??
+      state.projects.map((p) => ({ ...p, ...(mockProjectOverride.current ?? {}) }))
   })
   const useProjectStore = (sel?: (s: typeof state) => unknown) => {
     const merged = withOverride()
@@ -389,6 +397,7 @@ vi.mock('@/stores/workspace-store', () => {
 
 vi.mock('@/stores/acp-store', () => {
   const getState = () => ({
+    sessions: acpStateRef.current.sessions,
     startChat: mockStartChat,
     prepareChat: mockPrepareChat,
     cancelPreparedChat: mockCancelPreparedChat,
@@ -582,12 +591,14 @@ beforeEach(() => {
   mockStartChat.mockResolvedValue('session-1')
   mockClaimPreparedChat.mockReturnValue(null)
   mockCreateLaunchPlaceholder.mockReturnValue('launch-placeholder-1')
-  mockFinalizeChatLaunch.mockImplementation(
-    async (args: { adoptSession?: (a: string, b: string) => void; placeholderId: string }) => {
-      args.adoptSession?.(args.placeholderId, 'session-1')
-      return 'session-1'
+  mockFinalizeChatLaunch.mockImplementation(async (_args: { placeholderId: string }) => {
+    acpStateRef.current.sessions['session-1'] = {
+      ...preparedSession(ACP_CONFIG),
+      id: 'session-1',
+      conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
     }
-  )
+    return 'session-1'
+  })
   mockApplyPendingLauncherOptions.mockResolvedValue(undefined)
   mockSeedLaunchUserMessage.mockImplementation(() => undefined)
   mockClearLaunchingSession.mockImplementation(() => undefined)
@@ -610,6 +621,7 @@ beforeEach(() => {
   // Worktree-mode defaults: web context, no git repo, no worktree calls.
   vi.mocked(isTauriContext).mockReturnValue(false)
   mockProjectOverride.current = null
+  mockProjectsRef.current = null
   mockWorktreeCreate.mockReset()
   mockWorktreeCopyInclude.mockReset()
   mockWorktreeResolveBaseBranch.mockReset()
@@ -643,6 +655,59 @@ afterEach(() => {
 })
 
 describe('AgentLauncher ACP new thread', () => {
+  it('creates a canonical workspace Conversation with zero projects', async () => {
+    mockProjectsRef.current = []
+    renderLauncher()
+
+    expect(screen.getByRole('combobox', { name: 'Execution target' })).toHaveValue('workspace')
+    setComposerValue('project-less chat')
+    fireEvent.click(screen.getByLabelText('Start agent chat'))
+
+    await waitFor(() => expect(mockFinalizeChatLaunch).toHaveBeenCalledTimes(1))
+    expect(mockFinalizeChatLaunch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cwd: '/',
+        projectId: '',
+        executionTarget: { kind: 'workspace' }
+      })
+    )
+    await waitFor(() =>
+      expect(mockAddAgentChatTab).toHaveBeenCalledWith(
+        '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        'pane1'
+      )
+    )
+  })
+
+  it('keeps explicit project target and optional attachment separate', async () => {
+    renderLauncher()
+
+    fireEvent.change(screen.getByRole('combobox', { name: 'Execution target' }), {
+      target: { value: 'project_root' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Attach project context' }))
+    setComposerValue('explicit target')
+    fireEvent.click(screen.getByLabelText('Start agent chat'))
+
+    await waitFor(() => expect(mockFinalizeChatLaunch).toHaveBeenCalledTimes(1))
+    expect(mockFinalizeChatLaunch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        cwd: '/work',
+        projectId: 'p1',
+        executionTarget: {
+          kind: 'project_root',
+          projectId: 'p1',
+          projectRoot: '/work'
+        },
+        projectAttachment: expect.objectContaining({
+          schemaVersion: 1,
+          projectId: 'p1',
+          projectPathSnapshot: '/work'
+        })
+      })
+    )
+  })
+
   it('does not launch when Enter confirms an IME composition', async () => {
     renderLauncher()
 
@@ -662,8 +727,7 @@ describe('AgentLauncher ACP new thread', () => {
     fireEvent.click(screen.getByLabelText('Start agent chat'))
 
     expect(mockCreateLaunchPlaceholder).toHaveBeenCalled()
-    expect(mockAddAgentChatTab).toHaveBeenCalledWith('launch-placeholder-1', 'pane1')
-    expect(mockHideAgentLauncher).toHaveBeenCalled()
+    expect(mockAddAgentChatTab).not.toHaveBeenCalled()
 
     await waitFor(() => expect(mockFinalizeChatLaunch).toHaveBeenCalledTimes(1))
     expect(mockFinalizeChatLaunch).toHaveBeenCalledWith(
@@ -671,23 +735,26 @@ describe('AgentLauncher ACP new thread', () => {
         placeholderId: 'launch-placeholder-1',
         configId: defaultAgent.configId,
         cwd: '/work',
-        projectId: 'p1',
+        projectId: '',
         initialBlocks: [{ type: 'text', text: 'hello acp' }],
-        adoptSession: expect.any(Function)
+        adoptSession: expect.any(Function),
+        executionTarget: { kind: 'workspace' }
       })
     )
-    expect(mockRemapAgentChatSession).toHaveBeenCalledWith(
-      'launch-placeholder-1',
-      'session-1',
-      'pane1'
+    await waitFor(() =>
+      expect(mockAddAgentChatTab).toHaveBeenCalledWith(
+        '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        'pane1'
+      )
     )
+    expect(mockHideAgentLauncher).toHaveBeenCalled()
     expect(mockPersistWrite).toHaveBeenCalledWith('agents/last-selected', {
       agentId: defaultAgent.configId,
       mode: 'acp'
     })
   })
 
-  it('claims a prepared session so launch skips the placeholder path', async () => {
+  it('does not promote a backend-ephemeral prepared session into canonical UI identity', async () => {
     const defaultAgent = defaultReadyAgent()
     const key = `${defaultAgent.configId}\0/work\0`
     mockClaimPreparedChat.mockReturnValue('prepared-ready-1')
@@ -697,19 +764,13 @@ describe('AgentLauncher ACP new thread', () => {
     setComposerValue('ready now')
     fireEvent.click(screen.getByLabelText('Start agent chat'))
 
-    expect(mockClaimPreparedChat).toHaveBeenCalledWith(key, 'p1')
-    expect(mockCreateLaunchPlaceholder).not.toHaveBeenCalled()
-    expect(mockSeedLaunchUserMessage).toHaveBeenCalledWith('prepared-ready-1', [
-      { type: 'text', text: 'ready now' }
-    ])
-    expect(mockAddAgentChatTab).toHaveBeenCalledWith('prepared-ready-1', 'pane1')
-    expect(mockHideAgentLauncher).toHaveBeenCalled()
-
+    expect(mockClaimPreparedChat).not.toHaveBeenCalled()
+    expect(mockCreateLaunchPlaceholder).toHaveBeenCalled()
+    await waitFor(() => expect(mockFinalizeChatLaunch).toHaveBeenCalledTimes(1))
     await waitFor(() =>
-      expect(mockSendPrompt).toHaveBeenCalledWith(
-        'prepared-ready-1',
-        [{ type: 'text', text: 'ready now' }],
-        { skipUserAppend: true }
+      expect(mockAddAgentChatTab).toHaveBeenCalledWith(
+        '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        'pane1'
       )
     )
   })
@@ -1283,15 +1344,23 @@ describe('AgentLauncher ACP new thread', () => {
   })
 
   it('opens chat instantly while finalizeChatLaunch runs in the background (send-while-cold)', async () => {
-    let resolveFinalize!: (id: string) => void
+    let resolveFinalize!: () => void
     mockFinalizeChatLaunch.mockImplementation(
-      (args: { adoptSession?: (a: string, b: string) => void; placeholderId: string }) =>
-        new Promise<string>((resolve) => {
-          resolveFinalize = (id: string) => {
-            args.adoptSession?.(args.placeholderId, id)
-            resolve(id)
-          }
+      (args: {
+        placeholderId: string
+        adoptSession?: (fromSessionId: string, toSessionId: string) => void
+      }) => {
+        const realId = 'session-cold'
+        acpStateRef.current.sessions[realId] = {
+          ...preparedSession(ACP_CONFIG),
+          id: realId,
+          conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+        }
+        args.adoptSession?.(args.placeholderId, realId)
+        return new Promise<string>((resolve) => {
+          resolveFinalize = () => resolve(realId)
         })
+      }
     )
     renderLauncher()
 
@@ -1303,23 +1372,21 @@ describe('AgentLauncher ACP new thread', () => {
         initialUserBlocks: [{ type: 'text', text: 'hello cold' }]
       })
     )
-    expect(mockAddAgentChatTab).toHaveBeenCalledWith('launch-placeholder-1', 'pane1')
-    expect(mockHideAgentLauncher).toHaveBeenCalled()
     expect(screen.getByLabelText('Start agent chat').querySelector('.animate-spin')).toBeNull()
 
     await waitFor(() => expect(mockFinalizeChatLaunch).toHaveBeenCalled())
-
-    await act(async () => {
-      resolveFinalize('session-cold')
-    })
-
     await waitFor(() =>
-      expect(mockRemapAgentChatSession).toHaveBeenCalledWith(
-        'launch-placeholder-1',
-        'session-cold',
+      expect(mockAddAgentChatTab).toHaveBeenCalledWith(
+        '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
         'pane1'
       )
     )
+    expect(mockHideAgentLauncher).toHaveBeenCalled()
+
+    await act(async () => {
+      resolveFinalize()
+    })
+    expect(mockAddAgentChatTab).toHaveBeenCalledTimes(1)
   })
 })
 
@@ -1386,8 +1453,13 @@ describe('AgentLauncher skill chips (inline tokens)', () => {
         })
       )
     )
+    await waitFor(() =>
+      expect(mockAddAgentChatTab).toHaveBeenCalledWith(
+        '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        'pane1'
+      )
+    )
     expect(mockHideAgentLauncher).toHaveBeenCalled()
-    expect(mockAddAgentChatTab).toHaveBeenCalledWith('launch-placeholder-1', 'pane1')
 
     // The real send (finalize) carries the WIRE (path-framed) text — the agent
     // receives paths, not tokens.

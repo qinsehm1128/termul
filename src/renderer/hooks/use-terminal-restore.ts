@@ -671,11 +671,24 @@ function hasValidActiveAgentChatTab(
   if (!activeTab || activeTab.type !== 'agent-chat') return false
 
   const acpState = useAcpStore.getState()
-  return (
-    acpState.sessions[activeTab.sessionId]?.projectId === projectId ||
-    acpState.sessionIndex.some(
-      (entry) => entry.id === activeTab.sessionId && entry.projectId === projectId
+  if (activeTab.conversationId) {
+    return (
+      Object.values(acpState.sessions).some(
+        (session) =>
+          session.conversationId === activeTab.conversationId && session.projectId === projectId
+      ) ||
+      acpState.sessionIndex.some(
+        (entry) =>
+          entry.conversationId === activeTab.conversationId && entry.projectId === projectId
+      )
     )
+  }
+  return Boolean(
+    activeTab.sessionId &&
+      (acpState.sessions[activeTab.sessionId]?.projectId === projectId ||
+        acpState.sessionIndex.some(
+          (entry) => entry.id === activeTab.sessionId && entry.projectId === projectId
+        ))
   )
 }
 

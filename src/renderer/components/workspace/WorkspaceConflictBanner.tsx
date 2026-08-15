@@ -1,65 +1,13 @@
 import type { ConversationId } from '@shared/types/conversation.types'
-import type { RecoveryActionName, RecoveryItemV1 } from '@shared/types/conversation-recovery.types'
 import { useCallback } from 'react'
 import { useTranslation } from 'react-i18next'
+import { ConversationRecoveryPanel } from '@/components/conversation/ConversationRecoveryPanel'
 import { Button } from '@/components/ui/button'
-import {
-  resolveSessionWorkspaceConflict,
-  resolveSessionWorkspaceRecovery
-} from '@/hooks/use-session-workspace-sync'
+import { resolveSessionWorkspaceConflict } from '@/hooks/use-session-workspace-sync'
 import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
 
 export interface WorkspaceConflictBannerProps {
   conversationId?: ConversationId | null
-}
-
-const recoveryActions: readonly RecoveryActionName[] = [
-  'inspect',
-  'associateConversation',
-  'startEmptyWorkspace',
-  'dismissPreservedSource'
-]
-
-function RecoveryItemActions({
-  conversationId,
-  item
-}: {
-  conversationId: ConversationId
-  item: RecoveryItemV1
-}): React.ReactElement {
-  const run = useCallback(
-    (action: RecoveryActionName) => {
-      void resolveSessionWorkspaceRecovery(conversationId, item, action)
-    },
-    [conversationId, item]
-  )
-  return (
-    <section className="flex min-w-0 flex-col gap-2" aria-label={item.kind}>
-      <div className="min-w-0 text-xs text-muted-foreground">
-        <div className="font-medium text-amber-700 dark:text-amber-300">{item.kind}</div>
-        {item.sourcePaths.map((path, index) => (
-          <div key={`${path}-${item.sourceSha256[index] ?? ''}`} className="break-all font-mono">
-            <span>{path}</span>
-            {item.sourceSha256[index] ? <span> · sha256:{item.sourceSha256[index]}</span> : null}
-          </div>
-        ))}
-        <div>revision {item.revision}</div>
-      </div>
-      <div className="flex flex-wrap gap-2">
-        {recoveryActions.map((action) => (
-          <Button
-            key={action}
-            type="button"
-            variant="secondary"
-            size="xs"
-            onClick={() => run(action)}
-          >
-            {action}
-          </Button>
-        ))}
-      </div>
-    </section>
-  )
 }
 
 export function WorkspaceConflictBanner({
@@ -75,6 +23,7 @@ export function WorkspaceConflictBanner({
     conversationId ? state.recoveryByConversation[conversationId] : undefined
   )
   const recoveryItems = recoveryItemsValue ?? []
+  const setRecoveryItems = useSessionWorkspaceSyncStore((state) => state.setRecoveryItems)
 
   const resolveConflict = useCallback(
     (action: 'reload' | 'overwrite' | 'dismiss') => {
@@ -90,7 +39,7 @@ export function WorkspaceConflictBanner({
       role="alert"
       aria-live="polite"
       data-conversation-id={conversationId}
-      className="flex max-h-[40vh] flex-col gap-3 overflow-auto border-b border-amber-500/50 bg-amber-500/10 px-3 py-2"
+      className="flex max-h-[45vh] flex-col gap-3 overflow-auto border-b border-amber-500/50 bg-amber-500/10 px-3 py-2"
     >
       {conflict ? (
         <section className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
@@ -132,9 +81,15 @@ export function WorkspaceConflictBanner({
           </div>
         </section>
       ) : null}
-      {recoveryItems.map((item) => (
-        <RecoveryItemActions key={item.recoveryId} conversationId={conversationId} item={item} />
-      ))}
+      {recoveryItems.length > 0 ? (
+        <ConversationRecoveryPanel
+          embedded
+          items={recoveryItems}
+          conversationId={conversationId}
+          className="max-h-none border-0 bg-transparent p-0 shadow-none backdrop-blur-none"
+          onItemsChange={(updated) => setRecoveryItems(conversationId, updated)}
+        />
+      ) : null}
     </div>
   )
 }
