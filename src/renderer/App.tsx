@@ -13,6 +13,7 @@ import { WhatsNewModal } from './components/WhatsNewModal'
 import { useAppSettingsLoader } from './hooks/use-app-settings'
 import { useAppliedColorThemeSync } from './hooks/use-color-theme'
 import { useContextBarSettings } from './hooks/use-context-bar-settings'
+import { useConversationLifecycle } from './hooks/use-conversation-lifecycle'
 import { useCrashRecovery } from './hooks/use-crash-recovery'
 import { useCwd } from './hooks/use-cwd'
 import { useExitCode } from './hooks/use-exit-code'
@@ -114,6 +115,7 @@ function AppEffects(): null {
   usePreventAltMenu()
   useTerminalAutoSave()
   useSessionWorkspaceBootstrap()
+  useConversationLifecycle()
   useTerminalRestore()
   useCrashRecovery()
   useTerminalDetachedOutput()

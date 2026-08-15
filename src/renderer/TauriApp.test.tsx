@@ -3,10 +3,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CONTEXT_BAR_SETTINGS_KEY } from '@/types/settings'
 import TauriApp from './TauriApp'
 
-const { mockPersistenceRead, mockSessionWorkspaceBootstrap } = vi.hoisted(() => ({
-  mockPersistenceRead: vi.fn(),
-  mockSessionWorkspaceBootstrap: vi.fn()
-}))
+const { mockPersistenceRead, mockSessionWorkspaceBootstrap, mockConversationLifecycle } =
+  vi.hoisted(() => ({
+    mockPersistenceRead: vi.fn(),
+    mockSessionWorkspaceBootstrap: vi.fn(),
+    mockConversationLifecycle: vi.fn()
+  }))
 
 vi.mock('@/lib/api', () => ({
   persistenceApi: {
@@ -30,6 +32,10 @@ vi.mock('@/lib/api', () => ({
 
 vi.mock('@/hooks/use-session-workspace-sync', () => ({
   useSessionWorkspaceBootstrap: mockSessionWorkspaceBootstrap
+}))
+
+vi.mock('./hooks/use-conversation-lifecycle', () => ({
+  useConversationLifecycle: mockConversationLifecycle
 }))
 
 vi.mock('@/hooks/use-window-state', () => ({
@@ -160,5 +166,10 @@ describe('TauriApp', () => {
   it('mounts the portable SessionWorkspace bootstrap at the desktop root', () => {
     render(<TauriApp />)
     expect(mockSessionWorkspaceBootstrap).toHaveBeenCalledTimes(1)
+  })
+
+  it('mounts Conversation lifecycle reconciliation at the desktop root', () => {
+    render(<TauriApp />)
+    expect(mockConversationLifecycle).toHaveBeenCalledTimes(1)
   })
 })

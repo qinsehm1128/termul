@@ -45,7 +45,8 @@ use crate::pty::PtyManager;
 use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub};
 use crate::web::permissions::{TurnClaim, DEFAULT_PERMISSION_RECONNECT_GRACE};
 use crate::web::project_registry::{ProjectRegistry, ProjectSwitchContext};
-use crate::web::sink::{broadcast_projects_changed, ClientId, ReplayResult, WsRelaySink};
+use crate::web::sink::{broadcast_projects_changed, AcpEvent, ClientId, ReplayResult, WsRelaySink};
+use crate::web::EventSink;
 
 // ---------------------------------------------------------------------------
 // Sequenced event — the wire envelope (AC2 + AC3)
@@ -1037,6 +1038,56 @@ async fn handle_request(
             )
             .await
         }
+        "detach_binding" => {
+            handle_conversation_lifecycle(
+                id,
+                &req.payload,
+                acp,
+                relay,
+                ConversationWsMutation::Detach,
+            )
+            .await
+        }
+        "rebind_binding" => {
+            handle_conversation_lifecycle(
+                id,
+                &req.payload,
+                acp,
+                relay,
+                ConversationWsMutation::Rebind,
+            )
+            .await
+        }
+        "suspend_binding" => {
+            handle_conversation_lifecycle(
+                id,
+                &req.payload,
+                acp,
+                relay,
+                ConversationWsMutation::Suspend,
+            )
+            .await
+        }
+        "replace_binding" => {
+            handle_conversation_lifecycle(
+                id,
+                &req.payload,
+                acp,
+                relay,
+                ConversationWsMutation::Replace,
+            )
+            .await
+        }
+        "delete_conversation" => {
+            handle_conversation_lifecycle(
+                id,
+                &req.payload,
+                acp,
+                relay,
+                ConversationWsMutation::Delete,
+            )
+            .await
+        }
         "close_session" => {
             handle_close_session(id, &req.payload, acp, current_session, current_project).await
         }
@@ -1510,6 +1561,111 @@ fn ok_with_payload<T: serde::Serialize>(id: String, value: &T) -> WsReply {
             WsErrorCode::Unsupported,
             format!("failed to serialize reply payload: {e}"),
         ),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ConversationWsMutation {
+    Detach,
+    Rebind,
+    Suspend,
+    Replace,
+    Delete,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConversationLifecycleWsPayload {
+    conversation_id: String,
+    expected_revision: u64,
+    #[serde(default)]
+    request: Option<crate::conversation::PrepareConversationRequest>,
+}
+
+async fn handle_conversation_lifecycle(
+    id: String,
+    payload: &Value,
+    acp: &Arc<AcpManager>,
+    relay: &Arc<WsRelaySink>,
+    mutation: ConversationWsMutation,
+) -> WsReply {
+    let parsed: ConversationLifecycleWsPayload = match serde_json::from_value(payload.clone()) {
+        Ok(value) => value,
+        Err(error) => {
+            return WsReply::err_with_code(
+                id,
+                "VALIDATION_ERROR",
+                format!("malformed Conversation lifecycle payload: {error}"),
+            )
+        }
+    };
+    let conversation_id =
+        match crate::conversation::ConversationId::parse_path_component(&parsed.conversation_id) {
+            Ok(value) => value,
+            Err(error) => {
+                return WsReply::err_with_code(id, "CONVERSATION_INVALID_ID", error.to_string())
+            }
+        };
+    let Some(pty) = acp.pty_manager() else {
+        return WsReply::err_with_code(
+            id,
+            "CONVERSATION_RECOVERY_REQUIRED",
+            "bootstrap-published PtyManager is unavailable",
+        );
+    };
+    let service =
+        match crate::conversation::ConversationLifecycleService::from_manager(Arc::clone(acp), pty)
+        {
+            Ok(service) => service,
+            Err(error) => return WsReply::err_with_code(id, error.code.as_str(), error.detail),
+        };
+    let result = match mutation {
+        ConversationWsMutation::Detach => {
+            service
+                .detach_agent_binding(conversation_id, parsed.expected_revision)
+                .await
+        }
+        ConversationWsMutation::Rebind => {
+            service
+                .rebind_detached_binding(conversation_id, parsed.expected_revision)
+                .await
+        }
+        ConversationWsMutation::Suspend => {
+            service
+                .suspend_agent_binding(conversation_id, parsed.expected_revision)
+                .await
+        }
+        ConversationWsMutation::Replace => match parsed.request {
+            Some(request) => {
+                service
+                    .replace_agent_binding(conversation_id, request, parsed.expected_revision)
+                    .await
+            }
+            None => {
+                return WsReply::err_with_code(
+                    id,
+                    "VALIDATION_ERROR",
+                    "replace_binding requires request",
+                )
+            }
+        },
+        ConversationWsMutation::Delete => {
+            service
+                .delete_conversation(conversation_id, parsed.expected_revision)
+                .await
+        }
+    };
+    match result {
+        Ok(outcome) => {
+            relay.emit(&AcpEvent {
+                sid: None,
+                type_: "conversation_lifecycle",
+                payload: serde_json::to_value(&outcome)
+                    .expect("Conversation lifecycle outcome serializes"),
+            });
+            ok_with_payload(id, &outcome)
+        }
+        Err(error) => WsReply::err_with_code(id, error.code.as_str(), error.detail),
     }
 }
 
@@ -2707,7 +2863,47 @@ async fn handle_close_session(
         }
     };
     let closing_session_id = parsed.session_id.clone();
-    match acp.close_session(&parsed.agent_id, parsed.session_id).await {
+    let close_result = if let Some(conversation_id) =
+        acp.conversation_id_for_current_session(&closing_session_id.0)
+    {
+        let Some(pty) = acp.pty_manager() else {
+            return WsReply::err_with_code(
+                id,
+                "CONVERSATION_RECOVERY_REQUIRED",
+                "bootstrap-published PtyManager is unavailable",
+            );
+        };
+        let service = match crate::conversation::ConversationLifecycleService::from_manager(
+            Arc::clone(acp),
+            pty,
+        ) {
+            Ok(service) => service,
+            Err(error) => return WsReply::err_with_code(id, error.code.as_str(), error.detail),
+        };
+        let expected_revision = match acp
+            .conversation_creation()
+            .and_then(|creation| creation.repository().get_conversation(conversation_id).ok())
+        {
+            Some(record) => record.last_seq,
+            None => {
+                return WsReply::err_with_code(
+                    id,
+                    "CONVERSATION_RECOVERY_REQUIRED",
+                    "canonical Conversation revision is unavailable",
+                )
+            }
+        };
+        service
+            .suspend_agent_binding(conversation_id, expected_revision)
+            .await
+            .map(|_| ())
+            .map_err(|error| (error.code.as_str(), error.detail))
+    } else {
+        acp.close_session(&parsed.agent_id, parsed.session_id)
+            .await
+            .map_err(|error| ("agent_crashed".to_string(), error))
+    };
+    match close_result {
         Ok(()) => {
             if current_session.lock().as_ref() == Some(&closing_session_id) {
                 *current_session.lock() = None;
@@ -2715,7 +2911,7 @@ async fn handle_close_session(
             }
             WsReply::ok(id, Some(json!({})))
         }
-        Err(e) => acp_err_to_reply(id, e),
+        Err((code, detail)) => WsReply::err_with_code(id, code, detail),
     }
 }
 
@@ -6680,6 +6876,137 @@ mod tests {
     /// (a no-op `Completed` with the previous session). The cold-tab test
     /// (`execute_cold_tab_select_is_per_connection_no_persistence_no_broadcast`)
     /// covers the non-matching path; this test pins the matching path.
+    mod conversation_lifecycle {
+        use super::*;
+        use crate::conversation::contracts::{
+            parse_created_at_utc, AgentSessionBinding, AgentSessionBindingState,
+            ConversationCreator, ConversationLifecycleState, ConversationRecordV2,
+            CreationPartition, ExecutionTarget, AGENT_SESSION_BINDING_SCHEMA_VERSION,
+            CONVERSATION_SCHEMA_VERSION,
+        };
+        use crate::conversation::{
+            ConversationCreationService, ConversationLocator, ConversationPersistenceAdapter,
+            ConversationReader, ConversationRepository, LegacyConversationReader, ReaderPrecedence,
+            SessionWorkspaceLocator,
+        };
+
+        const ID: &str = "018f7a1c-1b4d-7c8a-9f01-0123456789ab";
+
+        async fn fixture() -> (
+            tempfile::TempDir,
+            Arc<AcpManager>,
+            Arc<crate::pty::PtyManager>,
+            Arc<WsRelaySink>,
+            u64,
+        ) {
+            let temp = tempfile::tempdir().unwrap();
+            let base = temp.path().canonicalize().unwrap();
+            let private = base.join("private");
+            let visible = base.join("visible");
+            std::fs::create_dir_all(&visible).unwrap();
+            let (repository, _) = ConversationRepository::open(private.clone()).unwrap();
+            let conversation_id = crate::conversation::ConversationId::parse(ID).unwrap();
+            let created_at = parse_created_at_utc("2026-08-15T09:45:15.123Z").unwrap();
+            let workspace = visible.join("sessions/2026/08/15").join(ID);
+            std::fs::create_dir_all(&workspace).unwrap();
+            repository
+                .create_conversation(ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: workspace.to_string_lossy().into_owned(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::Ready,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                })
+                .await
+                .unwrap();
+            repository
+                .bind_agent_session(
+                    conversation_id,
+                    AgentSessionBinding {
+                        schema_version: AGENT_SESSION_BINDING_SCHEMA_VERSION,
+                        binding_id: uuid::Uuid::new_v4(),
+                        agent_session_id: "opaque/ws".to_string(),
+                        runtime_agent_id: "agent-ws".to_string(),
+                        stable_agent_namespace: "config:ws".to_string(),
+                        execution_cwd: workspace.to_string_lossy().into_owned(),
+                        bound_at_utc: chrono::Utc::now(),
+                        state: AgentSessionBindingState::Active,
+                    },
+                    chrono::Utc::now(),
+                )
+                .await
+                .unwrap();
+            let creation = Arc::new(
+                ConversationCreationService::new(
+                    Arc::clone(&repository),
+                    ConversationLocator::new(private).unwrap(),
+                    SessionWorkspaceLocator::new(visible).unwrap(),
+                )
+                .unwrap(),
+            );
+            let reader = Arc::new(ConversationReader::new(
+                Arc::clone(&repository),
+                LegacyConversationReader::default(),
+                ReaderPrecedence::ConversationV2Only,
+            ));
+            let persistence = Arc::new(ConversationPersistenceAdapter::new(
+                Arc::clone(&repository),
+                reader,
+            ));
+            let relay = Arc::new(WsRelaySink::new());
+            let acp = Arc::new(AcpManager::with_conversation_services(
+                vec![relay.clone()],
+                creation,
+                persistence,
+            ));
+            let pty = crate::web::test_pty_manager();
+            acp.set_pty_manager(&pty);
+            let revision = repository
+                .get_conversation(conversation_id)
+                .unwrap()
+                .last_seq;
+            (temp, acp, pty, relay, revision)
+        }
+
+        #[tokio::test]
+        async fn detach_and_stale_revision_match_other_transports() {
+            let (_temp, acp, _pty, relay, revision) = fixture().await;
+            let reply = handle_conversation_lifecycle(
+                "detach-1".to_string(),
+                &json!({"conversationId":ID,"expectedRevision":revision}),
+                &acp,
+                &relay,
+                ConversationWsMutation::Detach,
+            )
+            .await;
+            assert!(reply.ok, "detach reply: {:?}", reply.err);
+            assert_eq!(reply.payload.as_ref().unwrap()["action"], "detachBinding");
+            assert_eq!(
+                reply.payload.as_ref().unwrap()["currentBinding"]["state"],
+                "detached"
+            );
+
+            let stale = handle_conversation_lifecycle(
+                "delete-1".to_string(),
+                &json!({"conversationId":ID,"expectedRevision":revision}),
+                &acp,
+                &relay,
+                ConversationWsMutation::Delete,
+            )
+            .await;
+            assert!(!stale.ok);
+            assert_eq!(
+                stale.err.expect("stale reply has an error").code,
+                "CONVERSATION_CONFLICT"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn execute_project_switch_returns_early_when_already_on_project() {
         let relay = Arc::new(WsRelaySink::new());

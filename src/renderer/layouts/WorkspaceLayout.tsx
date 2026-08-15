@@ -487,7 +487,13 @@ export default function WorkspaceLayout(): React.JSX.Element {
       useBrowserSessionStore.getState().removeTab(activeTab.browserTabId)
       useWorkspaceStore.getState().removeTab(activeTab.id)
     } else if (activeTab.type === 'agent-chat') {
-      useWorkspaceStore.getState().removeTab(activeTab.id)
+      const acp = useAcpStore.getState()
+      const conversationId = acp.sessions[activeTab.sessionId]?.conversationId
+      if (conversationId) {
+        acp.closeChatView(conversationId)
+      } else {
+        useWorkspaceStore.getState().closeChatView(activeTab.sessionId)
+      }
     }
   }, [activeTab])
 

@@ -119,10 +119,32 @@ pub async fn acp_resume_session(
 #[tauri::command]
 pub async fn acp_close_session(
     manager: State<'_, Arc<AcpManager>>,
+    pty: State<'_, Arc<crate::pty::PtyManager>>,
     agent_id: AgentId,
     session_id: SessionId,
 ) -> Result<(), String> {
-    manager.close_session(&agent_id, session_id).await
+    if let Some(conversation_id) = manager.conversation_id_for_current_session(&session_id.0) {
+        let service = crate::conversation::ConversationLifecycleService::from_manager(
+            manager.inner().clone(),
+            pty.inner().clone(),
+        )
+        .map_err(|error| error.to_string())?;
+        let creation = manager
+            .conversation_creation()
+            .ok_or_else(|| "CONVERSATION_BOOTSTRAP_REQUIRED".to_string())?;
+        let expected_revision = creation
+            .repository()
+            .get_conversation(conversation_id)
+            .map_err(|error| error.to_string())?
+            .last_seq;
+        service
+            .suspend_agent_binding(conversation_id, expected_revision)
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    } else {
+        manager.close_session(&agent_id, session_id).await
+    }
 }
 
 #[tauri::command]

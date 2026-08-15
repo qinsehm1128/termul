@@ -116,6 +116,72 @@
     "yesterday": "Yesterday",
     "earlier": "Earlier"
   },
+  "lifecycle": {
+    "actions": "Conversation actions",
+    "actionsFor": "Conversation actions for {{title}}",
+    "legacyReadOnly": "Legacy chat history is read-only",
+    "closeView": "Close chat view",
+    "detach": "Detach binding",
+    "rebind": "Rebind detached agent",
+    "suspend": "Suspend agent",
+    "replace": "Replace agent",
+    "delete": "Delete conversation",
+    "confirm": {
+      "detach": {
+        "title": "Detach agent binding?",
+        "message": "Detach the agent from “{{title}}”? The agent keeps running, but events stop routing to this conversation until you rebind it.",
+        "confirm": "Detach binding"
+      },
+      "rebind": {
+        "title": "Rebind detached agent?",
+        "message": "Reconnect “{{title}}” to the same still-running agent session?",
+        "confirm": "Rebind agent"
+      },
+      "suspend": {
+        "title": "Suspend agent?",
+        "message": "Close the agent session for “{{title}}”? The conversation, transcript, workspace, and terminals are retained.",
+        "confirm": "Suspend agent"
+      },
+      "replace": {
+        "title": "Replace agent?",
+        "message": "Create a new agent session for “{{title}}” while retaining the same conversation and workspace?",
+        "confirm": "Replace agent"
+      },
+      "delete": {
+        "title": "Delete conversation?",
+        "message": "Tombstone “{{title}}”? This is refused while an agent binding or terminal resource is still live.",
+        "confirm": "Delete conversation"
+      }
+    },
+    "success": {
+      "detach": "Agent binding detached",
+      "rebind": "Agent binding restored",
+      "suspend": "Agent suspended",
+      "replace": "Agent replaced",
+      "delete": "Conversation deleted"
+    },
+    "blocked": {
+      "title": "Conversation still has live resources",
+      "description": "Resolve these resources first: {{resources}}"
+    },
+    "errors": {
+      "CONVERSATION_CONFLICT": "The conversation changed. Refresh and try again.",
+      "CONVERSATION_NOT_FOUND": "The conversation could not be found.",
+      "CONVERSATION_BINDING_NOT_FOUND": "This conversation has no agent binding.",
+      "CONVERSATION_BINDING_NOT_ACTIVE": "This action requires an active agent binding.",
+      "CONVERSATION_BINDING_NOT_DETACHED": "This action requires a detached agent binding.",
+      "CONVERSATION_BINDING_NOT_ADDRESSABLE": "The detached agent session is no longer reachable.",
+      "CONVERSATION_LIVE_RESOURCES": "Resolve the live agent or terminal resources before deleting.",
+      "CONVERSATION_RECOVERY_REQUIRED": "Conversation recovery is required before this action.",
+      "CONVERSATION_DURABILITY_FAILED": "The lifecycle change could not be saved safely.",
+      "ACP_CLOSE_UNSUPPORTED": "This agent does not support suspension.",
+      "ACP_CLOSE_FAILED": "The agent could not be suspended.",
+      "ACP_REPLACE_FAILED": "A replacement agent session could not be created.",
+      "VALIDATION_ERROR": "The lifecycle request was invalid.",
+      "FORBIDDEN": "This lifecycle action is not allowed from the current connection.",
+      "NETWORK_ERROR": "The lifecycle request could not reach the host."
+    }
+  },
   "question": {
     "sendFailed": "Could not send your answer. Try again.",
     "noOptions": "The agent provided no options.",

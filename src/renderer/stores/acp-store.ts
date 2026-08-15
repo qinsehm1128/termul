@@ -22,6 +22,10 @@
  * prepared-chat reaping) and is **not** a cross-tab isolation boundary.
  */
 
+import type {
+  ConversationLifecycleOutcome,
+  ConversationReplacementRequest
+} from '@shared/types/conversation-lifecycle.types'
 import { type PersistedComposerOptions, PersistenceKeys } from '@shared/types/persistence.types'
 import type {
   ProjectSwitchCompletedEvent,
@@ -92,7 +96,6 @@ import {
   loadSessionPayload,
   markSessionPayloadPinned,
   maxPayloadSeq,
-  queueSessionPayloadDelete,
   restoredToolCalls,
   type SessionIndexEntry,
   setCachedSessionPayload,
@@ -120,6 +123,10 @@ import {
 } from '@/lib/agents/acp-spawn-errors'
 import { persistenceApi } from '@/lib/api'
 import { deleteSessionTempFiles } from '@/lib/attachment-temp-cleanup'
+import {
+  ConversationLifecycleApiError,
+  conversationLifecycleApi
+} from '@/lib/conversation-lifecycle-api'
 import { logFrontendError } from '@/lib/log-api'
 import { isTauriContext } from '@/lib/tauri-runtime'
 import { randomUUID } from '@/lib/uuid'
@@ -411,6 +418,13 @@ interface AcpState {
     }
   ) => Promise<SessionId>
   closeSession: (sessionId: SessionId) => Promise<void>
+  /** Renderer-local view close. Never calls ACP, canonical deletion, temp cleanup, or terminals. */
+  closeChatView: (conversationId: string) => void
+  detachAgentBinding: (conversationId: string) => Promise<ConversationLifecycleOutcome>
+  rebindDetachedBinding: (conversationId: string) => Promise<ConversationLifecycleOutcome>
+  suspendAgentBinding: (conversationId: string) => Promise<ConversationLifecycleOutcome>
+  replaceAgentBinding: (conversationId: string) => Promise<ConversationLifecycleOutcome>
+  deleteConversation: (conversationId: string) => Promise<ConversationLifecycleOutcome>
   setActiveSession: (sessionId: SessionId | null) => void
   switchProject: (projectId: string) => Promise<SwitchProjectReply>
   setFailedProjectSwitch: (projectId: string | null) => void
@@ -649,6 +663,7 @@ interface AcpState {
   _onAgentCrashed: (e: AgentCrashedEvent) => void
   _onAgentDisconnected: (e: AgentDisconnectedEvent) => void
   _onSessionClosed: (e: SessionClosedEvent) => void
+  _onConversationLifecycle: (outcome: ConversationLifecycleOutcome) => void
 }
 
 function newId(prefix: string): string {
@@ -1114,6 +1129,17 @@ function dropRecordKey<T>(
   return next
 }
 
+function remapRecordKey<T>(
+  record: Record<SessionId, T>,
+  fromSessionId: SessionId,
+  toSessionId: SessionId
+): Record<SessionId, T> {
+  if (fromSessionId === toSessionId || !(fromSessionId in record)) return record
+  const next = { ...record, [toSessionId]: record[fromSessionId] }
+  delete next[fromSessionId]
+  return next
+}
+
 /**
  * Maximum number of messages retained per session in the live React window.
  * Generous so normal single-session use never trims — only the multi-hour /
@@ -1373,6 +1399,7 @@ function persistSession(
   const fallbackTitle = existingEntry?.title ?? nextUntitledTitle()
   const entry: SessionIndexEntry = {
     id: sessionId,
+    conversationId: session.conversationId ?? existingEntry?.conversationId,
     agentId: session.agentId,
     agentConfigId,
     title: session.title ?? deriveTitle(liveMessages, fallbackTitle),
@@ -1381,9 +1408,9 @@ function persistSession(
     createdAt: session.createdAt,
     lastActivityAt: Date.now(),
     messageCount: liveMessages.length,
-    lastSeq: liveMessages.reduce(
-      (max, m) => Math.max(max, typeof m.seq === 'number' ? m.seq : 0),
-      0
+    lastSeq: Math.max(
+      existingEntry?.lastSeq ?? 0,
+      liveMessages.reduce((max, m) => Math.max(max, typeof m.seq === 'number' ? m.seq : 0), 0)
     ),
     status: session.status,
     // Preserve the origin flag so a discovered (external) session re-projected
@@ -1408,6 +1435,51 @@ function persistSession(
  * locally and not yet flushed to the durable index). The initial empty-load
  * case (no local entries) applies the host response verbatim.
  */
+function conversationLifecycleContext(
+  state: AcpState,
+  conversationId: string
+): {
+  entry: SessionIndexEntry
+  session: AcpSession | undefined
+} {
+  const entry = state.sessionIndex.find((candidate) => candidate.conversationId === conversationId)
+  const session = Object.values(state.sessions).find(
+    (candidate) => candidate.conversationId === conversationId
+  )
+  const resolvedEntry =
+    entry ?? state.sessionIndex.find((candidate) => candidate.id === session?.id)
+  if (!resolvedEntry) {
+    throw new ConversationLifecycleApiError(
+      'CONVERSATION_NOT_FOUND',
+      `Conversation ${conversationId} is not present in the canonical history index`
+    )
+  }
+  return { entry: resolvedEntry, session }
+}
+
+function replacementRequest(
+  conversationId: string,
+  entry: SessionIndexEntry,
+  session: AcpSession | undefined
+): ConversationReplacementRequest {
+  const projectId = session?.projectId || entry.projectId
+  const cwd = session?.cwd || entry.cwd
+  const worktreePath = session?.worktreePath ?? entry.worktreePath
+  const worktreeBranch = session?.worktreeBranch ?? entry.worktreeBranch
+  const executionTarget =
+    projectId && worktreePath && worktreeBranch
+      ? { kind: 'worktree' as const, projectId, worktreePath, worktreeBranch }
+      : projectId
+        ? { kind: 'project_root' as const, projectId, projectRoot: cwd }
+        : { kind: 'workspace' as const }
+  return {
+    schemaVersion: 1,
+    conversationId,
+    projectAttachment: null,
+    executionTarget
+  }
+}
+
 function mergeSessionIndexEntries(
   local: SessionIndexEntry[],
   host: SessionIndexEntry[],
@@ -1969,13 +2041,6 @@ function scheduleRestorePreloadEnd(set: TurnEndSetter, sessionId: SessionId, tok
   tracker.timer = setTimeout(clearIfCurrent, remaining)
 }
 
-function invalidateRestorePreload(set: TurnEndSetter, sessionId: SessionId): void {
-  const tracker = restorePreloadTrackers.get(sessionId)
-  if (tracker?.timer) clearTimeout(tracker.timer)
-  restorePreloadTrackers.delete(sessionId)
-  set((s) => ({ restoringChatIds: dropRecordKey(s.restoringChatIds, sessionId) }))
-}
-
 function beginSessionReopen(sessionId: SessionId): number {
   const generation = (sessionReopenGenerations.get(sessionId) ?? 0) + 1
   sessionReopenGenerations.set(sessionId, generation)
@@ -2312,6 +2377,7 @@ async function openHistorySessionInner(
       ...s.sessions,
       [id]: {
         id,
+        conversationId: meta.conversationId,
         agentId: meta.agentId,
         cwd: meta.cwd,
         projectId: meta.projectId,
@@ -3175,50 +3241,98 @@ export const useAcpStore = create<AcpState>((set, get) => ({
   closeSession: async (sessionId) => {
     invalidateSessionReopen(sessionId)
     const session = get().sessions[sessionId]
+    if (session?.conversationId) {
+      await get().suspendAgentBinding(session.conversationId)
+      return
+    }
     if (session && session.status !== 'closed') {
-      try {
-        await acpApi.closeSession(session.agentId, sessionId)
-      } catch (error) {
-        void logFrontendError({
-          level: 'warn',
-          source: 'acp.closeSession',
-          message: `Failed to close session ${sessionId}: ${String(error)}`
-        })
-      }
+      await acpApi.closeSession(session.agentId, sessionId)
     }
-    // Reclaim app-owned temp files (pasted screenshots) staged for this session
-    // now that no further turns can read them.
     void deleteSessionTempFiles(sessionId)
-    set((s) => {
-      const sessions = { ...s.sessions }
-      if (sessions[sessionId]) {
-        sessions[sessionId] = {
-          ...sessions[sessionId],
-          status: 'closed',
-          activeTurn: false,
-          openTurnId: null,
-          replaying: null
-        }
-      }
-      return {
-        sessions,
-        pendingPermissions: dropPermissionsForSession(s.pendingPermissions, sessionId),
-        pendingQuestions: dropQuestionsForSession(s.pendingQuestions, sessionId),
-        promptQueues: dropPromptQueueForSession(s.promptQueues, sessionId),
-        suppressQueueFlush: dropRecordKey(s.suppressQueueFlush, sessionId)
-      }
-    })
-    // Flush closed status + last transcript to disk while maps still hold it,
-    // then drop in-memory maps so WebView2 can reclaim heap. Ephemeral (warm
-    // pool) sessions are never mirrored.
-    if (
-      !ephemeralSessionIds.has(sessionId) &&
-      get().sessions[sessionId] &&
-      sessionId in get().messages
-    ) {
-      persistSession(get(), sessionId, (entries) => set({ sessionIndex: entries }))
+    set((s) => ({
+      sessions: s.sessions[sessionId]
+        ? {
+            ...s.sessions,
+            [sessionId]: {
+              ...s.sessions[sessionId],
+              status: 'closed',
+              activeTurn: false,
+              openTurnId: null,
+              replaying: null
+            }
+          }
+        : s.sessions,
+      pendingPermissions: dropPermissionsForSession(s.pendingPermissions, sessionId),
+      pendingQuestions: dropQuestionsForSession(s.pendingQuestions, sessionId),
+      promptQueues: dropPromptQueueForSession(s.promptQueues, sessionId),
+      suppressQueueFlush: dropRecordKey(s.suppressQueueFlush, sessionId)
+    }))
+  },
+
+  closeChatView: (conversationId) => {
+    const state = get()
+    const session = Object.values(state.sessions).find(
+      (candidate) => candidate.conversationId === conversationId
+    )
+    const entry = state.sessionIndex.find(
+      (candidate) => candidate.conversationId === conversationId
+    )
+    const sessionId = session?.id ?? entry?.id
+    if (!sessionId) return
+    const workspace = useWorkspaceStore.getState()
+    workspace.closeChatView(sessionId)
+    if (state.activeSessionId === sessionId) {
+      const activeTab = workspace.getActiveTab()
+      set({ activeSessionId: activeTab?.type === 'agent-chat' ? activeTab.sessionId : null })
     }
-    set((s) => dropSessionTranscriptState(s, sessionId))
+  },
+
+  detachAgentBinding: async (conversationId) => {
+    const { entry } = conversationLifecycleContext(get(), conversationId)
+    const outcome = await conversationLifecycleApi.detachBinding(conversationId, entry.lastSeq ?? 0)
+    get()._onConversationLifecycle(outcome)
+    return outcome
+  },
+
+  rebindDetachedBinding: async (conversationId) => {
+    const { entry } = conversationLifecycleContext(get(), conversationId)
+    const outcome = await conversationLifecycleApi.rebindDetachedBinding(
+      conversationId,
+      entry.lastSeq ?? 0
+    )
+    get()._onConversationLifecycle(outcome)
+    return outcome
+  },
+
+  suspendAgentBinding: async (conversationId) => {
+    const { entry } = conversationLifecycleContext(get(), conversationId)
+    const outcome = await conversationLifecycleApi.suspendBinding(
+      conversationId,
+      entry.lastSeq ?? 0
+    )
+    get()._onConversationLifecycle(outcome)
+    return outcome
+  },
+
+  replaceAgentBinding: async (conversationId) => {
+    const { entry, session } = conversationLifecycleContext(get(), conversationId)
+    const outcome = await conversationLifecycleApi.replaceBinding(
+      conversationId,
+      replacementRequest(conversationId, entry, session),
+      entry.lastSeq ?? 0
+    )
+    get()._onConversationLifecycle(outcome)
+    return outcome
+  },
+
+  deleteConversation: async (conversationId) => {
+    const { entry } = conversationLifecycleContext(get(), conversationId)
+    const outcome = await conversationLifecycleApi.deleteConversation(
+      conversationId,
+      entry.lastSeq ?? 0
+    )
+    get()._onConversationLifecycle(outcome)
+    return outcome
   },
 
   setActiveSession: (sessionId) => set({ activeSessionId: sessionId }),
@@ -4118,6 +4232,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
         ...s.sessions,
         [id]: {
           id,
+          conversationId: meta.conversationId,
           agentId,
           cwd: meta.cwd,
           projectId: meta.projectId,
@@ -4250,38 +4365,25 @@ export const useAcpStore = create<AcpState>((set, get) => ({
   },
 
   deleteHistorySession: async (id) => {
-    invalidateSessionReopen(id)
-    inFlightHistoryOpens.delete(id)
-    inFlightDiscoveredOpens.delete(id)
-    invalidateRestorePreload(set, id)
-    try {
-      await queueSessionPayloadDelete(id)
-      set((s) => {
-        // Only publish deletion after the Rust store confirms the durable
-        // payload/index removal, so a failed delete cannot diverge on restart.
-        const sessions = { ...s.sessions }
-        if (sessions[id]) {
-          sessions[id] = {
-            ...sessions[id],
-            status: 'closed',
-            activeTurn: false,
-            openTurnId: null,
-            replaying: null
-          }
-        }
-        return {
-          sessionIndex: s.sessionIndex.filter((e) => e.id !== id),
-          sessions,
-          openingHistoryIds: dropRecordKey(s.openingHistoryIds, id),
-          discoveredReopenContexts: dropRecordKey(s.discoveredReopenContexts, id),
-          ...dropSessionTranscriptState(s, id)
-        }
-      })
-      // Reclaim any app-owned temp files staged for this session.
-      void deleteSessionTempFiles(id)
-    } catch (e) {
-      console.error('[acp] failed to delete session history', e)
+    const state = get()
+    const entry = state.sessionIndex.find((candidate) => candidate.id === id)
+    const conversationId = state.sessions[id]?.conversationId ?? entry?.conversationId
+    if (conversationId) {
+      await get().deleteConversation(conversationId)
+      return
     }
+    if (ephemeralSessionIds.has(id)) {
+      ephemeralSessionIds.delete(id)
+      set((current) => ({
+        sessionIndex: current.sessionIndex.filter((candidate) => candidate.id !== id),
+        ...dropSessionTranscriptState(current, id)
+      }))
+      return
+    }
+    throw new ConversationLifecycleApiError(
+      'CONVERSATION_NOT_FOUND',
+      'LEGACY_STORE_READ_ONLY: legacy chat history cannot be deleted'
+    )
   },
 
   // --- Live window: scroll-up lazy-load -------------------------------------
@@ -5664,12 +5766,15 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       )
       return
     }
+    const conversationBacked = Boolean(get().sessions[e.sessionId]?.conversationId)
     // Flush coalesced updates so transcript eviction sees the final state.
     flushCoalescedSync()
     invalidateSessionReopen(e.sessionId)
-    // Reclaim app-owned temp files staged for this session (e.g. agent
-    // disconnected) so they do not linger in the OS temp dir.
-    void deleteSessionTempFiles(e.sessionId)
+    // Legacy/ephemeral sessions reclaim staged files on close. Canonical Conversation suspend
+    // retains renderer state and attachments; explicit tombstone cleanup is a separate concern.
+    if (!conversationBacked) {
+      void deleteSessionTempFiles(e.sessionId)
+    }
     if (ephemeralSessionIds.has(e.sessionId)) {
       const hasContent = (get().messages[e.sessionId]?.length ?? 0) > 0
       if (!hasContent) {
@@ -5729,12 +5834,112 @@ export const useAcpStore = create<AcpState>((set, get) => ({
         }
       }
     })
-    // Persist while transcript maps still hold content, then free WebView heap.
+    // Persist while transcript maps still hold content. Canonical Conversation-backed sessions
+    // retain their renderer transcript across suspend; legacy sessions may still free it.
     if (get().sessions[e.sessionId]) {
       persistSession(get(), e.sessionId, (entries) => set({ sessionIndex: entries }))
     }
-    set((s) => dropSessionTranscriptState(s, e.sessionId))
+    if (!conversationBacked) {
+      set((s) => dropSessionTranscriptState(s, e.sessionId))
+    }
     refreshHostOwnedIndex(get)
+  },
+
+  _onConversationLifecycle: (outcome) => {
+    if (outcome.status === 'blocked') return
+
+    let sourceId: SessionId | undefined
+    let targetId: SessionId | undefined
+    const deleting = outcome.action === 'deleteConversation'
+    set((state) => {
+      const sourceEntry = state.sessionIndex.find(
+        (entry) => entry.conversationId === outcome.conversationId
+      )
+      const sourceSession = Object.values(state.sessions).find(
+        (session) => session.conversationId === outcome.conversationId
+      )
+      sourceId = sourceSession?.id ?? sourceEntry?.id
+      targetId = outcome.currentBinding?.agentSessionId ?? sourceId
+
+      if (deleting) {
+        if (!sourceId) {
+          return {
+            sessionIndex: state.sessionIndex.filter(
+              (entry) => entry.conversationId !== outcome.conversationId
+            )
+          }
+        }
+        const sessions = { ...state.sessions }
+        delete sessions[sourceId]
+        const transcript = dropSessionTranscriptState(state, sourceId)
+        return {
+          sessions,
+          sessionIndex: state.sessionIndex.filter(
+            (entry) => entry.conversationId !== outcome.conversationId
+          ),
+          activeSessionId: state.activeSessionId === sourceId ? null : state.activeSessionId,
+          pendingPermissions: dropPermissionsForSession(state.pendingPermissions, sourceId),
+          pendingQuestions: dropQuestionsForSession(state.pendingQuestions, sourceId),
+          promptQueues: dropPromptQueueForSession(state.promptQueues, sourceId),
+          suppressQueueFlush: dropRecordKey(state.suppressQueueFlush, sourceId),
+          ...transcript
+        }
+      }
+
+      const bindingState = outcome.currentBinding?.state
+      const nextStatus: SessionStatus = bindingState === 'active' ? 'active' : 'closed'
+      let sessions = state.sessions
+      if (sourceId && sourceSession && targetId) {
+        sessions = { ...sessions }
+        if (targetId !== sourceId) delete sessions[sourceId]
+        sessions[targetId] = {
+          ...sourceSession,
+          id: targetId,
+          conversationId: outcome.conversationId,
+          status: nextStatus,
+          activeTurn: false,
+          openTurnId: null,
+          replaying: null
+        }
+      }
+
+      const remap = <T>(record: Record<SessionId, T>): Record<SessionId, T> =>
+        sourceId && targetId ? remapRecordKey(record, sourceId, targetId) : record
+
+      return {
+        sessions,
+        messages: remap(state.messages),
+        toolCalls: remap(state.toolCalls),
+        plans: remap(state.plans),
+        commands: remap(state.commands),
+        sessionUsage: remap(state.sessionUsage),
+        promptQueues: remap(state.promptQueues),
+        suppressQueueFlush: remap(state.suppressQueueFlush),
+        restoringChatIds: remap(state.restoringChatIds),
+        launchingSessionIds: remap(state.launchingSessionIds),
+        degradedRecoverySessions: remap(state.degradedRecoverySessions),
+        sessionIndex: state.sessionIndex.map((entry) =>
+          entry.conversationId === outcome.conversationId
+            ? {
+                ...entry,
+                id: targetId ?? entry.id,
+                status: nextStatus,
+                lastSeq: outcome.revision
+              }
+            : entry
+        ),
+        activeSessionId:
+          sourceId && state.activeSessionId === sourceId
+            ? (targetId ?? sourceId)
+            : state.activeSessionId
+      }
+    })
+
+    if (sourceId && deleting) {
+      useWorkspaceStore.getState().closeChatView(sourceId)
+    } else if (sourceId && targetId && sourceId !== targetId) {
+      useWorkspaceStore.getState().remapAgentChatSession(sourceId, targetId)
+    }
   }
 }))
 

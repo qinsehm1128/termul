@@ -1,15 +1,16 @@
-import { Copy, FolderOpen, Search, Terminal, Trash2, X } from 'lucide-react'
+import { Copy, FolderOpen, Search, Terminal, X } from 'lucide-react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
-import { ConfirmDialog } from '@/components/ConfirmDialog'
 import { AgentGlyph } from '@/components/chat/AgentGlyph'
-import type { ChatHistorySidebarEntry } from '@/components/chat/ChatHistoryEntryRow'
+import {
+  type ChatHistorySidebarEntry,
+  ConversationLifecycleActions
+} from '@/components/chat/ChatHistoryEntryRow'
 import {
   ContextMenu,
   ContextMenuContent,
   ContextMenuItem,
-  ContextMenuSeparator,
   ContextMenuTrigger
 } from '@/components/ui/context-menu'
 import { clipboardApi, openerApi } from '@/lib/api'
@@ -41,7 +42,6 @@ export function ProjectChatList({ projectId }: ProjectChatListProps): React.JSX.
   const { t } = useTranslation('projects')
   const sessionIndex = useAcpStore((s) => s.sessionIndex)
   const openHistorySession = useAcpStore((s) => s.openHistorySession)
-  const deleteHistorySession = useAcpStore((s) => s.deleteHistorySession)
   const addAgentChatTab = useWorkspaceStore((s) => s.addAgentChatTab)
 
   // Scope by projectId only (all of the project's chats, regardless of cwd),
@@ -52,6 +52,7 @@ export function ProjectChatList({ projectId }: ProjectChatListProps): React.JSX.
         .filter((e) => e.projectId === projectId && e.discovered !== true)
         .map((e) => ({
           id: e.id,
+          conversationId: e.conversationId,
           title: e.title,
           messageCount: e.messageCount,
           status: e.status,
@@ -111,10 +112,6 @@ export function ProjectChatList({ projectId }: ProjectChatListProps): React.JSX.
     return () => observer.disconnect()
   }, [hasMore, visibleCount])
 
-  // Delete is irreversible — route it through a confirmation dialog (mirrors
-  // the project/group delete pattern) instead of deleting on the first click.
-  const [deleteConfirm, setDeleteConfirm] = useState<ProjectChatEntry | null>(null)
-
   const handleOpen = useCallback(
     (entry: ProjectChatEntry) => {
       try {
@@ -128,15 +125,6 @@ export function ProjectChatList({ projectId }: ProjectChatListProps): React.JSX.
       }
     },
     [addAgentChatTab, openHistorySession, t]
-  )
-
-  const handleDelete = useCallback(
-    (id: string) => {
-      void deleteHistorySession(id).catch(() => {
-        toast.error(t('couldNotDeleteChat'))
-      })
-    },
-    [deleteHistorySession, t]
   )
 
   const handleOpenTerminal = useCallback(
@@ -248,7 +236,6 @@ export function ProjectChatList({ projectId }: ProjectChatListProps): React.JSX.
               onOpenTerminal={handleOpenTerminal}
               onOpenInFileExplorer={handleOpenInFileExplorer}
               onCopyPath={handleCopyPath}
-              onDelete={setDeleteConfirm}
             />
           ))
         )}
@@ -264,23 +251,6 @@ export function ProjectChatList({ projectId }: ProjectChatListProps): React.JSX.
           </div>
         )}
       </div>
-
-      <ConfirmDialog
-        isOpen={deleteConfirm !== null}
-        title={t('deleteChatConfirmTitle')}
-        message={deleteConfirm ? t('deleteChatConfirm', { title: deleteConfirm.title }) : ''}
-        confirmLabel={t('delete')}
-        cancelLabel={t('cancel')}
-        variant="danger"
-        onConfirm={() => {
-          if (deleteConfirm) {
-            const id = deleteConfirm.id
-            setDeleteConfirm(null)
-            handleDelete(id)
-          }
-        }}
-        onCancel={() => setDeleteConfirm(null)}
-      />
     </div>
   )
 }
@@ -291,7 +261,6 @@ interface ProjectChatRowProps {
   onOpenTerminal: (entry: ProjectChatEntry) => void
   onOpenInFileExplorer: (cwd: string) => void
   onCopyPath: (cwd: string) => void
-  onDelete: (entry: ProjectChatEntry) => void
 }
 
 function ProjectChatRow({
@@ -299,8 +268,7 @@ function ProjectChatRow({
   onOpen,
   onOpenTerminal,
   onOpenInFileExplorer,
-  onCopyPath,
-  onDelete
+  onCopyPath
 }: ProjectChatRowProps): React.JSX.Element {
   const { t } = useTranslation('projects')
   const hasCwd = Boolean(entry.cwd)
@@ -323,6 +291,7 @@ function ProjectChatRow({
             <span className="truncate flex-1 text-sidebar-foreground">{entry.title}</span>
             <span className="text-3xs text-muted-foreground">{entry.messageCount}</span>
           </button>
+          <ConversationLifecycleActions conversationId={entry.conversationId} title={entry.title} />
           <button
             type="button"
             aria-label={t('openTerminalForChat', { title: entry.title })}
@@ -364,10 +333,6 @@ function ProjectChatRow({
           }}
         >
           <Copy className="mr-2 h-4 w-4" /> {t('copyPath')}
-        </ContextMenuItem>
-        <ContextMenuSeparator />
-        <ContextMenuItem variant="destructive" onSelect={() => onDelete(entry)}>
-          <Trash2 className="mr-2 h-4 w-4" /> {t('deleteChat')}
         </ContextMenuItem>
       </ContextMenuContent>
     </ContextMenu>

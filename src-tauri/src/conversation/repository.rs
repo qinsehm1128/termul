@@ -16,7 +16,7 @@ use chrono::{DateTime, Utc};
 use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::Mutex as TokioMutex;
+use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
 
 use crate::conversation::catalog::{
     rebuild_catalog, AcceptedCanonicalConversation, CatalogRecoveryIssue,
@@ -596,22 +596,10 @@ impl ConversationRepository {
         conversation_id: ConversationId,
         recorded_at_utc: DateTime<Utc>,
     ) -> Result<ConversationEventRecordV2> {
-        let mut binding = self.current_binding(conversation_id)?.ok_or_else(|| {
-            repository_error(
-                ConversationErrorCode::ConversationBindFailed,
-                "detach_agent_binding",
-                Some(conversation_id),
-                "no current binding".to_string(),
-            )
-        })?;
-        binding.state = AgentSessionBindingState::Detached;
-        self.append_event(
-            conversation_id,
-            recorded_at_utc,
-            ConversationEventType::BindingDetached,
-            serde_json::to_value(BindingEventPayloadV1 { binding }).unwrap(),
-        )
-        .await
+        let _guard = self.lifecycle_lock(conversation_id).await;
+        let event = self.detach_agent_binding_locked(conversation_id, recorded_at_utc)?;
+        self.refresh_catalog_best_effort().await;
+        Ok(event)
     }
 
     pub async fn rebind_detached_binding(
@@ -619,22 +607,10 @@ impl ConversationRepository {
         conversation_id: ConversationId,
         recorded_at_utc: DateTime<Utc>,
     ) -> Result<ConversationEventRecordV2> {
-        let mut binding = self.current_binding(conversation_id)?.ok_or_else(|| {
-            repository_error(
-                ConversationErrorCode::ConversationBindFailed,
-                "rebind_detached_binding",
-                Some(conversation_id),
-                "no current binding".to_string(),
-            )
-        })?;
-        binding.state = AgentSessionBindingState::Active;
-        self.append_event(
-            conversation_id,
-            recorded_at_utc,
-            ConversationEventType::BindingRebound,
-            serde_json::to_value(BindingEventPayloadV1 { binding }).unwrap(),
-        )
-        .await
+        let _guard = self.lifecycle_lock(conversation_id).await;
+        let event = self.rebind_detached_binding_locked(conversation_id, recorded_at_utc)?;
+        self.refresh_catalog_best_effort().await;
+        Ok(event)
     }
 
     /// Record suspension only after the provider confirms close/suspend success.
@@ -648,27 +624,150 @@ impl ConversationRepository {
         if !provider_confirmed {
             return Ok(None);
         }
+        let _guard = self.lifecycle_lock(conversation_id).await;
+        let event = self.suspend_agent_binding_locked(conversation_id, recorded_at_utc)?;
+        self.refresh_catalog_best_effort().await;
+        Ok(Some(event))
+    }
+
+    pub async fn replace_agent_binding(
+        self: &Arc<Self>,
+        conversation_id: ConversationId,
+        binding: AgentSessionBinding,
+        recorded_at_utc: DateTime<Utc>,
+    ) -> Result<ConversationEventRecordV2> {
+        let _guard = self.lifecycle_lock(conversation_id).await;
+        let event = self.replace_agent_binding_locked(conversation_id, binding, recorded_at_utc)?;
+        self.refresh_catalog_best_effort().await;
+        Ok(event)
+    }
+
+    pub(crate) async fn lifecycle_lock(
+        &self,
+        conversation_id: ConversationId,
+    ) -> OwnedMutexGuard<()> {
+        self.conversation_lock(conversation_id).lock_owned().await
+    }
+
+    pub(crate) fn ensure_expected_revision_locked(
+        &self,
+        conversation_id: ConversationId,
+        expected_revision: u64,
+        operation: &'static str,
+    ) -> Result<ConversationRecordV2> {
+        let record = self.state(conversation_id, operation)?.record;
+        if record.last_seq != expected_revision {
+            log::warn!(
+                "[conversation-repository] stale lifecycle revision conversation_id={} expected_revision={} current_revision={}",
+                conversation_id,
+                expected_revision,
+                record.last_seq
+            );
+            return Err(repository_error(
+                ConversationErrorCode::ConversationConflict,
+                operation,
+                Some(conversation_id),
+                format!(
+                    "expected Conversation lastSeq {expected_revision}, current lastSeq is {}",
+                    record.last_seq
+                ),
+            ));
+        }
+        Ok(record)
+    }
+
+    pub(crate) fn detach_agent_binding_locked(
+        &self,
+        conversation_id: ConversationId,
+        recorded_at_utc: DateTime<Utc>,
+    ) -> Result<ConversationEventRecordV2> {
         let mut binding = self.current_binding(conversation_id)?.ok_or_else(|| {
             repository_error(
-                ConversationErrorCode::ConversationBindFailed,
+                ConversationErrorCode::ConversationBindingNotFound,
+                "detach_agent_binding",
+                Some(conversation_id),
+                "no current binding".to_string(),
+            )
+        })?;
+        if binding.state != AgentSessionBindingState::Active {
+            return Err(repository_error(
+                ConversationErrorCode::ConversationBindingNotActive,
+                "detach_agent_binding",
+                Some(conversation_id),
+                "detach requires the current active binding".to_string(),
+            ));
+        }
+        binding.state = AgentSessionBindingState::Detached;
+        self.append_event_locked(
+            conversation_id,
+            recorded_at_utc,
+            ConversationEventType::BindingDetached,
+            serde_json::to_value(BindingEventPayloadV1 { binding }).expect("binding serializes"),
+        )
+    }
+
+    pub(crate) fn rebind_detached_binding_locked(
+        &self,
+        conversation_id: ConversationId,
+        recorded_at_utc: DateTime<Utc>,
+    ) -> Result<ConversationEventRecordV2> {
+        let mut binding = self.current_binding(conversation_id)?.ok_or_else(|| {
+            repository_error(
+                ConversationErrorCode::ConversationBindingNotFound,
+                "rebind_detached_binding",
+                Some(conversation_id),
+                "no current binding".to_string(),
+            )
+        })?;
+        if binding.state != AgentSessionBindingState::Detached {
+            return Err(repository_error(
+                ConversationErrorCode::ConversationBindingNotDetached,
+                "rebind_detached_binding",
+                Some(conversation_id),
+                "rebind requires the current detached binding".to_string(),
+            ));
+        }
+        binding.state = AgentSessionBindingState::Active;
+        self.append_event_locked(
+            conversation_id,
+            recorded_at_utc,
+            ConversationEventType::BindingRebound,
+            serde_json::to_value(BindingEventPayloadV1 { binding }).expect("binding serializes"),
+        )
+    }
+
+    pub(crate) fn suspend_agent_binding_locked(
+        &self,
+        conversation_id: ConversationId,
+        recorded_at_utc: DateTime<Utc>,
+    ) -> Result<ConversationEventRecordV2> {
+        let mut binding = self.current_binding(conversation_id)?.ok_or_else(|| {
+            repository_error(
+                ConversationErrorCode::ConversationBindingNotFound,
                 "suspend_agent_binding",
                 Some(conversation_id),
                 "no current binding".to_string(),
             )
         })?;
+        if binding.state != AgentSessionBindingState::Active {
+            return Err(repository_error(
+                ConversationErrorCode::ConversationBindingNotActive,
+                "suspend_agent_binding",
+                Some(conversation_id),
+                "suspend requires the current active binding".to_string(),
+            ));
+        }
         binding.state = AgentSessionBindingState::Suspended;
-        self.append_event(
+        self.append_event_locked(
             conversation_id,
             recorded_at_utc,
             ConversationEventType::BindingSuspended,
-            serde_json::to_value(BindingEventPayloadV1 { binding }).unwrap(),
+            serde_json::to_value(BindingEventPayloadV1 { binding }).expect("binding serializes"),
         )
-        .await
-        .map(Some)
     }
 
-    pub async fn replace_agent_binding(
-        self: &Arc<Self>,
+    pub(crate) fn replace_agent_binding_locked(
+        &self,
         conversation_id: ConversationId,
         mut binding: AgentSessionBinding,
         recorded_at_utc: DateTime<Utc>,
@@ -676,7 +775,7 @@ impl ConversationRepository {
         validate_binding_input(&binding, conversation_id, "replace_agent_binding")?;
         let mut previous_binding = self.current_binding(conversation_id)?.ok_or_else(|| {
             repository_error(
-                ConversationErrorCode::ConversationBindFailed,
+                ConversationErrorCode::ConversationBindingNotFound,
                 "replace_agent_binding",
                 Some(conversation_id),
                 "no binding exists to replace".to_string(),
@@ -684,23 +783,25 @@ impl ConversationRepository {
         })?;
         previous_binding.state = AgentSessionBindingState::Replaced;
         binding.state = AgentSessionBindingState::Active;
-        let event = self
-            .append_event(
-                conversation_id,
-                recorded_at_utc,
-                ConversationEventType::BindingReplaced,
-                serde_json::to_value(BindingReplacementPayloadV1 {
-                    previous_binding,
-                    binding,
-                })
-                .unwrap(),
-            )
-            .await?;
+        let event = self.append_event_locked(
+            conversation_id,
+            recorded_at_utc,
+            ConversationEventType::BindingReplaced,
+            serde_json::to_value(BindingReplacementPayloadV1 {
+                previous_binding,
+                binding,
+            })
+            .expect("binding replacement serializes"),
+        )?;
         log::info!(
             "[conversation-repository] binding replaced conversation_id={}",
             conversation_id
         );
         Ok(event)
+    }
+
+    pub(crate) async fn refresh_lifecycle_catalog(&self) {
+        self.refresh_catalog_best_effort().await;
     }
 
     pub async fn append_project_attachment(
@@ -887,25 +988,52 @@ impl ConversationRepository {
     }
 
     /// Stage-2 deletion is a durable tombstone only. Physical removal and blocker policy belong to
-    /// the later explicit lifecycle service.
+    /// the explicit lifecycle service.
     pub async fn mark_deleted(
         self: &Arc<Self>,
         conversation_id: ConversationId,
     ) -> Result<ConversationRecordV2> {
-        let record = self
-            .update_metadata(
-                conversation_id,
-                ConversationMetadataUpdate {
-                    lifecycle_state: Some(ConversationLifecycleState::Deleted),
-                    execution_target: None,
-                },
-            )
-            .await?;
+        let _guard = self.lifecycle_lock(conversation_id).await;
+        let record = self.tombstone_conversation_locked(conversation_id)?;
+        self.refresh_catalog_best_effort().await;
+        Ok(record)
+    }
+
+    pub(crate) fn tombstone_conversation_locked(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Result<ConversationRecordV2> {
+        let mut state = self.state(conversation_id, "tombstone_conversation")?;
+        if state.record.lifecycle_state == ConversationLifecycleState::Deleted {
+            return Ok(state.record);
+        }
+        state.record.lifecycle_state = ConversationLifecycleState::Deleted;
+        self.persist_state_metadata(&state, "tombstone_conversation")?;
+        let record = state.record.clone();
+        self.states.lock().insert(conversation_id, state);
         log::info!(
             "[conversation-repository] conversation deletion tombstoned conversation_id={}",
             conversation_id
         );
         Ok(record)
+    }
+
+    /// Provider success followed by a canonical append failure must never leave the in-process
+    /// materialization falsely advertising an active binding. This fail-closed marker is best
+    /// effort durable and always updates the in-memory frontier before returning recovery-required.
+    pub(crate) fn mark_lifecycle_recovery_required_locked(&self, conversation_id: ConversationId) {
+        let Ok(mut state) = self.state(conversation_id, "lifecycle_recovery") else {
+            return;
+        };
+        state.record.lifecycle_state = ConversationLifecycleState::RecoveryRequired;
+        self.states.lock().insert(conversation_id, state.clone());
+        if let Err(error) = self.persist_state_metadata(&state, "lifecycle_recovery") {
+            log::error!(
+                "[conversation-repository] lifecycle recovery marker persistence failed conversation_id={} code={}",
+                conversation_id,
+                stable_code(error.code)
+            );
+        }
     }
 
     fn append_event_locked(

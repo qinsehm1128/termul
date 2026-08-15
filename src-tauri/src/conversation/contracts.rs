@@ -309,6 +309,12 @@ pub enum ConversationErrorCode {
     ConversationDurabilityFailed,
     ConversationCreateFailed,
     ConversationBindFailed,
+    ConversationConflict,
+    ConversationBindingNotFound,
+    ConversationBindingNotActive,
+    ConversationBindingNotDetached,
+    ConversationBindingNotAddressable,
+    ConversationLiveResources,
     ConversationRecoveryRequired,
     ConversationDurabilityUnsupported,
 }

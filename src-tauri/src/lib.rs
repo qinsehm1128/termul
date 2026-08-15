@@ -1534,6 +1534,7 @@ pub fn run() {
                 Arc::clone(&conversation_bootstrap.creation),
                 Arc::clone(&conversation_bootstrap.persistence_adapter),
             ));
+            acp_manager.set_pty_manager(&pty_manager);
             // Attach the server-side permission rendezvous so a phone can
             // respond to `acp:permission_request` over WS. The desktop renderer
             // still responds via the `acp_respond_permission` Tauri command
@@ -1899,6 +1900,12 @@ pub fn run() {
             commands::session_workspace_get,
             commands::session_workspace_write,
             commands::conversation_recovery_resolve,
+            // Explicit Conversation Chat/ACP lifecycle
+            commands::conversation_detach_binding,
+            commands::conversation_rebind_detached_binding,
+            commands::conversation_suspend_binding,
+            commands::conversation_replace_binding,
+            commands::conversation_delete,
             // Workspace manifest (legacy read-only compatibility)
             commands::workspace_manifest_get,
             commands::workspace_manifest_write,

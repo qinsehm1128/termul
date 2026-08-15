@@ -22,6 +22,7 @@ import { useAcpSessionResume } from './hooks/use-acp-session-resume'
 import { useAppSettingsLoader } from './hooks/use-app-settings'
 import { useAppliedColorThemeSync } from './hooks/use-color-theme'
 import { useContextBarSettings } from './hooks/use-context-bar-settings'
+import { useConversationLifecycle } from './hooks/use-conversation-lifecycle'
 import { useCrashRecovery } from './hooks/use-crash-recovery'
 import { useCwd } from './hooks/use-cwd'
 import { useExitCode } from './hooks/use-exit-code'
@@ -55,6 +56,7 @@ const queryClient = new QueryClient()
 function AppEffects(): null {
   useTerminalAutoSave()
   useSessionWorkspaceBootstrap()
+  useConversationLifecycle()
   useTerminalRestore()
   useCrashRecovery()
   useTerminalDetachedOutput()

@@ -78,7 +78,9 @@ export const WS_EVENT_TYPES = [
   // Desktop chat-history live push (Epic-4 bridge — agent-level, seq 0).
   // Fired when the renderer-fed ChatHistoryCache mutates so connected web
   // clients refetch the session index.
-  'chat_history_changed'
+  'chat_history_changed',
+  // Canonical Conversation lifecycle reconciliation (global, sid=null).
+  'conversation_lifecycle'
 ] as const
 
 /** Union of all WS event `type` strings. */
@@ -151,7 +153,13 @@ export const WS_REQUEST_TYPES = [
   // installs a catalog agent through `install_acp_agent` (the host downloads +
   // verifies sha256 + extracts + atomically activates). The request is
   // `{ agentId }` only; the host resolves everything from the trusted catalog.
-  'install_acp_agent'
+  'install_acp_agent',
+  // Canonical Conversation lifecycle mutations.
+  'detach_binding',
+  'rebind_binding',
+  'suspend_binding',
+  'replace_binding',
+  'delete_conversation'
 ] as const
 
 /** Union of all WS request `type` strings. */
@@ -236,7 +244,8 @@ export const WS_EVENT_TIERS: Readonly<Record<WsEventType, ReliabilityTier>> = {
   project_switch_completed: WS_RELAY_TIERS.RELIABLE,
   project_switch_failed: WS_RELAY_TIERS.RELIABLE,
   user_prompt: WS_RELAY_TIERS.RELIABLE,
-  chat_history_changed: WS_RELAY_TIERS.RELIABLE
+  chat_history_changed: WS_RELAY_TIERS.RELIABLE,
+  conversation_lifecycle: WS_RELAY_TIERS.RELIABLE
 }
 
 export type HistoryMode = 'server' | 'live_only'

@@ -30,7 +30,6 @@ export function ChatHistoryTab({
   const sessionIndex = useAcpStore((s) => s.sessionIndex)
   const openHistorySession = useAcpStore((s) => s.openHistorySession)
   const openDiscoveredSession = useAcpStore((s) => s.openDiscoveredSession)
-  const deleteHistorySession = useAcpStore((s) => s.deleteHistorySession)
   const addAgentChatTab = useWorkspaceStore((s) => s.addAgentChatTab)
   // Subscribe to the full active-project record so the sidebar re-scopes when
   // the active worktree changes (not just when the active project id changes).
@@ -58,10 +57,15 @@ export function ChatHistoryTab({
   // created is still reachable instead of silently hidden). Worktree-inclusive
   // reachability (above) keeps the project's worktree chats listed from the
   // root view. See `scopeSessionIndex` for the contract.
-  const scopedIndex = useMemo(
-    () => scopeSessionIndex(sessionIndex, activeProjectId, activeCwd, worktreePaths),
-    [sessionIndex, activeProjectId, activeCwd, worktreePaths]
-  )
+  const scopedIndex = useMemo(() => {
+    const projectScoped = activeProject
+      ? scopeSessionIndex(sessionIndex, activeProjectId, activeCwd, worktreePaths)
+      : []
+    const projectless = sessionIndex.filter((entry) => !entry.projectId)
+    return Array.from(
+      new Map([...projectScoped, ...projectless].map((entry) => [entry.id, entry])).values()
+    )
+  }, [sessionIndex, activeProject, activeProjectId, activeCwd, worktreePaths])
 
   // Termul-created sessions only. The host-owned `discovered` flag is `false`
   // for sessions Termul created (`register_session`) and `true` for external
@@ -71,6 +75,7 @@ export function ChatHistoryTab({
       .filter((e) => e.discovered !== true)
       .map((e) => ({
         id: e.id,
+        conversationId: e.conversationId,
         title: e.title,
         messageCount: e.messageCount,
         status: e.status,
@@ -176,15 +181,6 @@ export function ChatHistoryTab({
     ]
   )
 
-  const handleDelete = useCallback(
-    (id: string) => {
-      void deleteHistorySession(id).catch(() => {
-        toast.error(t('history.deleteFailed'))
-      })
-    },
-    [deleteHistorySession, t]
-  )
-
   return (
     <div className="flex flex-col h-full">
       <div className="px-2 py-1.5 border-b border-sidebar-border">
@@ -222,7 +218,7 @@ export function ChatHistoryTab({
                   key={entry.id}
                   entry={entry}
                   onOpen={(e) => void handleOpen(e)}
-                  onDelete={handleDelete}
+                  onViewClosed={onSessionOpened}
                 />
               ))}
             </div>

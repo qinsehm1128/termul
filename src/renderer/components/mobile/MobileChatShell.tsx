@@ -17,6 +17,7 @@ import {
 import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useNavigate } from 'react-router-dom'
+import { ConversationLifecycleActions } from '@/components/chat/ChatHistoryEntryRow'
 import { ChatHistoryTab } from '@/components/chat/ChatHistoryTab'
 import { ProjectSwitcherDrawer } from '@/components/chat/ProjectSwitcherDrawer'
 import { TermulMark } from '@/components/TermulMark'
@@ -119,6 +120,13 @@ export function MobileChatShell({
     const live = s.sessions[activeSessionId]?.title
     if (live) return live
     return s.sessionIndex.find((e) => e.id === activeSessionId)?.title ?? null
+  })
+  const activeConversationId = useAcpStore((s) => {
+    if (!activeSessionId) return undefined
+    return (
+      s.sessions[activeSessionId]?.conversationId ??
+      s.sessionIndex.find((entry) => entry.id === activeSessionId)?.conversationId
+    )
   })
 
   const headerTitle = useMemo(() => {
@@ -256,17 +264,26 @@ export function MobileChatShell({
             </Button>
           </>
         ) : (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="size-10 shrink-0"
-            aria-label={t('chatShell.newChat')}
-            disabled={!canNewChat}
-            onClick={onNewChat}
-          >
-            <MessageSquarePlus size={20} />
-          </Button>
+          <>
+            {activeConversationId && (
+              <ConversationLifecycleActions
+                conversationId={activeConversationId}
+                title={sessionTitle ?? t('chatShell.chats')}
+                className="size-10 opacity-100 after:inset-0"
+              />
+            )}
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="size-10 shrink-0"
+              aria-label={t('chatShell.newChat')}
+              disabled={!canNewChat}
+              onClick={onNewChat}
+            >
+              <MessageSquarePlus size={20} />
+            </Button>
+          </>
         )}
       </header>
 

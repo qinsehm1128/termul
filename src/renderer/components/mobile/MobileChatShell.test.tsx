@@ -3,8 +3,24 @@ import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { MobileChatShell } from './MobileChatShell'
 
-const { mockNavigate, projectRef, tauriRef } = vi.hoisted(() => ({
+const {
+  mockNavigate,
+  mockCloseChatView,
+  mockDetachBinding,
+  mockRebindBinding,
+  mockSuspendBinding,
+  mockReplaceBinding,
+  mockDeleteConversation,
+  projectRef,
+  tauriRef
+} = vi.hoisted(() => ({
   mockNavigate: vi.fn(),
+  mockCloseChatView: vi.fn(),
+  mockDetachBinding: vi.fn(),
+  mockRebindBinding: vi.fn(),
+  mockSuspendBinding: vi.fn(),
+  mockReplaceBinding: vi.fn(),
+  mockDeleteConversation: vi.fn(),
   // Mutable so individual tests can flip the active project path (the Git
   // Changes header button is disabled when `activeProject.path` is missing)
   // and the shell into web/remote mode (where the project-switcher button +
@@ -39,9 +55,22 @@ vi.mock('@/stores/workspace-store', () => ({
 }))
 
 vi.mock('@/stores/acp-store', () => ({
-  useAcpStore: (
-    sel: (s: { sessions: Record<string, { title: string }>; sessionIndex: unknown[] }) => unknown
-  ) => sel({ sessions: { s1: { title: 'Hello chat' } }, sessionIndex: [] })
+  useAcpStore: (sel: (s: Record<string, unknown>) => unknown) =>
+    sel({
+      sessions: {
+        s1: {
+          title: 'Hello chat',
+          conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+        }
+      },
+      sessionIndex: [],
+      closeChatView: mockCloseChatView,
+      detachAgentBinding: mockDetachBinding,
+      rebindDetachedBinding: mockRebindBinding,
+      suspendAgentBinding: mockSuspendBinding,
+      replaceAgentBinding: mockReplaceBinding,
+      deleteConversation: mockDeleteConversation
+    })
 }))
 
 vi.mock('@/components/chat/ChatHistoryTab', () => ({
@@ -102,6 +131,12 @@ vi.mock('@/lib/tauri-runtime', () => ({
 describe('MobileChatShell', () => {
   beforeEach(() => {
     mockNavigate.mockReset()
+    mockCloseChatView.mockReset()
+    mockDetachBinding.mockReset()
+    mockRebindBinding.mockReset()
+    mockSuspendBinding.mockReset()
+    mockReplaceBinding.mockReset()
+    mockDeleteConversation.mockReset()
     tauriRef.current = true
     projectRef.current = { id: 'p1', name: 'Demo', path: '/demo' }
   })
@@ -127,6 +162,28 @@ describe('MobileChatShell', () => {
     expect(container.querySelector('[data-sidebar]')).toBeNull()
     // The menu button reflects drawer state for assistive tech.
     expect(screen.getByLabelText('Open menu')).toHaveAttribute('aria-expanded', 'false')
+  })
+
+  it('exposes touch-sized independent Conversation lifecycle actions for the active chat', () => {
+    render(
+      <MemoryRouter>
+        <MobileChatShell onNewChat={vi.fn()} canNewChat>
+          <div>chat body</div>
+        </MobileChatShell>
+      </MemoryRouter>
+    )
+
+    const actions = screen.getByRole('button', {
+      name: 'Conversation actions for Hello chat'
+    })
+    expect(actions).toHaveClass('size-10')
+    fireEvent.pointerDown(actions, { button: 0, ctrlKey: false })
+    expect(screen.getByText('Close chat view')).toBeInTheDocument()
+    expect(screen.getByText('Detach binding')).toBeInTheDocument()
+    expect(screen.getByText('Rebind detached agent')).toBeInTheDocument()
+    expect(screen.getByText('Suspend agent')).toBeInTheDocument()
+    expect(screen.getByText('Replace agent')).toBeInTheDocument()
+    expect(screen.getByText('Delete conversation')).toBeInTheDocument()
   })
 
   it('opens the chat drawer and closes it after selecting a session', async () => {

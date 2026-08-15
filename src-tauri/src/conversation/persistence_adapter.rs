@@ -16,7 +16,9 @@ use crate::acp::session_persistence::{
     PersistedEventRecord, PersistedSessionStatus, SessionIndexEntry, SessionMetadata,
     SESSION_SCHEMA_VERSION,
 };
-use crate::conversation::contracts::{ConversationId, ConversationLifecycleState};
+use crate::conversation::contracts::{
+    AgentSessionBindingState, ConversationId, ConversationLifecycleState,
+};
 use crate::conversation::event_log::ConversationEventType;
 use crate::conversation::migration::ConversationReader;
 use crate::conversation::repository::ConversationRepository;
@@ -63,8 +65,8 @@ impl ConversationPersistenceAdapter {
     pub fn rebuild_binding_index(&self) {
         let mut bindings = HashMap::new();
         for record in self.repository.list_conversations() {
-            if let Ok(history) = self.repository.binding_history(record.conversation_id) {
-                for binding in history {
+            if let Ok(Some(binding)) = self.repository.current_binding(record.conversation_id) {
+                if binding.state == AgentSessionBindingState::Active {
                     bindings.insert(binding.agent_session_id, record.conversation_id);
                 }
             }
@@ -82,10 +84,40 @@ impl ConversationPersistenceAdapter {
     #[must_use]
     pub fn conversation_id_for_session(&self, agent_session_id: &str) -> Option<ConversationId> {
         if let Some(conversation_id) = self.bindings.read().get(agent_session_id).copied() {
-            return Some(conversation_id);
+            let active = self
+                .repository
+                .current_binding(conversation_id)
+                .ok()
+                .flatten()
+                .is_some_and(|binding| {
+                    binding.state == AgentSessionBindingState::Active
+                        && binding.agent_session_id == agent_session_id
+                });
+            if active {
+                return Some(conversation_id);
+            }
+            self.bindings.write().remove(agent_session_id);
         }
         self.rebuild_binding_index();
         self.bindings.read().get(agent_session_id).copied()
+    }
+
+    #[must_use]
+    pub fn conversation_id_for_current_binding(
+        &self,
+        agent_session_id: &str,
+    ) -> Option<ConversationId> {
+        self.repository
+            .list_conversations()
+            .into_iter()
+            .find_map(|record| {
+                self.repository
+                    .current_binding(record.conversation_id)
+                    .ok()
+                    .flatten()
+                    .filter(|binding| binding.agent_session_id == agent_session_id)
+                    .map(|_| record.conversation_id)
+            })
     }
 
     pub async fn append_acp_event(
@@ -131,8 +163,24 @@ impl ConversationPersistenceAdapter {
     pub fn list_sessions(&self) -> Vec<SessionIndexEntry> {
         let mut sessions = Vec::new();
         for record in self.reader.list() {
+            if record.lifecycle_state == ConversationLifecycleState::Deleted {
+                continue;
+            }
             let Ok(Some(binding)) = self.repository.current_binding(record.conversation_id) else {
                 continue;
+            };
+            let status = match binding.state {
+                AgentSessionBindingState::Active
+                    if record.lifecycle_state == ConversationLifecycleState::Ready =>
+                {
+                    PersistedSessionStatus::Active
+                }
+                AgentSessionBindingState::Detached | AgentSessionBindingState::Suspended => {
+                    PersistedSessionStatus::Closed
+                }
+                AgentSessionBindingState::Active | AgentSessionBindingState::Replaced => {
+                    PersistedSessionStatus::Error
+                }
             };
             sessions.push(SessionIndexEntry {
                 storage_key: record.conversation_id.to_string(),
@@ -148,11 +196,7 @@ impl ConversationPersistenceAdapter {
                 title_source: None,
                 created_at: record.created_at_utc.timestamp_millis().max(0) as u64,
                 last_activity_at: record.created_at_utc.timestamp_millis().max(0) as u64,
-                status: if record.lifecycle_state == ConversationLifecycleState::Ready {
-                    PersistedSessionStatus::Active
-                } else {
-                    PersistedSessionStatus::Error
-                },
+                status,
                 message_count: 0,
                 tool_count: 0,
                 last_seq: record.last_seq,

@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { setRouterNavigate } from '@/lib/router-navigate'
 import type { LeafNode, SplitNode } from '@/types/workspace.types'
 import type { WorkspaceState } from './workspace-store'
 import { flattenSameDirection, useWorkspaceStore } from './workspace-store'
@@ -197,6 +198,24 @@ describe('workspace-store split/move invariants', () => {
       { type: 'terminal', id: 'term-terminal-a', terminalId: 'terminal-a' }
     ])
     expect(pane.activeTabId).toBe(editorTab.id)
+  })
+
+  it('closeChatView removes only the chat tab, preserves terminals, and clears its route', () => {
+    const store = useWorkspaceStore.getState()
+    const navigate = vi.fn()
+    setRouterNavigate(navigate)
+    window.location.hash = '#/c/conversation-session'
+    store.addTerminalTab('terminal-live')
+    store.addAgentChatTab('conversation-session')
+
+    store.closeChatView('conversation-session')
+
+    const pane = useWorkspaceStore.getState().root as LeafNode
+    expect(pane.tabs).toEqual([
+      { type: 'terminal', id: 'term-terminal-live', terminalId: 'terminal-live' }
+    ])
+    expect(navigate).toHaveBeenCalledWith('/')
+    setRouterNavigate(null)
   })
 
   it('ensureTerminalTab can activate inserted terminal when requested', () => {

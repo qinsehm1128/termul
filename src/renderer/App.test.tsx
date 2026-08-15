@@ -4,16 +4,22 @@ import { useUpdaterStore } from '@/stores/updater-store'
 import { CONTEXT_BAR_SETTINGS_KEY } from '@/types/settings'
 import App from './App'
 
-const { mockContextBarSettingsRead, mockSessionWorkspaceBootstrap } = vi.hoisted(() => ({
-  mockContextBarSettingsRead: vi.fn(),
-  mockSessionWorkspaceBootstrap: vi.fn()
-}))
+const { mockContextBarSettingsRead, mockSessionWorkspaceBootstrap, mockConversationLifecycle } =
+  vi.hoisted(() => ({
+    mockContextBarSettingsRead: vi.fn(),
+    mockSessionWorkspaceBootstrap: vi.fn(),
+    mockConversationLifecycle: vi.fn()
+  }))
 
 vi.mock('./hooks/use-session-workspace-sync', () => ({
   useSessionWorkspaceBootstrap: mockSessionWorkspaceBootstrap,
   useSessionWorkspaceSync: vi.fn(),
   resolveSessionWorkspaceConflict: vi.fn(),
   resolveSessionWorkspaceRecovery: vi.fn()
+}))
+
+vi.mock('./hooks/use-conversation-lifecycle', () => ({
+  useConversationLifecycle: mockConversationLifecycle
 }))
 
 vi.mock('./hooks/use-context-bar-settings', () => ({
@@ -220,6 +226,11 @@ describe('App Routes', () => {
   it('mounts the portable SessionWorkspace bootstrap at the web root', () => {
     render(<App />)
     expect(mockSessionWorkspaceBootstrap).toHaveBeenCalled()
+  })
+
+  it('mounts Conversation lifecycle reconciliation at the web root', () => {
+    render(<App />)
+    expect(mockConversationLifecycle).toHaveBeenCalledTimes(1)
   })
 })
 

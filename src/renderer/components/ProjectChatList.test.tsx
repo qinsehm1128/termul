@@ -10,6 +10,12 @@ const {
   mockAddAgentChatTab,
   mockOpenHistorySession,
   mockDeleteHistorySession,
+  mockCloseChatView,
+  mockDetachBinding,
+  mockRebindBinding,
+  mockSuspendBinding,
+  mockReplaceBinding,
+  mockDeleteConversation,
   mockClipboardWriteText,
   mockRevealInFileManager,
   mockToastSuccess,
@@ -19,6 +25,12 @@ const {
   mockAddAgentChatTab: vi.fn(),
   mockOpenHistorySession: vi.fn(),
   mockDeleteHistorySession: vi.fn(),
+  mockCloseChatView: vi.fn(),
+  mockDetachBinding: vi.fn(),
+  mockRebindBinding: vi.fn(),
+  mockSuspendBinding: vi.fn(),
+  mockReplaceBinding: vi.fn(),
+  mockDeleteConversation: vi.fn(),
   mockClipboardWriteText: vi.fn(),
   mockRevealInFileManager: vi.fn(),
   mockToastSuccess: vi.fn(),
@@ -132,6 +144,22 @@ beforeEach(() => {
   mockOpenHistorySession.mockResolvedValue(undefined)
   mockDeleteHistorySession.mockReset()
   mockDeleteHistorySession.mockResolvedValue(undefined)
+  mockCloseChatView.mockReset()
+  mockDetachBinding.mockReset()
+  mockRebindBinding.mockReset()
+  mockSuspendBinding.mockReset()
+  mockReplaceBinding.mockReset()
+  mockDeleteConversation.mockReset()
+  mockDeleteConversation.mockResolvedValue({
+    status: 'updated',
+    action: 'deleteConversation',
+    conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+    previousRevision: 1,
+    revision: 1,
+    workspaceCwd: '/repo/main',
+    lifecycleState: 'deleted',
+    currentBinding: null
+  })
   mockClipboardWriteText.mockReset()
   mockClipboardWriteText.mockResolvedValue({ success: true })
   mockRevealInFileManager.mockReset()
@@ -141,7 +169,13 @@ beforeEach(() => {
   useAcpStore.setState({
     sessionIndex: [],
     openHistorySession: mockOpenHistorySession,
-    deleteHistorySession: mockDeleteHistorySession
+    deleteHistorySession: mockDeleteHistorySession,
+    closeChatView: mockCloseChatView,
+    detachAgentBinding: mockDetachBinding,
+    rebindDetachedBinding: mockRebindBinding,
+    suspendAgentBinding: mockSuspendBinding,
+    replaceAgentBinding: mockReplaceBinding,
+    deleteConversation: mockDeleteConversation
   })
   useWorkspaceStore.setState({
     activePaneId: 'pane-1',
@@ -151,6 +185,7 @@ beforeEach(() => {
 
 const entry = (overrides: Partial<SessionIndexEntry> = {}): SessionIndexEntry => ({
   id: 'c1',
+  conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
   agentId: 'agent-1',
   title: 'First chat',
   cwd: '/repo/main',
@@ -327,14 +362,16 @@ describe('ProjectChatList context menu', () => {
     })
   })
 
-  it('offers Open Terminal Here / Open in File Explorer / Copy Path / Delete Chat', () => {
+  it('offers cwd actions in the context menu and lifecycle actions separately', () => {
     render(<ProjectChatList projectId="p1" />)
     fireEvent.contextMenu(screen.getByText('Ctx Chat'))
 
     expect(screen.getByText('Open Terminal Here')).toBeInTheDocument()
     expect(screen.getByText('Open in File Explorer')).toBeInTheDocument()
     expect(screen.getByText('Copy Path')).toBeInTheDocument()
-    expect(screen.getByText('Delete Chat')).toBeInTheDocument()
+    expect(
+      screen.getByRole('button', { name: 'Conversation actions for Ctx Chat' })
+    ).toBeInTheDocument()
   })
 
   it('runs Open Terminal Here against the chat cwd', async () => {
@@ -361,41 +398,33 @@ describe('ProjectChatList context menu', () => {
     await waitFor(() => expect(mockRevealInFileManager).toHaveBeenCalledWith('/repo/x'))
   })
 
-  it('requires confirmation before deleting a chat, then deletes on confirm', async () => {
+  it('requires explicit confirmation before tombstoning a Conversation', async () => {
     render(<ProjectChatList projectId="p1" />)
-    fireEvent.contextMenu(screen.getByText('Ctx Chat'))
-    fireEvent.click(screen.getByText('Delete Chat'))
+    fireEvent.pointerDown(
+      screen.getByRole('button', { name: 'Conversation actions for Ctx Chat' }),
+      { button: 0, ctrlKey: false }
+    )
+    fireEvent.click(screen.getByText('Delete conversation'))
 
-    // A confirmation dialog blocks the irreversible delete.
-    expect(screen.getByText('Delete chat')).toBeInTheDocument()
-    // No deletion yet — only after the user confirms.
-    expect(mockDeleteHistorySession).not.toHaveBeenCalled()
+    expect(screen.getByText('Delete conversation?')).toBeInTheDocument()
+    expect(mockDeleteConversation).not.toHaveBeenCalled()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
-
-    await waitFor(() => expect(mockDeleteHistorySession).toHaveBeenCalledWith('c1'))
+    fireEvent.click(screen.getByRole('button', { name: 'Delete conversation' }))
+    await waitFor(() =>
+      expect(mockDeleteConversation).toHaveBeenCalledWith('018f7a1c-1b4d-7c8a-9f01-0123456789ab')
+    )
   })
 
-  it('does not delete when the confirmation dialog is cancelled', () => {
+  it('does not tombstone when the lifecycle confirmation is cancelled', () => {
     render(<ProjectChatList projectId="p1" />)
-    fireEvent.contextMenu(screen.getByText('Ctx Chat'))
-    fireEvent.click(screen.getByText('Delete Chat'))
-    // Cancel the confirmation — the chat must not be deleted.
+    fireEvent.pointerDown(
+      screen.getByRole('button', { name: 'Conversation actions for Ctx Chat' }),
+      { button: 0, ctrlKey: false }
+    )
+    fireEvent.click(screen.getByText('Delete conversation'))
     fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
 
-    expect(mockDeleteHistorySession).not.toHaveBeenCalled()
-  })
-
-  it('shows a toast.error when deleting a chat fails (rejection)', async () => {
-    mockDeleteHistorySession.mockRejectedValue(new Error('boom'))
-    render(<ProjectChatList projectId="p1" />)
-    fireEvent.contextMenu(screen.getByText('Ctx Chat'))
-    fireEvent.click(screen.getByText('Delete Chat'))
-    fireEvent.click(screen.getByRole('button', { name: 'Delete' }))
-
-    await waitFor(() => {
-      expect(mockToastError).toHaveBeenCalledWith('Could not delete that chat. Try again.')
-    })
+    expect(mockDeleteConversation).not.toHaveBeenCalled()
   })
 
   it('disables cwd-dependent context actions when the chat has no cwd', () => {

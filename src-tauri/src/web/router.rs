@@ -22,6 +22,7 @@ use crate::acp::{
 use crate::pty::PtyManager;
 use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub};
 use crate::web::catalog_api;
+use crate::web::conversation_lifecycle_api;
 use crate::web::fs_api;
 use crate::web::git_api;
 use crate::web::install_api;
@@ -79,6 +80,7 @@ pub fn router(
     acp_catalog: Option<Arc<AcpCatalogService>>,
     acp_install: Option<Arc<AcpInstallService>>,
 ) -> Router {
+    acp.set_pty_manager(&pty);
     let mut r = Router::new()
         .route("/health", get(health_check))
         .route("/ws", get(ws_upgrade))
@@ -162,6 +164,26 @@ pub fn router(
         .route(
             "/conversation-recovery/resolve",
             post(session_workspace_api::resolve_recovery),
+        )
+        .route(
+            "/conversations/{conversationId}/lifecycle/detach",
+            post(conversation_lifecycle_api::detach),
+        )
+        .route(
+            "/conversations/{conversationId}/lifecycle/rebind",
+            post(conversation_lifecycle_api::rebind),
+        )
+        .route(
+            "/conversations/{conversationId}/lifecycle/suspend",
+            post(conversation_lifecycle_api::suspend),
+        )
+        .route(
+            "/conversations/{conversationId}/lifecycle/replace",
+            post(conversation_lifecycle_api::replace),
+        )
+        .route(
+            "/conversations/{conversationId}/lifecycle/delete",
+            post(conversation_lifecycle_api::delete),
         )
         // ACP catalog web routes (CAP-6: Web & Mobile 1:1 Parity). Each
         // mirrors a desktop `#[tauri::command] acp_*_catalog` handler; see
@@ -254,6 +276,7 @@ pub fn router_with_static(
     static_dir: &Path,
     project_root: PathBuf,
 ) -> Router {
+    acp.set_pty_manager(&pty);
     Router::new()
         .route("/health", get(health_check))
         .route("/ws", get(ws_upgrade))
@@ -311,6 +334,26 @@ pub fn router_with_static(
         .route(
             "/conversation-recovery/resolve",
             post(session_workspace_api::resolve_recovery),
+        )
+        .route(
+            "/conversations/{conversationId}/lifecycle/detach",
+            post(conversation_lifecycle_api::detach),
+        )
+        .route(
+            "/conversations/{conversationId}/lifecycle/rebind",
+            post(conversation_lifecycle_api::rebind),
+        )
+        .route(
+            "/conversations/{conversationId}/lifecycle/suspend",
+            post(conversation_lifecycle_api::suspend),
+        )
+        .route(
+            "/conversations/{conversationId}/lifecycle/replace",
+            post(conversation_lifecycle_api::replace),
+        )
+        .route(
+            "/conversations/{conversationId}/lifecycle/delete",
+            post(conversation_lifecycle_api::delete),
         )
         .route("/acp/catalog", get(catalog_api::list))
         .route("/acp/catalog/opt-in", post(catalog_api::set_opt_in))

@@ -1,11 +1,23 @@
-import { Trash2 } from 'lucide-react'
+import type { ConversationLifecycleOutcome } from '@shared/types/conversation-lifecycle.types'
+import { Link2, MoreHorizontal, PauseCircle, RefreshCw, Trash2, Unlink, X } from 'lucide-react'
+import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { toast } from 'sonner'
+import { ConfirmDialog } from '@/components/ConfirmDialog'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger
+} from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
-import { useAgentTemplateId } from '@/stores/acp-store'
+import { useAcpStore, useAgentTemplateId } from '@/stores/acp-store'
 import { AgentGlyph } from './AgentGlyph'
 
 export interface ChatHistorySidebarEntry {
   id: string
+  conversationId?: string
   title: string
   messageCount: number
   status: string
@@ -17,6 +29,8 @@ export interface ChatHistorySidebarEntry {
   lastActivityAt: number
   canOpen: boolean
 }
+
+type ConfirmedLifecycleAction = 'detach' | 'rebind' | 'suspend' | 'replace' | 'delete'
 
 /** Resolve the agent's bundled registry icon for a history/discovered entry. */
 function ChatEntryIcon({
@@ -30,16 +44,172 @@ function ChatEntryIcon({
   return <AgentGlyph templateId={templateId} size={12} className="text-muted-foreground" />
 }
 
+function lifecycleErrorCode(error: unknown): string {
+  if (error && typeof error === 'object' && 'code' in error && typeof error.code === 'string') {
+    return error.code
+  }
+  return 'CONVERSATION_RECOVERY_REQUIRED'
+}
+
+function blockedResourceSummary(outcome: ConversationLifecycleOutcome): string {
+  if (outcome.status !== 'blocked') return ''
+  return outcome.blockers
+    .flatMap((blocker) => blocker.ids)
+    .filter(Boolean)
+    .join(', ')
+}
+
+export interface ConversationLifecycleActionsProps {
+  conversationId?: string
+  title: string
+  onViewClosed?: () => void
+  className?: string
+}
+
+/**
+ * Accessible, transport-neutral Conversation lifecycle menu shared by desktop project/history
+ * lists and the mobile chat shell. Every destructive host action is confirmed independently;
+ * close-view stays renderer-local and immediate.
+ */
+export function ConversationLifecycleActions({
+  conversationId,
+  title,
+  onViewClosed,
+  className
+}: ConversationLifecycleActionsProps): React.JSX.Element {
+  const { t } = useTranslation('chat')
+  const closeChatView = useAcpStore((state) => state.closeChatView)
+  const detachAgentBinding = useAcpStore((state) => state.detachAgentBinding)
+  const rebindDetachedBinding = useAcpStore((state) => state.rebindDetachedBinding)
+  const suspendAgentBinding = useAcpStore((state) => state.suspendAgentBinding)
+  const replaceAgentBinding = useAcpStore((state) => state.replaceAgentBinding)
+  const deleteConversation = useAcpStore((state) => state.deleteConversation)
+  const [pendingAction, setPendingAction] = useState<ConfirmedLifecycleAction | null>(null)
+  const [running, setRunning] = useState(false)
+
+  const closeView = (): void => {
+    if (!conversationId) return
+    closeChatView(conversationId)
+    onViewClosed?.()
+  }
+
+  const runConfirmedAction = async (): Promise<void> => {
+    if (!conversationId || !pendingAction) return
+    const action = pendingAction
+    setPendingAction(null)
+    setRunning(true)
+    try {
+      const outcome =
+        action === 'detach'
+          ? await detachAgentBinding(conversationId)
+          : action === 'rebind'
+            ? await rebindDetachedBinding(conversationId)
+            : action === 'suspend'
+              ? await suspendAgentBinding(conversationId)
+              : action === 'replace'
+                ? await replaceAgentBinding(conversationId)
+                : await deleteConversation(conversationId)
+      if (outcome.status === 'blocked') {
+        toast.error(t('lifecycle.blocked.title'), {
+          description: t('lifecycle.blocked.description', {
+            resources: blockedResourceSummary(outcome)
+          })
+        })
+        return
+      }
+      toast.success(t(`lifecycle.success.${action}`))
+    } catch (error) {
+      const code = lifecycleErrorCode(error)
+      toast.error(t(`lifecycle.errors.${code}`, { defaultValue: code }))
+    } finally {
+      setRunning(false)
+    }
+  }
+
+  const disabled = !conversationId || running
+  return (
+    <>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <button
+            type="button"
+            disabled={disabled}
+            aria-label={t('lifecycle.actionsFor', { title })}
+            title={conversationId ? t('lifecycle.actions') : t('lifecycle.legacyReadOnly')}
+            className={cn(
+              'relative inline-flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground',
+              "after:absolute after:-inset-1.5 after:content-['']",
+              'transition-colors hover:bg-background/50 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40',
+              'pointer-fine:opacity-0 pointer-fine:group-hover:opacity-100 focus-visible:opacity-100',
+              className
+            )}
+          >
+            <MoreHorizontal size={14} aria-hidden="true" />
+          </button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="w-56">
+          <DropdownMenuItem onSelect={closeView}>
+            <X className="mr-2 size-4" aria-hidden="true" />
+            {t('lifecycle.closeView')}
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem onSelect={() => setPendingAction('detach')}>
+            <Unlink className="mr-2 size-4" aria-hidden="true" />
+            {t('lifecycle.detach')}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setPendingAction('rebind')}>
+            <Link2 className="mr-2 size-4" aria-hidden="true" />
+            {t('lifecycle.rebind')}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setPendingAction('suspend')}>
+            <PauseCircle className="mr-2 size-4" aria-hidden="true" />
+            {t('lifecycle.suspend')}
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => setPendingAction('replace')}>
+            <RefreshCw className="mr-2 size-4" aria-hidden="true" />
+            {t('lifecycle.replace')}
+          </DropdownMenuItem>
+          <DropdownMenuSeparator />
+          <DropdownMenuItem
+            className="text-destructive focus:text-destructive"
+            onSelect={() => setPendingAction('delete')}
+          >
+            <Trash2 className="mr-2 size-4" aria-hidden="true" />
+            {t('lifecycle.delete')}
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+
+      <ConfirmDialog
+        isOpen={pendingAction !== null}
+        title={pendingAction ? t(`lifecycle.confirm.${pendingAction}.title`) : ''}
+        message={
+          pendingAction
+            ? t(`lifecycle.confirm.${pendingAction}.message`, {
+                title
+              })
+            : ''
+        }
+        confirmLabel={pendingAction ? t(`lifecycle.confirm.${pendingAction}.confirm`) : ''}
+        cancelLabel={t('common.cancel')}
+        variant={pendingAction === 'delete' ? 'danger' : 'default'}
+        onConfirm={() => void runConfirmedAction()}
+        onCancel={() => setPendingAction(null)}
+      />
+    </>
+  )
+}
+
 interface ChatHistoryEntryRowProps {
   entry: ChatHistorySidebarEntry
   onOpen: (entry: ChatHistorySidebarEntry) => void
-  onDelete: (id: string) => void
+  onViewClosed?: () => void
 }
 
 export function ChatHistoryEntryRow({
   entry,
   onOpen,
-  onDelete
+  onViewClosed
 }: ChatHistoryEntryRowProps): React.JSX.Element {
   const { t } = useTranslation('chat')
   return (
@@ -74,21 +244,11 @@ export function ChatHistoryEntryRow({
         )}
       </button>
       {!entry.discovered && (
-        <button
-          type="button"
-          aria-label={t('history.delete')}
-          title={t('history.delete')}
-          onClick={() => onDelete(entry.id)}
-          className={cn(
-            'relative inline-flex size-8 shrink-0 items-center justify-center rounded-md text-muted-foreground',
-            // 32px visual + 6px each side → 44×44 hit (match AttachFilesButton).
-            "after:absolute after:-inset-1.5 after:content-['']",
-            'opacity-100 transition-colors hover:bg-background/50 hover:text-foreground',
-            'pointer-fine:opacity-0 pointer-fine:group-hover:opacity-100 focus-visible:opacity-100'
-          )}
-        >
-          <Trash2 size={11} />
-        </button>
+        <ConversationLifecycleActions
+          conversationId={entry.conversationId}
+          title={entry.title}
+          onViewClosed={onViewClosed}
+        />
       )}
     </div>
   )

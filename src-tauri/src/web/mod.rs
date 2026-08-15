@@ -17,6 +17,7 @@
 pub mod assets;
 pub mod catalog_api;
 pub mod config;
+pub mod conversation_lifecycle_api;
 pub mod fs_api;
 pub mod git_api;
 pub mod install_api;

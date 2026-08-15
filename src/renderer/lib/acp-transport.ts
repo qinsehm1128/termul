@@ -13,6 +13,10 @@
  * (`.message` is the human string callers already toast).
  */
 
+import type {
+  ConversationLifecycleOutcome,
+  ConversationReplacementRequest
+} from '@shared/types/conversation-lifecycle.types'
 import type { IpcResult } from '@shared/types/ipc.types'
 import type {
   ProjectSwitchCompletedEvent,
@@ -169,6 +173,12 @@ export interface AcpTransport {
   answerQuestion(agentId: AgentId, questionId: string, values?: string[]): Promise<void>
   /** Agent ACP auth (methodId) — NOT the WS relay token gate. */
   authenticate(agentId: AgentId, methodId: string): Promise<void>
+  conversationLifecycle?(
+    action: 'detach' | 'rebind' | 'suspend' | 'replace' | 'delete',
+    conversationId: string,
+    expectedRevision: number,
+    request?: ConversationReplacementRequest
+  ): Promise<ConversationLifecycleOutcome>
   /** Web/remote only: switch now or report that the switch was queued. */
   switchProject?(projectId: string): Promise<SwitchProjectReply>
   historyMode?(): HistoryMode | 'tauri_store'
@@ -904,6 +914,29 @@ export class WsAcpTransport implements AcpTransport {
     await this.request('close_session', { agentId, sessionId })
     this.subscribed.delete(sessionId)
     this.lastSeq.delete(sessionId)
+  }
+
+  async conversationLifecycle(
+    action: 'detach' | 'rebind' | 'suspend' | 'replace' | 'delete',
+    conversationId: string,
+    expectedRevision: number,
+    request?: ConversationReplacementRequest
+  ): Promise<ConversationLifecycleOutcome> {
+    const requestType =
+      action === 'detach'
+        ? 'detach_binding'
+        : action === 'rebind'
+          ? 'rebind_binding'
+          : action === 'suspend'
+            ? 'suspend_binding'
+            : action === 'replace'
+              ? 'replace_binding'
+              : 'delete_conversation'
+    return this.request<ConversationLifecycleOutcome>(requestType, {
+      conversationId,
+      expectedRevision,
+      ...(request ? { request } : {})
+    })
   }
 
   async listSessions(

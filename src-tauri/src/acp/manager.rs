@@ -26,7 +26,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -58,9 +58,9 @@ use crate::acp::session_persistence::{
     SessionRegistration, TitleSource,
 };
 use crate::conversation::{
-    AgentBindingResult, ConversationCreationService, ConversationId,
-    ConversationPersistenceAdapter, ExecutionTarget, PrepareConversationRequest, ProjectAttachment,
-    PROJECT_ATTACHMENT_SCHEMA_VERSION,
+    AgentBindingResult, AgentSessionBinding, ConversationCreationService, ConversationId,
+    ConversationPersistenceAdapter, ExecutionTarget, PrepareConversationRequest,
+    PreparedConversation, ProjectAttachment, PROJECT_ATTACHMENT_SCHEMA_VERSION,
 };
 use crate::web::EventSink;
 
@@ -800,6 +800,10 @@ pub struct AcpManager {
     persistence: Option<Arc<SessionPersistence>>,
     conversation_creation: Option<Arc<ConversationCreationService>>,
     conversation_persistence: Option<Arc<ConversationPersistenceAdapter>>,
+    pty_manager: Mutex<Option<Weak<crate::pty::PtyManager>>>,
+    /// Replacement `session_created` gates keyed by provisional opaque session id. The provider
+    /// result is not renderer-visible until canonical `binding_replaced` commits.
+    replacement_gates: Mutex<HashMap<String, watch::Sender<Option<Result<(), String>>>>>,
     /// Per-agent "warmup done" guard for the first-prompt cold-start
     /// workaround (pi-acp issue #94). A visibility-churn re-entry of
     /// `NewSession` for an agent whose warmup already completed (or is still
@@ -894,6 +898,8 @@ impl AcpManager {
             persistence: None,
             conversation_creation: None,
             conversation_persistence: None,
+            pty_manager: Mutex::new(None),
+            replacement_gates: Mutex::new(HashMap::new()),
             warmup_done: Arc::new(Mutex::new(HashSet::new())),
             host_plan_server,
         }
@@ -915,6 +921,8 @@ impl AcpManager {
             persistence: Some(persistence),
             conversation_creation: None,
             conversation_persistence: None,
+            pty_manager: Mutex::new(None),
+            replacement_gates: Mutex::new(HashMap::new()),
             warmup_done: Arc::new(Mutex::new(HashSet::new())),
             host_plan_server,
         }
@@ -935,6 +943,8 @@ impl AcpManager {
             persistence: None,
             conversation_creation: Some(creation),
             conversation_persistence: Some(persistence),
+            pty_manager: Mutex::new(None),
+            replacement_gates: Mutex::new(HashMap::new()),
             warmup_done: Arc::new(Mutex::new(HashSet::new())),
             host_plan_server,
         }
@@ -943,6 +953,40 @@ impl AcpManager {
     #[must_use]
     pub fn persistence(&self) -> Option<Arc<SessionPersistence>> {
         self.persistence.clone()
+    }
+
+    #[must_use]
+    pub fn conversation_creation(&self) -> Option<Arc<ConversationCreationService>> {
+        self.conversation_creation.clone()
+    }
+
+    #[must_use]
+    pub fn conversation_id_for_current_session(
+        &self,
+        agent_session_id: &str,
+    ) -> Option<ConversationId> {
+        self.conversation_persistence
+            .as_ref()
+            .and_then(|adapter| adapter.conversation_id_for_current_binding(agent_session_id))
+    }
+
+    pub fn register_conversation_binding(
+        &self,
+        agent_session_id: &str,
+        conversation_id: ConversationId,
+    ) {
+        if let Some(adapter) = &self.conversation_persistence {
+            adapter.register_binding(agent_session_id, conversation_id);
+        }
+    }
+
+    pub fn set_pty_manager(&self, pty: &Arc<crate::pty::PtyManager>) {
+        *self.pty_manager.lock() = Some(Arc::downgrade(pty));
+    }
+
+    #[must_use]
+    pub fn pty_manager(&self) -> Option<Arc<crate::pty::PtyManager>> {
+        self.pty_manager.lock().as_ref().and_then(Weak::upgrade)
     }
 
     /// Spawn an ACP agent: launch the subprocess, complete `initialize`, and
@@ -1138,6 +1182,96 @@ impl AcpManager {
             cwd,
             mcp_servers,
             SessionCreationContext::default(),
+        )
+        .await
+    }
+
+    /// Create a replacement provider session without mutating canonical Conversation state.
+    /// ConversationLifecycleService calls this only after lastSeq CAS succeeds and appends the
+    /// replacement binding before publishing the returned session as canonical.
+    pub async fn create_replacement_session(
+        &self,
+        previous_binding: &AgentSessionBinding,
+        prepared: &PreparedConversation,
+    ) -> Result<AgentBindingResult, String> {
+        let agent_id = AgentId(previous_binding.runtime_agent_id.clone());
+        let (caps, stable_agent_namespace) = self
+            .agents
+            .lock()
+            .get(&agent_id)
+            .map(|entry| (entry.capabilities.clone(), entry.stable_namespace.clone()))
+            .ok_or_else(|| format!("unknown agent: {agent_id}"))?;
+        let (port, token, provisional_sid) = self.host_plan_server.register_session(&agent_id.0);
+        let internal = build_internal_plan_stdio(&agent_id.0, port, &token, &provisional_sid);
+        if let Err(error) = gate_mcp_servers(&caps, &internal) {
+            self.host_plan_server.unregister_by_token(&token);
+            return Err(error);
+        }
+        let tx = self.command_tx(&agent_id)?;
+        let (binding_gate_tx, binding_gate_rx) = watch::channel(None);
+        let outcome = send_command(&tx, |reply| AcpCommand::NewSession {
+            cwd: prepared.execution_cwd.clone(),
+            mcp_servers: internal,
+            stable_agent_namespace: stable_agent_namespace.clone(),
+            runtime_agent_id: agent_id.0.clone(),
+            project_id: None,
+            ephemeral: false,
+            worktree_path: None,
+            worktree_branch: None,
+            binding_gate: Some(binding_gate_rx),
+            reply,
+        })
+        .await;
+        match outcome {
+            Ok(outcome) => {
+                self.host_plan_server
+                    .bind_session(&token, &outcome.session_id.0);
+                self.replacement_gates
+                    .lock()
+                    .insert(outcome.session_id.0.clone(), binding_gate_tx);
+                Ok(AgentBindingResult {
+                    agent_session_id: outcome.session_id.0,
+                    runtime_agent_id: agent_id.0,
+                    stable_agent_namespace: stable_agent_namespace
+                        .unwrap_or_else(|| previous_binding.stable_agent_namespace.clone()),
+                })
+            }
+            Err(error) => {
+                let _ = binding_gate_tx.send(Some(Err("ACP_REPLACE_FAILED".to_string())));
+                self.host_plan_server.unregister_by_token(&token);
+                Err(error)
+            }
+        }
+    }
+
+    /// Publish a replacement provider session only after canonical binding history commits.
+    pub fn commit_replacement_session(&self, agent_session_id: &str) {
+        if let Some(gate) = self.replacement_gates.lock().remove(agent_session_id) {
+            let _ = gate.send(Some(Ok(())));
+        }
+    }
+
+    /// Suppress a provisional replacement event before best-effort provider cleanup.
+    pub async fn abort_replacement_session(&self, binding: &AgentSessionBinding) {
+        if let Some(gate) = self
+            .replacement_gates
+            .lock()
+            .remove(&binding.agent_session_id)
+        {
+            let _ = gate.send(Some(Err("CONVERSATION_RECOVERY_REQUIRED".to_string())));
+        }
+        let _ = self.close_conversation_session(binding).await;
+    }
+
+    /// Capability-aware close used by ConversationLifecycleService. It does not mutate canonical
+    /// bindings; the service appends `binding_suspended` only after this succeeds.
+    pub async fn close_conversation_session(
+        &self,
+        binding: &AgentSessionBinding,
+    ) -> Result<(), String> {
+        self.close_session(
+            &AgentId(binding.runtime_agent_id.clone()),
+            SessionId::new(binding.agent_session_id.clone()),
         )
         .await
     }

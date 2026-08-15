@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { SessionIndexEntry } from '@/lib/acp-history-persistence'
 
@@ -8,6 +8,12 @@ const {
   mockAddTab,
   mockDiscover,
   mockOpenDiscovered,
+  mockCloseView,
+  mockDetach,
+  mockRebind,
+  mockSuspend,
+  mockReplace,
+  mockDeleteConversation,
   sessionIndexRef,
   discoveredSessionsRef,
   agentsRef,
@@ -21,6 +27,12 @@ const {
   mockAddTab: vi.fn(),
   mockDiscover: vi.fn().mockResolvedValue(undefined),
   mockOpenDiscovered: vi.fn().mockResolvedValue(undefined),
+  mockCloseView: vi.fn(),
+  mockDetach: vi.fn(),
+  mockRebind: vi.fn(),
+  mockSuspend: vi.fn(),
+  mockReplace: vi.fn(),
+  mockDeleteConversation: vi.fn(),
   sessionIndexRef: { current: [] as SessionIndexEntry[] },
   discoveredSessionsRef: { current: {} as Record<string, unknown[]> },
   agentsRef: { current: {} as Record<string, unknown> },
@@ -56,6 +68,12 @@ vi.mock('@/stores/acp-store', () => {
       configToLiveAgent: configToLiveAgentRef.current,
       discoverSessions: mockDiscover,
       openDiscoveredSession: mockOpenDiscovered,
+      closeChatView: mockCloseView,
+      detachAgentBinding: mockDetach,
+      rebindDetachedBinding: mockRebind,
+      suspendAgentBinding: mockSuspend,
+      replaceAgentBinding: mockReplace,
+      deleteConversation: mockDeleteConversation,
       activeSessionId: activeSessionIdRef.current
     })
   // Stubs for the store helpers the component imports.
@@ -90,6 +108,7 @@ import { ChatHistoryTab } from './ChatHistoryTab'
 function entry(id: string, overrides: Partial<SessionIndexEntry> = {}): SessionIndexEntry {
   return {
     id,
+    conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
     agentId: 'a',
     title: id,
     cwd: '/work',
@@ -109,6 +128,12 @@ describe('ChatHistoryTab scoping', () => {
     mockAddTab.mockReset()
     mockDiscover.mockReset().mockResolvedValue(undefined)
     mockOpenDiscovered.mockReset().mockResolvedValue(undefined)
+    mockCloseView.mockReset()
+    mockDetach.mockReset()
+    mockRebind.mockReset()
+    mockSuspend.mockReset()
+    mockReplace.mockReset()
+    mockDeleteConversation.mockReset()
     sessionIndexRef.current = []
     discoveredSessionsRef.current = {}
     agentsRef.current = {}
@@ -189,6 +214,55 @@ describe('ChatHistoryTab scoping', () => {
 
     render(<ChatHistoryTab />)
     expect(mockDiscover).not.toHaveBeenCalled()
+  })
+
+  it('exposes separate accessible close, detach, rebind, suspend, replace, and delete actions', async () => {
+    sessionIndexRef.current = [entry('s1', { projectId: 'p1', cwd: '/work' })]
+    mockSuspend.mockResolvedValue({
+      status: 'updated',
+      action: 'suspendBinding',
+      conversationId: sessionIndexRef.current[0].conversationId,
+      previousRevision: 1,
+      revision: 2,
+      workspaceCwd: '/work',
+      lifecycleState: 'ready',
+      currentBinding: null
+    })
+    render(<ChatHistoryTab />)
+
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'Conversation actions for s1' }), {
+      button: 0,
+      ctrlKey: false
+    })
+    expect(screen.getByText('Close chat view')).toBeInTheDocument()
+    expect(screen.getByText('Detach binding')).toBeInTheDocument()
+    expect(screen.getByText('Rebind detached agent')).toBeInTheDocument()
+    expect(screen.getByText('Suspend agent')).toBeInTheDocument()
+    expect(screen.getByText('Replace agent')).toBeInTheDocument()
+    expect(screen.getByText('Delete conversation')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByText('Suspend agent'))
+    expect(screen.getByText('Suspend agent?')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Suspend agent' }))
+    await waitFor(() => {
+      expect(mockSuspend).toHaveBeenCalledWith(sessionIndexRef.current[0].conversationId)
+    })
+  })
+
+  it('close chat view invokes only the renderer-local close action', () => {
+    sessionIndexRef.current = [entry('s1', { projectId: 'p1', cwd: '/work' })]
+    render(<ChatHistoryTab />)
+
+    fireEvent.pointerDown(screen.getByRole('button', { name: 'Conversation actions for s1' }), {
+      button: 0,
+      ctrlKey: false
+    })
+    fireEvent.click(screen.getByText('Close chat view'))
+
+    expect(mockCloseView).toHaveBeenCalledWith(sessionIndexRef.current[0].conversationId)
+    expect(mockDetach).not.toHaveBeenCalled()
+    expect(mockSuspend).not.toHaveBeenCalled()
+    expect(mockDeleteConversation).not.toHaveBeenCalled()
   })
 
   it('opens a visible chat via addAgentChatTab', () => {

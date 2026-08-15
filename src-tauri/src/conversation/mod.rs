@@ -6,6 +6,7 @@ pub mod contracts;
 pub mod creation;
 pub mod durable_fs;
 pub mod event_log;
+pub mod lifecycle;
 pub mod locator;
 pub mod migration;
 pub mod persistence_adapter;
@@ -49,6 +50,12 @@ pub use event_log::{
     EventLogErrorKind, EventLogRepairWarning, ProjectAttachmentEventPayloadV1, ATTACHMENTS_FILE,
     BINDINGS_FILE, CONVERSATION_EVENT_SCHEMA_VERSION, EVENT_LOG_FILES, MESSAGES_FILE,
     TOOL_CALLS_FILE,
+};
+pub use lifecycle::{
+    AgentLifecycleProviderError, AgentLifecycleProviderErrorKind, ConversationAgentLifecycle,
+    ConversationDeleteBlocker, ConversationLifecycleAction, ConversationLifecycleError,
+    ConversationLifecycleErrorCode, ConversationLifecycleOutcome, ConversationLifecycleService,
+    TerminalResourceInspector,
 };
 pub use locator::{
     bounded_scan, BoundedScan, ConversationLocator, LocatedConversation, LocatorError,

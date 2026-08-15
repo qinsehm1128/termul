@@ -203,6 +203,72 @@ impl ConversationCreationService {
         })
     }
 
+    #[must_use]
+    pub fn repository(&self) -> &Arc<ConversationRepository> {
+        &self.repository
+    }
+
+    /// Resolve a replacement execution target against an existing Conversation without mutating
+    /// its identity, workspace, attachment, metadata revision, or binding history. The lifecycle
+    /// service holds the repository Conversation lock while calling this method and commits the
+    /// replacement binding only after the provider creates the new opaque session.
+    pub fn prepare_replacement(
+        &self,
+        request: &PrepareConversationRequest,
+    ) -> Result<PreparedConversation> {
+        validate_request_schema(request)?;
+        let conversation_id = request.conversation_id.ok_or_else(|| {
+            creation_error(
+                ConversationErrorCode::ConversationInvalidId,
+                "prepare_replacement",
+                None,
+                "replacement request requires conversationId",
+            )
+        })?;
+        let record = self
+            .repository
+            .get_conversation(conversation_id)
+            .map_err(map_repository_error)?;
+        if matches!(
+            record.lifecycle_state,
+            ConversationLifecycleState::Deleted | ConversationLifecycleState::RecoveryRequired
+        ) {
+            return Err(creation_error(
+                ConversationErrorCode::ConversationRecoveryRequired,
+                "prepare_replacement",
+                Some(conversation_id),
+                "Conversation lifecycle does not admit replacement",
+            ));
+        }
+        if request
+            .project_attachment
+            .as_ref()
+            .is_some_and(|requested| record.project_attachment.as_ref() != Some(requested))
+        {
+            return Err(creation_error(
+                ConversationErrorCode::ConversationCreateFailed,
+                "prepare_replacement",
+                Some(conversation_id),
+                "replacement cannot change project attachment",
+            ));
+        }
+        if request.execution_target != record.execution_target {
+            return Err(creation_error(
+                ConversationErrorCode::ConversationCreateFailed,
+                "prepare_replacement",
+                Some(conversation_id),
+                "replacement executionTarget must match canonical Conversation metadata",
+            ));
+        }
+        let workspace = self.canonical_workspace_for(&record)?;
+        let execution_cwd = self.resolve_execution_cwd(
+            &request.execution_target,
+            &workspace,
+            record.project_attachment.as_ref(),
+        )?;
+        Ok(prepared_from_record(&record, execution_cwd))
+    }
+
     /// Prepare canonical metadata and the independent visible workspace without contacting ACP.
     ///
     /// New creation ordering is exact: durable `allocating_workspace` metadata, durable visible

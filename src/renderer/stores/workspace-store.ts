@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import { useShallow } from 'zustand/shallow'
-import { navigateToChatSession } from '@/lib/router-navigate'
+import { clearChatRoute, navigateToChatSession } from '@/lib/router-navigate'
 import { randomUUID } from '@/lib/uuid'
 import { useTerminalStore } from '@/stores/terminal-store'
 import type {
@@ -189,6 +189,8 @@ export interface WorkspaceState {
    * leaving a duplicate tab behind.
    */
   remapAgentChatSession: (fromSessionId: string, toSessionId: string, targetPaneId?: string) => void
+  /** Remove only the renderer chat view and route. Never touches ACP, history, or terminals. */
+  closeChatView: (sessionId: string) => void
   removeTab: (tabId: string) => void
   getNextTabId: (direction: 1 | -1) => string | null
 }
@@ -890,6 +892,18 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => {
         agentLauncherPaneId: agentLauncherPaneId === pane.id ? null : agentLauncherPaneId
       })
       navigateToChatSession(toSessionId)
+    },
+
+    closeChatView: (sessionId: string): void => {
+      const tabId = agentChatTabId(sessionId)
+      const { root } = get()
+      const pane = findPaneContainingTab(root, tabId)
+      if (pane) {
+        void get().closeTab(pane.id, tabId)
+      }
+      if (window.location.hash === `#/c/${sessionId}`) {
+        clearChatRoute()
+      }
     },
 
     removeTab: (tabId: string): void => {
