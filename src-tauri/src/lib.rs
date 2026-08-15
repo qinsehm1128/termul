@@ -1895,7 +1895,11 @@ pub fn run() {
             commands::acp_history_get_legacy,
             // Frontend error forwarding (issue #244)
             commands::log_frontend_error,
-            // Workspace manifest (CAP-5 / Story 5)
+            // Per-Conversation SessionWorkspace (Conversation stage 5)
+            commands::session_workspace_get,
+            commands::session_workspace_write,
+            commands::conversation_recovery_resolve,
+            // Workspace manifest (legacy read-only compatibility)
             commands::workspace_manifest_get,
             commands::workspace_manifest_write,
             commands::workspace_manifest_delete,

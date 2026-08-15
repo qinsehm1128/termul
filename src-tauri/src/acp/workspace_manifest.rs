@@ -357,11 +357,18 @@ impl WorkspaceManifestService {
     /// `Arc<Self>`. A non-directory root (e.g. a stray file at the path) is an
     /// error so a misconfigured host fails loudly at startup.
     pub async fn open(root: PathBuf) -> Result<Arc<Self>> {
-        Self::open_mode(root, false).await
+        // Stage 5 cutover: the legacy project-keyed store is preserved evidence only.
+        // All normal workspace writes now target per-Conversation workspace.json.
+        Self::open_mode(root, true).await
     }
 
     pub async fn open_read_only(root: PathBuf) -> Result<Arc<Self>> {
         Self::open_mode(root, true).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn open_writable_for_tests(root: PathBuf) -> Result<Arc<Self>> {
+        Self::open_mode(root, false).await
     }
 
     async fn open_mode(root: PathBuf, read_only: bool) -> Result<Arc<Self>> {
@@ -510,6 +517,15 @@ impl WorkspaceManifestService {
     /// `Ok(None)` (the workspace reloads fresh). The `BadSchemaVersion` error
     /// is exposed for callers that want to distinguish, but `load` itself
     /// collapses it to the fresh-start path.
+    pub fn read_source_bytes(&self, project_id: &str) -> Result<Option<Vec<u8>>> {
+        let path = self.project_path(project_id)?;
+        match fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub async fn load(self: &Arc<Self>, project_id: &str) -> Result<Option<WorkspaceManifest>> {
         let root = Arc::clone(self);
         let project_id = project_id.to_string();
@@ -848,6 +864,10 @@ mod tests {
         path
     }
 
+    async fn open_writable(root: PathBuf) -> Result<Arc<WorkspaceManifestService>> {
+        WorkspaceManifestService::open_writable_for_tests(root).await
+    }
+
     fn sample_manifest(project_id: &str) -> WorkspaceManifest {
         WorkspaceManifest {
             project_id: project_id.to_string(),
@@ -879,7 +899,7 @@ mod tests {
     async fn read_only_mode_performs_zero_writes_and_rejects_mutations() {
         let root = temp_dir("read-only");
         let store = root.join("store");
-        let writable = WorkspaceManifestService::open(store.clone()).await.unwrap();
+        let writable = open_writable(store.clone()).await.unwrap();
         writable
             .write("project-1", None, sample_manifest("project-1"))
             .await
@@ -931,9 +951,7 @@ mod tests {
     #[tokio::test]
     async fn load_missing_manifest_returns_ok_none() {
         let root = temp_dir("load-missing");
-        let service = WorkspaceManifestService::open(root.join("store"))
-            .await
-            .unwrap();
+        let service = open_writable(root.join("store")).await.unwrap();
         let loaded = service.load("project-1").await.unwrap();
         assert!(loaded.is_none(), "missing manifest => Ok(None)");
         let _ = fs::remove_dir_all(root);
@@ -943,9 +961,7 @@ mod tests {
     #[tokio::test]
     async fn load_existing_manifest_after_write() {
         let root = temp_dir("load-existing");
-        let service = WorkspaceManifestService::open(root.join("store"))
-            .await
-            .unwrap();
+        let service = open_writable(root.join("store")).await.unwrap();
         let manifest = sample_manifest("project-1");
         let outcome = service
             .write("project-1", None, manifest.clone())
@@ -967,9 +983,7 @@ mod tests {
     #[tokio::test]
     async fn initial_write_with_null_based_revision() {
         let root = temp_dir("initial-write");
-        let service = WorkspaceManifestService::open(root.join("store"))
-            .await
-            .unwrap();
+        let service = open_writable(root.join("store")).await.unwrap();
         let outcome = service
             .write("project-1", None, sample_manifest("project-1"))
             .await
@@ -988,9 +1002,7 @@ mod tests {
     #[tokio::test]
     async fn subsequent_write_with_based_revision_one() {
         let root = temp_dir("subsequent-write");
-        let service = WorkspaceManifestService::open(root.join("store"))
-            .await
-            .unwrap();
+        let service = open_writable(root.join("store")).await.unwrap();
         service
             .write("project-1", None, sample_manifest("project-1"))
             .await
@@ -1013,9 +1025,7 @@ mod tests {
     #[tokio::test]
     async fn stale_revision_conflict_does_not_mutate() {
         let root = temp_dir("stale-conflict");
-        let service = WorkspaceManifestService::open(root.join("store"))
-            .await
-            .unwrap();
+        let service = open_writable(root.join("store")).await.unwrap();
         // Drive on-disk revision to 3.
         service
             .write("project-1", None, sample_manifest("project-1"))
@@ -1063,9 +1073,7 @@ mod tests {
     #[tokio::test]
     async fn null_based_revision_against_existing_conflicts() {
         let root = temp_dir("null-against-existing");
-        let service = WorkspaceManifestService::open(root.join("store"))
-            .await
-            .unwrap();
+        let service = open_writable(root.join("store")).await.unwrap();
         service
             .write("project-1", None, sample_manifest("project-1"))
             .await
@@ -1088,9 +1096,7 @@ mod tests {
     #[tokio::test]
     async fn delete_existing_manifest() {
         let root = temp_dir("delete-existing");
-        let service = WorkspaceManifestService::open(root.join("store"))
-            .await
-            .unwrap();
+        let service = open_writable(root.join("store")).await.unwrap();
         service
             .write("project-1", None, sample_manifest("project-1"))
             .await
@@ -1104,9 +1110,7 @@ mod tests {
     #[tokio::test]
     async fn delete_missing_manifest_is_idempotent() {
         let root = temp_dir("delete-missing");
-        let service = WorkspaceManifestService::open(root.join("store"))
-            .await
-            .unwrap();
+        let service = open_writable(root.join("store")).await.unwrap();
         // No file exists; delete must return Ok.
         service.delete("project-1").await.unwrap();
         // And a second delete is still Ok.
@@ -1123,7 +1127,7 @@ mod tests {
         let path = store.join("project-1.json");
         fs::write(&path, b"{ not valid json").unwrap();
 
-        let service = WorkspaceManifestService::open(store.clone()).await.unwrap();
+        let service = open_writable(store.clone()).await.unwrap();
         let loaded = service.load("project-1").await.unwrap();
         assert!(loaded.is_none());
 
@@ -1154,7 +1158,7 @@ mod tests {
         let bytes = br#"{"schemaVersion":99,"manifest":{"projectId":"project-1","revision":1,"updatedAt":0,"terminals":[],"editors":[]}}"#;
         fs::write(&path, bytes).unwrap();
 
-        let service = WorkspaceManifestService::open(store.clone()).await.unwrap();
+        let service = open_writable(store.clone()).await.unwrap();
         let loaded = service.load("project-1").await.unwrap();
         assert!(loaded.is_none(), "bad schema version => fresh start");
 
@@ -1178,9 +1182,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_writes_same_project_serialize() {
         let root = temp_dir("concurrent");
-        let service = WorkspaceManifestService::open(root.join("store"))
-            .await
-            .unwrap();
+        let service = open_writable(root.join("store")).await.unwrap();
         // Initial write so both concurrent writes present basedRevision=1
         // against on-disk revision=1.
         service
@@ -1300,7 +1302,7 @@ mod tests {
     async fn write_then_reopen_returns_persisted_manifest() {
         let root = temp_dir("write-reopen");
         let store = root.join("store");
-        let service = WorkspaceManifestService::open(store.clone()).await.unwrap();
+        let service = open_writable(store.clone()).await.unwrap();
         let manifest = sample_manifest("project-1");
         let outcome = service
             .write("project-1", None, manifest.clone())
@@ -1317,7 +1319,7 @@ mod tests {
         // Reopen the SAME root — the per-instance mutex map is fresh, but the
         // on-disk state survives (the mutex only avoids the lost-update race
         // between concurrent writers in the SAME process).
-        let reopened = WorkspaceManifestService::open(store).await.unwrap();
+        let reopened = open_writable(store).await.unwrap();
         let loaded = reopened.load("project-1").await.unwrap().unwrap();
         assert_eq!(loaded.revision, revision);
         assert_eq!(loaded.updated_at, updated_at);
@@ -1331,9 +1333,7 @@ mod tests {
     #[tokio::test]
     async fn project_id_with_separators_rejected() {
         let root = temp_dir("pid-separators");
-        let service = WorkspaceManifestService::open(root.join("store"))
-            .await
-            .unwrap();
+        let service = open_writable(root.join("store")).await.unwrap();
         let err = service.load("../escape").await.unwrap_err();
         assert!(matches!(
             err,
@@ -1351,9 +1351,7 @@ mod tests {
     #[tokio::test]
     async fn empty_project_id_rejected() {
         let root = temp_dir("pid-empty");
-        let service = WorkspaceManifestService::open(root.join("store"))
-            .await
-            .unwrap();
+        let service = open_writable(root.join("store")).await.unwrap();
         let err = service.load("").await.unwrap_err();
         assert!(matches!(
             err,
@@ -1370,9 +1368,7 @@ mod tests {
         // NOT be rejected (only the exact id `..` is dangerous). Patch 5
         // removed the over-broad `contains("..")` check.
         let root = temp_dir("pid-double-dot");
-        let service = WorkspaceManifestService::open(root.join("store"))
-            .await
-            .unwrap();
+        let service = open_writable(root.join("store")).await.unwrap();
         let outcome = service
             .write("foo..bar", None, sample_manifest("foo..bar"))
             .await
@@ -1386,9 +1382,7 @@ mod tests {
     #[tokio::test]
     async fn single_dot_project_id_rejected() {
         let root = temp_dir("pid-single-dot");
-        let service = WorkspaceManifestService::open(root.join("store"))
-            .await
-            .unwrap();
+        let service = open_writable(root.join("store")).await.unwrap();
         let err = service.load(".").await.unwrap_err();
         assert!(matches!(
             err,
@@ -1400,9 +1394,7 @@ mod tests {
     #[tokio::test]
     async fn double_dot_exact_project_id_rejected() {
         let root = temp_dir("pid-double-dot-exact");
-        let service = WorkspaceManifestService::open(root.join("store"))
-            .await
-            .unwrap();
+        let service = open_writable(root.join("store")).await.unwrap();
         let err = service.load("..").await.unwrap_err();
         assert!(matches!(
             err,
@@ -1414,9 +1406,7 @@ mod tests {
     #[tokio::test]
     async fn project_id_with_nul_byte_rejected() {
         let root = temp_dir("pid-nul");
-        let service = WorkspaceManifestService::open(root.join("store"))
-            .await
-            .unwrap();
+        let service = open_writable(root.join("store")).await.unwrap();
         let err = service.load("evil\0root").await.unwrap_err();
         assert!(matches!(
             err,
@@ -1429,9 +1419,7 @@ mod tests {
     #[tokio::test]
     async fn delete_evicts_lock_entry() {
         let root = temp_dir("delete-evict");
-        let service = WorkspaceManifestService::open(root.join("store"))
-            .await
-            .unwrap();
+        let service = open_writable(root.join("store")).await.unwrap();
         service
             .write("project-1", None, sample_manifest("project-1"))
             .await
@@ -1460,9 +1448,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_project_id_does_not_insert_lock_entry() {
         let root = temp_dir("pid-invalid-no-lock");
-        let service = WorkspaceManifestService::open(root.join("store"))
-            .await
-            .unwrap();
+        let service = open_writable(root.join("store")).await.unwrap();
         // An invalid id surfaces as InvalidProjectId; the lock map must NOT
         // have an entry for the bad id.
         let _ = service.write("", None, sample_manifest("ignored")).await;
@@ -1499,7 +1485,7 @@ mod tests {
         let root = temp_dir("file-root");
         let file_path = root.join("not-a-dir");
         fs::write(&file_path, b"x").unwrap();
-        let error = match WorkspaceManifestService::open(file_path).await {
+        let error = match open_writable(file_path).await {
             Ok(_) => panic!("a non-directory root must not open"),
             Err(error) => error,
         };
@@ -1514,9 +1500,7 @@ mod tests {
     #[tokio::test]
     async fn different_projects_progress_independently() {
         let root = temp_dir("independent");
-        let service = WorkspaceManifestService::open(root.join("store"))
-            .await
-            .unwrap();
+        let service = open_writable(root.join("store")).await.unwrap();
         // Initial writes to two different projects.
         let o1 = service
             .write("project-1", None, sample_manifest("project-1"))
@@ -1661,9 +1645,7 @@ mod tests {
     #[tokio::test]
     async fn project_path_rejects_empty_id_at_write_time() {
         let root = temp_dir("write-empty");
-        let service = WorkspaceManifestService::open(root.join("store"))
-            .await
-            .unwrap();
+        let service = open_writable(root.join("store")).await.unwrap();
         let err = service
             .write("", None, sample_manifest("ignored"))
             .await
@@ -1680,9 +1662,7 @@ mod tests {
     #[tokio::test]
     async fn null_update_identity_survives_round_trip() {
         let root = temp_dir("null-identity");
-        let service = WorkspaceManifestService::open(root.join("store"))
-            .await
-            .unwrap();
+        let service = open_writable(root.join("store")).await.unwrap();
         let mut manifest = sample_manifest("project-1");
         manifest.update_identity = None;
         service

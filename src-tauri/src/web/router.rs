@@ -16,7 +16,9 @@ use axum::{
     Router,
 };
 
-use crate::acp::{AcpCatalogService, AcpInstallService, AcpManager, FileProjectRegistry, WorkspaceManifestService};
+use crate::acp::{
+    AcpCatalogService, AcpInstallService, AcpManager, FileProjectRegistry, WorkspaceManifestService,
+};
 use crate::pty::PtyManager;
 use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub};
 use crate::web::catalog_api;
@@ -26,11 +28,12 @@ use crate::web::install_api;
 use crate::web::log_api;
 use crate::web::mcp_probe_api;
 use crate::web::mcp_servers_api;
-use crate::web::search_api;
-use crate::web::skills_api;
 use crate::web::project_registry::ProjectRegistry;
 use crate::web::projects_api;
+use crate::web::search_api;
+use crate::web::session_workspace_api;
 use crate::web::sink::WsRelaySink;
+use crate::web::skills_api;
 use crate::web::terminal_ws::terminal_ws_upgrade;
 use crate::web::workspace_api;
 use crate::web::worktree_api;
@@ -152,6 +155,14 @@ pub fn router(
         .route("/workspace/{projectId}", get(workspace_api::get))
         .route("/workspace/{projectId}/write", post(workspace_api::write))
         .route("/workspace/{projectId}/delete", post(workspace_api::delete))
+        .route(
+            "/conversations/{conversationId}/workspace",
+            get(session_workspace_api::get).post(session_workspace_api::write),
+        )
+        .route(
+            "/conversation-recovery/resolve",
+            post(session_workspace_api::resolve_recovery),
+        )
         // ACP catalog web routes (CAP-6: Web & Mobile 1:1 Parity). Each
         // mirrors a desktop `#[tauri::command] acp_*_catalog` handler; see
         // `web/catalog_api.rs`. Registered AHEAD of the static fallback so
@@ -180,8 +191,14 @@ pub fn router(
         .route("/worktree/remove", post(worktree_api::remove))
         .route("/worktree/branches", get(worktree_api::branches))
         .route("/worktree/check-dirty", get(worktree_api::check_dirty))
-        .route("/worktree/resolve-base-branch", post(worktree_api::resolve_base_branch))
-        .route("/worktree/copy-include-files", post(worktree_api::copy_include_files));
+        .route(
+            "/worktree/resolve-base-branch",
+            post(worktree_api::resolve_base_branch),
+        )
+        .route(
+            "/worktree/copy-include-files",
+            post(worktree_api::copy_include_files),
+        );
     // Static fallback: disk ServeDir in dev (dist-web/ on disk) or the embedded
     // bundle in release. `/health` + `/ws` are registered above so the static
     // mount cannot shadow them (Story 1.3 AC1).
@@ -287,6 +304,14 @@ pub fn router_with_static(
         .route("/workspace/{projectId}", get(workspace_api::get))
         .route("/workspace/{projectId}/write", post(workspace_api::write))
         .route("/workspace/{projectId}/delete", post(workspace_api::delete))
+        .route(
+            "/conversations/{conversationId}/workspace",
+            get(session_workspace_api::get).post(session_workspace_api::write),
+        )
+        .route(
+            "/conversation-recovery/resolve",
+            post(session_workspace_api::resolve_recovery),
+        )
         .route("/acp/catalog", get(catalog_api::list))
         .route("/acp/catalog/opt-in", post(catalog_api::set_opt_in))
         .route("/acp/install", post(install_api::install))
@@ -295,13 +320,18 @@ pub fn router_with_static(
         .route("/worktree/remove", post(worktree_api::remove))
         .route("/worktree/branches", get(worktree_api::branches))
         .route("/worktree/check-dirty", get(worktree_api::check_dirty))
-        .route("/worktree/resolve-base-branch", post(worktree_api::resolve_base_branch))
-        .route("/worktree/copy-include-files", post(worktree_api::copy_include_files))
+        .route(
+            "/worktree/resolve-base-branch",
+            post(worktree_api::resolve_base_branch),
+        )
+        .route(
+            "/worktree/copy-include-files",
+            post(worktree_api::copy_include_files),
+        )
         .fallback_service(assets::static_service_from(static_dir))
         // CAP-1: same RwLock wrap + handle registration as `router`.
         .with_state({
-            let project_root_handle =
-                std::sync::Arc::new(parking_lot::RwLock::new(project_root));
+            let project_root_handle = std::sync::Arc::new(parking_lot::RwLock::new(project_root));
             registry.set_project_root_handle(std::sync::Arc::clone(&project_root_handle));
             AppState {
                 acp,

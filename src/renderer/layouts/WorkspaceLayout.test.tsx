@@ -3,6 +3,7 @@ import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { useFileExplorerStore } from '@/stores/file-explorer-store'
+import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
 import { useSidebarStore } from '@/stores/sidebar-store'
 import { useThemePickerStore } from '@/stores/theme-picker-store'
 import type { Project, ProjectColor, Terminal } from '@/types/project'
@@ -243,6 +244,14 @@ vi.mock('@/hooks/use-workspace-manifest-sync', () => ({
   resolveManifestConflict: vi.fn().mockResolvedValue(undefined),
   performManifestWrite: vi.fn().mockResolvedValue(undefined)
 }))
+vi.mock('@/hooks/use-session-workspace-sync', () => ({
+  useSessionWorkspaceSync: vi.fn(),
+  useSessionWorkspaceBootstrap: vi.fn(),
+  loadSessionWorkspace: vi.fn().mockResolvedValue(false),
+  resolveSessionWorkspaceConflict: vi.fn().mockResolvedValue(undefined),
+  resolveSessionWorkspaceRecovery: vi.fn().mockResolvedValue(undefined),
+  performSessionWorkspaceWrite: vi.fn().mockResolvedValue('skipped')
+}))
 vi.mock('@/components/workspace/WorkspaceConflictBanner', () => ({
   WorkspaceConflictBanner: () => <div data-testid="workspace-conflict-banner" />
 }))
@@ -390,6 +399,7 @@ beforeEach(() => {
   mockUpdatePanelVisibility.mockReset()
   mockWaitForPendingAppSettingsPersistence.mockReset()
   useFileExplorerStore.setState({ isVisible: true })
+  useSessionWorkspaceSyncStore.setState({ activeConversationId: null })
   useSidebarStore.setState({ isVisible: true })
   useThemePickerStore.getState().close()
   mockApi.filesystem.watchDirectory.mockReset()
@@ -460,9 +470,10 @@ describe('WorkspaceLayout - Empty States', () => {
 
     renderWithRouter()
 
-    // Patch 19: the Story 6 sync hook is mounted with the active project id.
-    const { useWorkspaceManifestSync } = await import('@/hooks/use-workspace-manifest-sync')
-    expect(useWorkspaceManifestSync).toHaveBeenCalledWith('project-1')
+    const conversationId = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+    act(() => useSessionWorkspaceSyncStore.getState().setActiveConversationId(conversationId))
+    const { useSessionWorkspaceSync } = await import('@/hooks/use-session-workspace-sync')
+    expect(useSessionWorkspaceSync).toHaveBeenCalledWith(conversationId)
 
     window.dispatchEvent(new Event('beforeunload'))
 

@@ -9,6 +9,7 @@ import { Toaster } from '@/components/ui/toaster'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { usePreventDevToolsShortcuts } from '@/hooks/use-prevent-devtools-shortcuts'
 import { usePreventNativeContextMenu } from '@/hooks/use-prevent-native-context-menu'
+import { useSessionWorkspaceBootstrap } from '@/hooks/use-session-workspace-sync'
 import { useWindowState } from '@/hooks/use-window-state'
 import { getCurrentWindow } from '@/lib/tauri-window'
 import { useUpdateToast } from './components/UpdateAvailableToast'
@@ -53,6 +54,7 @@ const queryClient = new QueryClient()
 // Component to handle app-level effects like auto-save
 function AppEffects(): null {
   useTerminalAutoSave()
+  useSessionWorkspaceBootstrap()
   useTerminalRestore()
   useCrashRecovery()
   useTerminalDetachedOutput()

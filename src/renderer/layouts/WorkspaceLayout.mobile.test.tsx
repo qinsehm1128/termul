@@ -230,8 +230,13 @@ vi.mock('@/hooks/use-workspace-manifest-sync', () => ({
   resolveManifestConflict: vi.fn().mockResolvedValue(undefined),
   performManifestWrite: vi.fn().mockResolvedValue(undefined)
 }))
-vi.mock('@/components/workspace/WorkspaceConflictBanner', () => ({
-  WorkspaceConflictBanner: () => <div data-testid="workspace-conflict-banner" />
+vi.mock('@/hooks/use-session-workspace-sync', () => ({
+  useSessionWorkspaceSync: vi.fn(),
+  useSessionWorkspaceBootstrap: vi.fn(),
+  loadSessionWorkspace: vi.fn().mockResolvedValue(false),
+  resolveSessionWorkspaceConflict: vi.fn().mockResolvedValue(undefined),
+  resolveSessionWorkspaceRecovery: vi.fn().mockResolvedValue(undefined),
+  performSessionWorkspaceWrite: vi.fn().mockResolvedValue('skipped')
 }))
 vi.mock('@/pages/WorkspaceDashboard', () => ({ default: () => <div>dashboard</div> }))
 vi.mock('@/pages/WorkspaceSnapshots', () => ({ default: () => <div>snapshots</div> }))
@@ -321,7 +326,36 @@ vi.mock('@/components/ssh/SSHFileExplorer', () => ({
   SSHFileExplorer: () => <div data-testid="ssh-file-explorer-stub" />
 }))
 
+import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
 import WorkspaceLayout from './WorkspaceLayout'
+
+const conversationId = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+const mobileRecoveryItem = {
+  recoveryId: 'a'.repeat(64),
+  kind: 'ambiguous_workspace_manifest' as const,
+  severity: 'warning' as const,
+  sourcePaths: ['legacy_workspace_manifests/0/shared.json'],
+  conversationIds: [conversationId],
+  sourceSha256: ['e'.repeat(64)],
+  candidateFacts: [],
+  provenance: [
+    {
+      sourceKind: 'legacy_workspace_manifests',
+      relativePath: 'legacy_workspace_manifests/0/shared.json',
+      sha256: 'e'.repeat(64),
+      preservedReadOnly: true as const
+    }
+  ],
+  status: 'unresolved' as const,
+  suggestedActions: [
+    'inspect',
+    'associateConversation',
+    'startEmptyWorkspace',
+    'dismissPreservedSource'
+  ] as const,
+  revision: 7,
+  associationDecisions: []
+}
 
 describe('WorkspaceLayout mobile branch', () => {
   beforeEach(() => {
@@ -333,6 +367,14 @@ describe('WorkspaceLayout mobile branch', () => {
     gitState.selectedFile = null
     gitState.commitContexts = {}
     sshProfileRef.current = null
+    useSessionWorkspaceSyncStore.setState({
+      activeConversationId: conversationId,
+      basedRevisionByConversation: {},
+      conflictsByConversation: {},
+      recoveryByConversation: {},
+      loadOutcomeByConversation: {},
+      restoreInProgressByConversation: {}
+    })
   })
 
   it('mounts MobileChatShell and threads the command-palette + git-changes triggers', async () => {
@@ -346,6 +388,23 @@ describe('WorkspaceLayout mobile branch', () => {
     await waitFor(() => expect(document.querySelector('[data-mobile-chat-shell]')).toBeTruthy())
     expect(screen.getByLabelText('Command palette')).toBeInTheDocument()
     expect(screen.getByLabelText('Git changes')).not.toBeDisabled()
+  })
+
+  it('keeps immutable recovery context and exact actions usable at phone width', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 })
+    useSessionWorkspaceSyncStore.getState().setRecoveryItems(conversationId, [mobileRecoveryItem])
+    render(
+      <MemoryRouter>
+        <WorkspaceLayout />
+      </MemoryRouter>
+    )
+
+    expect(await screen.findByRole('alert')).toHaveAttribute('data-conversation-id', conversationId)
+    expect(screen.getByText(/legacy_workspace_manifests\/0\/shared.json/)).toBeInTheDocument()
+    expect(screen.getByText(new RegExp(`sha256:${'e'.repeat(64)}`))).toBeInTheDocument()
+    for (const action of mobileRecoveryItem.suggestedActions) {
+      expect(screen.getByRole('button', { name: action })).toBeVisible()
+    }
   })
 
   it('opens the CommandPalette overlay when the mobile trigger is tapped', async () => {

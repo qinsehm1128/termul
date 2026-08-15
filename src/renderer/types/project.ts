@@ -73,6 +73,8 @@ export type TerminalHealthStatus = 'running' | 'crashed' | 'hibernated' | 'disco
 
 export interface Terminal {
   id: string
+  /** Canonical Conversation that may persist a passive reference to this terminal. */
+  conversationId?: string
   ptyId?: string
   name: string
   projectId: string

@@ -314,7 +314,7 @@ mod tests {
     async fn state_with_store(
         root: &std::path::Path,
     ) -> AppState {
-        let store = WorkspaceManifestService::open(root.join("manifests"))
+        let store = WorkspaceManifestService::open_writable_for_tests(root.join("manifests"))
             .await
             .expect("open store");
         let pty = crate::web::test_pty_manager();

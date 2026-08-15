@@ -19,6 +19,7 @@ import { useExitCode } from './hooks/use-exit-code'
 import { useGitBranch } from './hooks/use-git-branch'
 import { useGitStatus } from './hooks/use-git-status'
 import { useRemoteProjects } from './hooks/use-remote-projects'
+import { useSessionWorkspaceBootstrap } from './hooks/use-session-workspace-sync'
 import { useTerminalDetachedOutput } from './hooks/use-terminal-detached-output'
 import { useTerminalExitNotification } from './hooks/use-terminal-exit-notification'
 import { useTerminalRestore } from './hooks/use-terminal-restore'
@@ -112,6 +113,7 @@ const queryClient = new QueryClient()
 function AppEffects(): null {
   usePreventAltMenu()
   useTerminalAutoSave()
+  useSessionWorkspaceBootstrap()
   useTerminalRestore()
   useCrashRecovery()
   useTerminalDetachedOutput()

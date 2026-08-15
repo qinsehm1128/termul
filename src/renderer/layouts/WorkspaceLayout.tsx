@@ -40,9 +40,9 @@ import { useMobileWebShell } from '@/hooks/use-mobile-web-shell'
 import { PaneDndProvider } from '@/hooks/use-pane-dnd'
 import { usePinnedCommandsLoader } from '@/hooks/use-pinned-commands'
 import { useRecentCommandsLoader } from '@/hooks/use-recent-commands'
+import { useSessionWorkspaceSync } from '@/hooks/use-session-workspace-sync'
 import { useCreateSnapshot, useSnapshotLoader } from '@/hooks/use-snapshots'
 import { useSSHConnection } from '@/hooks/use-ssh-connection'
-import { useWorkspaceManifestSync } from '@/hooks/use-workspace-manifest-sync'
 import { useWorktreeShortcuts } from '@/hooks/use-worktree-shortcuts'
 import { saveTerminalLayout } from '@/hooks/useTerminalAutoSave'
 import { runtimeT } from '@/i18n/runtime'
@@ -89,6 +89,7 @@ import {
   useProjects,
   useProjectsLoaded
 } from '@/stores/project-store'
+import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
 import { useSidebarVisible } from '@/stores/sidebar-store'
 import {
   useActiveSSHProfile,
@@ -175,6 +176,8 @@ function getShortcutTargetContext(target: EventTarget | null): {
  * stays a window-drag zone; the toggle sits in a separate no-drag container.
  */
 const macOsTrafficLightClearance = 'w-[80px] shrink-0'
+const canonicalConversationId =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 
 function MacOsTitlebarStrip(): React.JSX.Element | null {
   const activeProject = useActiveProject()
@@ -254,6 +257,15 @@ export default function WorkspaceLayout(): React.JSX.Element {
   const projects = useProjects()
   const activeProject = useActiveProject()
   const activeProjectId = useActiveProjectId()
+  const conversationIdFromAcp = useAcpStore((state) => {
+    if (!state.activeSessionId) return null
+    const candidate = state.sessions[state.activeSessionId]?.conversationId
+    return candidate && canonicalConversationId.test(candidate) ? candidate : null
+  })
+  const bootstrappedConversationId = useSessionWorkspaceSyncStore(
+    (state) => state.activeConversationId
+  )
+  const activeConversationId = conversationIdFromAcp ?? bootstrappedConversationId
   const {
     selectProject,
     addProject,
@@ -614,10 +626,9 @@ export default function WorkspaceLayout(): React.JSX.Element {
   // Editor state persistence
   useEditorPersistence(activeProjectId)
 
-  // Story 6: cross-client workspace manifest sync (load happens inside
-  // useEditorPersistence's restore flow via loadAndRestoreManifest; this hook
-  // wires the debounced write side + conflict surfacing).
-  useWorkspaceManifestSync(activeProjectId)
+  // SessionWorkspace is keyed only by canonical ConversationId. The legacy
+  // project manifest remains a read-only migration input and receives no live writes.
+  useSessionWorkspaceSync(activeConversationId)
 
   useEffect(() => {
     return () => {
@@ -1949,6 +1960,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
           >
             <PaneDndProvider>
               <main className="flex h-full min-h-0 flex-col overflow-hidden bg-background">
+                <WorkspaceConflictBanner conversationId={activeConversationId} />
                 {workspaceMain}
               </main>
             </PaneDndProvider>
@@ -2026,7 +2038,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
                 <div className="flex-1 flex min-h-0 h-full gap-0 overflow-hidden min-w-0">
                   {/* Main Content Area */}
                   <main className="flex-1 flex flex-col min-w-0 rounded-xl bg-card overflow-hidden">
-                    <WorkspaceConflictBanner />
+                    <WorkspaceConflictBanner conversationId={activeConversationId} />
                     {workspaceMain}
                   </main>
 

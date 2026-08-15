@@ -3,8 +3,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CONTEXT_BAR_SETTINGS_KEY } from '@/types/settings'
 import TauriApp from './TauriApp'
 
-const { mockPersistenceRead } = vi.hoisted(() => ({
-  mockPersistenceRead: vi.fn()
+const { mockPersistenceRead, mockSessionWorkspaceBootstrap } = vi.hoisted(() => ({
+  mockPersistenceRead: vi.fn(),
+  mockSessionWorkspaceBootstrap: vi.fn()
 }))
 
 vi.mock('@/lib/api', () => ({
@@ -25,6 +26,10 @@ vi.mock('@/lib/api', () => ({
     clear: vi.fn(),
     flush: vi.fn()
   }
+}))
+
+vi.mock('@/hooks/use-session-workspace-sync', () => ({
+  useSessionWorkspaceBootstrap: mockSessionWorkspaceBootstrap
 }))
 
 vi.mock('@/hooks/use-window-state', () => ({
@@ -150,5 +155,10 @@ describe('TauriApp', () => {
   it('wires app visibility tracking at app scope', () => {
     render(<TauriApp />)
     expect(mockUseVisibilityState).toHaveBeenCalledTimes(1)
+  })
+
+  it('mounts the portable SessionWorkspace bootstrap at the desktop root', () => {
+    render(<TauriApp />)
+    expect(mockSessionWorkspaceBootstrap).toHaveBeenCalledTimes(1)
   })
 })

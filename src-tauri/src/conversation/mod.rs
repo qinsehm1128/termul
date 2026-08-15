@@ -10,6 +10,8 @@ pub mod locator;
 pub mod migration;
 pub mod persistence_adapter;
 pub mod repository;
+pub mod session_workspace;
+pub mod workspace_projection;
 
 pub use bootstrap::{
     BootstrapError, BootstrapOutcome, ConversationBootstrap, HostConversationRoots,
@@ -65,4 +67,14 @@ pub use persistence_adapter::{ConversationPersistenceAdapter, ConversationPersis
 pub use repository::{
     ConversationMetadataUpdate, ConversationRepository, RepositoryError, RepositoryOpenReport,
     RepositoryRecoveryItem, RepositoryRecoveryKind,
+};
+pub use session_workspace::{
+    SessionWorkspaceError, SessionWorkspaceErrorCode, SessionWorkspaceLeafNode,
+    SessionWorkspaceLoadOutcome, SessionWorkspacePaneDirection, SessionWorkspacePaneNode,
+    SessionWorkspaceProjectionState, SessionWorkspaceResourceDescriptor, SessionWorkspaceService,
+    SessionWorkspaceSplitNode, SessionWorkspaceV1, SessionWorkspaceWriteOutcome,
+    TerminalResourceDescriptor, SESSION_WORKSPACE_SCHEMA_VERSION,
+};
+pub use workspace_projection::{
+    LegacyWorkspaceProjector, WorkspaceProjectionOutcome, WorkspaceProjectionReceiptV1,
 };

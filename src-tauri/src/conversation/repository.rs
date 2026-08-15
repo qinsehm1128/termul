@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Weak};
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
@@ -43,6 +43,7 @@ pub enum RepositoryRecoveryKind {
     TornTailRepaired,
     CorruptAuthoritativeRecord,
     UnsupportedAuthoritativeSchema,
+    WorkspaceRecoveryRequired,
     IncompleteCreationRecovered,
     CatalogIgnored,
     CatalogRewriteFailed,
@@ -102,6 +103,9 @@ impl std::error::Error for RepositoryError {}
 
 pub type Result<T> = std::result::Result<T, RepositoryError>;
 
+static OPEN_REPOSITORIES: LazyLock<ParkingMutex<HashMap<PathBuf, Weak<ConversationRepository>>>> =
+    LazyLock::new(|| ParkingMutex::new(HashMap::new()));
+
 pub struct ConversationRepository {
     locator: ConversationLocator,
     durable_fs: DurableFileSystem,
@@ -149,6 +153,7 @@ impl ConversationRepository {
         })?;
         let mut recovery_items = map_catalog_recovery(&rebuilt.recovery_issues);
         recovery_items.extend(map_repairs(&rebuilt.repairs));
+        recovery_items.extend(scan_workspace_recovery(&rebuilt.accepted));
 
         let mut recovered_incomplete = false;
         for accepted in &mut rebuilt.accepted {
@@ -262,6 +267,9 @@ impl ConversationRepository {
             conversation_locks: ParkingMutex::new(HashMap::new()),
             catalog_lock: TokioMutex::new(()),
         });
+        OPEN_REPOSITORIES
+            .lock()
+            .insert(private_root.clone(), Arc::downgrade(&repository));
         log::info!(
             "[conversation-repository] open complete root={} valid_count={} recovery_item_count={} duration_ms={}",
             private_root.display(),
@@ -275,6 +283,88 @@ impl ConversationRepository {
     #[must_use]
     pub fn root(&self) -> &Path {
         self.locator.root()
+    }
+
+    /// Resolve the already-open canonical writer for a host root without opening a second writer.
+    #[must_use]
+    pub fn lookup_open(private_root: &Path) -> Option<Arc<Self>> {
+        let mut repositories = OPEN_REPOSITORIES.lock();
+        let repository = repositories.get(private_root).and_then(Weak::upgrade);
+        if repository.is_none() {
+            repositories.remove(private_root);
+        }
+        repository
+    }
+
+    /// Resolve the sole bootstrap-opened repository when a compatibility root is configured
+    /// outside the host-state directory. Ambiguous multi-repository processes fail closed.
+    #[must_use]
+    pub fn lookup_single_open() -> Option<Arc<Self>> {
+        let mut repositories = OPEN_REPOSITORIES.lock();
+        let mut open = Vec::new();
+        repositories.retain(|_, repository| {
+            if let Some(repository) = repository.upgrade() {
+                open.push(repository);
+                true
+            } else {
+                false
+            }
+        });
+        (open.len() == 1).then(|| open.pop().expect("one open repository"))
+    }
+
+    pub(crate) fn workspace_path(&self, conversation_id: ConversationId) -> Result<PathBuf> {
+        // Workspace corruption is surfaced by SessionWorkspaceService itself. Do not let the
+        // repository's workspace-only recovery report hide the preserved bytes from that service.
+        let record = self
+            .states
+            .lock()
+            .get(&conversation_id)
+            .map(|state| state.record.clone())
+            .ok_or_else(|| {
+                repository_error(
+                    ConversationErrorCode::ConversationNotFound,
+                    "workspace_path",
+                    Some(conversation_id),
+                    "canonical Conversation was not found".to_string(),
+                )
+            })?;
+        Ok(self
+            .conversation_dir(&record, "workspace_path")?
+            .join("workspace.json"))
+    }
+
+    pub(crate) fn read_workspace_bytes(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Result<Option<Vec<u8>>> {
+        let path = self.workspace_path(conversation_id)?;
+        match fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(repository_error(
+                ConversationErrorCode::ConversationRecoveryRequired,
+                "read_workspace",
+                Some(conversation_id),
+                error.to_string(),
+            )),
+        }
+    }
+
+    pub(crate) fn replace_workspace_bytes(
+        &self,
+        conversation_id: ConversationId,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let path = self.workspace_path(conversation_id)?;
+        self.durable_fs
+            .replace_bytes(&path, bytes)
+            .map_err(|error| durability_error("replace_workspace", conversation_id, error))?;
+        Ok(())
+    }
+
+    pub(crate) fn workspace_lock(&self, conversation_id: ConversationId) -> Arc<TokioMutex<()>> {
+        self.conversation_lock(conversation_id)
     }
 
     #[must_use]
@@ -1075,6 +1165,89 @@ fn persist_metadata_at(
         .replace_bytes(&directory.join(CONVERSATION_METADATA_FILE), &bytes)
         .map_err(|error| durability_error("persist_metadata", record.conversation_id, error))?;
     Ok(())
+}
+
+fn scan_workspace_recovery(
+    accepted: &[AcceptedCanonicalConversation],
+) -> Vec<RepositoryRecoveryItem> {
+    let mut items = Vec::new();
+    for conversation in accepted {
+        let path = conversation.directory.join("workspace.json");
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                items.push(RepositoryRecoveryItem {
+                    code: ConversationErrorCode::ConversationRecoveryRequired,
+                    kind: RepositoryRecoveryKind::WorkspaceRecoveryRequired,
+                    conversation_id: Some(conversation.record.conversation_id),
+                    relative_path: format!(
+                        "{}/{}/workspace.json",
+                        conversation.record.creation_partition.path,
+                        conversation.record.conversation_id
+                    ),
+                    detail: format!("workspace.json could not be read: {error}"),
+                    repaired: false,
+                    requires_action: true,
+                });
+                continue;
+            }
+        };
+        let value: Value = match serde_json::from_slice(&bytes) {
+            Ok(value) => value,
+            Err(error) => {
+                items.push(RepositoryRecoveryItem {
+                    code: ConversationErrorCode::ConversationCorrupt,
+                    kind: RepositoryRecoveryKind::WorkspaceRecoveryRequired,
+                    conversation_id: Some(conversation.record.conversation_id),
+                    relative_path: format!(
+                        "{}/{}/workspace.json",
+                        conversation.record.creation_partition.path,
+                        conversation.record.conversation_id
+                    ),
+                    detail: format!("workspace.json is corrupt: {error}"),
+                    repaired: false,
+                    requires_action: true,
+                });
+                continue;
+            }
+        };
+        let schema_version = value.get("schemaVersion").and_then(Value::as_u64);
+        let workspace_conversation_id = value.get("conversationId").and_then(Value::as_str);
+        if schema_version != Some(1) {
+            items.push(RepositoryRecoveryItem {
+                code: ConversationErrorCode::ConversationUnsupportedSchema,
+                kind: RepositoryRecoveryKind::WorkspaceRecoveryRequired,
+                conversation_id: Some(conversation.record.conversation_id),
+                relative_path: format!(
+                    "{}/{}/workspace.json",
+                    conversation.record.creation_partition.path,
+                    conversation.record.conversation_id
+                ),
+                detail: "workspace.json has an unsupported schemaVersion".to_string(),
+                repaired: false,
+                requires_action: true,
+            });
+        } else if workspace_conversation_id
+            != Some(conversation.record.conversation_id.to_string()).as_deref()
+        {
+            items.push(RepositoryRecoveryItem {
+                code: ConversationErrorCode::ConversationCorrupt,
+                kind: RepositoryRecoveryKind::WorkspaceRecoveryRequired,
+                conversation_id: Some(conversation.record.conversation_id),
+                relative_path: format!(
+                    "{}/{}/workspace.json",
+                    conversation.record.creation_partition.path,
+                    conversation.record.conversation_id
+                ),
+                detail: "workspace.json ConversationId does not match its canonical directory"
+                    .to_string(),
+                repaired: false,
+                requires_action: true,
+            });
+        }
+    }
+    items
 }
 
 fn map_catalog_recovery(issues: &[CatalogRecoveryIssue]) -> Vec<RepositoryRecoveryItem> {

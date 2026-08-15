@@ -171,6 +171,8 @@ export interface ChatMessage {
 
 export interface AcpSession {
   id: SessionId
+  /** Canonical Termul-owned Conversation identity for durable workspace/history operations. */
+  conversationId?: string
   agentId: AgentId
   cwd: string
   /**
@@ -3031,6 +3033,10 @@ export const useAcpStore = create<AcpState>((set, get) => ({
             ...s.sessions,
             [sessionId]: {
               id: sessionId,
+              conversationId:
+                outcome.persistence === 'conversation'
+                  ? outcome.conversationId
+                  : existing?.conversationId,
               agentId,
               cwd,
               projectId,

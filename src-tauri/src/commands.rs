@@ -4362,7 +4362,112 @@ pub fn log_frontend_error(
 }
 
 // ============================================================================
-// Workspace Manifest Commands (CAP-5 / Story 5)
+// SessionWorkspace Commands (Conversation stage 5)
+// ============================================================================
+
+#[tauri::command]
+pub async fn session_workspace_get(
+    conversation_id: String,
+    repository: State<'_, Arc<crate::conversation::ConversationRepository>>,
+) -> Result<IpcResult<crate::conversation::SessionWorkspaceLoadOutcome>, String> {
+    let conversation_id =
+        match crate::conversation::ConversationId::parse_path_component(&conversation_id) {
+            Ok(conversation_id) => conversation_id,
+            Err(error) => {
+                return Ok(IpcResult::error(
+                    error.to_string(),
+                    "CONVERSATION_INVALID_ID",
+                ))
+            }
+        };
+    let service = crate::conversation::SessionWorkspaceService::new(repository.inner().clone());
+    match service.load(conversation_id).await {
+        Ok(outcome) => Ok(IpcResult::success(outcome)),
+        Err(error) => {
+            log::warn!(
+                "[session-workspace-command] get failed conversation_id={} code={}",
+                conversation_id,
+                error.code.as_str()
+            );
+            Ok(IpcResult::error(error.detail, error.code.as_str()))
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn session_workspace_write(
+    conversation_id: String,
+    based_revision: Option<u64>,
+    workspace: serde_json::Value,
+    repository: State<'_, Arc<crate::conversation::ConversationRepository>>,
+) -> Result<IpcResult<crate::conversation::SessionWorkspaceWriteOutcome>, String> {
+    let conversation_id =
+        match crate::conversation::ConversationId::parse_path_component(&conversation_id) {
+            Ok(conversation_id) => conversation_id,
+            Err(error) => {
+                return Ok(IpcResult::error(
+                    error.to_string(),
+                    "CONVERSATION_INVALID_ID",
+                ))
+            }
+        };
+    let workspace: crate::conversation::SessionWorkspaceV1 = match serde_json::from_value(workspace)
+    {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            return Ok(IpcResult::error(
+                format!("payload validation failed: {error}"),
+                "VALIDATION_ERROR",
+            ))
+        }
+    };
+    let service = crate::conversation::SessionWorkspaceService::new(repository.inner().clone());
+    match service
+        .write(conversation_id, based_revision, workspace)
+        .await
+    {
+        Ok(outcome) => Ok(IpcResult::success(outcome)),
+        Err(error) => {
+            log::warn!(
+                "[session-workspace-command] write failed conversation_id={} code={}",
+                conversation_id,
+                error.code.as_str()
+            );
+            Ok(IpcResult::error(error.detail, error.code.as_str()))
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn conversation_recovery_resolve(
+    request: serde_json::Value,
+    repository: State<'_, Arc<crate::conversation::ConversationRepository>>,
+) -> Result<IpcResult<crate::conversation::migration::RecoveryActionResult>, String> {
+    let request: crate::conversation::migration::ResolveRecoveryItemRequest =
+        match serde_json::from_value(request) {
+            Ok(request) => request,
+            Err(error) => {
+                return Ok(IpcResult::error(
+                    format!("payload validation failed: {error}"),
+                    "VALIDATION_ERROR",
+                ))
+            }
+        };
+    let service = crate::conversation::SessionWorkspaceService::new(repository.inner().clone());
+    match service.resolve_recovery(request).await {
+        Ok(outcome) => Ok(IpcResult::success(outcome)),
+        Err(error) => {
+            log::warn!(
+                "[session-workspace-command] recovery failed code={}",
+                error.code.as_str()
+            );
+            Ok(IpcResult::error(error.detail, error.code.as_str()))
+        }
+    }
+}
+
+// ============================================================================
+// Workspace Manifest Commands (legacy read-only compatibility)
 // ============================================================================
 //
 // Host-owned versioned workspace manifests — one per project, atomically

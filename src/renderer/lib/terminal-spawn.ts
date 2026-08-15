@@ -14,6 +14,7 @@ import { logFrontendError } from '@/lib/log-api'
 import { ensureWorktreeSymlinks } from '@/lib/worktree-context'
 import { useAppSettingsStore } from '@/stores/app-settings-store'
 import { useProjectStore } from '@/stores/project-store'
+import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
 import { useTerminalStore } from '@/stores/terminal-store'
 import { useWorkspaceStore } from '@/stores/workspace-store'
 
@@ -122,6 +123,14 @@ export async function spawnTerminalInPane(
       shell,
       cwd
     )
+    const conversationId = useSessionWorkspaceSyncStore.getState().activeConversationId
+    if (conversationId) {
+      useTerminalStore.setState((state) => ({
+        terminals: state.terminals.map((candidate) =>
+          candidate.id === terminal.id ? { ...candidate, conversationId } : candidate
+        )
+      }))
+    }
 
     // Link PTY ID to terminal record
     terminalStore.setTerminalPtyId(terminal.id, spawnResult.data.id)

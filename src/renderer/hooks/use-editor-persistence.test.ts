@@ -177,7 +177,7 @@ const {
     getBasedRevision: vi.fn(() => null),
     hasPendingConflict: vi.fn(() => false),
     pendingConflict: null,
-    basedRevisionByProject: {},
+    legacyRevisionByProject: {},
     manifestRestoreInProgressByProject: {}
   }
 }))
@@ -764,12 +764,9 @@ describe('useEditorPersistence', () => {
     })
   })
 
-  // P3: manifest-wins integration — when getManifest returns a real manifest,
-  // loadWorkspaceManifest rebuilds the tree from the manifest's portable
-  // topology and the legacy paneLayout path (reconcileTerminalTabs +
-  // loadPersistedTerminals) is skipped. Asserts the workspace root matches
-  // the manifest-rebuilt tree (leaf id from manifest), NOT the paneLayout tree.
-  it('uses the manifest-rebuilt tree and skips the legacy paneLayout path when a manifest exists', async () => {
+  // Stage-5 cutover: preserved project manifests are inspection-only. Their editor evidence may
+  // be opened, but the Conversation-independent project pane tree is never restored as live state.
+  it('inspects a legacy manifest but restores the renderer-local paneLayout instead', async () => {
     mockPersistenceRead.mockResolvedValue({
       success: true,
       data: {
@@ -811,23 +808,15 @@ describe('useEditorPersistence', () => {
       expect(mockGetManifest).toHaveBeenCalledWith('project-a')
     })
 
-    // The manifest path rebuilt the tree → loadProjectWorkspace called with
-    // the manifest-rebuilt root (leaf id 'manifest-leaf-A'), NOT 'legacy-leaf'.
     await waitFor(() => {
       expect(mockWorkspaceState.loadProjectWorkspace).toHaveBeenCalledTimes(1)
     })
-    const [restoredRootArg, activePaneIdArg] = mockWorkspaceState.loadProjectWorkspace.mock.calls[0]
-    expect((restoredRootArg as { id: string }).id).toBe('manifest-leaf-A')
-    expect(activePaneIdArg).toBe('manifest-leaf-A')
-
-    // The legacy path is skipped: loadPersistedTerminals + reconcileTerminalTabs
-    // (which would call loadProjectWorkspace with the 'legacy-leaf' tree) are
-    // NOT invoked.
-    expect(mockLoadPersistedTerminals).not.toHaveBeenCalled()
+    const [restoredRootArg] = mockWorkspaceState.loadProjectWorkspace.mock.calls[0]
+    expect((restoredRootArg as { id: string }).id).toBe('legacy-leaf')
+    expect(mockLoadPersistedTerminals).toHaveBeenCalled()
     expect(mockWorkspaceState.resetLayout).not.toHaveBeenCalled()
-    expect(mockWorkspaceState.syncEditorTabs).not.toHaveBeenCalled()
 
-    // P2: the manifest's editor descriptors are seeded into openFiles.
+    // Preserved manifest editor paths remain inspectable, without applying its pane topology.
     expect(mockEditorState.openFile).toHaveBeenCalledWith('/manifest/file.ts')
   })
 
