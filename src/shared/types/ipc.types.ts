@@ -1,5 +1,6 @@
 // IPC Result pattern from architecture.md
 import type { AcpCatalog } from './acp-catalog.types'
+import type { ConversationId } from './conversation.types'
 import type { WorkspaceManifest, WriteOutcome } from './workspace-manifest.types'
 
 export type IpcResult<T> =
@@ -23,13 +24,11 @@ export interface TerminalSpawnOptions {
   /** argv tail; each element is passed as a discrete, unescaped argument. */
   args?: string[]
   /** Descriptive marker for the session type. Defaults to 'shell'. */
-  kind?: 'shell' | 'agent'
-  /**
-   * Project-scoping id. The web/remote terminal server (terminal_ws.rs)
-   * requires a non-empty projectId on every spawn (project-scoped security);
-   * desktop treats it as optional (SpawnOptions.project_id is Option<String>
-   * with #[serde(default)]). Renderers populate it at project-scoped call sites.
-   */
+  kind?: 'shell' | 'agent' | 'ssh'
+  /** Canonical primary ownership/authorization scope. Required for every
+   * durable user terminal; only explicitly ephemeral SSH terminals omit it. */
+  conversationId?: ConversationId
+  /** Optional attribution/filter only. Never terminal ownership. */
   projectId?: string
   // Index signature to satisfy Tauri's InvokeArgs constraint
   [key: string]: unknown
@@ -92,6 +91,9 @@ export type TerminalIpcChannels = {
   'terminal:revoke_claim': (terminalId: string, claim: string) => IpcResult<void>
   'terminal:write': (terminalId: string, data: string) => IpcResult<void>
   'terminal:resize': (terminalId: string, cols: number, rows: number) => IpcResult<void>
+  'terminal:close_view': (terminalId: string) => IpcResult<void>
+  'terminal:terminate': (terminalId: string) => IpcResult<void>
+  /** @deprecated compatibility alias for terminal:terminate */
   'terminal:kill': (terminalId: string) => IpcResult<void>
 }
 
@@ -253,6 +255,11 @@ export interface TerminalApi {
   revokeClaim: (terminalId: string, claim: string) => Promise<IpcResult<void>>
   write: (terminalId: string, data: string) => Promise<IpcResult<void>>
   resize: (terminalId: string, cols: number, rows: number) => Promise<IpcResult<void>>
+  /** Close/detach the renderer view without destroying the PTY or claim. */
+  closeView: (terminalId: string) => Promise<IpcResult<void>>
+  /** The sole user-facing destructive terminal resource operation. */
+  terminate: (terminalId: string) => Promise<IpcResult<void>>
+  /** @deprecated compatibility alias for terminate. */
   kill: (terminalId: string) => Promise<IpcResult<void>>
   onData: (callback: TerminalDataCallback) => () => void
   onExit: (callback: TerminalExitCallback) => () => void
@@ -273,6 +280,7 @@ export const IpcErrorCodes = {
   SPAWN_FAILED: 'SPAWN_FAILED',
   WRITE_FAILED: 'WRITE_FAILED',
   RESIZE_FAILED: 'RESIZE_FAILED',
+  TERMINATE_FAILED: 'TERMINATE_FAILED',
   KILL_FAILED: 'KILL_FAILED',
   DIALOG_CANCELED: 'DIALOG_CANCELED',
   VALIDATION_ERROR: 'VALIDATION_ERROR',

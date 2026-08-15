@@ -105,6 +105,8 @@ describe('API Bridge (api.ts)', () => {
       expect(typeof terminalApi.spawn).toBe('function')
       expect(typeof terminalApi.write).toBe('function')
       expect(typeof terminalApi.resize).toBe('function')
+      expect(typeof terminalApi.closeView).toBe('function')
+      expect(typeof terminalApi.terminate).toBe('function')
       expect(typeof terminalApi.kill).toBe('function')
     })
 

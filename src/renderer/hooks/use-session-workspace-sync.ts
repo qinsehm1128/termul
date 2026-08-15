@@ -94,12 +94,11 @@ export function buildSessionWorkspace(conversationId: ConversationId): SessionWo
   const resources: SessionWorkspaceResourceDescriptor[] = []
 
   for (const terminal of useTerminalStore.getState().terminals) {
-    if (terminal.conversationId !== conversationId || !referencedTerminals.has(terminal.id)) {
-      continue
-    }
+    if (terminal.conversationId !== conversationId || !terminal.ptyId) continue
     const descriptor: TerminalResourceDescriptor = {
       kind: 'terminal',
-      terminalId: terminal.id,
+      terminalId: terminal.ptyId,
+      terminalRecordId: terminal.id,
       conversationId
     }
     resources.push(descriptor)
@@ -196,8 +195,9 @@ function loadConversationWorkspace(
   const terminals = new Map<string, TerminalResourceDescriptor>()
   const editors = new Map<string, EditorResourceDescriptor>()
   for (const resource of workspace.resources) {
-    if (resource.kind === 'terminal') terminals.set(resource.terminalId, resource)
-    else editors.set(resource.editorId, resource)
+    if (resource.kind === 'terminal') {
+      terminals.set(resource.terminalRecordId ?? resource.terminalId, resource)
+    } else editors.set(resource.editorId, resource)
   }
   let root: PaneNode = workspace.topology
     ? rebuildTopology(workspace.topology, terminals, editors, conversationId)

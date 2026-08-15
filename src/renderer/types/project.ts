@@ -70,14 +70,16 @@ export function isWorktreeTermulManaged(worktree: Worktree): boolean {
 }
 
 export type TerminalHealthStatus = 'running' | 'crashed' | 'hibernated' | 'disconnected'
+export type TerminalViewState = 'visible' | 'hidden' | 'detached'
 
 export interface Terminal {
   id: string
-  /** Canonical Conversation that may persist a passive reference to this terminal. */
-  conversationId?: string
+  /** Canonical primary PTY ownership and authorization scope. */
+  conversationId: string
   ptyId?: string
   name: string
-  projectId: string
+  /** Optional attribution/filter only; never ownership or authorization. */
+  projectId?: string
   shell: string
   cwd?: string
   worktreeId?: string
@@ -97,7 +99,9 @@ export interface Terminal {
   detachedOutput?: string // Raw PTY output captured while no renderer is mounted
   rendererAttachmentCount?: number // Number of mounted renderers bound to this PTY
   healthStatus?: TerminalHealthStatus // Terminal health status
-  isHidden?: boolean // Whether terminal is currently hidden within the workspace/pane model
+  /** Explicit view lifecycle, independent from the live PTY resource. */
+  viewState?: TerminalViewState
+  isHidden?: boolean // Compatibility mirror of viewState === 'hidden' | 'detached'
   hiddenSince?: number // Timestamp when terminal became hidden within the workspace/pane model
   isAppHidden?: boolean // Whether the entire app/window is currently hidden or minimized
   appHiddenSince?: number // Timestamp when the app-hidden retention window started

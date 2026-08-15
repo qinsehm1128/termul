@@ -23,6 +23,7 @@ import { useRemoteProjects } from './hooks/use-remote-projects'
 import { useSessionWorkspaceBootstrap } from './hooks/use-session-workspace-sync'
 import { useTerminalDetachedOutput } from './hooks/use-terminal-detached-output'
 import { useTerminalExitNotification } from './hooks/use-terminal-exit-notification'
+import { useTerminalResourceLifecycle } from './hooks/use-terminal-resource-lifecycle'
 import { useTerminalRestore } from './hooks/use-terminal-restore'
 import { useWhatsNew } from './hooks/use-whats-new'
 import { useTerminalAutoSave } from './hooks/useTerminalAutoSave'
@@ -116,6 +117,7 @@ function AppEffects(): null {
   useTerminalAutoSave()
   useSessionWorkspaceBootstrap()
   useConversationLifecycle()
+  useTerminalResourceLifecycle()
   useTerminalRestore()
   useCrashRecovery()
   useTerminalDetachedOutput()

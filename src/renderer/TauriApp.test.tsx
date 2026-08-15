@@ -3,12 +3,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { CONTEXT_BAR_SETTINGS_KEY } from '@/types/settings'
 import TauriApp from './TauriApp'
 
-const { mockPersistenceRead, mockSessionWorkspaceBootstrap, mockConversationLifecycle } =
-  vi.hoisted(() => ({
-    mockPersistenceRead: vi.fn(),
-    mockSessionWorkspaceBootstrap: vi.fn(),
-    mockConversationLifecycle: vi.fn()
-  }))
+const {
+  mockPersistenceRead,
+  mockSessionWorkspaceBootstrap,
+  mockConversationLifecycle,
+  mockTerminalResourceLifecycle
+} = vi.hoisted(() => ({
+  mockPersistenceRead: vi.fn(),
+  mockSessionWorkspaceBootstrap: vi.fn(),
+  mockConversationLifecycle: vi.fn(),
+  mockTerminalResourceLifecycle: vi.fn()
+}))
 
 vi.mock('@/lib/api', () => ({
   persistenceApi: {
@@ -36,6 +41,10 @@ vi.mock('@/hooks/use-session-workspace-sync', () => ({
 
 vi.mock('./hooks/use-conversation-lifecycle', () => ({
   useConversationLifecycle: mockConversationLifecycle
+}))
+
+vi.mock('./hooks/use-terminal-resource-lifecycle', () => ({
+  useTerminalResourceLifecycle: mockTerminalResourceLifecycle
 }))
 
 vi.mock('@/hooks/use-window-state', () => ({
@@ -171,5 +180,10 @@ describe('TauriApp', () => {
   it('mounts Conversation lifecycle reconciliation at the desktop root', () => {
     render(<TauriApp />)
     expect(mockConversationLifecycle).toHaveBeenCalledTimes(1)
+  })
+
+  it('mounts terminal resource reconciliation at the desktop root', () => {
+    render(<TauriApp />)
+    expect(mockTerminalResourceLifecycle).toHaveBeenCalledTimes(1)
   })
 })

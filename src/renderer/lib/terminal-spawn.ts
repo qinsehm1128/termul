@@ -19,6 +19,8 @@ import { useTerminalStore } from '@/stores/terminal-store'
 import { useWorkspaceStore } from '@/stores/workspace-store'
 
 export interface SpawnTerminalOptions {
+  /** Override the active Conversation scope (used by restart). */
+  conversationId?: string
   /** Shell path/name. If omitted, resolves from project default → app default. */
   shell?: string
   /** Project environment variables for spawn. */
@@ -47,6 +49,17 @@ export async function spawnTerminalInPane(
 ): Promise<SpawnTerminalResult> {
   const terminalStore = useTerminalStore.getState()
   const workspaceStore = useWorkspaceStore.getState()
+  const conversationId =
+    options?.conversationId ?? useSessionWorkspaceSyncStore.getState().activeConversationId
+  if (!conversationId) {
+    return {
+      success: false,
+      error: i18n.t('lifecycle.conversationScopeRequired', {
+        ns: 'terminal',
+        defaultValue: 'Open a Conversation before creating a durable terminal'
+      })
+    }
+  }
 
   // Check per-project terminal limit
   if (options?.maxTerminalsPerProject !== undefined) {
@@ -95,6 +108,7 @@ export async function spawnTerminalInPane(
     const spawnResult = await terminalApi.spawn({
       shell,
       cwd,
+      conversationId,
       projectId,
       ...(hasProjectEnv ? { env } : {})
     })
@@ -121,16 +135,10 @@ export async function spawnTerminalInPane(
       }),
       projectId,
       shell,
-      cwd
+      cwd,
+      undefined,
+      conversationId
     )
-    const conversationId = useSessionWorkspaceSyncStore.getState().activeConversationId
-    if (conversationId) {
-      useTerminalStore.setState((state) => ({
-        terminals: state.terminals.map((candidate) =>
-          candidate.id === terminal.id ? { ...candidate, conversationId } : candidate
-        )
-      }))
-    }
 
     // Link PTY ID to terminal record
     terminalStore.setTerminalPtyId(terminal.id, spawnResult.data.id)

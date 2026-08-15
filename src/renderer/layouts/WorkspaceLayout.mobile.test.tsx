@@ -63,7 +63,12 @@ vi.mock('@/stores/project-store', () => ({
 }))
 
 vi.mock('@/stores/terminal-store', () => ({
-  useTerminalStore: vi.fn((selector) => selector({ terminals: [] })),
+  useTerminalStore: Object.assign(
+    vi.fn((selector) => selector({ terminals: [] })),
+    {
+      getState: () => ({ terminals: [], findTerminalByPtyId: () => undefined })
+    }
+  ),
   useTerminals: () => [],
   useAllTerminals: () => [],
   useActiveTerminal: () => null,
@@ -72,6 +77,10 @@ vi.mock('@/stores/terminal-store', () => ({
     selectTerminal: vi.fn(),
     addTerminal: vi.fn(),
     closeTerminal: vi.fn(),
+    closeTerminalView: vi.fn(async () => true),
+    reopenTerminalView: vi.fn(),
+    terminateTerminalResource: vi.fn(async () => true),
+    restartTerminalResource: vi.fn(async () => true),
     renameTerminal: vi.fn(),
     reorderTerminals: vi.fn(),
     setTerminalPtyId: vi.fn(),

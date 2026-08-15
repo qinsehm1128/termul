@@ -1065,6 +1065,7 @@ mod tests {
                     active_pane_id: None,
                     resources: vec![SessionWorkspaceResourceDescriptor::Terminal {
                         terminal_id: "terminal-live".to_string(),
+                        terminal_record_id: None,
                         conversation_id: fixture.id,
                     }],
                     projection_state: SessionWorkspaceProjectionState::Native,

@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { useTerminalStore } from '@/stores/terminal-store'
 import { MobileChatShell } from './MobileChatShell'
 
 const {
@@ -12,7 +13,8 @@ const {
   mockReplaceBinding,
   mockDeleteConversation,
   projectRef,
-  tauriRef
+  tauriRef,
+  mockReopenTerminalView
 } = vi.hoisted(() => ({
   mockNavigate: vi.fn(),
   mockCloseChatView: vi.fn(),
@@ -26,7 +28,8 @@ const {
   // and the shell into web/remote mode (where the project-switcher button +
   // drawer are mounted).
   projectRef: { current: { id: 'p1', name: 'Demo', path: '/demo' } as { path?: string } },
-  tauriRef: { current: true as boolean }
+  tauriRef: { current: true as boolean },
+  mockReopenTerminalView: vi.fn()
 }))
 
 vi.mock('react-router-dom', async () => {
@@ -50,8 +53,17 @@ vi.mock('@/stores/workspace-store', () => ({
       activeTabId: 'tab-1'
     }
   ],
-  useWorkspaceStore: (sel: (s: { root: unknown; activePaneId: string }) => unknown) =>
-    sel({ root: {}, activePaneId: 'pane-1' })
+  useWorkspaceStore: Object.assign(
+    (sel: (s: { root: unknown; activePaneId: string }) => unknown) =>
+      sel({ root: {}, activePaneId: 'pane-1' }),
+    {
+      getState: () => ({
+        activePaneId: 'pane-1',
+        setActiveTab: vi.fn(),
+        reopenTerminalView: mockReopenTerminalView
+      })
+    }
+  )
 }))
 
 vi.mock('@/stores/acp-store', () => ({
@@ -137,6 +149,8 @@ describe('MobileChatShell', () => {
     mockSuspendBinding.mockReset()
     mockReplaceBinding.mockReset()
     mockDeleteConversation.mockReset()
+    mockReopenTerminalView.mockReset()
+    useTerminalStore.setState({ terminals: [], activeTerminalId: '', ptyIdIndex: new Map() })
     tauriRef.current = true
     projectRef.current = { id: 'p1', name: 'Demo', path: '/demo' }
   })
@@ -429,5 +443,51 @@ describe('MobileChatShell', () => {
 
     fireEvent.click(screen.getByLabelText('Open menu'))
     expect(screen.getByLabelText('Git history')).toBeDisabled()
+  })
+  it('lists hidden live Conversation terminals as reopenable and separates close from terminate', () => {
+    useTerminalStore.setState({
+      terminals: [
+        {
+          id: 'terminal-hidden',
+          conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+          projectId: 'p1',
+          name: 'Hidden live terminal',
+          shell: 'bash',
+          ptyId: 'pty-hidden',
+          claim: 'memory-only',
+          viewState: 'hidden',
+          healthStatus: 'running'
+        }
+      ],
+      ptyIdIndex: new Map([['pty-hidden', 'terminal-hidden']])
+    })
+    const onCloseTerminal = vi.fn()
+    const onTerminateTerminal = vi.fn()
+    render(
+      <MemoryRouter>
+        <MobileChatShell
+          onNewChat={vi.fn()}
+          canNewChat
+          onCloseTerminal={onCloseTerminal}
+          onTerminateTerminal={onTerminateTerminal}
+        >
+          <div>chat body</div>
+        </MobileChatShell>
+      </MemoryRouter>
+    )
+
+    fireEvent.click(screen.getByLabelText('Open menu'))
+    const reopen = screen.getByRole('button', { name: /Hidden live terminal.*Reopen/i })
+    expect(reopen).toHaveClass('h-11')
+    fireEvent.click(reopen)
+    expect(mockReopenTerminalView).toHaveBeenCalledWith('terminal-hidden')
+    expect(onCloseTerminal).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByLabelText('Open menu'))
+    const terminate = screen.getByLabelText('Terminate terminal process')
+    expect(terminate).toHaveClass('size-11')
+    fireEvent.click(terminate)
+    expect(onTerminateTerminal).toHaveBeenCalledWith('terminal-hidden', undefined)
+    expect(onCloseTerminal).not.toHaveBeenCalled()
   })
 })

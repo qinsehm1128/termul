@@ -12,11 +12,13 @@ import {
   Search,
   Settings,
   TerminalSquare,
+  Trash2,
   X
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useNavigate } from 'react-router-dom'
+import { useShallow } from 'zustand/shallow'
 import { ConversationLifecycleActions } from '@/components/chat/ChatHistoryEntryRow'
 import { ChatHistoryTab } from '@/components/chat/ChatHistoryTab'
 import { ProjectSwitcherDrawer } from '@/components/chat/ProjectSwitcherDrawer'
@@ -51,6 +53,7 @@ interface MobileChatShellProps {
   onOpenGitHistory?: () => void
   onNewTerminal?: () => void
   onCloseTerminal?: (terminalId: string, tabId: string) => void
+  onTerminateTerminal?: (terminalId: string, tabId?: string) => void
   onRenameTerminal?: (terminalId: string, name: string) => void
   onRestartTerminal?: (terminalId: string) => void
 }
@@ -69,6 +72,7 @@ export function MobileChatShell({
   onOpenGitHistory,
   onNewTerminal,
   onCloseTerminal,
+  onTerminateTerminal,
   onRenameTerminal,
   onRestartTerminal
 }: MobileChatShellProps): React.JSX.Element {
@@ -99,6 +103,7 @@ export function MobileChatShell({
   const activeTerminal = useTerminalStore((s) =>
     activeTerminalId ? s.terminals.find((terminal) => terminal.id === activeTerminalId) : undefined
   )
+  const allTerminals = useTerminalStore(useShallow((state) => state.terminals))
 
   // Terminal tabs across ALL leaf panes. Derive via useMemo from the stable
   // `root` reference so the wrapper objects are only rebuilt when the tree
@@ -128,6 +133,15 @@ export function MobileChatShell({
       s.sessionIndex.find((entry) => entry.id === activeSessionId)?.conversationId
     )
   })
+  const conversationTerminals = useMemo(
+    () =>
+      activeConversationId
+        ? allTerminals.filter((terminal) => terminal.conversationId === activeConversationId)
+        : terminalTabs
+            .map(({ tab }) => allTerminals.find((terminal) => terminal.id === tab.terminalId))
+            .filter((terminal): terminal is NonNullable<typeof terminal> => Boolean(terminal)),
+    [activeConversationId, allTerminals, terminalTabs]
+  )
 
   const headerTitle = useMemo(() => {
     if (activeTerminal?.name) return activeTerminal.name
@@ -257,7 +271,7 @@ export function MobileChatShell({
               variant="ghost"
               size="icon"
               className="size-10 shrink-0"
-              aria-label={t('chatShell.closeTerminal')}
+              aria-label={t('chatShell.closeTerminalView')}
               onClick={() => onCloseTerminal?.(activeTab.terminalId, activeTab.id)}
             >
               <X size={20} />
@@ -383,39 +397,49 @@ export function MobileChatShell({
                 <Plus size={16} />
               </Button>
             </div>
-            {terminalTabs.length === 0 ? (
+            {conversationTerminals.length === 0 ? (
               <p className="px-2 py-2 text-xs text-muted-foreground">
                 {t('chatShell.noOpenTerminals')}
               </p>
             ) : (
-              terminalTabs.map(({ tab, paneId }) => {
-                const terminal = useTerminalStore
-                  .getState()
-                  .terminals.find((item) => item.id === tab.terminalId)
-                const isActive = tab.id === activeTab?.id
-                const isRenaming = renamingId === tab.terminalId
+              conversationTerminals.map((terminal) => {
+                const tabEntry = terminalTabs.find((entry) => entry.tab.terminalId === terminal.id)
+                const isActive = tabEntry?.tab.id === activeTab?.id
+                const isRenaming = renamingId === terminal.id
+                const isHidden = terminal.viewState !== 'visible' || !tabEntry
                 return (
-                  <div key={tab.id} className="flex items-center gap-1">
+                  <div key={terminal.id} className="flex items-center gap-1">
                     <Button
                       type="button"
                       variant={isActive ? 'secondary' : 'ghost'}
-                      className="h-10 flex-1 justify-start gap-2"
-                      onClick={() => selectTerminal(paneId, tab.id)}
+                      className="h-11 min-w-0 flex-1 justify-start gap-2"
+                      onClick={() => {
+                        if (tabEntry) selectTerminal(tabEntry.paneId, tabEntry.tab.id)
+                        else {
+                          useWorkspaceStore.getState().reopenTerminalView(terminal.id)
+                          closeDrawer()
+                        }
+                      }}
                     >
                       <TerminalSquare size={16} />
-                      <span className="truncate">{terminal?.name ?? t('chatShell.terminal')}</span>
+                      <span className="truncate">{terminal.name}</span>
+                      {isHidden && (
+                        <span className="ml-auto text-[10px] text-muted-foreground">
+                          {t('chatShell.reopenTerminal')}
+                        </span>
+                      )}
                     </Button>
                     {isRenaming ? (
                       <input
                         type="text"
                         value={renameValue}
-                        onChange={(e) => setRenameValue(e.target.value)}
+                        onChange={(event) => setRenameValue(event.target.value)}
                         onBlur={confirmRename}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') confirmRename()
-                          if (e.key === 'Escape') setRenamingId(null)
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter') confirmRename()
+                          if (event.key === 'Escape') setRenamingId(null)
                         }}
-                        className="h-8 w-24 rounded border border-border bg-background px-2 text-xs"
+                        className="h-11 w-24 rounded border border-border bg-background px-2 text-xs"
                         autoFocus
                       />
                     ) : (
@@ -424,28 +448,36 @@ export function MobileChatShell({
                           type="button"
                           variant="ghost"
                           size="icon"
-                          className="size-8 shrink-0"
+                          className="size-11 shrink-0"
                           aria-label={t('chatShell.renameTerminal')}
-                          onClick={() =>
-                            startRename(tab.terminalId, terminal?.name ?? t('chatShell.terminal'))
-                          }
+                          onClick={() => startRename(terminal.id, terminal.name)}
                         >
                           <Pencil size={14} />
                         </Button>
                       )
                     )}
-                    {onCloseTerminal && (
+                    {!isHidden && tabEntry && onCloseTerminal && (
                       <Button
                         type="button"
                         variant="ghost"
                         size="icon"
-                        className="size-8 shrink-0"
-                        aria-label={t('chatShell.closeTerminal')}
-                        onClick={() => {
-                          onCloseTerminal(tab.terminalId, tab.id)
-                        }}
+                        className="size-11 shrink-0"
+                        aria-label={t('chatShell.closeTerminalView')}
+                        onClick={() => onCloseTerminal(terminal.id, tabEntry.tab.id)}
                       >
                         <X size={14} />
+                      </Button>
+                    )}
+                    {onTerminateTerminal && (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className="size-11 shrink-0 text-destructive hover:text-destructive"
+                        aria-label={t('chatShell.terminateTerminal')}
+                        onClick={() => onTerminateTerminal(terminal.id, tabEntry?.tab.id)}
+                      >
+                        <Trash2 size={14} />
                       </Button>
                     )}
                   </div>

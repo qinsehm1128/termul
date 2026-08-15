@@ -25,7 +25,10 @@
     "newTerminal": "New terminal",
     "noOpenTerminals": "No open terminals",
     "terminal": "Terminal",
-    "renameTerminal": "Rename terminal"
+    "renameTerminal": "Rename terminal",
+    "closeTerminalView": "Close terminal view",
+    "terminateTerminal": "Terminate terminal process",
+    "reopenTerminal": "Reopen"
   },
   "files": {
     "title": "Files",

@@ -37,6 +37,7 @@ vi.mock('./useTerminalAutoSave', () => ({
 vi.mock('@/lib/api', () => ({
   terminalApi: {
     spawn: mockTerminalSpawn,
+    terminate: mockTerminalKill,
     kill: mockTerminalKill
   },
   sessionApi: {
@@ -85,6 +86,14 @@ const mockProjectState = {
     { id: 'project-b', path: '/projects/b' }
   ]
 }
+
+vi.mock('../stores/session-workspace-sync-store', () => ({
+  useSessionWorkspaceSyncStore: {
+    getState: () => ({
+      activeConversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+    })
+  }
+}))
 
 vi.mock('../stores/project-store', () => ({
   useProjectStore: Object.assign(

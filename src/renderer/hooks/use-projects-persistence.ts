@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useRef } from 'react'
 import { getAcpTransport } from '@/lib/acp-transport'
-import { persistenceApi, secureStorageApi, syncProjects, terminalApi, worktreeApi } from '@/lib/api'
+import { persistenceApi, secureStorageApi, syncProjects, worktreeApi } from '@/lib/api'
 import { isTauriContext } from '@/lib/tauri-runtime'
-import { setTerminalProtected } from '@/lib/terminal-api'
 import { randomUUID } from '@/lib/uuid'
 import { webServerProjects } from '@/lib/web-server-api'
 import { useAcpStore } from '@/stores/acp-store'
@@ -664,33 +663,10 @@ export function useDeleteProjectWithCascade(): (id: string) => Promise<void> {
       await deleteSecrets(project.id, project.envVars)
     }
 
-    // Kill the project's live PTYs so the backend reclaims them. The terminals
-    // are genuinely released here (the project is being deleted), so they must
-    // not stay alive/protected and leak. kill() removes them from the backend
-    // terminal map; we also drop them from the renderer store.
-    const projectTerminals = useTerminalStore.getState().terminals.filter((t) => t.projectId === id)
-    for (const terminal of projectTerminals) {
-      if (terminal.ptyId) {
-        try {
-          // kill() returns an IpcResult; a soft failure does not throw. The
-          // project is being deleted regardless, so we always proceed to drop
-          // the renderer record below — we just surface a failed kill in logs
-          // (e.g. the backend deferring a kill while the window is hidden still
-          // reports success, so this only logs genuine failures).
-          const result = await terminalApi.kill(terminal.ptyId)
-          if (!result.success) {
-            console.warn('Failed to kill PTY during project delete:', result.error)
-            // Best-effort fallback: allow orphan cleanup if PTY still exists
-            await setTerminalProtected(terminal.ptyId, false).catch((error) => {
-              console.warn('Failed to clear PTY protection during project delete:', error)
-            })
-          }
-        } catch (error) {
-          console.warn('Failed to kill PTY during project delete:', error)
-        }
-      }
-      useTerminalStore.getState().closeTerminal(terminal.id, id)
-    }
+    // Project attribution is secondary to Conversation ownership. Deleting a
+    // project therefore hides its terminal views but never terminates or drops
+    // Conversation-scoped PTYs, claims, or passive workspace refs.
+    useTerminalStore.getState().cleanupProjectTerminals(id)
 
     // Delete the project from the store
     useProjectStore.getState().deleteProject(id)

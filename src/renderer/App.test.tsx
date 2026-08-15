@@ -4,12 +4,17 @@ import { useUpdaterStore } from '@/stores/updater-store'
 import { CONTEXT_BAR_SETTINGS_KEY } from '@/types/settings'
 import App from './App'
 
-const { mockContextBarSettingsRead, mockSessionWorkspaceBootstrap, mockConversationLifecycle } =
-  vi.hoisted(() => ({
-    mockContextBarSettingsRead: vi.fn(),
-    mockSessionWorkspaceBootstrap: vi.fn(),
-    mockConversationLifecycle: vi.fn()
-  }))
+const {
+  mockContextBarSettingsRead,
+  mockSessionWorkspaceBootstrap,
+  mockConversationLifecycle,
+  mockTerminalResourceLifecycle
+} = vi.hoisted(() => ({
+  mockContextBarSettingsRead: vi.fn(),
+  mockSessionWorkspaceBootstrap: vi.fn(),
+  mockConversationLifecycle: vi.fn(),
+  mockTerminalResourceLifecycle: vi.fn()
+}))
 
 vi.mock('./hooks/use-session-workspace-sync', () => ({
   useSessionWorkspaceBootstrap: mockSessionWorkspaceBootstrap,
@@ -20,6 +25,10 @@ vi.mock('./hooks/use-session-workspace-sync', () => ({
 
 vi.mock('./hooks/use-conversation-lifecycle', () => ({
   useConversationLifecycle: mockConversationLifecycle
+}))
+
+vi.mock('./hooks/use-terminal-resource-lifecycle', () => ({
+  useTerminalResourceLifecycle: mockTerminalResourceLifecycle
 }))
 
 vi.mock('./hooks/use-context-bar-settings', () => ({
@@ -231,6 +240,11 @@ describe('App Routes', () => {
   it('mounts Conversation lifecycle reconciliation at the web root', () => {
     render(<App />)
     expect(mockConversationLifecycle).toHaveBeenCalledTimes(1)
+  })
+
+  it('mounts terminal resource reconciliation at the web root', () => {
+    render(<App />)
+    expect(mockTerminalResourceLifecycle).toHaveBeenCalledTimes(1)
   })
 })
 

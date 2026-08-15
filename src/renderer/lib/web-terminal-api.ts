@@ -148,7 +148,7 @@ export class WebTerminalClient {
         // re-attached — mark them disconnected (no credential is ever
         // presented id-only, and a rejected credential is never re-presented).
         for (const [terminalId, tracker] of this.trackers) {
-          if (tracker.exited) continue
+          if (tracker.exited || tracker.refCount <= 0) continue
           if (!tracker.claim) {
             tracker.disconnected = true
             continue
@@ -314,7 +314,16 @@ export class WebTerminalClient {
     }
   }
 
-  /** Remove a terminal from tracking (used after kill/exit). */
+  /** Close every renderer attachment while retaining the claim/cursor tracker. */
+  async closeView(terminalId: string): Promise<IpcResult<void>> {
+    const tracker = this.trackers.get(terminalId)
+    if (!tracker) return { success: true, data: undefined }
+    const result = await this.request<void>('close_view', { terminalId })
+    if (result.success) tracker.refCount = 0
+    return result
+  }
+
+  /** Remove a terminal from tracking (used only after explicit terminate/exit). */
   removeTracker(terminalId: string): void {
     void this.request('detach', { terminalId }).catch(() => {})
     this.trackers.delete(terminalId)
@@ -477,7 +486,7 @@ export class WebTerminalClient {
     // Stop reconnecting if no terminal is both live AND holds a lease
     // credential — exited/disconnected terminals are never re-presented.
     const activeCount = Array.from(this.trackers.values()).filter(
-      (t) => !t.exited && !t.disconnected
+      (t) => !t.exited && !t.disconnected && t.refCount > 0
     ).length
     if (activeCount === 0) return
     if (this.reconnectAttempt >= RECONNECT_MAX_ATTEMPTS) return
@@ -622,10 +631,8 @@ export function createWebTerminalApi(): TerminalApi {
           client.adoptClaim(result.data.id, result.data.claim)
           const attachResult = await client.attach(result.data.id, result.data.claim)
           if (!attachResult.success) {
-            // Attach failed — the PTY exists but we can't receive output.
-            // Kill it to avoid orphaning, and return the attach failure.
-            void client.request('kill', { terminalId: result.data.id })
-            client.removeTracker(result.data.id)
+            // A failed view attach is non-destructive. The PTY and claim remain
+            // eligible for a later explicit reopen/reconnect.
             return { success: false, error: attachResult.error, code: attachResult.code }
           }
         } else {
@@ -660,11 +667,16 @@ export function createWebTerminalApi(): TerminalApi {
     },
     write: (terminalId, data) => client.request('write', { terminalId, data }),
     resize: (terminalId, cols, rows) => client.request('resize', { terminalId, cols, rows }),
+    closeView: (terminalId) => client.closeView(terminalId),
+    async terminate(terminalId): Promise<IpcResult<void>> {
+      const result = await client.request<void>('terminate', { terminalId })
+      if (result.success) client.removeTracker(terminalId)
+      return result
+    },
+    /** @deprecated compatibility alias for terminate. */
     async kill(terminalId): Promise<IpcResult<void>> {
       const result = await client.request<void>('kill', { terminalId })
-      // Kill is idempotent on the server (not_found = success).
-      // Either way, stop tracking and detach (the claim goes with the tracker).
-      client.removeTracker(terminalId)
+      if (result.success) client.removeTracker(terminalId)
       return result
     },
     onData: (callback) => client.onData(callback),
@@ -689,9 +701,12 @@ export const webTerminalInternals = {
     if (!attached.success) return attached
     return client.request<void>('add_renderer_ref', { terminalId, rendererId })
   },
-  removeRendererRef: (terminalId: string, rendererId: string) => {
+  async removeRendererRef(terminalId: string, rendererId: string): Promise<IpcResult<void>> {
+    // Remove the backend ref while this connection is still authorized. Only
+    // then detach the output/authorization and decrement the local ref count.
+    const result = await client.request<void>('remove_renderer_ref', { terminalId, rendererId })
     client.detach(terminalId)
-    return client.request<void>('remove_renderer_ref', { terminalId, rendererId })
+    return result
   },
   setProtected: (terminalId: string, protectedState: boolean) =>
     client.request<void>('set_protected', { terminalId, protected: protectedState })

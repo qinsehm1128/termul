@@ -55,6 +55,8 @@ const IPC_COMMANDS = {
   REVOKE_CLAIM: 'terminal_revoke_claim',
   WRITE: 'terminal_write',
   RESIZE: 'terminal_resize',
+  CLOSE_VIEW: 'terminal_close_view',
+  TERMINATE: 'terminal_terminate',
   KILL: 'terminal_kill',
   GET_CWD: 'terminal_get_cwd',
   GET_GIT_BRANCH: 'terminal_get_git_branch',
@@ -446,9 +448,17 @@ export function createTauriTerminalApi(): TerminalApi {
       return invokeIpc<void>(IPC_COMMANDS.RESIZE, { terminalId, cols, rows })
     },
 
-    /**
-     * Kill terminal PTY
-     */
+    /** Close one renderer view; the PTY and claim survive. */
+    async closeView(terminalId: string): Promise<IpcResult<void>> {
+      return invokeIpc<void>(IPC_COMMANDS.CLOSE_VIEW, { terminalId })
+    },
+
+    /** Explicitly terminate the PTY resource. */
+    async terminate(terminalId: string): Promise<IpcResult<void>> {
+      return invokeIpc<void>(IPC_COMMANDS.TERMINATE, { terminalId })
+    },
+
+    /** @deprecated compatibility alias for terminate. */
     async kill(terminalId: string): Promise<IpcResult<void>> {
       return invokeIpc<void>(IPC_COMMANDS.KILL, { terminalId })
     },

@@ -142,7 +142,7 @@ vi.mock('@/lib/api', async () => {
   }
 })
 
-vi.mock('@/lib/tauri-terminal-api', async () => {
+vi.mock('@/lib/terminal-api', async () => {
   const { vi: v } = await import('vitest')
   return {
     addRendererRef: v.fn().mockResolvedValue({ success: true }),
@@ -204,6 +204,7 @@ vi.mock('@/stores/terminal-store', async () => {
     terminals: [] as Array<{ id: string; healthStatus?: string }>,
     healthStatus: 'running',
     restartTerminal: v.fn(),
+    restartTerminalResource: v.fn(async () => true),
     setRendererAttached: v.fn(),
     findTerminalByPtyId: v.fn(),
     peekTranscript: v.fn(() => ''),

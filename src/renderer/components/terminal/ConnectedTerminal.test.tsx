@@ -228,7 +228,7 @@ Object.defineProperty(window, 'api', {
 
 import { clipboardApi, systemApi, terminalApi } from '@/lib/api'
 import { openFilePathFromTerminal } from '@/lib/file-path-links'
-import { addRendererRef, removeRendererRef } from '@/lib/tauri-terminal-api'
+import { addRendererRef, removeRendererRef } from '@/lib/terminal-api'
 import { ConnectedTerminal } from './ConnectedTerminal'
 
 const { mockRecordTerminalContinuityEvent, mockGetOrCreateProjectContinuityCorrelation } =
@@ -252,6 +252,8 @@ vi.mock('@/lib/api', () => ({
     spawn: vi.fn(),
     write: vi.fn(),
     resize: vi.fn(),
+    closeView: vi.fn(),
+    terminate: vi.fn(),
     kill: vi.fn(),
     onData: vi.fn(),
     onExit: vi.fn(),
@@ -307,6 +309,7 @@ const mockTerminalStoreState = {
   updateTerminalLastActivityTimestamp: vi.fn(),
   updateTerminalActivityBatch: vi.fn(),
   restartTerminal: vi.fn(),
+  restartTerminalResource: vi.fn(async () => true),
   clearTerminalPtyId: vi.fn(),
   truncateHiddenTerminalBuffers: vi.fn(),
   getTerminalCount: vi.fn(() => 0),
@@ -321,7 +324,7 @@ vi.mock('@/stores/terminal-store', () => ({
   )
 }))
 
-vi.mock('@/lib/tauri-terminal-api', () => ({
+vi.mock('@/lib/terminal-api', () => ({
   addRendererRef: vi.fn().mockResolvedValue({ success: true, data: undefined }),
   removeRendererRef: vi.fn().mockResolvedValue({ success: true, data: undefined })
 }))
@@ -2917,6 +2920,8 @@ describe('ConnectedTerminal', () => {
       expect(typeof terminalApi.spawn).toBe('function')
       expect(typeof terminalApi.write).toBe('function')
       expect(typeof terminalApi.resize).toBe('function')
+      expect(typeof terminalApi.closeView).toBe('function')
+      expect(typeof terminalApi.terminate).toBe('function')
       expect(typeof terminalApi.kill).toBe('function')
     })
 

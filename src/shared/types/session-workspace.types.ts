@@ -31,7 +31,10 @@ export type SessionWorkspacePaneNode = SessionWorkspaceSplitNode | SessionWorksp
 /** Passive reference to a PtyManager-owned terminal. It conveys no ownership or credential. */
 export interface TerminalResourceDescriptor {
   kind: 'terminal'
+  /** PtyManager-owned live resource id. */
   terminalId: string
+  /** Optional renderer record id used to rebuild visible topology. */
+  terminalRecordId?: string
   conversationId: ConversationId
 }
 

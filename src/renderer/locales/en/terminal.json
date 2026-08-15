@@ -85,5 +85,20 @@
     "perProject_other": "Maximum {{formattedCount}} terminals per project",
     "global_one": "Maximum {{formattedCount}} terminal allowed across all projects",
     "global_other": "Maximum {{formattedCount}} terminals allowed across all projects"
+  },
+  "lifecycle": {
+    "closeView": "Close view",
+    "closeViewDescription": "Hide this view while the process keeps running.",
+    "closeViewFailed": "Failed to close terminal view. The process is still running.",
+    "terminateProcess": "Terminate process",
+    "terminateTitle": "Terminate terminal process?",
+    "terminateDescription": "This stops the live process and removes only its terminal resource. Conversation chat and history are preserved.",
+    "terminateFailed": "Failed to terminate terminal process.",
+    "restartFailed": "Failed to restart terminal process.",
+    "reopen": "Reopen",
+    "reconnect": "Reconnect",
+    "hiddenRunning": "Hidden running terminals",
+    "conversationScopeRequired": "Open a Conversation before creating a durable terminal",
+    "scopeError": "Terminal requires a valid Conversation scope."
   }
 }

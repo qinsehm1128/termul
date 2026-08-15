@@ -117,12 +117,22 @@ describe('tauri-terminal-api', () => {
       const { api, Channel } = await loadApi()
       mockInvoke.mockResolvedValue({ success: true, data: SPAWNED })
 
-      const result = await api.spawn({ projectId: 'p1', cols: 120, rows: 32 })
+      const result = await api.spawn({
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        projectId: 'p1',
+        cols: 120,
+        rows: 32
+      })
 
       expect(mockInvoke).toHaveBeenCalledTimes(1)
       const [command, args] = mockInvoke.mock.calls[0]
       expect(command).toBe('terminal_spawn')
-      expect(args.options).toEqual({ projectId: 'p1', cols: 120, rows: 32 })
+      expect(args.options).toEqual({
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        projectId: 'p1',
+        cols: 120,
+        rows: 32
+      })
       // Output still streams through a raw binary channel (shape unchanged).
       expect(args.onData).toBeInstanceOf(Channel)
 
@@ -223,6 +233,25 @@ describe('tauri-terminal-api', () => {
       expect(received).toHaveLength(0)
 
       off()
+    })
+
+    it('maps closeView and explicit terminate to distinct commands; kill remains an alias', async () => {
+      const { api } = await loadApi()
+      mockInvoke.mockResolvedValue({ success: true, data: undefined })
+
+      await api.closeView('terminal-1752-1')
+      await api.terminate('terminal-1752-1')
+      await api.kill('terminal-1752-1')
+
+      expect(mockInvoke).toHaveBeenNthCalledWith(1, 'terminal_close_view', {
+        terminalId: 'terminal-1752-1'
+      })
+      expect(mockInvoke).toHaveBeenNthCalledWith(2, 'terminal_terminate', {
+        terminalId: 'terminal-1752-1'
+      })
+      expect(mockInvoke).toHaveBeenNthCalledWith(3, 'terminal_kill', {
+        terminalId: 'terminal-1752-1'
+      })
     })
 
     it('rotateClaim invokes terminal_rotate_claim with (terminalId, claim) and returns the fresh credential', async () => {

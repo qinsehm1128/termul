@@ -109,7 +109,6 @@ import { useThemePickerOpen, useThemePickerStore } from '@/stores/theme-picker-s
 import {
   editorTabId,
   findPaneById,
-  findPaneContainingTab,
   getActiveFilePathFromTree,
   getActiveTerminalIdFromTree,
   useActiveTab,
@@ -238,6 +237,11 @@ export default function WorkspaceLayout(): React.JSX.Element {
   } | null>(null)
   const [closeConfirmLoading, setCloseConfirmLoading] = useState(false)
   const [closeConfirmRememberChoice, setCloseConfirmRememberChoice] = useState(false)
+  const [terminateConfirmTerminal, setTerminateConfirmTerminal] = useState<{
+    terminalId: string
+    tabId?: string
+  } | null>(null)
+  const [terminateConfirmLoading, setTerminateConfirmLoading] = useState(false)
   const [closingTerminalIds, setClosingTerminalIds] = useState<string[]>([])
   const [dirtyCloseFilePath, setDirtyCloseFilePath] = useState<string | null>(null)
   const [isCommandHistoryOpen, setIsCommandHistoryOpen] = useState(false)
@@ -279,7 +283,13 @@ export default function WorkspaceLayout(): React.JSX.Element {
   const terminals = useTerminals()
   const activeTerminal = useActiveTerminal()
   const activeTerminalId = useActiveTerminalId()
-  const { addTerminal, closeTerminal, renameTerminal } = useTerminalActions()
+  const {
+    addTerminal,
+    closeTerminalView,
+    terminateTerminalResource,
+    restartTerminalResource,
+    renameTerminal
+  } = useTerminalActions()
 
   // File explorer & editor state
   const isExplorerVisible = useFileExplorerVisible()
@@ -1453,103 +1463,52 @@ export default function WorkspaceLayout(): React.JSX.Element {
     })
   }, [cycleTab, applyZoomAction, handleOpenThemePicker, updatePanelVisibility, isSidebarVisible])
 
-  const closeTerminalByRecordId = useCallback(
+  const closeTerminalViewByRecordId = useCallback(
     async (terminalRecordId: string): Promise<boolean> => {
-      const terminalToClose = useTerminalStore
-        .getState()
-        .terminals.find((t) => t.id === terminalRecordId)
-
-      if (!terminalToClose) {
-        return false
-      }
-
-      if (closingTerminalIds.includes(terminalRecordId)) {
-        return false
-      }
-
+      if (closingTerminalIds.includes(terminalRecordId)) return false
       setClosingTerminalIds((current) => [...current, terminalRecordId])
-
       try {
-        if (terminalToClose.ptyId) {
-          const result = await terminalApi.kill(terminalToClose.ptyId)
-          if (!result.success) {
-            console.error('Failed to close terminal PTY:', result.error)
-            toast.error(
-              result.error ||
-                runtimeT(
-                  'workspace',
-                  'errors.closeTerminalProcess',
-                  'Failed to close terminal process. Please try again.'
-                )
+        const didClose = await closeTerminalView(terminalRecordId)
+        if (!didClose) {
+          toast.error(
+            runtimeT(
+              'terminal',
+              'lifecycle.closeViewFailed',
+              'Failed to close terminal view. The process is still running.'
             )
-            return false
-          }
+          )
+          return false
         }
-
-        closeTerminal(terminalRecordId, activeProjectId)
+        useWorkspaceStore.getState().closeTerminalView(terminalRecordId)
         return true
       } finally {
         setClosingTerminalIds((current) => current.filter((id) => id !== terminalRecordId))
       }
     },
-    [activeProjectId, closeTerminal, closingTerminalIds]
-  )
-
-  const closeTerminalTabByTabId = useCallback(
-    async (tabId: string): Promise<boolean> => {
-      const root = useWorkspaceStore.getState().root
-      const containingPane = findPaneContainingTab(root, tabId)
-      if (!containingPane) {
-        return false
-      }
-
-      const tab = containingPane.tabs.find((t) => t.id === tabId)
-      if (tab?.type !== 'terminal') {
-        return false
-      }
-
-      const didClose = await closeTerminalByRecordId(tab.terminalId)
-      if (!didClose) {
-        return false
-      }
-      useWorkspaceStore.getState().closeTab(containingPane.id, tabId)
-      return true
-    },
-    [closeTerminalByRecordId]
+    [closeTerminalView, closingTerminalIds]
   )
 
   const handleCloseTerminal = useCallback(
     (id: string, tabId: string) => {
-      if (closingTerminalIds.includes(id)) {
-        return
-      }
-
+      if (closingTerminalIds.includes(id)) return
       if (!confirmTerminalClose) {
-        void closeTerminalTabByTabId(tabId)
+        void closeTerminalViewByRecordId(id)
         return
       }
-
       setCloseConfirmRememberChoice(false)
       setCloseConfirmTerminal({ terminalId: id, tabId })
     },
-    [closeTerminalTabByTabId, closingTerminalIds, confirmTerminalClose]
+    [closeTerminalViewByRecordId, closingTerminalIds, confirmTerminalClose]
   )
 
-  // Keep ref in sync so the keydown effect can call it without declaration-order issues
-  handleCloseTerminalRef.current = handleCloseTerminal
-
   const handleConfirmCloseTerminal = useCallback(async () => {
-    if (!closeConfirmTerminal) {
-      return
-    }
-
+    if (!closeConfirmTerminal) return
     setCloseConfirmLoading(true)
     try {
       if (closeConfirmRememberChoice) {
         await updateAppSetting('confirmTerminalClose', false)
       }
-
-      const didClose = await closeTerminalTabByTabId(closeConfirmTerminal.tabId)
+      const didClose = await closeTerminalViewByRecordId(closeConfirmTerminal.terminalId)
       if (didClose) {
         setCloseConfirmTerminal(null)
         setCloseConfirmRememberChoice(false)
@@ -1557,16 +1516,44 @@ export default function WorkspaceLayout(): React.JSX.Element {
     } finally {
       setCloseConfirmLoading(false)
     }
-  }, [closeConfirmRememberChoice, closeConfirmTerminal, closeTerminalTabByTabId, updateAppSetting])
+  }, [
+    closeConfirmRememberChoice,
+    closeConfirmTerminal,
+    closeTerminalViewByRecordId,
+    updateAppSetting
+  ])
+
+  const requestTerminateTerminal = useCallback((terminalId: string, tabId?: string) => {
+    setCloseConfirmTerminal(null)
+    setTerminateConfirmTerminal({ terminalId, tabId })
+  }, [])
+
+  const handleConfirmTerminateTerminal = useCallback(async () => {
+    if (!terminateConfirmTerminal) return
+    setTerminateConfirmLoading(true)
+    try {
+      const didTerminate = await terminateTerminalResource(terminateConfirmTerminal.terminalId)
+      if (!didTerminate) {
+        toast.error(
+          runtimeT('terminal', 'lifecycle.terminateFailed', 'Failed to terminate terminal process.')
+        )
+        return
+      }
+      useWorkspaceStore.getState().closeTerminalView(terminateConfirmTerminal.terminalId)
+      setTerminateConfirmTerminal(null)
+    } finally {
+      setTerminateConfirmLoading(false)
+    }
+  }, [terminateConfirmTerminal, terminateTerminalResource])
 
   const handleCancelCloseTerminal = useCallback(() => {
-    if (closeConfirmLoading) {
-      return
-    }
-
+    if (closeConfirmLoading) return
     setCloseConfirmRememberChoice(false)
     setCloseConfirmTerminal(null)
   }, [closeConfirmLoading])
+
+  // Keep ref in sync so the keydown effect can call it without declaration-order issues
+  handleCloseTerminalRef.current = handleCloseTerminal
 
   // Dirty file close handlers
   const handleCloseEditorTab = useCallback((filePath: string) => {
@@ -1656,7 +1643,18 @@ export default function WorkspaceLayout(): React.JSX.Element {
     clearHistory(activeProjectId)
   }, [activeProjectId])
 
-  const terminalToClose = terminals.find((t) => t.id === closeConfirmTerminal?.terminalId)
+  const terminalToClose = useTerminalStore
+    .getState()
+    .terminals.find(
+      (terminal) =>
+        terminal.id === (terminateConfirmTerminal?.terminalId ?? closeConfirmTerminal?.terminalId)
+    )
+  const hiddenConversationTerminals = useTerminalStore
+    .getState()
+    .terminals.filter(
+      (terminal) =>
+        terminal.conversationId === activeConversationId && terminal.viewState !== 'visible'
+    )
 
   // Show loading state while projects are being loaded
   if (!isLoaded) {
@@ -1728,6 +1726,23 @@ export default function WorkspaceLayout(): React.JSX.Element {
           {isWorkspaceRoute ? (
             <>
               <ChatRoute />
+              {hiddenConversationTerminals.length > 0 && (
+                <div className="flex shrink-0 items-center gap-2 overflow-x-auto border-b border-border/60 px-2 py-1">
+                  <span className="text-xs text-muted-foreground">
+                    {runtimeT('terminal', 'lifecycle.hiddenRunning', 'Hidden running terminals')}
+                  </span>
+                  {hiddenConversationTerminals.map((terminal) => (
+                    <button
+                      key={terminal.id}
+                      type="button"
+                      className="h-9 shrink-0 rounded-md border border-border px-3 text-xs hover:bg-accent"
+                      onClick={() => useWorkspaceStore.getState().reopenTerminalView(terminal.id)}
+                    >
+                      {runtimeT('terminal', 'lifecycle.reopen', 'Reopen')} {terminal.name}
+                    </button>
+                  ))}
+                </div>
+              )}
               <motion.div
                 key={fullscreenPaneId ? 'fullscreen' : 'normal'}
                 initial={{ opacity: 0.85, scale: 0.97 }}
@@ -1881,9 +1896,16 @@ export default function WorkspaceLayout(): React.JSX.Element {
         message={t('closeTerminal.message', {
           name: terminalToClose?.name || t('closeTerminal.thisTerminal')
         })}
-        confirmLabel={t('tabs.close')}
+        confirmLabel={runtimeT('terminal', 'lifecycle.closeView', 'Close view')}
         cancelLabel={t('cancel')}
-        variant="danger"
+        secondaryAction={{
+          label: runtimeT('terminal', 'lifecycle.terminateProcess', 'Terminate process'),
+          onClick: () => {
+            if (closeConfirmTerminal) {
+              requestTerminateTerminal(closeConfirmTerminal.terminalId, closeConfirmTerminal.tabId)
+            }
+          }
+        }}
         isLoading={closeConfirmLoading}
         onConfirm={handleConfirmCloseTerminal}
         onCancel={handleCancelCloseTerminal}
@@ -1899,6 +1921,24 @@ export default function WorkspaceLayout(): React.JSX.Element {
           {t('closeTerminal.dontAsk')}
         </label>
       </ConfirmDialog>
+
+      <ConfirmDialog
+        isOpen={terminateConfirmTerminal !== null}
+        title={runtimeT('terminal', 'lifecycle.terminateTitle', 'Terminate terminal process?')}
+        message={runtimeT(
+          'terminal',
+          'lifecycle.terminateDescription',
+          'This stops the live process and removes only its terminal resource. Conversation chat and history are preserved.'
+        )}
+        confirmLabel={runtimeT('terminal', 'lifecycle.terminateProcess', 'Terminate process')}
+        cancelLabel={t('cancel')}
+        variant="danger"
+        isLoading={terminateConfirmLoading}
+        onConfirm={handleConfirmTerminateTerminal}
+        onCancel={() => {
+          if (!terminateConfirmLoading) setTerminateConfirmTerminal(null)
+        }}
+      />
 
       {/* Dirty File Close Confirmation */}
       <ConfirmDialog
@@ -1943,24 +1983,19 @@ export default function WorkspaceLayout(): React.JSX.Element {
             onOpenGitHistory={() => handleAddGitHistoryTab()}
             onNewTerminal={() => handleAddTerminal(undefined)}
             onCloseTerminal={handleCloseTerminal}
+            onTerminateTerminal={(terminalId, tabId) => requestTerminateTerminal(terminalId, tabId)}
             onRenameTerminal={renameTerminal}
             onRestartTerminal={(terminalId) => {
-              // Restart: kill the PTY, close the old tab, then re-spawn.
-              const terminal = useTerminalStore
-                .getState()
-                .terminals.find((t) => t.id === terminalId)
-              if (!terminal?.ptyId) return
-              const root = useWorkspaceStore.getState().root
-              const pane = findPaneContainingTab(root, `term-${terminalId}`)
-              void terminalApi.kill(terminal.ptyId).then(() => {
-                closeTerminal(terminalId, activeProjectId)
-                if (pane) {
-                  useWorkspaceStore.getState().closeTab(pane.id, `term-${terminalId}`)
+              void restartTerminalResource(terminalId).then((restarted) => {
+                if (!restarted) {
+                  toast.error(
+                    runtimeT(
+                      'terminal',
+                      'lifecycle.restartFailed',
+                      'Failed to restart terminal process.'
+                    )
+                  )
                 }
-                handleCreateTerminalInPane(
-                  pane?.id ?? useWorkspaceStore.getState().activePaneId ?? '',
-                  terminal.shell ?? undefined
-                )
               })
             }}
           >

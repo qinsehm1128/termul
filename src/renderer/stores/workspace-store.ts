@@ -180,6 +180,8 @@ export interface WorkspaceState {
 
   // New tab helpers
   addTerminalTab: (terminalId: string, targetPaneId?: string) => void
+  closeTerminalView: (terminalId: string) => void
+  reopenTerminalView: (terminalId: string, targetPaneId?: string) => void
   ensureTerminalTab: (terminalId: string, targetPaneId?: string, makeActive?: boolean) => void
   addEditorTab: (filePath: string, targetPaneId?: string) => void
   addBrowserTab: (browserTabId: string, targetPaneId?: string) => void
@@ -756,6 +758,17 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => {
       get().addTabToPane(paneId, tab)
     },
 
+    closeTerminalView: (terminalId: string): void => {
+      const tabId = terminalTabId(terminalId)
+      const pane = findPaneContainingTab(get().root, tabId)
+      if (pane) void get().closeTab(pane.id, tabId)
+    },
+
+    reopenTerminalView: (terminalId: string, targetPaneId?: string): void => {
+      useTerminalStore.getState().reopenTerminalView(terminalId)
+      get().addTerminalTab(terminalId, targetPaneId)
+    },
+
     ensureTerminalTab: (
       terminalId: string,
       targetPaneId?: string,
@@ -1267,6 +1280,8 @@ export function usePaneRoot(): PaneNode {
 export function useWorkspaceActions(): Pick<
   WorkspaceState,
   | 'addTerminalTab'
+  | 'closeTerminalView'
+  | 'reopenTerminalView'
   | 'addEditorTab'
   | 'addBrowserTab'
   | 'addAgentChatTab'
@@ -1294,6 +1309,8 @@ export function useWorkspaceActions(): Pick<
   return useWorkspaceStore(
     useShallow((state) => ({
       addTerminalTab: state.addTerminalTab,
+      closeTerminalView: state.closeTerminalView,
+      reopenTerminalView: state.reopenTerminalView,
       addEditorTab: state.addEditorTab,
       addBrowserTab: state.addBrowserTab,
       addAgentChatTab: state.addAgentChatTab,

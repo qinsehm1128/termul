@@ -36,6 +36,7 @@ import { useProjectsAutoSave, useProjectsLoader } from './hooks/use-projects-per
 import { useRemoteProjects } from './hooks/use-remote-projects'
 import { useTerminalDetachedOutput } from './hooks/use-terminal-detached-output'
 import { useTerminalExitNotification } from './hooks/use-terminal-exit-notification'
+import { useTerminalResourceLifecycle } from './hooks/use-terminal-resource-lifecycle'
 import { useTerminalRestore } from './hooks/use-terminal-restore'
 import { useAppliedUiZoomSync } from './hooks/use-ui-zoom'
 import { useUpdateCheck } from './hooks/use-updater'
@@ -57,6 +58,7 @@ function AppEffects(): null {
   useTerminalAutoSave()
   useSessionWorkspaceBootstrap()
   useConversationLifecycle()
+  useTerminalResourceLifecycle()
   useTerminalRestore()
   useCrashRecovery()
   useTerminalDetachedOutput()

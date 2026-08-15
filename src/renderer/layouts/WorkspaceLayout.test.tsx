@@ -59,10 +59,16 @@ const mockUseTerminals = vi.fn((): Terminal[] => [])
 const mockUseAllTerminals = vi.fn((): Terminal[] => [])
 const mockUseActiveTerminal = vi.fn((): Terminal | null => null)
 const mockUseActiveTerminalId = vi.fn((): string => '')
+const mockCloseTerminalView = vi.fn(async () => true)
+const mockTerminateTerminalResource = vi.fn(async () => true)
 const mockUseTerminalActions = vi.fn(() => ({
   selectTerminal: vi.fn(),
   addTerminal: vi.fn(),
   closeTerminal: vi.fn(),
+  closeTerminalView: mockCloseTerminalView,
+  reopenTerminalView: vi.fn(),
+  terminateTerminalResource: mockTerminateTerminalResource,
+  restartTerminalResource: vi.fn(async () => true),
   renameTerminal: vi.fn(),
   reorderTerminals: vi.fn(),
   setTerminalPtyId: vi.fn(),
@@ -99,7 +105,16 @@ vi.mock('@/stores/project-store', () => ({
 }))
 
 vi.mock('@/stores/terminal-store', () => ({
-  useTerminalStore: vi.fn((selector) => selector({ terminals: [] })),
+  useTerminalStore: Object.assign(
+    vi.fn((selector) => selector({ terminals: mockUseTerminals() })),
+    {
+      getState: () => ({
+        terminals: mockUseTerminals(),
+        findTerminalByPtyId: (ptyId: string) =>
+          mockUseTerminals().find((terminal) => terminal.ptyId === ptyId)
+      })
+    }
+  ),
   useTerminals: () => mockUseTerminals(),
   useAllTerminals: () => mockUseAllTerminals(),
   useActiveTerminal: () => mockUseActiveTerminal(),
@@ -291,6 +306,8 @@ const { mockApi } = vi.hoisted(() => ({
       onExit: vi.fn(() => vi.fn()),
       spawn: vi.fn().mockResolvedValue({ success: true, data: 'mock-pty-id' }),
       resize: vi.fn().mockResolvedValue({ success: true }),
+      closeView: vi.fn().mockResolvedValue({ success: true }),
+      terminate: vi.fn().mockResolvedValue({ success: true }),
       kill: vi.fn().mockResolvedValue({ success: true }),
       write: vi.fn().mockResolvedValue({ success: true })
     },
@@ -396,6 +413,10 @@ beforeEach(() => {
   mockUseAllTerminals.mockReturnValue([])
   mockUseActiveTerminal.mockReturnValue(null)
   mockUseActiveTerminalId.mockReturnValue('')
+  mockCloseTerminalView.mockReset()
+  mockCloseTerminalView.mockResolvedValue(true)
+  mockTerminateTerminalResource.mockReset()
+  mockTerminateTerminalResource.mockResolvedValue(true)
   mockUpdatePanelVisibility.mockReset()
   mockWaitForPendingAppSettingsPersistence.mockReset()
   useFileExplorerStore.setState({ isVisible: true })
@@ -1127,6 +1148,34 @@ describe('WorkspaceLayout - Empty States', () => {
       await waitFor(() => {
         expect(mockApi.filesystem.unwatchDirectory).toHaveBeenCalledWith('/workspace/a')
       })
+    })
+
+    it('surfaces hidden live Conversation terminals as reopenable on desktop', () => {
+      const projects = [createProject('a', '/workspace/a', 'blue')]
+      const terminal = {
+        id: 'terminal-hidden',
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        projectId: 'a',
+        name: 'Hidden shell',
+        shell: 'bash',
+        ptyId: 'pty-hidden',
+        claim: 'memory-only',
+        viewState: 'hidden',
+        healthStatus: 'running'
+      } as Terminal
+      useSessionWorkspaceSyncStore.setState({
+        activeConversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+      })
+      mockUseProjects.mockReturnValue(projects)
+      mockUseTerminals.mockReturnValue([terminal])
+      mockUseAllTerminals.mockReturnValue([terminal])
+      mockUseActiveProject.mockReturnValue(projects[0])
+      mockUseActiveProjectId.mockReturnValue('a')
+
+      renderWithRouter()
+
+      expect(screen.getByText('Hidden running terminals')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Reopen Hidden shell' })).toHaveClass('h-9')
     })
 
     it.skip('does not re-run terminal sync when terminal ids stay unchanged across rerenders', async () => {

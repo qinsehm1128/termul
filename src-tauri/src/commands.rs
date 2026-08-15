@@ -238,9 +238,41 @@ pub async fn terminal_spawn(
     options: SpawnOptions,
     on_data: Channel<Response>,
     pty_manager: State<'_, Arc<PtyManager>>,
+    repository: State<'_, Arc<crate::conversation::ConversationRepository>>,
 ) -> Result<IpcResult<SpawnedTerminal>, String> {
+    let is_ephemeral_ssh = options.kind.as_deref() == Some("ssh");
+    if !is_ephemeral_ssh && options.conversation_id.is_none() {
+        log::warn!("[terminal-command] durable spawn rejected: missing ConversationId");
+        return Ok(IpcResult::error(
+            "Durable terminal spawn requires conversationId",
+            "CONVERSATION_INVALID_ID",
+        ));
+    }
+    let track_workspace_ref = !is_ephemeral_ssh;
     match pty_manager.spawn(options, Some(on_data)).await {
-        Ok(spawned) => Ok(IpcResult::success(spawned)),
+        Ok(spawned) => {
+            if track_workspace_ref {
+                let instance = pty_manager
+                    .get(&spawned.info.id)
+                    .expect("spawned terminal remains registered");
+                let service =
+                    crate::conversation::SessionWorkspaceService::new(repository.inner().clone());
+                if let Err(error) = service
+                    .add_terminal_ref(instance.conversation_id, &spawned.info.id)
+                    .await
+                {
+                    let _ = pty_manager.terminate(&spawned.info.id).await;
+                    log::warn!(
+                        "[terminal-command] spawn ref failed conversation_id={} terminal_id={} code={}",
+                        instance.conversation_id,
+                        spawned.info.id,
+                        error.code.as_str()
+                    );
+                    return Ok(IpcResult::error(error.detail, error.code.as_str()));
+                }
+            }
+            Ok(IpcResult::success(spawned))
+        }
         Err(e) => Ok(IpcResult::error(e, "SPAWN_FAILED")),
     }
 }
@@ -519,16 +551,66 @@ pub async fn terminal_resize(
     }
 }
 
-/// Kill a terminal
+/// Close one renderer view without touching the PTY, claim, or passive workspace ref.
+#[tauri::command]
+pub async fn terminal_close_view(terminal_id: String) -> Result<IpcResult<()>, String> {
+    if let Some((_, forwarder)) = lock_forwarders().remove(&terminal_id) {
+        forwarder.abort();
+    }
+    log::info!("[terminal-command] close-view terminal_id={terminal_id}");
+    Ok(IpcResult::success(()))
+}
+
+/// Explicitly terminate a terminal resource. This is the destructive path.
+#[tauri::command]
+pub async fn terminal_terminate(
+    terminal_id: String,
+    pty_manager: State<'_, Arc<PtyManager>>,
+    repository: State<'_, Arc<crate::conversation::ConversationRepository>>,
+) -> Result<IpcResult<()>, String> {
+    let scope = pty_manager
+        .get(&terminal_id)
+        .filter(|instance| instance.workspace_ref_tracked)
+        .map(|instance| instance.conversation_id);
+    if pty_manager.get(&terminal_id).is_none() {
+        return Ok(IpcResult::success(()));
+    }
+    match pty_manager.terminate(&terminal_id).await {
+        Ok(()) => {
+            if let Some((_, forwarder)) = lock_forwarders().remove(&terminal_id) {
+                forwarder.abort();
+            }
+            if let Some(conversation_id) = scope {
+                let service =
+                    crate::conversation::SessionWorkspaceService::new(repository.inner().clone());
+                if let Err(error) = service
+                    .remove_terminal_ref(conversation_id, &terminal_id)
+                    .await
+                {
+                    log::warn!(
+                        "[terminal-command] terminate ref cleanup failed conversation_id={} terminal_id={} code={}",
+                        conversation_id,
+                        terminal_id,
+                        error.code.as_str()
+                    );
+                    return Ok(IpcResult::error(error.detail, error.code.as_str()));
+                }
+            }
+            log::info!("[terminal-command] terminated terminal_id={terminal_id}");
+            Ok(IpcResult::success(()))
+        }
+        Err(e) => Ok(IpcResult::error(e, "TERMINATE_FAILED")),
+    }
+}
+
+/// Deprecated compatibility alias; identical to `terminal_terminate`.
 #[tauri::command]
 pub async fn terminal_kill(
     terminal_id: String,
     pty_manager: State<'_, Arc<PtyManager>>,
+    repository: State<'_, Arc<crate::conversation::ConversationRepository>>,
 ) -> Result<IpcResult<()>, String> {
-    match pty_manager.kill(&terminal_id).await {
-        Ok(()) => Ok(IpcResult::success(())),
-        Err(e) => Ok(IpcResult::error(e, "KILL_FAILED")),
-    }
+    terminal_terminate(terminal_id, pty_manager, repository).await
 }
 
 /// Get the current working directory for a terminal

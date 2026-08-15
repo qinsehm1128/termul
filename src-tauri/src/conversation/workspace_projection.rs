@@ -128,6 +128,7 @@ impl LegacyWorkspaceProjector {
         resources.extend(projected_terminal_ids.iter().map(|terminal_id| {
             SessionWorkspaceResourceDescriptor::Terminal {
                 terminal_id: terminal_id.clone(),
+                terminal_record_id: None,
                 conversation_id: target_conversation_id,
             }
         }));

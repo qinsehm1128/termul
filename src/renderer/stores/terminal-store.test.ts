@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { serializeTerminalsForProject } from '../hooks/useTerminalAutoSave'
 import { useProjectStore } from './project-store'
+import { useSessionWorkspaceSyncStore } from './session-workspace-sync-store'
 import {
   HIDDEN_BUFFER_TRUNCATION_DELAY,
   MAX_TRANSCRIPT_CHARS,
@@ -11,6 +12,9 @@ import {
 describe('terminal-store', () => {
   beforeEach(() => {
     // Reset stores to initial state before each test
+    useSessionWorkspaceSyncStore.setState({
+      activeConversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+    })
     useProjectStore.setState({
       projects: [
         { id: '1', name: 'Project 1', color: 'blue', isActive: true },

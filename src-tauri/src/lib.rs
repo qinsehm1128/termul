@@ -1722,6 +1722,8 @@ pub fn run() {
             commands::terminal_revoke_claim,
             commands::terminal_write,
             commands::terminal_resize,
+            commands::terminal_close_view,
+            commands::terminal_terminate,
             commands::terminal_kill,
             commands::terminal_get_cwd,
             commands::terminal_get_git_branch,

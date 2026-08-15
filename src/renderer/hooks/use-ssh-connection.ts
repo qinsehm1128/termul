@@ -143,7 +143,7 @@ export function useSSHConnection(profile: SSHProfile | null) {
     // If a previous attempt left a local PTY (e.g. a failed connect the user is
     // retrying), kill it first so we don't orphan a running ssh process.
     if (localTerminalPtyId) {
-      void terminalApi.kill(localTerminalPtyId)
+      void terminalApi.terminate(localTerminalPtyId)
       setLocalTerminalPtyId(null)
     }
 
@@ -212,9 +212,9 @@ export function useSSHConnection(profile: SSHProfile | null) {
         }
       }
 
-      const spawnResult = await terminalApi.spawn({ env: spawnEnv })
+      const spawnResult = await terminalApi.spawn({ kind: 'ssh', env: spawnEnv })
       if (!isCurrentProfileGeneration(generation, operationProfileId)) {
-        if (spawnResult.success) void terminalApi.kill(spawnResult.data.id)
+        if (spawnResult.success) void terminalApi.terminate(spawnResult.data.id)
         return
       }
       if (!spawnResult.success) {
@@ -253,7 +253,7 @@ export function useSSHConnection(profile: SSHProfile | null) {
       // for whether SSH actually authenticated.
       const sftpResult = await sshApi.connect(profile.id, profile.password)
       if (!isCurrentProfileGeneration(generation, operationProfileId)) {
-        void terminalApi.kill(ptyId)
+        void terminalApi.terminate(ptyId)
         if (sftpResult.success && sftpResult.data?.id) void sshApi.disconnect(sftpResult.data.id)
         return
       }
@@ -354,7 +354,7 @@ export function useSSHConnection(profile: SSHProfile | null) {
         console.warn('Backend disconnect failed:', error)
       }
     }
-    if (localTerminalPtyId) void terminalApi.kill(localTerminalPtyId)
+    if (localTerminalPtyId) void terminalApi.terminate(localTerminalPtyId)
     markDisconnected(profile.id)
     setLocalTerminalPtyId(null)
     setSftpReady(false)

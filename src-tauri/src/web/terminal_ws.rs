@@ -2,12 +2,12 @@
 //!
 //! This endpoint intentionally stays separate from the ACP relay. Authentication
 //! is not implemented yet; never expose it to an untrusted network. All
-//! operations are project-scoped: a connection may only interact with terminals
-//! whose `project_id` it has been authorized for via spawn or explicit attach.
+//! operations are Conversation-scoped: `conversationId` is the primary PTY
+//! ownership/claim scope. `projectId` is optional attribution only.
 
+use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use parking_lot::RwLock;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
@@ -54,8 +54,7 @@ async fn run(socket: WebSocket, state: AppState) {
 
     // Per-connection authorization: terminal IDs this socket may operate on.
     // Shared with the event-forwarding task so it can see updates.
-    let authorized: Arc<RwLock<HashSet<String>>> =
-        Arc::new(RwLock::new(HashSet::new()));
+    let authorized: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
     // Per-terminal output forwarding tasks.
     let attachments: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
 
@@ -75,14 +74,10 @@ async fn run(socket: WebSocket, state: AppState) {
                     if !event_authorized.read().contains(&terminal_id) {
                         continue;
                     }
-                    let payload = serde_json::to_value(&event)
-                        .unwrap_or_else(|_| json!({}));
-                    if send_json(
-                        &event_tx,
-                        json!({ "type": "event", "payload": payload }),
-                    )
-                    .await
-                    .is_err()
+                    let payload = serde_json::to_value(&event).unwrap_or_else(|_| json!({}));
+                    if send_json(&event_tx, json!({ "type": "event", "payload": payload }))
+                        .await
+                        .is_err()
                     {
                         break;
                     }
@@ -102,7 +97,9 @@ async fn run(socket: WebSocket, state: AppState) {
 
     while let Some(frame) = stream.next().await {
         let Ok(message) = frame else { break };
-        let Message::Text(text) = message else { continue };
+        let Message::Text(text) = message else {
+            continue;
+        };
         let request = match serde_json::from_str::<Request>(&text) {
             Ok(request) => request,
             Err(error) => {
@@ -130,7 +127,10 @@ async fn run(socket: WebSocket, state: AppState) {
     for task in ctx.attachments.values() {
         task.abort();
     }
-    info!("[terminal-ws] client disconnected; {} PTY(s) preserved", ctx.authorized.read().len());
+    info!(
+        "[terminal-ws] client disconnected; {} PTY(s) preserved",
+        ctx.authorized.read().len()
+    );
     drop(tx);
     let _ = write_task.await;
 }
@@ -151,10 +151,14 @@ impl ConnectionContext {
         self.authorized.read().contains(terminal_id)
     }
 
-    fn detach(&mut self, terminal_id: &str) {
+    fn close_view(&mut self, terminal_id: &str) {
         if let Some(task) = self.attachments.remove(terminal_id) {
             task.abort();
         }
+    }
+
+    fn detach(&mut self, terminal_id: &str) {
+        self.close_view(terminal_id);
         self.authorized.write().remove(terminal_id);
     }
 }
@@ -169,17 +173,16 @@ async fn handle(
         "spawn" => {
             let options: SpawnOptions = serde_json::from_value(request.payload)
                 .map_err(|e| ("VALIDATION_ERROR", e.to_string()))?;
-            // Require project_id so the terminal is scoped — do not default
-            // to a literal that any client can target.
-            if options.project_id.as_deref().filter(|s| !s.is_empty()).is_none() {
-                return Err((
-                    "VALIDATION_ERROR",
-                    "spawn requires a non-empty projectId".to_string(),
-                ));
-            }
+            let conversation_id = options.conversation_id.ok_or_else(|| {
+                (
+                    "CONVERSATION_INVALID_ID",
+                    "spawn requires conversationId".to_string(),
+                )
+            })?;
             info!(
-                "[terminal-ws] spawn requested project_id={}",
-                options.project_id.as_deref().unwrap_or("?")
+                "[terminal-ws] spawn requested conversation_id={} project_id={}",
+                conversation_id,
+                options.project_id.as_deref().unwrap_or("<none>")
             );
             // CAP-3: spawn is the only issuance path. The reply carries the
             // flattened info + claim (same camelCase shape as desktop).
@@ -188,14 +191,28 @@ async fn handle(
                 .spawn(options, None)
                 .await
                 .map_err(|e| ("SPAWN_FAILED", e))?;
+            let service = terminal_workspace_service()?;
+            if let Err(error) = service
+                .add_terminal_ref(conversation_id, &spawned.info.id)
+                .await
+            {
+                let _ = state.pty.terminate(&spawned.info.id).await;
+                return Err(("SESSION_WORKSPACE_UNAVAILABLE", error.detail));
+            }
             ctx.authorize(&spawned.info.id);
-            info!("[terminal-ws] spawn success terminal_id={}", spawned.info.id);
+            info!(
+                "[terminal-ws] spawn success terminal_id={}",
+                spawned.info.id
+            );
             serde_json::to_value(spawned).map_err(|e| ("SPAWN_FAILED", e.to_string()))
         }
         "write" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
             if !ctx.is_authorized(terminal_id) {
-                return Err(("UNAUTHORIZED", format!("Not authorized for terminal {terminal_id}")));
+                return Err((
+                    "UNAUTHORIZED",
+                    format!("Not authorized for terminal {terminal_id}"),
+                ));
             }
             let data = string_field(&request.payload, "data")?;
             state
@@ -208,7 +225,10 @@ async fn handle(
         "resize" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
             if !ctx.is_authorized(terminal_id) {
-                return Err(("UNAUTHORIZED", format!("Not authorized for terminal {terminal_id}")));
+                return Err((
+                    "UNAUTHORIZED",
+                    format!("Not authorized for terminal {terminal_id}"),
+                ));
             }
             let cols = u16_field(&request.payload, "cols")?;
             let rows = u16_field(&request.payload, "rows")?;
@@ -219,25 +239,33 @@ async fn handle(
                 .map(|_| Value::Null)
                 .map_err(|e| ("RESIZE_FAILED", e))
         }
-        "kill" => {
+        "terminate" | "kill" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
-            // Idempotent kill: if the terminal is already gone, treat as success
-            // so a lost reply or double-close doesn't leave an uncloseable tab.
+            let scope = state
+                .pty
+                .get(terminal_id)
+                .filter(|instance| instance.workspace_ref_tracked)
+                .map(|instance| instance.conversation_id);
+            if !ctx.is_authorized(terminal_id) && state.pty.get(terminal_id).is_some() {
+                return Err(unauthorized_error(terminal_id));
+            }
             if state.pty.get(terminal_id).is_none() {
                 ctx.detach(terminal_id);
                 return Ok(Value::Null);
             }
-            // Force-kill: bypass the desktop is_hidden deferral so web close
-            // actually terminates the process. Desktop behavior is unchanged.
             state
                 .pty
-                .force_kill(terminal_id)
+                .terminate(terminal_id)
                 .await
-                .map(|_| {
-                    ctx.detach(terminal_id);
-                    Value::Null
-                })
-                .map_err(|e| ("KILL_FAILED", e))
+                .map_err(|e| ("TERMINATE_FAILED", e))?;
+            if let Some(conversation_id) = scope {
+                terminal_workspace_service()?
+                    .remove_terminal_ref(conversation_id, terminal_id)
+                    .await
+                    .map_err(|error| ("SESSION_WORKSPACE_UNAVAILABLE", error.detail))?;
+            }
+            ctx.detach(terminal_id);
+            Ok(Value::Null)
         }
         "attach" => {
             let terminal_id = string_field(&request.payload, "terminalId")?.to_string();
@@ -248,9 +276,7 @@ async fn handle(
             // through verification like any bad credential (contract: "missing/
             // invalid claim" collapses into the one generic error).
             let claim = request.payload["claim"].as_str().unwrap_or("");
-            let last_seq = request.payload["lastSeq"]
-                .as_u64()
-                .unwrap_or(0);
+            let last_seq = request.payload["lastSeq"].as_u64().unwrap_or(0);
 
             // Capture the generation BEFORE verifying (TOCTOU-safe ordering,
             // same as the desktop command): captured-first means a rotate/
@@ -411,40 +437,68 @@ async fn handle(
         "detach" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
             ctx.detach(terminal_id);
+            info!("[terminal-ws] detached terminal_id={terminal_id}");
+            Ok(Value::Null)
+        }
+        "close_view" => {
+            let terminal_id = string_field(&request.payload, "terminalId")?;
+            if !ctx.is_authorized(terminal_id) {
+                return Err(unauthorized_error(terminal_id));
+            }
+            // Abort output first but retain authorization long enough for the
+            // renderer component's unmount cleanup to remove its backend ref.
+            // That cleanup then sends `detach`, which drops authorization.
+            ctx.close_view(terminal_id);
+            info!("[terminal-ws] close-view terminal_id={terminal_id}");
             Ok(Value::Null)
         }
         "get_cwd" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
             if !ctx.is_authorized(terminal_id) {
-                return Err(("UNAUTHORIZED", format!("Not authorized for terminal {terminal_id}")));
+                return Err((
+                    "UNAUTHORIZED",
+                    format!("Not authorized for terminal {terminal_id}"),
+                ));
             }
             Ok(json!(state.cwd_tracker.get_cwd(terminal_id)))
         }
         "get_git_branch" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
             if !ctx.is_authorized(terminal_id) {
-                return Err(("UNAUTHORIZED", format!("Not authorized for terminal {terminal_id}")));
+                return Err((
+                    "UNAUTHORIZED",
+                    format!("Not authorized for terminal {terminal_id}"),
+                ));
             }
             Ok(json!(state.git_tracker.get_branch(terminal_id)))
         }
         "get_git_status" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
             if !ctx.is_authorized(terminal_id) {
-                return Err(("UNAUTHORIZED", format!("Not authorized for terminal {terminal_id}")));
+                return Err((
+                    "UNAUTHORIZED",
+                    format!("Not authorized for terminal {terminal_id}"),
+                ));
             }
             Ok(json!(state.git_tracker.get_status(terminal_id)))
         }
         "get_exit_code" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
             if !ctx.is_authorized(terminal_id) {
-                return Err(("UNAUTHORIZED", format!("Not authorized for terminal {terminal_id}")));
+                return Err((
+                    "UNAUTHORIZED",
+                    format!("Not authorized for terminal {terminal_id}"),
+                ));
             }
             Ok(json!(state.exit_code_tracker.get_exit_code(terminal_id)))
         }
         "add_renderer_ref" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
             if !ctx.is_authorized(terminal_id) {
-                return Err(("UNAUTHORIZED", format!("Not authorized for terminal {terminal_id}")));
+                return Err((
+                    "UNAUTHORIZED",
+                    format!("Not authorized for terminal {terminal_id}"),
+                ));
             }
             state
                 .pty
@@ -455,7 +509,10 @@ async fn handle(
         "remove_renderer_ref" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
             if !ctx.is_authorized(terminal_id) {
-                return Err(("UNAUTHORIZED", format!("Not authorized for terminal {terminal_id}")));
+                return Err((
+                    "UNAUTHORIZED",
+                    format!("Not authorized for terminal {terminal_id}"),
+                ));
             }
             state
                 .pty
@@ -466,7 +523,10 @@ async fn handle(
         "set_protected" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
             if !ctx.is_authorized(terminal_id) {
-                return Err(("UNAUTHORIZED", format!("Not authorized for terminal {terminal_id}")));
+                return Err((
+                    "UNAUTHORIZED",
+                    format!("Not authorized for terminal {terminal_id}"),
+                ));
             }
             let protected = request.payload["protected"].as_bool().unwrap_or(true);
             state.pty.set_protected(terminal_id, protected);
@@ -476,7 +536,10 @@ async fn handle(
             // Global setting — require at least one authorized terminal to
             // prevent arbitrary clients from changing lifecycle policy.
             if ctx.authorized.read().is_empty() {
-                return Err(("UNAUTHORIZED", "Not authorized to update orphan detection".to_string()));
+                return Err((
+                    "UNAUTHORIZED",
+                    "Not authorized to update orphan detection".to_string(),
+                ));
             }
             let enabled = request.payload["enabled"].as_bool().unwrap_or(true);
             let timeout = request.payload["timeout"]
@@ -495,6 +558,20 @@ async fn handle(
         }
         _ => Err(("NOT_IMPLEMENTED", "unknown terminal request".to_string())),
     }
+}
+
+fn terminal_workspace_service(
+) -> Result<crate::conversation::SessionWorkspaceService, (&'static str, String)> {
+    let repository =
+        crate::conversation::ConversationRepository::lookup_single_open().ok_or_else(|| {
+            (
+                "SESSION_WORKSPACE_UNAVAILABLE",
+                "ConversationRepository is unavailable".to_string(),
+            )
+        })?;
+    Ok(crate::conversation::SessionWorkspaceService::new(
+        repository,
+    ))
 }
 
 fn string_field<'a>(value: &'a Value, key: &str) -> Result<&'a str, (&'static str, String)> {
@@ -568,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn context_authorize_and_detach_roundtrip() {
+    fn context_close_view_preserves_authorization_until_detach() {
         let mut ctx = ConnectionContext {
             authorized: Arc::new(RwLock::new(HashSet::new())),
             attachments: HashMap::new(),
@@ -576,6 +653,10 @@ mod tests {
         ctx.authorize("t1");
         assert!(ctx.is_authorized("t1"));
         assert!(!ctx.is_authorized("t2"));
+
+        ctx.close_view("t1");
+        assert!(ctx.is_authorized("t1"));
+
         ctx.detach("t1");
         assert!(!ctx.is_authorized("t1"));
     }
@@ -609,7 +690,10 @@ mod tests {
         // terminal id (no input echo — nothing distinguishes failure causes).
         assert_eq!(message, "Unauthorized");
         assert_eq!(unauthorized_error("t1"), unauthorized_error("t2"));
-        assert_ne!(code, "TERMINAL_NOT_FOUND", "existence-leaking code must not return");
+        assert_ne!(
+            code, "TERMINAL_NOT_FOUND",
+            "existence-leaking code must not return"
+        );
     }
 
     #[tokio::test]
@@ -641,5 +725,29 @@ mod tests {
         // abort actually reached the task (teardown is real, not bookkeeping).
         assert!(!ctx.is_authorized("t1"));
         assert!(ctx.attachments.is_empty());
+    }
+    #[test]
+    fn disconnect_cleanup_and_detach_are_non_destructive() {
+        let source = include_str!("terminal_ws.rs");
+        let run = source
+            .split("async fn run")
+            .nth(1)
+            .and_then(|tail| tail.split("struct ConnectionContext").next())
+            .expect("run body");
+        let stripped = strip_comments(run);
+        for forbidden in [".kill(", "force_kill", ".terminate(", "kill_all"] {
+            assert!(
+                !stripped.contains(forbidden),
+                "run disconnect cleanup must not call {forbidden}"
+            );
+        }
+    }
+
+    fn strip_comments(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

@@ -307,6 +307,7 @@ export function PaneContent({
                   !!terminal.agentId &&
                   agentLoadingIds.has(terminal.id)
                 const connectedTerminalSpawnOptions = {
+                  conversationId: terminal.conversationId,
                   projectId: terminal.projectId,
                   shell: terminal.shell,
                   cwd: terminal.cwd

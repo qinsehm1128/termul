@@ -69,8 +69,16 @@ pub enum SessionWorkspacePaneNode {
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
 pub enum SessionWorkspaceResourceDescriptor {
     Terminal {
+        /// PtyManager-owned resource id.
         #[serde(rename = "terminalId")]
         terminal_id: String,
+        /// Optional renderer record id used only to rebuild visible topology.
+        #[serde(
+            rename = "terminalRecordId",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        terminal_record_id: Option<String>,
         #[serde(rename = "conversationId")]
         conversation_id: ConversationId,
     },
@@ -227,6 +235,122 @@ impl SessionWorkspaceService {
     #[must_use]
     pub fn repository(&self) -> &Arc<ConversationRepository> {
         &self.repository
+    }
+
+    /// Add a passive reference after a PTY spawn succeeds. This never owns,
+    /// attaches, detaches, or terminates the PTY.
+    pub async fn add_terminal_ref(
+        &self,
+        conversation_id: ConversationId,
+        terminal_id: &str,
+    ) -> Result<SessionWorkspaceWriteOutcome> {
+        self.mutate_terminal_ref(conversation_id, terminal_id, true)
+            .await
+    }
+
+    /// Remove the passive reference after explicit PTY termination succeeds.
+    /// View close/detach paths must never call this method.
+    pub async fn remove_terminal_ref(
+        &self,
+        conversation_id: ConversationId,
+        terminal_id: &str,
+    ) -> Result<SessionWorkspaceWriteOutcome> {
+        self.mutate_terminal_ref(conversation_id, terminal_id, false)
+            .await
+    }
+
+    async fn mutate_terminal_ref(
+        &self,
+        conversation_id: ConversationId,
+        terminal_id: &str,
+        add: bool,
+    ) -> Result<SessionWorkspaceWriteOutcome> {
+        let lock = self.repository.workspace_lock(conversation_id);
+        let _guard = lock.lock().await;
+        let current_bytes = self
+            .repository
+            .read_workspace_bytes(conversation_id)
+            .map_err(|source| repository_error("terminal_ref", conversation_id, source))?;
+        let mut workspace = match current_bytes.as_deref() {
+            Some(bytes) => decode_workspace(bytes, conversation_id).map_err(|reason| {
+                error(
+                    SessionWorkspaceErrorCode::ConversationRecoveryRequired,
+                    "terminal_ref",
+                    Some(conversation_id),
+                    reason.reason_code(),
+                )
+            })?,
+            None => SessionWorkspaceV1 {
+                schema_version: SESSION_WORKSPACE_SCHEMA_VERSION,
+                conversation_id,
+                revision: 0,
+                updated_at_utc: String::new(),
+                update_identity: Some("host:terminalResource".to_string()),
+                topology: None,
+                active_pane_id: None,
+                resources: Vec::new(),
+                projection_state: SessionWorkspaceProjectionState::Native,
+            },
+        };
+        let existing = workspace.resources.iter().position(|resource| {
+            matches!(
+                resource,
+                SessionWorkspaceResourceDescriptor::Terminal {
+                    terminal_id: existing,
+                    ..
+                } if existing == terminal_id
+            )
+        });
+        if add && existing.is_none() {
+            workspace
+                .resources
+                .push(SessionWorkspaceResourceDescriptor::Terminal {
+                    terminal_id: terminal_id.to_string(),
+                    terminal_record_id: None,
+                    conversation_id,
+                });
+        } else if !add {
+            workspace.resources.retain(|resource| {
+                !matches!(
+                    resource,
+                    SessionWorkspaceResourceDescriptor::Terminal {
+                        terminal_id: existing,
+                        ..
+                    } if existing == terminal_id
+                )
+            });
+        } else {
+            return Ok(SessionWorkspaceWriteOutcome::Updated {
+                revision: workspace.revision,
+                updated_at_utc: workspace.updated_at_utc,
+            });
+        }
+        workspace.revision += 1;
+        workspace.updated_at_utc = format_created_at_utc(&Utc::now());
+        workspace.update_identity = Some("host:terminalResource".to_string());
+        let mut bytes = serde_json::to_vec_pretty(&workspace).map_err(|source| {
+            error(
+                SessionWorkspaceErrorCode::ValidationError,
+                "terminal_ref",
+                Some(conversation_id),
+                source.to_string(),
+            )
+        })?;
+        bytes.push(b'\n');
+        self.repository
+            .replace_workspace_bytes(conversation_id, &bytes)
+            .map_err(|source| repository_error("terminal_ref", conversation_id, source))?;
+        log::info!(
+            "[session-workspace] terminal-ref action={} conversation_id={} terminal_id={} revision={}",
+            if add { "add" } else { "remove" },
+            conversation_id,
+            terminal_id,
+            workspace.revision
+        );
+        Ok(SessionWorkspaceWriteOutcome::Updated {
+            revision: workspace.revision,
+            updated_at_utc: workspace.updated_at_utc,
+        })
     }
 
     pub async fn load(
@@ -1498,6 +1622,41 @@ mod tests {
             sha256_bytes(&fs::read(legacy_root.join("project-one.json")).unwrap()),
             source_sha256
         );
+    }
+
+    #[tokio::test]
+    async fn passive_terminal_refs_survive_view_close_and_change_only_on_spawn_terminate() {
+        let (_temp, _repository, service) = fixture().await;
+        let id = ConversationId::parse(ID).unwrap();
+        let added = service.add_terminal_ref(id, "pty-one").await.unwrap();
+        assert!(matches!(
+            added,
+            SessionWorkspaceWriteOutcome::Updated { revision: 1, .. }
+        ));
+        let SessionWorkspaceLoadOutcome::Loaded { workspace } = service.load(id).await.unwrap()
+        else {
+            panic!("workspace loaded");
+        };
+        assert!(workspace.resources.iter().any(|resource| matches!(
+            resource,
+            SessionWorkspaceResourceDescriptor::Terminal { terminal_id, .. }
+                if terminal_id == "pty-one"
+        )));
+
+        let removed = service.remove_terminal_ref(id, "pty-one").await.unwrap();
+        assert!(matches!(
+            removed,
+            SessionWorkspaceWriteOutcome::Updated { revision: 2, .. }
+        ));
+        let SessionWorkspaceLoadOutcome::Loaded { workspace } = service.load(id).await.unwrap()
+        else {
+            panic!("workspace loaded");
+        };
+        assert!(!workspace.resources.iter().any(|resource| matches!(
+            resource,
+            SessionWorkspaceResourceDescriptor::Terminal { terminal_id, .. }
+                if terminal_id == "pty-one"
+        )));
     }
 
     #[test]

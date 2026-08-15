@@ -26,7 +26,7 @@ import { systemApi, terminalApi } from '@/lib/api'
 import { openTerminalUrl } from '@/lib/browser/terminal-url-navigation'
 import { buildTerminalPathLinks, openFilePathFromTerminal } from '@/lib/file-path-links'
 import { isMac, isPlatformModifier } from '@/lib/platform'
-import { addRendererRef, removeRendererRef } from '@/lib/tauri-terminal-api'
+import { addRendererRef, removeRendererRef } from '@/lib/terminal-api'
 import {
   getOrCreateProjectContinuityCorrelation,
   recordTerminalContinuityEvent
@@ -191,12 +191,12 @@ function ConnectedTerminalComponent({
   const targetId = storeTerminalId || externalTerminalId
 
   // 2. STORE HOOKS (Must be at the top)
-  const { healthStatus, restartTerminal } = useTerminalStore(
+  const { healthStatus, restartTerminalResource } = useTerminalStore(
     useShallow((state) => {
       const term = state.terminals.find((t) => t.id === targetId)
       return {
         healthStatus: term?.healthStatus || 'running',
-        restartTerminal: state.restartTerminal
+        restartTerminalResource: state.restartTerminalResource
       }
     })
   )
@@ -1857,7 +1857,7 @@ function ConnectedTerminalComponent({
                     <button
                       onClick={(e) => {
                         e.stopPropagation()
-                        if (targetId) restartTerminal(targetId)
+                        if (targetId) void restartTerminalResource(targetId)
                       }}
                       className="w-full sm:w-auto inline-flex items-center justify-center gap-3 px-8 py-3.5 bg-primary text-primary-foreground rounded-xl hover:bg-primary/90 hover:shadow-xl hover:shadow-primary/20 active:scale-95 transition-all font-bold shadow-md"
                     >
@@ -1892,7 +1892,7 @@ function ConnectedTerminalComponent({
         <ContextMenuSeparator />
         <ContextMenuItem
           onSelect={() => {
-            if (targetId) restartTerminal(targetId)
+            if (targetId) void restartTerminalResource(targetId)
           }}
           className="cursor-pointer text-primary focus:text-primary"
         >

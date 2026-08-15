@@ -3,6 +3,7 @@
 //! This module provides terminal spawning, I/O, and lifecycle management
 //! ported from the Electron implementation.
 
+use crate::conversation::ConversationId;
 use crate::pty::claims::ClaimError;
 use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEvent, TerminalEventHub};
 use parking_lot::RwLock;
@@ -261,8 +262,7 @@ pub(super) fn parse_powershell_cmd_shim(shim_path: &str) -> Option<ResolvedProgr
 
     let resolve_batch_token = |raw: &str| -> String {
         let shim_dir_str = shim_dir.to_str().unwrap_or(".");
-        let system_root =
-            env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let system_root = env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
         raw.replace("%SystemRoot%", &system_root)
             .replace("%SYSTEMROOT%", &system_root)
             .replace("%SCRIPT_DIR%", shim_dir_str)
@@ -284,9 +284,7 @@ pub(super) fn parse_powershell_cmd_shim(shim_path: &str) -> Option<ResolvedProgr
             .split_whitespace()
             .find(|t| t.to_ascii_lowercase().contains("powershell.exe"))?;
         let ps_exe = resolve_batch_token(ps_exe_token);
-        if !std::path::Path::new(&ps_exe).exists()
-            || !is_directly_executable_windows(&ps_exe)
-        {
+        if !std::path::Path::new(&ps_exe).exists() || !is_directly_executable_windows(&ps_exe) {
             continue;
         }
 
@@ -461,7 +459,8 @@ const ORPHAN_CHECK_INTERVAL_MS: u64 = 30_000; // 30 seconds
 pub const FLUSH_INTERVAL: Duration = Duration::from_millis(4);
 pub const READ_BUF: usize = 16 * 1024; // 16KB read buffer
 pub const MAX_PENDING: usize = 4 * 1024 * 1024; // 4MB overflow cap
-pub const OVERFLOW_NOTICE: &[u8] = b"\x1bc\x1b[2m[termul: dropped output due to backpressure]\x1b[0m\r\n";
+pub const OVERFLOW_NOTICE: &[u8] =
+    b"\x1bc\x1b[2m[termul: dropped output due to backpressure]\x1b[0m\r\n";
 
 /// Public info emitted to renderer on spawn (also forwarded to ws clients)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -541,6 +540,10 @@ pub struct SpawnOptions {
     pub shell: Option<String>,
     pub cwd: Option<String>,
     pub env: Option<HashMap<String, String>>,
+    /// Canonical primary ownership scope for every durable user terminal.
+    #[serde(default)]
+    pub conversation_id: Option<ConversationId>,
+    /// Optional project attribution; never the ownership or authorization key.
     #[serde(default)]
     pub project_id: Option<String>,
     pub cols: Option<u16>,
@@ -563,6 +566,7 @@ impl Default for SpawnOptions {
             shell: None,
             cwd: None,
             env: None,
+            conversation_id: None,
             project_id: None,
             cols: Some(80),
             rows: Some(24),
@@ -576,6 +580,8 @@ impl Default for SpawnOptions {
 /// A running terminal instance
 pub struct TerminalInstance {
     pub id: String,
+    pub conversation_id: ConversationId,
+    pub workspace_ref_tracked: bool,
     pub project_id: Option<String>,
     pub child: Arc<AsyncMutex<Option<Box<dyn Child + Send>>>>,
     pub master: Arc<AsyncMutex<Option<Box<dyn MasterPty + Send>>>>,
@@ -680,6 +686,10 @@ impl TerminalInstance {
     /// orphan reaping once it also has no renderer refs.
     pub fn set_protected(&self, protected: bool) {
         self.protected.store(protected, Ordering::Relaxed);
+    }
+
+    pub fn conversation_matches(&self, conversation_id: ConversationId) -> bool {
+        self.conversation_id == conversation_id
     }
 
     pub fn project_matches(&self, project_id: &str) -> bool {
@@ -1027,15 +1037,26 @@ impl PtyManager {
             .ok_or_else(|| "Global terminal limit reached".to_string())?;
 
         let id = self.generate_id();
+        // Durable callers are validated at their transport boundary. The only
+        // scope-less compatibility caller is the explicitly ephemeral SSH
+        // terminal; give it a process-local ConversationId so claims still have
+        // one typed primary scope and never fall back to ProjectId ownership.
+        let conversation_id = options
+            .conversation_id
+            .unwrap_or_else(ConversationId::new_v4);
 
-        let claim = self.claims.issue(&id, options.project_id.as_deref());
+        let claim = self
+            .claims
+            .issue(&id, conversation_id, options.project_id.as_deref());
         let mut claim_guard = ClaimRollbackGuard {
             claims: &self.claims,
             terminal_id: id.clone(),
             active: true,
         };
 
-        let info = match self.spawn_pty(id.clone(), options, on_data).await {
+        let mut scoped_options = options;
+        scoped_options.conversation_id = Some(conversation_id);
+        let info = match self.spawn_pty(id.clone(), scoped_options, on_data).await {
             Ok(info) => info,
             Err(e) => {
                 // claim_guard drops here and removes the dangling record.
@@ -1075,11 +1096,8 @@ impl PtyManager {
         } else {
             Vec::new()
         };
-        let program_args: Vec<String> = resolved
-            .prepend_args
-            .into_iter()
-            .chain(user_args)
-            .collect();
+        let program_args: Vec<String> =
+            resolved.prepend_args.into_iter().chain(user_args).collect();
         let shell_path = resolved.program;
 
         // Resolve working directory
@@ -1097,7 +1115,8 @@ impl PtyManager {
         // mirroring the #347 fix for git worktree paths. See `strip_verbatim_prefix`.
         let cwd = std::fs::canonicalize(&cwd)
             .map_err(|e| format!("Invalid working directory '{}': {}", cwd, e))?;
-        let cwd = crate::path_validation::strip_verbatim_prefix(&cwd.to_string_lossy()).into_owned();
+        let cwd =
+            crate::path_validation::strip_verbatim_prefix(&cwd.to_string_lossy()).into_owned();
 
         // Get terminal size
         let cols = options.cols.unwrap_or(80);
@@ -1120,13 +1139,13 @@ impl PtyManager {
                     if cfg!(windows)
                         && (shell_path.contains("powershell") || shell_path.contains("pwsh"))
                     {
-                        "-NoLogo"  // Skip PowerShell banner only (profile still loads)
+                        "-NoLogo" // Skip PowerShell banner only (profile still loads)
                     } else {
                         ""
                     }
                 )
             } else if shell_path.contains("powershell") || shell_path.contains("pwsh") {
-                format!("{} -NoLogo", shell_path)  // Skip PowerShell banner only (profile still loads)
+                format!("{} -NoLogo", shell_path) // Skip PowerShell banner only (profile still loads)
             } else {
                 shell_path.clone()
             };
@@ -1144,6 +1163,10 @@ impl PtyManager {
             // Create terminal instance
             let instance = Arc::new(TerminalInstance {
                 id: id.clone(),
+                conversation_id: options
+                    .conversation_id
+                    .expect("spawn assigned a ConversationId scope"),
+                workspace_ref_tracked: options.kind.as_deref() != Some("ssh"),
                 project_id: options.project_id.clone(),
                 child: Arc::new(AsyncMutex::new(Some(Box::new(child)))),
                 master: Arc::new(AsyncMutex::new(None)), // No master for ConPTY
@@ -1294,6 +1317,10 @@ impl PtyManager {
 
             let instance = Arc::new(TerminalInstance {
                 id: id.clone(),
+                conversation_id: options
+                    .conversation_id
+                    .expect("spawn assigned a ConversationId scope"),
+                workspace_ref_tracked: options.kind.as_deref() != Some("ssh"),
                 project_id: options.project_id.clone(),
                 child: Arc::new(AsyncMutex::new(Some(child))),
                 master: Arc::new(AsyncMutex::new(Some(pty_pair.master))),
@@ -1530,7 +1557,9 @@ impl PtyManager {
             let mut total = bytes.load(Ordering::Relaxed) + chunk.data.len();
             guard.push_back(chunk.clone());
             while total > SCROLLBACK_CAP {
-                let Some(evicted) = guard.pop_front() else { break };
+                let Some(evicted) = guard.pop_front() else {
+                    break;
+                };
                 total = total.saturating_sub(evicted.data.len());
             }
             bytes.store(total, Ordering::Relaxed);
@@ -1576,7 +1605,11 @@ impl PtyManager {
                         );
                         if let Some(ch) = channel_ref {
                             if let Err(e) = ch.send(Response::new(final_data)) {
-                                log::error!("[PTY {}] Failed to send final data via channel: {}", id, e);
+                                log::error!(
+                                    "[PTY {}] Failed to send final data via channel: {}",
+                                    id,
+                                    e
+                                );
                             }
                         }
                     }
@@ -1666,25 +1699,12 @@ impl PtyManager {
         Ok(())
     }
 
-    /// Kill a terminal
-    /// This is async because cleanup_terminal_resources_sync uses blocking_lock()
-    /// on AsyncMutex fields, which is forbidden inside tokio async runtime.
+    /// Explicitly terminate a terminal resource.
     ///
-    /// When app window is hidden, kill is deferred to prevent ConPTY lifecycle
-    /// issues on Windows where minimize can cause terminal processes to die.
-    /// The terminal remains tracked and will be cleaned up on next visible cycle
-    /// or when explicitly killed from the visible state.
-    pub async fn kill(&self, id: &str) -> Result<(), String> {
-        // When app is hidden, defer the kill — the PTY process should survive hide.
-        // ConPTY on Windows can kill processes when the window is minimized.
-        if self.is_hidden.load(Ordering::Relaxed) {
-            log::info!(
-                "[PtyManager] Deferring kill of terminal {} (app window hidden)",
-                id
-            );
-            return Ok(());
-        }
-
+    /// This is the sole user-facing destructive lifecycle operation. It is
+    /// intentionally independent from window visibility, renderer refs, view
+    /// close, navigation, and websocket connection cleanup.
+    pub async fn terminate(&self, id: &str) -> Result<(), String> {
         let instance = self
             .terminals
             .write()
@@ -1711,33 +1731,14 @@ impl PtyManager {
         Ok(())
     }
 
-    /// Force-kill bypassing the desktop `is_hidden` deferral. Used by the web
-    /// handler so that closing a terminal from a browser actually terminates
-    /// the process even when the desktop window is minimized. Desktop callers
-    /// continue to use [`kill`](Self::kill) which preserves the hide behavior.
+    /// Deprecated compatibility alias for [`terminate`](Self::terminate).
+    pub async fn kill(&self, id: &str) -> Result<(), String> {
+        self.terminate(id).await
+    }
+
+    /// Deprecated compatibility alias retained for older web handlers.
     pub async fn force_kill(&self, id: &str) -> Result<(), String> {
-        let instance = self
-            .terminals
-            .write()
-            .remove(id)
-            .ok_or_else(|| format!("Terminal not found: {}", id))?;
-
-        self.release_terminal_slot();
-
-        let instance_clone = instance.clone();
-        tokio::task::spawn_blocking(move || {
-            Self::cleanup_terminal_resources_sync(instance_clone, true);
-        })
-        .await
-        .map_err(|e| format!("spawn_blocking failed for terminal {}: {}", id, e))?;
-
-        self.cwd_tracker.stop_tracking(id);
-        self.git_tracker.remove_terminal(id);
-        self.exit_code_tracker.remove_terminal(id);
-        self.terminal_events.remove(id);
-        self.claims.remove(id);
-
-        Ok(())
+        self.terminate(id).await
     }
 
     /// Add a renderer reference to a terminal
@@ -1796,11 +1797,13 @@ impl PtyManager {
     /// unknown terminal, oversized probe, wrong/revoked credential, binding
     /// mismatch — collapses to the same [`crate::pty::claims::ClaimError`].
     pub fn verify_claim(&self, terminal_id: &str, claim: &str) -> Result<(), ClaimError> {
-        let binding = self
-            .get(terminal_id)
-            .and_then(|instance| instance.project_id.clone());
-        self.claims
-            .verify(terminal_id, claim, binding.as_deref())
+        let instance = self.get(terminal_id).ok_or(ClaimError)?;
+        self.claims.verify(
+            terminal_id,
+            claim,
+            instance.conversation_id,
+            instance.project_id.as_deref(),
+        )
     }
 
     /// Rotate a claim: possession of the current credential yields a fresh
@@ -1808,21 +1811,25 @@ impl PtyManager {
     /// is the signal for credential-derived access (desktop attach forwarders)
     /// to terminate.
     pub fn rotate_claim(&self, terminal_id: &str, claim: &str) -> Result<String, ClaimError> {
-        let binding = self
-            .get(terminal_id)
-            .and_then(|instance| instance.project_id.clone());
-        self.claims
-            .rotate(terminal_id, claim, binding.as_deref())
+        let instance = self.get(terminal_id).ok_or(ClaimError)?;
+        self.claims.rotate(
+            terminal_id,
+            claim,
+            instance.conversation_id,
+            instance.project_id.as_deref(),
+        )
     }
 
     /// Revoke a claim credential. The PTY itself is untouched — revocation
     /// only severs credential-derived access (never-clause).
     pub fn revoke_claim(&self, terminal_id: &str, claim: &str) -> Result<(), ClaimError> {
-        let binding = self
-            .get(terminal_id)
-            .and_then(|instance| instance.project_id.clone());
-        self.claims
-            .revoke(terminal_id, claim, binding.as_deref())
+        let instance = self.get(terminal_id).ok_or(ClaimError)?;
+        self.claims.revoke(
+            terminal_id,
+            claim,
+            instance.conversation_id,
+            instance.project_id.as_deref(),
+        )
     }
 
     /// Current claim generation for a terminal, if a claim record exists.
@@ -1859,6 +1866,19 @@ impl PtyManager {
     /// Get terminal by ID
     pub fn get(&self, id: &str) -> Option<Arc<TerminalInstance>> {
         self.terminals.read().get(id).cloned()
+    }
+
+    /// Get live terminals owned by one canonical Conversation.
+    pub fn get_by_conversation(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Vec<Arc<TerminalInstance>> {
+        self.terminals
+            .read()
+            .values()
+            .filter(|instance| instance.conversation_matches(conversation_id))
+            .cloned()
+            .collect()
     }
 
     /// Get all terminals
@@ -1997,7 +2017,8 @@ impl PtyManager {
                             .extension()
                             .and_then(|e| e.to_str())
                             .map(|e| e.to_ascii_lowercase());
-                        if shim_ext.as_deref() == Some("cmd") || shim_ext.as_deref() == Some("bat") {
+                        if shim_ext.as_deref() == Some("cmd") || shim_ext.as_deref() == Some("bat")
+                        {
                             return Err(format!(
                                 "Agent program '{}' is a batch shim that could not be parsed (ADR-004.2)",
                                 trimmed
@@ -2294,11 +2315,9 @@ impl PtyManager {
         &self,
         custom_env: Option<HashMap<String, String>>,
     ) -> HashMap<String, String> {
-        let custom_sets_path = custom_env.as_ref().is_some_and(|custom| {
-            custom
-                .keys()
-                .any(|key| key.eq_ignore_ascii_case("path"))
-        });
+        let custom_sets_path = custom_env
+            .as_ref()
+            .is_some_and(|custom| custom.keys().any(|key| key.eq_ignore_ascii_case("path")));
 
         #[cfg(target_os = "windows")]
         {
@@ -2312,11 +2331,7 @@ impl PtyManager {
                 }
             }
             if !has_windows_env_var(&env_map, "Path") {
-                upsert_windows_env_var(
-                    &mut env_map,
-                    "Path",
-                    env::var("PATH").unwrap_or_default(),
-                );
+                upsert_windows_env_var(&mut env_map, "Path", env::var("PATH").unwrap_or_default());
             }
             if !has_windows_env_var(&env_map, "PATHEXT") {
                 upsert_windows_env_var(
@@ -2669,10 +2684,8 @@ mod tests {
         // + extension via is_directly_executable_windows).
         std::fs::write(dir.join("node.exe"), b"MZ").unwrap();
         // Create the target script file.
-        std::fs::create_dir_all(dir.join("node_modules\\opencode-ai\\bin"))
-            .unwrap();
-        std::fs::write(dir.join("node_modules\\opencode-ai\\bin\\opencode"), b"")
-            .unwrap();
+        std::fs::create_dir_all(dir.join("node_modules\\opencode-ai\\bin")).unwrap();
+        std::fs::write(dir.join("node_modules\\opencode-ai\\bin\\opencode"), b"").unwrap();
 
         let shim_path = dir.join("opencode.cmd");
         let shim_content = "@ECHO off\r\n".to_owned()
@@ -2786,7 +2799,10 @@ mod tests {
             resolved.program
         );
         assert!(
-            resolved.prepend_args.iter().any(|a| a.ends_with("cursor-agent.ps1")),
+            resolved
+                .prepend_args
+                .iter()
+                .any(|a| a.ends_with("cursor-agent.ps1")),
             "expected -File script in prepend_args: {:?}",
             resolved.prepend_args
         );
@@ -2927,7 +2943,10 @@ mod tests {
             resolved.program
         );
         assert!(
-            resolved.prepend_args.iter().any(|a| a.ends_with("cursor-agent.ps1")),
+            resolved
+                .prepend_args
+                .iter()
+                .any(|a| a.ends_with("cursor-agent.ps1")),
             "expected -File script prepended, got: {:?}",
             resolved.prepend_args
         );
@@ -2944,8 +2963,8 @@ mod tests {
         let exe_path = dir.join("agent.exe");
         std::fs::write(&exe_path, b"MZ").unwrap();
 
-        let resolved = resolve_spawn_program(exe_path.to_str().unwrap())
-            .expect("native .exe should resolve");
+        let resolved =
+            resolve_spawn_program(exe_path.to_str().unwrap()).expect("native .exe should resolve");
         assert!(resolved.program.ends_with("agent.exe"));
         assert!(
             resolved.prepend_args.is_empty(),
@@ -3043,6 +3062,7 @@ mod tests {
         assert!(options.shell.is_none());
         assert!(options.cwd.is_none());
         assert!(options.env.is_none());
+        assert!(options.conversation_id.is_none());
         assert_eq!(options.cols, Some(80));
         assert_eq!(options.rows, Some(24));
     }
@@ -3069,8 +3089,13 @@ mod tests {
 
     #[test]
     fn test_spawn_options_deserialization() {
-        let json = r#"{"shell":"cmd.exe","cwd":"C:\\","cols":120,"rows":40}"#;
+        let json = r#"{"conversationId":"018f7a1c-1b4d-7c8a-9f01-0123456789ab","projectId":"project-attribution","shell":"cmd.exe","cwd":"C:\\","cols":120,"rows":40}"#;
         let options: SpawnOptions = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            options.conversation_id,
+            Some(ConversationId::parse("018f7a1c-1b4d-7c8a-9f01-0123456789ab").unwrap())
+        );
+        assert_eq!(options.project_id.as_deref(), Some("project-attribution"));
         assert_eq!(options.shell, Some("cmd.exe".to_string()));
         assert_eq!(options.cwd, Some("C:\\".to_string()));
         assert_eq!(options.cols, Some(120));
@@ -3104,7 +3129,10 @@ mod tests {
             !obj.contains_key("info"),
             "SpawnedTerminal must flatten info, not nest it"
         );
-        assert_eq!(obj.get("id").and_then(|v| v.as_str()), Some("terminal-123-0"));
+        assert_eq!(
+            obj.get("id").and_then(|v| v.as_str()),
+            Some("terminal-123-0")
+        );
         assert_eq!(obj.get("shell").and_then(|v| v.as_str()), Some("pwsh"));
         assert_eq!(obj.get("cwd").and_then(|v| v.as_str()), Some("C:\\work"));
         assert_eq!(obj.get("pid").and_then(|v| v.as_u64()), Some(42));
@@ -3153,9 +3181,18 @@ mod tests {
         let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
         assert_eq!(
             keys,
-            ["id", "shell", "cwd", "pid", "cols", "rows", "latestSeq", "gap"]
-                .into_iter()
-                .collect::<std::collections::BTreeSet<&str>>()
+            [
+                "id",
+                "shell",
+                "cwd",
+                "pid",
+                "cols",
+                "rows",
+                "latestSeq",
+                "gap"
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<&str>>()
         );
     }
 

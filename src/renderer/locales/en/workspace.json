@@ -22,10 +22,10 @@
     "prompt": "Enter password for {{name}}"
   },
   "closeTerminal": {
-    "title": "Close Terminal",
-    "message": "Are you sure you want to close \"{{name}}\"? Any running processes will be terminated.",
+    "title": "Close Terminal View",
+    "message": "Close the view for \"{{name}}\"? The terminal process keeps running and can be reopened.",
     "thisTerminal": "this terminal",
-    "dontAsk": "Don't ask again when closing terminals"
+    "dontAsk": "Don't ask again when closing terminal views"
   },
   "unsaved": {
     "title": "Unsaved Changes",

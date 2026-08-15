@@ -585,6 +585,49 @@ describe('WebTerminalClient frame handling & request lifecycle', () => {
       client.dispose()
     })
 
+    it('close-view detaches output while retaining the claim/cursor for explicit reopen', async () => {
+      vi.useFakeTimers()
+      const { client, internals } = makeClient()
+      await client.connect()
+      await client.attach('t1', 'lease-abc')
+      internals.socket.emit({ type: 'data', terminalId: 't1', seq: 9, data: [65] })
+
+      const closed = await client.closeView('t1')
+      expect(closed.success).toBe(true)
+
+      expect(internals.trackers.get('t1')).toMatchObject({
+        claim: 'lease-abc',
+        lastSeq: 9,
+        refCount: 0,
+        disconnected: false
+      })
+      expect(findSentRequest(internals.socket, 'close_view')?.payload).toEqual({ terminalId: 't1' })
+
+      internals.socket.close()
+      await vi.advanceTimersByTimeAsync(600)
+      expect(internals.socket).toBeNull()
+
+      const reopened = await client.attach('t1')
+      expect(reopened.success).toBe(true)
+      expect(internals.trackers.get('t1')?.claim).toBe('lease-abc')
+      client.dispose()
+    })
+
+    it('terminate is a distinct explicit request; kill is compatibility-only', async () => {
+      vi.useFakeTimers()
+      const { client, internals } = makeClient()
+      await client.connect()
+      await client.attach('t1', 'lease-abc')
+
+      const result = await client.request<void>('terminate', { terminalId: 't1' })
+      expect(result.success).toBe(true)
+      expect(findSentRequest(internals.socket, 'terminate')?.payload).toEqual({ terminalId: 't1' })
+      expect(findSentRequest(internals.socket, 'kill')).toBeUndefined()
+      client.removeTracker('t1')
+      expect(internals.trackers.has('t1')).toBe(false)
+      client.dispose()
+    })
+
     it('reconnect re-attaches terminals with a stored claim only', async () => {
       vi.useFakeTimers()
       const { client, internals } = makeClient()
@@ -593,7 +636,7 @@ describe('WebTerminalClient frame handling & request lifecycle', () => {
       // t1 holds a lease; t3 does not (e.g. a cross-client record without a
       // credential).
       await client.attach('t1', 'lease-abc')
-      internals.trackers.set('t3', { lastSeq: 0, exited: false, refCount: 0, disconnected: false })
+      internals.trackers.set('t3', { lastSeq: 0, exited: false, refCount: 1, disconnected: false })
 
       internals.socket.close()
       await vi.advanceTimersByTimeAsync(600)

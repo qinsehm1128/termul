@@ -2,8 +2,10 @@ import { create } from 'zustand'
 import { useShallow } from 'zustand/shallow'
 import { i18n } from '@/i18n'
 import { formatNumber } from '@/i18n/format'
+import { terminalApi } from '@/lib/terminal-api'
 import type { GitStatus, Terminal, TerminalHealthStatus } from '@/types/project'
 import { useProjectStore } from './project-store'
+import { useSessionWorkspaceSyncStore } from './session-workspace-sync-store'
 
 const GLOBAL_TERMINAL_LIMIT = 30
 export const HIDDEN_BUFFER_TRUNCATION_DELAY = 15 * 60 * 1000 // 15 minutes
@@ -47,9 +49,13 @@ export interface TerminalState {
     projectId: string,
     shell?: Terminal['shell'],
     cwd?: string,
-    pendingScrollback?: string[]
+    pendingScrollback?: string[],
+    conversationId?: string
   ) => Terminal
   closeTerminal: (id: string, projectId: string) => void
+  closeTerminalView: (id: string) => Promise<boolean>
+  reopenTerminalView: (id: string) => void
+  terminateTerminalResource: (id: string) => Promise<boolean>
   renameTerminal: (id: string, name: string) => void
   reorderTerminals: (projectId: string, orderedIds: string[]) => void
   setTerminals: (terminals: Terminal[]) => void
@@ -77,6 +83,7 @@ export interface TerminalState {
   /** @deprecated Use updateTerminalActivityBatch instead */
   updateTerminalLastActivityTimestamp: (id: string, timestamp: number) => void
   restartTerminal: (id: string) => void
+  restartTerminalResource: (id: string) => Promise<boolean>
   updateTerminalActivityBatch: (id: string, hasActivity: boolean, timestamp: number) => void
   clearTerminalPtyId: (ptyId: string) => void
   truncateHiddenTerminalBuffers: () => void
@@ -102,7 +109,8 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
     projectId: string,
     shell: Terminal['shell'] = 'powershell',
     cwd?: string,
-    pendingScrollback?: string[]
+    pendingScrollback?: string[],
+    suppliedConversationId?: string
   ): Terminal => {
     // Check global terminal limit
     const { terminals } = get()
@@ -117,8 +125,20 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
       )
     }
 
+    const conversationId =
+      suppliedConversationId ?? useSessionWorkspaceSyncStore.getState().activeConversationId
+    if (!conversationId) {
+      throw new Error(
+        i18n.t('lifecycle.conversationScopeRequired', {
+          ns: 'terminal',
+          defaultValue: 'Open a Conversation before creating a durable terminal'
+        })
+      )
+    }
+
     const newTerminal: Terminal = {
       id: Date.now().toString(),
+      conversationId,
       name,
       projectId,
       shell,
@@ -126,6 +146,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
       output: [],
       pendingScrollback,
       healthStatus: 'running',
+      viewState: 'visible',
       isHidden: false
     }
     set((state) => ({
@@ -156,6 +177,51 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
             ? ''
             : activeTerminalId
     })
+  },
+
+  closeTerminalView: async (id: string): Promise<boolean> => {
+    const terminal = get().terminals.find((candidate) => candidate.id === id)
+    if (!terminal) return false
+    if (terminal.ptyId) {
+      const result = await terminalApi.closeView(terminal.ptyId)
+      if (!result.success) return false
+    }
+    set((state) => ({
+      terminals: state.terminals.map((candidate) =>
+        candidate.id === id
+          ? { ...candidate, viewState: 'hidden', isHidden: true, hiddenSince: Date.now() }
+          : candidate
+      ),
+      activeTerminalId: state.activeTerminalId === id ? '' : state.activeTerminalId
+    }))
+    return true
+  },
+
+  reopenTerminalView: (id: string): void => {
+    set((state) => ({
+      terminals: state.terminals.map((candidate) =>
+        candidate.id === id
+          ? {
+              ...candidate,
+              viewState: 'visible',
+              isHidden: false,
+              hiddenSince: undefined
+            }
+          : candidate
+      ),
+      activeTerminalId: id
+    }))
+  },
+
+  terminateTerminalResource: async (id: string): Promise<boolean> => {
+    const terminal = get().terminals.find((candidate) => candidate.id === id)
+    if (!terminal) return false
+    if (terminal.ptyId) {
+      const result = await terminalApi.terminate(terminal.ptyId)
+      if (!result.success) return false
+    }
+    get().closeTerminal(id, terminal.projectId ?? '')
+    return true
   },
 
   renameTerminal: (id: string, name: string): void => {
@@ -462,6 +528,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
 
         return {
           ...t,
+          viewState: isHidden ? 'hidden' : 'visible',
           isHidden,
           hiddenSince: isHidden ? Date.now() : undefined
         }
@@ -522,35 +589,88 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
   },
 
   restartTerminal: (id: string): void => {
+    // Compatibility action for legacy callers that only reset renderer state.
+    // User-facing restart paths use restartTerminalResource below so the live
+    // PTY is explicitly terminated and re-spawned in the same Conversation.
+    set((state) => ({
+      terminals: state.terminals.map((terminal) =>
+        terminal.id === id
+          ? {
+              ...terminal,
+              healthStatus: 'running',
+              transcript: undefined,
+              pendingScrollback: undefined,
+              pendingModes: undefined
+            }
+          : terminal
+      ),
+      activeTerminalId: id
+    }))
+  },
+
+  restartTerminalResource: async (id: string): Promise<boolean> => {
+    const terminal = get().terminals.find((candidate) => candidate.id === id)
+    if (!terminal?.ptyId || !terminal.conversationId) return false
+
+    const terminated = await terminalApi.terminate(terminal.ptyId)
+    if (!terminated.success) return false
+
+    const previousPtyId = terminal.ptyId
     set((state) => {
-      const terminal = state.terminals.find((t) => t.id === id)
-      if (!terminal) return state
-      const newPtyId = `restart-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`
-      const newIndex = new Map(state.ptyIdIndex)
-      if (terminal.ptyId) {
-        newIndex.delete(terminal.ptyId)
-      }
-      newIndex.set(newPtyId, id)
+      const nextIndex = new Map(state.ptyIdIndex)
+      nextIndex.delete(previousPtyId)
       return {
-        terminals: state.terminals.map((t) =>
-          t.id === id
+        terminals: state.terminals.map((candidate) =>
+          candidate.id === id
             ? {
-                ...t,
-                ptyId: newPtyId,
-                // CAP-3: the old lease belonged to the old PTY — clear it; a
-                // fresh claim is issued when the restart re-spawns.
+                ...candidate,
+                ptyId: undefined,
                 claim: undefined,
+                healthStatus: 'crashed'
+              }
+            : candidate
+        ),
+        ptyIdIndex: nextIndex
+      }
+    })
+
+    const spawned = await terminalApi.spawn({
+      conversationId: terminal.conversationId,
+      projectId: terminal.projectId,
+      shell: terminal.agentProgram ? undefined : terminal.shell,
+      cwd: terminal.cwd,
+      kind: terminal.kind ?? 'shell',
+      program: terminal.agentProgram,
+      args: terminal.agentArgs
+    })
+    if (!spawned.success) return false
+
+    set((state) => {
+      if (!state.terminals.some((candidate) => candidate.id === id)) return state
+      const nextIndex = new Map(state.ptyIdIndex)
+      nextIndex.set(spawned.data.id, id)
+      return {
+        terminals: state.terminals.map((candidate) =>
+          candidate.id === id
+            ? {
+                ...candidate,
+                ptyId: spawned.data.id,
+                claim: spawned.data.claim,
                 healthStatus: 'running',
+                viewState: 'visible',
+                isHidden: false,
+                hiddenSince: undefined,
                 transcript: undefined,
                 pendingScrollback: undefined,
                 pendingModes: undefined
               }
-            : t
+            : candidate
         ),
-        ptyIdIndex: newIndex,
+        ptyIdIndex: nextIndex,
         activeTerminalId: id
       }
     })
+    return true
   },
 
   updateTerminalActivityBatch: (id: string, hasActivity: boolean, timestamp: number): void => {
@@ -633,27 +753,25 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
   },
 
   cleanupProjectTerminals: (projectId: string): void => {
-    set((state) => {
-      const removedTerminals = state.terminals.filter((t) => t.projectId === projectId)
-      const remainingTerminals = state.terminals.filter((t) => t.projectId !== projectId)
-      const newIndex = new Map(state.ptyIdIndex)
-
-      for (const terminal of removedTerminals) {
-        if (terminal.ptyId) {
-          newIndex.delete(terminal.ptyId)
-        }
-      }
-
-      return {
-        terminals: remainingTerminals,
-        ptyIdIndex: newIndex,
-        activeTerminalId: state.terminals.some(
-          (t) => t.id === state.activeTerminalId && t.projectId === projectId
-        )
-          ? ''
-          : state.activeTerminalId
-      }
-    })
+    // Project removal/navigation is not PTY termination. Preserve Conversation
+    // terminal records and claims; only hide their renderer views.
+    set((state) => ({
+      terminals: state.terminals.map((terminal) =>
+        terminal.projectId === projectId
+          ? {
+              ...terminal,
+              viewState: 'hidden',
+              isHidden: true,
+              hiddenSince: terminal.hiddenSince ?? Date.now()
+            }
+          : terminal
+      ),
+      activeTerminalId: state.terminals.some(
+        (terminal) => terminal.id === state.activeTerminalId && terminal.projectId === projectId
+      )
+        ? ''
+        : state.activeTerminalId
+    }))
   },
 
   getTerminalCount: (): number => {
@@ -680,6 +798,16 @@ export function useTerminals(): Terminal[] {
   )
 }
 
+export function useConversationTerminals(conversationId: string | null): Terminal[] {
+  return useTerminalStore(
+    useShallow((state) =>
+      conversationId
+        ? state.terminals.filter((terminal) => terminal.conversationId === conversationId)
+        : []
+    )
+  )
+}
+
 export function useAllTerminals(): Terminal[] {
   return useTerminalStore(useShallow((state) => state.terminals))
 }
@@ -703,6 +831,10 @@ export function useTerminalActions(): Pick<
   | 'selectTerminal'
   | 'addTerminal'
   | 'closeTerminal'
+  | 'closeTerminalView'
+  | 'reopenTerminalView'
+  | 'terminateTerminalResource'
+  | 'restartTerminalResource'
   | 'renameTerminal'
   | 'reorderTerminals'
   | 'updateTerminalCwd'
@@ -721,6 +853,10 @@ export function useTerminalActions(): Pick<
       selectTerminal: state.selectTerminal,
       addTerminal: state.addTerminal,
       closeTerminal: state.closeTerminal,
+      closeTerminalView: state.closeTerminalView,
+      reopenTerminalView: state.reopenTerminalView,
+      terminateTerminalResource: state.terminateTerminalResource,
+      restartTerminalResource: state.restartTerminalResource,
       renameTerminal: state.renameTerminal,
       reorderTerminals: state.reorderTerminals,
       updateTerminalCwd: state.updateTerminalCwd,
@@ -749,7 +885,7 @@ export function useProjectsWithActivity(): string[] {
         // Indikator menyala jika:
         // 1. Ada aktivitas output (hasActivity)
         // 2. Sedang proses awal loading/spawn (status running tapi PTY belum siap)
-        if (t.hasActivity || (t.healthStatus === 'running' && !t.ptyId)) {
+        if (t.projectId && (t.hasActivity || (t.healthStatus === 'running' && !t.ptyId))) {
           activeProjectIds.add(t.projectId)
         }
       }
@@ -766,7 +902,7 @@ export function useProjectsWithErrors(): Set<string> {
     useShallow((state) => {
       const errorProjectIds = new Set<string>()
       for (const t of state.terminals) {
-        if (t.healthStatus === 'crashed' || t.healthStatus === 'disconnected') {
+        if (t.projectId && (t.healthStatus === 'crashed' || t.healthStatus === 'disconnected')) {
           errorProjectIds.add(t.projectId)
         }
       }

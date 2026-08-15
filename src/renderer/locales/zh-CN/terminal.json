@@ -85,5 +85,20 @@
     "perProject_other": "每个项目最多允许 {{formattedCount}} 个终端",
     "global_one": "所有项目最多允许 {{formattedCount}} 个终端",
     "global_other": "所有项目最多允许 {{formattedCount}} 个终端"
+  },
+  "lifecycle": {
+    "closeView": "关闭视图",
+    "closeViewDescription": "隐藏此视图，终端进程将继续运行。",
+    "closeViewFailed": "无法关闭终端视图；进程仍在运行。",
+    "terminateProcess": "终止进程",
+    "terminateTitle": "终止终端进程？",
+    "terminateDescription": "这会停止实时进程并仅移除终端资源；对话聊天和历史记录会保留。",
+    "terminateFailed": "无法终止终端进程。",
+    "restartFailed": "无法重启终端进程。",
+    "reopen": "重新打开",
+    "reconnect": "重新连接",
+    "hiddenRunning": "已隐藏但仍在运行的终端",
+    "conversationScopeRequired": "请先打开一个对话，再创建持久终端",
+    "scopeError": "终端需要有效的对话作用域。"
   }
 }
