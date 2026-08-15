@@ -12,7 +12,10 @@ import {
   type AcpTransport,
   AcpTransportError
 } from '@/lib/acp-transport'
-import { createTauriConversationApi } from '@/lib/tauri-conversation-api'
+import {
+  createTauriConversationApi,
+  normalizeConversationError
+} from '@/lib/tauri-conversation-api'
 import { createWebConversationApi } from '@/lib/web-conversation-api'
 
 const ID = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
@@ -139,6 +142,93 @@ describe('Conversation transport golden parity', () => {
       success: false,
       code: 'LEGACY_COMPATIBILITY_READ_ONLY',
       error: 'legacy source is read-only'
+    })
+  })
+
+  it('preserves every release-stable application code without transport remapping', () => {
+    const stableCodes = [
+      'CONVERSATION_INVALID_ID',
+      'CONVERSATION_NOT_FOUND',
+      'CONVERSATION_CONFLICT',
+      'CONVERSATION_RECOVERY_REQUIRED',
+      'CONVERSATION_LIVE_RESOURCES',
+      'CONVERSATION_BINDING_NOT_FOUND',
+      'CONVERSATION_BINDING_NOT_ACTIVE',
+      'CONVERSATION_BINDING_NOT_DETACHED',
+      'CONVERSATION_BINDING_NOT_ADDRESSABLE',
+      'CONVERSATION_DURABILITY_FAILED',
+      'LEGACY_COMPATIBILITY_READ_ONLY',
+      'LEGACY_ID_AMBIGUOUS',
+      'MIGRATION_IDEMPOTENCY_CONFLICT',
+      'VALIDATION_ERROR',
+      'FORBIDDEN',
+      'UNAUTHORIZED'
+    ]
+    for (const code of stableCodes) {
+      expect(normalizeConversationError({ code, message: `stable:${code}` })).toEqual({
+        success: false,
+        code,
+        error: `stable:${code}`
+      })
+    }
+  })
+
+  it('passes workspace success/conflict/recovery and lifecycle/resource outcomes unchanged', async () => {
+    vi.mocked(invoke).mockImplementation(async (command) => {
+      if (command === 'session_workspace_get') {
+        return { success: true, data: { status: 'missing', conversationId: ID } }
+      }
+      if (command === 'session_workspace_write') {
+        return {
+          success: true,
+          data: {
+            status: 'conflict',
+            currentRevision: 7,
+            currentUpdatedAtUtc: '2026-08-15T10:00:00.000Z',
+            currentUpdateIdentity: 'browser-b'
+          }
+        }
+      }
+      if (command === 'conversation_delete') {
+        return {
+          success: true,
+          data: {
+            status: 'blocked',
+            action: 'deleteConversation',
+            conversationId: ID,
+            revision: 7,
+            code: 'CONVERSATION_LIVE_RESOURCES',
+            blockers: [{ kind: 'terminalResources', count: 1, ids: ['terminal-live'] }]
+          }
+        }
+      }
+      return { success: false, code: 'CONVERSATION_RECOVERY_REQUIRED', error: 'recovery' }
+    })
+    const api = createTauriConversationApi()
+    await expect(api.getWorkspace(ID)).resolves.toMatchObject({
+      success: true,
+      data: { status: 'missing', conversationId: ID }
+    })
+    await expect(
+      api.writeWorkspace(ID, 6, {
+        schemaVersion: 1,
+        conversationId: ID,
+        revision: 6,
+        updatedAtUtc: '',
+        resources: [],
+        projectionState: { status: 'native' }
+      })
+    ).resolves.toMatchObject({
+      success: true,
+      data: { status: 'conflict', currentRevision: 7 }
+    })
+    await expect(api.deleteConversation(ID, 7)).resolves.toMatchObject({
+      success: true,
+      data: {
+        status: 'blocked',
+        code: 'CONVERSATION_LIVE_RESOURCES',
+        blockers: [{ kind: 'terminalResources', ids: ['terminal-live'] }]
+      }
     })
   })
 

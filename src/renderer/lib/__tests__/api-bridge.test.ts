@@ -26,6 +26,10 @@ vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn()
 }))
 
+vi.mock('@/lib/tauri-runtime', () => ({
+  isTauriContext: vi.fn(() => true)
+}))
+
 vi.mock('@tauri-apps/api/event', () => ({
   listen: vi.fn()
 }))

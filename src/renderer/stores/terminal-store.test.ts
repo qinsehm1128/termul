@@ -928,7 +928,7 @@ describe('terminal-store', () => {
       expect(terminals.some((t) => t.claim === 'lease-on-closed-terminal')).toBe(false)
     })
 
-    it('restartTerminal drops the stale claim of the replaced PTY', () => {
+    it('restartTerminal preserves the live PTY claim during a renderer-only reset', () => {
       const { setTerminalPtyId, setTerminalClaim, restartTerminal } = useTerminalStore.getState()
 
       setTerminalPtyId('t1', 'pty-cap3-restart')
@@ -938,12 +938,11 @@ describe('terminal-store', () => {
 
       const { terminals } = useTerminalStore.getState()
       const restarted = terminals.find((t) => t.id === 't1')
-      // The old lease belonged to the old PTY — the record gets a fresh
-      // placeholder ptyId and no claim until the restart re-spawns.
-      expect(restarted?.claim).toBeUndefined()
-      expect(restarted?.ptyId).toBeDefined()
-      expect(restarted?.ptyId).not.toBe('pty-cap3-restart')
-      expect(terminals.some((t) => t.claim === 'lease-stale-after-restart')).toBe(false)
+      // This compatibility action resets only renderer state. Explicit
+      // restartTerminalResource owns PTY termination, re-spawn, and claim rotation.
+      expect(restarted?.claim).toBe('lease-stale-after-restart')
+      expect(restarted?.ptyId).toBe('pty-cap3-restart')
+      expect(terminals.some((t) => t.claim === 'lease-stale-after-restart')).toBe(true)
     })
 
     it('excludes the claim from the auto-save persisted payload (persistence exclusion)', () => {

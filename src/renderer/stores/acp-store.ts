@@ -4407,6 +4407,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
   },
 
   deleteHistorySession: async (id) => {
+    invalidateSessionReopen(id)
     const state = get()
     const entry = state.sessionIndex.find((candidate) => candidate.id === id)
     const conversationId = state.sessions[id]?.conversationId ?? entry?.conversationId
@@ -4417,11 +4418,16 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     if (ephemeralSessionIds.has(id)) {
       ephemeralSessionIds.delete(id)
       set((current) => ({
+        ...dropEphemeralSessionState(current, id),
         sessionIndex: current.sessionIndex.filter((candidate) => candidate.id !== id),
-        ...dropSessionTranscriptState(current, id)
+        openingHistoryIds: dropRecordKey(current.openingHistoryIds, id),
+        restoringChatIds: dropRecordKey(current.restoringChatIds, id)
       }))
       return
     }
+    // Repeated cleanup of an already-removed ephemeral session is idempotent. A present legacy
+    // index/session still fails closed below because compatibility sources are read-only.
+    if (!entry && !state.sessions[id]) return
     throw new ConversationLifecycleApiError(
       'CONVERSATION_NOT_FOUND',
       'LEGACY_STORE_READ_ONLY: legacy chat history cannot be deleted'

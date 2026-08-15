@@ -21,8 +21,8 @@ import {
 } from './web-protocol.types'
 
 describe('web-protocol.types — event/request type registries (AC2)', () => {
-  it('exports exactly 22 event types including durable user prompts', () => {
-    expect(WS_EVENT_TYPES).toHaveLength(22)
+  it('exports exactly 23 event types including Conversation lifecycle events', () => {
+    expect(WS_EVENT_TYPES).toHaveLength(23)
     // The 16 from events.rs (prefix-dropped) + auth_required.
     const expected16FromEvents = [
       'agent_spawned',
@@ -53,13 +53,14 @@ describe('web-protocol.types — event/request type registries (AC2)', () => {
     expect(WS_EVENT_TYPES).toContain('user_prompt')
     // Epic-4 bridge: desktop chat-history live push (agent-level, seq 0).
     expect(WS_EVENT_TYPES).toContain('chat_history_changed')
+    expect(WS_EVENT_TYPES).toContain('conversation_lifecycle')
     expect(WS_REQUEST_TYPES).toContain('list_persisted_sessions')
     expect(WS_REQUEST_TYPES).toContain('open_persisted_session')
     expect(WS_REQUEST_TYPES).toContain('get_session_payload')
   })
 
-  it('exports exactly 30 request types including discovered-session promotion', () => {
-    expect(WS_REQUEST_TYPES).toHaveLength(30)
+  it('exports exactly 43 request types including Conversation-first operations', () => {
+    expect(WS_REQUEST_TYPES).toHaveLength(43)
     const expected = [
       'send_prompt',
       'cancel_prompt',
@@ -93,7 +94,21 @@ describe('web-protocol.types — event/request type registries (AC2)', () => {
       'list_acp_catalog',
       'set_catalog_opt_in',
       // CAP-6 / Story 9: host-owned verified-atomic ACP install.
-      'install_acp_agent'
+      'install_acp_agent',
+      'recover_session_snapshot',
+      'detach_binding',
+      'rebind_binding',
+      'suspend_binding',
+      'replace_binding',
+      'delete_conversation',
+      'conversation_host_status',
+      'list_conversations',
+      'get_conversation',
+      'open_conversation',
+      'resolve_legacy_conversation_id',
+      'get_session_workspace',
+      'write_session_workspace',
+      'resolve_recovery_item'
     ]
     for (const name of expected) {
       expect(WS_REQUEST_TYPES).toContain(name)

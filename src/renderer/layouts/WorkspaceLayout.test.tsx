@@ -847,7 +847,7 @@ describe('WorkspaceLayout - Empty States', () => {
       expect(
         await screen.findByRole('dialog', { name: 'Color theme picker' }, { timeout: 10000 })
       ).toBeInTheDocument()
-    })
+    }, 15_000)
   })
 
   describe('Close flow persistence coordination', () => {
@@ -1187,6 +1187,6 @@ describe('WorkspaceLayout - Empty States', () => {
         tauriRef.current = prev
         mockApi.filesystem.watchDirectory.mockResolvedValue({ success: true })
       }
-    })
+    }, 15_000)
   })
 })

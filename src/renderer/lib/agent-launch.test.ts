@@ -25,6 +25,12 @@ const {
   mockTerminals: [] as Array<{ projectId: string }>
 }))
 
+vi.mock('@/stores/session-workspace-sync-store', () => ({
+  useSessionWorkspaceSyncStore: {
+    getState: () => ({ activeConversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab' })
+  }
+}))
+
 vi.mock('@/stores/terminal-store', () => ({
   useTerminalStore: {
     getState: () => ({

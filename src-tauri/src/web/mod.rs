@@ -38,6 +38,9 @@ pub mod workspace_api;
 pub mod worktree_api;
 pub mod ws;
 
+#[cfg(test)]
+mod conversation_golden_tests;
+
 pub use config::ServerConfig;
 pub use permissions::PermissionRendezvous;
 pub use permissions::QuestionRendezvous;

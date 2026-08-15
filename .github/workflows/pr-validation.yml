@@ -173,6 +173,67 @@ jobs:
           src/renderer/assets/agent-icons/acp/
           src-tauri/src/acp_registry_snapshot.rs
 
+  conversation-native-durability:
+    name: Conversation Native Durability (${{ matrix.platform }})
+    if: github.event.action != 'edited'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ubuntu-22.04
+          - platform: macos
+            os: macos-latest
+          - platform: windows
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            patchelf
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: src-tauri
+          cache-on-failure: true
+
+      - name: Durable filesystem replacement matrix
+        working-directory: src-tauri
+        run: cargo test conversation::durable_fs
+
+      - name: Migration recovery matrix
+        working-directory: src-tauri
+        run: cargo test conversation::migration
+
+      - name: Repository recovery matrix
+        working-directory: src-tauri
+        run: cargo test conversation::repository
+
+      - name: SessionWorkspace recovery matrix
+        working-directory: src-tauri
+        run: cargo test conversation::session_workspace
+
+      - name: Native replacement and restart matrix
+        working-directory: src-tauri
+        run: cargo test conversation::native_durability_tests
+
   rust-checks:
     name: Rust Checks
     if: github.event.action != 'edited'
@@ -284,6 +345,8 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy
 
       - name: Cache Rust
         uses: swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
@@ -366,7 +429,15 @@ jobs:
   build-check:
     name: Verify Tauri Frontend Build
     if: github.event.action != 'edited'
-    needs: [validate, rust-checks, rust-windows-check, web-build, standalone-server-build]
+    needs:
+      [
+        validate,
+        conversation-native-durability,
+        rust-checks,
+        rust-windows-check,
+        web-build,
+        standalone-server-build
+      ]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

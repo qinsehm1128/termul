@@ -1,4 +1,4 @@
-import { cleanup, render } from '@testing-library/react'
+import { cleanup, render, screen } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 // Mock window.api before any imports that use it
@@ -65,11 +65,11 @@ describe('WorkspaceDashboard', () => {
     cleanup()
   })
 
-  it('should render empty component (layout handles all rendering)', () => {
-    const { container } = render(<WorkspaceDashboard />)
+  it('renders the project-less Conversation workspace entry point', () => {
+    render(<WorkspaceDashboard />)
 
-    // WorkspaceDashboard is now a minimal route target component
-    // All actual UI is rendered by WorkspaceLayout.tsx
-    expect(container.firstChild).toBe(null)
+    expect(screen.getByRole('heading', { name: 'Your Conversation workspace' })).toBeVisible()
+    expect(screen.getByText(/Start a chat without creating a project/)).toBeVisible()
+    expect(screen.getByText(/No conversations yet/)).toBeVisible()
   })
 })

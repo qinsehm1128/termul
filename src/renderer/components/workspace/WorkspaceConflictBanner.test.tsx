@@ -1,15 +1,22 @@
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { conflictMock, recoveryMock } = vi.hoisted(() => ({
+const { conflictMock, conversationApiMock } = vi.hoisted(() => ({
   conflictMock: vi.fn(),
-  recoveryMock: vi.fn()
+  conversationApiMock: {
+    resolveRecovery: vi.fn()
+  }
 }))
 
 vi.mock('@/hooks/use-session-workspace-sync', () => ({
-  resolveSessionWorkspaceConflict: conflictMock,
-  resolveSessionWorkspaceRecovery: recoveryMock
+  resolveSessionWorkspaceConflict: conflictMock
 }))
+
+vi.mock('@/lib/conversation-api', () => ({
+  conversationApi: conversationApiMock
+}))
+
+vi.mock('@/lib/log-api', () => ({ logFrontendError: vi.fn() }))
 
 import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
 import { WorkspaceConflictBanner } from './WorkspaceConflictBanner'
@@ -45,6 +52,22 @@ const recoveryItem = {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  conversationApiMock.resolveRecovery.mockImplementation(async (request) => ({
+    success: true,
+    data: {
+      recoveryId: request.recoveryId,
+      action: request.action,
+      authorization: request.action === 'inspect' ? 'read' : 'mutation',
+      status: 'unresolved',
+      recoveryRevision: 7,
+      workspaceRevision: null,
+      workspaceChanged: false,
+      sourcePaths: recoveryItem.sourcePaths,
+      sourceSha256: recoveryItem.sourceSha256,
+      candidateFacts: recoveryItem.candidateFacts,
+      provenance: recoveryItem.provenance
+    }
+  }))
   useSessionWorkspaceSyncStore.setState({
     activeConversationId: one,
     basedRevisionByConversation: {},
@@ -92,23 +115,38 @@ describe('WorkspaceConflictBanner', () => {
   it('renders immutable source/checksum context and the exact shared recovery actions', () => {
     useSessionWorkspaceSyncStore.getState().setRecoveryItems(one, [recoveryItem])
     render(<WorkspaceConflictBanner conversationId={one} />)
-    expect(screen.getByText('ambiguous_workspace_manifest')).toBeInTheDocument()
-    expect(screen.getByText(/legacy_workspace_manifests\/0\/shared.json/)).toBeInTheDocument()
-    expect(screen.getByText(new RegExp(`sha256:${'e'.repeat(64)}`))).toBeInTheDocument()
+    expect(
+      screen.getByRole('region', {
+        name: new RegExp(`ambiguous_workspace_manifest ${'a'.repeat(64)}`)
+      })
+    ).toBeVisible()
+    expect(
+      screen.getAllByText(/legacy_workspace_manifests\/0\/shared.json/).length
+    ).toBeGreaterThan(0)
+    expect(screen.getAllByText(new RegExp(`sha256:${'e'.repeat(64)}`)).length).toBeGreaterThan(0)
     for (const action of recoveryItem.suggestedActions) {
-      expect(screen.getByRole('button', { name: action })).toBeInTheDocument()
+      expect(document.querySelector(`[data-recovery-action="${action}"]`)).toBeVisible()
     }
   })
 
-  it('invokes every exact recovery action with the active Conversation and RecoveryItem revision', () => {
+  it('invokes every exact recovery action with RecoveryItem revision and action payloads', async () => {
     useSessionWorkspaceSyncStore.getState().setRecoveryItems(one, [recoveryItem])
     render(<WorkspaceConflictBanner conversationId={one} />)
     for (const action of recoveryItem.suggestedActions) {
-      fireEvent.click(screen.getByRole('button', { name: action }))
+      const button = document.querySelector<HTMLButtonElement>(`[data-recovery-action="${action}"]`)
+      expect(button).toBeVisible()
+      fireEvent.click(button!)
+      await waitFor(() =>
+        expect(conversationApiMock.resolveRecovery).toHaveBeenCalledWith(
+          expect.objectContaining({
+            recoveryId: recoveryItem.recoveryId,
+            expectedRevision: 7,
+            action
+          })
+        )
+      )
     }
-    expect(recoveryMock.mock.calls).toEqual(
-      recoveryItem.suggestedActions.map((action) => [one, recoveryItem, action])
-    )
+    expect(conversationApiMock.resolveRecovery).toHaveBeenCalledTimes(4)
   })
 
   it('uses accessible buttons and responsive wrapping', () => {
@@ -117,7 +155,7 @@ describe('WorkspaceConflictBanner', () => {
     expect(screen.getByRole('alert')).toHaveAttribute('aria-live', 'polite')
     for (const button of screen.getAllByRole('button')) {
       expect(button).toHaveAttribute('type', 'button')
-      expect(button.parentElement?.className).toContain('flex-wrap')
+      expect(button.parentElement?.className).toContain('grid-cols-2')
     }
   })
 })

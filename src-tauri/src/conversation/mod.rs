@@ -15,6 +15,11 @@ pub mod repository;
 pub mod session_workspace;
 pub mod workspace_projection;
 
+#[cfg(test)]
+mod native_durability_tests;
+#[cfg(test)]
+mod validation_tests;
+
 pub use application::{
     ConversationApplicationError, ConversationApplicationService, ConversationHostKind,
     ConversationHostState, ConversationHostStatus, ConversationOpenOutcome, LegacyConversationKey,

@@ -158,7 +158,7 @@ describe('ACP Conversation lifecycle store', () => {
   it('closes only the renderer view and preserves session and transcript state', () => {
     useAcpStore.getState().closeChatView(conversationId)
 
-    expect(closeViewSpy).toHaveBeenCalledWith('session-old')
+    expect(closeViewSpy).toHaveBeenCalledWith(conversationId)
     expect(detachSpy).not.toHaveBeenCalled()
     expect(suspendSpy).not.toHaveBeenCalled()
     expect(deleteSpy).not.toHaveBeenCalled()
@@ -209,7 +209,7 @@ describe('ACP Conversation lifecycle store', () => {
     expect(useAcpStore.getState().sessions['session-old']).toBeUndefined()
     expect(useAcpStore.getState().sessions['session-new']?.conversationId).toBe(conversationId)
     expect(useAcpStore.getState().messages['session-new']).toHaveLength(1)
-    expect(remapViewSpy).toHaveBeenCalledWith('session-old', 'session-new')
+    expect(remapViewSpy).not.toHaveBeenCalled()
   })
 
   it('keeps state intact when delete is blocked by live bindings or terminals', async () => {
@@ -253,6 +253,6 @@ describe('ACP Conversation lifecycle store', () => {
     expect(deleteSpy).toHaveBeenCalledWith(conversationId, 4)
     expect(useAcpStore.getState().sessionIndex).toEqual([])
     expect(useAcpStore.getState().sessions['session-old']).toBeUndefined()
-    expect(closeViewSpy).toHaveBeenCalledWith('session-old')
+    expect(closeViewSpy).toHaveBeenCalledWith(conversationId)
   })
 })

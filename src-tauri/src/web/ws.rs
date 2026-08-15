@@ -4063,6 +4063,45 @@ async fn handle_answer_question(
 }
 
 #[cfg(test)]
+pub(crate) async fn dispatch_conversation_golden_request(
+    text: &str,
+    authed: &mut bool,
+    service: &Arc<crate::conversation::ConversationApplicationService>,
+) -> WsReply {
+    let relay = Arc::new(WsRelaySink::new());
+    let acp = Arc::new(AcpManager::new(vec![]));
+    let registry = Arc::new(ProjectRegistry::new());
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let mut subscribed_clients = Vec::new();
+    let mut current_agent = None;
+    let current_session = Arc::new(parking_lot::Mutex::new(None));
+    let current_conversation = Arc::new(parking_lot::Mutex::new(None));
+    let current_project = Arc::new(parking_lot::Mutex::new(None));
+    let switch_queue = Arc::new(tokio::sync::Mutex::new(ProjectSwitchQueue::default()));
+    handle_request_with_conversation(
+        text,
+        authed,
+        &acp,
+        &relay,
+        &registry,
+        None,
+        None,
+        &out_tx,
+        &mut subscribed_clients,
+        &mut current_agent,
+        &current_session,
+        &current_conversation,
+        &current_project,
+        &switch_queue,
+        HistoryMode::LiveOnly,
+        None,
+        None,
+        Some(service),
+    )
+    .await
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;

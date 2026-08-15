@@ -67,7 +67,8 @@ impl CwdTracker {
     /// Detects the current working directory for a given process ID.
     ///
     /// # Platform Support
-    /// - **Unix/Linux**: Reads `/proc/{pid}/cwd` symlink
+    /// - **Linux**: Reads `/proc/{pid}/cwd` symlink
+    /// - **macOS**: Queries the process cwd through `lsof`
     /// - **Windows**: Returns None (not supported)
     ///
     /// # Arguments
@@ -77,24 +78,38 @@ impl CwdTracker {
     /// * `Some(String)` - Absolute path to current working directory
     /// * `None` - Process not found or platform not supported
     fn detect_cwd(_pid: u32) -> Option<String> {
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
             use std::fs;
             use std::path::Path;
 
             let cwd_path = Path::new("/proc").join(_pid.to_string()).join("cwd");
-
-            // Read the symlink which points to the actual directory
-            fs::read_link(&cwd_path)
+            return fs::read_link(&cwd_path)
                 .ok()
-                .and_then(|path| path.into_os_string().into_string().ok())
+                .and_then(|path| path.into_os_string().into_string().ok());
         }
 
-        #[cfg(not(unix))]
+        #[cfg(target_os = "macos")]
         {
-            // Windows does not have /proc filesystem
-            // CWD tracking on Windows would require different mechanisms
-            // (e.g., NtQueryInformationProcess), which is not implemented here
+            use std::process::Command;
+
+            let output = Command::new("lsof")
+                .args(["-a", "-p", &_pid.to_string(), "-d", "cwd", "-Fn"])
+                .output()
+                .ok()?;
+            if !output.status.success() {
+                return None;
+            }
+            String::from_utf8(output.stdout)
+                .ok()?
+                .lines()
+                .find_map(|line| line.strip_prefix('n').filter(|path| !path.is_empty()))
+                .map(ToOwned::to_owned)
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            // Windows does not have a portable process-CWD query.
             None
         }
     }

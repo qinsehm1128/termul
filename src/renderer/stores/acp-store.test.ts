@@ -1,8 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { toastError, toastWarning } = vi.hoisted(() => ({
+const { toastError, toastWarning, conversationApiMock } = vi.hoisted(() => ({
   toastError: vi.fn(),
-  toastWarning: vi.fn()
+  toastWarning: vi.fn(),
+  conversationApiMock: {
+    listConversations: vi.fn(),
+    openConversation: vi.fn(),
+    resolveRecovery: vi.fn()
+  }
 }))
 
 vi.mock('sonner', () => ({
@@ -21,6 +26,9 @@ vi.mock('@/lib/tauri-runtime', () => ({
 }))
 vi.mock('@/lib/log-api', () => ({
   logFrontendError: vi.fn()
+}))
+vi.mock('@/lib/conversation-api', () => ({
+  conversationApi: conversationApiMock
 }))
 vi.mock('@/lib/acp-agents-persistence', async (orig) => {
   const actual = await orig<typeof import('@/lib/acp-agents-persistence')>()
@@ -130,6 +138,18 @@ import {
   selectConfigWarmState,
   useAcpStore
 } from './acp-store'
+
+const CONVERSATION_ID = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+
+function conversationOutcome(sessionId: string) {
+  return {
+    sessionId,
+    persistence: 'conversation' as const,
+    conversationId: CONVERSATION_ID,
+    workspaceCwd: `/visible/${CONVERSATION_ID}`,
+    executionCwd: `/visible/${CONVERSATION_ID}`
+  }
+}
 
 const FRESH = {
   agents: {},
@@ -291,6 +311,11 @@ describe('acp-store', () => {
     _resetCoalesceForTesting()
     _resetEphemeralSessionIdsForTesting()
     _resetSessionIndexLoadGenerationForTesting()
+    conversationApiMock.openConversation.mockResolvedValue({
+      success: false,
+      code: 'TEST_CONVERSATION_OPEN',
+      error: 'test boundary'
+    })
     useAcpStore.setState(FRESH)
   })
 
@@ -2324,7 +2349,7 @@ describe('acp-store', () => {
     )
   })
 
-  it('startChat reuses a prepared session from prepareChat (GH-288)', async () => {
+  it('startChat replaces a backend-ephemeral prepare with a canonical Conversation', async () => {
     await useAcpStore
       .getState()
       .saveAgentConfig({ id: 'cfg-1', name: 'Gemini', command: 'gemini', args: [], env: {} })
@@ -2333,7 +2358,19 @@ describe('acp-store', () => {
       agentStatus: { ...s.agentStatus, 'agent-9': 'connected' },
       configToLiveAgent: { ...s.configToLiveAgent, [agentReuseKey('cfg-1', '/work')]: 'agent-9' }
     }))
-    ;(invoke as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ sessionId: 'sess-prep' })
+    let newSessionCalls = 0
+    ;(invoke as ReturnType<typeof vi.fn>).mockImplementation((command: string) => {
+      if (command === 'acp_new_session') {
+        newSessionCalls += 1
+        return Promise.resolve(
+          newSessionCalls === 1
+            ? { sessionId: 'sess-prep', persistence: 'ephemeral' }
+            : conversationOutcome('sess-canonical')
+        )
+      }
+      if (command === 'acp_close_session') return Promise.resolve(undefined)
+      return Promise.resolve(undefined)
+    })
     useAcpStore.getState().prepareChat('cfg-1', '/work', undefined, 'p1')
     await vi.waitFor(() => {
       expect(Object.values(useAcpStore.getState().preparedSessions).includes('sess-prep')).toBe(
@@ -2341,14 +2378,12 @@ describe('acp-store', () => {
       )
     })
     const sessionId = await useAcpStore.getState().startChat('cfg-1', '/work', undefined, 'p1')
-    expect(sessionId).toBe('sess-prep')
-    expect(invoke).toHaveBeenCalledTimes(1)
-    expect(invoke).toHaveBeenCalledWith('acp_new_session', {
-      agentId: 'agent-9',
-      cwd: '/work',
-      mcpServers: [],
-      projectId: 'p1'
-    })
+    expect(sessionId).toBe('sess-canonical')
+    expect(useAcpStore.getState().sessions['sess-canonical']?.conversationId).toBe(CONVERSATION_ID)
+    expect(useAcpStore.getState().preparedSessions).toEqual({})
+    expect(
+      vi.mocked(invoke).mock.calls.filter(([command]) => command === 'acp_new_session')
+    ).toHaveLength(2)
   })
 
   it('records and clears prepareChat failures', async () => {
@@ -2474,7 +2509,7 @@ describe('acp-store', () => {
         sessionId: 'sess-stale'
       })
     })
-    expect(useAcpStore.getState().sessions['sess-stale']?.status).toBe('closed')
+    expect(useAcpStore.getState().sessions['sess-stale']).toBeUndefined()
   })
 
   it('stale prepare resolving while newer is still in flight keeps preparingChatKeys', async () => {
@@ -2572,7 +2607,11 @@ describe('acp-store', () => {
         const sid = nextSessionId === 1 ? 'sess-reopen' : `sess-extra-${nextSessionId}`
         createdSessions.push(sid)
         nextSessionId++
-        return Promise.resolve({ sessionId: sid })
+        return Promise.resolve(
+          sid === 'sess-reopen'
+            ? { sessionId: sid, persistence: 'ephemeral' }
+            : conversationOutcome(sid)
+        )
       }
       if (cmd === 'acp_close_session') {
         const closeArgs = args as { sessionId?: string }
@@ -2591,17 +2630,19 @@ describe('acp-store', () => {
     const started = useAcpStore.getState().startChat('cfg-1', '/work', undefined, 'p1')
     useAcpStore.getState().cancelPreparedChat(key)
     useAcpStore.getState().prepareChat('cfg-1', '/work', undefined, 'p1')
-    // …which returns null; startChat must pick up the newer prepare.
-    resolveFirst({ sessionId: 'sess-stale' })
+    // …which returns null. The newer backend-ephemeral prepare is also non-authoritative,
+    // so startChat creates one canonical Conversation session instead of promoting either.
+    resolveFirst({ sessionId: 'sess-stale', persistence: 'ephemeral' })
     const returnedId = await started
-    expect(returnedId).toBe('sess-reopen')
+    expect(returnedId).toBe('sess-extra-2')
+    expect(useAcpStore.getState().sessions[returnedId]?.conversationId).toBe(CONVERSATION_ID)
     // Let async cleanup (orphan reaping → acp_close_session) settle.
     await flushTurnEnd()
     await vi.waitFor(() => {
       // No orphaned sessions: every created session is either the returned
       // one ('sess-reopen') or explicitly closed via `acp_close_session`.
       for (const sid of createdSessions) {
-        const isReturned = sid === 'sess-reopen'
+        const isReturned = sid === returnedId
         const isClosed = closedSessions.includes(sid)
         if (!isReturned && !isClosed) {
           throw new Error(`orphaned session ${sid} was neither returned nor closed`)
@@ -2875,7 +2916,8 @@ describe('acp-store', () => {
       agentId: 'agent-9',
       cwd: '/work',
       mcpServers: [],
-      projectId: 'p1'
+      projectId: 'p1',
+      executionTarget: { kind: 'project_root', projectId: 'p1', projectRoot: '/work' }
     })
   })
 
@@ -3557,7 +3599,8 @@ describe('acp-store', () => {
     }
   })
 
-  it('openHistorySession does not activate a chat deleted during load', async () => {
+  it('openHistorySession does not activate an ephemeral chat deleted during load', async () => {
+    _addEphemeralSessionIdForTesting('s-del-ok')
     useAcpStore.setState((s) => ({
       agents: { ...s.agents, 'agent-1': { id: 'agent-1', capabilities: { loadSession: true } } },
       agentStatus: { ...s.agentStatus, 'agent-1': 'connected' },
@@ -3603,15 +3646,14 @@ describe('acp-store', () => {
       await useAcpStore.getState().deleteHistorySession('s-del-ok')
     })
     await useAcpStore.getState().openHistorySession('s-del-ok')
-    const session = useAcpStore.getState().sessions['s-del-ok']
-    expect(session.status).toBe('closed')
-    expect(session.replaying).toBeNull()
-    expect(session.lastError).toBeNull()
-    expect(useAcpStore.getState().sessionIndex.some((e) => e.id === 's-del-ok')).toBe(false)
+    expect(useAcpStore.getState().sessions['s-del-ok']).toBeUndefined()
+    expect(useAcpStore.getState().messages['s-del-ok']).toBeUndefined()
+    expect(useAcpStore.getState().sessionIndex.some((entry) => entry.id === 's-del-ok')).toBe(false)
     vi.mocked(invoke).mockReset()
   })
 
-  it('openHistorySession does not restore or error a chat deleted during a failed load', async () => {
+  it('openHistorySession does not restore an ephemeral chat deleted during a failed load', async () => {
+    _addEphemeralSessionIdForTesting('s-del-fail')
     useAcpStore.setState((s) => ({
       agents: { ...s.agents, 'agent-1': { id: 'agent-1', capabilities: { loadSession: true } } },
       agentStatus: { ...s.agentStatus, 'agent-1': 'connected' },
@@ -3665,10 +3707,7 @@ describe('acp-store', () => {
     })
     // Must resolve (not reject) so callers do not toast after an intentional delete.
     await expect(useAcpStore.getState().openHistorySession('s-del-fail')).resolves.toBeUndefined()
-    const session = useAcpStore.getState().sessions['s-del-fail']
-    expect(session.status).toBe('closed')
-    expect(session.lastError).toBeNull()
-    expect(session.replaying).toBeNull()
+    expect(useAcpStore.getState().sessions['s-del-fail']).toBeUndefined()
     // Delete frees transcript maps; the failure path must not resurrect them
     // or leave a partial mid-load replay resident in the WebView heap.
     expect(useAcpStore.getState().messages['s-del-fail']).toBeUndefined()
@@ -4665,6 +4704,7 @@ describe('acp-store', () => {
 
     const oldOpening = useAcpStore.getState().openHistorySession('s-local-recreated')
     expect(useAcpStore.getState().openingHistoryIds['s-local-recreated']).toBe(true)
+    _addEphemeralSessionIdForTesting('s-local-recreated')
     await useAcpStore.getState().deleteHistorySession('s-local-recreated')
     expect(useAcpStore.getState().openingHistoryIds['s-local-recreated']).toBeUndefined()
 
@@ -4723,7 +4763,8 @@ describe('acp-store', () => {
     expect(useAcpStore.getState().sessions['s-local-recreated']?.cwd).toBe('/new')
   })
 
-  it('deleteHistorySession removes the index entry (P5)', async () => {
+  it('deleteHistorySession removes an unpromoted ephemeral index entry', async () => {
+    _addEphemeralSessionIdForTesting('s1')
     useAcpStore.setState({
       sessionIndex: [
         {
@@ -4743,10 +4784,8 @@ describe('acp-store', () => {
     expect(useAcpStore.getState().sessionIndex).toHaveLength(0)
   })
 
-  it('preserves a concurrent index update while durable history deletion is pending', async () => {
-    const deleteGate = deferred<void>()
-    const { queueSessionPayloadDelete } = await import('@/lib/acp-history-persistence')
-    vi.mocked(queueSessionPayloadDelete).mockReturnValueOnce(deleteGate.promise)
+  it('preserves a concurrent index update while deleting an ephemeral entry', async () => {
+    _addEphemeralSessionIdForTesting('s-delete')
     useAcpStore.setState({
       sessionIndex: [
         {
@@ -4780,16 +4819,12 @@ describe('acp-store', () => {
         }
       ]
     }))
-    deleteGate.resolve()
     await deleting
 
     expect(useAcpStore.getState().sessionIndex.map((entry) => entry.id)).toEqual(['s-concurrent'])
   })
 
-  it('keeps the index entry when durable history deletion fails', async () => {
-    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
-    const { queueSessionPayloadDelete } = await import('@/lib/acp-history-persistence')
-    vi.mocked(queueSessionPayloadDelete).mockRejectedValueOnce(new Error('delete failed'))
+  it('fails closed when asked to delete a read-only legacy history entry', async () => {
     useAcpStore.setState({
       sessionIndex: [
         {
@@ -4806,10 +4841,10 @@ describe('acp-store', () => {
       ]
     })
 
-    await useAcpStore.getState().deleteHistorySession('s-delete-fail')
-
+    await expect(
+      useAcpStore.getState().deleteHistorySession('s-delete-fail')
+    ).rejects.toMatchObject({ code: 'CONVERSATION_NOT_FOUND' })
     expect(useAcpStore.getState().sessionIndex.map((entry) => entry.id)).toContain('s-delete-fail')
-    consoleError.mockRestore()
   })
 
   it('MCP registry CRUD persists and removes (P6)', async () => {
@@ -4952,7 +4987,8 @@ describe('acp-store', () => {
       agentId: 'agent-1',
       cwd: '/work',
       mcpServers: [{ type: 'stdio', name: 'Files', command: 'node', args: [], env: [] }],
-      projectId: 'p1'
+      projectId: 'p1',
+      executionTarget: { kind: 'project_root', projectId: 'p1', projectRoot: '/work' }
     })
     expect(useAcpStore.getState().sessions.derived.mcpServerCount).toBe(1)
     expect(toastWarning).toHaveBeenCalledWith(
@@ -4973,7 +5009,8 @@ describe('acp-store', () => {
       agentId: 'agent-1',
       cwd: '/work',
       mcpServers: [],
-      projectId: 'p1'
+      projectId: 'p1',
+      executionTarget: { kind: 'project_root', projectId: 'p1', projectRoot: '/work' }
     })
     expect(toastWarning).not.toHaveBeenCalled()
   })
@@ -5006,7 +5043,8 @@ describe('acp-store', () => {
       agentId: 'agent-9',
       cwd: '/work',
       mcpServers: servers,
-      projectId: 'p1'
+      projectId: 'p1',
+      executionTarget: { kind: 'project_root', projectId: 'p1', projectRoot: '/work' }
     })
   })
 
@@ -5948,6 +5986,7 @@ describe('session discovery (gh-407)', () => {
       .getState()
       .openDiscoveredSession('agent-1', 'sess-recreated', '/old', 'p-old')
     await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(1))
+    _addEphemeralSessionIdForTesting('sess-recreated')
     await useAcpStore.getState().deleteHistorySession('sess-recreated')
     seedSession('sess-recreated', 'agent-1', false)
 
@@ -6114,6 +6153,10 @@ describe('session discovery (gh-407)', () => {
 
 describe('ACP agent plan store', () => {
   beforeEach(() => {
+    vi.clearAllMocks()
+    vi.mocked(invoke).mockReset()
+    _resetInFlightHistoryOpensForTesting()
+    _resetEphemeralSessionIdsForTesting()
     useAcpStore.setState(FRESH)
   })
 
@@ -6136,30 +6179,24 @@ describe('ACP agent plan store', () => {
     expect(useAcpStore.getState().plans['sess-1']).toBeUndefined()
   })
 
-  it('closeSession clears cached plan for the session', async () => {
+  it('closeSession preserves cached plan history while closing the ACP binding', async () => {
     seedSession('sess-1', 'agent-1', false)
-    useAcpStore.setState({
-      plans: {
-        'sess-1': [{ content: 'old plan', status: 'completed' }]
-      }
-    })
+    const plan: PlanEntry[] = [{ content: 'old plan', status: 'completed' }]
+    useAcpStore.setState({ plans: { 'sess-1': plan } })
     vi.mocked(invoke).mockResolvedValue(undefined)
     await useAcpStore.getState().closeSession('sess-1')
-    expect(useAcpStore.getState().plans['sess-1']).toBeUndefined()
+    expect(useAcpStore.getState().plans['sess-1']).toBe(plan)
+    expect(useAcpStore.getState().sessions['sess-1']?.status).toBe('closed')
   })
 
-  it('logs close failures while still closing the session locally', async () => {
+  it('fails closed when the provider rejects session close', async () => {
     seedSession('sess-close-failure', 'agent-1', false)
     vi.mocked(invoke).mockRejectedValueOnce(new Error('agent rejected session/close'))
 
-    await useAcpStore.getState().closeSession('sess-close-failure')
-
-    expect(logFrontendError).toHaveBeenCalledWith({
-      level: 'warn',
-      source: 'acp.closeSession',
-      message: 'Failed to close session sess-close-failure: Error: agent rejected session/close'
-    })
-    expect(useAcpStore.getState().sessions['sess-close-failure']?.status).toBe('closed')
+    await expect(useAcpStore.getState().closeSession('sess-close-failure')).rejects.toThrow(
+      'agent rejected session/close'
+    )
+    expect(useAcpStore.getState().sessions['sess-close-failure']?.status).toBe('active')
   })
 
   it('_onSessionClosed clears cached plan for the session', () => {
@@ -6674,7 +6711,7 @@ describe('acp-store transcript eviction (WebView memory)', () => {
     })
   }
 
-  it('closeSession drops messages/toolCalls/commands/sessionUsage', async () => {
+  it('closeSession preserves Chat transcript, tools, commands, usage, and plan history', async () => {
     seedTranscript('sess-mem')
     useAcpStore.setState({
       plans: { 'sess-mem': [{ content: 'plan', status: 'pending' }] }
@@ -6683,15 +6720,16 @@ describe('acp-store transcript eviction (WebView memory)', () => {
     await useAcpStore.getState().closeSession('sess-mem')
     const st = useAcpStore.getState()
     expect(st.sessions['sess-mem']?.status).toBe('closed')
-    expect(st.messages['sess-mem']).toBeUndefined()
-    expect(st.toolCalls['sess-mem']).toBeUndefined()
-    expect(st.commands['sess-mem']).toBeUndefined()
-    expect(st.sessionUsage['sess-mem']).toBeUndefined()
-    expect(st.plans['sess-mem']).toBeUndefined()
+    expect(st.messages['sess-mem']).toHaveLength(1)
+    expect(st.toolCalls['sess-mem']).toHaveLength(1)
+    expect(st.commands['sess-mem']).toHaveLength(1)
+    expect(st.sessionUsage['sess-mem']).toBeDefined()
+    expect(st.plans['sess-mem']).toHaveLength(1)
   })
 
-  it('deleteHistorySession drops in-memory transcript maps', async () => {
+  it('deleteHistorySession drops in-memory maps for an ephemeral session', async () => {
     seedTranscript('sess-del')
+    _addEphemeralSessionIdForTesting('sess-del')
     useAcpStore.setState({
       sessionIndex: [
         {
@@ -6733,7 +6771,9 @@ describe('acp-store transcript eviction (WebView memory)', () => {
       sessionId: 'sess-late',
       toolCall: { toolCallId: 'late-1', title: 'write', status: 'pending' }
     })
-    expect(useAcpStore.getState().toolCalls['sess-late']).toBeUndefined()
+    expect(useAcpStore.getState().toolCalls['sess-late']).toEqual([
+      { toolCallId: 'tc-1', title: 'read', status: 'completed', seq: 1 }
+    ])
   })
 
   it('late commands/usage/plan updates do not recreate maps after close', async () => {
@@ -6757,8 +6797,8 @@ describe('acp-store transcript eviction (WebView memory)', () => {
       plan: { entries: [{ content: 'step', status: 'pending' }] }
     })
     const st = useAcpStore.getState()
-    expect(st.commands['sess-late-maps']).toBeUndefined()
-    expect(st.sessionUsage['sess-late-maps']).toBeUndefined()
+    expect(st.commands['sess-late-maps']).toEqual([{ name: 'help', description: 'help' }])
+    expect(st.sessionUsage['sess-late-maps']).toMatchObject({ used: 10, size: 100 })
     expect(st.plans['sess-late-maps']).toBeUndefined()
   })
 
@@ -6773,12 +6813,12 @@ describe('acp-store transcript eviction (WebView memory)', () => {
     expect(queueSessionPayloadSave).not.toHaveBeenCalled()
   })
 
-  it('openHistorySession reloads messages after prior close eviction', async () => {
+  it('openHistorySession can refresh preserved messages after prior close', async () => {
     const { loadSessionPayload } = await import('@/lib/acp-history-persistence')
     seedTranscript('sess-reopen')
     vi.mocked(invoke).mockResolvedValue(undefined)
     await useAcpStore.getState().closeSession('sess-reopen')
-    expect(useAcpStore.getState().messages['sess-reopen']).toBeUndefined()
+    expect(useAcpStore.getState().messages['sess-reopen']?.[0]?.id).toBe('m1')
 
     vi.mocked(loadSessionPayload).mockResolvedValueOnce({
       metadata: {
@@ -7045,6 +7085,11 @@ describe('warm session pool', () => {
     })
     _resetInFlightHistoryOpensForTesting()
     _resetEphemeralSessionIdsForTesting()
+    conversationApiMock.openConversation.mockResolvedValue({
+      success: false,
+      code: 'TEST_CONVERSATION_OPEN',
+      error: 'test boundary'
+    })
   })
 
   async function seedConnectedAgent(
@@ -7080,33 +7125,50 @@ describe('warm session pool', () => {
     expect(useAcpStore.getState().sessionIndex.find((e) => e.id === 'sess-prep')).toBeUndefined()
   })
 
-  it('startChat promotes an ephemeral prepared session into the history index', async () => {
+  it('startChat never promotes a backend-ephemeral prepared session into durable identity', async () => {
     await seedConnectedAgent('cfg-1', 'agent-9')
-    vi.mocked(invoke).mockResolvedValueOnce({ sessionId: 'sess-prep' })
+    let newSessionCalls = 0
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === 'acp_new_session') {
+        newSessionCalls += 1
+        return newSessionCalls === 1
+          ? { sessionId: 'sess-prep', persistence: 'ephemeral' }
+          : conversationOutcome('sess-canonical')
+      }
+      return undefined
+    })
     useAcpStore.getState().prepareChat('cfg-1', '/work', undefined, 'p1')
     const key = prepareChatKey('cfg-1', '/work', undefined)
     await vi.waitFor(() => expect(useAcpStore.getState().preparedSessions[key]).toBe('sess-prep'))
     const sessionId = await useAcpStore.getState().startChat('cfg-1', '/work', undefined, 'p1')
-    expect(sessionId).toBe('sess-prep')
-    // Promoted: now mirrored to the history index; warm-slot lookup cleared.
-    await vi.waitFor(() => {
-      expect(useAcpStore.getState().sessionIndex.find((e) => e.id === 'sess-prep')).toBeDefined()
-    })
+    expect(sessionId).toBe('sess-canonical')
+    expect(useAcpStore.getState().sessions[sessionId]?.conversationId).toBe(CONVERSATION_ID)
+    expect(
+      useAcpStore.getState().sessionIndex.find((entry) => entry.id === 'sess-prep')
+    ).toBeUndefined()
     expect(useAcpStore.getState().preparedSessions[key]).toBeUndefined()
   })
 
-  it('startChat refills a warm session for the pool target after consuming one', async () => {
+  it('startChat replaces the selected warm slot with one canonical Conversation session', async () => {
     await seedConnectedAgent('cfg-1', 'agent-9')
     useAcpStore.getState().setSelectedAgentConfigId('cfg-1')
-    vi.mocked(invoke).mockResolvedValueOnce({ sessionId: 'sess-1' })
+    let newSessionCalls = 0
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === 'acp_new_session') {
+        newSessionCalls += 1
+        return newSessionCalls === 1
+          ? { sessionId: 'sess-1', persistence: 'ephemeral' }
+          : conversationOutcome('sess-2')
+      }
+      return undefined
+    })
     useAcpStore.getState().prepareChat('cfg-1', '/work', undefined, 'p1')
     const key = prepareChatKey('cfg-1', '/work', undefined)
     await vi.waitFor(() => expect(useAcpStore.getState().preparedSessions[key]).toBe('sess-1'))
-    vi.mocked(invoke).mockResolvedValueOnce({ sessionId: 'sess-2' })
     const sessionId = await useAcpStore.getState().startChat('cfg-1', '/work', undefined, 'p1')
-    expect(sessionId).toBe('sess-1')
-    // Refill fired: a fresh session/new produced a new warm slot for the next chat.
-    await vi.waitFor(() => expect(useAcpStore.getState().preparedSessions[key]).toBe('sess-2'))
+    expect(sessionId).toBe('sess-2')
+    expect(useAcpStore.getState().sessions[sessionId]?.conversationId).toBe(CONVERSATION_ID)
+    expect(useAcpStore.getState().preparedSessions[key]).toBeUndefined()
   })
 
   it('retargetWarmPool drains another agent stale pooled session (same cwd) and seeds the new one', async () => {

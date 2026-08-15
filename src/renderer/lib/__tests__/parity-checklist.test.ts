@@ -334,18 +334,53 @@ describe('Parity Checklist Automation', () => {
         })
 
         it(`Verified: Test file exists at ${domain.testFile}`, () => {
-          // P1 tests are optional (warn but don't fail)
           const testExists = testFileExists(domain.testFile)
-          if (!testExists) {
-            console.warn(
-              `[WARN] ${domain.domain}: Test file ${domain.testFile} not found (P1 - recommended but not required)`
-            )
+          const releaseRequired =
+            domain.domain === 'ConversationLifecycle' ||
+            domain.domain === 'ConversationTerminalResources'
+          if (releaseRequired) {
+            expect(
+              testExists,
+              `${domain.domain} is a release-required Conversation domain and must have ${domain.testFile}`
+            ).toBe(true)
+          } else {
+            if (!testExists) {
+              console.warn(
+                `[WARN] ${domain.domain}: Test file ${domain.testFile} not found (P1 - recommended but not required)`
+              )
+            }
+            expect(true).toBe(true)
           }
-          // For P1, we just log a warning but the test passes
-          expect(true).toBe(true)
         })
       })
     }
+  })
+
+  describe('Conversation renderer root parity', () => {
+    it('requires the dedicated App/TauriApp release parity matrix', () => {
+      const parityPath = join(LIB_DIR, '..', '__tests__', 'renderer-root-parity.test.tsx')
+      expect(existsSync(parityPath), 'renderer-root-parity.test.tsx should exist').toBe(true)
+    })
+
+    it('pins identical portable Conversation routes and hooks in both roots', () => {
+      const app = readFileSync(join(LIB_DIR, '..', 'App.tsx'), 'utf-8')
+      const tauri = readFileSync(join(LIB_DIR, '..', 'TauriApp.tsx'), 'utf-8')
+      for (const token of [
+        "path: 'c/:conversationId'",
+        "path: 'legacy/session/:legacyValue'",
+        "path: 'legacy/storage/:legacyValue'",
+        "path: 'legacy/history/:legacyValue'",
+        'useSessionWorkspaceBootstrap()',
+        'useConversationHostBootstrap()',
+        'useConversationLifecycle()',
+        'useTerminalResourceLifecycle()',
+        '<ConversationHostStatus />',
+        '<ConversationRecoveryPanel />'
+      ]) {
+        expect(app, `App.tsx missing ${token}`).toContain(token)
+        expect(tauri, `TauriApp.tsx missing ${token}`).toContain(token)
+      }
+    })
   })
 
   describe('Regression Prevention', () => {

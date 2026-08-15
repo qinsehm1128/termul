@@ -57,6 +57,7 @@ const {
     setActiveFilePath: vi.fn()
   },
   mockTerminalStoreState: {
+    terminals: [],
     activeTerminalId: '',
     selectTerminal: vi.fn(),
     setTerminalPtyId: vi.fn()

@@ -123,7 +123,8 @@ const mockTerminalStoreState = {
 
 vi.mock('../stores/terminal-store', () => ({
   useTerminalStore: {
-    getState: vi.fn(() => mockTerminalStoreState)
+    getState: vi.fn(() => mockTerminalStoreState),
+    setState: vi.fn()
   },
   cleanupProjectTerminals: vi.fn(),
   useProjectsWithActivity: () => [],

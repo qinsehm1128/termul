@@ -1294,10 +1294,15 @@ mod tests {
     async fn unsupported_platform_rejects_before_download() {
         let root = temp_dir("no-platform");
         let service = open_service(root.clone()).await;
-        // Agent with a binary target for a DIFFERENT platform.
+        // Agent with a binary target for a DIFFERENT platform on every host.
+        let unsupported = if platform_arch_for(&host()) == "darwin-aarch64" {
+            "linux-x86_64"
+        } else {
+            "darwin-aarch64"
+        };
         let agent = sample_binary_agent(
             "no-platform",
-            "darwin-aarch64",
+            unsupported,
             Some("abc"),
             "./acp",
             "https://example.com/no-platform.zip",

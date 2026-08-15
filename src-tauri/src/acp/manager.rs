@@ -794,6 +794,10 @@ struct AgentEntry {
 /// Tauri-aware). No code under `src-tauri/src/acp/` may call `app.emit("acp:..")`
 /// directly (AC7); all emission goes through [`events::fan_out`] against
 /// `self.sinks`.
+type ReplacementGateSender = watch::Sender<Option<Result<(), String>>>;
+
+type ReplacementGates = HashMap<String, ReplacementGateSender>;
+
 pub struct AcpManager {
     sinks: Vec<Arc<dyn EventSink>>,
     agents: Arc<Mutex<HashMap<AgentId, AgentEntry>>>,
@@ -803,7 +807,7 @@ pub struct AcpManager {
     pty_manager: Mutex<Option<Weak<crate::pty::PtyManager>>>,
     /// Replacement `session_created` gates keyed by provisional opaque session id. The provider
     /// result is not renderer-visible until canonical `binding_replaced` commits.
-    replacement_gates: Mutex<HashMap<String, watch::Sender<Option<Result<(), String>>>>>,
+    replacement_gates: Mutex<ReplacementGates>,
     /// Per-agent "warmup done" guard for the first-prompt cold-start
     /// workaround (pi-acp issue #94). A visibility-churn re-entry of
     /// `NewSession` for an agent whose warmup already completed (or is still
