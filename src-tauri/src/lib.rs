@@ -5,6 +5,7 @@ mod acp_registry_snapshot;
 mod agent_registry;
 mod browser_tab_manager;
 mod commands;
+pub mod conversation;
 mod logging;
 mod migrations;
 mod path_validation;
@@ -334,6 +335,11 @@ pub use acp::{
 // + `host_mcp::child::run()` through this re-export (the `acp` module itself is
 // private). See `acp/host_mcp/mod.rs` + spec `spec-acp-host-todo-plan-tool.md`.
 pub use acp::host_mcp;
+pub use conversation::{
+    AgentSessionBinding, ConversationErrorCode, ConversationId, ConversationLifecycleState,
+    ConversationRecordV2, CreationPartition, ExecutionTarget, ProjectAttachment,
+    TerminalResourceRef,
+};
 pub use pty::PtyManager;
 pub use trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub};
 // Desktop ACP event sink: wraps the Tauri `AppHandle` so the dispatcher's
