@@ -109,5 +109,34 @@
       "recovery": "Conversation recovery required",
       "error": "Conversation service unavailable"
     }
+  },
+  "conversationNavigation": {
+    "title": "Conversations",
+    "newChat": "New Chat",
+    "search": "Search conversations",
+    "clearSearch": "Clear conversation search",
+    "filter": "Filter conversations by project",
+    "allProjects": "All projects",
+    "projectless": "No project",
+    "projectView": "Project conversations",
+    "empty": "No conversations match this view.",
+    "loadMore": "Load {{count}} more",
+    "recoveryBadge_one": "{{count}} recovery item",
+    "recoveryBadge_other": "{{count}} recovery items"
+  },
+  "conversationRoute": {
+    "opening": "Opening conversation…",
+    "resolvingLegacy": "Resolving legacy conversation…",
+    "legacyError": "This legacy conversation link could not be resolved.",
+    "errors": {
+      "title": "Conversation unavailable",
+      "CONVERSATION_INVALID_ID": "The address is not a canonical ConversationId.",
+      "CONVERSATION_NOT_FOUND": "The conversation was not found.",
+      "LEGACY_ID_AMBIGUOUS": "This legacy identifier matches more than one conversation.",
+      "CONVERSATION_RECOVERY_REQUIRED": "Recovery is required before this conversation can open.",
+      "CONVERSATION_BINDING_OPEN_FAILED": "The conversation opened, but its agent binding could not be restored.",
+      "CONVERSATION_LEGACY_RESOLVE_FAILED": "The legacy identifier resolver is unavailable.",
+      "CONVERSATION_OPEN_FAILED": "The conversation could not be opened."
+    }
   }
 }

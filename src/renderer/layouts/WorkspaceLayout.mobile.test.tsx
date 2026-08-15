@@ -335,6 +335,7 @@ vi.mock('@/components/ssh/SSHFileExplorer', () => ({
   SSHFileExplorer: () => <div data-testid="ssh-file-explorer-stub" />
 }))
 
+import { useConversationStore } from '@/stores/conversation-store'
 import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
 import WorkspaceLayout from './WorkspaceLayout'
 
@@ -376,6 +377,8 @@ describe('WorkspaceLayout mobile branch', () => {
     gitState.selectedFile = null
     gitState.commitContexts = {}
     sshProfileRef.current = null
+    useConversationStore.getState().reset()
+    useConversationStore.getState().setActiveConversationId(conversationId)
     useSessionWorkspaceSyncStore.setState({
       activeConversationId: conversationId,
       basedRevisionByConversation: {},

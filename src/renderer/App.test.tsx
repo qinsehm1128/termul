@@ -18,6 +18,21 @@ const {
   mockTerminalResourceLifecycle: vi.fn()
 }))
 
+vi.mock('./layouts/WorkspaceLayout', async () => {
+  const { Outlet } = await import('react-router-dom')
+  return { default: () => <Outlet /> }
+})
+
+vi.mock('@/components/conversation/ConversationRoute', () => ({
+  ConversationRoute: () => <div data-testid="canonical-conversation-route" />
+}))
+
+vi.mock('@/components/ChatRoute', () => ({
+  ChatRoute: ({ sourceKind }: { sourceKind: string }) => (
+    <div data-testid="legacy-conversation-route" data-source-kind={sourceKind} />
+  )
+}))
+
 vi.mock('./hooks/use-session-workspace-sync', () => ({
   useSessionWorkspaceBootstrap: mockSessionWorkspaceBootstrap,
   useSessionWorkspaceSync: vi.fn(),
@@ -184,6 +199,7 @@ const mockApi = {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  window.location.hash = '#/'
   vi.stubGlobal('api', mockApi)
   useUpdaterStore.setState({
     updateAvailable: false,
@@ -261,6 +277,31 @@ describe('App Routes', () => {
   it('mounts terminal resource reconciliation at the web root', () => {
     render(<App />)
     expect(mockTerminalResourceLifecycle).toHaveBeenCalledTimes(1)
+  })
+
+  it('registers the canonical Conversation route in the web root', async () => {
+    window.location.hash = '#/c/018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+    render(<App />)
+
+    await waitFor(() => {
+      expect(document.querySelector('[data-testid="canonical-conversation-route"]')).not.toBeNull()
+    })
+  })
+
+  it.each([
+    ['session', 'legacyAgentSessionId'],
+    ['storage', 'legacyStorageKey'],
+    ['history', 'legacyChatHistoryId']
+  ])('registers the legacy %s resolver route in the web root', async (route, sourceKind) => {
+    window.location.hash = `#/legacy/${route}/opaque-value`
+    render(<App />)
+
+    await waitFor(() => {
+      expect(document.querySelector('[data-testid="legacy-conversation-route"]')).toHaveAttribute(
+        'data-source-kind',
+        sourceKind
+      )
+    })
   })
 })
 

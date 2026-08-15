@@ -53,7 +53,6 @@ import { ColorPickerPopover } from './ColorPickerPopover'
 import { ConfirmDialog } from './ConfirmDialog'
 import { NewGroupModal } from './NewGroupModal'
 import { NewWorktreeModal } from './NewWorktreeModal'
-import { ProjectChatList } from './ProjectChatList'
 import { SSHPanel } from './ssh/SSHPanel'
 
 interface ColorPickerState {
@@ -159,10 +158,6 @@ export function ProjectSidebar({
   const [searchQuery, setSearchQuery] = useState('')
   const searchInputRef = useRef<HTMLInputElement>(null)
 
-  // Expanded projects — expansion is controlled solely by the chevron.
-  // Selecting a project does not auto-expand its chat list, keeping the list uncluttered.
-  const [expandedProjects, setExpandedProjects] = useState<Set<string>>(() => new Set<string>())
-
   // Inline editing state
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editName, setEditName] = useState('')
@@ -259,18 +254,6 @@ export function ProjectSidebar({
       projectActivityIds.includes(projectId) || agentChatActivityIds.includes(projectId),
     [projectActivityIds, agentChatActivityIds]
   )
-
-  const toggleProjectExpanded = useCallback((projectId: string): void => {
-    setExpandedProjects((prev) => {
-      const next = new Set(prev)
-      if (next.has(projectId)) {
-        next.delete(projectId)
-      } else {
-        next.add(projectId)
-      }
-      return next
-    })
-  }, [])
 
   const handleCreateGroup = useCallback((): void => {
     setNewGroupModal({ isOpen: true })
@@ -1048,8 +1031,6 @@ export function ProjectSidebar({
                                   <ProjectItem
                                     project={project}
                                     isActive={project.id === activeProjectId}
-                                    isExpanded={expandedProjects.has(project.id)}
-                                    onToggleExpand={() => toggleProjectExpanded(project.id)}
                                     isEditing={editingId === project.id}
                                     editName={editName}
                                     shortcut={
@@ -1059,10 +1040,7 @@ export function ProjectSidebar({
                                     }
                                     hasActivity={hasActivity}
                                     hasError={projectErrorIds.has(project.id)}
-                                    onClick={() => {
-                                      onSelectProject(project.id)
-                                      navigate('/')
-                                    }}
+                                    onClick={() => onSelectProject(project.id)}
                                     onContextMenu={handleContextMenu}
                                     renderContextMenu={renderProjectContextMenu}
                                     onEditNameChange={setEditName}
@@ -1143,8 +1121,6 @@ export function ProjectSidebar({
                         <ProjectItem
                           project={project}
                           isActive={project.id === activeProjectId}
-                          isExpanded={expandedProjects.has(project.id)}
-                          onToggleExpand={() => toggleProjectExpanded(project.id)}
                           isEditing={editingId === project.id}
                           editName={editName}
                           shortcut={
@@ -1154,10 +1130,7 @@ export function ProjectSidebar({
                           }
                           hasActivity={hasActivity}
                           hasError={projectErrorIds.has(project.id)}
-                          onClick={() => {
-                            onSelectProject(project.id)
-                            navigate('/')
-                          }}
+                          onClick={() => onSelectProject(project.id)}
                           onContextMenu={handleContextMenu}
                           renderContextMenu={renderProjectContextMenu}
                           onEditNameChange={setEditName}
@@ -1201,10 +1174,7 @@ export function ProjectSidebar({
                         project={project}
                         hasActivity={hasActivity}
                         hasError={projectErrorIds.has(project.id)}
-                        onClick={() => {
-                          onSelectProject(project.id)
-                          navigate('/')
-                        }}
+                        onClick={() => onSelectProject(project.id)}
                         onContextMenu={handleContextMenu}
                         renderContextMenu={renderArchivedProjectContextMenu}
                       />
@@ -1437,8 +1407,6 @@ export function ProjectSidebar({
 interface ProjectItemProps {
   project: Project
   isActive: boolean
-  isExpanded: boolean
-  onToggleExpand: () => void
   isEditing: boolean
   editName: string
   shortcut?: string
@@ -1456,8 +1424,6 @@ interface ProjectItemProps {
 const ProjectItem = memo(function ProjectItem({
   project,
   isActive,
-  isExpanded,
-  onToggleExpand,
   isEditing,
   editName,
   shortcut,
@@ -1521,24 +1487,6 @@ const ProjectItem = memo(function ProjectItem({
                 : t('projectAria', { name: project.name })
             }
           >
-            {/* Expand/collapse chevron — every project can have chats, so the
-            chevron always shows (not only git projects). */}
-            <button
-              onClick={(e) => {
-                e.stopPropagation()
-                onToggleExpand()
-              }}
-              className="h-5 w-5 inline-flex items-center justify-center flex-shrink-0 hover:bg-sidebar-accent rounded transition-colors"
-              aria-label={isExpanded ? t('collapseChats') : t('expandChats')}
-              aria-expanded={isExpanded}
-            >
-              {isExpanded ? (
-                <ChevronDown size={12} className="text-muted-foreground" />
-              ) : (
-                <ChevronRight size={12} className="text-muted-foreground" />
-              )}
-            </button>
-
             {isEditing ? (
               <input
                 ref={inputRef}
@@ -1612,11 +1560,6 @@ const ProjectItem = memo(function ProjectItem({
         </ContextMenuTrigger>
         {renderContextMenu?.(project)}
       </ContextMenu>
-
-      {/* Project chat history sub-items */}
-      <CollapseExpandMotion open={isExpanded} className="ml-5 border-l border-sidebar-border">
-        <ProjectChatList projectId={project.id} />
-      </CollapseExpandMotion>
     </div>
   )
 })

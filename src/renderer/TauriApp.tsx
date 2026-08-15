@@ -3,6 +3,7 @@ import { useEffect } from 'react'
 import { createHashRouter, RouterProvider } from 'react-router-dom'
 import { ChatRoute } from '@/components/ChatRoute'
 import { ConversationHostStatus } from '@/components/conversation/ConversationHostStatus'
+import { ConversationRoute } from '@/components/conversation/ConversationRoute'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { GlobalContextMenu } from '@/components/GlobalContextMenu'
 import { Toaster as Sonner } from '@/components/ui/sonner'
@@ -116,7 +117,19 @@ const router = createHashRouter(
       element: <WorkspaceLayout />,
       children: [
         { index: true, element: <WorkspaceDashboard /> },
-        { path: 'c/:sessionId', element: <ChatRoute /> },
+        { path: 'c/:conversationId', element: <ConversationRoute /> },
+        {
+          path: 'legacy/session/:legacyValue',
+          element: <ChatRoute sourceKind="legacyAgentSessionId" />
+        },
+        {
+          path: 'legacy/storage/:legacyValue',
+          element: <ChatRoute sourceKind="legacyStorageKey" />
+        },
+        {
+          path: 'legacy/history/:legacyValue',
+          element: <ChatRoute sourceKind="legacyChatHistoryId" />
+        },
         { path: 'snapshots', element: <WorkspaceSnapshots /> },
         { path: 'settings', element: <ProjectSettings /> },
         { path: 'preferences', element: <AppPreferences /> }

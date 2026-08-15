@@ -20,6 +20,7 @@ vi.mock('@/hooks/useTerminalAutoSave', () => ({ isTerminalRestoreInProgress: () 
 
 import type { SessionWorkspaceV1 } from '@shared/types/session-workspace.types'
 import { useAcpStore } from '@/stores/acp-store'
+import { useConversationStore } from '@/stores/conversation-store'
 import { useEditorStore } from '@/stores/editor-store'
 import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
 import { useTerminalStore } from '@/stores/terminal-store'
@@ -67,6 +68,7 @@ beforeEach(() => {
     restoreInProgressByConversation: {}
   })
   useWorkspaceStore.getState().resetLayout()
+  useConversationStore.getState().reset()
   useAcpStore.setState({ sessions: {}, activeSessionId: null })
   useEditorStore.getState().clearAllFiles()
   useTerminalStore.setState({ terminals: [], activeTerminalId: '', ptyIdIndex: new Map() })
@@ -112,45 +114,42 @@ describe('Conversation-scoped SessionWorkspace sync', () => {
     })
     useTerminalStore.setState({
       terminals: [
-        { id: 't-one', projectId: 'same-project', shell: 'bash', name: 'one', conversationId: one },
-        { id: 't-two', projectId: 'same-project', shell: 'bash', name: 'two', conversationId: two }
+        {
+          id: 't-one',
+          ptyId: 'pty-one',
+          projectId: 'same-project',
+          shell: 'bash',
+          name: 'one',
+          conversationId: one
+        },
+        {
+          id: 't-two',
+          ptyId: 'pty-two',
+          projectId: 'same-project',
+          shell: 'bash',
+          name: 'two',
+          conversationId: two
+        }
       ] as never
     })
     const value = buildSessionWorkspace(one)
     expect(value.resources).toEqual([
-      { kind: 'terminal', terminalId: 't-one', conversationId: one }
+      {
+        kind: 'terminal',
+        terminalId: 'pty-one',
+        terminalRecordId: 't-one',
+        conversationId: one
+      }
     ])
     expect(value.topology).toMatchObject({ type: 'leaf', terminalIds: ['t-one'] })
     expect(JSON.stringify(value)).not.toMatch(/claim|envVars|credentials/i)
   })
 
-  it('reads only the Conversation-backed ACP field and never treats an ACP SessionId as identity', () => {
-    useAcpStore.setState({
-      activeSessionId: one,
-      sessions: {
-        [one]: {
-          id: one,
-          agentId: 'agent-one',
-          cwd: '/work',
-          projectId: 'same-project',
-          status: 'active',
-          title: null,
-          activeTurn: false,
-          openTurnId: null,
-          modes: null,
-          configOptions: [],
-          lastError: null,
-          createdAt: 1
-        }
-      }
-    })
+  it('reads only ConversationStore authority and never treats an ACP SessionId as identity', () => {
+    useAcpStore.setState({ activeSessionId: one })
     expect(getActiveConversationId()).toBeNull()
-    useAcpStore.setState((state) => ({
-      sessions: {
-        ...state.sessions,
-        [one]: { ...state.sessions[one], conversationId: two }
-      }
-    }))
+
+    useConversationStore.getState().setActiveConversationId(two)
     expect(getActiveConversationId()).toBe(two)
   })
 

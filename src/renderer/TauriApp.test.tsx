@@ -61,8 +61,19 @@ vi.mock('@/hooks/use-window-state', () => ({
   useWindowState: () => false
 }))
 
-vi.mock('./layouts/WorkspaceLayout', () => ({
-  default: () => <div>Workspace Layout</div>
+vi.mock('./layouts/WorkspaceLayout', async () => {
+  const { Outlet } = await import('react-router-dom')
+  return { default: () => <Outlet /> }
+})
+
+vi.mock('@/components/conversation/ConversationRoute', () => ({
+  ConversationRoute: () => <div data-testid="canonical-conversation-route" />
+}))
+
+vi.mock('@/components/ChatRoute', () => ({
+  ChatRoute: ({ sourceKind }: { sourceKind: string }) => (
+    <div data-testid="legacy-conversation-route" data-source-kind={sourceKind} />
+  )
 }))
 
 vi.mock('./pages/WorkspaceDashboard', () => ({
@@ -157,6 +168,7 @@ vi.mock('@/lib/tauri-notification-api', () => ({
 
 beforeEach(() => {
   vi.clearAllMocks()
+  window.location.hash = '#/'
   mockPersistenceRead.mockResolvedValue({
     success: false,
     error: 'Key not found',
@@ -201,5 +213,30 @@ describe('TauriApp', () => {
   it('mounts terminal resource reconciliation at the desktop root', () => {
     render(<TauriApp />)
     expect(mockTerminalResourceLifecycle).toHaveBeenCalledTimes(1)
+  })
+
+  it('registers the canonical Conversation route in the desktop root', async () => {
+    window.location.hash = '#/c/018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+    render(<TauriApp />)
+
+    await waitFor(() => {
+      expect(document.querySelector('[data-testid="canonical-conversation-route"]')).not.toBeNull()
+    })
+  })
+
+  it.each([
+    ['session', 'legacyAgentSessionId'],
+    ['storage', 'legacyStorageKey'],
+    ['history', 'legacyChatHistoryId']
+  ])('registers the legacy %s resolver route in the desktop root', async (route, sourceKind) => {
+    window.location.hash = `#/legacy/${route}/opaque-value`
+    render(<TauriApp />)
+
+    await waitFor(() => {
+      expect(document.querySelector('[data-testid="legacy-conversation-route"]')).toHaveAttribute(
+        'data-source-kind',
+        sourceKind
+      )
+    })
   })
 })

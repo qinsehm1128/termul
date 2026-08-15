@@ -33,6 +33,7 @@ import {
 } from '@/components/ui/sheet'
 import { isTauriContext } from '@/lib/tauri-runtime'
 import { useAcpStore } from '@/stores/acp-store'
+import { useConversationStore } from '@/stores/conversation-store'
 import { useActiveProject } from '@/stores/project-store'
 import { useTerminalStore } from '@/stores/terminal-store'
 import { getAllLeafPanes, useWorkspaceStore } from '@/stores/workspace-store'
@@ -126,13 +127,7 @@ export function MobileChatShell({
     if (live) return live
     return s.sessionIndex.find((e) => e.id === activeSessionId)?.title ?? null
   })
-  const activeConversationId = useAcpStore((s) => {
-    if (!activeSessionId) return undefined
-    return (
-      s.sessions[activeSessionId]?.conversationId ??
-      s.sessionIndex.find((entry) => entry.id === activeSessionId)?.conversationId
-    )
-  })
+  const activeConversationId = useConversationStore((state) => state.activeConversationId)
   const conversationTerminals = useMemo(
     () =>
       activeConversationId

@@ -1,24 +1,22 @@
-import type { ConversationRecordV2 } from '@shared/types/conversation.types'
 import type { ConversationHostStatus } from '@shared/types/conversation-api.types'
 import { useEffect } from 'react'
 import { create } from 'zustand'
 import { conversationApi } from '@/lib/conversation-api'
 import { logFrontendError } from '@/lib/log-api'
+import { applyConversationHostStatus, useConversationStore } from '@/stores/conversation-store'
 
 interface ConversationHostBootstrapState {
   status: ConversationHostStatus | null
-  conversations: ConversationRecordV2[]
   loading: boolean
-  setReady(status: ConversationHostStatus, conversations: ConversationRecordV2[]): void
+  setReady(status: ConversationHostStatus): void
   setError(code: string): void
   reset(): void
 }
 
 export const useConversationHostBootstrapStore = create<ConversationHostBootstrapState>((set) => ({
   status: null,
-  conversations: [],
   loading: true,
-  setReady: (status, conversations) => set({ status, conversations, loading: false }),
+  setReady: (status) => set({ status, loading: false }),
   setError: (code) =>
     set({
       loading: false,
@@ -32,7 +30,7 @@ export const useConversationHostBootstrapStore = create<ConversationHostBootstra
         recoveryItems: []
       }
     }),
-  reset: () => set({ status: null, conversations: [], loading: true })
+  reset: () => set({ status: null, loading: true })
 }))
 
 async function refreshHostState(active: () => boolean): Promise<void> {
@@ -59,7 +57,9 @@ async function refreshHostState(active: () => boolean): Promise<void> {
     })
     return
   }
-  useConversationHostBootstrapStore.getState().setReady(status.data, conversations.data)
+  useConversationStore.getState().replaceSummaries(conversations.data)
+  applyConversationHostStatus(status.data)
+  useConversationHostBootstrapStore.getState().setReady(status.data)
 }
 
 /** Load the shared host status, Conversation list, recovery queue, and reconnect updates. */

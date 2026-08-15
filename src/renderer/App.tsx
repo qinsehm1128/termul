@@ -3,6 +3,7 @@ import { lazy, Suspense, useEffect } from 'react'
 import { createHashRouter, RouterProvider } from 'react-router-dom'
 import { ChatRoute } from '@/components/ChatRoute'
 import { ConversationHostStatus } from '@/components/conversation/ConversationHostStatus'
+import { ConversationRoute } from '@/components/conversation/ConversationRoute'
 import { DirectoryPicker } from '@/components/DirectoryPicker'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { GlobalContextMenu } from '@/components/GlobalContextMenu'
@@ -181,7 +182,19 @@ const router = createHashRouter(
             </Suspense>
           )
         },
-        { path: 'c/:sessionId', element: <ChatRoute /> },
+        { path: 'c/:conversationId', element: <ConversationRoute /> },
+        {
+          path: 'legacy/session/:legacyValue',
+          element: <ChatRoute sourceKind="legacyAgentSessionId" />
+        },
+        {
+          path: 'legacy/storage/:legacyValue',
+          element: <ChatRoute sourceKind="legacyStorageKey" />
+        },
+        {
+          path: 'legacy/history/:legacyValue',
+          element: <ChatRoute sourceKind="legacyChatHistoryId" />
+        },
         {
           path: 'snapshots',
           element: (

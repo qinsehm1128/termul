@@ -1,59 +1,96 @@
-import { useEffect, useMemo } from 'react'
-import { useLocation } from 'react-router-dom'
-import { useAcpStore } from '@/stores/acp-store'
-import { useWorkspaceStore } from '@/stores/workspace-store'
+import type { LegacyConversationSourceKind } from '@shared/types/conversation-api.types'
+import { AlertTriangle, LoaderCircle } from 'lucide-react'
+import { useEffect, useState } from 'react'
+import { useTranslation } from 'react-i18next'
+import { useNavigate, useParams } from 'react-router-dom'
+import { conversationRouteErrorKey } from '@/components/conversation/ConversationRoute'
+import { conversationApi } from '@/lib/conversation-api'
+import { logFrontendError } from '@/lib/log-api'
 
-/**
- * Null-rendering component that triggers `openHistorySession` when the URL
- * contains `#/c/<sessionId>`. This is the refresh-survival mechanism for the
- * active chat — on reload the session restores from the URL before the
- * workspace manifest or session index loads, avoiding the "no active chat"
- * race.
- *
- * Retries up to 5 times with a 500ms delay because the server's history
- * persistence is async — a session that was just active may not be in the
- * persisted store immediately after a refresh.
- *
- * After restoring, calls `addAgentChatTab` to ensure the session has a
- * visible tab in the workspace (the manifest may not have restored it).
- */
-export function ChatRoute(): null {
-  const location = useLocation()
-  const openHistorySession = useAcpStore((s) => s.openHistorySession)
+interface ChatRouteProps {
+  sourceKind?: LegacyConversationSourceKind
+  value?: string
+}
 
-  const sessionId = useMemo(() => {
-    const match = location.pathname.match(/^\/c\/(.+)$/)
-    return match?.[1] ?? null
-  }, [location.pathname])
+/** Read-only compatibility route that resolves an opaque legacy key to ConversationId. */
+export function ChatRoute({
+  sourceKind = 'legacyAgentSessionId',
+  value
+}: ChatRouteProps = {}): React.JSX.Element | null {
+  const { t } = useTranslation('common')
+  const params = useParams<{ legacyValue: string }>()
+  const navigate = useNavigate()
+  const legacyValue = value ?? params.legacyValue ?? ''
+  const [errorCode, setErrorCode] = useState<string | null>(null)
+  const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    if (!sessionId) return
-    const existing = useAcpStore.getState().sessions[sessionId]
-    if (existing && existing.status !== 'closed') {
-      useWorkspaceStore.getState().addAgentChatTab(sessionId)
+    if (!legacyValue) {
+      setLoading(false)
       return
     }
-    let cancelled = false
-    let attempt = 0
-    const maxAttempts = 5
-    const tryOpen = async (): Promise<void> => {
-      if (cancelled) return
-      attempt++
-      try {
-        await openHistorySession(sessionId)
-        if (!cancelled) {
-          useWorkspaceStore.getState().addAgentChatTab(sessionId)
+    let active = true
+    setLoading(true)
+    setErrorCode(null)
+    void conversationApi
+      .resolveLegacyConversationId({ sourceKind, value: legacyValue })
+      .then((result) => {
+        if (!active) return
+        if (!result.success) {
+          setErrorCode(result.code)
+          setLoading(false)
+          void logFrontendError({
+            level: 'warn',
+            source: 'legacy-conversation-route',
+            message: `sourceKind=${sourceKind} code=${result.code}`
+          })
+          return
         }
-      } catch {
-        if (cancelled || attempt >= maxAttempts) return
-        setTimeout(tryOpen, 500)
-      }
-    }
-    void tryOpen()
+        const canonicalPath = result.data.canonicalRoute.replace(/^#/, '')
+        navigate(canonicalPath, { replace: true })
+      })
+      .catch(() => {
+        if (!active) return
+        setErrorCode('CONVERSATION_LEGACY_RESOLVE_FAILED')
+        setLoading(false)
+        void logFrontendError({
+          level: 'warn',
+          source: 'legacy-conversation-route',
+          message: `sourceKind=${sourceKind} code=CONVERSATION_LEGACY_RESOLVE_FAILED`
+        })
+      })
     return () => {
-      cancelled = true
+      active = false
     }
-  }, [sessionId, openHistorySession])
+  }, [legacyValue, navigate, sourceKind])
 
-  return null
+  if (loading) {
+    return (
+      <div
+        role="status"
+        aria-live="polite"
+        className="absolute inset-x-3 top-3 z-20 flex items-center gap-2 rounded-md border bg-background/95 px-3 py-2 text-sm shadow-sm"
+      >
+        <LoaderCircle className="size-4 animate-spin" aria-hidden="true" />
+        {t('conversationRoute.resolvingLegacy')}
+      </div>
+    )
+  }
+
+  if (!errorCode) return null
+  return (
+    <div
+      role="alert"
+      aria-live="assertive"
+      className="absolute inset-x-3 top-3 z-20 flex items-start gap-2 rounded-md border border-destructive bg-background/95 p-3 text-sm text-destructive shadow-sm"
+      data-error-code={errorCode}
+    >
+      <AlertTriangle className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+      <div>
+        <p className="font-medium">{t('conversationRoute.legacyError')}</p>
+        <p className="mt-1 text-xs">{t(conversationRouteErrorKey(errorCode))}</p>
+        <code className="mt-1 block font-mono text-[10px] opacity-80">{errorCode}</code>
+      </div>
+    </div>
+  )
 }

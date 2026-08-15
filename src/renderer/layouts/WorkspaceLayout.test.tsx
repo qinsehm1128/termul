@@ -2,6 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TooltipProvider } from '@/components/ui/tooltip'
+import { useConversationStore } from '@/stores/conversation-store'
 import { useFileExplorerStore } from '@/stores/file-explorer-store'
 import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
 import { useSidebarStore } from '@/stores/sidebar-store'
@@ -419,6 +420,7 @@ beforeEach(() => {
   mockTerminateTerminalResource.mockResolvedValue(true)
   mockUpdatePanelVisibility.mockReset()
   mockWaitForPendingAppSettingsPersistence.mockReset()
+  useConversationStore.getState().reset()
   useFileExplorerStore.setState({ isVisible: true })
   useSessionWorkspaceSyncStore.setState({ activeConversationId: null })
   useSidebarStore.setState({ isVisible: true })
@@ -492,7 +494,7 @@ describe('WorkspaceLayout - Empty States', () => {
     renderWithRouter()
 
     const conversationId = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
-    act(() => useSessionWorkspaceSyncStore.getState().setActiveConversationId(conversationId))
+    act(() => useConversationStore.getState().setActiveConversationId(conversationId))
     const { useSessionWorkspaceSync } = await import('@/hooks/use-session-workspace-sync')
     expect(useSessionWorkspaceSync).toHaveBeenCalledWith(conversationId)
 
@@ -1163,6 +1165,9 @@ describe('WorkspaceLayout - Empty States', () => {
         viewState: 'hidden',
         healthStatus: 'running'
       } as Terminal
+      useConversationStore
+        .getState()
+        .setActiveConversationId('018f7a1c-1b4d-7c8a-9f01-0123456789ab')
       useSessionWorkspaceSyncStore.setState({
         activeConversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
       })

@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { useConversationStore } from '@/stores/conversation-store'
 import { useTerminalStore } from '@/stores/terminal-store'
 import { MobileChatShell } from './MobileChatShell'
 
@@ -150,6 +151,8 @@ describe('MobileChatShell', () => {
     mockReplaceBinding.mockReset()
     mockDeleteConversation.mockReset()
     mockReopenTerminalView.mockReset()
+    useConversationStore.getState().reset()
+    useConversationStore.getState().setActiveConversationId('018f7a1c-1b4d-7c8a-9f01-0123456789ab')
     useTerminalStore.setState({ terminals: [], activeTerminalId: '', ptyIdIndex: new Map() })
     tauriRef.current = true
     projectRef.current = { id: 'p1', name: 'Demo', path: '/demo' }

@@ -1,6 +1,5 @@
 import { create } from 'zustand'
 import { useShallow } from 'zustand/shallow'
-import { clearChatRoute } from '@/lib/router-navigate'
 import { randomUUID } from '@/lib/uuid'
 import type { EnvVariable, Project, ProjectColor, ProjectGroup, Worktree } from '@/types/project'
 
@@ -59,12 +58,10 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   },
 
   selectProject: (id: string): void => {
-    const prev = get().activeProjectId
     set((state) => ({
       activeProjectId: id,
       projects: state.projects.map((p) => ({ ...p, isActive: p.id === id }))
     }))
-    if (prev !== id) clearChatRoute()
   },
 
   addProject: (
@@ -74,7 +71,6 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     defaultShell?: string,
     envVars?: EnvVariable[]
   ): Project => {
-    const prev = get().activeProjectId
     const newProject: Project = {
       id: randomUUID(),
       name,
@@ -88,7 +84,6 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       projects: [...state.projects, newProject],
       activeProjectId: newProject.id
     }))
-    if (prev !== newProject.id) clearChatRoute()
     return newProject
   },
 
@@ -114,7 +109,6 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
       activeProjectId:
         wasActive && remaining.length > 0 ? remaining[0].id : wasActive ? '' : activeProjectId
     })
-    if (wasActive) clearChatRoute()
   },
 
   archiveProject: (id: string): void => {

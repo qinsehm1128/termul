@@ -7,9 +7,9 @@ import { useTranslation } from 'react-i18next'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
 import { ActivityRail } from '@/components/ActivityRail'
-import { ChatRoute } from '@/components/ChatRoute'
 import { ConfirmDialog } from '@/components/ConfirmDialog'
 import { CreateSnapshotModal } from '@/components/CreateSnapshotModal'
+import { ConversationSidebar } from '@/components/conversation/ConversationSidebar'
 import { NewProjectModal } from '@/components/NewProjectModal'
 import { ProjectSidebar } from '@/components/ProjectSidebar'
 import { ResizeEdges } from '@/components/ResizeEdges'
@@ -79,6 +79,7 @@ import {
 } from '@/stores/app-settings-store'
 import { useBrowserSessionStore } from '@/stores/browser-session-store'
 import { useCommandHistoryStore } from '@/stores/command-history-store'
+import { useConversationStore } from '@/stores/conversation-store'
 import { useEditorStore } from '@/stores/editor-store'
 import { useFileExplorerStore, useFileExplorerVisible } from '@/stores/file-explorer-store'
 import { matchesShortcut, useKeyboardShortcutsStore } from '@/stores/keyboard-shortcuts-store'
@@ -89,7 +90,6 @@ import {
   useProjects,
   useProjectsLoaded
 } from '@/stores/project-store'
-import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
 import { useSidebarVisible } from '@/stores/sidebar-store'
 import {
   useActiveSSHProfile,
@@ -175,9 +175,6 @@ function getShortcutTargetContext(target: EventTarget | null): {
  * stays a window-drag zone; the toggle sits in a separate no-drag container.
  */
 const macOsTrafficLightClearance = 'w-[80px] shrink-0'
-const canonicalConversationId =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
-
 function MacOsTitlebarStrip(): React.JSX.Element | null {
   const activeProject = useActiveProject()
 
@@ -261,15 +258,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
   const projects = useProjects()
   const activeProject = useActiveProject()
   const activeProjectId = useActiveProjectId()
-  const conversationIdFromAcp = useAcpStore((state) => {
-    if (!state.activeSessionId) return null
-    const candidate = state.sessions[state.activeSessionId]?.conversationId
-    return candidate && canonicalConversationId.test(candidate) ? candidate : null
-  })
-  const bootstrappedConversationId = useSessionWorkspaceSyncStore(
-    (state) => state.activeConversationId
-  )
-  const activeConversationId = conversationIdFromAcp ?? bootstrappedConversationId
+  const activeConversationId = useConversationStore((state) => state.activeConversationId)
   const {
     selectProject,
     addProject,
@@ -640,7 +629,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
   }, [activeProject?.path, activeProjectId])
 
   // Editor state persistence
-  useEditorPersistence(activeProjectId)
+  useEditorPersistence(activeConversationId ? '' : activeProjectId)
 
   // SessionWorkspace is keyed only by canonical ConversationId. The legacy
   // project manifest remains a read-only migration input and receives no live writes.
@@ -1697,7 +1686,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
         <Suspense fallback={<ShellSkeleton />}>
           <SSHWorkspace profile={sshProfileWithPassword!} conn={sshConn} />
         </Suspense>
-      ) : projects.length === 0 ? (
+      ) : projects.length === 0 && !activeConversationId && location.pathname === '/' ? (
         <div className="flex flex-1 flex-col items-center justify-center bg-background px-6 rounded-xl">
           <motion.div
             initial={{ opacity: 0, scale: 0.9 }}
@@ -1725,7 +1714,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
         <>
           {isWorkspaceRoute ? (
             <>
-              <ChatRoute />
+              {location.pathname !== '/' && <Outlet />}
               {hiddenConversationTerminals.length > 0 && (
                 <div className="flex shrink-0 items-center gap-2 overflow-x-auto border-b border-border/60 px-2 py-1">
                   <span className="text-xs text-muted-foreground">
@@ -2056,7 +2045,8 @@ export default function WorkspaceLayout(): React.JSX.Element {
             <div className="flex-1 flex overflow-hidden min-h-0 h-full p-2 gap-0">
               {/* Sidebar */}
               {isSidebarVisible && (
-                <div className="mr-2">
+                <div className="mr-2 flex h-full gap-2">
+                  <ConversationSidebar onNewChat={handleOpenAgentChat} />
                   <ProjectSidebar
                     projects={projects}
                     activeProjectId={activeProjectId}

@@ -185,7 +185,7 @@ export interface WorkspaceState {
   ensureTerminalTab: (terminalId: string, targetPaneId?: string, makeActive?: boolean) => void
   addEditorTab: (filePath: string, targetPaneId?: string) => void
   addBrowserTab: (browserTabId: string, targetPaneId?: string) => void
-  addAgentChatTab: (sessionId: string, targetPaneId?: string) => void
+  addAgentChatTab: (sessionId: string, targetPaneId?: string, navigate?: boolean) => void
   /**
    * Swap a launch-placeholder chat tab to the real ACP session id without
    * leaving a duplicate tab behind.
@@ -843,12 +843,16 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => {
       get().addTabToPane(paneId, tab)
     },
 
-    addAgentChatTab: (sessionId: string, targetPaneId?: string): void => {
+    addAgentChatTab: (
+      sessionId: string,
+      targetPaneId?: string,
+      shouldNavigate: boolean = true
+    ): void => {
       const id = agentChatTabId(sessionId)
       const { root, activePaneId, agentLauncherPaneId } = get()
       const paneId = targetPaneId ?? activePaneId
 
-      navigateToChatSession(sessionId)
+      if (shouldNavigate) navigateToChatSession(sessionId)
 
       const existing = findPaneContainingTab(root, id)
       if (existing) {
@@ -914,7 +918,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => {
       if (pane) {
         void get().closeTab(pane.id, tabId)
       }
-      if (window.location.hash === `#/c/${sessionId}`) {
+      if (
+        window.location.hash.startsWith('#/c/') ||
+        window.location.hash === `#/legacy/session/${encodeURIComponent(sessionId)}`
+      ) {
         clearChatRoute()
       }
     },

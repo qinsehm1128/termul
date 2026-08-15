@@ -16,7 +16,7 @@ import { isTerminalRestoreInProgress } from '@/hooks/useTerminalAutoSave'
 import { logFrontendError } from '@/lib/log-api'
 import { sessionWorkspaceApi } from '@/lib/session-workspace-api'
 import { randomUUID } from '@/lib/uuid'
-import { useAcpStore } from '@/stores/acp-store'
+import { useConversationStore } from '@/stores/conversation-store'
 import { useEditorStore } from '@/stores/editor-store'
 import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
 import { useTerminalStore } from '@/stores/terminal-store'
@@ -24,7 +24,6 @@ import type { WorkspaceTab } from '@/stores/workspace-store'
 import { editorTabId, terminalTabId, useWorkspaceStore } from '@/stores/workspace-store'
 import type { LeafNode, PaneNode, SplitNode } from '@/types/workspace.types'
 
-const canonicalUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 const WRITE_DEBOUNCE_MS = 500
 let updateIdentity: string | null = null
 
@@ -34,10 +33,7 @@ function rendererIdentity(): string {
 }
 
 export function getActiveConversationId(): ConversationId | null {
-  const state = useAcpStore.getState()
-  if (!state.activeSessionId) return null
-  const candidate = state.sessions[state.activeSessionId]?.conversationId
-  return candidate && canonicalUuid.test(candidate) ? candidate : null
+  return useConversationStore.getState().activeConversationId
 }
 
 function serializeTopology(
@@ -386,14 +382,11 @@ export async function resolveSessionWorkspaceRecovery(
 }
 
 export function useSessionWorkspaceBootstrap(): void {
-  const activeSessionId = useAcpStore((state) => state.activeSessionId)
-  const sessions = useAcpStore((state) => state.sessions)
+  const conversationId = useConversationStore((state) => state.activeConversationId)
   useEffect(() => {
-    const candidate = activeSessionId ? sessions[activeSessionId]?.conversationId : undefined
-    const conversationId = candidate && canonicalUuid.test(candidate) ? candidate : null
     useSessionWorkspaceSyncStore.getState().setActiveConversationId(conversationId)
     if (conversationId) void loadSessionWorkspace(conversationId)
-  }, [activeSessionId, sessions])
+  }, [conversationId])
 }
 
 export function useSessionWorkspaceSync(conversationId: ConversationId | null): void {

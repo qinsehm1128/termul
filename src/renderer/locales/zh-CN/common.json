@@ -109,5 +109,34 @@
       "recovery": "需要恢复会话",
       "error": "会话服务不可用"
     }
+  },
+  "conversationNavigation": {
+    "title": "会话",
+    "newChat": "新建聊天",
+    "search": "搜索会话",
+    "clearSearch": "清除会话搜索",
+    "filter": "按项目筛选会话",
+    "allProjects": "全部项目",
+    "projectless": "无项目",
+    "projectView": "项目会话",
+    "empty": "此视图中没有匹配的会话。",
+    "loadMore": "再加载 {{count}} 个",
+    "recoveryBadge_one": "{{count}} 个恢复项",
+    "recoveryBadge_other": "{{count}} 个恢复项"
+  },
+  "conversationRoute": {
+    "opening": "正在打开会话…",
+    "resolvingLegacy": "正在解析旧版会话…",
+    "legacyError": "无法解析此旧版会话链接。",
+    "errors": {
+      "title": "会话不可用",
+      "CONVERSATION_INVALID_ID": "该地址不是规范的 ConversationId。",
+      "CONVERSATION_NOT_FOUND": "未找到该会话。",
+      "LEGACY_ID_AMBIGUOUS": "此旧版标识符匹配多个会话。",
+      "CONVERSATION_RECOVERY_REQUIRED": "打开此会话前需要先完成恢复。",
+      "CONVERSATION_BINDING_OPEN_FAILED": "会话已打开，但无法恢复其代理绑定。",
+      "CONVERSATION_LEGACY_RESOLVE_FAILED": "旧版标识符解析器不可用。",
+      "CONVERSATION_OPEN_FAILED": "无法打开该会话。"
+    }
   }
 }

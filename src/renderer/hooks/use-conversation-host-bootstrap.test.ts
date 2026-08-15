@@ -1,6 +1,7 @@
 import { act, renderHook, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { conversationApi } from '@/lib/conversation-api'
+import { useConversationStore } from '@/stores/conversation-store'
 import {
   useConversationHostBootstrap,
   useConversationHostBootstrapStore
@@ -27,6 +28,7 @@ const status = {
 beforeEach(() => {
   vi.clearAllMocks()
   useConversationHostBootstrapStore.getState().reset()
+  useConversationStore.getState().reset()
   vi.mocked(conversationApi.getHostStatus).mockResolvedValue({ success: true, data: status })
   vi.mocked(conversationApi.listConversations).mockResolvedValue({ success: true, data: [] })
   vi.mocked(conversationApi.subscribeHostStatus).mockReturnValue(() => undefined)
@@ -38,6 +40,7 @@ describe('useConversationHostBootstrap', () => {
     await waitFor(() => expect(useConversationHostBootstrapStore.getState().loading).toBe(false))
     expect(useConversationHostBootstrapStore.getState().status).toEqual(status)
     expect(conversationApi.listConversations).toHaveBeenCalledTimes(1)
+    expect(useConversationStore.getState().conversationIds).toEqual([])
   })
 
   it('renders a stable error code instead of throwing a platform stub', async () => {
