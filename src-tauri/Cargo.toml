@@ -197,6 +197,7 @@ keyring = { version = "3.6", features = ["windows-native"] }
 # macOS Keychain and self-contained SSH/OpenSSL linkage for packaged apps
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3.6", features = ["apple-native"] }
+libc = "0.2"
 ssh2 = { version = "0.9", features = ["vendored-openssl"] }
 
 # Preserve the existing system/default SSH native dependency behavior outside
@@ -212,7 +213,11 @@ gtk = "0.18"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
-windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
 winapi = { version = "0.3", features = [
     "jobapi2",
     "winbase",
