@@ -13,8 +13,8 @@ use serde::Deserialize;
 use tracing::warn;
 
 use crate::conversation::{
-    ConversationId, SessionWorkspaceLoadOutcome, SessionWorkspaceService, SessionWorkspaceV1,
-    SessionWorkspaceWriteOutcome,
+    ConversationApplicationService, ConversationId, SessionWorkspaceLoadOutcome,
+    SessionWorkspaceV1, SessionWorkspaceWriteOutcome,
 };
 use crate::web::fs_api::IpcBody;
 use crate::web::ws::AppState;
@@ -26,15 +26,15 @@ pub struct WriteRequest {
     pub workspace: SessionWorkspaceV1,
 }
 
-fn service(state: &AppState) -> Result<SessionWorkspaceService, (&'static str, String)> {
-    let legacy = state.workspace_manifest.as_ref().ok_or_else(|| {
+fn service(
+    state: &AppState,
+) -> Result<std::sync::Arc<ConversationApplicationService>, (&'static str, String)> {
+    state.conversation.clone().ok_or_else(|| {
         (
             "SESSION_WORKSPACE_UNAVAILABLE",
-            "bootstrap-published SessionWorkspace service is unavailable".to_string(),
+            "bootstrap-published Conversation application service is unavailable".to_string(),
         )
-    })?;
-    SessionWorkspaceService::from_legacy_manifest_root(legacy.root())
-        .map_err(|error| ("SESSION_WORKSPACE_UNAVAILABLE", error.detail))
+    })
 }
 
 pub async fn get(
@@ -62,20 +62,20 @@ pub async fn get(
             )
         }
     };
-    match service.load(conversation_id).await {
+    match service.get_workspace(conversation_id).await {
         Ok(outcome) => (StatusCode::OK, Json(IpcBody::ok(outcome))),
         Err(error) => {
             warn!(
                 target: "termul::web::session_workspace_api",
                 conversation_id = %conversation_id,
-                code = %error.code.as_str(),
+                code = %error.code,
                 "workspace get failed"
             );
             (
                 StatusCode::OK,
                 Json(IpcBody::<SessionWorkspaceLoadOutcome>::err(
                     error.detail,
-                    error.code.as_str(),
+                    error.code,
                 )),
             )
         }
@@ -125,7 +125,7 @@ pub async fn write(
         }
     };
     match service
-        .write(conversation_id, request.based_revision, request.workspace)
+        .write_workspace(conversation_id, request.based_revision, request.workspace)
         .await
     {
         Ok(outcome) => (StatusCode::OK, Json(IpcBody::ok(outcome))),
@@ -133,14 +133,14 @@ pub async fn write(
             warn!(
                 target: "termul::web::session_workspace_api",
                 conversation_id = %conversation_id,
-                code = %error.code.as_str(),
+                code = %error.code,
                 "workspace write failed"
             );
             (
                 StatusCode::OK,
                 Json(IpcBody::<SessionWorkspaceWriteOutcome>::err(
                     error.detail,
-                    error.code.as_str(),
+                    error.code,
                 )),
             )
         }
@@ -183,13 +183,13 @@ pub async fn resolve_recovery(
             )
         }
     };
-    match service.resolve_recovery(request).await {
+    match service.resolve_recovery_item(request).await {
         Ok(outcome) => (StatusCode::OK, Json(IpcBody::ok(outcome))),
         Err(error) => (
             StatusCode::OK,
             Json(IpcBody::<
                 crate::conversation::migration::RecoveryActionResult,
-            >::err(error.detail, error.code.as_str())),
+            >::err(error.detail, error.code)),
         ),
     }
 }
@@ -213,7 +213,14 @@ mod tests {
         parse_created_at_utc, ConversationCreator, ConversationLifecycleState,
         ConversationRecordV2, CreationPartition, ExecutionTarget, CONVERSATION_SCHEMA_VERSION,
     };
-    use crate::conversation::{ConversationRepository, SessionWorkspaceProjectionState};
+    use crate::conversation::migration::{
+        MigrationHostMode, MigrationMapV1, MigrationPhase, ReaderPrecedence,
+        MIGRATION_MAP_SCHEMA_VERSION,
+    };
+    use crate::conversation::{
+        ConversationReader, ConversationRepository, LegacyConversationReader,
+        SessionWorkspaceProjectionState, SessionWorkspaceService,
+    };
     use crate::web::ws::HistoryMode;
     use axum::body::Body;
     use axum::http::Request;
@@ -248,6 +255,25 @@ mod tests {
             WorkspaceManifestService::open_read_only(state_root.join("workspace-manifests"))
                 .await
                 .unwrap();
+        let reader = Arc::new(ConversationReader::new(
+            Arc::clone(&repository),
+            LegacyConversationReader::default(),
+            ReaderPrecedence::ConversationV2Only,
+        ));
+        let migration_map = MigrationMapV1 {
+            schema_version: MIGRATION_MAP_SCHEMA_VERSION,
+            operation_id: uuid::Uuid::new_v4(),
+            entries: Vec::new(),
+        };
+        let conversation = Arc::new(ConversationApplicationService::new(
+            reader,
+            Arc::new(SessionWorkspaceService::new(Arc::clone(&repository))),
+            &migration_map,
+            MigrationHostMode::Standalone,
+            MigrationPhase::Finalized,
+            ReaderPrecedence::ConversationV2Only,
+            0,
+        ));
         let pty = crate::web::test_pty_manager();
         (
             temp,
@@ -264,6 +290,7 @@ mod tests {
                 registry_persistence: None,
                 projects_file: None,
                 history_mode: HistoryMode::LiveOnly,
+                conversation: Some(conversation),
                 project_root: Arc::new(parking_lot::RwLock::new(std::env::temp_dir())),
                 workspace_manifest: Some(legacy),
                 acp_catalog: None,

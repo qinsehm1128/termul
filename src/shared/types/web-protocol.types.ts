@@ -159,7 +159,16 @@ export const WS_REQUEST_TYPES = [
   'rebind_binding',
   'suspend_binding',
   'replace_binding',
-  'delete_conversation'
+  'delete_conversation',
+  // Shared Conversation application service operations.
+  'conversation_host_status',
+  'list_conversations',
+  'get_conversation',
+  'open_conversation',
+  'resolve_legacy_conversation_id',
+  'get_session_workspace',
+  'write_session_workspace',
+  'resolve_recovery_item'
 ] as const
 
 /** Union of all WS request `type` strings. */
@@ -191,7 +200,28 @@ export const WS_ERROR_CODES = {
 } as const
 
 /** Union of all WS error code strings. */
-export type WsErrorCode = (typeof WS_ERROR_CODES)[keyof typeof WS_ERROR_CODES]
+export const CONVERSATION_APPLICATION_ERROR_CODES = [
+  'UNAUTHORIZED',
+  'FORBIDDEN',
+  'VALIDATION_ERROR',
+  'CONVERSATION_INVALID_ID',
+  'CONVERSATION_NOT_FOUND',
+  'CONVERSATION_CONFLICT',
+  'CONVERSATION_RECOVERY_REQUIRED',
+  'CONVERSATION_DURABILITY_FAILED',
+  'CONVERSATION_LIVE_RESOURCES',
+  'RECOVERY_NOT_FOUND',
+  'MIGRATION_IDEMPOTENCY_CONFLICT',
+  'SESSION_WORKSPACE_UNAVAILABLE',
+  'LEGACY_ID_AMBIGUOUS',
+  'LEGACY_COMPATIBILITY_READ_ONLY',
+  'CONVERSATION_SERVICE_UNAVAILABLE'
+] as const
+
+export type ConversationApplicationErrorCode = (typeof CONVERSATION_APPLICATION_ERROR_CODES)[number]
+export type WsErrorCode =
+  | (typeof WS_ERROR_CODES)[keyof typeof WS_ERROR_CODES]
+  | ConversationApplicationErrorCode
 
 // ============================================================================
 // Reliability tiers (AC5) — single registry mirroring the Rust enum

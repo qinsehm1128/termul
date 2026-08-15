@@ -13,7 +13,7 @@ use serde::Deserialize;
 use tracing::warn;
 
 use crate::conversation::{
-    ConversationId, ConversationLifecycleOutcome, ConversationLifecycleService,
+    ConversationApplicationService, ConversationId, ConversationLifecycleOutcome,
     PrepareConversationRequest,
 };
 use crate::web::fs_api::IpcBody;
@@ -81,22 +81,21 @@ pub async fn replace(
     }
     let conversation_id = match parse_id(&conversation_id) {
         Ok(value) => value,
-        Err(body) => return body,
+        Err((code, detail)) => return failure(code, detail),
     };
     let request: ReplaceRequest = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(error) => return validation(error.to_string()),
     };
-    let service =
-        match ConversationLifecycleService::from_manager(state.acp.clone(), state.pty.clone()) {
-            Ok(service) => service,
-            Err(error) => return failure(error.code.as_str(), error.detail),
-        };
+    let service = match application(&state) {
+        Ok(service) => service,
+        Err((code, detail)) => return failure(code, detail),
+    };
     respond(
         &state,
         conversation_id,
         service
-            .replace_agent_binding(conversation_id, request.request, request.expected_revision)
+            .replace_binding(conversation_id, request.request, request.expected_revision)
             .await,
     )
 }
@@ -121,31 +120,30 @@ async fn mutate_revision(
     }
     let conversation_id = match parse_id(&conversation_id) {
         Ok(value) => value,
-        Err(body) => return body,
+        Err((code, detail)) => return failure(code, detail),
     };
     let request: RevisionRequest = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(error) => return validation(error.to_string()),
     };
-    let service =
-        match ConversationLifecycleService::from_manager(state.acp.clone(), state.pty.clone()) {
-            Ok(service) => service,
-            Err(error) => return failure(error.code.as_str(), error.detail),
-        };
+    let service = match application(&state) {
+        Ok(service) => service,
+        Err((code, detail)) => return failure(code, detail),
+    };
     let result = match mutation {
         Mutation::Detach => {
             service
-                .detach_agent_binding(conversation_id, request.expected_revision)
+                .detach_binding(conversation_id, request.expected_revision)
                 .await
         }
         Mutation::Rebind => {
             service
-                .rebind_detached_binding(conversation_id, request.expected_revision)
+                .rebind_binding(conversation_id, request.expected_revision)
                 .await
         }
         Mutation::Suspend => {
             service
-                .suspend_agent_binding(conversation_id, request.expected_revision)
+                .suspend_binding(conversation_id, request.expected_revision)
                 .await
         }
         Mutation::Delete => {
@@ -157,10 +155,21 @@ async fn mutate_revision(
     respond(&state, conversation_id, result)
 }
 
+fn application(
+    state: &AppState,
+) -> Result<std::sync::Arc<ConversationApplicationService>, (String, String)> {
+    state.conversation.clone().ok_or_else(|| {
+        (
+            "CONVERSATION_SERVICE_UNAVAILABLE".to_string(),
+            "bootstrap-published Conversation application service is unavailable".to_string(),
+        )
+    })
+}
+
 fn respond(
     state: &AppState,
     conversation_id: ConversationId,
-    result: crate::conversation::lifecycle::Result<ConversationLifecycleOutcome>,
+    result: crate::conversation::application::Result<ConversationLifecycleOutcome>,
 ) -> (StatusCode, Json<IpcBody<ConversationLifecycleOutcome>>) {
     match result {
         Ok(outcome) => {
@@ -176,20 +185,18 @@ fn respond(
             warn!(
                 target: "termul::web::conversation_lifecycle_api",
                 conversation_id = %conversation_id,
-                code = %error.code.as_str(),
+                code = %error.code,
                 operation = error.operation,
                 "conversation lifecycle mutation failed"
             );
-            failure(error.code.as_str(), error.detail)
+            failure(error.code, error.detail)
         }
     }
 }
 
-fn parse_id(
-    value: &str,
-) -> Result<ConversationId, (StatusCode, Json<IpcBody<ConversationLifecycleOutcome>>)> {
+fn parse_id(value: &str) -> Result<ConversationId, (String, String)> {
     ConversationId::parse_path_component(value)
-        .map_err(|error| failure("CONVERSATION_INVALID_ID".to_string(), error.to_string()))
+        .map_err(|error| ("CONVERSATION_INVALID_ID".to_string(), error.to_string()))
 }
 
 fn validation(detail: String) -> (StatusCode, Json<IpcBody<ConversationLifecycleOutcome>>) {
@@ -225,9 +232,14 @@ mod tests {
         ConversationLifecycleState, ConversationRecordV2, CreationPartition, ExecutionTarget,
         AGENT_SESSION_BINDING_SCHEMA_VERSION, CONVERSATION_SCHEMA_VERSION,
     };
+    use crate::conversation::migration::{
+        MigrationHostMode, MigrationMapV1, MigrationPhase, ReaderPrecedence,
+        MIGRATION_MAP_SCHEMA_VERSION,
+    };
     use crate::conversation::{
-        ConversationCreationService, ConversationLocator, ConversationPersistenceAdapter,
-        ConversationReader, ConversationRepository, ReaderPrecedence, SessionWorkspaceLocator,
+        ConversationApplicationService, ConversationCreationService, ConversationLifecycleService,
+        ConversationLocator, ConversationPersistenceAdapter, ConversationReader,
+        ConversationRepository, SessionWorkspaceLocator, SessionWorkspaceService,
     };
     use crate::web::ws::HistoryMode;
     use axum::body::Body;
@@ -297,7 +309,7 @@ mod tests {
         ));
         let persistence = Arc::new(ConversationPersistenceAdapter::new(
             Arc::clone(&repository),
-            reader,
+            Arc::clone(&reader),
         ));
         let acp = Arc::new(AcpManager::with_conversation_services(
             vec![],
@@ -305,6 +317,27 @@ mod tests {
             persistence,
         ));
         let pty = crate::web::test_pty_manager();
+        acp.set_pty_manager(&pty);
+        let migration_map = MigrationMapV1 {
+            schema_version: MIGRATION_MAP_SCHEMA_VERSION,
+            operation_id: Uuid::new_v4(),
+            entries: Vec::new(),
+        };
+        let conversation = Arc::new(ConversationApplicationService::new(
+            reader,
+            Arc::new(SessionWorkspaceService::new(Arc::clone(&repository))),
+            &migration_map,
+            MigrationHostMode::Standalone,
+            MigrationPhase::Finalized,
+            ReaderPrecedence::ConversationV2Only,
+            0,
+        ));
+        conversation
+            .attach_lifecycle(
+                ConversationLifecycleService::from_manager(Arc::clone(&acp), Arc::clone(&pty))
+                    .unwrap(),
+            )
+            .unwrap();
         let revision = repository.get_conversation(id).unwrap().last_seq;
         let state = AppState {
             acp,
@@ -318,6 +351,7 @@ mod tests {
             registry_persistence: None,
             projects_file: None,
             history_mode: HistoryMode::LiveOnly,
+            conversation: Some(conversation),
             project_root: Arc::new(parking_lot::RwLock::new(std::env::temp_dir())),
             workspace_manifest: None,
             acp_catalog: None,

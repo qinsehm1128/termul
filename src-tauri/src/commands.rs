@@ -3398,6 +3398,7 @@ pub async fn remote_server_start(
     pty_manager: State<'_, Arc<PtyManager>>,
     ws_relay: State<'_, Arc<crate::web::WsRelaySink>>,
     remote_state: State<'_, Arc<remote::RemoteServerState>>,
+    conversation: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
     project_registry: State<'_, Arc<crate::web::ProjectRegistry>>,
     workspace_manifest_store: State<'_, HostWorkspaceManifestStore>,
     acp_catalog_store: State<'_, HostAcpCatalogStore>,
@@ -3437,6 +3438,7 @@ pub async fn remote_server_start(
             ws_relay.inner().clone(),
             project_registry.inner().clone(),
             bind_mode,
+            Some(conversation.inner().clone()),
             workspace_manifest,
             acp_catalog,
             acp_install,
@@ -4444,36 +4446,147 @@ pub fn log_frontend_error(
 }
 
 // ============================================================================
-// SessionWorkspace Commands (Conversation stage 5)
+// Conversation application commands (shared Tauri/HTTP/WS service)
 // ============================================================================
+
+fn conversation_application_failure<T>(
+    error: crate::conversation::ConversationApplicationError,
+) -> IpcResult<T> {
+    log::warn!(
+        "[conversation-command] operation={} conversation_id={} code={}",
+        error.operation,
+        error
+            .conversation_id
+            .map_or_else(|| "none".to_string(), |value| value.to_string()),
+        error.code
+    );
+    IpcResult::error(error.detail, error.code)
+}
+
+fn parse_conversation_id<T>(
+    value: &str,
+) -> Result<crate::conversation::ConversationId, IpcResult<T>> {
+    crate::conversation::ConversationId::parse_path_component(value)
+        .map_err(|error| IpcResult::error(error.to_string(), "CONVERSATION_INVALID_ID"))
+}
+
+pub(crate) fn conversation_host_status_inner(
+    service: &crate::conversation::ConversationApplicationService,
+) -> IpcResult<crate::conversation::ConversationHostStatus> {
+    match service.host_status() {
+        Ok(outcome) => IpcResult::success(outcome),
+        Err(error) => conversation_application_failure(error),
+    }
+}
+
+#[tauri::command]
+pub fn conversation_host_status(
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::ConversationHostStatus>, String> {
+    Ok(conversation_host_status_inner(service.inner()))
+}
+
+pub(crate) fn conversation_list_inner(
+    service: &crate::conversation::ConversationApplicationService,
+) -> IpcResult<Vec<crate::conversation::ConversationRecordV2>> {
+    IpcResult::success(service.list_conversations())
+}
+
+#[tauri::command]
+pub fn conversation_list(
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<Vec<crate::conversation::ConversationRecordV2>>, String> {
+    Ok(conversation_list_inner(service.inner()))
+}
+
+pub(crate) fn conversation_get_inner(
+    service: &crate::conversation::ConversationApplicationService,
+    conversation_id: &str,
+) -> IpcResult<crate::conversation::ConversationRecordV2> {
+    let conversation_id = match parse_conversation_id(conversation_id) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    match service.get_conversation(conversation_id) {
+        Ok(outcome) => IpcResult::success(outcome),
+        Err(error) => conversation_application_failure(error),
+    }
+}
+
+#[tauri::command]
+pub fn conversation_get(
+    conversation_id: String,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::ConversationRecordV2>, String> {
+    Ok(conversation_get_inner(service.inner(), &conversation_id))
+}
+
+pub(crate) async fn conversation_open_inner(
+    service: &crate::conversation::ConversationApplicationService,
+    conversation_id: &str,
+) -> IpcResult<crate::conversation::ConversationOpenOutcome> {
+    let conversation_id = match parse_conversation_id(conversation_id) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    match service.open_conversation(conversation_id).await {
+        Ok(outcome) => IpcResult::success(outcome),
+        Err(error) => conversation_application_failure(error),
+    }
+}
+
+#[tauri::command]
+pub async fn conversation_open(
+    conversation_id: String,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::ConversationOpenOutcome>, String> {
+    Ok(conversation_open_inner(service.inner(), &conversation_id).await)
+}
+
+pub(crate) fn conversation_resolve_legacy_id_inner(
+    service: &crate::conversation::ConversationApplicationService,
+    request: serde_json::Value,
+) -> IpcResult<crate::conversation::LegacyConversationResolution> {
+    let request: crate::conversation::LegacyConversationKey = match serde_json::from_value(request)
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return IpcResult::error(
+                format!("payload validation failed: {error}"),
+                "VALIDATION_ERROR",
+            )
+        }
+    };
+    match service.resolve_legacy_conversation_id(request) {
+        Ok(outcome) => IpcResult::success(outcome),
+        Err(error) => conversation_application_failure(error),
+    }
+}
+
+#[tauri::command]
+pub fn conversation_resolve_legacy_id(
+    request: serde_json::Value,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::LegacyConversationResolution>, String> {
+    Ok(conversation_resolve_legacy_id_inner(
+        service.inner(),
+        request,
+    ))
+}
 
 #[tauri::command]
 pub async fn session_workspace_get(
     conversation_id: String,
-    repository: State<'_, Arc<crate::conversation::ConversationRepository>>,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
 ) -> Result<IpcResult<crate::conversation::SessionWorkspaceLoadOutcome>, String> {
-    let conversation_id =
-        match crate::conversation::ConversationId::parse_path_component(&conversation_id) {
-            Ok(conversation_id) => conversation_id,
-            Err(error) => {
-                return Ok(IpcResult::error(
-                    error.to_string(),
-                    "CONVERSATION_INVALID_ID",
-                ))
-            }
-        };
-    let service = crate::conversation::SessionWorkspaceService::new(repository.inner().clone());
-    match service.load(conversation_id).await {
-        Ok(outcome) => Ok(IpcResult::success(outcome)),
-        Err(error) => {
-            log::warn!(
-                "[session-workspace-command] get failed conversation_id={} code={}",
-                conversation_id,
-                error.code.as_str()
-            );
-            Ok(IpcResult::error(error.detail, error.code.as_str()))
-        }
-    }
+    let conversation_id = match parse_conversation_id(&conversation_id) {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    Ok(match service.get_workspace(conversation_id).await {
+        Ok(outcome) => IpcResult::success(outcome),
+        Err(error) => conversation_application_failure(error),
+    })
 }
 
 #[tauri::command]
@@ -4481,18 +4594,12 @@ pub async fn session_workspace_write(
     conversation_id: String,
     based_revision: Option<u64>,
     workspace: serde_json::Value,
-    repository: State<'_, Arc<crate::conversation::ConversationRepository>>,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
 ) -> Result<IpcResult<crate::conversation::SessionWorkspaceWriteOutcome>, String> {
-    let conversation_id =
-        match crate::conversation::ConversationId::parse_path_component(&conversation_id) {
-            Ok(conversation_id) => conversation_id,
-            Err(error) => {
-                return Ok(IpcResult::error(
-                    error.to_string(),
-                    "CONVERSATION_INVALID_ID",
-                ))
-            }
-        };
+    let conversation_id = match parse_conversation_id(&conversation_id) {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
     let workspace: crate::conversation::SessionWorkspaceV1 = match serde_json::from_value(workspace)
     {
         Ok(workspace) => workspace,
@@ -4503,60 +4610,55 @@ pub async fn session_workspace_write(
             ))
         }
     };
-    let service = crate::conversation::SessionWorkspaceService::new(repository.inner().clone());
-    match service
-        .write(conversation_id, based_revision, workspace)
-        .await
-    {
-        Ok(outcome) => Ok(IpcResult::success(outcome)),
-        Err(error) => {
-            log::warn!(
-                "[session-workspace-command] write failed conversation_id={} code={}",
-                conversation_id,
-                error.code.as_str()
-            );
-            Ok(IpcResult::error(error.detail, error.code.as_str()))
-        }
+    Ok(
+        match service
+            .write_workspace(conversation_id, based_revision, workspace)
+            .await
+        {
+            Ok(outcome) => IpcResult::success(outcome),
+            Err(error) => conversation_application_failure(error),
+        },
+    )
+}
+
+pub(crate) async fn conversation_recovery_resolve_inner(
+    service: &crate::conversation::ConversationApplicationService,
+    request: serde_json::Value,
+) -> IpcResult<crate::conversation::migration::RecoveryActionResult> {
+    let request: crate::conversation::migration::ResolveRecoveryItemRequest =
+        match serde_json::from_value(request) {
+            Ok(request) => request,
+            Err(error) => {
+                return IpcResult::error(
+                    format!("payload validation failed: {error}"),
+                    "VALIDATION_ERROR",
+                )
+            }
+        };
+    match service.resolve_recovery_item(request).await {
+        Ok(outcome) => IpcResult::success(outcome),
+        Err(error) => conversation_application_failure(error),
     }
 }
 
 #[tauri::command]
 pub async fn conversation_recovery_resolve(
+    app: AppHandle,
     request: serde_json::Value,
-    repository: State<'_, Arc<crate::conversation::ConversationRepository>>,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
 ) -> Result<IpcResult<crate::conversation::migration::RecoveryActionResult>, String> {
-    let request: crate::conversation::migration::ResolveRecoveryItemRequest =
-        match serde_json::from_value(request) {
-            Ok(request) => request,
-            Err(error) => {
-                return Ok(IpcResult::error(
-                    format!("payload validation failed: {error}"),
-                    "VALIDATION_ERROR",
-                ))
-            }
-        };
-    let service = crate::conversation::SessionWorkspaceService::new(repository.inner().clone());
-    match service.resolve_recovery(request).await {
-        Ok(outcome) => Ok(IpcResult::success(outcome)),
-        Err(error) => {
-            log::warn!(
-                "[session-workspace-command] recovery failed code={}",
-                error.code.as_str()
-            );
-            Ok(IpcResult::error(error.detail, error.code.as_str()))
-        }
+    let outcome = conversation_recovery_resolve_inner(service.inner(), request).await;
+    if outcome.success {
+        let _ = app.emit("conversation:host-status", ());
     }
+    Ok(outcome)
 }
-
-// ============================================================================
-// Conversation lifecycle commands (Conversation stage 6)
-// ============================================================================
 
 async fn run_conversation_lifecycle_command(
     app: &AppHandle,
-    conversation_id: String,
+    _conversation_id: String,
     operation: impl std::future::Future<
-        Output = crate::conversation::lifecycle::Result<
+        Output = crate::conversation::application::Result<
             crate::conversation::ConversationLifecycleOutcome,
         >,
     >,
@@ -4566,26 +4668,8 @@ async fn run_conversation_lifecycle_command(
             let _ = app.emit("conversation:lifecycle", &outcome);
             Ok(IpcResult::success(outcome))
         }
-        Err(error) => {
-            log::warn!(
-                "[conversation-lifecycle-command] failed conversation_id={} operation={} code={}",
-                conversation_id,
-                error.operation,
-                error.code.as_str()
-            );
-            Ok(IpcResult::error(error.detail, error.code.as_str()))
-        }
+        Err(error) => Ok(conversation_application_failure(error)),
     }
-}
-
-fn conversation_lifecycle_service(
-    acp: &State<'_, Arc<crate::acp::AcpManager>>,
-    pty: &State<'_, Arc<PtyManager>>,
-) -> crate::conversation::lifecycle::Result<crate::conversation::ConversationLifecycleService> {
-    crate::conversation::ConversationLifecycleService::from_manager(
-        acp.inner().clone(),
-        pty.inner().clone(),
-    )
 }
 
 #[tauri::command]
@@ -4593,26 +4677,16 @@ pub async fn conversation_detach_binding(
     app: AppHandle,
     conversation_id: String,
     expected_revision: u64,
-    acp: State<'_, Arc<crate::acp::AcpManager>>,
-    pty: State<'_, Arc<PtyManager>>,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
 ) -> Result<IpcResult<crate::conversation::ConversationLifecycleOutcome>, String> {
-    let id = match crate::conversation::ConversationId::parse_path_component(&conversation_id) {
+    let id = match parse_conversation_id(&conversation_id) {
         Ok(value) => value,
-        Err(error) => {
-            return Ok(IpcResult::error(
-                error.to_string(),
-                "CONVERSATION_INVALID_ID",
-            ))
-        }
-    };
-    let service = match conversation_lifecycle_service(&acp, &pty) {
-        Ok(service) => service,
-        Err(error) => return Ok(IpcResult::error(error.detail, error.code.as_str())),
+        Err(error) => return Ok(error),
     };
     run_conversation_lifecycle_command(
         &app,
         conversation_id,
-        service.detach_agent_binding(id, expected_revision),
+        service.detach_binding(id, expected_revision),
     )
     .await
 }
@@ -4622,26 +4696,16 @@ pub async fn conversation_rebind_detached_binding(
     app: AppHandle,
     conversation_id: String,
     expected_revision: u64,
-    acp: State<'_, Arc<crate::acp::AcpManager>>,
-    pty: State<'_, Arc<PtyManager>>,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
 ) -> Result<IpcResult<crate::conversation::ConversationLifecycleOutcome>, String> {
-    let id = match crate::conversation::ConversationId::parse_path_component(&conversation_id) {
+    let id = match parse_conversation_id(&conversation_id) {
         Ok(value) => value,
-        Err(error) => {
-            return Ok(IpcResult::error(
-                error.to_string(),
-                "CONVERSATION_INVALID_ID",
-            ))
-        }
-    };
-    let service = match conversation_lifecycle_service(&acp, &pty) {
-        Ok(service) => service,
-        Err(error) => return Ok(IpcResult::error(error.detail, error.code.as_str())),
+        Err(error) => return Ok(error),
     };
     run_conversation_lifecycle_command(
         &app,
         conversation_id,
-        service.rebind_detached_binding(id, expected_revision),
+        service.rebind_binding(id, expected_revision),
     )
     .await
 }
@@ -4651,26 +4715,16 @@ pub async fn conversation_suspend_binding(
     app: AppHandle,
     conversation_id: String,
     expected_revision: u64,
-    acp: State<'_, Arc<crate::acp::AcpManager>>,
-    pty: State<'_, Arc<PtyManager>>,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
 ) -> Result<IpcResult<crate::conversation::ConversationLifecycleOutcome>, String> {
-    let id = match crate::conversation::ConversationId::parse_path_component(&conversation_id) {
+    let id = match parse_conversation_id(&conversation_id) {
         Ok(value) => value,
-        Err(error) => {
-            return Ok(IpcResult::error(
-                error.to_string(),
-                "CONVERSATION_INVALID_ID",
-            ))
-        }
-    };
-    let service = match conversation_lifecycle_service(&acp, &pty) {
-        Ok(service) => service,
-        Err(error) => return Ok(IpcResult::error(error.detail, error.code.as_str())),
+        Err(error) => return Ok(error),
     };
     run_conversation_lifecycle_command(
         &app,
         conversation_id,
-        service.suspend_agent_binding(id, expected_revision),
+        service.suspend_binding(id, expected_revision),
     )
     .await
 }
@@ -4681,17 +4735,11 @@ pub async fn conversation_replace_binding(
     conversation_id: String,
     expected_revision: u64,
     request: serde_json::Value,
-    acp: State<'_, Arc<crate::acp::AcpManager>>,
-    pty: State<'_, Arc<PtyManager>>,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
 ) -> Result<IpcResult<crate::conversation::ConversationLifecycleOutcome>, String> {
-    let id = match crate::conversation::ConversationId::parse_path_component(&conversation_id) {
+    let id = match parse_conversation_id(&conversation_id) {
         Ok(value) => value,
-        Err(error) => {
-            return Ok(IpcResult::error(
-                error.to_string(),
-                "CONVERSATION_INVALID_ID",
-            ))
-        }
+        Err(error) => return Ok(error),
     };
     let request: crate::conversation::PrepareConversationRequest =
         match serde_json::from_value(request) {
@@ -4703,14 +4751,10 @@ pub async fn conversation_replace_binding(
                 ))
             }
         };
-    let service = match conversation_lifecycle_service(&acp, &pty) {
-        Ok(service) => service,
-        Err(error) => return Ok(IpcResult::error(error.detail, error.code.as_str())),
-    };
     run_conversation_lifecycle_command(
         &app,
         conversation_id,
-        service.replace_agent_binding(id, request, expected_revision),
+        service.replace_binding(id, request, expected_revision),
     )
     .await
 }
@@ -4720,21 +4764,11 @@ pub async fn conversation_delete(
     app: AppHandle,
     conversation_id: String,
     expected_revision: u64,
-    acp: State<'_, Arc<crate::acp::AcpManager>>,
-    pty: State<'_, Arc<PtyManager>>,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
 ) -> Result<IpcResult<crate::conversation::ConversationLifecycleOutcome>, String> {
-    let id = match crate::conversation::ConversationId::parse_path_component(&conversation_id) {
+    let id = match parse_conversation_id(&conversation_id) {
         Ok(value) => value,
-        Err(error) => {
-            return Ok(IpcResult::error(
-                error.to_string(),
-                "CONVERSATION_INVALID_ID",
-            ))
-        }
-    };
-    let service = match conversation_lifecycle_service(&acp, &pty) {
-        Ok(service) => service,
-        Err(error) => return Ok(IpcResult::error(error.detail, error.code.as_str())),
+        Err(error) => return Ok(error),
     };
     run_conversation_lifecycle_command(
         &app,

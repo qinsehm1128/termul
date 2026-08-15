@@ -22,6 +22,7 @@ use crate::acp::{
 use crate::pty::PtyManager;
 use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub};
 use crate::web::catalog_api;
+use crate::web::conversation_api;
 use crate::web::conversation_lifecycle_api;
 use crate::web::fs_api;
 use crate::web::git_api;
@@ -76,6 +77,7 @@ pub fn router(
     projects_file: Option<PathBuf>,
     project_root: PathBuf,
     history_mode: HistoryMode,
+    conversation: Option<Arc<crate::conversation::ConversationApplicationService>>,
     workspace_manifest: Option<Arc<WorkspaceManifestService>>,
     acp_catalog: Option<Arc<AcpCatalogService>>,
     acp_install: Option<Arc<AcpInstallService>>,
@@ -158,12 +160,29 @@ pub fn router(
         .route("/workspace/{projectId}/write", post(workspace_api::write))
         .route("/workspace/{projectId}/delete", post(workspace_api::delete))
         .route(
+            "/conversations/host-status",
+            get(conversation_api::host_status),
+        )
+        .route("/conversations", get(conversation_api::list))
+        .route(
+            "/conversations/resolve-legacy",
+            post(conversation_api::resolve_legacy),
+        )
+        .route(
+            "/conversations/{conversationId}",
+            get(conversation_api::get),
+        )
+        .route(
+            "/conversations/{conversationId}/open",
+            post(conversation_api::open),
+        )
+        .route(
             "/conversations/{conversationId}/workspace",
             get(session_workspace_api::get).post(session_workspace_api::write),
         )
         .route(
             "/conversation-recovery/resolve",
-            post(session_workspace_api::resolve_recovery),
+            post(conversation_api::resolve_recovery),
         )
         .route(
             "/conversations/{conversationId}/lifecycle/detach",
@@ -249,6 +268,7 @@ pub fn router(
         registry_persistence,
         projects_file: projects_file.map(Arc::new),
         history_mode,
+        conversation,
         workspace_manifest,
         acp_catalog,
         acp_install,
@@ -328,12 +348,29 @@ pub fn router_with_static(
         .route("/workspace/{projectId}/write", post(workspace_api::write))
         .route("/workspace/{projectId}/delete", post(workspace_api::delete))
         .route(
+            "/conversations/host-status",
+            get(conversation_api::host_status),
+        )
+        .route("/conversations", get(conversation_api::list))
+        .route(
+            "/conversations/resolve-legacy",
+            post(conversation_api::resolve_legacy),
+        )
+        .route(
+            "/conversations/{conversationId}",
+            get(conversation_api::get),
+        )
+        .route(
+            "/conversations/{conversationId}/open",
+            post(conversation_api::open),
+        )
+        .route(
             "/conversations/{conversationId}/workspace",
             get(session_workspace_api::get).post(session_workspace_api::write),
         )
         .route(
             "/conversation-recovery/resolve",
-            post(session_workspace_api::resolve_recovery),
+            post(conversation_api::resolve_recovery),
         )
         .route(
             "/conversations/{conversationId}/lifecycle/detach",
@@ -388,6 +425,7 @@ pub fn router_with_static(
                 registry_persistence: None,
                 projects_file: None,
                 history_mode: HistoryMode::LiveOnly,
+                conversation: None,
                 workspace_manifest: None,
                 acp_catalog: None,
                 acp_install: None,

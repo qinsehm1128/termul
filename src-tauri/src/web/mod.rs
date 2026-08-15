@@ -17,6 +17,7 @@
 pub mod assets;
 pub mod catalog_api;
 pub mod config;
+pub mod conversation_api;
 pub mod conversation_lifecycle_api;
 pub mod fs_api;
 pub mod git_api;
@@ -122,6 +123,7 @@ pub async fn serve(
     registry_persistence: Option<Arc<parking_lot::Mutex<crate::acp::FileProjectRegistry>>>,
     projects_file: Option<PathBuf>,
     cfg: ServerConfig,
+    conversation: Arc<crate::conversation::ConversationApplicationService>,
     workspace_manifest: Option<Arc<crate::acp::WorkspaceManifestService>>,
     acp_catalog: Option<Arc<crate::acp::AcpCatalogService>>,
     acp_install: Option<Arc<crate::acp::install::AcpInstallService>>,
@@ -139,6 +141,7 @@ pub async fn serve(
         projects_file,
         cfg,
         shutdown_signal_future(),
+        Some(conversation),
         workspace_manifest,
         acp_catalog,
         acp_install,
@@ -208,6 +211,7 @@ pub async fn serve_router(
     projects_file: Option<PathBuf>,
     cfg: ServerConfig,
     shutdown: impl Future<Output = ()> + Send + 'static,
+    conversation: Option<Arc<crate::conversation::ConversationApplicationService>>,
     workspace_manifest: Option<Arc<crate::acp::WorkspaceManifestService>>,
     acp_catalog: Option<Arc<crate::acp::AcpCatalogService>>,
     acp_install: Option<Arc<crate::acp::install::AcpInstallService>>,
@@ -251,6 +255,7 @@ pub async fn serve_router(
         projects_file,
         cfg.project_root.clone(),
         history_mode,
+        conversation,
         workspace_manifest,
         acp_catalog,
         acp_install,
@@ -317,5 +322,41 @@ async fn shutdown_signal() -> Result<(), std::io::Error> {
         // Windows: Ctrl-C / console ctrl handler via tokio. SIGTERM is not a
         // portable Win32 signal; service-stop is out of scope for this scaffold.
         ctrl_c.await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn standalone_shutdown_owns_resources() {
+        let source = include_str!("mod.rs");
+        let serve_start = source.find("pub async fn serve(").expect("serve exists");
+        let router_start = source[serve_start..]
+            .find("pub async fn serve_router(")
+            .map(|offset| serve_start + offset)
+            .expect("serve_router exists");
+        let serve_body = &source[serve_start..router_start];
+        assert!(
+            serve_body.contains("acp.kill_all_checked().await"),
+            "standalone serve must retain owned ACP cleanup after Axum drain"
+        );
+        assert!(
+            serve_body.contains("pty.kill_all().await"),
+            "standalone serve must retain owned PTY cleanup after Axum drain"
+        );
+
+        let router_end = source[router_start..]
+            .find("/// Build the shutdown-signal future")
+            .map(|offset| router_start + offset)
+            .expect("serve_router body boundary exists");
+        let router_body = &source[router_start..router_end];
+        assert!(
+            !router_body.contains("kill_all_checked"),
+            "desktop shared-live serve_router must not own ACP cleanup"
+        );
+        assert!(
+            !router_body.contains("pty.kill_all().await"),
+            "desktop shared-live serve_router must not own PTY cleanup"
+        );
     }
 }

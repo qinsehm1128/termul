@@ -103,6 +103,7 @@ mod tests {
             registry_persistence: None,
             projects_file: None,
             history_mode: crate::web::ws::HistoryMode::LiveOnly,
+            conversation: None,
             project_root: Arc::new(parking_lot::RwLock::new(
                 std::env::temp_dir()
                     .canonicalize()

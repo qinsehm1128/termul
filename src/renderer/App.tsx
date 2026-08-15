@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { lazy, Suspense, useEffect } from 'react'
 import { createHashRouter, RouterProvider } from 'react-router-dom'
 import { ChatRoute } from '@/components/ChatRoute'
+import { ConversationHostStatus } from '@/components/conversation/ConversationHostStatus'
 import { DirectoryPicker } from '@/components/DirectoryPicker'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { GlobalContextMenu } from '@/components/GlobalContextMenu'
@@ -13,6 +14,7 @@ import { WhatsNewModal } from './components/WhatsNewModal'
 import { useAppSettingsLoader } from './hooks/use-app-settings'
 import { useAppliedColorThemeSync } from './hooks/use-color-theme'
 import { useContextBarSettings } from './hooks/use-context-bar-settings'
+import { useConversationHostBootstrap } from './hooks/use-conversation-host-bootstrap'
 import { useConversationLifecycle } from './hooks/use-conversation-lifecycle'
 import { useCrashRecovery } from './hooks/use-crash-recovery'
 import { useCwd } from './hooks/use-cwd'
@@ -116,6 +118,7 @@ function AppEffects(): null {
   usePreventAltMenu()
   useTerminalAutoSave()
   useSessionWorkspaceBootstrap()
+  useConversationHostBootstrap()
   useConversationLifecycle()
   useTerminalResourceLifecycle()
   useTerminalRestore()
@@ -229,6 +232,7 @@ const App = () => {
         <GlobalContextMenu>
           <ErrorBoundary context="appRoot">
             <AppEffects />
+            <ConversationHostStatus />
             <Toaster />
             <Sonner />
             {/* Web/remote mode only: in-app directory picker registered with

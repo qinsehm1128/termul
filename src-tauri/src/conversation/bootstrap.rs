@@ -19,6 +19,7 @@ use std::sync::{LazyLock, Mutex};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 
+use crate::conversation::application::ConversationApplicationService;
 use crate::conversation::creation::ConversationCreationService;
 use crate::conversation::locator::{ConversationLocator, SessionWorkspaceLocator};
 use crate::conversation::migration::{
@@ -28,6 +29,7 @@ use crate::conversation::migration::{
 };
 use crate::conversation::persistence_adapter::ConversationPersistenceAdapter;
 use crate::conversation::repository::ConversationRepository;
+use crate::conversation::session_workspace::SessionWorkspaceService;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostConversationRoots {
@@ -74,6 +76,7 @@ pub struct BootstrapOutcome {
     pub reader: Arc<ConversationReader>,
     pub creation: Arc<ConversationCreationService>,
     pub persistence_adapter: Arc<ConversationPersistenceAdapter>,
+    pub application: Arc<ConversationApplicationService>,
     pub layout_generation: uuid::Uuid,
     pub reader_precedence: ReaderPrecedence,
     pub migration_phase: MigrationPhase,
@@ -294,6 +297,16 @@ impl ConversationBootstrap {
             Arc::clone(&repository),
             Arc::clone(&reader),
         ));
+        let workspace = Arc::new(SessionWorkspaceService::new(Arc::clone(&repository)));
+        let application = Arc::new(ConversationApplicationService::new(
+            Arc::clone(&reader),
+            workspace,
+            &migration_map,
+            host_mode,
+            report.phase,
+            report.reader_precedence,
+            open_report.recovery_items.len(),
+        ));
         drop(lock_guard);
         log::info!(
             "[conversation-bootstrap] complete host_mode={host_mode:?} phase={:?} precedence={:?} recovery_count={}",
@@ -306,6 +319,7 @@ impl ConversationBootstrap {
             reader,
             creation,
             persistence_adapter,
+            application,
             layout_generation: report.target_generation,
             reader_precedence: report.reader_precedence,
             migration_phase: report.phase,
@@ -398,6 +412,19 @@ mod tests {
         .unwrap();
         assert_ne!(desktop.repository.root(), standalone.repository.root());
         assert_ne!(desktop.workspace_base, standalone.workspace_base);
+        assert_eq!(
+            std::any::type_name_of_val(desktop.application.as_ref()),
+            std::any::type_name_of_val(standalone.application.as_ref()),
+            "both hosts publish the exact shared ConversationApplicationService type"
+        );
+        assert_eq!(
+            desktop.application.host_status().unwrap().host_kind,
+            crate::conversation::ConversationHostKind::Desktop
+        );
+        assert_eq!(
+            standalone.application.host_status().unwrap().host_kind,
+            crate::conversation::ConversationHostKind::Standalone
+        );
         assert!(desktop.repository.list_conversations().is_empty());
         assert!(standalone.repository.list_conversations().is_empty());
     }

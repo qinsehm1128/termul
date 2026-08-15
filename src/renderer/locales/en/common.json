@@ -97,5 +97,17 @@
     "greeting": "Hello, {{name}}",
     "itemCount_one": "{{formattedCount}} item",
     "itemCount_other": "{{formattedCount}} items"
+  },
+  "conversationHost": {
+    "ariaLabel": "Conversation host status",
+    "recoveryCount_one": "{{count}} recovery item",
+    "recoveryCount_other": "{{count}} recovery items",
+    "states": {
+      "ready": "Conversation service ready",
+      "migrating": "Conversation service is starting",
+      "hybrid": "Conversation compatibility mode",
+      "recovery": "Conversation recovery required",
+      "error": "Conversation service unavailable"
+    }
   }
 }

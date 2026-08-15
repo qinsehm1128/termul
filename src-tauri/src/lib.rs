@@ -1312,6 +1312,7 @@ pub fn run() {
             app.manage(Arc::clone(&conversation_bootstrap.reader));
             app.manage(Arc::clone(&conversation_bootstrap.creation));
             app.manage(Arc::clone(&conversation_bootstrap.persistence_adapter));
+            app.manage(Arc::clone(&conversation_bootstrap.application));
 
             // Window chrome is configured before show(). macOS overlay settings
             // live in tauri.conf.json — avoid set_decorations(true) there because
@@ -1535,6 +1536,16 @@ pub fn run() {
                 Arc::clone(&conversation_bootstrap.persistence_adapter),
             ));
             acp_manager.set_pty_manager(&pty_manager);
+            conversation_bootstrap
+                .application
+                .attach_lifecycle(
+                    crate::conversation::ConversationLifecycleService::from_manager(
+                        Arc::clone(&acp_manager),
+                        Arc::clone(&pty_manager),
+                    )
+                    .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
             // Attach the server-side permission rendezvous so a phone can
             // respond to `acp:permission_request` over WS. The desktop renderer
             // still responds via the `acp_respond_permission` Tauri command
@@ -1898,6 +1909,12 @@ pub fn run() {
             commands::acp_history_get_legacy,
             // Frontend error forwarding (issue #244)
             commands::log_frontend_error,
+            // Shared Conversation application service
+            commands::conversation_host_status,
+            commands::conversation_list,
+            commands::conversation_get,
+            commands::conversation_open,
+            commands::conversation_resolve_legacy_id,
             // Per-Conversation SessionWorkspace (Conversation stage 5)
             commands::session_workspace_get,
             commands::session_workspace_write,

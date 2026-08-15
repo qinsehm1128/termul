@@ -7,11 +7,13 @@ import App from './App'
 const {
   mockContextBarSettingsRead,
   mockSessionWorkspaceBootstrap,
+  mockConversationHostBootstrap,
   mockConversationLifecycle,
   mockTerminalResourceLifecycle
 } = vi.hoisted(() => ({
   mockContextBarSettingsRead: vi.fn(),
   mockSessionWorkspaceBootstrap: vi.fn(),
+  mockConversationHostBootstrap: vi.fn(),
   mockConversationLifecycle: vi.fn(),
   mockTerminalResourceLifecycle: vi.fn()
 }))
@@ -21,6 +23,14 @@ vi.mock('./hooks/use-session-workspace-sync', () => ({
   useSessionWorkspaceSync: vi.fn(),
   resolveSessionWorkspaceConflict: vi.fn(),
   resolveSessionWorkspaceRecovery: vi.fn()
+}))
+
+vi.mock('./hooks/use-conversation-host-bootstrap', () => ({
+  useConversationHostBootstrap: mockConversationHostBootstrap
+}))
+
+vi.mock('@/components/conversation/ConversationHostStatus', () => ({
+  ConversationHostStatus: () => <div data-testid="conversation-host-status" />
 }))
 
 vi.mock('./hooks/use-conversation-lifecycle', () => ({
@@ -235,6 +245,12 @@ describe('App Routes', () => {
   it('mounts the portable SessionWorkspace bootstrap at the web root', () => {
     render(<App />)
     expect(mockSessionWorkspaceBootstrap).toHaveBeenCalled()
+  })
+
+  it('mounts the shared Conversation host bootstrap and status at the web root', () => {
+    render(<App />)
+    expect(mockConversationHostBootstrap).toHaveBeenCalledTimes(1)
+    expect(document.querySelector('[data-testid="conversation-host-status"]')).not.toBeNull()
   })
 
   it('mounts Conversation lifecycle reconciliation at the web root', () => {

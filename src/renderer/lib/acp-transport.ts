@@ -13,6 +13,7 @@
  * (`.message` is the human string callers already toast).
  */
 
+import type { ConversationApplicationRequestType } from '@shared/types/conversation-api.types'
 import type {
   ConversationLifecycleOutcome,
   ConversationReplacementRequest
@@ -173,6 +174,7 @@ export interface AcpTransport {
   answerQuestion(agentId: AgentId, questionId: string, values?: string[]): Promise<void>
   /** Agent ACP auth (methodId) — NOT the WS relay token gate. */
   authenticate(agentId: AgentId, methodId: string): Promise<void>
+  conversationRequest?<T>(type: ConversationApplicationRequestType, payload: unknown): Promise<T>
   conversationLifecycle?(
     action: 'detach' | 'rebind' | 'suspend' | 'replace' | 'delete',
     conversationId: string,
@@ -914,6 +916,10 @@ export class WsAcpTransport implements AcpTransport {
     await this.request('close_session', { agentId, sessionId })
     this.subscribed.delete(sessionId)
     this.lastSeq.delete(sessionId)
+  }
+
+  conversationRequest<T>(type: ConversationApplicationRequestType, payload: unknown): Promise<T> {
+    return this.request<T>(type, payload)
   }
 
   async conversationLifecycle(

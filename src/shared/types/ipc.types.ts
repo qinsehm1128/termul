@@ -1,6 +1,25 @@
 // IPC Result pattern from architecture.md
 import type { AcpCatalog } from './acp-catalog.types'
-import type { ConversationId } from './conversation.types'
+import type { ConversationId, ConversationRecordV2 } from './conversation.types'
+import type {
+  ConversationHostStatus,
+  ConversationOpenOutcome,
+  LegacyConversationKey,
+  LegacyConversationResolution
+} from './conversation-api.types'
+import type {
+  ConversationLifecycleOutcome,
+  ConversationReplacementRequest
+} from './conversation-lifecycle.types'
+import type {
+  RecoveryActionResult,
+  ResolveRecoveryItemRequest
+} from './conversation-recovery.types'
+import type {
+  SessionWorkspaceLoadOutcome,
+  SessionWorkspaceV1,
+  SessionWorkspaceWriteOutcome
+} from './session-workspace.types'
 import type { WorkspaceManifest, WriteOutcome } from './workspace-manifest.types'
 
 export type IpcResult<T> =
@@ -80,6 +99,48 @@ export interface RotatedClaim {
 }
 
 // IPC channel definitions
+export type ConversationIpcChannels = {
+  'conversation:host_status': () => IpcResult<ConversationHostStatus>
+  'conversation:list': () => IpcResult<ConversationRecordV2[]>
+  'conversation:get': (conversationId: ConversationId) => IpcResult<ConversationRecordV2>
+  'conversation:open': (conversationId: ConversationId) => IpcResult<ConversationOpenOutcome>
+  'conversation:resolve_legacy_id': (
+    request: LegacyConversationKey
+  ) => IpcResult<LegacyConversationResolution>
+  'conversation:workspace:get': (
+    conversationId: ConversationId
+  ) => IpcResult<SessionWorkspaceLoadOutcome>
+  'conversation:workspace:write': (
+    conversationId: ConversationId,
+    basedRevision: number | null,
+    workspace: SessionWorkspaceV1
+  ) => IpcResult<SessionWorkspaceWriteOutcome>
+  'conversation:recovery:resolve': (
+    request: ResolveRecoveryItemRequest
+  ) => IpcResult<RecoveryActionResult>
+  'conversation:lifecycle:detach': (
+    conversationId: ConversationId,
+    expectedRevision: number
+  ) => IpcResult<ConversationLifecycleOutcome>
+  'conversation:lifecycle:rebind': (
+    conversationId: ConversationId,
+    expectedRevision: number
+  ) => IpcResult<ConversationLifecycleOutcome>
+  'conversation:lifecycle:suspend': (
+    conversationId: ConversationId,
+    expectedRevision: number
+  ) => IpcResult<ConversationLifecycleOutcome>
+  'conversation:lifecycle:replace': (
+    conversationId: ConversationId,
+    request: ConversationReplacementRequest,
+    expectedRevision: number
+  ) => IpcResult<ConversationLifecycleOutcome>
+  'conversation:lifecycle:delete': (
+    conversationId: ConversationId,
+    expectedRevision: number
+  ) => IpcResult<ConversationLifecycleOutcome>
+}
+
 export type TerminalIpcChannels = {
   'terminal:spawn': (options: TerminalSpawnOptions) => IpcResult<SpawnedTerminal>
   'terminal:attach': (

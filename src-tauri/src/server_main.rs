@@ -246,6 +246,28 @@ fn main() -> ExitCode {
             Arc::clone(&git_tracker),
             Arc::clone(&exit_code_tracker),
         ));
+        acp.set_pty_manager(&pty);
+        let lifecycle =
+            match termul_manager_lib::conversation::ConversationLifecycleService::from_manager(
+                Arc::clone(&acp),
+                Arc::clone(&pty),
+            ) {
+                Ok(service) => service,
+                Err(error) => {
+                    error!(
+                        code = error.code.as_str(),
+                        "Conversation lifecycle construction failed"
+                    );
+                    return ExitCode::from(1);
+                }
+            };
+        if let Err(error) = conversation_bootstrap
+            .application
+            .attach_lifecycle(lifecycle)
+        {
+            error!(code = error.code, "Conversation lifecycle admission failed");
+            return ExitCode::from(1);
+        }
 
         let projects_file = cfg.projects_file.clone();
         // Opt-in self-update loop (default off): only runs when the operator set
@@ -265,6 +287,7 @@ fn main() -> ExitCode {
             registry_persistence,
             projects_file,
             cfg,
+            Arc::clone(&conversation_bootstrap.application),
             workspace_manifest,
             acp_catalog,
             acp_install,

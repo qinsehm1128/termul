@@ -97,5 +97,17 @@
     "greeting": "你好，{{name}}",
     "itemCount_one": "{{formattedCount}} 项",
     "itemCount_other": "{{formattedCount}} 项"
+  },
+  "conversationHost": {
+    "ariaLabel": "会话主机状态",
+    "recoveryCount_one": "{{count}} 个恢复项",
+    "recoveryCount_other": "{{count}} 个恢复项",
+    "states": {
+      "ready": "会话服务已就绪",
+      "migrating": "会话服务正在启动",
+      "hybrid": "会话兼容模式",
+      "recovery": "需要恢复会话",
+      "error": "会话服务不可用"
+    }
   }
 }

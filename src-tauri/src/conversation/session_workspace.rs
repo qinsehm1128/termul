@@ -501,6 +501,36 @@ impl SessionWorkspaceService {
         })
     }
 
+    /// List the durable recovery queue without mutating preserved sources or revisions.
+    pub fn list_recovery_items(&self) -> Result<Vec<RecoveryItemV1>> {
+        let mut items = Vec::new();
+        for path in self.recovery_queue_paths()? {
+            if !path.exists() {
+                continue;
+            }
+            let bytes = fs::read(&path).map_err(|source| {
+                error(
+                    SessionWorkspaceErrorCode::ConversationRecoveryRequired,
+                    "list_recovery_items",
+                    None,
+                    source.to_string(),
+                )
+            })?;
+            let queue: RecoveryQueueV1 = serde_json::from_slice(&bytes).map_err(|source| {
+                error(
+                    SessionWorkspaceErrorCode::ConversationRecoveryRequired,
+                    "list_recovery_items",
+                    None,
+                    source.to_string(),
+                )
+            })?;
+            items.extend(queue.items);
+        }
+        items.sort_by(|left, right| left.recovery_id.cmp(&right.recovery_id));
+        items.dedup_by(|left, right| left.recovery_id == right.recovery_id);
+        Ok(items)
+    }
+
     pub async fn resolve_recovery(
         &self,
         request: ResolveRecoveryItemRequest,

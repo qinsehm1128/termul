@@ -6,11 +6,13 @@ import TauriApp from './TauriApp'
 const {
   mockPersistenceRead,
   mockSessionWorkspaceBootstrap,
+  mockConversationHostBootstrap,
   mockConversationLifecycle,
   mockTerminalResourceLifecycle
 } = vi.hoisted(() => ({
   mockPersistenceRead: vi.fn(),
   mockSessionWorkspaceBootstrap: vi.fn(),
+  mockConversationHostBootstrap: vi.fn(),
   mockConversationLifecycle: vi.fn(),
   mockTerminalResourceLifecycle: vi.fn()
 }))
@@ -37,6 +39,14 @@ vi.mock('@/lib/api', () => ({
 
 vi.mock('@/hooks/use-session-workspace-sync', () => ({
   useSessionWorkspaceBootstrap: mockSessionWorkspaceBootstrap
+}))
+
+vi.mock('./hooks/use-conversation-host-bootstrap', () => ({
+  useConversationHostBootstrap: mockConversationHostBootstrap
+}))
+
+vi.mock('@/components/conversation/ConversationHostStatus', () => ({
+  ConversationHostStatus: () => <div data-testid="conversation-host-status" />
 }))
 
 vi.mock('./hooks/use-conversation-lifecycle', () => ({
@@ -175,6 +185,12 @@ describe('TauriApp', () => {
   it('mounts the portable SessionWorkspace bootstrap at the desktop root', () => {
     render(<TauriApp />)
     expect(mockSessionWorkspaceBootstrap).toHaveBeenCalledTimes(1)
+  })
+
+  it('mounts the shared Conversation host bootstrap and status at the desktop root', () => {
+    render(<TauriApp />)
+    expect(mockConversationHostBootstrap).toHaveBeenCalledTimes(1)
+    expect(document.querySelector('[data-testid="conversation-host-status"]')).not.toBeNull()
   })
 
   it('mounts Conversation lifecycle reconciliation at the desktop root', () => {

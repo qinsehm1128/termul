@@ -123,6 +123,30 @@ function apiBridgeUsesTauriAdapter(exportName: string, tauriAdapterFile: string)
  */
 const P0_DOMAINS: DomainCheck[] = [
   {
+    domain: 'Conversation',
+    priority: 'P0',
+    tauriAdapterFile: 'tauri-conversation-api.ts',
+    adapterExportName: 'createTauriConversationApi',
+    methods: [
+      'getHostStatus',
+      'listConversations',
+      'getConversation',
+      'openConversation',
+      'resolveLegacyConversationId'
+    ],
+    apiBridgeExport: 'conversationApi',
+    testFile: 'conversation-parity-golden.test.ts'
+  },
+  {
+    domain: 'SessionWorkspace',
+    priority: 'P0',
+    tauriAdapterFile: 'tauri-conversation-api.ts',
+    adapterExportName: 'createTauriConversationApi',
+    methods: ['getWorkspace', 'writeWorkspace', 'resolveRecovery'],
+    apiBridgeExport: 'conversationApi',
+    testFile: 'conversation-parity-golden.test.ts'
+  },
+  {
     domain: 'Session',
     priority: 'P0',
     tauriAdapterFile: 'tauri-session-api.ts',
@@ -143,6 +167,30 @@ const P0_DOMAINS: DomainCheck[] = [
 ]
 
 const P1_DOMAINS: DomainCheck[] = [
+  {
+    domain: 'ConversationLifecycle',
+    priority: 'P1',
+    tauriAdapterFile: 'tauri-conversation-api.ts',
+    adapterExportName: 'createTauriConversationApi',
+    methods: [
+      'detachBinding',
+      'rebindDetachedBinding',
+      'suspendBinding',
+      'replaceBinding',
+      'deleteConversation'
+    ],
+    apiBridgeExport: 'conversationApi',
+    testFile: 'conversation-parity-golden.test.ts'
+  },
+  {
+    domain: 'ConversationTerminalResources',
+    priority: 'P1',
+    tauriAdapterFile: 'tauri-conversation-api.ts',
+    adapterExportName: 'createTauriConversationApi',
+    methods: ['getWorkspace', 'writeWorkspace'],
+    apiBridgeExport: 'conversationApi',
+    testFile: 'conversation-parity-golden.test.ts'
+  },
   {
     domain: 'Terminal',
     priority: 'P1',
@@ -226,7 +274,7 @@ describe('Parity Checklist Automation', () => {
           // Check key methods are implemented
           for (const method of domain.methods) {
             expect(
-              fileContains(domain.tauriAdapterFile, new RegExp(`\\b${method}\\s*\\(`)),
+              fileContains(domain.tauriAdapterFile, new RegExp(`\\b${method}\\s*(?:\\(|:)`)),
               `${domain.tauriAdapterFile} should implement ${method}()`
             ).toBe(true)
           }
@@ -272,7 +320,7 @@ describe('Parity Checklist Automation', () => {
           // Check key methods are implemented
           for (const method of domain.methods) {
             expect(
-              fileContains(domain.tauriAdapterFile, new RegExp(`\\b${method}\\s*\\(`)),
+              fileContains(domain.tauriAdapterFile, new RegExp(`\\b${method}\\s*(?:\\(|:)`)),
               `${domain.tauriAdapterFile} should implement ${method}()`
             ).toBe(true)
           }
@@ -438,10 +486,10 @@ describe('Parity Checklist Automation', () => {
       const web = readFileSync(WebAdapter, 'utf-8')
       for (const method of ['getManifest', 'writeManifest', 'deleteManifest']) {
         expect(tauri, `tauri-workspace-manifest-api.ts should implement ${method}`).toMatch(
-          new RegExp(`\\b${method}\\s*\\(`)
+          new RegExp(`\\b${method}\\s*(?:\\(|:)`)
         )
         expect(web, `web-workspace-manifest-api.ts should implement ${method}`).toMatch(
-          new RegExp(`\\b${method}\\s*\\(`)
+          new RegExp(`\\b${method}\\s*(?:\\(|:)`)
         )
       }
     })
@@ -568,10 +616,10 @@ describe('Parity Checklist Automation', () => {
       const web = readFileSync(WebAdapter, 'utf-8')
       for (const method of ['listCatalog', 'setCatalogOptIn', 'isCatalogOptedIn']) {
         expect(tauri, `tauri-acp-catalog-api.ts should implement ${method}`).toMatch(
-          new RegExp(`\\b${method}\\s*\\(`)
+          new RegExp(`\\b${method}\\s*(?:\\(|:)`)
         )
         expect(web, `web-acp-catalog-api.ts should implement ${method}`).toMatch(
-          new RegExp(`\\b${method}\\s*\\(`)
+          new RegExp(`\\b${method}\\s*(?:\\(|:)`)
         )
       }
     })
@@ -1079,7 +1127,7 @@ describe('Parity Checklist Automation', () => {
       const content = readFileSync(Facade, 'utf-8')
       for (const method of LAUNCH_FLOW_METHODS) {
         expect(content, `worktree-api.ts should branch ${method}`).toMatch(
-          new RegExp(`\\b${method}\\s*\\(`)
+          new RegExp(`\\b${method}\\s*(?:\\(|:)`)
         )
       }
       // The 7 launch-flow methods must reference `webServerWorktree` (the web branch).

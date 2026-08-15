@@ -1,5 +1,6 @@
 //! Host-owned Conversation domain contracts and services.
 
+pub mod application;
 pub mod bootstrap;
 pub mod catalog;
 pub mod contracts;
@@ -14,6 +15,11 @@ pub mod repository;
 pub mod session_workspace;
 pub mod workspace_projection;
 
+pub use application::{
+    ConversationApplicationError, ConversationApplicationService, ConversationHostKind,
+    ConversationHostState, ConversationHostStatus, ConversationOpenOutcome, LegacyConversationKey,
+    LegacyConversationResolution, LegacyConversationSourceKind,
+};
 pub use bootstrap::{
     BootstrapError, BootstrapOutcome, ConversationBootstrap, HostConversationRoots,
 };
@@ -63,8 +69,9 @@ pub use locator::{
 };
 pub use migration::{
     advance_phase, recover_cutover, ActiveLayout, ApprovalReceiptV1, BootstrapObservationReceiptV1,
-    ConversationLayoutDescriptorV1, ConversationMigrationService, ConversationReader,
-    CutoverRecovery, HostMigrationLock, HostMigrationLockGuard, LegacyConversationProjection,
+    CompatibilityError, ConversationLayoutDescriptorV1, ConversationMigrationService,
+    ConversationReader, CutoverRecovery, HostMigrationLock, HostMigrationLockGuard,
+    LegacyConversationProjection,
     LegacyConversationReader, MigrationAdmissionState, MigrationCallbacks, MigrationContext,
     MigrationControlContext, MigrationError, MigrationErrorCode, MigrationHostMode,
     MigrationJournalV1, MigrationPhase, MigrationReport, MigrationStepOutput,

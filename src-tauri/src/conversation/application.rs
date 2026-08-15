@@ -1,0 +1,982 @@
+//! Transport-neutral Conversation application service.
+//!
+//! Bootstrap constructs exactly one instance from the canonical repository, compatibility reader,
+//! SessionWorkspace service, and durable legacy identity map. Desktop Tauri commands, Axum HTTP,
+//! and authenticated WebSocket adapters share this `Arc`; adapters only decode, authorize, and map
+//! the stable application envelope.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
+
+use serde::{Deserialize, Serialize};
+
+use crate::conversation::lifecycle::{
+    ConversationLifecycleError, ConversationLifecycleOutcome, ConversationLifecycleService,
+};
+use crate::conversation::migration::{
+    MigrationHostMode, MigrationMapV1, MigrationPhase, ReaderPrecedence, RecoveryActionResult,
+    RecoveryItemV1, RecoveryStatus, ResolveRecoveryItemRequest,
+};
+use crate::conversation::session_workspace::{
+    SessionWorkspaceError, SessionWorkspaceLoadOutcome, SessionWorkspaceService,
+    SessionWorkspaceV1, SessionWorkspaceWriteOutcome,
+};
+use crate::conversation::{
+    CompatibilityError, ConversationId, ConversationReader, ConversationRecordV2,
+    PrepareConversationRequest,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LegacyConversationSourceKind {
+    LegacyStorageKey,
+    LegacyAgentSessionId,
+    LegacyChatHistoryId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LegacyConversationKey {
+    pub source_kind: LegacyConversationSourceKind,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LegacyConversationResolution {
+    pub conversation_id: ConversationId,
+    pub canonical_route: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConversationHostKind {
+    Desktop,
+    Standalone,
+}
+
+impl From<MigrationHostMode> for ConversationHostKind {
+    fn from(value: MigrationHostMode) -> Self {
+        match value {
+            MigrationHostMode::Desktop => Self::Desktop,
+            MigrationHostMode::Standalone => Self::Standalone,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConversationHostState {
+    Ready,
+    Migrating,
+    Hybrid,
+    Recovery,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationHostStatus {
+    pub host_kind: ConversationHostKind,
+    pub state: ConversationHostState,
+    pub code: String,
+    pub migration_phase: MigrationPhase,
+    pub reader_precedence: ReaderPrecedence,
+    pub recovery_item_count: usize,
+    pub recovery_items: Vec<RecoveryItemV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationOpenOutcome {
+    pub conversation: ConversationRecordV2,
+    pub workspace: SessionWorkspaceLoadOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationApplicationError {
+    pub code: String,
+    pub operation: &'static str,
+    pub conversation_id: Option<ConversationId>,
+    pub detail: String,
+}
+
+impl std::fmt::Display for ConversationApplicationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.detail)
+    }
+}
+
+impl std::error::Error for ConversationApplicationError {}
+
+pub type Result<T> = std::result::Result<T, ConversationApplicationError>;
+
+pub struct ConversationApplicationService {
+    reader: Arc<ConversationReader>,
+    workspace: Arc<SessionWorkspaceService>,
+    legacy_index: HashMap<(LegacyConversationSourceKind, String), Vec<ConversationId>>,
+    mapped_legacy_ids: HashSet<ConversationId>,
+    lifecycle: OnceLock<ConversationLifecycleService>,
+    host_kind: ConversationHostKind,
+    migration_phase: MigrationPhase,
+    reader_precedence: ReaderPrecedence,
+    bootstrap_recovery_item_count: usize,
+}
+
+impl ConversationApplicationService {
+    #[must_use]
+    pub fn new(
+        reader: Arc<ConversationReader>,
+        workspace: Arc<SessionWorkspaceService>,
+        migration_map: &MigrationMapV1,
+        host_mode: MigrationHostMode,
+        migration_phase: MigrationPhase,
+        reader_precedence: ReaderPrecedence,
+        bootstrap_recovery_item_count: usize,
+    ) -> Self {
+        let mut legacy_index =
+            HashMap::<(LegacyConversationSourceKind, String), Vec<ConversationId>>::new();
+        let mut mapped_legacy_ids = HashSet::new();
+        for entry in &migration_map.entries {
+            mapped_legacy_ids.insert(entry.conversation_id);
+            if let Some(value) = &entry.legacy_storage_key {
+                push_legacy(
+                    &mut legacy_index,
+                    LegacyConversationSourceKind::LegacyStorageKey,
+                    value,
+                    entry.conversation_id,
+                );
+            }
+            if let Some(value) = &entry.legacy_agent_session_id {
+                push_legacy(
+                    &mut legacy_index,
+                    LegacyConversationSourceKind::LegacyAgentSessionId,
+                    value,
+                    entry.conversation_id,
+                );
+                // Legacy chat payload metadata used the same opaque session/history id. Index it
+                // independently so adapters never guess that the value is a ConversationId.
+                push_legacy(
+                    &mut legacy_index,
+                    LegacyConversationSourceKind::LegacyChatHistoryId,
+                    value,
+                    entry.conversation_id,
+                );
+            }
+            if let Some(value) = chat_history_key(&entry.source_key) {
+                push_legacy(
+                    &mut legacy_index,
+                    LegacyConversationSourceKind::LegacyChatHistoryId,
+                    value,
+                    entry.conversation_id,
+                );
+            }
+        }
+        for ids in legacy_index.values_mut() {
+            ids.sort_by_key(ToString::to_string);
+            ids.dedup();
+        }
+        Self {
+            reader,
+            workspace,
+            legacy_index,
+            mapped_legacy_ids,
+            lifecycle: OnceLock::new(),
+            host_kind: host_mode.into(),
+            migration_phase,
+            reader_precedence,
+            bootstrap_recovery_item_count,
+        }
+    }
+
+    pub fn attach_lifecycle(&self, lifecycle: ConversationLifecycleService) -> Result<()> {
+        self.lifecycle.set(lifecycle).map_err(|_| {
+            application_error(
+                "CONVERSATION_SERVICE_ALREADY_ATTACHED",
+                "attach_lifecycle",
+                None,
+                "Conversation lifecycle runtime was already attached",
+            )
+        })
+    }
+
+    pub fn host_status(&self) -> Result<ConversationHostStatus> {
+        let started = Instant::now();
+        let recovery_items = self
+            .workspace
+            .list_recovery_items()
+            .map_err(map_workspace_error)?
+            .into_iter()
+            .filter(|item| item.status == RecoveryStatus::Unresolved)
+            .collect::<Vec<_>>();
+        let recovery_item_count = self.bootstrap_recovery_item_count.max(recovery_items.len());
+        let state = if recovery_item_count > 0 {
+            ConversationHostState::Recovery
+        } else if self.reader_precedence == ReaderPrecedence::HybridLegacyFirst
+            || self.migration_phase == MigrationPhase::RolledBack
+        {
+            ConversationHostState::Hybrid
+        } else if !matches!(
+            self.migration_phase,
+            MigrationPhase::ObservationWindow | MigrationPhase::Finalized
+        ) {
+            ConversationHostState::Migrating
+        } else {
+            ConversationHostState::Ready
+        };
+        let code = match state {
+            ConversationHostState::Ready => "CONVERSATION_HOST_READY",
+            ConversationHostState::Migrating => "CONVERSATION_HOST_MIGRATING",
+            ConversationHostState::Hybrid => "CONVERSATION_HOST_HYBRID",
+            ConversationHostState::Recovery => "CONVERSATION_RECOVERY_REQUIRED",
+            ConversationHostState::Error => "CONVERSATION_HOST_ERROR",
+        };
+        log_outcome("host_status", None, self.host_kind, code, None, started);
+        Ok(ConversationHostStatus {
+            host_kind: self.host_kind,
+            state,
+            code: code.to_string(),
+            migration_phase: self.migration_phase,
+            reader_precedence: self.reader_precedence,
+            recovery_item_count,
+            recovery_items,
+        })
+    }
+
+    #[must_use]
+    pub fn list_conversations(&self) -> Vec<ConversationRecordV2> {
+        let started = Instant::now();
+        let records = self.reader.list();
+        log_outcome(
+            "list_conversations",
+            None,
+            self.host_kind,
+            "OK",
+            None,
+            started,
+        );
+        records
+    }
+
+    pub fn get_conversation(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Result<ConversationRecordV2> {
+        let started = Instant::now();
+        let result = self
+            .reader
+            .get(conversation_id)
+            .map_err(map_compatibility_error);
+        let code = result
+            .as_ref()
+            .map_or_else(|error| error.code.as_str(), |_| "OK");
+        let revision = result.as_ref().ok().map(|record| record.last_seq);
+        log_outcome(
+            "get_conversation",
+            Some(conversation_id),
+            self.host_kind,
+            code,
+            revision,
+            started,
+        );
+        result
+    }
+
+    pub async fn open_conversation(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Result<ConversationOpenOutcome> {
+        let started = Instant::now();
+        let result = async {
+            let conversation = self.get_conversation(conversation_id)?;
+            let workspace = self
+                .workspace
+                .load(conversation_id)
+                .await
+                .map_err(map_workspace_error)?;
+            Ok(ConversationOpenOutcome {
+                conversation,
+                workspace,
+            })
+        }
+        .await;
+        log_result(
+            "open_conversation",
+            Some(conversation_id),
+            self.host_kind,
+            None,
+            started,
+            &result,
+        );
+        result
+    }
+
+    pub fn resolve_legacy_conversation_id(
+        &self,
+        key: LegacyConversationKey,
+    ) -> Result<LegacyConversationResolution> {
+        let started = Instant::now();
+        let value = key.value.trim();
+        if value.is_empty() {
+            return Err(application_error(
+                "VALIDATION_ERROR",
+                "resolve_legacy_conversation_id",
+                None,
+                "legacy value must be non-empty",
+            ));
+        }
+        let matches = self
+            .legacy_index
+            .get(&(key.source_kind, value.to_string()))
+            .cloned()
+            .unwrap_or_default();
+        let result = match matches.as_slice() {
+            [] => Err(application_error(
+                "CONVERSATION_NOT_FOUND",
+                "resolve_legacy_conversation_id",
+                None,
+                "legacy Conversation mapping was not found",
+            )),
+            [conversation_id] => Ok(LegacyConversationResolution {
+                conversation_id: *conversation_id,
+                canonical_route: format!("#/c/{conversation_id}"),
+            }),
+            _ => Err(application_error(
+                "LEGACY_ID_AMBIGUOUS",
+                "resolve_legacy_conversation_id",
+                None,
+                "legacy Conversation key maps to multiple canonical Conversations",
+            )),
+        };
+        let code = result
+            .as_ref()
+            .map_or_else(|error| error.code.as_str(), |_| "OK");
+        let conversation_id = result.as_ref().ok().map(|value| value.conversation_id);
+        log_outcome(
+            "resolve_legacy_conversation_id",
+            conversation_id,
+            self.host_kind,
+            code,
+            None,
+            started,
+        );
+        result
+    }
+
+    pub async fn get_workspace(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Result<SessionWorkspaceLoadOutcome> {
+        let started = Instant::now();
+        let result = self
+            .workspace
+            .load(conversation_id)
+            .await
+            .map_err(map_workspace_error);
+        log_result(
+            "get_workspace",
+            Some(conversation_id),
+            self.host_kind,
+            None,
+            started,
+            &result,
+        );
+        result
+    }
+
+    pub async fn write_workspace(
+        &self,
+        conversation_id: ConversationId,
+        based_revision: Option<u64>,
+        workspace: SessionWorkspaceV1,
+    ) -> Result<SessionWorkspaceWriteOutcome> {
+        let started = Instant::now();
+        let result = async {
+            self.ensure_writable(conversation_id)?;
+            self.workspace
+                .write(conversation_id, based_revision, workspace)
+                .await
+                .map_err(map_workspace_error)
+        }
+        .await;
+        log_result(
+            "write_workspace",
+            Some(conversation_id),
+            self.host_kind,
+            based_revision,
+            started,
+            &result,
+        );
+        result
+    }
+
+    pub async fn resolve_recovery_item(
+        &self,
+        request: ResolveRecoveryItemRequest,
+    ) -> Result<RecoveryActionResult> {
+        let started = Instant::now();
+        let recovery_id = request.recovery_id.clone();
+        let expected_revision = request.expected_revision;
+        let result = self
+            .workspace
+            .resolve_recovery(request)
+            .await
+            .map_err(map_workspace_error);
+        let code = result
+            .as_ref()
+            .map_or_else(|error| error.code.as_str(), |_| "OK");
+        log::info!(
+            "[conversation-application] operation=resolve_recovery_item recovery_id={} host_kind={:?} code={} revision={} duration_ms={}",
+            recovery_id,
+            self.host_kind,
+            code,
+            expected_revision,
+            started.elapsed().as_millis()
+        );
+        result
+    }
+
+    pub async fn detach_binding(
+        &self,
+        conversation_id: ConversationId,
+        expected_revision: u64,
+    ) -> Result<ConversationLifecycleOutcome> {
+        let started = Instant::now();
+        let result = async {
+            self.ensure_writable(conversation_id)?;
+            self.lifecycle()?
+                .detach_agent_binding(conversation_id, expected_revision)
+                .await
+                .map_err(map_lifecycle_error)
+        }
+        .await;
+        log_result(
+            "detach_binding",
+            Some(conversation_id),
+            self.host_kind,
+            Some(expected_revision),
+            started,
+            &result,
+        );
+        result
+    }
+
+    pub async fn rebind_binding(
+        &self,
+        conversation_id: ConversationId,
+        expected_revision: u64,
+    ) -> Result<ConversationLifecycleOutcome> {
+        let started = Instant::now();
+        let result = async {
+            self.ensure_writable(conversation_id)?;
+            self.lifecycle()?
+                .rebind_detached_binding(conversation_id, expected_revision)
+                .await
+                .map_err(map_lifecycle_error)
+        }
+        .await;
+        log_result(
+            "rebind_binding",
+            Some(conversation_id),
+            self.host_kind,
+            Some(expected_revision),
+            started,
+            &result,
+        );
+        result
+    }
+
+    pub async fn suspend_binding(
+        &self,
+        conversation_id: ConversationId,
+        expected_revision: u64,
+    ) -> Result<ConversationLifecycleOutcome> {
+        let started = Instant::now();
+        let result = async {
+            self.ensure_writable(conversation_id)?;
+            self.lifecycle()?
+                .suspend_agent_binding(conversation_id, expected_revision)
+                .await
+                .map_err(map_lifecycle_error)
+        }
+        .await;
+        log_result(
+            "suspend_binding",
+            Some(conversation_id),
+            self.host_kind,
+            Some(expected_revision),
+            started,
+            &result,
+        );
+        result
+    }
+
+    pub async fn replace_binding(
+        &self,
+        conversation_id: ConversationId,
+        request: PrepareConversationRequest,
+        expected_revision: u64,
+    ) -> Result<ConversationLifecycleOutcome> {
+        let started = Instant::now();
+        let result = async {
+            self.ensure_writable(conversation_id)?;
+            self.lifecycle()?
+                .replace_agent_binding(conversation_id, request, expected_revision)
+                .await
+                .map_err(map_lifecycle_error)
+        }
+        .await;
+        log_result(
+            "replace_binding",
+            Some(conversation_id),
+            self.host_kind,
+            Some(expected_revision),
+            started,
+            &result,
+        );
+        result
+    }
+
+    pub async fn delete_conversation(
+        &self,
+        conversation_id: ConversationId,
+        expected_revision: u64,
+    ) -> Result<ConversationLifecycleOutcome> {
+        let started = Instant::now();
+        let result = async {
+            self.ensure_writable(conversation_id)?;
+            self.lifecycle()?
+                .delete_conversation(conversation_id, expected_revision)
+                .await
+                .map_err(map_lifecycle_error)
+        }
+        .await;
+        log_result(
+            "delete_conversation",
+            Some(conversation_id),
+            self.host_kind,
+            Some(expected_revision),
+            started,
+            &result,
+        );
+        result
+    }
+
+    fn lifecycle(&self) -> Result<&ConversationLifecycleService> {
+        self.lifecycle.get().ok_or_else(|| {
+            application_error(
+                "CONVERSATION_SERVICE_UNAVAILABLE",
+                "lifecycle",
+                None,
+                "Conversation lifecycle runtime is not attached",
+            )
+        })
+    }
+
+    fn ensure_writable(&self, conversation_id: ConversationId) -> Result<()> {
+        if self.reader_precedence == ReaderPrecedence::LegacyOnly
+            || (self.reader_precedence == ReaderPrecedence::HybridLegacyFirst
+                && self.mapped_legacy_ids.contains(&conversation_id))
+        {
+            return Err(application_error(
+                "LEGACY_COMPATIBILITY_READ_ONLY",
+                "ensure_writable",
+                Some(conversation_id),
+                "mapped legacy Conversations are read-only under the active reader policy",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn push_legacy(
+    index: &mut HashMap<(LegacyConversationSourceKind, String), Vec<ConversationId>>,
+    kind: LegacyConversationSourceKind,
+    value: &str,
+    conversation_id: ConversationId,
+) {
+    if !value.trim().is_empty() {
+        index
+            .entry((kind, value.to_string()))
+            .or_default()
+            .push(conversation_id);
+    }
+}
+
+fn chat_history_key(source_key: &str) -> Option<&str> {
+    let relative = source_key
+        .strip_prefix("legacy_chat_history:")?
+        .split_once(':')?
+        .1;
+    relative
+        .strip_prefix("payloads/")?
+        .strip_suffix(".json")
+        .filter(|value| !value.is_empty())
+}
+
+fn application_error(
+    code: impl Into<String>,
+    operation: &'static str,
+    conversation_id: Option<ConversationId>,
+    detail: impl Into<String>,
+) -> ConversationApplicationError {
+    ConversationApplicationError {
+        code: code.into(),
+        operation,
+        conversation_id,
+        detail: detail.into(),
+    }
+}
+
+fn map_compatibility_error(source: CompatibilityError) -> ConversationApplicationError {
+    let code = match source.code {
+        "LEGACY_COMPATIBILITY_READ_ONLY" => "LEGACY_COMPATIBILITY_READ_ONLY",
+        "CONVERSATION_NOT_FOUND" => "CONVERSATION_NOT_FOUND",
+        _ => "CONVERSATION_RECOVERY_REQUIRED",
+    };
+    application_error(code, "read_conversation", None, source.detail)
+}
+
+fn map_workspace_error(source: SessionWorkspaceError) -> ConversationApplicationError {
+    application_error(
+        source.code.as_str(),
+        source.operation,
+        source.conversation_id,
+        source.detail,
+    )
+}
+
+fn map_lifecycle_error(source: ConversationLifecycleError) -> ConversationApplicationError {
+    application_error(
+        source.code.as_str(),
+        source.operation,
+        source.conversation_id,
+        source.detail,
+    )
+}
+
+fn log_outcome(
+    operation: &'static str,
+    conversation_id: Option<ConversationId>,
+    host_kind: ConversationHostKind,
+    code: &str,
+    revision: Option<u64>,
+    started: Instant,
+) {
+    log::info!(
+        "[conversation-application] operation={} conversation_id={} host_kind={:?} code={} revision={:?} duration_ms={}",
+        operation,
+        conversation_id.map_or_else(|| "none".to_string(), |value| value.to_string()),
+        host_kind,
+        code,
+        revision,
+        started.elapsed().as_millis()
+    );
+}
+
+fn log_result<T>(
+    operation: &'static str,
+    conversation_id: Option<ConversationId>,
+    host_kind: ConversationHostKind,
+    revision: Option<u64>,
+    started: Instant,
+    result: &Result<T>,
+) {
+    let code = result
+        .as_ref()
+        .map_or_else(|error| error.code.as_str(), |_| "OK");
+    log_outcome(
+        operation,
+        conversation_id,
+        host_kind,
+        code,
+        revision,
+        started,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conversation::contracts::{
+        parse_created_at_utc, ConversationCreator, ConversationLifecycleState,
+        ConversationRecordV2, CreationPartition, ExecutionTarget, CONVERSATION_SCHEMA_VERSION,
+    };
+    use crate::conversation::migration::{
+        CreatedAtSource, IdentityDecision, MigrationMapEntryV1, MIGRATION_MAP_SCHEMA_VERSION,
+    };
+    use crate::conversation::{
+        ConversationRepository, LegacyConversationReader, SessionWorkspaceProjectionState,
+    };
+    use uuid::Uuid;
+
+    const ID: &str = "018f7a1c-1b4d-7c8a-9f01-0123456789ab";
+
+    async fn fixture() -> (
+        tempfile::TempDir,
+        Arc<ConversationRepository>,
+        ConversationApplicationService,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("state/conversations/v2");
+        let (repository, _) = ConversationRepository::open(root).unwrap();
+        let id = ConversationId::parse(ID).unwrap();
+        let created_at = parse_created_at_utc("2026-08-15T09:45:15.123Z").unwrap();
+        repository
+            .create_conversation(ConversationRecordV2 {
+                schema_version: CONVERSATION_SCHEMA_VERSION,
+                conversation_id: id,
+                created_at_utc: created_at,
+                creation_partition: CreationPartition::from_created_at(created_at),
+                workspace_cwd: "/visible/conversation".to_string(),
+                execution_target: ExecutionTarget::Workspace,
+                project_attachment: None,
+                lifecycle_state: ConversationLifecycleState::Ready,
+                last_seq: 0,
+                created_by: ConversationCreator::Termul,
+            })
+            .await
+            .unwrap();
+        let reader = Arc::new(ConversationReader::new(
+            Arc::clone(&repository),
+            LegacyConversationReader::default(),
+            ReaderPrecedence::ConversationV2Only,
+        ));
+        let workspace = Arc::new(SessionWorkspaceService::new(Arc::clone(&repository)));
+        let map = MigrationMapV1 {
+            schema_version: MIGRATION_MAP_SCHEMA_VERSION,
+            operation_id: Uuid::new_v4(),
+            entries: vec![MigrationMapEntryV1 {
+                source_key: "legacy_chat_history:0:payloads/chat-history.json".to_string(),
+                legacy_storage_key: Some("legacy-storage".to_string()),
+                legacy_agent_session_id: Some("opaque-agent-session".to_string()),
+                conversation_id: id,
+                identity_decision: IdentityDecision::AllocatedInvalidUuid,
+                created_at_source: Some(CreatedAtSource::HostMetadata),
+                source_record_sha256: "a".repeat(64),
+            }],
+        };
+        (
+            temp,
+            repository,
+            ConversationApplicationService::new(
+                reader,
+                workspace,
+                &map,
+                MigrationHostMode::Desktop,
+                MigrationPhase::Finalized,
+                ReaderPrecedence::ConversationV2Only,
+                0,
+            ),
+        )
+    }
+
+    async fn service() -> (tempfile::TempDir, ConversationApplicationService) {
+        let (temp, _repository, service) = fixture().await;
+        (temp, service)
+    }
+
+    fn seed_recovery(repository: &ConversationRepository) -> RecoveryItemV1 {
+        use crate::conversation::migration::{
+            RecoveryKind, RecoveryProvenanceV1, RecoveryQueueV1, RecoverySeverity,
+        };
+        let item = RecoveryItemV1::new(
+            RecoveryKind::AmbiguousWorkspaceManifest,
+            RecoverySeverity::Warning,
+            vec!["legacy_workspace_manifests/0/shared.json".to_string()],
+            vec![ConversationId::parse(ID).unwrap()],
+            vec!["e".repeat(64)],
+            vec![serde_json::json!({"candidate":"preserved"})],
+            vec![RecoveryProvenanceV1 {
+                source_kind: "legacy_workspace_manifests".to_string(),
+                relative_path: "legacy_workspace_manifests/0/shared.json".to_string(),
+                sha256: "e".repeat(64),
+                preserved_read_only: true,
+            }],
+        );
+        let state_root = repository
+            .root()
+            .parent()
+            .and_then(std::path::Path::parent)
+            .unwrap();
+        RecoveryQueueV1::new(uuid::Uuid::new_v4(), vec![item.clone()])
+            .persist(
+                &state_root
+                    .join("conversation-migrations")
+                    .join("workspace-recovery-v1"),
+            )
+            .unwrap();
+        item
+    }
+
+    #[tokio::test]
+    async fn list_get_open_and_host_status_share_one_service() {
+        let (_temp, service) = service().await;
+        assert_eq!(service.list_conversations().len(), 1);
+        let id = ConversationId::parse(ID).unwrap();
+        assert_eq!(service.get_conversation(id).unwrap().conversation_id, id);
+        assert!(matches!(
+            service.open_conversation(id).await.unwrap().workspace,
+            SessionWorkspaceLoadOutcome::Missing { .. }
+        ));
+        assert_eq!(
+            service.host_status().unwrap().state,
+            ConversationHostState::Ready
+        );
+        let _ = SessionWorkspaceProjectionState::Native;
+    }
+
+    #[tokio::test]
+    async fn legacy_resolver_accepts_exact_source_kinds_and_never_parses_values_as_ids() {
+        let (_temp, service) = service().await;
+        for (source_kind, value) in [
+            (
+                LegacyConversationSourceKind::LegacyStorageKey,
+                "legacy-storage",
+            ),
+            (
+                LegacyConversationSourceKind::LegacyAgentSessionId,
+                "opaque-agent-session",
+            ),
+            (
+                LegacyConversationSourceKind::LegacyChatHistoryId,
+                "chat-history",
+            ),
+        ] {
+            let resolution = service
+                .resolve_legacy_conversation_id(LegacyConversationKey {
+                    source_kind,
+                    value: value.to_string(),
+                })
+                .unwrap();
+            assert_eq!(resolution.conversation_id.to_string(), ID);
+            assert_eq!(resolution.canonical_route, format!("#/c/{ID}"));
+        }
+        let error = service
+            .resolve_legacy_conversation_id(LegacyConversationKey {
+                source_kind: LegacyConversationSourceKind::LegacyStorageKey,
+                value: ID.to_string(),
+            })
+            .unwrap_err();
+        assert_eq!(error.code, "CONVERSATION_NOT_FOUND");
+    }
+
+    #[tokio::test]
+    async fn tauri_command_inners_preserve_legacy_and_recovery_golden_envelopes() {
+        let (_temp, repository, service) = fixture().await;
+        for (source_kind, value) in [
+            ("legacyStorageKey", "legacy-storage"),
+            ("legacyAgentSessionId", "opaque-agent-session"),
+            ("legacyChatHistoryId", "chat-history"),
+        ] {
+            let result = crate::commands::conversation_resolve_legacy_id_inner(
+                &service,
+                serde_json::json!({"sourceKind":source_kind,"value":value}),
+            );
+            assert!(result.success, "{source_kind}: {:?}", result.error);
+            assert_eq!(result.data.unwrap().canonical_route, format!("#/c/{ID}"));
+        }
+        let missing = crate::commands::conversation_resolve_legacy_id_inner(
+            &service,
+            serde_json::json!({"sourceKind":"legacyStorageKey","value":"missing"}),
+        );
+        assert_eq!(missing.code.as_deref(), Some("CONVERSATION_NOT_FOUND"));
+
+        let item = seed_recovery(&repository);
+        let result = crate::commands::conversation_recovery_resolve_inner(
+            &service,
+            serde_json::json!({
+                "recoveryId":item.recovery_id,
+                "expectedRevision":item.revision,
+                "action":"inspect",
+                "payload":{}
+            }),
+        )
+        .await;
+        assert!(result.success, "inspect: {:?}", result.error);
+        let result = result.data.unwrap();
+        assert_eq!(serde_json::to_value(result.action).unwrap(), "inspect");
+        assert_eq!(result.source_paths, item.source_paths);
+        assert_eq!(result.source_sha256, item.source_sha256);
+        assert_eq!(
+            service.host_status().unwrap().state,
+            ConversationHostState::Recovery
+        );
+
+        let associated = crate::commands::conversation_recovery_resolve_inner(
+            &service,
+            serde_json::json!({
+                "recoveryId":item.recovery_id,
+                "expectedRevision":item.revision,
+                "idempotencyKey":"21aee10a-56b8-4624-a5e7-586c25dc8d1f",
+                "action":"associateConversation",
+                "payload":{"conversationId":ID}
+            }),
+        )
+        .await;
+        assert!(associated.success, "associate: {:?}", associated.error);
+        assert_eq!(
+            service.host_status().unwrap().state,
+            ConversationHostState::Ready
+        );
+    }
+
+    #[test]
+    fn duplicate_legacy_mappings_are_ambiguous_and_hybrid_mutation_is_read_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap().join("conversations/v2");
+        let (repository, _) = ConversationRepository::open(root).unwrap();
+        let reader = Arc::new(ConversationReader::new(
+            Arc::clone(&repository),
+            LegacyConversationReader::default(),
+            ReaderPrecedence::HybridLegacyFirst,
+        ));
+        let id = ConversationId::parse(ID).unwrap();
+        let other = ConversationId::new_v4();
+        let entries = [id, other]
+            .into_iter()
+            .map(|conversation_id| MigrationMapEntryV1 {
+                source_key: format!("legacy_host_session:0:{conversation_id}"),
+                legacy_storage_key: Some("duplicate".to_string()),
+                legacy_agent_session_id: None,
+                conversation_id,
+                identity_decision: IdentityDecision::AllocatedCollisionUuid,
+                created_at_source: Some(CreatedAtSource::HostMetadata),
+                source_record_sha256: "a".repeat(64),
+            })
+            .collect();
+        let map = MigrationMapV1 {
+            schema_version: MIGRATION_MAP_SCHEMA_VERSION,
+            operation_id: Uuid::new_v4(),
+            entries,
+        };
+        let service = ConversationApplicationService::new(
+            reader,
+            Arc::new(SessionWorkspaceService::new(repository)),
+            &map,
+            MigrationHostMode::Standalone,
+            MigrationPhase::RolledBack,
+            ReaderPrecedence::HybridLegacyFirst,
+            0,
+        );
+        assert_eq!(
+            service
+                .resolve_legacy_conversation_id(LegacyConversationKey {
+                    source_kind: LegacyConversationSourceKind::LegacyStorageKey,
+                    value: "duplicate".to_string(),
+                })
+                .unwrap_err()
+                .code,
+            "LEGACY_ID_AMBIGUOUS"
+        );
+        assert_eq!(
+            service.ensure_writable(id).unwrap_err().code,
+            "LEGACY_COMPATIBILITY_READ_ONLY"
+        );
+    }
+}

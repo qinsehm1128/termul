@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { useEffect } from 'react'
 import { createHashRouter, RouterProvider } from 'react-router-dom'
 import { ChatRoute } from '@/components/ChatRoute'
+import { ConversationHostStatus } from '@/components/conversation/ConversationHostStatus'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import { GlobalContextMenu } from '@/components/GlobalContextMenu'
 import { Toaster as Sonner } from '@/components/ui/sonner'
@@ -22,6 +23,7 @@ import { useAcpSessionResume } from './hooks/use-acp-session-resume'
 import { useAppSettingsLoader } from './hooks/use-app-settings'
 import { useAppliedColorThemeSync } from './hooks/use-color-theme'
 import { useContextBarSettings } from './hooks/use-context-bar-settings'
+import { useConversationHostBootstrap } from './hooks/use-conversation-host-bootstrap'
 import { useConversationLifecycle } from './hooks/use-conversation-lifecycle'
 import { useCrashRecovery } from './hooks/use-crash-recovery'
 import { useCwd } from './hooks/use-cwd'
@@ -57,6 +59,7 @@ const queryClient = new QueryClient()
 function AppEffects(): null {
   useTerminalAutoSave()
   useSessionWorkspaceBootstrap()
+  useConversationHostBootstrap()
   useConversationLifecycle()
   useTerminalResourceLifecycle()
   useTerminalRestore()
@@ -155,6 +158,7 @@ export default function TauriApp(): React.JSX.Element {
         <GlobalContextMenu>
           <ErrorBoundary context="appRoot">
             <AppEffects />
+            <ConversationHostStatus />
             <Toaster />
             <Sonner />
             <RouterProvider router={router} future={{ v7_startTransition: true }} />
