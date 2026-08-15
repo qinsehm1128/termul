@@ -3705,7 +3705,22 @@ pub(crate) async fn sync_mcp_registry_to_project_file(
 /// open `SessionPersistence` at startup (degraded live-only mode); commands
 /// must treat absence as empty history, never crash.
 #[derive(Default)]
-pub struct HostHistoryStore(pub Option<Arc<crate::acp::SessionPersistence>>);
+pub struct HostHistoryStore {
+    pub conversation: Option<Arc<crate::conversation::ConversationPersistenceAdapter>>,
+    pub legacy_read_only: Option<Arc<crate::acp::SessionPersistence>>,
+}
+
+impl HostHistoryStore {
+    pub fn conversation(
+        adapter: Arc<crate::conversation::ConversationPersistenceAdapter>,
+        legacy_read_only: Option<Arc<crate::acp::SessionPersistence>>,
+    ) -> Self {
+        Self {
+            conversation: Some(adapter),
+            legacy_read_only,
+        }
+    }
+}
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -3753,13 +3768,20 @@ pub async fn acp_history_list(
     // The legacy flag still gates the renderer's one-time KV wipe migration;
     // the session list itself is host-owned now.
     let legacy_import_complete = store.list().1;
-    let sessions = match &host.0 {
-        Some(persistence) => persistence
+    let sessions = if let Some(persistence) = &host.conversation {
+        persistence
             .list_sessions()
             .into_iter()
             .map(host_entry_to_desktop)
-            .collect(),
-        None => Vec::new(),
+            .collect()
+    } else if let Some(persistence) = &host.legacy_read_only {
+        persistence
+            .list_sessions()
+            .into_iter()
+            .map(host_entry_to_desktop)
+            .collect()
+    } else {
+        Vec::new()
     };
     log::info!("[acp-history] list success sessions={}", sessions.len());
     Ok(IpcResult::success(DesktopChatHistoryList {
@@ -3775,32 +3797,22 @@ pub async fn acp_history_get(
 ) -> Result<IpcResult<Option<serde_json::Value>>, String> {
     let log_session_id = sanitize_log_field(&session_id);
     log::info!("[acp-history] get start session_id={}", log_session_id);
-    let Some(persistence) = host.0.as_ref().map(Arc::clone) else {
-        log::info!("[acp-history] get not_found session_id={}", log_session_id);
-        return Ok(IpcResult::success(None));
-    };
-    match persistence.session_payload_async(&session_id).await {
-        Ok(payload) => {
-            log::info!("[acp-history] get success session_id={}", log_session_id);
-            let value = serde_json::to_value(&payload).map_err(|error| error.to_string())?;
-            Ok(IpcResult::success(Some(value)))
-        }
-        Err(crate::acp::SessionPersistenceError::SessionNotFound) => {
-            log::info!("[acp-history] get not_found session_id={}", log_session_id);
-            Ok(IpcResult::success(None))
-        }
-        Err(error) => {
-            log::error!(
-                "[acp-history] get failure session_id={} error={}",
-                log_session_id,
-                error
-            );
-            Ok(IpcResult::error(
-                error.to_string(),
-                "ACP_HISTORY_GET_FAILED",
-            ))
-        }
+    if let Some(persistence) = &host.conversation {
+        return match persistence.legacy_materialization(&session_id) {
+            Ok((metadata, records)) => {
+                let payload =
+                    crate::acp::session_payload::materialize_session_payload(&metadata, &records);
+                let value = serde_json::to_value(&payload).map_err(|error| error.to_string())?;
+                Ok(IpcResult::success(Some(value)))
+            }
+            Err(error) if error.code == "CONVERSATION_NOT_FOUND" => Ok(IpcResult::success(None)),
+            Err(error) => Ok(IpcResult::error(
+                "failed to read Conversation history",
+                error.code,
+            )),
+        };
     }
+    Ok(IpcResult::success(None))
 }
 
 /// Legacy write path (renderer wipe-migration only). Live sessions are authored
@@ -3816,34 +3828,12 @@ pub async fn acp_history_save(
     host: State<'_, HostHistoryStore>,
     ws_relay: State<'_, Arc<crate::web::WsRelaySink>>,
 ) -> Result<IpcResult<()>, String> {
-    let log_session_id = sanitize_log_field(&session_id);
-    log::info!("[acp-history] save start session_id={}", log_session_id);
-    let task_store = store.inner().clone();
-    let task_id = session_id.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || task_store.save(&task_id, payload))
-        .await
-        .map_err(|error| error.to_string())?;
-    match result {
-        Ok(()) => {
-            if let Some(persistence) = &host.0 {
-                crate::acp::import_chat_history(persistence, store.inner()).await;
-            }
-            crate::web::broadcast_chat_history_changed(ws_relay.inner());
-            log::info!("[acp-history] save success session_id={}", log_session_id);
-            Ok(IpcResult::success(()))
-        }
-        Err(error) => {
-            log::error!(
-                "[acp-history] save failure session_id={} error={}",
-                log_session_id,
-                error
-            );
-            Ok(IpcResult::error(
-                error.to_string(),
-                "ACP_HISTORY_SAVE_FAILED",
-            ))
-        }
-    }
+    let _ = (session_id, payload, store, host, ws_relay);
+    log::warn!("[acp-history] legacy mutation rejected code=LEGACY_STORE_READ_ONLY");
+    Ok(IpcResult::error(
+        "legacy chat history is read-only after Conversation bootstrap",
+        "LEGACY_STORE_READ_ONLY",
+    ))
 }
 
 #[tauri::command]
@@ -3852,54 +3842,21 @@ pub async fn acp_history_delete(
     host: State<'_, HostHistoryStore>,
     ws_relay: State<'_, Arc<crate::web::WsRelaySink>>,
 ) -> Result<IpcResult<()>, String> {
-    let log_session_id = sanitize_log_field(&session_id);
-    log::info!("[acp-history] delete start session_id={}", log_session_id);
-    match &host.0 {
-        Some(persistence) => match persistence.delete_session(&session_id).await {
-            Ok(()) => {
-                crate::web::broadcast_chat_history_changed(ws_relay.inner());
-                log::info!("[acp-history] delete success session_id={}", log_session_id);
-                Ok(IpcResult::success(()))
-            }
-            Err(error) => {
-                log::error!(
-                    "[acp-history] delete failure session_id={} error={}",
-                    log_session_id,
-                    error
-                );
-                Ok(IpcResult::error(
-                    error.to_string(),
-                    "ACP_HISTORY_DELETE_FAILED",
-                ))
-            }
-        },
-        // Degraded live-only mode: there is no durable history to delete.
-        None => Ok(IpcResult::success(())),
-    }
+    let _ = (session_id, host, ws_relay);
+    log::warn!("[acp-history] legacy mutation rejected code=LEGACY_STORE_READ_ONLY");
+    Ok(IpcResult::error(
+        "legacy chat history is read-only after Conversation bootstrap",
+        "LEGACY_STORE_READ_ONLY",
+    ))
 }
 
 #[tauri::command]
 pub async fn acp_history_flush(
     store: State<'_, Arc<crate::acp::ChatHistoryStore>>,
 ) -> Result<IpcResult<()>, String> {
-    log::info!("[acp-history] flush start");
-    let task_store = store.inner().clone();
-    let result = tauri::async_runtime::spawn_blocking(move || task_store.flush())
-        .await
-        .map_err(|error| error.to_string())?;
-    match result {
-        Ok(()) => {
-            log::info!("[acp-history] flush success");
-            Ok(IpcResult::success(()))
-        }
-        Err(error) => {
-            log::error!("[acp-history] flush failure error={}", error);
-            Ok(IpcResult::error(
-                error.to_string(),
-                "ACP_HISTORY_FLUSH_FAILED",
-            ))
-        }
-    }
+    let _ = store;
+    log::info!("[acp-history] ConversationRepository appends are already durable");
+    Ok(IpcResult::success(()))
 }
 
 #[tauri::command]
@@ -3908,33 +3865,12 @@ pub async fn acp_history_mark_legacy_import_complete(
     host: State<'_, HostHistoryStore>,
     ws_relay: State<'_, Arc<crate::web::WsRelaySink>>,
 ) -> Result<IpcResult<()>, String> {
-    log::info!("[acp-history] legacy marker start");
-    let task_store = store.inner().clone();
-    let result =
-        tauri::async_runtime::spawn_blocking(move || task_store.mark_legacy_import_complete())
-            .await
-            .map_err(|error| error.to_string())?;
-    match result {
-        Ok(()) => {
-            // The wipe migration may just have written new legacy entries;
-            // converge the host store incrementally (idempotent).
-            if let Some(persistence) = &host.0 {
-                let imported = crate::acp::import_chat_history(persistence, store.inner()).await;
-                if imported > 0 {
-                    crate::web::broadcast_chat_history_changed(ws_relay.inner());
-                }
-            }
-            log::info!("[acp-history] legacy marker success");
-            Ok(IpcResult::success(()))
-        }
-        Err(error) => {
-            log::error!("[acp-history] legacy marker failure error={}", error);
-            Ok(IpcResult::error(
-                error.to_string(),
-                "ACP_HISTORY_MIGRATION_FAILED",
-            ))
-        }
-    }
+    let _ = (store, host, ws_relay);
+    log::warn!("[acp-history] legacy mutation rejected code=LEGACY_STORE_READ_ONLY");
+    Ok(IpcResult::error(
+        "legacy chat history is read-only after Conversation bootstrap",
+        "LEGACY_STORE_READ_ONLY",
+    ))
 }
 
 /// Legacy-store read used ONLY by the renderer's one-time KV wipe migration,

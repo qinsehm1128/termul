@@ -1,5 +1,6 @@
 //! Host-owned Conversation domain contracts and services.
 
+pub mod bootstrap;
 pub mod catalog;
 pub mod contracts;
 pub mod creation;
@@ -7,8 +8,12 @@ pub mod durable_fs;
 pub mod event_log;
 pub mod locator;
 pub mod migration;
+pub mod persistence_adapter;
 pub mod repository;
 
+pub use bootstrap::{
+    BootstrapError, BootstrapOutcome, ConversationBootstrap, HostConversationRoots,
+};
 pub use catalog::{
     rebuild_catalog, AcceptedCanonicalConversation, CatalogError, CatalogRebuildResult,
     CatalogRecoveryIssue, ConversationCatalogEntryV1, ConversationCatalogFileV1,
@@ -49,12 +54,14 @@ pub use locator::{
 };
 pub use migration::{
     advance_phase, recover_cutover, ActiveLayout, ApprovalReceiptV1, BootstrapObservationReceiptV1,
-    ConversationLayoutDescriptorV1, ConversationMigrationService, CutoverRecovery,
-    HostMigrationLock, HostMigrationLockGuard, MigrationAdmissionState, MigrationCallbacks,
-    MigrationContext, MigrationControlContext, MigrationError, MigrationErrorCode,
-    MigrationHostMode, MigrationJournalV1, MigrationPhase, MigrationReport, MigrationStepOutput,
+    ConversationLayoutDescriptorV1, ConversationMigrationService, ConversationReader,
+    CutoverRecovery, HostMigrationLock, HostMigrationLockGuard, LegacyConversationProjection,
+    LegacyConversationReader, MigrationAdmissionState, MigrationCallbacks, MigrationContext,
+    MigrationControlContext, MigrationError, MigrationErrorCode, MigrationHostMode,
+    MigrationJournalV1, MigrationPhase, MigrationReport, MigrationStepOutput,
     ObservationEvidenceV1, ReaderPrecedence, StepReceiptV1,
 };
+pub use persistence_adapter::{ConversationPersistenceAdapter, ConversationPersistenceError};
 pub use repository::{
     ConversationMetadataUpdate, ConversationRepository, RepositoryError, RepositoryOpenReport,
     RepositoryRecoveryItem, RepositoryRecoveryKind,

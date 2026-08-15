@@ -57,6 +57,11 @@ use crate::acp::session_persistence::{
     is_protected_title_source, normalize_title, PersistedSessionStatus, SessionPersistence,
     SessionRegistration, TitleSource,
 };
+use crate::conversation::{
+    AgentBindingResult, ConversationCreationService, ConversationId,
+    ConversationPersistenceAdapter, ExecutionTarget, PrepareConversationRequest, ProjectAttachment,
+    PROJECT_ATTACHMENT_SCHEMA_VERSION,
+};
 use crate::web::EventSink;
 
 /// How long to wait for the agent to answer `initialize` before treating the
@@ -516,6 +521,13 @@ where
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewSessionOutcome {
+    pub persistence: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<ConversationId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_cwd: Option<String>,
     pub session_id: SessionId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modes: Option<agent_client_protocol::schema::v1::SessionModeState>,
@@ -530,6 +542,9 @@ pub struct NewSessionOutcome {
 pub struct SessionCreationContext {
     pub project_id: Option<String>,
     pub ephemeral: bool,
+    pub conversation_id: Option<ConversationId>,
+    pub project_attachment: Option<ProjectAttachment>,
+    pub execution_target: Option<ExecutionTarget>,
     /// Worktree path the agent runs in (CAP-3). When set, the durable record
     /// carries it so relaunch reattaches without a second `git worktree add`
     /// and the chat indicator (CAP-6) survives reload. State isolation still
@@ -622,6 +637,7 @@ enum AcpCommand {
         ephemeral: bool,
         worktree_path: Option<String>,
         worktree_branch: Option<String>,
+        binding_gate: Option<watch::Receiver<Option<Result<(), String>>>>,
         reply: oneshot::Sender<Result<NewSessionOutcome, String>>,
     },
     LoadSession {
@@ -782,6 +798,8 @@ pub struct AcpManager {
     sinks: Vec<Arc<dyn EventSink>>,
     agents: Arc<Mutex<HashMap<AgentId, AgentEntry>>>,
     persistence: Option<Arc<SessionPersistence>>,
+    conversation_creation: Option<Arc<ConversationCreationService>>,
+    conversation_persistence: Option<Arc<ConversationPersistenceAdapter>>,
     /// Per-agent "warmup done" guard for the first-prompt cold-start
     /// workaround (pi-acp issue #94). A visibility-churn re-entry of
     /// `NewSession` for an agent whose warmup already completed (or is still
@@ -874,6 +892,8 @@ impl AcpManager {
             sinks,
             agents: Arc::new(Mutex::new(HashMap::new())),
             persistence: None,
+            conversation_creation: None,
+            conversation_persistence: None,
             warmup_done: Arc::new(Mutex::new(HashSet::new())),
             host_plan_server,
         }
@@ -893,6 +913,28 @@ impl AcpManager {
             sinks,
             agents: Arc::new(Mutex::new(HashMap::new())),
             persistence: Some(persistence),
+            conversation_creation: None,
+            conversation_persistence: None,
+            warmup_done: Arc::new(Mutex::new(HashSet::new())),
+            host_plan_server,
+        }
+    }
+
+    /// Create a manager backed exclusively by the canonical Conversation repository.
+    #[must_use]
+    pub fn with_conversation_services(
+        sinks: Vec<Arc<dyn EventSink>>,
+        creation: Arc<ConversationCreationService>,
+        persistence: Arc<ConversationPersistenceAdapter>,
+    ) -> Self {
+        let host_plan_server =
+            crate::acp::host_mcp::parent::HostPlanServer::start(sinks.clone(), None);
+        Self {
+            sinks,
+            agents: Arc::new(Mutex::new(HashMap::new())),
+            persistence: None,
+            conversation_creation: Some(creation),
+            conversation_persistence: Some(persistence),
             warmup_done: Arc::new(Mutex::new(HashSet::new())),
             host_plan_server,
         }
@@ -1114,20 +1156,77 @@ impl AcpManager {
             .map(|entry| (entry.capabilities.clone(), entry.stable_namespace.clone()))
             .ok_or_else(|| format!("unknown agent: {agent_id}"))?;
 
-        // Host-injected `plan` MCP tool: prepend a self-spawned stdio
-        // child to every non-ephemeral session's mcp_servers so the agent
-        // discovers + calls it as a first-class tool (see `host_mcp::mod` +
-        // spec `spec-acp-host-todo-plan-tool.md`). The real ACP session_id
-        // isn't known until the response, so register with a provisional id
-        // now + bind after `session/new` returns. If session creation fails,
-        // evict the token so it doesn't leak (CodeRabbit #6).
+        let mut prepared = None;
+        let mut binding_gate_tx = None;
+        let mut binding_gate_rx = None;
+        let execution_cwd = if context.ephemeral {
+            cwd.clone()
+        } else if let Some(creation) = &self.conversation_creation {
+            let execution_target = context.execution_target.clone().unwrap_or_else(|| {
+                if let (Some(project_id), Some(worktree_path), Some(worktree_branch)) = (
+                    context.project_id.clone(),
+                    context.worktree_path.clone(),
+                    context.worktree_branch.clone(),
+                ) {
+                    ExecutionTarget::Worktree {
+                        project_id,
+                        worktree_path,
+                        worktree_branch,
+                    }
+                } else if let Some(project_id) = context.project_id.clone() {
+                    ExecutionTarget::ProjectRoot {
+                        project_id,
+                        project_root: cwd.clone(),
+                    }
+                } else {
+                    ExecutionTarget::Workspace
+                }
+            });
+            let project_attachment = context.project_attachment.clone().or_else(|| {
+                context
+                    .project_id
+                    .clone()
+                    .map(|project_id| ProjectAttachment {
+                        schema_version: PROJECT_ATTACHMENT_SCHEMA_VERSION,
+                        project_id,
+                        attached_at_utc: chrono::Utc::now(),
+                        project_path_snapshot: cwd.clone(),
+                        worktree_path: context.worktree_path.clone(),
+                        worktree_branch: context.worktree_branch.clone(),
+                    })
+            });
+            let request = PrepareConversationRequest {
+                schema_version: crate::conversation::PREPARE_CONVERSATION_SCHEMA_VERSION,
+                conversation_id: context.conversation_id,
+                project_attachment,
+                execution_target,
+            };
+            let value = creation
+                .prepare_conversation(request)
+                .await
+                .map_err(|error| error.to_string())?;
+            log::info!(
+                "[conversation-creation] prepared before ACP conversation_id={}",
+                value.conversation_id
+            );
+            let (tx, rx) = watch::channel(None);
+            binding_gate_tx = Some(tx);
+            binding_gate_rx = Some(rx);
+            let execution_cwd = value.execution_cwd.clone();
+            prepared = Some(value);
+            execution_cwd
+        } else {
+            return Err("CONVERSATION_BOOTSTRAP_REQUIRED: non-ephemeral creation has no ConversationCreationService".to_string());
+        };
+
+        // Host-injected `plan` MCP tool: prepend a self-spawned stdio child to every
+        // non-ephemeral session. The provisional token is rebound after durable binding.
         let (combined_mcp_servers, plan_token): (Vec<McpServer>, Option<String>) = if !context
             .ephemeral
         {
             let (port, token, provisional_sid) =
                 self.host_plan_server.register_session(&agent_id.0);
             let internal = build_internal_plan_stdio(&agent_id.0, port, &token, &provisional_sid);
-            // Prepend so the internal server is first in the agent's tool list.
             let mut combined = internal;
             combined.extend(mcp_servers);
             (combined, Some(token))
@@ -1135,11 +1234,14 @@ impl AcpManager {
             (mcp_servers, None)
         };
 
+        let stable_for_binding = stable_agent_namespace
+            .clone()
+            .unwrap_or_else(|| agent_id.0.clone());
         let outcome = async {
             gate_mcp_servers(&caps, &combined_mcp_servers)?;
             let tx = self.command_tx(agent_id)?;
             send_command(&tx, |reply| AcpCommand::NewSession {
-                cwd,
+                cwd: execution_cwd,
                 mcp_servers: combined_mcp_servers,
                 stable_agent_namespace,
                 runtime_agent_id: agent_id.0.clone(),
@@ -1147,6 +1249,7 @@ impl AcpManager {
                 ephemeral: context.ephemeral,
                 worktree_path: context.worktree_path,
                 worktree_branch: context.worktree_branch,
+                binding_gate: binding_gate_rx,
                 reply,
             })
             .await
@@ -1154,23 +1257,81 @@ impl AcpManager {
         .await;
 
         match outcome {
-            Ok(outcome) => {
-                // Bind the real session_id to the plan token so the parent can
-                // emit plan_update for the right session when the agent calls
-                // plan.
+            Ok(mut outcome) => {
+                if let Some(prepared) = prepared {
+                    let bind_result = self
+                        .conversation_creation
+                        .as_ref()
+                        .expect("prepared only when creation service exists")
+                        .complete_agent_binding(
+                            prepared.conversation_id,
+                            AgentBindingResult {
+                                agent_session_id: outcome.session_id.0.clone(),
+                                runtime_agent_id: agent_id.0.clone(),
+                                stable_agent_namespace: stable_for_binding,
+                            },
+                        )
+                        .await;
+                    match bind_result {
+                        Ok(_) => {
+                            if let Some(adapter) = &self.conversation_persistence {
+                                adapter.register_binding(
+                                    &outcome.session_id.0,
+                                    prepared.conversation_id,
+                                );
+                            }
+                            if let Some(tx) = binding_gate_tx {
+                                let _ = tx.send(Some(Ok(())));
+                            }
+                            outcome.persistence = "conversation";
+                            outcome.conversation_id = Some(prepared.conversation_id);
+                            outcome.workspace_cwd = Some(prepared.workspace_cwd);
+                            outcome.execution_cwd = Some(prepared.execution_cwd);
+                            log::info!(
+                                "[conversation-creation] binding durable conversation_id={}",
+                                prepared.conversation_id
+                            );
+                        }
+                        Err(error) => {
+                            if let Some(tx) = binding_gate_tx {
+                                let _ = tx.send(Some(Err("CONVERSATION_BIND_FAILED".to_string())));
+                            }
+                            let _ = self
+                                .close_session(agent_id, outcome.session_id.clone())
+                                .await;
+                            log::error!(
+                                "[conversation-creation] binding durability failed conversation_id={}",
+                                prepared.conversation_id
+                            );
+                            return Err(format!("CONVERSATION_BIND_FAILED: {error}"));
+                        }
+                    }
+                }
                 if let Some(token) = plan_token {
                     self.host_plan_server
                         .bind_session(&token, &outcome.session_id.0);
                 }
                 Ok(outcome)
             }
-            Err(e) => {
-                // Evict the registered token on failure so it doesn't leak +
-                // the provisional id can't be reused by a later session.
+            Err(error) => {
+                if let Some(prepared) = prepared {
+                    if let Some(creation) = &self.conversation_creation {
+                        let _ = creation
+                            .record_agent_creation_failure(
+                                prepared.conversation_id,
+                                "ACP_SESSION_NEW_FAILED",
+                                "agent session creation failed",
+                            )
+                            .await;
+                    }
+                    if let Some(tx) = binding_gate_tx {
+                        let _ = tx.send(Some(Err("ACP_SESSION_NEW_FAILED".to_string())));
+                    }
+                }
                 if let Some(token) = plan_token {
                     self.host_plan_server.unregister_by_token(&token);
                 }
-                Err(e)
+                Err(error)
             }
         }
     }
@@ -1548,6 +1709,62 @@ impl AcpManager {
                 .map_err(|error| error.to_string())?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_agent_for_new_session(
+        &self,
+        agent_id: AgentId,
+        observed: std::sync::mpsc::SyncSender<(String, bool)>,
+    ) {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(command) = command_rx.recv().await {
+                match command {
+                    AcpCommand::NewSession {
+                        cwd,
+                        ephemeral,
+                        mut binding_gate,
+                        reply,
+                        ..
+                    } => {
+                        let exists = PathBuf::from(&cwd).is_dir();
+                        let _ = observed.send((cwd.clone(), exists));
+                        let _ = reply.send(Ok(NewSessionOutcome {
+                            persistence: if ephemeral {
+                                "ephemeral"
+                            } else {
+                                "conversation"
+                            },
+                            conversation_id: None,
+                            workspace_cwd: None,
+                            execution_cwd: None,
+                            session_id: SessionId::new("opaque/fake-session"),
+                            modes: None,
+                            models: None,
+                            config_options: None,
+                        }));
+                        if let Some(gate) = binding_gate.as_mut() {
+                            while gate.borrow().is_none() && gate.changed().await.is_ok() {}
+                        }
+                    }
+                    AcpCommand::CloseSession { reply, .. } => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    _ => {}
+                }
+            }
+        });
+        self.agents.lock().insert(
+            agent_id,
+            AgentEntry {
+                command_tx,
+                capabilities: AgentCapabilities::default(),
+                stable_namespace: Some("config:test".to_string()),
+                join_handle: None,
+                killed: Arc::new(AtomicBool::new(false)),
+            },
+        );
     }
 
     #[cfg(test)]
@@ -2636,6 +2853,7 @@ async fn run_command_loop(
                 ephemeral,
                 worktree_path,
                 worktree_branch,
+                mut binding_gate,
                 reply,
             } => {
                 let slot = reply_slot(reply);
@@ -2841,8 +3059,15 @@ async fn run_command_loop(
                                     .set_model_config_id(session_id.0.clone(), id);
                             }
 
-                            let event = SessionCreatedEvent {
-                                agent_id: req_agent_id,
+                            let outcome = NewSessionOutcome {
+                                persistence: if ephemeral {
+                                    "ephemeral"
+                                } else {
+                                    "conversation"
+                                },
+                                conversation_id: None,
+                                workspace_cwd: None,
+                                execution_cwd: None,
                                 session_id: session_id.clone(),
                                 modes: response.modes.clone(),
                                 models: events::models_from_config_options(
@@ -2850,22 +3075,43 @@ async fn run_command_loop(
                                 ),
                                 config_options: response.config_options.clone(),
                             };
+                            // Return the opaque ACP response to the manager, then hold the
+                            // renderer-visible success event until the manager has durably bound
+                            // it to the pre-created Conversation.
+                            send_reply(&task_slot, Ok(outcome));
+                            if let Some(gate) = binding_gate.as_mut() {
+                                loop {
+                                    if let Some(result) = gate.borrow().clone() {
+                                        if let Err(error) = result {
+                                            log::error!(
+                                                "[conversation-creation] session-created event suppressed code={error}"
+                                            );
+                                            return;
+                                        }
+                                        break;
+                                    }
+                                    if gate.changed().await.is_err() {
+                                        log::error!(
+                                            "[conversation-creation] binding gate dropped before durable bind"
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                            let event = SessionCreatedEvent {
+                                agent_id: req_agent_id,
+                                session_id,
+                                modes: response.modes,
+                                models: events::models_from_config_options(
+                                    response.config_options.as_deref(),
+                                ),
+                                config_options: response.config_options,
+                            };
                             events::fan_out(
                                 &req_sinks,
                                 Some(event.session_id.0.as_str()),
                                 events::EVENT_SESSION_CREATED,
                                 &event,
-                            );
-                            send_reply(
-                                &task_slot,
-                                Ok(NewSessionOutcome {
-                                    session_id,
-                                    modes: response.modes,
-                                    models: events::models_from_config_options(
-                                        response.config_options.as_deref(),
-                                    ),
-                                    config_options: response.config_options,
-                                }),
                             );
                         }
                         Ok(Err(e)) => send_reply(&task_slot, Err(e.to_string())),

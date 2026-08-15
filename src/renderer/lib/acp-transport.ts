@@ -44,6 +44,7 @@ import type {
   ListSessionsResponse,
   McpServer,
   McpServerConfig,
+  NewSessionOptions,
   NewSessionOutcome,
   ProbeResult,
   SessionConfigOption,
@@ -128,13 +129,7 @@ export interface AcpTransport {
     agentId: AgentId,
     cwd: string,
     mcpServers?: McpServer[],
-    options?: {
-      ephemeral?: boolean
-      projectId?: string
-      /** Worktree path + branch (CAP-3) — desktop-only; ignored on the WS path. */
-      worktreePath?: string
-      worktreeBranch?: string
-    }
+    options?: NewSessionOptions
   ): Promise<NewSessionOutcome>
   loadSession(agentId: AgentId, sessionId: SessionId, cwd: string): Promise<SessionReopenOutcome>
   resumeSession(agentId: AgentId, sessionId: SessionId, cwd: string): Promise<SessionReopenOutcome>
@@ -265,16 +260,32 @@ function createTauriAcpTransport(): AcpTransport {
       await invoke('acp_kill_agent', { agentId })
     },
     listAgents: () => invoke<AgentId[]>('acp_list_agents'),
-    newSession: (agentId, cwd, mcpServers, options) =>
-      invoke<NewSessionOutcome>('acp_new_session', {
+    newSession: (agentId, cwd, mcpServers, options) => {
+      const executionTarget =
+        options?.executionTarget ??
+        (options?.projectId && options.worktreePath && options.worktreeBranch
+          ? {
+              kind: 'worktree' as const,
+              projectId: options.projectId,
+              worktreePath: options.worktreePath,
+              worktreeBranch: options.worktreeBranch
+            }
+          : options?.projectId
+            ? { kind: 'project_root' as const, projectId: options.projectId, projectRoot: cwd }
+            : { kind: 'workspace' as const })
+      return invoke<NewSessionOutcome>('acp_new_session', {
         agentId,
         cwd,
         mcpServers,
         ...(options?.ephemeral ? { ephemeral: true } : {}),
         ...(options?.projectId ? { projectId: options.projectId } : {}),
         ...(options?.worktreePath ? { worktreePath: options.worktreePath } : {}),
-        ...(options?.worktreeBranch ? { worktreeBranch: options.worktreeBranch } : {})
-      }),
+        ...(options?.worktreeBranch ? { worktreeBranch: options.worktreeBranch } : {}),
+        ...(options?.conversationId ? { conversationId: options.conversationId } : {}),
+        ...(options?.projectAttachment ? { projectAttachment: options.projectAttachment } : {}),
+        ...(!options?.ephemeral ? { executionTarget } : {})
+      })
+    },
     loadSession: (agentId, sessionId, cwd) =>
       invoke<SessionReopenOutcome>('acp_load_session', { agentId, sessionId, cwd }),
     resumeSession: (agentId, sessionId, cwd) =>
@@ -812,22 +823,32 @@ export class WsAcpTransport implements AcpTransport {
     agentId: AgentId,
     cwd: string,
     mcpServers?: McpServer[],
-    options?: {
-      ephemeral?: boolean
-      projectId?: string
-      worktreePath?: string
-      worktreeBranch?: string
-    }
+    options?: NewSessionOptions
   ): Promise<NewSessionOutcome> {
     // Web/remote: the host attributes the session to a project by resolving
     // `cwd` against its registry (CAP-2), so no explicit projectId is sent.
     // Worktree fields are desktop-only (CAP-3) and ignored on the WS path —
     // the host-owned durable record keys state isolation on `cwd` regardless.
+    const executionTarget =
+      options?.executionTarget ??
+      (options?.projectId && options.worktreePath && options.worktreeBranch
+        ? {
+            kind: 'worktree' as const,
+            projectId: options.projectId,
+            worktreePath: options.worktreePath,
+            worktreeBranch: options.worktreeBranch
+          }
+        : options?.projectId
+          ? { kind: 'project_root' as const, projectId: options.projectId, projectRoot: cwd }
+          : { kind: 'workspace' as const })
     const outcome = await this.request<NewSessionOutcome>('create_session', {
       agentId,
       cwd,
       mcpServers,
-      ephemeral: options?.ephemeral ?? false
+      ephemeral: options?.ephemeral ?? false,
+      ...(options?.conversationId ? { conversationId: options.conversationId } : {}),
+      ...(options?.projectAttachment ? { projectAttachment: options.projectAttachment } : {}),
+      ...(!options?.ephemeral ? { executionTarget } : {})
     })
     if (outcome?.sessionId && !options?.ephemeral) {
       await this.subscribeSession(outcome.sessionId, null)

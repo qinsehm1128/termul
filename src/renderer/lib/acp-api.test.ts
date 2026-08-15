@@ -54,7 +54,37 @@ describe('acp-api command wrappers (Tauri transport)', () => {
     expect(invoke).toHaveBeenCalledWith('acp_new_session', {
       agentId: 'agent-1',
       cwd: '/home/user',
-      mcpServers: [{ type: 'stdio', name: 'fs', command: 'npx' }]
+      mcpServers: [{ type: 'stdio', name: 'fs', command: 'npx' }],
+      executionTarget: { kind: 'workspace' }
+    })
+  })
+
+  it('acpNewSession forwards retry, attachment, and explicit target fields', async () => {
+    ;(invoke as ReturnType<typeof vi.fn>).mockResolvedValue({
+      persistence: 'conversation',
+      conversationId: '11111111-1111-4111-8111-111111111111',
+      workspaceCwd: '/visible/session',
+      executionCwd: '/project',
+      sessionId: 's1'
+    })
+    const projectAttachment = {
+      schemaVersion: 1 as const,
+      projectId: 'p1',
+      attachedAtUtc: '2026-08-16T10:00:00.000Z',
+      projectPathSnapshot: '/project'
+    }
+    await acpNewSession('agent-1', '/ignored', undefined, {
+      conversationId: '11111111-1111-4111-8111-111111111111',
+      projectAttachment,
+      executionTarget: { kind: 'project_root', projectId: 'p1', projectRoot: '/project' }
+    })
+    expect(invoke).toHaveBeenCalledWith('acp_new_session', {
+      agentId: 'agent-1',
+      cwd: '/ignored',
+      mcpServers: undefined,
+      conversationId: '11111111-1111-4111-8111-111111111111',
+      projectAttachment,
+      executionTarget: { kind: 'project_root', projectId: 'p1', projectRoot: '/project' }
     })
   })
 

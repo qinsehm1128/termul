@@ -172,17 +172,32 @@ class FakeWebSocket {
       return
     }
     if (req.type === 'create_session') {
-      // Story 1.8 AC3 chat-flow test: reply with a NewSessionOutcome + echo the
-      // client-subscribed session id. Tests assert the transport resolves the
-      // promise with the session id.
-      const payload = req.payload as { agentId: string; cwd: string }
+      // Story 1.8 AC3 chat-flow test: reply with the same discriminated
+      // NewSessionOutcome used by the Tauri command.
+      const payload = req.payload as { agentId: string; cwd: string; ephemeral?: boolean }
       const sessionId = 'sess-chatflow'
       this.emitReply({
         id: req.id,
         ok: true,
-        payload: { sessionId, modes: null, models: null, configOptions: null }
+        payload: payload.ephemeral
+          ? {
+              persistence: 'ephemeral',
+              sessionId,
+              modes: null,
+              models: null,
+              configOptions: null
+            }
+          : {
+              persistence: 'conversation',
+              conversationId: '11111111-1111-4111-8111-111111111111',
+              workspaceCwd: '/visible/Termul/sessions/2026/08/16/conversation',
+              executionCwd: payload.cwd,
+              sessionId,
+              modes: null,
+              models: null,
+              configOptions: null
+            }
       })
-      void payload
       return
     }
     if (req.type === 'dispose_ephemeral_session') {
@@ -1196,6 +1211,80 @@ describe('WsAcpTransport', () => {
     }
     expect(frame.type).toBe('send_prompt')
     expect(frame.payload.turnId).toEqual(expect.any(String))
+    transport.dispose()
+  })
+
+  it('sends project-less Conversation creation with Tauri-parity fields over WS', async () => {
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+    const projectAttachment = {
+      schemaVersion: 1 as const,
+      projectId: 'project-1',
+      attachedAtUtc: '2026-08-16T10:00:00.000Z',
+      projectPathSnapshot: '/project'
+    }
+
+    const outcome = await transport.newSession('a1', '/project', undefined, {
+      conversationId: '11111111-1111-4111-8111-111111111111',
+      projectAttachment,
+      executionTarget: {
+        kind: 'worktree',
+        projectId: 'project-1',
+        worktreePath: '/project-worktree',
+        worktreeBranch: 'chat/example'
+      }
+    })
+    expect(outcome).toMatchObject({
+      persistence: 'conversation',
+      conversationId: '11111111-1111-4111-8111-111111111111',
+      sessionId: 'sess-chatflow'
+    })
+    const frames = sock.sent.map((raw) => JSON.parse(raw) as { type: string; payload: unknown })
+    expect(frames).toContainEqual({
+      id: expect.any(String),
+      type: 'create_session',
+      payload: {
+        agentId: 'a1',
+        cwd: '/project',
+        conversationId: '11111111-1111-4111-8111-111111111111',
+        ephemeral: false,
+        executionTarget: {
+          kind: 'worktree',
+          projectId: 'project-1',
+          worktreePath: '/project-worktree',
+          worktreeBranch: 'chat/example'
+        },
+        mcpServers: undefined,
+        projectAttachment
+      }
+    })
+    transport.dispose()
+  })
+
+  it('omits projectId for a project-less workspace Conversation request', async () => {
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+
+    await transport.newSession('a1', '/legacy-cwd')
+    const frame = sock.sent
+      .map((raw) => JSON.parse(raw) as { type: string; payload: Record<string, unknown> })
+      .find((candidate) => candidate.type === 'create_session')
+    expect(frame?.payload).toEqual({
+      agentId: 'a1',
+      cwd: '/legacy-cwd',
+      mcpServers: undefined,
+      ephemeral: false,
+      executionTarget: { kind: 'workspace' }
+    })
+    expect(frame?.payload).not.toHaveProperty('projectId')
     transport.dispose()
   })
 

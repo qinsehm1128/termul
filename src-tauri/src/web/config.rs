@@ -176,6 +176,9 @@ pub struct ServerConfig {
     pub projects_file: Option<PathBuf>,
     /// Standalone-only durable session root. Desktop shared-live uses `None`.
     pub sessions_dir: Option<PathBuf>,
+    /// Standalone visible Conversation workspace base. CLI wins over the environment; when
+    /// neither is set this is `<project_root>/Termul`.
+    pub conversation_workspace_root: PathBuf,
     /// CAP-5 / Story 5: workspace-manifests root override. `None` means
     /// "use `<service_account_state_dir>/workspace-manifests`" — the
     /// standalone binary resolves this in `server_main.rs` so the
@@ -224,7 +227,13 @@ impl ServerConfig {
     /// relative `./termul` dir (CWD-dependent, unbounded). A truly unset env
     /// var falls through to the next branch; an empty-string env var now
     /// behaves the same way (the next branch or the temp-dir fallback).
+    /// Resolve the standalone visible Conversation workspace base. CLI wins over the
+    /// environment, which wins over `<project_root>/Termul`.
     #[must_use]
+    pub fn conversation_workspace_root(&self) -> PathBuf {
+        self.conversation_workspace_root.clone()
+    }
+
     pub fn service_account_state_dir(&self) -> PathBuf {
         #[cfg(unix)]
         {
@@ -281,6 +290,7 @@ impl ServerConfig {
         // optional $TERMUL_PROJECTS_FILE env var is honored after the loop.
         let mut projects_file: Option<PathBuf> = None;
         let mut sessions_dir: Option<PathBuf> = None;
+        let mut conversation_workspace_root: Option<PathBuf> = None;
         // CAP-5 / Story 5: workspace-manifests root override. `None` means
         // "resolve <state dir>/workspace-manifests at startup" in
         // `server_main.rs`. Parsed but NOT validated against the filesystem
@@ -410,11 +420,24 @@ impl ServerConfig {
                     }
                     sessions_dir = Some(PathBuf::from(trimmed));
                 }
-                "--workspace-manifests-dir" => {
+                "--conversation-workspace-root" => {
                     let value = iter.next().ok_or_else(|| {
                         ParseCliError::Message(
-                            "missing value for --workspace-manifests-dir".into(),
+                            "missing value for --conversation-workspace-root".into(),
                         )
+                    })?;
+                    let trimmed = value.as_ref().trim();
+                    if trimmed.is_empty() {
+                        return Err(ParseCliError::Message(
+                            "invalid --conversation-workspace-root '': must be a non-empty path"
+                                .into(),
+                        ));
+                    }
+                    conversation_workspace_root = Some(PathBuf::from(trimmed));
+                }
+                "--workspace-manifests-dir" => {
+                    let value = iter.next().ok_or_else(|| {
+                        ParseCliError::Message("missing value for --workspace-manifests-dir".into())
                     })?;
                     let trimmed = value.as_ref().trim();
                     if trimmed.is_empty() {
@@ -426,9 +449,7 @@ impl ServerConfig {
                 }
                 "--acp-catalog-dir" => {
                     let value = iter.next().ok_or_else(|| {
-                        ParseCliError::Message(
-                            "missing value for --acp-catalog-dir".into(),
-                        )
+                        ParseCliError::Message("missing value for --acp-catalog-dir".into())
                     })?;
                     let trimmed = value.as_ref().trim();
                     if trimmed.is_empty() {
@@ -511,6 +532,15 @@ impl ServerConfig {
             )));
         }
 
+        let conversation_workspace_root = conversation_workspace_root
+            .or_else(|| {
+                std::env::var("TERMUL_CONVERSATION_WORKSPACE_ROOT")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(PathBuf::from)
+            })
+            .unwrap_or_else(|| project_root.join("Termul"));
+
         Ok(Self {
             host,
             port,
@@ -520,6 +550,7 @@ impl ServerConfig {
             project_root,
             projects_file,
             sessions_dir: Some(sessions_dir),
+            conversation_workspace_root,
             workspace_manifests_dir,
             acp_catalog_dir,
         })
@@ -645,6 +676,7 @@ mod tests {
             project_root: PathBuf::from("/tmp"),
             projects_file: None,
             sessions_dir: None,
+            conversation_workspace_root: PathBuf::from("/tmp/Termul"),
             workspace_manifests_dir: None,
             acp_catalog_dir: None,
         };
@@ -662,6 +694,7 @@ mod tests {
             project_root: PathBuf::from("/tmp"),
             projects_file: None,
             sessions_dir: None,
+            conversation_workspace_root: PathBuf::from("/tmp/Termul"),
             workspace_manifests_dir: None,
             acp_catalog_dir: None,
         };
@@ -771,8 +804,7 @@ mod tests {
 
     #[test]
     fn from_args_accepts_permission_reconnect_grace() {
-        let cfg = ServerConfig::from_args(["--permission-reconnect-grace", "20"])
-            .expect("parse");
+        let cfg = ServerConfig::from_args(["--permission-reconnect-grace", "20"]).expect("parse");
         assert_eq!(cfg.permission_reconnect_grace_secs, 20);
     }
 
@@ -828,12 +860,39 @@ mod tests {
     // empty-value tests (mirrors the `--permission-timeout` test pattern).
 
     #[test]
-    fn from_args_accepts_workspace_manifests_dir() {
+    fn from_args_accepts_conversation_workspace_root() {
         let cfg = ServerConfig::from_args([
-            "--workspace-manifests-dir",
-            "/var/lib/termul/manifests",
+            "--conversation-workspace-root",
+            "/var/lib/termul/conversation-workspaces",
         ])
         .expect("parse");
+        assert_eq!(
+            cfg.conversation_workspace_root,
+            PathBuf::from("/var/lib/termul/conversation-workspaces")
+        );
+    }
+
+    #[test]
+    fn from_args_missing_conversation_workspace_root_value() {
+        assert!(matches!(
+            ServerConfig::from_args(["--conversation-workspace-root"]),
+            Err(ParseCliError::Message(_))
+        ));
+    }
+
+    #[test]
+    fn from_args_rejects_empty_conversation_workspace_root() {
+        assert!(matches!(
+            ServerConfig::from_args(["--conversation-workspace-root", ""]),
+            Err(ParseCliError::Message(_))
+        ));
+    }
+
+    #[test]
+    fn from_args_accepts_workspace_manifests_dir() {
+        let cfg =
+            ServerConfig::from_args(["--workspace-manifests-dir", "/var/lib/termul/manifests"])
+                .expect("parse");
         assert_eq!(
             cfg.workspace_manifests_dir,
             Some(PathBuf::from("/var/lib/termul/manifests"))
@@ -873,6 +932,7 @@ mod tests {
             project_root: PathBuf::from("/tmp"),
             projects_file: None,
             sessions_dir: None,
+            conversation_workspace_root: PathBuf::from("/tmp/Termul"),
             workspace_manifests_dir: None,
             acp_catalog_dir: None,
         };

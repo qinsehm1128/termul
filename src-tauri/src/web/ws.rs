@@ -1165,8 +1165,9 @@ async fn handle_list_persisted_sessions(
             "persisted history is unavailable",
         );
     }
-    // Host-owned history (CAP-2): both desktop shared-live and the standalone
-    // server serve the file-backed `SessionPersistence` index.
+    if let Some(persistence) = relay.conversation_persistence() {
+        return ok_with_payload(id, &persistence.list_sessions());
+    }
     match relay.persistence() {
         Some(persistence) => ok_with_payload(id, &persistence.list_sessions()),
         None => WsReply::err(
@@ -1211,11 +1212,30 @@ async fn handle_get_session_payload(
             )
         }
     };
-    // Host-owned history (CAP-2): materialize the renderer-shaped payload from
-    // the durable JSONL records (pure fold of `user_prompt` / `message_chunk`).
-    // `session_payload_async` flushes the writer queue first, so an active
-    // session reads every already-assigned seq; a finalized session is served
-    // read-only. Errors fail closed — never a fabricated empty payload.
+    if let Some(persistence) = relay.conversation_persistence() {
+        return match persistence.legacy_materialization(&parsed.session_id) {
+            Ok((metadata, records)) => {
+                let payload =
+                    crate::acp::session_payload::materialize_session_payload(&metadata, &records);
+                ok_with_payload(id, &payload)
+            }
+            Err(error) if error.code == "CONVERSATION_NOT_FOUND" => {
+                WsReply::err(id, WsErrorCode::NotFound, "session payload not found")
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "termul::web::ws",
+                    code = error.code,
+                    "get_session_payload: Conversation materialization failed"
+                );
+                WsReply::err(
+                    id,
+                    WsErrorCode::Unsupported,
+                    "failed to read session payload",
+                )
+            }
+        };
+    }
     match relay.persistence() {
         Some(persistence) => {
             match persistence.session_payload_async(&parsed.session_id).await {
@@ -1296,12 +1316,19 @@ async fn handle_recover_session_snapshot(
         match relay.subscribe_snapshot(&parsed.session_id).await {
             Ok(result) => result,
             Err(error) => {
-                if relay.persistence().is_some_and(|persistence| {
+                let conversation_missing =
+                    relay.conversation_persistence().is_some_and(|persistence| {
+                        persistence
+                            .conversation_id_for_session(&parsed.session_id)
+                            .is_none()
+                    });
+                let legacy_missing = relay.persistence().is_some_and(|persistence| {
                     matches!(
                         persistence.metadata(&parsed.session_id),
                         Err(crate::acp::SessionPersistenceError::SessionNotFound)
                     )
-                }) {
+                });
+                if conversation_missing || legacy_missing {
                     return WsReply::err(id, WsErrorCode::NotFound, "session snapshot not found");
                 }
                 tracing::warn!(
@@ -1393,21 +1420,34 @@ async fn handle_get_session_cursor(
     // but `Err(_)` for a real I/O / decode failure. `unwrap_or(0)` would mask a
     // storage failure as "new session" in the reply + logs; log the `Err` first
     // so a corrupted payload or permission error is visible, then default to 0.
-    let watermark = relay
-        .persistence()
-        .map(|persistence| {
-            persistence
-                .last_seq(&parsed.session_id)
-                .unwrap_or_else(|error| {
-                    tracing::warn!(
-                        session_id = %parsed.session_id,
-                        error = ?error,
-                        "get_session_cursor: last_seq lookup failed"
-                    );
-                    0
-                })
-        })
-        .unwrap_or(0);
+    let watermark = if let Some(persistence) = relay.conversation_persistence() {
+        persistence
+            .last_seq(&parsed.session_id)
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    session_id = %parsed.session_id,
+                    code = error.code,
+                    "get_session_cursor: Conversation last_seq lookup failed"
+                );
+                0
+            })
+    } else {
+        relay
+            .persistence()
+            .map(|persistence| {
+                persistence
+                    .last_seq(&parsed.session_id)
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(
+                            session_id = %parsed.session_id,
+                            error = ?error,
+                            "get_session_cursor: last_seq lookup failed"
+                        );
+                        0
+                    })
+            })
+            .unwrap_or(0)
+    };
     tracing::debug!(
         target: "termul::web::ws",
         session_id = %parsed.session_id,
@@ -1803,6 +1843,12 @@ struct CreateSessionPayload {
     mcp_servers: Vec<agent_client_protocol::schema::v1::McpServer>,
     #[serde(default)]
     ephemeral: bool,
+    #[serde(default)]
+    conversation_id: Option<crate::conversation::ConversationId>,
+    #[serde(default)]
+    project_attachment: Option<crate::conversation::ProjectAttachment>,
+    #[serde(default)]
+    execution_target: Option<crate::conversation::ExecutionTarget>,
 }
 
 async fn handle_create_session(
@@ -1847,6 +1893,9 @@ async fn handle_create_session(
             SessionCreationContext {
                 project_id,
                 ephemeral: parsed.ephemeral,
+                conversation_id: parsed.conversation_id,
+                project_attachment: parsed.project_attachment,
+                execution_target: parsed.execution_target,
                 ..Default::default()
             },
         )

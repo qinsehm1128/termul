@@ -249,12 +249,47 @@ export interface AgentConfig {
   allowTerminal?: boolean
 }
 
-export interface NewSessionOutcome {
+export type ConversationExecutionTarget =
+  | { kind: 'workspace' }
+  | { kind: 'project_root'; projectId: string; projectRoot: string }
+  | { kind: 'worktree'; projectId: string; worktreePath: string; worktreeBranch: string }
+
+export interface ConversationProjectAttachment {
+  schemaVersion: 1
+  projectId: string
+  attachedAtUtc: string
+  projectPathSnapshot: string
+  worktreePath?: string | null
+  worktreeBranch?: string | null
+}
+
+export interface NewSessionOptions {
+  ephemeral?: boolean
+  projectId?: string
+  worktreePath?: string
+  worktreeBranch?: string
+  conversationId?: string
+  projectAttachment?: ConversationProjectAttachment
+  executionTarget?: ConversationExecutionTarget
+}
+
+type NewSessionCommon = {
   sessionId: SessionId
   modes?: SessionModeState | null
   models?: SessionModelState | null
   configOptions?: SessionConfigOption[] | null
 }
+
+export type NewSessionOutcome =
+  | (NewSessionCommon & {
+      persistence: 'conversation'
+      conversationId: string
+      workspaceCwd: string
+      executionCwd: string
+    })
+  | (NewSessionCommon & {
+      persistence: 'ephemeral'
+    })
 
 /** A session discovered via `session/list` (agent-native session). */
 export interface SessionInfo {
@@ -565,13 +600,7 @@ export async function acpNewSession(
   agentId: AgentId,
   cwd: string,
   mcpServers?: McpServer[],
-  options?: {
-    ephemeral?: boolean
-    projectId?: string
-    /** Worktree path + branch (CAP-3) — persisted for the indicator + fallback. */
-    worktreePath?: string
-    worktreeBranch?: string
-  }
+  options?: NewSessionOptions
 ): Promise<NewSessionOutcome> {
   return getAcpTransport().newSession(agentId, cwd, mcpServers, options)
 }

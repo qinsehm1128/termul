@@ -28,8 +28,7 @@ use termul_manager_lib::web::{
 };
 use termul_manager_lib::{
     AcpCatalogService, AcpInstallService, AcpManager, CwdTracker, ExitCodeTracker,
-    FileProjectRegistry, GitTracker, PtyManager, SessionPersistence, TerminalEventHub,
-    WorkspaceManifestService,
+    FileProjectRegistry, GitTracker, PtyManager, TerminalEventHub, WorkspaceManifestService,
 };
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -82,24 +81,40 @@ fn main() -> ExitCode {
     };
 
     runtime.block_on(async move {
+        // The standalone host crosses the same synchronous Conversation admission gate as
+        // Desktop before opening any app-managed store, manager, PTY, or network route.
+        let conversation_bootstrap =
+            match termul_manager_lib::conversation::ConversationBootstrap::run(
+                termul_manager_lib::conversation::HostConversationRoots::standalone(
+                    cfg.service_account_state_dir(),
+                    cfg.conversation_workspace_root(),
+                    cfg.sessions_dir.clone(),
+                    cfg.workspace_manifests_dir.clone(),
+                ),
+                termul_manager_lib::conversation::MigrationHostMode::Standalone,
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    error!(
+                        code = error.code,
+                        operation = error.operation,
+                        "Conversation bootstrap aborted startup"
+                    );
+                    return ExitCode::from(1);
+                }
+            };
+        info!(
+            phase = ?conversation_bootstrap.migration_phase,
+            precedence = ?conversation_bootstrap.reader_precedence,
+            recovery_count = conversation_bootstrap.recovery_item_count,
+            "Conversation repository ready; mutable-store admission opened"
+        );
+
         // Story 1.4: construct the LIVE relay sink (per-session event logs +
         // seq counters + subscriber set) and pass it to BOTH the ACP manager
         // (as an event sink) and `serve` (so `/ws` can subscribe clients +
-        // replay cursors). AC7: standalone registers ONLY WsRelaySink (1 sink).
-        let sessions_dir = match cfg.sessions_dir.clone() {
-            Some(path) => path,
-            None => {
-                eprintln!("termul-server: sessions directory is not configured");
-                return ExitCode::from(1);
-            }
-        };
-        let persistence = match SessionPersistence::open(sessions_dir).await {
-            Ok(persistence) => persistence,
-            Err(error) => {
-                eprintln!("termul-server: failed to open sessions store: {error}");
-                return ExitCode::from(1);
-            }
-        };
+        // replay cursors). ConversationRepository is the sole live writer; the configured
+        // legacy sessions root was consumed read-only by bootstrap and is never reopened.
         // CAP-5 / Story 5: open the host-owned workspace-manifests root. The
         // standalone binary owns its own root — NEVER shared with a desktop
         // host on the same machine (two processes on one JSONL store would
@@ -109,13 +124,14 @@ fn main() -> ExitCode {
             .workspace_manifests_dir
             .clone()
             .unwrap_or_else(|| cfg.service_account_state_dir().join("workspace-manifests"));
-        let workspace_manifest = match WorkspaceManifestService::open(workspace_manifests_dir).await {
-            Ok(service) => Some(service),
-            Err(error) => {
-                eprintln!("termul-server: failed to open workspace-manifests store: {error}");
-                return ExitCode::from(1);
-            }
-        };
+        let workspace_manifest =
+            match WorkspaceManifestService::open_read_only(workspace_manifests_dir).await {
+                Ok(service) => Some(service),
+                Err(error) => {
+                    eprintln!("termul-server: failed to open workspace-manifests store: {error}");
+                    return ExitCode::from(1);
+                }
+            };
         // CAP-6 / Story 8: open the host-owned ACP catalog root. The
         // standalone binary owns its own root — NEVER shared with a desktop
         // host on the same machine. Defaults to `<state dir>/acp-catalog`.
@@ -150,13 +166,15 @@ fn main() -> ExitCode {
                 return ExitCode::from(1);
             }
         };
-        let ws_relay = Arc::new(WsRelaySink::with_persistence(
+        let ws_relay = Arc::new(WsRelaySink::with_conversation_persistence(
             cfg.event_log_capacity,
-            Arc::clone(&persistence),
+            Arc::clone(&conversation_bootstrap.persistence_adapter),
+            None,
         ));
-        let acp = Arc::new(AcpManager::with_persistence(
+        let acp = Arc::new(AcpManager::with_conversation_services(
             vec![ws_relay.clone()],
-            persistence,
+            Arc::clone(&conversation_bootstrap.creation),
+            Arc::clone(&conversation_bootstrap.persistence_adapter),
         ));
         // Story 1.7: attach the server-side permission rendezvous (bounded
         // timeout, at-most-one, first-response-wins, disconnect-deny, TOCTOU).
@@ -286,10 +304,9 @@ fn current_binary_path() -> PathBuf {
 /// one-shot, which defaults to Stable), while `None` surfaces an error (used by
 /// the periodic loop, which requires the env to opt in).
 fn build_update_options(default_channel: Option<UpdateChannel>) -> Result<UpdateOptions, String> {
-    let channel = UpdateChannel::parse(
-        &std::env::var("TERMUL_SERVER_UPDATE_CHANNEL").unwrap_or_default(),
-    )
-    .or(default_channel);
+    let channel =
+        UpdateChannel::parse(&std::env::var("TERMUL_SERVER_UPDATE_CHANNEL").unwrap_or_default())
+            .or(default_channel);
     let channel = match channel {
         Some(c) => c,
         None => {
@@ -354,7 +371,10 @@ fn run_one_shot_update_check() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
-        Ok(UpdateOutcome::Updated { new_version, old_path }) => {
+        Ok(UpdateOutcome::Updated {
+            new_version,
+            old_path,
+        }) => {
             // One-shot: apply the update but do NOT re-exec — re-exec would
             // start the server in this one-shot's place. The operator restarts
             // the server to run the new version; the `.old` binary is retained
@@ -429,7 +449,10 @@ fn spawn_periodic_update_loop() {
                         "no newer server binary on channel {:?}", opts.channel
                     );
                 }
-                Ok(UpdateOutcome::Updated { new_version, old_path }) => {
+                Ok(UpdateOutcome::Updated {
+                    new_version,
+                    old_path,
+                }) => {
                     info!(
                         target: "termul::server_update",
                         "verified + swapped to {new_version}; restarting into the new binary"
@@ -468,7 +491,7 @@ fn spawn_periodic_update_loop() {
 }
 
 fn usage() -> &'static str {
-    "Usage: termul-server [--host HOST] [--port PORT] [--event-log-capacity N] [--permission-timeout SECS] [--permission-reconnect-grace SECS] [--project-root PATH] [--projects-file PATH] [--sessions-dir PATH] [--workspace-manifests-dir PATH] [--acp-catalog-dir PATH] [--check-update]\n\n\
+    "Usage: termul-server [--host HOST] [--port PORT] [--event-log-capacity N] [--permission-timeout SECS] [--permission-reconnect-grace SECS] [--project-root PATH] [--projects-file PATH] [--sessions-dir PATH] [--conversation-workspace-root PATH] [--workspace-manifests-dir PATH] [--acp-catalog-dir PATH] [--check-update]\n\n\
      Options:\n\
         --host HOST                 Bind host (default: 127.0.0.1; use 0.0.0.0 to expose)\n\
         --port PORT                 Bind port (default: 8080)\n\
@@ -477,8 +500,9 @@ fn usage() -> &'static str {
         --permission-reconnect-grace SECS  Last-subscriber reconnect grace (default: 15)\n\
         --project-root PATH         Project-root boundary for /fs/* routes (default: $TERMUL_PROJECT_ROOT or $HOME)\n\
         --projects-file PATH        VFS-roots registry file (default: $TERMUL_PROJECTS_FILE; missing = empty list)\n\
-        --sessions-dir PATH         Durable sessions root (default: $TERMUL_SESSIONS_DIR or service-account state dir)\n\
-        --workspace-manifests-dir PATH  Workspace manifests root (default: <state dir>/workspace-manifests)\n\
+        --sessions-dir PATH         Legacy sessions input root (default: $TERMUL_SESSIONS_DIR or service-account state dir)\n\
+        --conversation-workspace-root PATH  Visible Conversation workspaces (default: $TERMUL_CONVERSATION_WORKSPACE_ROOT or <project-root>/Termul)\n\
+        --workspace-manifests-dir PATH  Legacy workspace-manifests input root (default: <state dir>/workspace-manifests)\n\
         --acp-catalog-dir PATH      ACP catalog root (default: <state dir>/acp-catalog)\n\
         --check-update              Run one opt-in self-update now: fetch the channel manifest,\n\
                                      verify the downloaded binary signature, atomically swap, and\n\

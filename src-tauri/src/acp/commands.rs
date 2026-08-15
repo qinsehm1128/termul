@@ -68,6 +68,9 @@ pub async fn acp_new_session(
     project_id: Option<String>,
     worktree_path: Option<String>,
     worktree_branch: Option<String>,
+    conversation_id: Option<String>,
+    project_attachment: Option<crate::conversation::ProjectAttachment>,
+    execution_target: Option<crate::conversation::ExecutionTarget>,
 ) -> Result<NewSessionOutcome, String> {
     manager
         .new_session_with_context(
@@ -77,6 +80,12 @@ pub async fn acp_new_session(
             SessionCreationContext {
                 project_id: project_id.filter(|id| !id.trim().is_empty()),
                 ephemeral: ephemeral.unwrap_or(false),
+                conversation_id: conversation_id
+                    .map(|value| crate::conversation::ConversationId::parse(&value))
+                    .transpose()
+                    .map_err(|error| error.to_string())?,
+                project_attachment,
+                execution_target,
                 worktree_path: worktree_path.filter(|p| !p.trim().is_empty()),
                 worktree_branch: worktree_branch.filter(|b| !b.trim().is_empty()),
             },

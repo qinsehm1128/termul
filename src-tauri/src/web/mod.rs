@@ -229,11 +229,9 @@ pub async fn serve_router(
         );
     }
 
-    // Advertise `Server` history mode when the host-owned file-backed
-    // `SessionPersistence` is attached to the relay (both desktop shared-live
-    // and the standalone VPS attach it now — CAP-2). Otherwise the web client
-    // negotiates `live_only` (no stored transcript mirror).
-    let history_mode = if ws_relay.persistence().is_some() {
+    // Advertise `Server` history mode when the relay has either canonical Conversation
+    // persistence or the pre-cutover SessionPersistence compatibility provider.
+    let history_mode = if ws_relay.has_persisted_history() {
         HistoryMode::Server
     } else {
         HistoryMode::LiveOnly

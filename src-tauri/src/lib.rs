@@ -1210,6 +1210,10 @@ static CLEANUP_IN_PROGRESS: std::sync::atomic::AtomicBool =
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Keep the legacy importer linkable for compatibility tests and older internal callers, but
+    // never invoke it after the synchronous Conversation bootstrap cutover.
+    let _legacy_import_compatibility_symbol = crate::acp::import_chat_history;
+
     // Install the panic hook before anything can panic so Rust panics are
     // captured to the log file with a backtrace (issue #244).
     logging::install_panic_hook();
@@ -1270,6 +1274,45 @@ pub fn run() {
             // channel, session id, and resolved log path on a single line.
             logging::log_startup_banner(&handle);
 
+            // Conversation admission is the first app-managed storage/resource boundary.
+            let app_data_dir = handle
+                .path()
+                .app_data_dir()
+                .map_err(|error| format!("failed to resolve app data directory: {error}"))?;
+            let conversation_workspace_base = std::env::var("TERMUL_CONVERSATION_WORKSPACE_ROOT")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(std::path::PathBuf::from)
+                .or_else(|| handle.path().document_dir().ok().map(|path| path.join("Termul")))
+                .or_else(|| {
+                    log::warn!(
+                        "[conversation-bootstrap] document directory unavailable; using home directory"
+                    );
+                    handle.path().home_dir().ok().map(|path| path.join("Termul"))
+                })
+                .ok_or_else(|| {
+                    "CONVERSATION_ROOT_INVALID: no document or home directory is available"
+                        .to_string()
+                })?;
+            let conversation_bootstrap = crate::conversation::ConversationBootstrap::run(
+                crate::conversation::HostConversationRoots::desktop(
+                    app_data_dir.clone(),
+                    conversation_workspace_base,
+                ),
+                crate::conversation::MigrationHostMode::Desktop,
+            )
+            .map_err(|error| error.to_string())?;
+            log::info!(
+                "[conversation-bootstrap] desktop repository ready phase={:?} precedence={:?} recovery_count={}",
+                conversation_bootstrap.migration_phase,
+                conversation_bootstrap.reader_precedence,
+                conversation_bootstrap.recovery_item_count
+            );
+            app.manage(Arc::clone(&conversation_bootstrap.repository));
+            app.manage(Arc::clone(&conversation_bootstrap.reader));
+            app.manage(Arc::clone(&conversation_bootstrap.creation));
+            app.manage(Arc::clone(&conversation_bootstrap.persistence_adapter));
+
             // Window chrome is configured before show(). macOS overlay settings
             // live in tauri.conf.json — avoid set_decorations(true) there because
             // it resets hiddenTitle/full-size content view. Win/Linux drop native
@@ -1326,74 +1369,22 @@ pub fn run() {
             // Desktop renderer chat history lives outside tauri-plugin-store so
             // loading unrelated preferences never materializes full transcripts
             // in the WebView. The app-data path is mandatory for safe startup.
-            let chat_history_root = handle
-                .path()
-                .app_data_dir()
-                .map_err(|error| format!("failed to resolve app data directory: {error}"))?
-                .join("acp-chat-history");
-            let chat_history_store = ChatHistoryStore::open(chat_history_root)
+            let chat_history_root = app_data_dir.join("acp-chat-history");
+            let chat_history_store = ChatHistoryStore::open_read_only(chat_history_root)
                 .map_err(|error| format!("failed to open ACP chat history store: {error}"))?;
             log::info!(
                 "[acp-history] store ready path={}",
                 chat_history_store.root().display()
             );
 
-            // Host-owned durable ACP history (CAP-2). The desktop attaches the
-            // same file-backed `SessionPersistence` the standalone server uses,
-            // so every non-ephemeral session becomes durable at the host
-            // event/session layer regardless of which client created it. The
-            // sessions root is desktop-private: NEVER share it with a
-            // standalone `termul-server` on the same machine (two processes on
-            // one JSONL store would corrupt both). The persistence must exist
-            // BEFORE any agent spawn — driver threads clone it at spawn time.
-            let sessions_root = handle
-                .path()
-                .app_data_dir()
-                .map_err(|error| format!("failed to resolve app data directory: {error}"))?
-                .join("acp-sessions");
-            let session_persistence =
-                match tauri::async_runtime::block_on(SessionPersistence::open(
-                    sessions_root.clone(),
-                )) {
-                    Ok(persistence) => {
-                        log::info!(
-                            "[acp-history] host persistence ready path={}",
-                            persistence.root().display()
-                        );
-                        Some(persistence)
-                    }
-                    Err(error) => {
-                        // Degrade, don't crash: history becomes live-only, the
-                        // app must still boot (parity with the store-free web
-                        // negotiation path).
-                        log::error!(
-                            "[acp-history] host persistence unavailable path={} error={error}",
-                            sessions_root.display()
-                        );
-                        None
-                    }
-                };
-            // Idempotent incremental import of legacy renderer-authored
-            // history so existing desktop sessions survive the ownership
-            // transfer. Per-entry fail-open inside; `acp_history_list`
-            // tolerates a partially converged store. Spawned as a background
-            // task so it does NOT block `setup` (the main window is created
-            // immediately) — the import is documented idempotent and safe to
-            // run after setup returns. `app.manage` below takes ownership of
-            // the store; the task holds its own `Arc` clones.
-            if let Some(persistence) = &session_persistence {
-                let persistence = std::sync::Arc::clone(persistence);
-                let chat_history = std::sync::Arc::clone(&chat_history_store);
-                tauri::async_runtime::spawn(async move {
-                    let imported =
-                        crate::acp::import_chat_history(&persistence, &chat_history).await;
-                    if imported > 0 {
-                        log::info!("[acp-history] legacy store imported sessions={imported}");
-                    }
-                });
-            }
+            // ConversationRepository is the sole live history writer after bootstrap.
+            // The legacy `acp-sessions` root was already inventoried/migrated synchronously and
+            // is not opened as a live SessionPersistence store.
             app.manage(chat_history_store);
-            app.manage(commands::HostHistoryStore(session_persistence.clone()));
+            app.manage(commands::HostHistoryStore::conversation(
+                Arc::clone(&conversation_bootstrap.persistence_adapter),
+                None,
+            ));
 
             // CAP-5 / Story 5: open the host-owned workspace-manifests root
             // under `<app_data_dir>/workspace-manifests`. The desktop owns its
@@ -1402,13 +1393,9 @@ pub fn run() {
             // both). `None` degrades to fresh-only mode (the
             // `workspace_manifest_*` commands return `Ok(None)` / idempotent
             // success; the web routes follow suit).
-            let workspace_manifests_root = handle
-                .path()
-                .app_data_dir()
-                .map_err(|error| format!("failed to resolve app data directory: {error}"))?
-                .join("workspace-manifests");
+            let workspace_manifests_root = app_data_dir.join("workspace-manifests");
             let workspace_manifest_service =
-                match tauri::async_runtime::block_on(WorkspaceManifestService::open(
+                match tauri::async_runtime::block_on(WorkspaceManifestService::open_read_only(
                     workspace_manifests_root.clone(),
                 )) {
                     Ok(service) => {
@@ -1536,26 +1523,17 @@ pub fn run() {
             // the desktop's live sessions to a browser/phone over the LAN.
             let mut sinks: Vec<Arc<dyn crate::web::EventSink>> =
                 vec![Arc::new(TauriEventSink::new(handle.clone()))];
-            let (ws_relay, acp_manager) = match &session_persistence {
-                Some(persistence) => {
-                    let relay = Arc::new(WsRelaySink::with_persistence(
-                        4096,
-                        Arc::clone(persistence),
-                    ));
-                    sinks.push(relay.clone());
-                    let manager = Arc::new(AcpManager::with_persistence(
-                        sinks,
-                        Arc::clone(persistence),
-                    ));
-                    (relay, manager)
-                }
-                None => {
-                    let relay = Arc::new(WsRelaySink::new());
-                    sinks.push(relay.clone());
-                    let manager = Arc::new(AcpManager::new(sinks));
-                    (relay, manager)
-                }
-            };
+            let ws_relay = Arc::new(WsRelaySink::with_conversation_persistence(
+                4096,
+                Arc::clone(&conversation_bootstrap.persistence_adapter),
+                None,
+            ));
+            sinks.push(ws_relay.clone());
+            let acp_manager = Arc::new(AcpManager::with_conversation_services(
+                sinks,
+                Arc::clone(&conversation_bootstrap.creation),
+                Arc::clone(&conversation_bootstrap.persistence_adapter),
+            ));
             // Attach the server-side permission rendezvous so a phone can
             // respond to `acp:permission_request` over WS. The desktop renderer
             // still responds via the `acp_respond_permission` Tauri command

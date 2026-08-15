@@ -159,8 +159,10 @@ pub struct WsRelaySink {
     /// `prompt_complete` / `send_prompt` handlers read this via
     /// [`Self::turn_watermark`] to dedup agent turns by client turn-id.
     turn_watermark: crate::web::permissions::TurnWatermark,
-    /// Standalone durable history. Desktop/shared-live leave this disabled.
+    /// Read-only legacy history provider retained for compatibility reads.
     persistence: Option<Arc<SessionPersistence>>,
+    /// Canonical live writer after Conversation bootstrap.
+    conversation_persistence: Option<Arc<crate::conversation::ConversationPersistenceAdapter>>,
     /// Serializes each session's durable replay/catch-up/register handoff.
     /// Emits remain non-blocking and use the synchronous session state lock.
     replay_gates: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -244,6 +246,7 @@ impl WsRelaySink {
             question_rendezvous: Mutex::new(None),
             turn_watermark: crate::web::permissions::TurnWatermark::new(),
             persistence: None,
+            conversation_persistence: None,
             replay_gates: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -273,8 +276,32 @@ impl WsRelaySink {
     }
 
     #[must_use]
+    pub fn with_conversation_persistence(
+        event_log_capacity: usize,
+        persistence: Arc<crate::conversation::ConversationPersistenceAdapter>,
+        legacy_read_only: Option<Arc<SessionPersistence>>,
+    ) -> Self {
+        let mut sink = Self::with_capacity(event_log_capacity, DEFAULT_LOSSY_CAPACITY);
+        sink.conversation_persistence = Some(persistence);
+        sink.persistence = legacy_read_only;
+        sink
+    }
+
+    #[must_use]
+    pub fn conversation_persistence(
+        &self,
+    ) -> Option<Arc<crate::conversation::ConversationPersistenceAdapter>> {
+        self.conversation_persistence.clone()
+    }
+
+    #[must_use]
     pub fn persistence(&self) -> Option<Arc<SessionPersistence>> {
         self.persistence.clone()
+    }
+
+    #[must_use]
+    pub fn has_persisted_history(&self) -> bool {
+        self.conversation_persistence.is_some() || self.persistence.is_some()
     }
 
     /// The configured per-session event-log capacity (AC4).
@@ -343,9 +370,14 @@ impl WsRelaySink {
     pub fn session_watermark(&self, session_id: &str) -> u64 {
         self.sessions.lock().get(session_id).map_or_else(
             || {
-                self.persistence
+                self.conversation_persistence
                     .as_ref()
                     .and_then(|persistence| persistence.last_seq(session_id).ok())
+                    .or_else(|| {
+                        self.persistence
+                            .as_ref()
+                            .and_then(|persistence| persistence.last_seq(session_id).ok())
+                    })
                     .unwrap_or(0)
             },
             |state| state.last_seq,
@@ -355,11 +387,14 @@ impl WsRelaySink {
     /// Assign seq + append under the sessions lock (atomic w.r.t. concurrent emits).
     fn assign_and_append(&self, sid: &str, type_: &str, payload: Value) -> SequencedEvent {
         let mut sessions = self.sessions.lock();
-        let durable_last = self
-            .persistence
-            .as_ref()
-            .and_then(|persistence| persistence.last_seq(sid).ok())
-            .unwrap_or(0);
+        let durable_last = if self.conversation_persistence.is_some() {
+            0
+        } else {
+            self.persistence
+                .as_ref()
+                .and_then(|persistence| persistence.last_seq(sid).ok())
+                .unwrap_or(0)
+        };
         let state = sessions
             .entry(sid.to_string())
             .or_insert_with(|| SessionState {
@@ -390,7 +425,7 @@ impl WsRelaySink {
         // atomic stale recovery. When persistence is available, do NOT maintain
         // `snapshot_events` at all — `subscribe_snapshot` rebuilds the snapshot
         // from durable history instead (avoids unbounded growth).
-        if self.persistence.is_none() {
+        if self.persistence.is_none() && self.conversation_persistence.is_none() {
             state.snapshot_events.push(se.clone());
             while state.snapshot_events.len() > self.event_log_capacity {
                 state.snapshot_events.remove(0);
@@ -404,17 +439,19 @@ impl WsRelaySink {
                 .map(|e| e.seq)
                 .unwrap_or(state.base_seq.saturating_add(1));
         }
-        if let Some(persistence) = &self.persistence {
-            let record = PersistedEventRecord {
-                schema_version: SESSION_SCHEMA_VERSION,
-                session_id: sid.to_string(),
-                seq,
-                type_: type_.to_string(),
-                recorded_at: now_millis(),
-                payload: se.payload.clone(),
-            };
-            if let Err(error) = persistence.enqueue_event(record) {
-                warn!("[sessions] persistence queue rejected event for session {sid}: {error}");
+        if self.conversation_persistence.is_none() {
+            if let Some(persistence) = &self.persistence {
+                let record = PersistedEventRecord {
+                    schema_version: SESSION_SCHEMA_VERSION,
+                    session_id: sid.to_string(),
+                    seq,
+                    type_: type_.to_string(),
+                    recorded_at: now_millis(),
+                    payload: se.payload.clone(),
+                };
+                if let Err(error) = persistence.enqueue_event(record) {
+                    warn!("[sessions] persistence queue rejected event for session {sid}: {error}");
+                }
             }
         }
         se
@@ -515,6 +552,23 @@ impl WsRelaySink {
         let _replay_guard = gate.lock().await;
         let mut by_seq = std::collections::BTreeMap::new();
         loop {
+            if let Some(persistence) = &self.conversation_persistence {
+                let durable = match persistence.replay_after(sid, cursor) {
+                    Ok(records) => records,
+                    Err(_) => return (client_id, rx, ReplayResult::Stale),
+                };
+                for record in durable {
+                    by_seq.insert(
+                        record.seq,
+                        SequencedEvent::new(
+                            Some(record.session_id),
+                            record.seq,
+                            record.type_,
+                            record.payload,
+                        ),
+                    );
+                }
+            }
             if let Some(persistence) = &self.persistence {
                 // Flush is a queue barrier for everything assigned before it.
                 // The JSONL scan itself runs on spawn_blocking.
@@ -577,7 +631,7 @@ impl WsRelaySink {
             let first_missing = cursor
                 .checked_add(1)
                 .and_then(|start| (start..=frontier).find(|seq| !by_seq.contains_key(seq)));
-            if first_missing.is_some() {
+            if self.conversation_persistence.is_none() && first_missing.is_some() {
                 if self.persistence.is_none() || base_seq <= cursor.saturating_add(1) {
                     return (client_id, rx, ReplayResult::Stale);
                 }
@@ -629,6 +683,27 @@ impl WsRelaySink {
                 .clone()
         };
         let _replay_guard = gate.lock().await;
+        if let Some(persistence) = &self.conversation_persistence {
+            let watermark = persistence
+                .last_seq(sid)
+                .map_err(|error| error.to_string())?;
+            let records = persistence
+                .replay_after(sid, 0)
+                .map_err(|error| error.to_string())?;
+            let snapshot = records
+                .into_iter()
+                .map(|record| {
+                    SequencedEvent::new(
+                        Some(record.session_id),
+                        record.seq,
+                        record.type_,
+                        record.payload,
+                    )
+                })
+                .collect();
+            self.register(client_id, sid, tx);
+            return Ok((client_id, rx, snapshot, watermark));
+        }
         if let Some(persistence) = &self.persistence {
             // Persistence is available: rebuild the snapshot from durable
             // history (do NOT maintain `snapshot_events` on this path).
@@ -674,7 +749,12 @@ impl WsRelaySink {
         payload: Value,
     ) -> Result<SequencedEvent, String> {
         let event = self.assign_and_append(sid, "user_prompt", payload);
-        if let Some(persistence) = &self.persistence {
+        if let Some(persistence) = &self.conversation_persistence {
+            persistence
+                .append_acp_event(sid, "user_prompt", event.payload.clone())
+                .await
+                .map_err(|error| error.to_string())?;
+        } else if let Some(persistence) = &self.persistence {
             persistence
                 .flush_session(sid)
                 .await
@@ -845,6 +925,31 @@ impl EventSink for WsRelaySink {
             Some(sid) => {
                 // Session-scoped: assign seq + append atomically, then fan out.
                 let se = self.assign_and_append(sid, type_, event.payload.clone());
+                if matches!(
+                    type_,
+                    "message_chunk"
+                        | "prompt_complete"
+                        | "tool_call"
+                        | "tool_call_update"
+                        | "session_info_update"
+                ) {
+                    if let Some(persistence) = self.conversation_persistence() {
+                        let sid = sid.clone();
+                        let type_ = type_.to_string();
+                        let payload = event.payload.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) =
+                                persistence.append_acp_event(&sid, &type_, payload).await
+                            {
+                                log::error!(
+                                    "[conversation-persistence] ACP event append failed event_type={} code={}",
+                                    type_,
+                                    error.code
+                                );
+                            }
+                        });
+                    }
+                }
                 let targets: Vec<ClientId> = self
                     .session_subs
                     .lock()
@@ -954,7 +1059,7 @@ impl EventSink for WsRelaySink {
         // `local_title_generated` covers background title generation. Only
         // fires when durable persistence is attached (live-only mode has
         // nothing to refetch).
-        if self.persistence().is_some()
+        if self.has_persisted_history()
             && matches!(
                 type_,
                 "session_created"
@@ -1737,7 +1842,9 @@ mod tests {
 
         let drained = drain_rx(&mut rx);
         assert!(
-            drained.iter().all(|event| event.type_ != "chat_history_changed"),
+            drained
+                .iter()
+                .all(|event| event.type_ != "chat_history_changed"),
             "no history notification without durable persistence"
         );
     }
