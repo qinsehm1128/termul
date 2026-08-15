@@ -2,6 +2,7 @@
 
 pub mod catalog;
 pub mod contracts;
+pub mod creation;
 pub mod durable_fs;
 pub mod event_log;
 pub mod locator;
@@ -22,6 +23,12 @@ pub use contracts::{
     ExecutionTarget, ProjectAttachment, TerminalResourceRef, AGENT_SESSION_BINDING_SCHEMA_VERSION,
     CONVERSATION_SCHEMA_VERSION, PROJECT_ATTACHMENT_SCHEMA_VERSION,
     TERMINAL_RESOURCE_REF_SCHEMA_VERSION,
+};
+pub use creation::{
+    AgentBindingResult, AgentCreationFailure, Clock, ConversationCreationError,
+    ConversationCreationService, ConversationIdGenerator, DefaultConversationIdGenerator,
+    PrepareConversationRequest, PreparedConversation, SystemClock,
+    PREPARED_CONVERSATION_SCHEMA_VERSION, PREPARE_CONVERSATION_SCHEMA_VERSION,
 };
 pub use durable_fs::{
     append_jsonl, create_dir_durable, replace_bytes, sync_file_and_namespace, CrashInjector,
