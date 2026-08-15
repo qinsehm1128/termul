@@ -1,9 +1,19 @@
 //! Host-owned Conversation domain contracts and services.
 
+pub mod catalog;
 pub mod contracts;
 pub mod durable_fs;
+pub mod event_log;
 pub mod locator;
+pub mod repository;
 
+pub use catalog::{
+    rebuild_catalog, AcceptedCanonicalConversation, CatalogError, CatalogRebuildResult,
+    CatalogRecoveryIssue, ConversationCatalogEntryV1, ConversationCatalogFileV1,
+    ConversationProvenanceFileV1, ConversationProvenanceSourceV1, CATALOG_FILE,
+    CATALOG_SCHEMA_VERSION, CONVERSATION_METADATA_FILE, EMPTY_CATALOG_GENERATED_AT_UTC,
+    PROVENANCE_FILE, PROVENANCE_SCHEMA_VERSION,
+};
 pub use contracts::{
     format_created_at_utc, parse_created_at_utc, AgentSessionBinding, AgentSessionBindingState,
     ConversationCreator, ConversationErrorCode, ConversationId, ConversationIdPathError,
@@ -17,7 +27,19 @@ pub use durable_fs::{
     CrashPoint, DirectoryPermissions, DurabilityLevel, DurableFileSystem, DurableFsError,
     DurableWriteOutcome, NamespaceState, OwnedTempDisposition,
 };
+pub use event_log::{
+    materialize_records, replay_conversation, AttachmentMaterialization, BindingEventPayloadV1,
+    BindingMaterialization, BindingReplacementPayloadV1, ConversationEventRecordV2,
+    ConversationEventStream, ConversationEventType, ConversationReplay, EventLogError,
+    EventLogErrorKind, EventLogRepairWarning, ProjectAttachmentEventPayloadV1, ATTACHMENTS_FILE,
+    BINDINGS_FILE, CONVERSATION_EVENT_SCHEMA_VERSION, EVENT_LOG_FILES, MESSAGES_FILE,
+    TOOL_CALLS_FILE,
+};
 pub use locator::{
     bounded_scan, BoundedScan, ConversationLocator, LocatedConversation, LocatorError,
     SessionWorkspaceLocator, MAX_CONVERSATIONS_PER_SCAN, MAX_DIRECTORY_ENTRIES_PER_LEVEL,
+};
+pub use repository::{
+    ConversationMetadataUpdate, ConversationRepository, RepositoryError, RepositoryOpenReport,
+    RepositoryRecoveryItem, RepositoryRecoveryKind,
 };
