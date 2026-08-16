@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::conversation::lifecycle::{
@@ -25,7 +26,7 @@ use crate::conversation::session_workspace::{
 use crate::conversation::write_authority::{ConversationMutation, ConversationWriter};
 use crate::conversation::{
     CompatibilityError, ConversationId, ConversationReader, ConversationRecordV2,
-    PrepareConversationRequest,
+    CreationPartition, ExecutionTarget, PrepareConversationRequest, ProjectAttachment,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -93,6 +94,38 @@ pub struct ConversationHostStatus {
 pub struct ConversationOpenOutcome {
     pub conversation: ConversationRecordV2,
     pub workspace: SessionWorkspaceLoadOutcome,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConversationAggregateMutationAction {
+    AttachProject,
+    DetachProject,
+    UpdateExecutionTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConversationIdentitySnapshot {
+    pub conversation_id: ConversationId,
+    pub created_at_utc: String,
+    pub creation_partition: CreationPartition,
+    pub workspace_cwd: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConversationAggregateMutationOutcome {
+    pub status: String,
+    pub action: ConversationAggregateMutationAction,
+    pub conversation_id: ConversationId,
+    pub previous_revision: u64,
+    pub revision: u64,
+    pub identity_before: ConversationIdentitySnapshot,
+    pub identity_after: ConversationIdentitySnapshot,
+    pub project_attachment: Option<ProjectAttachment>,
+    pub execution_target: ExecutionTarget,
+    pub conversation: ConversationRecordV2,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -371,6 +404,96 @@ impl ConversationApplicationService {
         result
     }
 
+    pub async fn attach_project(
+        &self,
+        conversation_id: ConversationId,
+        expected_revision: u64,
+        attachment: ProjectAttachment,
+    ) -> Result<ConversationAggregateMutationOutcome> {
+        let started = Instant::now();
+        let result = self
+            .writer
+            .attach_project(
+                conversation_id,
+                expected_revision,
+                attachment,
+                Utc::now(),
+            )
+            .await
+            .map_err(map_repository_error)
+            .and_then(|mutation| {
+                aggregate_outcome(ConversationAggregateMutationAction::AttachProject, mutation)
+            });
+        log_aggregate_result(
+            "attach_project",
+            conversation_id,
+            expected_revision,
+            self.host_kind,
+            started,
+            &result,
+        );
+        result
+    }
+
+    pub async fn detach_project(
+        &self,
+        conversation_id: ConversationId,
+        expected_revision: u64,
+    ) -> Result<ConversationAggregateMutationOutcome> {
+        let started = Instant::now();
+        let result = self
+            .writer
+            .detach_project(conversation_id, expected_revision, Utc::now())
+            .await
+            .map_err(map_repository_error)
+            .and_then(|mutation| {
+                aggregate_outcome(ConversationAggregateMutationAction::DetachProject, mutation)
+            });
+        log_aggregate_result(
+            "detach_project",
+            conversation_id,
+            expected_revision,
+            self.host_kind,
+            started,
+            &result,
+        );
+        result
+    }
+
+    pub async fn update_execution_target(
+        &self,
+        conversation_id: ConversationId,
+        expected_revision: u64,
+        execution_target: ExecutionTarget,
+    ) -> Result<ConversationAggregateMutationOutcome> {
+        let started = Instant::now();
+        let result = self
+            .writer
+            .update_execution_target(
+                conversation_id,
+                expected_revision,
+                execution_target,
+                Utc::now(),
+            )
+            .await
+            .map_err(map_repository_error)
+            .and_then(|mutation| {
+                aggregate_outcome(
+                    ConversationAggregateMutationAction::UpdateExecutionTarget,
+                    mutation,
+                )
+            });
+        log_aggregate_result(
+            "update_execution_target",
+            conversation_id,
+            expected_revision,
+            self.host_kind,
+            started,
+            &result,
+        );
+        result
+    }
+
     pub async fn get_workspace(
         &self,
         conversation_id: ConversationId,
@@ -590,6 +713,99 @@ impl ConversationApplicationService {
             .authorize(conversation_id, mutation)
             .map(|_| ())
             .map_err(map_repository_error)
+    }
+}
+
+fn aggregate_outcome(
+    action: ConversationAggregateMutationAction,
+    mutation: crate::conversation::repository::ConversationAggregateMutationRecord,
+) -> Result<ConversationAggregateMutationOutcome> {
+    let identity_before = identity_snapshot(&mutation.before);
+    let identity_after = identity_snapshot(&mutation.after);
+    if identity_before != identity_after
+        || mutation.event.seq != mutation.after.last_seq
+        || mutation.before.last_seq >= mutation.after.last_seq
+    {
+        log::error!(
+            "[conversation-application] aggregate invariant failed conversation_id={} action={:?} code=CONVERSATION_RECOVERY_REQUIRED",
+            mutation.before.conversation_id,
+            action
+        );
+        return Err(application_error(
+            "CONVERSATION_RECOVERY_REQUIRED",
+            "aggregate_mutation",
+            Some(mutation.before.conversation_id),
+            "aggregate mutation did not preserve immutable identity or advance canonical lastSeq",
+        ));
+    }
+    Ok(ConversationAggregateMutationOutcome {
+        status: "updated".to_string(),
+        action,
+        conversation_id: mutation.after.conversation_id,
+        previous_revision: mutation.before.last_seq,
+        revision: mutation.after.last_seq,
+        identity_before,
+        identity_after,
+        project_attachment: mutation.after.project_attachment.clone(),
+        execution_target: mutation.after.execution_target.clone(),
+        conversation: mutation.after,
+    })
+}
+
+fn identity_snapshot(record: &ConversationRecordV2) -> ConversationIdentitySnapshot {
+    ConversationIdentitySnapshot {
+        conversation_id: record.conversation_id,
+        created_at_utc: crate::conversation::format_created_at_utc(&record.created_at_utc),
+        creation_partition: record.creation_partition.clone(),
+        workspace_cwd: record.workspace_cwd.clone(),
+    }
+}
+
+fn log_aggregate_result(
+    operation: &'static str,
+    conversation_id: ConversationId,
+    expected_revision: u64,
+    host_kind: ConversationHostKind,
+    started: Instant,
+    result: &Result<ConversationAggregateMutationOutcome>,
+) {
+    match result {
+        Ok(outcome) => log::info!(
+            "[conversation-application] operation={} conversation_id={} host_kind={:?} previous_revision={} revision={} target_kind={} code=OK duration_ms={}",
+            operation,
+            conversation_id,
+            host_kind,
+            outcome.previous_revision,
+            outcome.revision,
+            execution_target_kind(&outcome.execution_target),
+            started.elapsed().as_millis()
+        ),
+        Err(error) if error.code == "CONVERSATION_CONFLICT" => log::warn!(
+            "[conversation-application] operation={} conversation_id={} host_kind={:?} expected_revision={} code={} duration_ms={}",
+            operation,
+            conversation_id,
+            host_kind,
+            expected_revision,
+            error.code,
+            started.elapsed().as_millis()
+        ),
+        Err(error) => log::warn!(
+            "[conversation-application] operation={} conversation_id={} host_kind={:?} expected_revision={} code={} duration_ms={}",
+            operation,
+            conversation_id,
+            host_kind,
+            expected_revision,
+            error.code,
+            started.elapsed().as_millis()
+        ),
+    }
+}
+
+fn execution_target_kind(target: &ExecutionTarget) -> &'static str {
+    match target {
+        ExecutionTarget::Workspace => "workspace",
+        ExecutionTarget::ProjectRoot { .. } => "project_root",
+        ExecutionTarget::Worktree { .. } => "worktree",
     }
 }
 

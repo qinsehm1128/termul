@@ -4,7 +4,7 @@ import type {
   ProjectAttachment
 } from '@shared/types/conversation.types'
 import { Folder, FolderGit2, Link2, PanelsTopLeft, Unlink } from 'lucide-react'
-import { useMemo } from 'react'
+import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
@@ -15,16 +15,14 @@ import {
   SelectTrigger,
   SelectValue
 } from '@/components/ui/select'
+import { getCurrentConversation, useConversationStore } from '@/stores/conversation-store'
 import type { Project } from '@/types/project'
 
 export interface ExecutionTargetPickerProps {
   projects: readonly Project[]
   value: ExecutionTarget
   attachment: ProjectAttachment | null
-  conversation?: Pick<
-    ConversationRecordV2,
-    'conversationId' | 'createdAtUtc' | 'creationPartition' | 'workspaceCwd'
-  > | null
+  conversation?: ConversationRecordV2 | null
   workspaceCwd?: string | null
   onChange: (target: ExecutionTarget) => void
   onAttachmentChange: (attachment: ProjectAttachment | null) => void
@@ -44,6 +42,7 @@ export type ExecutionTargetValidationError =
   | 'projectRequired'
   | 'projectRootRequired'
   | 'worktreeBranchRequired'
+  | 'projectAttachmentRequired'
 
 export function validateExecutionTarget(
   target: ExecutionTarget
@@ -70,20 +69,56 @@ export function ExecutionTargetPicker({
   const { t } = useTranslation('conversation')
   const selectedProjectId = value.kind === 'workspace' ? (projects[0]?.id ?? '') : value.projectId
   const selectedProject = projects.find((project) => project.id === selectedProjectId)
-  const validationError = validateExecutionTarget(value)
+  const attachProject = useConversationStore((state) => state.attachProject)
+  const detachProject = useConversationStore((state) => state.detachProject)
+  const updateExecutionTarget = useConversationStore((state) => state.updateExecutionTarget)
+  const aggregateBusy = useConversationStore((state) =>
+    conversation ? Boolean(state.aggregateBusyById[conversation.conversationId]) : false
+  )
+  const aggregateError = useConversationStore((state) =>
+    conversation ? state.errorsById[conversation.conversationId] : undefined
+  )
+  const [localValidationError, setLocalValidationError] =
+    useState<ExecutionTargetValidationError | null>(null)
+  const [savedAction, setSavedAction] = useState<'target' | 'attached' | 'detached' | null>(null)
+  const validationError = localValidationError ?? validateExecutionTarget(value)
+  const readyConversation = conversation?.lifecycleState === 'ready' ? conversation : null
   const attachableProjects = useMemo(
     () => projects.filter((project) => Boolean(project.path?.trim())),
     [projects]
   )
 
+  const commitTarget = async (target: ExecutionTarget): Promise<void> => {
+    setLocalValidationError(null)
+    setSavedAction(null)
+    onChange(target)
+    if (!readyConversation) return
+    const currentConversation =
+      getCurrentConversation(useConversationStore.getState(), readyConversation.conversationId) ??
+      readyConversation
+    if (target.kind !== 'workspace' && !currentConversation.projectAttachment) {
+      setLocalValidationError('projectAttachmentRequired')
+      onChange(currentConversation.executionTarget)
+      return
+    }
+    const outcome = await updateExecutionTarget(currentConversation.conversationId, target)
+    if (!outcome) {
+      onChange(currentConversation.executionTarget)
+      return
+    }
+    onChange(outcome.executionTarget)
+    onAttachmentChange(outcome.projectAttachment)
+    setSavedAction('target')
+  }
+
   const selectKind = (kind: ExecutionTarget['kind']): void => {
     if (kind === 'workspace') {
-      onChange({ kind: 'workspace' })
+      void commitTarget({ kind: 'workspace' })
       return
     }
     const project = selectedProject ?? attachableProjects[0]
     if (kind === 'project_root') {
-      onChange({
+      void commitTarget({
         kind,
         projectId: project?.id ?? '',
         projectRoot: projectRoot(project)
@@ -91,7 +126,7 @@ export function ExecutionTargetPicker({
       return
     }
     const selectedWorktree = activeWorktree(project)
-    onChange({
+    void commitTarget({
       kind,
       projectId: project?.id ?? '',
       worktreePath: selectedWorktree?.path ?? '',
@@ -103,11 +138,11 @@ export function ExecutionTargetPicker({
     const project = projects.find((candidate) => candidate.id === projectId)
     if (!project || value.kind === 'workspace') return
     if (value.kind === 'project_root') {
-      onChange({ kind: value.kind, projectId, projectRoot: projectRoot(project) })
+      void commitTarget({ kind: value.kind, projectId, projectRoot: projectRoot(project) })
       return
     }
     const selectedWorktree = activeWorktree(project)
-    onChange({
+    void commitTarget({
       kind: value.kind,
       projectId,
       worktreePath: selectedWorktree?.path ?? '',
@@ -115,23 +150,56 @@ export function ExecutionTargetPicker({
     })
   }
 
-  const toggleAttachment = (): void => {
-    if (attachment) {
+  const toggleAttachment = async (): Promise<void> => {
+    setLocalValidationError(null)
+    setSavedAction(null)
+    const currentConversation = readyConversation
+      ? (getCurrentConversation(
+          useConversationStore.getState(),
+          readyConversation.conversationId
+        ) ?? readyConversation)
+      : null
+    const currentAttachment = currentConversation?.projectAttachment ?? attachment
+    const currentTarget = currentConversation?.executionTarget ?? value
+    if (currentAttachment) {
+      if (currentConversation && currentTarget.kind !== 'workspace') {
+        setLocalValidationError('projectAttachmentRequired')
+        return
+      }
       onAttachmentChange(null)
+      if (!currentConversation) return
+      const outcome = await detachProject(currentConversation.conversationId)
+      if (!outcome) {
+        onAttachmentChange(currentAttachment)
+        return
+      }
+      onAttachmentChange(outcome.projectAttachment)
+      onChange(outcome.executionTarget)
+      setSavedAction('detached')
       return
     }
     const project = selectedProject ?? attachableProjects[0]
     const root = projectRoot(project)
     if (!project || !root) return
     const selectedWorktree = value.kind === 'worktree' ? activeWorktree(project) : undefined
-    onAttachmentChange({
+    const nextAttachment: ProjectAttachment = {
       schemaVersion: 1,
       projectId: project.id,
       attachedAtUtc: nowUtc(),
       projectPathSnapshot: root,
       worktreePath: selectedWorktree?.path ?? null,
       worktreeBranch: selectedWorktree?.branch ?? null
-    })
+    }
+    onAttachmentChange(nextAttachment)
+    if (!currentConversation) return
+    const outcome = await attachProject(currentConversation.conversationId, nextAttachment)
+    if (!outcome) {
+      onAttachmentChange(null)
+      return
+    }
+    onAttachmentChange(outcome.projectAttachment)
+    onChange(outcome.executionTarget)
+    setSavedAction('attached')
   }
 
   return (
@@ -144,6 +212,7 @@ export function ExecutionTargetPicker({
           <Label htmlFor="execution-target-kind">{t('target.label')}</Label>
           <Select
             value={value.kind}
+            disabled={aggregateBusy}
             onValueChange={(kind) => selectKind(kind as ExecutionTarget['kind'])}
           >
             <SelectTrigger id="execution-target-kind" aria-label={t('target.label')}>
@@ -156,13 +225,23 @@ export function ExecutionTargetPicker({
                   {t('target.workspace')}
                 </span>
               </SelectItem>
-              <SelectItem value="project_root" disabled={attachableProjects.length === 0}>
+              <SelectItem
+                value="project_root"
+                disabled={
+                  attachableProjects.length === 0 || Boolean(readyConversation && !attachment)
+                }
+              >
                 <span className="flex items-center gap-2">
                   <Folder className="size-4" aria-hidden="true" />
                   {t('target.projectRoot')}
                 </span>
               </SelectItem>
-              <SelectItem value="worktree" disabled={attachableProjects.length === 0}>
+              <SelectItem
+                value="worktree"
+                disabled={
+                  attachableProjects.length === 0 || Boolean(readyConversation && !attachment)
+                }
+              >
                 <span className="flex items-center gap-2">
                   <FolderGit2 className="size-4" aria-hidden="true" />
                   {t('target.worktree')}
@@ -177,7 +256,9 @@ export function ExecutionTargetPicker({
           <Select
             value={selectedProjectId}
             onValueChange={selectProject}
-            disabled={value.kind === 'workspace' || attachableProjects.length === 0}
+            disabled={
+              aggregateBusy || value.kind === 'workspace' || attachableProjects.length === 0
+            }
           >
             <SelectTrigger id="execution-target-project" aria-label={t('target.project')}>
               <SelectValue placeholder={t('target.noProject')} />
@@ -246,8 +327,12 @@ export function ExecutionTargetPicker({
           variant="outline"
           size="sm"
           className="min-h-10 shrink-0 gap-2"
-          disabled={!attachment && attachableProjects.length === 0}
-          onClick={toggleAttachment}
+          disabled={
+            aggregateBusy ||
+            (!attachment && attachableProjects.length === 0) ||
+            Boolean(attachment && readyConversation && value.kind !== 'workspace')
+          }
+          onClick={() => void toggleAttachment()}
         >
           {attachment ? <Unlink className="size-4" /> : <Link2 className="size-4" />}
           {attachment ? t('attachment.detach') : t('attachment.attach')}
@@ -255,9 +340,17 @@ export function ExecutionTargetPicker({
       </div>
 
       <output className="mt-2 block text-xs text-muted-foreground" aria-live="polite">
-        {attachment
-          ? t('attachment.attached', { projectId: attachment.projectId })
-          : t('attachment.none')}
+        {aggregateBusy
+          ? t('mutation.saving')
+          : aggregateError
+            ? t(`mutation.errors.${aggregateError.code}` as const, {
+                defaultValue: aggregateError.message
+              })
+            : savedAction
+              ? t(`mutation.saved.${savedAction}` as const)
+              : attachment
+                ? t('attachment.attached', { projectId: attachment.projectId })
+                : t('attachment.none')}
       </output>
     </section>
   )

@@ -180,6 +180,18 @@ pub fn router(
             post(conversation_api::open),
         )
         .route(
+            "/conversations/{conversationId}/attach-project",
+            post(conversation_api::attach_project),
+        )
+        .route(
+            "/conversations/{conversationId}/detach-project",
+            post(conversation_api::detach_project),
+        )
+        .route(
+            "/conversations/{conversationId}/execution-target",
+            post(conversation_api::update_execution_target),
+        )
+        .route(
             "/conversations/{conversationId}/workspace",
             get(session_workspace_api::get).post(session_workspace_api::write),
         )
@@ -368,6 +380,18 @@ pub fn router_with_static(
         .route(
             "/conversations/{conversationId}/open",
             post(conversation_api::open),
+        )
+        .route(
+            "/conversations/{conversationId}/attach-project",
+            post(conversation_api::attach_project),
+        )
+        .route(
+            "/conversations/{conversationId}/detach-project",
+            post(conversation_api::detach_project),
+        )
+        .route(
+            "/conversations/{conversationId}/execution-target",
+            post(conversation_api::update_execution_target),
         )
         .route(
             "/conversations/{conversationId}/workspace",

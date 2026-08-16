@@ -314,6 +314,7 @@ pub enum ConversationErrorCode {
     ConversationRecoveryRequired,
     ConversationDurabilityUnsupported,
     LegacyCompatibilityReadOnly,
+    ValidationError,
 }
 
 impl ConversationErrorCode {

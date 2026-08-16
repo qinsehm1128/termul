@@ -314,8 +314,14 @@ impl ConversationPersistenceAdapter {
 
     pub fn last_seq(&self, agent_session_id: &str) -> Result<u64> {
         let conversation_id = self
-            .conversation_id_for_history_binding(agent_session_id)
-            .ok_or_else(|| error("CONVERSATION_NOT_FOUND", "last_seq", "binding not found"))?;
+            .conversation_id_for_active_binding(agent_session_id)
+            .ok_or_else(|| {
+                error(
+                    "CONVERSATION_BINDING_NOT_FOUND",
+                    "last_seq",
+                    "binding is not active",
+                )
+            })?;
         self.reader
             .get(conversation_id)
             .map(|record| record.last_seq)
@@ -693,6 +699,11 @@ mod tests {
             .append_acp_event("opaque/detached", "message_chunk", serde_json::json!({}))
             .await
             .is_err());
+        assert_eq!(
+            adapter.last_seq("opaque/detached").unwrap_err().code,
+            "CONVERSATION_BINDING_NOT_FOUND"
+        );
+        assert!(!adapter.replay_after("opaque/detached", 0).unwrap().is_empty());
 
         writer
             .rebind_detached_binding(id, created_at)
@@ -718,6 +729,11 @@ mod tests {
             .append_acp_event("opaque/detached", "message_chunk", serde_json::json!({}))
             .await
             .is_err());
+        assert_eq!(
+            adapter.last_seq("opaque/detached").unwrap_err().code,
+            "CONVERSATION_BINDING_NOT_FOUND"
+        );
+        assert!(!adapter.replay_after("opaque/detached", 0).unwrap().is_empty());
 
         drop(adapter);
         drop(repository);

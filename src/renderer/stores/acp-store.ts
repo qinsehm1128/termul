@@ -2446,6 +2446,13 @@ async function openHistorySessionInner(
     }
   }
 
+  // A detached or suspended canonical Conversation is intentionally history-only. The host
+  // projects both states as a closed Conversation-backed row: install its durable transcript, but
+  // never spawn/load/resume an agent or enable send routing merely because the user reopened it.
+  if (meta.conversationId && meta.status === 'closed') {
+    return
+  }
+
   // Resolve the CURRENT live agent for this chat's config+cwd. Without this
   // remap the `agentStatus`/`agents` lookups miss (stale UUID after restart)
   // and `decideResume` falls to 'local', leaving `sendPrompt` rejected.

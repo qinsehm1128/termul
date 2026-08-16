@@ -59,8 +59,8 @@ impl ConversationAgentLifecycle for MatrixProvider {
     fn abort_replacement<'a>(
         &'a self,
         _binding: &'a AgentSessionBinding,
-    ) -> ProviderFuture<'a, ()> {
-        Box::pin(async {})
+    ) -> ProviderFuture<'a, std::result::Result<(), AgentLifecycleProviderError>> {
+        Box::pin(async { Ok(()) })
     }
 
     fn register_binding(&self, _agent_session_id: &str, _conversation_id: ConversationId) {}

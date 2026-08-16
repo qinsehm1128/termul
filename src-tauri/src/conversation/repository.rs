@@ -33,8 +33,9 @@ use crate::conversation::durable_fs::{DirectoryPermissions, DurableFileSystem};
 use crate::conversation::event_log::{
     apply_event, read_event_page as read_event_page_from_log, BindingEventPayloadV1,
     BindingReplacementPayloadV1, ConversationEventRecordV2, ConversationEventType,
-    ConversationFrontier, EventLogRepairWarning, EventLogScan, ProjectAttachmentEventPayloadV1,
-    CONVERSATION_EVENT_SCHEMA_VERSION, EVENT_LOG_FILES, MAX_EVENT_PAGE_LIMIT, MIN_EVENT_PAGE_LIMIT,
+    ConversationFrontier, EventLogRepairWarning, EventLogScan, ExecutionTargetEventPayloadV1,
+    ProjectAttachmentEventPayloadV1, CONVERSATION_EVENT_SCHEMA_VERSION, EVENT_LOG_FILES,
+    MAX_EVENT_PAGE_LIMIT, MIN_EVENT_PAGE_LIMIT,
 };
 use crate::conversation::locator::ConversationLocator;
 use crate::conversation::write_authority::RepositoryWritePermit;
@@ -100,6 +101,13 @@ pub(crate) fn bootstrap_scan_metrics<'a>(
 pub struct ConversationMetadataUpdate {
     pub lifecycle_state: Option<ConversationLifecycleState>,
     pub execution_target: Option<ExecutionTarget>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConversationAggregateMutationRecord {
+    pub before: ConversationRecordV2,
+    pub after: ConversationRecordV2,
+    pub event: ConversationEventRecordV2,
 }
 
 #[derive(Debug, Clone)]
@@ -359,6 +367,8 @@ pub struct ConversationRepository {
     bootstrap_duration_ms: u64,
     #[cfg(test)]
     fail_next_workspace_replace: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    fail_agent_binding_appends_remaining: std::sync::atomic::AtomicUsize,
 }
 
 impl ConversationRepository {
@@ -546,6 +556,8 @@ impl ConversationRepository {
             bootstrap_duration_ms: report.duration_ms,
             #[cfg(test)]
             fail_next_workspace_replace: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fail_agent_binding_appends_remaining: std::sync::atomic::AtomicUsize::new(0),
         });
         log::info!(
             "[conversation-repository] open complete root={} valid_count={} recovery_item_count={} scanned_event_count={} sparse_index_entry_count={} retained_payload_bytes={} duration_ms={}",
@@ -643,6 +655,12 @@ impl ConversationRepository {
     pub(crate) fn fail_next_workspace_replace(&self) {
         self.fail_next_workspace_replace
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_agent_binding_appends(&self, count: usize) {
+        self.fail_agent_binding_appends_remaining
+            .store(count, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(crate) fn workspace_lock(&self, conversation_id: ConversationId) -> Arc<TokioMutex<()>> {
@@ -1405,6 +1423,211 @@ impl ConversationRepository {
         Ok(event)
     }
 
+    pub(crate) async fn attach_project_cas(
+        self: &Arc<Self>,
+        permit: &RepositoryWritePermit,
+        conversation_id: ConversationId,
+        expected_revision: u64,
+        attachment: ProjectAttachment,
+        recorded_at_utc: DateTime<Utc>,
+    ) -> Result<ConversationAggregateMutationRecord> {
+        self.validate_write_permit(permit, conversation_id, "attach_project")?;
+        let _guard = self.lifecycle_lock(conversation_id).await;
+        let before = self.ensure_expected_revision_locked(
+            conversation_id,
+            expected_revision,
+            "attach_project",
+        )?;
+        ensure_ready_aggregate(&before, "attach_project")?;
+        validate_project_attachment_input(&attachment, conversation_id, "attach_project")?;
+        validate_execution_target_input(
+            &before.execution_target,
+            Some(&attachment),
+            conversation_id,
+            "attach_project",
+        )?;
+        if before.project_attachment.is_some() {
+            return Err(repository_error(
+                ConversationErrorCode::ConversationConflict,
+                "attach_project",
+                Some(conversation_id),
+                "Conversation already has a project attachment".to_string(),
+            ));
+        }
+        let event = self.append_event_locked(
+            conversation_id,
+            recorded_at_utc,
+            ConversationEventType::ProjectAttached,
+            serde_json::to_value(ProjectAttachmentEventPayloadV1 { attachment }).map_err(
+                |error| {
+                    repository_error(
+                        ConversationErrorCode::ValidationError,
+                        "attach_project",
+                        Some(conversation_id),
+                        error.to_string(),
+                    )
+                },
+            )?,
+        )?;
+        let after = self.aggregate_after(&before, "attach_project")?;
+        self.flush_catalog_best_effort().await;
+        log::info!(
+            "[conversation-repository] aggregate mutation operation=attach_project conversation_id={} previous_revision={} revision={} code=OK",
+            conversation_id,
+            before.last_seq,
+            after.last_seq
+        );
+        Ok(ConversationAggregateMutationRecord {
+            before,
+            after,
+            event,
+        })
+    }
+
+    pub(crate) async fn detach_project_cas(
+        self: &Arc<Self>,
+        permit: &RepositoryWritePermit,
+        conversation_id: ConversationId,
+        expected_revision: u64,
+        recorded_at_utc: DateTime<Utc>,
+    ) -> Result<ConversationAggregateMutationRecord> {
+        self.validate_write_permit(permit, conversation_id, "detach_project")?;
+        let _guard = self.lifecycle_lock(conversation_id).await;
+        let before = self.ensure_expected_revision_locked(
+            conversation_id,
+            expected_revision,
+            "detach_project",
+        )?;
+        ensure_ready_aggregate(&before, "detach_project")?;
+        if !matches!(before.execution_target, ExecutionTarget::Workspace) {
+            return Err(repository_error(
+                ConversationErrorCode::ValidationError,
+                "detach_project",
+                Some(conversation_id),
+                "switch executionTarget to workspace before detaching its project".to_string(),
+            ));
+        }
+        let attachment = before.project_attachment.clone().ok_or_else(|| {
+            repository_error(
+                ConversationErrorCode::ConversationConflict,
+                "detach_project",
+                Some(conversation_id),
+                "Conversation has no project attachment".to_string(),
+            )
+        })?;
+        let event = self.append_event_locked(
+            conversation_id,
+            recorded_at_utc,
+            ConversationEventType::ProjectDetached,
+            serde_json::to_value(ProjectAttachmentEventPayloadV1 { attachment }).map_err(
+                |error| {
+                    repository_error(
+                        ConversationErrorCode::ValidationError,
+                        "detach_project",
+                        Some(conversation_id),
+                        error.to_string(),
+                    )
+                },
+            )?,
+        )?;
+        let after = self.aggregate_after(&before, "detach_project")?;
+        self.flush_catalog_best_effort().await;
+        log::info!(
+            "[conversation-repository] aggregate mutation operation=detach_project conversation_id={} previous_revision={} revision={} code=OK",
+            conversation_id,
+            before.last_seq,
+            after.last_seq
+        );
+        Ok(ConversationAggregateMutationRecord {
+            before,
+            after,
+            event,
+        })
+    }
+
+    pub(crate) async fn update_execution_target_cas(
+        self: &Arc<Self>,
+        permit: &RepositoryWritePermit,
+        conversation_id: ConversationId,
+        expected_revision: u64,
+        execution_target: ExecutionTarget,
+        recorded_at_utc: DateTime<Utc>,
+    ) -> Result<ConversationAggregateMutationRecord> {
+        self.validate_write_permit(permit, conversation_id, "update_execution_target")?;
+        let _guard = self.lifecycle_lock(conversation_id).await;
+        let before = self.ensure_expected_revision_locked(
+            conversation_id,
+            expected_revision,
+            "update_execution_target",
+        )?;
+        ensure_ready_aggregate(&before, "update_execution_target")?;
+        validate_execution_target_input(
+            &execution_target,
+            before.project_attachment.as_ref(),
+            conversation_id,
+            "update_execution_target",
+        )?;
+        if before.execution_target == execution_target {
+            return Err(repository_error(
+                ConversationErrorCode::ConversationConflict,
+                "update_execution_target",
+                Some(conversation_id),
+                "executionTarget is already current".to_string(),
+            ));
+        }
+        let event = self.append_event_locked(
+            conversation_id,
+            recorded_at_utc,
+            ConversationEventType::ExecutionTargetUpdated,
+            serde_json::to_value(ExecutionTargetEventPayloadV1 { execution_target }).map_err(
+                |error| {
+                    repository_error(
+                        ConversationErrorCode::ValidationError,
+                        "update_execution_target",
+                        Some(conversation_id),
+                        error.to_string(),
+                    )
+                },
+            )?,
+        )?;
+        let after = self.aggregate_after(&before, "update_execution_target")?;
+        self.flush_catalog_best_effort().await;
+        log::info!(
+            "[conversation-repository] aggregate mutation operation=update_execution_target conversation_id={} previous_revision={} revision={} target_kind={} code=OK",
+            conversation_id,
+            before.last_seq,
+            after.last_seq,
+            execution_target_kind(&after.execution_target)
+        );
+        Ok(ConversationAggregateMutationRecord {
+            before,
+            after,
+            event,
+        })
+    }
+
+    fn aggregate_after(
+        &self,
+        before: &ConversationRecordV2,
+        operation: &'static str,
+    ) -> Result<ConversationRecordV2> {
+        let after = self.get_conversation(before.conversation_id)?;
+        if immutable_identity(before) != immutable_identity(&after) {
+            log::error!(
+                "[conversation-repository] immutable aggregate identity changed operation={} conversation_id={} code=CONVERSATION_RECOVERY_REQUIRED",
+                operation,
+                before.conversation_id
+            );
+            return Err(repository_error(
+                ConversationErrorCode::ConversationRecoveryRequired,
+                operation,
+                Some(before.conversation_id),
+                "aggregate mutation changed immutable Conversation identity".to_string(),
+            ));
+        }
+        Ok(after)
+    }
+
     pub(crate) async fn write_provenance(
         self: &Arc<Self>,
         permit: &RepositoryWritePermit,
@@ -1562,31 +1785,15 @@ impl ConversationRepository {
         &self,
         permit: &RepositoryWritePermit,
         conversation_id: ConversationId,
-    ) {
-        if let Err(error) =
-            self.validate_write_permit(permit, conversation_id, "lifecycle_recovery")
-        {
-            log::error!(
-                "[conversation-repository] lifecycle recovery bypass rejected conversation_id={} code={}",
-                conversation_id,
-                stable_code(error.code)
-            );
-            return;
-        }
-        if self
-            .check_recovery(conversation_id, "lifecycle_recovery")
-            .is_err()
-        {
-            return;
-        }
-        let Some(mut record) = self
+    ) -> Result<ConversationRecordV2> {
+        self.validate_write_permit(permit, conversation_id, "lifecycle_recovery")?;
+        self.check_recovery(conversation_id, "lifecycle_recovery")?;
+        let mut record = self
             .states
             .lock()
             .get(&conversation_id)
             .map(|state| state.record.clone())
-        else {
-            return;
-        };
+            .ok_or_else(|| not_found("lifecycle_recovery", conversation_id))?;
         record.lifecycle_state = ConversationLifecycleState::RecoveryRequired;
         self.states
             .lock()
@@ -1600,7 +1807,9 @@ impl ConversationRepository {
                 conversation_id,
                 stable_code(error.code)
             );
+            return Err(error);
         }
+        Ok(record)
     }
 
     fn append_event_locked(
@@ -1611,6 +1820,28 @@ impl ConversationRepository {
         payload: Value,
     ) -> Result<ConversationEventRecordV2> {
         self.check_recovery(conversation_id, "append_event")?;
+        #[cfg(test)]
+        if matches!(
+            type_,
+            ConversationEventType::BindingBound
+                | ConversationEventType::BindingReplaced
+                | ConversationEventType::CreationFailed
+        ) && self
+            .fail_agent_binding_appends_remaining
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |remaining| remaining.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Err(repository_error(
+                ConversationErrorCode::ConversationDurabilityFailed,
+                "append_event",
+                Some(conversation_id),
+                "injected agent binding append failure".to_string(),
+            ));
+        }
         let stream = type_.stream();
         let (record, mut frontier, expected_stream_bytes) = self
             .states
@@ -1725,6 +1956,9 @@ impl ConversationRepository {
             state.record.last_seq = seq;
             if scan.frontier.attachment.has_events {
                 state.record.project_attachment = scan.frontier.attachment.current.clone();
+            }
+            if let Some(execution_target) = &scan.frontier.execution_target {
+                state.record.execution_target = execution_target.clone();
             }
             if let Some(lifecycle_state) = scan.frontier.lifecycle_state {
                 state.record.lifecycle_state = lifecycle_state;
@@ -1891,6 +2125,227 @@ impl ConversationRepository {
                 );
             }
         }
+    }
+}
+
+fn immutable_identity(
+    record: &ConversationRecordV2,
+) -> (
+    ConversationId,
+    DateTime<Utc>,
+    crate::conversation::CreationPartition,
+    String,
+) {
+    (
+        record.conversation_id,
+        record.created_at_utc,
+        record.creation_partition.clone(),
+        record.workspace_cwd.clone(),
+    )
+}
+
+fn ensure_ready_aggregate(record: &ConversationRecordV2, operation: &'static str) -> Result<()> {
+    if record.lifecycle_state == ConversationLifecycleState::Ready {
+        return Ok(());
+    }
+    let code = if matches!(
+        record.lifecycle_state,
+        ConversationLifecycleState::RecoveryRequired | ConversationLifecycleState::Deleted
+    ) {
+        ConversationErrorCode::ConversationRecoveryRequired
+    } else {
+        ConversationErrorCode::ValidationError
+    };
+    Err(repository_error(
+        code,
+        operation,
+        Some(record.conversation_id),
+        "only ready Conversations admit attachment or execution-target mutations".to_string(),
+    ))
+}
+
+fn validate_project_attachment_input(
+    attachment: &ProjectAttachment,
+    conversation_id: ConversationId,
+    operation: &'static str,
+) -> Result<()> {
+    if attachment.schema_version != PROJECT_ATTACHMENT_SCHEMA_VERSION
+        || attachment.project_id.trim().is_empty()
+        || attachment.project_id != attachment.project_id.trim()
+    {
+        return Err(repository_error(
+            ConversationErrorCode::ValidationError,
+            operation,
+            Some(conversation_id),
+            "project attachment has an invalid schema or projectId".to_string(),
+        ));
+    }
+    validate_canonical_directory(
+        &attachment.project_path_snapshot,
+        "projectPathSnapshot",
+        conversation_id,
+        operation,
+    )?;
+    match (&attachment.worktree_path, &attachment.worktree_branch) {
+        (None, None) => Ok(()),
+        (Some(path), Some(branch)) if !branch.trim().is_empty() && branch == branch.trim() => {
+            validate_canonical_directory(path, "worktreePath", conversation_id, operation)
+        }
+        _ => Err(repository_error(
+            ConversationErrorCode::ValidationError,
+            operation,
+            Some(conversation_id),
+            "worktreePath and worktreeBranch must either both be present or both be absent"
+                .to_string(),
+        )),
+    }
+}
+
+fn validate_execution_target_input(
+    target: &ExecutionTarget,
+    attachment: Option<&ProjectAttachment>,
+    conversation_id: ConversationId,
+    operation: &'static str,
+) -> Result<()> {
+    match target {
+        ExecutionTarget::Workspace => Ok(()),
+        ExecutionTarget::ProjectRoot {
+            project_id,
+            project_root,
+        } => {
+            let attachment =
+                matching_attachment(attachment, project_id, conversation_id, operation)?;
+            validate_canonical_directory(project_root, "projectRoot", conversation_id, operation)?;
+            if project_root != &attachment.project_path_snapshot {
+                return Err(repository_error(
+                    ConversationErrorCode::ValidationError,
+                    operation,
+                    Some(conversation_id),
+                    "projectRoot must match the attached project path snapshot".to_string(),
+                ));
+            }
+            Ok(())
+        }
+        ExecutionTarget::Worktree {
+            project_id,
+            worktree_path,
+            worktree_branch,
+        } => {
+            let attachment =
+                matching_attachment(attachment, project_id, conversation_id, operation)?;
+            if worktree_branch.trim().is_empty() || worktree_branch != worktree_branch.trim() {
+                return Err(repository_error(
+                    ConversationErrorCode::ValidationError,
+                    operation,
+                    Some(conversation_id),
+                    "worktreeBranch must be non-empty and trimmed".to_string(),
+                ));
+            }
+            validate_canonical_directory(
+                worktree_path,
+                "worktreePath",
+                conversation_id,
+                operation,
+            )?;
+            if let Some(attached_path) = &attachment.worktree_path {
+                if attached_path != worktree_path
+                    || attachment.worktree_branch.as_deref() != Some(worktree_branch.as_str())
+                {
+                    return Err(repository_error(
+                        ConversationErrorCode::ValidationError,
+                        operation,
+                        Some(conversation_id),
+                        "worktree target does not match the attached worktree snapshot".to_string(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn matching_attachment<'a>(
+    attachment: Option<&'a ProjectAttachment>,
+    project_id: &str,
+    conversation_id: ConversationId,
+    operation: &'static str,
+) -> Result<&'a ProjectAttachment> {
+    if project_id.trim().is_empty() || project_id != project_id.trim() {
+        return Err(repository_error(
+            ConversationErrorCode::ValidationError,
+            operation,
+            Some(conversation_id),
+            "execution target projectId must be non-empty and trimmed".to_string(),
+        ));
+    }
+    attachment
+        .filter(|attachment| attachment.project_id == project_id)
+        .ok_or_else(|| {
+            repository_error(
+                ConversationErrorCode::ValidationError,
+                operation,
+                Some(conversation_id),
+                "execution target projectId does not match the current project attachment"
+                    .to_string(),
+            )
+        })
+}
+
+fn validate_canonical_directory(
+    value: &str,
+    field: &str,
+    conversation_id: ConversationId,
+    operation: &'static str,
+) -> Result<()> {
+    let path = Path::new(value);
+    if value.trim().is_empty() || value != value.trim() || !path.is_absolute() {
+        return Err(repository_error(
+            ConversationErrorCode::ValidationError,
+            operation,
+            Some(conversation_id),
+            format!("{field} must be a trimmed absolute directory path"),
+        ));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|_| {
+        repository_error(
+            ConversationErrorCode::ValidationError,
+            operation,
+            Some(conversation_id),
+            format!("{field} must reference an existing directory"),
+        )
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(repository_error(
+            ConversationErrorCode::ValidationError,
+            operation,
+            Some(conversation_id),
+            format!("{field} must reference a non-symlink directory"),
+        ));
+    }
+    let canonical = fs::canonicalize(path).map_err(|_| {
+        repository_error(
+            ConversationErrorCode::ValidationError,
+            operation,
+            Some(conversation_id),
+            format!("{field} cannot be canonicalized"),
+        )
+    })?;
+    if canonical != path {
+        return Err(repository_error(
+            ConversationErrorCode::ValidationError,
+            operation,
+            Some(conversation_id),
+            format!("{field} must use its canonical path without traversal or link aliases"),
+        ));
+    }
+    Ok(())
+}
+
+fn execution_target_kind(target: &ExecutionTarget) -> &'static str {
+    match target {
+        ExecutionTarget::Workspace => "workspace",
+        ExecutionTarget::ProjectRoot { .. } => "project_root",
+        ExecutionTarget::Worktree { .. } => "worktree",
     }
 }
 

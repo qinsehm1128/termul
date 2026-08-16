@@ -168,7 +168,10 @@ export const WS_REQUEST_TYPES = [
   'resolve_legacy_conversation_id',
   'get_session_workspace',
   'write_session_workspace',
-  'resolve_recovery_item'
+  'resolve_recovery_item',
+  'attach_project',
+  'detach_project',
+  'update_execution_target'
 ] as const
 
 /** Union of all WS request `type` strings. */
@@ -222,7 +225,8 @@ export const CONVERSATION_APPLICATION_ERROR_CODES = [
   'SESSION_WORKSPACE_UNAVAILABLE',
   'LEGACY_ID_AMBIGUOUS',
   'LEGACY_COMPATIBILITY_READ_ONLY',
-  'CONVERSATION_SERVICE_UNAVAILABLE'
+  'CONVERSATION_SERVICE_UNAVAILABLE',
+  'ACP_COMPENSATION_FAILED'
 ] as const
 
 export type ConversationApplicationErrorCode = (typeof CONVERSATION_APPLICATION_ERROR_CODES)[number]

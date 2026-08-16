@@ -120,7 +120,9 @@ export const CONVERSATION_ERROR_CODES = [
   'CONVERSATION_BINDING_NOT_ADDRESSABLE',
   'CONVERSATION_LIVE_RESOURCES',
   'CONVERSATION_RECOVERY_REQUIRED',
-  'CONVERSATION_DURABILITY_UNSUPPORTED'
+  'CONVERSATION_DURABILITY_UNSUPPORTED',
+  'LEGACY_COMPATIBILITY_READ_ONLY',
+  'VALIDATION_ERROR'
 ] as const
 
 export type ConversationErrorCode = (typeof CONVERSATION_ERROR_CODES)[number]
@@ -137,4 +139,43 @@ export interface ConversationRecordV2 {
   lifecycleState: ConversationLifecycleState
   lastSeq: number
   createdBy: 'termul'
+}
+
+export type ConversationAggregateMutationAction =
+  | 'attachProject'
+  | 'detachProject'
+  | 'updateExecutionTarget'
+
+export interface ConversationIdentitySnapshot {
+  conversationId: ConversationId
+  createdAtUtc: string
+  creationPartition: CreationPartition
+  workspaceCwd: string
+}
+
+export interface ConversationAttachProjectRequest {
+  expectedRevision: number
+  attachment: ProjectAttachment
+}
+
+export interface ConversationDetachProjectRequest {
+  expectedRevision: number
+}
+
+export interface ConversationUpdateExecutionTargetRequest {
+  expectedRevision: number
+  executionTarget: ExecutionTarget
+}
+
+export interface ConversationAggregateMutationOutcome {
+  status: 'updated'
+  action: ConversationAggregateMutationAction
+  conversationId: ConversationId
+  previousRevision: number
+  revision: number
+  identityBefore: ConversationIdentitySnapshot
+  identityAfter: ConversationIdentitySnapshot
+  projectAttachment: ProjectAttachment | null
+  executionTarget: ExecutionTarget
+  conversation: ConversationRecordV2
 }

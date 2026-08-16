@@ -1164,7 +1164,10 @@ async fn handle_request_with_conversation(
         | "resolve_legacy_conversation_id"
         | "get_session_workspace"
         | "write_session_workspace"
-        | "resolve_recovery_item" => {
+        | "resolve_recovery_item"
+        | "attach_project"
+        | "detach_project"
+        | "update_execution_target" => {
             handle_conversation_application(
                 id,
                 &req.type_,
@@ -1764,6 +1767,13 @@ async fn handle_open_persisted_session(
 /// failures (`"agent does not support …"`) → `Unsupported`. Unrecognized
 /// errors fall back to `NotImplemented` (preserves the human message verbatim).
 fn acp_err_to_reply(id: String, err: String) -> WsReply {
+    if let Some(failure) = crate::conversation::AgentCompensationFailure::from_wire_error(&err) {
+        return WsReply::err_with_code(
+            id,
+            crate::conversation::ACP_COMPENSATION_FAILED,
+            failure.wire_detail(),
+        );
+    }
     if let Some(code) = map_prompt_error_code(&err) {
         return WsReply::err(id, code, err);
     }
@@ -1801,6 +1811,9 @@ fn is_conversation_request(type_: &str) -> bool {
             | "get_session_workspace"
             | "write_session_workspace"
             | "resolve_recovery_item"
+            | "attach_project"
+            | "detach_project"
+            | "update_execution_target"
             | "detach_binding"
             | "rebind_binding"
             | "suspend_binding"
@@ -1821,6 +1834,29 @@ struct ConversationWorkspaceWriteWsPayload {
     conversation_id: String,
     based_revision: Option<u64>,
     workspace: crate::conversation::SessionWorkspaceV1,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConversationAttachProjectWsPayload {
+    conversation_id: String,
+    expected_revision: u64,
+    attachment: crate::conversation::ProjectAttachment,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConversationDetachProjectWsPayload {
+    conversation_id: String,
+    expected_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConversationUpdateExecutionTargetWsPayload {
+    conversation_id: String,
+    expected_revision: u64,
+    execution_target: crate::conversation::ExecutionTarget,
 }
 
 async fn handle_conversation_application(
@@ -1928,6 +1964,98 @@ async fn handle_conversation_application(
             };
             match service
                 .write_workspace(conversation_id, request.based_revision, request.workspace)
+                .await
+            {
+                Ok(value) => ok_with_payload(id, &value),
+                Err(error) => WsReply::err_with_code(id, error.code, error.detail),
+            }
+        }
+        "attach_project" => {
+            let request: ConversationAttachProjectWsPayload =
+                match serde_json::from_value(payload.clone()) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return WsReply::err_with_code(
+                            id,
+                            "VALIDATION_ERROR",
+                            format!("malformed attach project payload: {error}"),
+                        )
+                    }
+                };
+            let conversation_id = match crate::conversation::ConversationId::parse_path_component(
+                &request.conversation_id,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    return WsReply::err_with_code(id, "CONVERSATION_INVALID_ID", error.to_string())
+                }
+            };
+            match service
+                .attach_project(
+                    conversation_id,
+                    request.expected_revision,
+                    request.attachment,
+                )
+                .await
+            {
+                Ok(value) => ok_with_payload(id, &value),
+                Err(error) => WsReply::err_with_code(id, error.code, error.detail),
+            }
+        }
+        "detach_project" => {
+            let request: ConversationDetachProjectWsPayload =
+                match serde_json::from_value(payload.clone()) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return WsReply::err_with_code(
+                            id,
+                            "VALIDATION_ERROR",
+                            format!("malformed detach project payload: {error}"),
+                        )
+                    }
+                };
+            let conversation_id = match crate::conversation::ConversationId::parse_path_component(
+                &request.conversation_id,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    return WsReply::err_with_code(id, "CONVERSATION_INVALID_ID", error.to_string())
+                }
+            };
+            match service
+                .detach_project(conversation_id, request.expected_revision)
+                .await
+            {
+                Ok(value) => ok_with_payload(id, &value),
+                Err(error) => WsReply::err_with_code(id, error.code, error.detail),
+            }
+        }
+        "update_execution_target" => {
+            let request: ConversationUpdateExecutionTargetWsPayload =
+                match serde_json::from_value(payload.clone()) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return WsReply::err_with_code(
+                            id,
+                            "VALIDATION_ERROR",
+                            format!("malformed execution target payload: {error}"),
+                        )
+                    }
+                };
+            let conversation_id = match crate::conversation::ConversationId::parse_path_component(
+                &request.conversation_id,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    return WsReply::err_with_code(id, "CONVERSATION_INVALID_ID", error.to_string())
+                }
+            };
+            match service
+                .update_execution_target(
+                    conversation_id,
+                    request.expected_revision,
+                    request.execution_target,
+                )
                 .await
             {
                 Ok(value) => ok_with_payload(id, &value),

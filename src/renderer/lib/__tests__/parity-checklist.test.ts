@@ -132,7 +132,10 @@ const P0_DOMAINS: DomainCheck[] = [
       'listConversations',
       'getConversation',
       'openConversation',
-      'resolveLegacyConversationId'
+      'resolveLegacyConversationId',
+      'attachProject',
+      'detachProject',
+      'updateExecutionTarget'
     ],
     apiBridgeExport: 'conversationApi',
     testFile: 'conversation-parity-golden.test.ts'

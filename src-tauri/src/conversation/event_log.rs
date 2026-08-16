@@ -20,7 +20,8 @@ use uuid::Uuid;
 use crate::conversation::contracts::{
     format_created_at_utc, parse_created_at_utc, AgentSessionBinding, AgentSessionBindingState,
     ConversationErrorCode, ConversationId, ConversationLifecycleState, ConversationTitleSource,
-    ProjectAttachment, AGENT_SESSION_BINDING_SCHEMA_VERSION, PROJECT_ATTACHMENT_SCHEMA_VERSION,
+    ExecutionTarget, ProjectAttachment, AGENT_SESSION_BINDING_SCHEMA_VERSION,
+    PROJECT_ATTACHMENT_SCHEMA_VERSION,
 };
 use crate::conversation::durable_fs::DurableFileSystem;
 
@@ -76,6 +77,7 @@ pub enum ConversationEventType {
     BindingReplaced,
     ProjectAttached,
     ProjectDetached,
+    ExecutionTargetUpdated,
     CreationFailed,
 }
 
@@ -89,7 +91,9 @@ impl ConversationEventType {
             | Self::BindingRebound
             | Self::BindingSuspended
             | Self::BindingReplaced => ConversationEventStream::Bindings,
-            Self::ProjectAttached | Self::ProjectDetached => ConversationEventStream::Attachments,
+            Self::ProjectAttached | Self::ProjectDetached | Self::ExecutionTargetUpdated => {
+                ConversationEventStream::Attachments
+            }
             Self::UserPrompt
             | Self::MessageChunk
             | Self::SessionInfoUpdate
@@ -175,6 +179,12 @@ pub struct ProjectAttachmentEventPayloadV1 {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionTargetEventPayloadV1 {
+    pub execution_target: ExecutionTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EventLogRepairWarning {
     pub conversation_id: ConversationId,
     pub stream: String,
@@ -195,6 +205,7 @@ pub struct ConversationSummaryFrontier {
 pub struct ConversationFrontier {
     pub binding: BindingMaterialization,
     pub attachment: AttachmentMaterialization,
+    pub execution_target: Option<ExecutionTarget>,
     pub summary: ConversationSummaryFrontier,
     pub lifecycle_state: Option<ConversationLifecycleState>,
     pub last_seq: u64,
@@ -517,6 +528,7 @@ pub fn apply_event(
 
     apply_binding_event(&mut frontier.binding, record, path)?;
     apply_attachment_event(&mut frontier.attachment, record, path)?;
+    apply_execution_target_event(&mut frontier.execution_target, record, path)?;
     apply_summary_event(&mut frontier.summary, record)?;
     match record.type_ {
         ConversationEventType::CreationFailed => {
@@ -1414,6 +1426,61 @@ fn apply_attachment_event(
     }
     materialized.has_events = true;
     Ok(())
+}
+
+fn apply_execution_target_event(
+    materialized: &mut Option<ExecutionTarget>,
+    record: &ConversationEventRecordV2,
+    path: &Path,
+) -> Result<()> {
+    if record.type_ != ConversationEventType::ExecutionTargetUpdated {
+        return Ok(());
+    }
+    let payload: ExecutionTargetEventPayloadV1 = serde_json::from_value(record.payload.clone())
+        .map_err(|source| {
+            attachment_history_error(
+                record.conversation_id,
+                path,
+                record.seq,
+                &format!("invalid execution_target_updated payload: {source}"),
+            )
+        })?;
+    validate_execution_target_snapshot(&payload.execution_target, record, path)?;
+    *materialized = Some(payload.execution_target);
+    Ok(())
+}
+
+fn validate_execution_target_snapshot(
+    target: &ExecutionTarget,
+    record: &ConversationEventRecordV2,
+    path: &Path,
+) -> Result<()> {
+    let valid = match target {
+        ExecutionTarget::Workspace => true,
+        ExecutionTarget::ProjectRoot {
+            project_id,
+            project_root,
+        } => !project_id.trim().is_empty() && !project_root.trim().is_empty(),
+        ExecutionTarget::Worktree {
+            project_id,
+            worktree_path,
+            worktree_branch,
+        } => {
+            !project_id.trim().is_empty()
+                && !worktree_path.trim().is_empty()
+                && !worktree_branch.trim().is_empty()
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(attachment_history_error(
+            record.conversation_id,
+            path,
+            record.seq,
+            "execution target snapshot has empty required fields",
+        ))
+    }
 }
 
 fn apply_summary_event(

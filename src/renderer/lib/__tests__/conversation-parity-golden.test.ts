@@ -1,6 +1,10 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
-import type { ConversationId } from '@shared/types/conversation.types'
+import type {
+  ConversationAggregateMutationOutcome,
+  ConversationId,
+  ProjectAttachment
+} from '@shared/types/conversation.types'
 import { parseConversationId } from '@shared/types/conversation.types'
 import {
   RECOVERY_ACTION_FIXTURES,
@@ -22,6 +26,7 @@ import {
   webConversationApi
 } from '@/lib/conversation-api'
 import {
+  ConversationLifecycleApiError,
   conversationLifecycleApi,
   createConversationLifecycleApi
 } from '@/lib/conversation-lifecycle-api'
@@ -48,6 +53,49 @@ function workspace(conversationId: ConversationId = ID) {
     updatedAtUtc: '',
     resources: [],
     projectionState: { status: 'native' as const }
+  }
+}
+
+const attachment: ProjectAttachment = {
+  schemaVersion: 1,
+  projectId: 'project-1',
+  attachedAtUtc: '2026-08-15T10:00:00.000Z',
+  projectPathSnapshot: '/projects/termul',
+  worktreePath: null,
+  worktreeBranch: null
+}
+
+function aggregateOutcome(
+  action: ConversationAggregateMutationOutcome['action'],
+  previousRevision: number,
+  projectAttachment: ProjectAttachment | null,
+  executionTarget: ConversationAggregateMutationOutcome['executionTarget']
+): ConversationAggregateMutationOutcome {
+  const identity = {
+    conversationId: ID,
+    createdAtUtc: '2026-08-15T09:45:15.123Z',
+    creationPartition: { year: 2026, month: 8, day: 15, path: '2026/08/15' },
+    workspaceCwd: '/visible/conversation'
+  }
+  return {
+    status: 'updated',
+    action,
+    conversationId: ID,
+    previousRevision,
+    revision: previousRevision + 1,
+    identityBefore: identity,
+    identityAfter: identity,
+    projectAttachment,
+    executionTarget,
+    conversation: {
+      schemaVersion: 2,
+      ...identity,
+      projectAttachment,
+      executionTarget,
+      lifecycleState: 'ready',
+      lastSeq: previousRevision + 1,
+      createdBy: 'termul'
+    }
   }
 }
 
@@ -110,6 +158,80 @@ describe('Conversation production transport golden parity', () => {
       code: 'CONVERSATION_RECOVERY_REQUIRED',
       error: 'recovery required'
     })
+  })
+
+  it('pins aggregate mutation commands and authenticated HTTP routes with identical outcomes', async () => {
+    const attached = aggregateOutcome('attachProject', 4, attachment, { kind: 'workspace' })
+    const target = {
+      kind: 'project_root' as const,
+      projectId: attachment.projectId,
+      projectRoot: attachment.projectPathSnapshot
+    }
+    const retargeted = aggregateOutcome('updateExecutionTarget', 5, attachment, target)
+    const detached = aggregateOutcome('detachProject', 6, null, { kind: 'workspace' })
+    vi.mocked(invoke).mockImplementation(async (command, args) => {
+      if (command === 'conversation_attach_project') {
+        expect(args).toEqual({ conversationId: ID, expectedRevision: 4, attachment })
+        return { success: true, data: attached }
+      }
+      if (command === 'conversation_update_execution_target') {
+        expect(args).toEqual({ conversationId: ID, expectedRevision: 5, executionTarget: target })
+        return { success: true, data: retargeted }
+      }
+      if (command === 'conversation_detach_project') {
+        expect(args).toEqual({ conversationId: ID, expectedRevision: 6 })
+        return { success: true, data: detached }
+      }
+      throw new Error(`unexpected command ${command}`)
+    })
+
+    await expect(tauriConversationApi.attachProject(ID, 4, attachment)).resolves.toEqual({
+      success: true,
+      data: attached
+    })
+    await expect(tauriConversationApi.updateExecutionTarget(ID, 5, target)).resolves.toEqual({
+      success: true,
+      data: retargeted
+    })
+    await expect(tauriConversationApi.detachProject(ID, 6)).resolves.toEqual({
+      success: true,
+      data: detached
+    })
+
+    window.history.replaceState(null, '', `/#access_token=${ACCESS_TOKEN}`)
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      expect(new Headers(init?.headers).get('authorization')).toBe(`Bearer ${ACCESS_TOKEN}`)
+      expect(init?.method).toBe('POST')
+      const url = String(input)
+      if (url.endsWith(`/conversations/${ID}/attach-project`)) {
+        expect(init?.body).toBe(JSON.stringify({ expectedRevision: 4, attachment }))
+        return response({ success: true, data: attached })
+      }
+      if (url.endsWith(`/conversations/${ID}/execution-target`)) {
+        expect(init?.body).toBe(JSON.stringify({ expectedRevision: 5, executionTarget: target }))
+        return response({ success: true, data: retargeted })
+      }
+      if (url.endsWith(`/conversations/${ID}/detach-project`)) {
+        expect(init?.body).toBe(JSON.stringify({ expectedRevision: 6 }))
+        return response({ success: true, data: detached })
+      }
+      throw new Error(`unexpected request ${url}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(webConversationApi.attachProject(ID, 4, attachment)).resolves.toEqual({
+      success: true,
+      data: attached
+    })
+    await expect(webConversationApi.updateExecutionTarget(ID, 5, target)).resolves.toEqual({
+      success: true,
+      data: retargeted
+    })
+    await expect(webConversationApi.detachProject(ID, 6)).resolves.toEqual({
+      success: true,
+      data: detached
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(3)
   })
 
   it('routes the production web compatibility facade through exact specialized singletons', async () => {
@@ -334,6 +456,7 @@ describe('Conversation production transport golden parity', () => {
       'CONVERSATION_BINDING_NOT_DETACHED',
       'CONVERSATION_BINDING_NOT_ADDRESSABLE',
       'CONVERSATION_DURABILITY_FAILED',
+      'ACP_COMPENSATION_FAILED',
       'LEGACY_COMPATIBILITY_READ_ONLY',
       'LEGACY_ID_AMBIGUOUS',
       'MIGRATION_IDEMPOTENCY_CONFLICT',
@@ -350,6 +473,22 @@ describe('Conversation production transport golden parity', () => {
     }
   })
 
+  it('parses actionable compensation receipts without exposing provider detail', () => {
+    const receipt = {
+      conversationId: ID,
+      primaryCode: 'CONVERSATION_DURABILITY_FAILED',
+      providerCloseCode: 'ACP_CLOSE_FAILED',
+      failureRecordCode: 'CONVERSATION_DURABILITY_FAILED',
+      recoveryId: 'a'.repeat(64)
+    }
+    const error = new ConversationLifecycleApiError(
+      'ACP_COMPENSATION_FAILED',
+      JSON.stringify(receipt)
+    )
+    expect(error.compensation).toEqual(receipt)
+    expect(error.message).not.toContain('SUPER_SECRET')
+  })
+
   it('keeps the compatibility facade as zero-logic delegation', async () => {
     const core = {
       getHostStatus: vi.fn(),
@@ -357,6 +496,9 @@ describe('Conversation production transport golden parity', () => {
       getConversation: vi.fn(),
       openConversation: vi.fn(),
       resolveLegacyConversationId: vi.fn(),
+      attachProject: vi.fn(),
+      detachProject: vi.fn(),
+      updateExecutionTarget: vi.fn(),
       subscribeHostStatus: vi.fn()
     }
     const workspaces = {
@@ -375,7 +517,13 @@ describe('Conversation production transport golden parity', () => {
     const facade = createConversationFacadeApi(core, workspaces, lifecycle)
 
     await facade.listConversations()
+    await facade.attachProject(ID, 4, attachment)
+    await facade.detachProject(ID, 5)
+    await facade.updateExecutionTarget(ID, 6, { kind: 'workspace' })
     expect(core.listConversations).toHaveBeenCalledTimes(1)
+    expect(core.attachProject).toHaveBeenCalledWith(ID, 4, attachment)
+    expect(core.detachProject).toHaveBeenCalledWith(ID, 5)
+    expect(core.updateExecutionTarget).toHaveBeenCalledWith(ID, 6, { kind: 'workspace' })
     expect(workspaces.getWorkspace).not.toHaveBeenCalled()
     expect(lifecycle.deleteConversation).not.toHaveBeenCalled()
   })

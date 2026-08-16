@@ -26,7 +26,8 @@
     "errors": {
       "projectRequired": "Select a project for this target.",
       "projectRootRequired": "The selected project needs a root path.",
-      "worktreeBranchRequired": "Select a base branch or existing worktree."
+      "worktreeBranchRequired": "Select a base branch or existing worktree.",
+      "projectAttachmentRequired": "Attach the project context before selecting or detaching a project target."
     }
   },
   "identity": {
@@ -40,6 +41,19 @@
     "detach": "Detach project context",
     "attached": "Attached project: {{projectId}}",
     "none": "No project attachment"
+  },
+  "mutation": {
+    "saving": "Saving Conversation changes…",
+    "saved": {
+      "target": "Execution target updated. Conversation identity and workspace are unchanged.",
+      "attached": "Project context attached. Conversation identity and workspace are unchanged.",
+      "detached": "Project context detached. Conversation identity and workspace are unchanged."
+    },
+    "errors": {
+      "CONVERSATION_CONFLICT": "This Conversation changed elsewhere. Reopen it and try again.",
+      "VALIDATION_ERROR": "The selected project or execution target is not valid.",
+      "CONVERSATION_RECOVERY_REQUIRED": "This Conversation requires recovery before it can change."
+    }
   },
   "recovery": {
     "title": "Conversation recovery",

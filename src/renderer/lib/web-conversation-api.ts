@@ -1,7 +1,10 @@
 import {
+  type ConversationAggregateMutationOutcome,
   type ConversationId,
   type ConversationRecordV2,
-  isConversationId
+  type ExecutionTarget,
+  isConversationId,
+  type ProjectAttachment
 } from '@shared/types/conversation.types'
 import type {
   ConversationApi,
@@ -81,6 +84,19 @@ function withConversationId<T>(
   return isConversationId(conversationId) ? operation() : Promise.resolve(invalidConversationId())
 }
 
+function withExpectedRevision<T>(
+  conversationId: ConversationId,
+  expectedRevision: number,
+  operation: () => Promise<IpcResult<T>>
+): Promise<IpcResult<T>> {
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
+    return Promise.resolve(
+      failure('VALIDATION_ERROR', 'expectedRevision must be a non-negative safe integer')
+    )
+  }
+  return withConversationId(conversationId, operation)
+}
+
 export function createWebConversationApi(): ConversationApi {
   return {
     getHostStatus: () => requestJson<ConversationHostStatus>('/conversations/host-status'),
@@ -101,6 +117,38 @@ export function createWebConversationApi(): ConversationApi {
         return Promise.resolve(failure('VALIDATION_ERROR', 'legacy value must be non-empty'))
       }
       return postJson<LegacyConversationResolution>('/conversations/resolve-legacy', request)
+    },
+    attachProject(
+      conversationId: ConversationId,
+      expectedRevision: number,
+      attachment: ProjectAttachment
+    ) {
+      return withExpectedRevision(conversationId, expectedRevision, () =>
+        postJson<ConversationAggregateMutationOutcome>(
+          `/conversations/${encodeURIComponent(conversationId)}/attach-project`,
+          { expectedRevision, attachment }
+        )
+      )
+    },
+    detachProject(conversationId: ConversationId, expectedRevision: number) {
+      return withExpectedRevision(conversationId, expectedRevision, () =>
+        postJson<ConversationAggregateMutationOutcome>(
+          `/conversations/${encodeURIComponent(conversationId)}/detach-project`,
+          { expectedRevision }
+        )
+      )
+    },
+    updateExecutionTarget(
+      conversationId: ConversationId,
+      expectedRevision: number,
+      executionTarget: ExecutionTarget
+    ) {
+      return withExpectedRevision(conversationId, expectedRevision, () =>
+        postJson<ConversationAggregateMutationOutcome>(
+          `/conversations/${encodeURIComponent(conversationId)}/execution-target`,
+          { expectedRevision, executionTarget }
+        )
+      )
     },
     subscribeHostStatus(listener) {
       if (typeof window === 'undefined') return () => undefined

@@ -11,17 +11,19 @@ import {
   RotateCcw,
   Search,
   Settings,
+  SlidersHorizontal,
   TerminalSquare,
   Trash2,
   X
 } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useNavigate } from 'react-router-dom'
 import { useShallow } from 'zustand/shallow'
 import { ConversationLifecycleActions } from '@/components/chat/ChatHistoryEntryRow'
 import { ChatHistoryTab } from '@/components/chat/ChatHistoryTab'
 import { ProjectSwitcherDrawer } from '@/components/chat/ProjectSwitcherDrawer'
+import { ExecutionTargetPicker } from '@/components/conversation/ExecutionTargetPicker'
 import { TermulMark } from '@/components/TermulMark'
 import { Button } from '@/components/ui/button'
 import {
@@ -34,7 +36,7 @@ import {
 import { isTauriContext } from '@/lib/tauri-runtime'
 import { useAcpStore } from '@/stores/acp-store'
 import { useConversationStore } from '@/stores/conversation-store'
-import { useActiveProject } from '@/stores/project-store'
+import { useActiveProject, useProjectStore } from '@/stores/project-store'
 import { useTerminalStore } from '@/stores/terminal-store'
 import { getAllLeafPanes, useWorkspaceStore } from '@/stores/workspace-store'
 import { MobileFileExplorer } from './MobileFileExplorer'
@@ -81,10 +83,12 @@ export function MobileChatShell({
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [projectsOpen, setProjectsOpen] = useState(false)
   const [filesOpen, setFilesOpen] = useState(false)
+  const [targetOpen, setTargetOpen] = useState(false)
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const navigate = useNavigate()
   const activeProject = useActiveProject()
+  const projects = useProjectStore((state) => state.projects)
 
   // Active tab — return the stable Tab object reference held in the store
   // tree. Stable references compare with Object.is, so no `useShallow` is
@@ -120,6 +124,24 @@ export function MobileChatShell({
   }, [workspaceRoot])
 
   const activeConversationId = useConversationStore((state) => state.activeConversationId)
+  const activeConversation = useConversationStore((state) =>
+    activeConversationId ? state.summariesById[activeConversationId] : undefined
+  )
+  const [mobileTarget, setMobileTarget] = useState(
+    activeConversation?.executionTarget ?? {
+      kind: 'workspace' as const
+    }
+  )
+  const [mobileAttachment, setMobileAttachment] = useState(
+    activeConversation?.projectAttachment ?? null
+  )
+
+  useEffect(() => {
+    if (!activeConversation) return
+    setMobileTarget(activeConversation.executionTarget)
+    setMobileAttachment(activeConversation.projectAttachment)
+  }, [activeConversation])
+
   const activeSessionId = useAcpStore((state) => {
     if (activeTab?.type !== 'agent-chat') return null
     if (activeTab.sessionId) return activeTab.sessionId
@@ -285,12 +307,25 @@ export function MobileChatShell({
           </>
         ) : (
           <>
-            {activeConversationId && (
-              <ConversationLifecycleActions
-                conversationId={activeConversationId}
-                title={sessionTitle ?? t('chatShell.chats')}
-                className="size-10 opacity-100 after:inset-0"
-              />
+            {activeConversationId && activeConversation && (
+              <>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="size-10 shrink-0"
+                  aria-label={t('chatShell.executionTarget')}
+                  aria-expanded={targetOpen}
+                  onClick={() => setTargetOpen(true)}
+                >
+                  <SlidersHorizontal size={18} />
+                </Button>
+                <ConversationLifecycleActions
+                  conversationId={activeConversationId}
+                  title={sessionTitle ?? t('chatShell.chats')}
+                  className="size-10 opacity-100 after:inset-0"
+                />
+              </>
             )}
             <Button
               type="button"
@@ -495,6 +530,28 @@ export function MobileChatShell({
           <div className="min-h-0 flex-1 overflow-hidden">
             <ChatHistoryTab onSessionOpened={closeDrawer} />
           </div>
+        </SheetContent>
+      </Sheet>
+
+      <Sheet open={targetOpen} onOpenChange={setTargetOpen}>
+        <SheetContent side="bottom" className="max-h-[85dvh] overflow-y-auto">
+          <SheetHeader className="text-left">
+            <SheetTitle>{t('chatShell.executionTarget')}</SheetTitle>
+            <SheetDescription>{t('chatShell.executionTargetDescription')}</SheetDescription>
+          </SheetHeader>
+          {activeConversation ? (
+            <div className="mt-4">
+              <ExecutionTargetPicker
+                projects={projects}
+                value={mobileTarget}
+                attachment={mobileAttachment}
+                conversation={activeConversation}
+                workspaceCwd={activeConversation.workspaceCwd}
+                onChange={setMobileTarget}
+                onAttachmentChange={setMobileAttachment}
+              />
+            </div>
+          ) : null}
         </SheetContent>
       </Sheet>
 

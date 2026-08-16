@@ -72,7 +72,7 @@ pub async fn acp_new_session(
     project_attachment: Option<crate::conversation::ProjectAttachment>,
     execution_target: Option<crate::conversation::ExecutionTarget>,
 ) -> Result<NewSessionOutcome, String> {
-    manager
+    let result = manager
         .new_session_with_context(
             &agent_id,
             cwd,
@@ -90,7 +90,23 @@ pub async fn acp_new_session(
                 worktree_branch: worktree_branch.filter(|b| !b.trim().is_empty()),
             },
         )
-        .await
+        .await;
+    if let Err(error) = &result {
+        if let Some(failure) = crate::conversation::AgentCompensationFailure::from_wire_error(error)
+        {
+            log::error!(
+                "[acp-command] operation=new_session conversation_id={} code={} primary_code={} provider_close_code={} failure_record_code={} recovery_marker_code={} recovery_record_code={}",
+                failure.conversation_id,
+                crate::conversation::ACP_COMPENSATION_FAILED,
+                failure.primary_code,
+                failure.provider_close_code.as_deref().unwrap_or("OK"),
+                failure.failure_record_code.as_deref().unwrap_or("OK"),
+                failure.recovery_marker_code.as_deref().unwrap_or("OK"),
+                failure.recovery_record_code.as_deref().unwrap_or("OK")
+            );
+        }
+    }
+    result
 }
 
 /// Load an existing session (requires the agent's `loadSession` capability).

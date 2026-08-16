@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::conversation::catalog::ConversationProvenanceFileV1;
 use crate::conversation::contracts::{
     AgentSessionBinding, ConversationErrorCode, ConversationId, ConversationRecordV2,
-    ProjectAttachment,
+    ExecutionTarget, ProjectAttachment,
 };
 use crate::conversation::event_log::{ConversationEventRecordV2, ConversationEventType};
 use crate::conversation::migration::ReaderPrecedence;
@@ -39,6 +39,7 @@ pub enum ConversationMutation {
     BindingReplace,
     ProjectAttachmentAdd,
     ProjectAttachmentDetach,
+    ExecutionTargetUpdate,
     ProvenanceWrite,
     ConversationSync,
     ConversationTombstone,
@@ -55,7 +56,7 @@ pub enum ConversationMutation {
 }
 
 impl ConversationMutation {
-    pub const RUNTIME: [Self; 22] = [
+    pub const RUNTIME: [Self; 23] = [
         Self::CreateConversation,
         Self::CreationRetry,
         Self::CreationRecovery,
@@ -69,6 +70,7 @@ impl ConversationMutation {
         Self::BindingReplace,
         Self::ProjectAttachmentAdd,
         Self::ProjectAttachmentDetach,
+        Self::ExecutionTargetUpdate,
         Self::ProvenanceWrite,
         Self::ConversationSync,
         Self::ConversationTombstone,
@@ -107,6 +109,7 @@ impl ConversationMutation {
             Self::BindingReplace => "binding_replace",
             Self::ProjectAttachmentAdd => "project_attachment_add",
             Self::ProjectAttachmentDetach => "project_attachment_detach",
+            Self::ExecutionTargetUpdate => "execution_target_update",
             Self::ProvenanceWrite => "provenance_write",
             Self::ConversationSync => "conversation_sync",
             Self::ConversationTombstone => "conversation_tombstone",
@@ -435,6 +438,67 @@ impl ConversationWriter {
         )?;
         self.repository
             .detach_project_attachment(&permit, conversation_id, recorded_at_utc)
+            .await
+    }
+
+    pub(crate) async fn update_execution_target(
+        self: &Arc<Self>,
+        conversation_id: ConversationId,
+        expected_revision: u64,
+        execution_target: ExecutionTarget,
+        recorded_at_utc: DateTime<Utc>,
+    ) -> Result<crate::conversation::repository::ConversationAggregateMutationRecord> {
+        let permit = self.authorize(
+            conversation_id,
+            ConversationMutation::ExecutionTargetUpdate,
+        )?;
+        self.repository
+            .update_execution_target_cas(
+                &permit,
+                conversation_id,
+                expected_revision,
+                execution_target,
+                recorded_at_utc,
+            )
+            .await
+    }
+
+    pub(crate) async fn attach_project(
+        self: &Arc<Self>,
+        conversation_id: ConversationId,
+        expected_revision: u64,
+        attachment: ProjectAttachment,
+        recorded_at_utc: DateTime<Utc>,
+    ) -> Result<crate::conversation::repository::ConversationAggregateMutationRecord> {
+        let permit = self.authorize(conversation_id, ConversationMutation::ProjectAttachmentAdd)?;
+        self.repository
+            .attach_project_cas(
+                &permit,
+                conversation_id,
+                expected_revision,
+                attachment,
+                recorded_at_utc,
+            )
+            .await
+    }
+
+    pub(crate) async fn detach_project(
+        self: &Arc<Self>,
+        conversation_id: ConversationId,
+        expected_revision: u64,
+        recorded_at_utc: DateTime<Utc>,
+    ) -> Result<crate::conversation::repository::ConversationAggregateMutationRecord> {
+        let permit = self.authorize(
+            conversation_id,
+            ConversationMutation::ProjectAttachmentDetach,
+        )?;
+        self.repository
+            .detach_project_cas(
+                &permit,
+                conversation_id,
+                expected_revision,
+                recorded_at_utc,
+            )
             .await
     }
 

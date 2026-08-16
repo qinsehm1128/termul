@@ -26,7 +26,8 @@
     "errors": {
       "projectRequired": "请为此目标选择项目。",
       "projectRootRequired": "所选项目需要根目录路径。",
-      "worktreeBranchRequired": "请选择基础分支或现有工作树。"
+      "worktreeBranchRequired": "请选择基础分支或现有工作树。",
+      "projectAttachmentRequired": "选择或移除项目执行目标前，请先附加项目上下文。"
     }
   },
   "identity": {
@@ -40,6 +41,19 @@
     "detach": "移除项目上下文",
     "attached": "已附加项目：{{projectId}}",
     "none": "未附加项目"
+  },
+  "mutation": {
+    "saving": "正在保存会话更改…",
+    "saved": {
+      "target": "执行目标已更新，会话身份和工作区保持不变。",
+      "attached": "项目上下文已附加，会话身份和工作区保持不变。",
+      "detached": "项目上下文已移除，会话身份和工作区保持不变。"
+    },
+    "errors": {
+      "CONVERSATION_CONFLICT": "此会话已在其他位置发生更改，请重新打开后重试。",
+      "VALIDATION_ERROR": "所选项目或执行目标无效。",
+      "CONVERSATION_RECOVERY_REQUIRED": "此会话需要恢复后才能更改。"
+    }
   },
   "recovery": {
     "title": "会话恢复",

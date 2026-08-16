@@ -14,7 +14,7 @@ use super::conversation_api;
 use super::ws::{dispatch_conversation_golden_request, AppState, HistoryMode};
 use crate::conversation::contracts::{
     parse_created_at_utc, ConversationCreator, ConversationLifecycleState, ConversationRecordV2,
-    CreationPartition, ExecutionTarget, CONVERSATION_SCHEMA_VERSION,
+    CreationPartition, ExecutionTarget, ProjectAttachment, CONVERSATION_SCHEMA_VERSION,
 };
 use crate::conversation::migration::{
     CreatedAtSource, IdentityDecision, MigrationHostMode, MigrationMapEntryV1, MigrationMapV1,
@@ -136,6 +136,18 @@ fn app(state: AppState) -> axum::Router {
             "/conversation-recovery/resolve",
             post(conversation_api::resolve_recovery),
         )
+        .route(
+            "/conversations/{conversationId}/attach-project",
+            post(conversation_api::attach_project),
+        )
+        .route(
+            "/conversations/{conversationId}/detach-project",
+            post(conversation_api::detach_project),
+        )
+        .route(
+            "/conversations/{conversationId}/execution-target",
+            post(conversation_api::update_execution_target),
+        )
         .with_state(state)
         .layer(Extension(principal))
         .layer(Extension(authority))
@@ -146,6 +158,17 @@ async fn response_json(response: axum::response::Response) -> Value {
         .await
         .unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+fn attachment(project_root: &std::path::Path) -> ProjectAttachment {
+    ProjectAttachment {
+        schema_version: 1,
+        project_id: "project-golden".to_string(),
+        attached_at_utc: parse_created_at_utc("2026-08-15T10:00:00.000Z").unwrap(),
+        project_path_snapshot: project_root.to_string_lossy().into_owned(),
+        worktree_path: None,
+        worktree_branch: None,
+    }
 }
 
 fn seed_recovery(repository: &ConversationRepository) -> RecoveryItemV1 {
@@ -245,6 +268,170 @@ async fn transport_golden_matrix() {
                 .await;
         assert_eq!(ws.payload.unwrap(), expected, "sourceKind={source_kind}");
     }
+}
+
+#[tokio::test]
+async fn aggregate_transport_golden_matrix() {
+    let project_temp = tempfile::tempdir().unwrap();
+    let project_root = project_temp.path().join("project");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let project_root = std::fs::canonicalize(project_root).unwrap();
+    let attachment = attachment(&project_root);
+    let conversation_id = ConversationId::parse(ID).unwrap();
+
+    let tauri_fixture = fixture().await;
+    let tauri = crate::commands::conversation_attach_project_inner(
+        &tauri_fixture.service,
+        ID,
+        0,
+        serde_json::to_value(&attachment).unwrap(),
+    )
+    .await;
+    let expected_attach = serde_json::to_value(tauri.data.unwrap()).unwrap();
+
+    let http_fixture = fixture().await;
+    let http = response_json(
+        app(http_fixture.state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/conversations/{ID}/attach-project"))
+                    .body(Body::from(
+                        json!({"expectedRevision":0,"attachment":attachment}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(http["data"], expected_attach);
+
+    let ws_fixture = fixture().await;
+    let mut authed = true;
+    let ws = dispatch_conversation_golden_request(
+        &json!({
+            "id":"attach-1",
+            "type":"attach_project",
+            "payload":{"conversationId":ID,"expectedRevision":0,"attachment":attachment}
+        })
+        .to_string(),
+        &mut authed,
+        &ws_fixture.service,
+    )
+    .await;
+    assert_eq!(ws.payload.unwrap(), expected_attach);
+
+    let target = ExecutionTarget::ProjectRoot {
+        project_id: "project-golden".to_string(),
+        project_root: project_root.to_string_lossy().into_owned(),
+    };
+    let tauri_fixture = fixture().await;
+    tauri_fixture
+        .service
+        .attach_project(conversation_id, 0, attachment.clone())
+        .await
+        .unwrap();
+    let tauri = crate::commands::conversation_update_execution_target_inner(
+        &tauri_fixture.service,
+        ID,
+        1,
+        serde_json::to_value(&target).unwrap(),
+    )
+    .await;
+    let expected_target = serde_json::to_value(tauri.data.unwrap()).unwrap();
+
+    let http_fixture = fixture().await;
+    http_fixture
+        .service
+        .attach_project(conversation_id, 0, attachment.clone())
+        .await
+        .unwrap();
+    let http = response_json(
+        app(http_fixture.state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/conversations/{ID}/execution-target"))
+                    .body(Body::from(
+                        json!({"expectedRevision":1,"executionTarget":target}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(http["data"], expected_target);
+
+    let ws_fixture = fixture().await;
+    ws_fixture
+        .service
+        .attach_project(conversation_id, 0, attachment.clone())
+        .await
+        .unwrap();
+    let ws = dispatch_conversation_golden_request(
+        &json!({
+            "id":"target-1",
+            "type":"update_execution_target",
+            "payload":{"conversationId":ID,"expectedRevision":1,"executionTarget":target}
+        })
+        .to_string(),
+        &mut authed,
+        &ws_fixture.service,
+    )
+    .await;
+    assert_eq!(ws.payload.unwrap(), expected_target);
+
+    let tauri_fixture = fixture().await;
+    tauri_fixture
+        .service
+        .attach_project(conversation_id, 0, attachment.clone())
+        .await
+        .unwrap();
+    let tauri =
+        crate::commands::conversation_detach_project_inner(&tauri_fixture.service, ID, 1).await;
+    let expected_detach = serde_json::to_value(tauri.data.unwrap()).unwrap();
+
+    let http_fixture = fixture().await;
+    http_fixture
+        .service
+        .attach_project(conversation_id, 0, attachment.clone())
+        .await
+        .unwrap();
+    let http = response_json(
+        app(http_fixture.state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/conversations/{ID}/detach-project"))
+                    .body(Body::from(json!({"expectedRevision":1}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(http["data"], expected_detach);
+
+    let ws_fixture = fixture().await;
+    ws_fixture
+        .service
+        .attach_project(conversation_id, 0, attachment)
+        .await
+        .unwrap();
+    let ws = dispatch_conversation_golden_request(
+        &json!({
+            "id":"detach-1",
+            "type":"detach_project",
+            "payload":{"conversationId":ID,"expectedRevision":1}
+        })
+        .to_string(),
+        &mut authed,
+        &ws_fixture.service,
+    )
+    .await;
+    assert_eq!(ws.payload.unwrap(), expected_detach);
 }
 
 #[tokio::test]

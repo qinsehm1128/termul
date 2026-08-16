@@ -58,9 +58,10 @@ use crate::acp::session_persistence::{
     SessionRegistration, TitleSource,
 };
 use crate::conversation::{
-    AgentBindingResult, AgentSessionBinding, ConversationCreationService, ConversationId,
-    ConversationPersistenceAdapter, ExecutionTarget, PrepareConversationRequest,
-    PreparedConversation, ProjectAttachment, PROJECT_ATTACHMENT_SCHEMA_VERSION,
+    AgentBindingResult, AgentCompensationFailure, AgentSessionBinding, ConversationCreationService,
+    ConversationId, ConversationPersistenceAdapter, ExecutionTarget, PrepareConversationRequest,
+    PreparedConversation, ProjectAttachment, ACP_COMPENSATION_FAILED,
+    PROJECT_ATTACHMENT_SCHEMA_VERSION,
 };
 use crate::web::EventSink;
 
@@ -884,6 +885,35 @@ pub(crate) async fn record_local_title(
     Ok(())
 }
 
+fn stable_conversation_code(code: crate::conversation::ConversationErrorCode) -> String {
+    serde_json::to_value(code)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "CONVERSATION_RECOVERY_REQUIRED".to_string())
+}
+
+fn compensation_provider_close_code(detail: &str) -> String {
+    if detail.contains("does not support session/close") {
+        "ACP_CLOSE_UNSUPPORTED"
+    } else {
+        "ACP_CLOSE_FAILED"
+    }
+    .to_string()
+}
+
+fn log_compensation_failure(operation: &'static str, failure: &AgentCompensationFailure) {
+    log::error!(
+        "[acp-compensation] operation={} conversation_id={} primary_code={} provider_close_code={} failure_record_code={} recovery_marker_code={} recovery_record_code={}",
+        operation,
+        failure.conversation_id,
+        failure.primary_code,
+        failure.provider_close_code.as_deref().unwrap_or("OK"),
+        failure.failure_record_code.as_deref().unwrap_or("OK"),
+        failure.recovery_marker_code.as_deref().unwrap_or("OK"),
+        failure.recovery_record_code.as_deref().unwrap_or("OK")
+    );
+}
+
 impl AcpManager {
     /// Create a new manager that fans `acp:*` events out to the given sinks.
     ///
@@ -1255,8 +1285,11 @@ impl AcpManager {
         }
     }
 
-    /// Suppress a provisional replacement event before best-effort provider cleanup.
-    pub async fn abort_replacement_session(&self, binding: &AgentSessionBinding) {
+    /// Suppress a provisional replacement event before checked provider cleanup.
+    pub async fn abort_replacement_session(
+        &self,
+        binding: &AgentSessionBinding,
+    ) -> Result<(), String> {
         if let Some(gate) = self
             .replacement_gates
             .lock()
@@ -1264,7 +1297,7 @@ impl AcpManager {
         {
             let _ = gate.send(Some(Err("CONVERSATION_RECOVERY_REQUIRED".to_string())));
         }
-        let _ = self.close_conversation_session(binding).await;
+        self.close_conversation_session(binding).await
     }
 
     /// Capability-aware close used by ConversationLifecycleService. It does not mutate canonical
@@ -1434,14 +1467,49 @@ impl AcpManager {
                             if let Some(tx) = binding_gate_tx {
                                 let _ = tx.send(Some(Err("CONVERSATION_BIND_FAILED".to_string())));
                             }
-                            let _ = self
+                            if let Some(token) = plan_token {
+                                self.host_plan_server.unregister_by_token(&token);
+                            }
+                            let provider_close_code = self
                                 .close_session(agent_id, outcome.session_id.clone())
-                                .await;
+                                .await
+                                .err()
+                                .map(|detail| compensation_provider_close_code(&detail));
+                            let creation = self
+                                .conversation_creation
+                                .as_ref()
+                                .expect("prepared only when creation service exists");
+                            let failure_record_code = creation
+                                .record_agent_creation_failure(
+                                    prepared.conversation_id,
+                                    "CONVERSATION_BIND_FAILED",
+                                    "canonical agent binding could not be persisted",
+                                )
+                                .await
+                                .err()
+                                .map(|failure| stable_conversation_code(failure.code));
+                            if provider_close_code.is_some() || failure_record_code.is_some() {
+                                let failure = creation
+                                    .record_agent_compensation_failure(
+                                        prepared.conversation_id,
+                                        "CONVERSATION_BIND_FAILED",
+                                        provider_close_code.as_deref(),
+                                        failure_record_code.as_deref(),
+                                        None,
+                                    )
+                                    .await;
+                                log_compensation_failure("new_session_bind", &failure);
+                                return Err(failure.wire_error());
+                            }
                             log::error!(
-                                "[conversation-creation] binding durability failed conversation_id={}",
-                                prepared.conversation_id
+                                "[conversation-creation] binding durability failed conversation_id={} primary_code=CONVERSATION_BIND_FAILED repository_code={}",
+                                prepared.conversation_id,
+                                stable_conversation_code(error.code)
                             );
-                            return Err(format!("CONVERSATION_BIND_FAILED: {error}"));
+                            return Err(
+                                "CONVERSATION_BIND_FAILED: canonical agent binding could not be persisted"
+                                    .to_string(),
+                            );
                         }
                     }
                 }
@@ -1452,24 +1520,47 @@ impl AcpManager {
                 Ok(outcome)
             }
             Err(error) => {
+                let mut compensation_failure = None;
                 if let Some(prepared) = prepared {
                     if let Some(creation) = &self.conversation_creation {
-                        let _ = creation
+                        if let Err(failure) = creation
                             .record_agent_creation_failure(
                                 prepared.conversation_id,
                                 "ACP_SESSION_NEW_FAILED",
                                 "agent session creation failed",
                             )
-                            .await;
+                            .await
+                        {
+                            let failure_record_code = stable_conversation_code(failure.code);
+                            let compound = creation
+                                .record_agent_compensation_failure(
+                                    prepared.conversation_id,
+                                    "ACP_SESSION_NEW_FAILED",
+                                    None,
+                                    Some(&failure_record_code),
+                                    None,
+                                )
+                                .await;
+                            log_compensation_failure("new_session_create", &compound);
+                            compensation_failure = Some(compound);
+                        }
                     }
                     if let Some(tx) = binding_gate_tx {
-                        let _ = tx.send(Some(Err("ACP_SESSION_NEW_FAILED".to_string())));
+                        let code = if compensation_failure.is_some() {
+                            ACP_COMPENSATION_FAILED
+                        } else {
+                            "ACP_SESSION_NEW_FAILED"
+                        };
+                        let _ = tx.send(Some(Err(code.to_string())));
                     }
                 }
                 if let Some(token) = plan_token {
                     self.host_plan_server.unregister_by_token(&token);
                 }
-                Err(error)
+                match compensation_failure {
+                    Some(failure) => Err(failure.wire_error()),
+                    None => Err(error),
+                }
             }
         }
     }
@@ -1855,6 +1946,16 @@ impl AcpManager {
         agent_id: AgentId,
         observed: std::sync::mpsc::SyncSender<(String, bool)>,
     ) {
+        self.install_test_agent_for_new_session_with_close_result(agent_id, observed, Ok(()));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_agent_for_new_session_with_close_result(
+        &self,
+        agent_id: AgentId,
+        observed: std::sync::mpsc::SyncSender<(String, bool)>,
+        close_result: Result<(), String>,
+    ) {
         let (command_tx, mut command_rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
             while let Some(command) = command_rx.recv().await {
@@ -1887,17 +1988,19 @@ impl AcpManager {
                         }
                     }
                     AcpCommand::CloseSession { reply, .. } => {
-                        let _ = reply.send(Ok(()));
+                        let _ = reply.send(close_result.clone());
                     }
                     _ => {}
                 }
             }
         });
+        let mut capabilities = AgentCapabilities::default();
+        capabilities.session_capabilities.close = Some(Default::default());
         self.agents.lock().insert(
             agent_id,
             AgentEntry {
                 command_tx,
-                capabilities: AgentCapabilities::default(),
+                capabilities,
                 stable_namespace: Some("config:test".to_string()),
                 join_handle: None,
                 killed: Arc::new(AtomicBool::new(false)),
@@ -4072,6 +4175,91 @@ mod tests {
             .await
             .unwrap());
         responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn conversation_compensation_double_failure_persists_actionable_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("state");
+        let bootstrap = crate::conversation::ConversationBootstrap::run(
+            crate::conversation::HostConversationRoots::desktop(
+                state_root.clone(),
+                temp.path().join("visible"),
+            ),
+            crate::conversation::MigrationHostMode::Desktop,
+        )
+        .unwrap();
+        bootstrap.repository.fail_next_agent_binding_appends(2);
+        let manager = Arc::new(AcpManager::with_conversation_services(
+            Vec::new(),
+            Arc::clone(&bootstrap.creation),
+            Arc::clone(&bootstrap.persistence_adapter),
+        ));
+        let agent_id = AgentId("fake-agent".to_string());
+        let (observed_tx, _observed_rx) = std::sync::mpsc::sync_channel(1);
+        manager.install_test_agent_for_new_session_with_close_result(
+            agent_id.clone(),
+            observed_tx,
+            Err("provider close leaked SUPER_SECRET=do-not-return".to_string()),
+        );
+
+        let error = manager
+            .new_session_with_context(
+                &agent_id,
+                temp.path()
+                    .join("ignored-cwd")
+                    .to_string_lossy()
+                    .into_owned(),
+                Vec::new(),
+                SessionCreationContext {
+                    execution_target: Some(ExecutionTarget::Workspace),
+                    ..SessionCreationContext::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        let failure = AgentCompensationFailure::from_wire_error(&error)
+            .expect("double failure must return the stable compound receipt");
+        assert_eq!(failure.primary_code, "CONVERSATION_BIND_FAILED");
+        assert_eq!(
+            failure.provider_close_code.as_deref(),
+            Some("ACP_CLOSE_FAILED")
+        );
+        assert_eq!(
+            failure.failure_record_code.as_deref(),
+            Some("CONVERSATION_DURABILITY_FAILED")
+        );
+        assert!(failure.recovery_id.is_some());
+        assert!(!error.contains("SUPER_SECRET"));
+        assert!(!error.contains("opaque/fake-session"));
+
+        let record = bootstrap.repository.list_conversations().remove(0);
+        assert_eq!(record.conversation_id, failure.conversation_id);
+        assert_eq!(
+            record.lifecycle_state,
+            crate::conversation::ConversationLifecycleState::RecoveryRequired
+        );
+        assert!(bootstrap
+            .repository
+            .current_binding(record.conversation_id)
+            .unwrap()
+            .is_none());
+
+        let recovery_bytes = std::fs::read(
+            state_root
+                .join("conversation-migrations")
+                .join("workspace-recovery-v1")
+                .join(crate::conversation::migration::RECOVERY_ITEMS_FILE),
+        )
+        .unwrap();
+        let recovery: crate::conversation::migration::RecoveryQueueV1 =
+            serde_json::from_slice(&recovery_bytes).unwrap();
+        assert_eq!(recovery.items.len(), 1);
+        assert_eq!(recovery.items[0].recovery_id, failure.recovery_id.unwrap());
+        let serialized = String::from_utf8(recovery_bytes).unwrap();
+        assert!(serialized.contains("acpCompensationFailed"));
+        assert!(!serialized.contains("SUPER_SECRET"));
+        assert!(!serialized.contains("opaque/fake-session"));
     }
 
     /// Capability gating exercises the *real* gate functions used by

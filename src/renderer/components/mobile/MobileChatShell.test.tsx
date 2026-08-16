@@ -28,7 +28,13 @@ const {
   // Changes header button is disabled when `activeProject.path` is missing)
   // and the shell into web/remote mode (where the project-switcher button +
   // drawer are mounted).
-  projectRef: { current: { id: 'p1', name: 'Demo', path: '/demo' } as { path?: string } },
+  projectRef: {
+    current: { id: 'p1', name: 'Demo', path: '/demo' } as {
+      id?: string
+      name?: string
+      path?: string
+    }
+  },
   tauriRef: { current: true as boolean },
   mockReopenTerminalView: vi.fn()
 }))
@@ -42,7 +48,9 @@ vi.mock('react-router-dom', async () => {
 })
 
 vi.mock('@/stores/project-store', () => ({
-  useActiveProject: () => projectRef.current
+  useActiveProject: () => projectRef.current,
+  useProjectStore: (selector: (state: { projects: unknown[] }) => unknown) =>
+    selector({ projects: projectRef.current.id ? [projectRef.current] : [] })
 }))
 
 vi.mock('@/stores/workspace-store', () => ({
@@ -152,6 +160,20 @@ describe('MobileChatShell', () => {
     mockDeleteConversation.mockReset()
     mockReopenTerminalView.mockReset()
     useConversationStore.getState().reset()
+    useConversationStore.getState().replaceSummaries([
+      {
+        schemaVersion: 2,
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        createdAtUtc: '2026-08-15T09:45:15.123Z',
+        creationPartition: { year: 2026, month: 8, day: 15, path: '2026/08/15' },
+        workspaceCwd: '/visible/sessions/2026/08/15/conversation',
+        executionTarget: { kind: 'workspace' },
+        projectAttachment: null,
+        lifecycleState: 'ready',
+        lastSeq: 4,
+        createdBy: 'termul'
+      }
+    ])
     useConversationStore.getState().setActiveConversationId('018f7a1c-1b4d-7c8a-9f01-0123456789ab')
     useTerminalStore.setState({ terminals: [], activeTerminalId: '', ptyIdIndex: new Map() })
     tauriRef.current = true
@@ -179,6 +201,33 @@ describe('MobileChatShell', () => {
     expect(container.querySelector('[data-sidebar]')).toBeNull()
     // The menu button reflects drawer state for assistive tech.
     expect(screen.getByLabelText('Open menu')).toHaveAttribute('aria-expanded', 'false')
+  })
+
+  it('opens the mobile execution-target sheet with immutable Conversation identity', async () => {
+    render(
+      <MemoryRouter>
+        <MobileChatShell onNewChat={vi.fn()} canNewChat>
+          <div>chat body</div>
+        </MobileChatShell>
+      </MemoryRouter>
+    )
+
+    const trigger = screen.getByRole('button', {
+      name: 'Execution target and project context'
+    })
+    expect(trigger).toHaveClass('size-10')
+    fireEvent.click(trigger)
+    expect(
+      await screen.findByText(
+        "Attach or detach project context and change this Conversation's execution target without changing its identity or workspace."
+      )
+    ).toBeInTheDocument()
+    expect(screen.getByLabelText('Execution target')).toHaveTextContent('Conversation workspace')
+    expect(screen.getByText('018f7a1c-1b4d-7c8a-9f01-0123456789ab')).toBeInTheDocument()
+    expect(screen.getByText('2026-08-15T09:45:15.123Z')).toBeInTheDocument()
+    expect(screen.getAllByText('/visible/sessions/2026/08/15/conversation').length).toBeGreaterThan(
+      0
+    )
   })
 
   it('exposes touch-sized independent Conversation lifecycle actions for the active chat', () => {

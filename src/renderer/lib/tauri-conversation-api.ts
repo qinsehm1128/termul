@@ -1,7 +1,10 @@
 import {
+  type ConversationAggregateMutationOutcome,
   type ConversationId,
   type ConversationRecordV2,
-  isConversationId
+  type ExecutionTarget,
+  isConversationId,
+  type ProjectAttachment
 } from '@shared/types/conversation.types'
 import type {
   ConversationApi,
@@ -63,6 +66,21 @@ function withConversationId<T>(
   return isConversationId(conversationId) ? operation() : Promise.resolve(invalidConversationId())
 }
 
+function withExpectedRevision<T>(
+  conversationId: ConversationId,
+  expectedRevision: number,
+  operation: () => Promise<IpcResult<T>>
+): Promise<IpcResult<T>> {
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
+    return Promise.resolve({
+      success: false,
+      code: 'VALIDATION_ERROR',
+      error: 'expectedRevision must be a non-negative safe integer'
+    })
+  }
+  return withConversationId(conversationId, operation)
+}
+
 export function createTauriConversationApi(): ConversationApi {
   return {
     getHostStatus: () => invokeConversation<ConversationHostStatus>('conversation_host_status'),
@@ -86,6 +104,39 @@ export function createTauriConversationApi(): ConversationApi {
       return invokeConversation<LegacyConversationResolution>('conversation_resolve_legacy_id', {
         request
       })
+    },
+    attachProject(
+      conversationId: ConversationId,
+      expectedRevision: number,
+      attachment: ProjectAttachment
+    ) {
+      return withExpectedRevision(conversationId, expectedRevision, () =>
+        invokeConversation<ConversationAggregateMutationOutcome>('conversation_attach_project', {
+          conversationId,
+          expectedRevision,
+          attachment
+        })
+      )
+    },
+    detachProject(conversationId: ConversationId, expectedRevision: number) {
+      return withExpectedRevision(conversationId, expectedRevision, () =>
+        invokeConversation<ConversationAggregateMutationOutcome>('conversation_detach_project', {
+          conversationId,
+          expectedRevision
+        })
+      )
+    },
+    updateExecutionTarget(
+      conversationId: ConversationId,
+      expectedRevision: number,
+      executionTarget: ExecutionTarget
+    ) {
+      return withExpectedRevision(conversationId, expectedRevision, () =>
+        invokeConversation<ConversationAggregateMutationOutcome>(
+          'conversation_update_execution_target',
+          { conversationId, expectedRevision, executionTarget }
+        )
+      )
     },
     subscribeHostStatus(listener) {
       let active = true

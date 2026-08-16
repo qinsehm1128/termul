@@ -90,6 +90,7 @@ pub enum ConversationLifecycleErrorCode {
     AcpCloseUnsupported,
     AcpCloseFailed,
     AcpReplaceFailed,
+    AcpCompensationFailed,
     ValidationError,
 }
 
@@ -146,7 +147,10 @@ pub trait ConversationAgentLifecycle: Send + Sync {
         previous_binding: &'a AgentSessionBinding,
         prepared: &'a PreparedConversation,
     ) -> ProviderFuture<'a, std::result::Result<AgentBindingResult, AgentLifecycleProviderError>>;
-    fn abort_replacement<'a>(&'a self, binding: &'a AgentSessionBinding) -> ProviderFuture<'a, ()>;
+    fn abort_replacement<'a>(
+        &'a self,
+        binding: &'a AgentSessionBinding,
+    ) -> ProviderFuture<'a, std::result::Result<(), AgentLifecycleProviderError>>;
     fn register_binding(&self, agent_session_id: &str, conversation_id: ConversationId);
 }
 
@@ -196,9 +200,21 @@ impl ConversationAgentLifecycle for AcpManager {
         })
     }
 
-    fn abort_replacement<'a>(&'a self, binding: &'a AgentSessionBinding) -> ProviderFuture<'a, ()> {
+    fn abort_replacement<'a>(
+        &'a self,
+        binding: &'a AgentSessionBinding,
+    ) -> ProviderFuture<'a, std::result::Result<(), AgentLifecycleProviderError>> {
         Box::pin(async move {
-            self.abort_replacement_session(binding).await;
+            self.abort_replacement_session(binding)
+                .await
+                .map_err(|detail| AgentLifecycleProviderError {
+                    kind: if detail.contains("does not support session/close") {
+                        AgentLifecycleProviderErrorKind::Unsupported
+                    } else {
+                        AgentLifecycleProviderErrorKind::Failed
+                    },
+                    detail,
+                })
         })
     }
 
@@ -365,18 +381,24 @@ impl ConversationLifecycleService {
             self.repository
                 .suspend_agent_binding_locked(&permit, conversation_id, Utc::now())
         {
-            if let Ok(compensation) = self
-                .writer
-                .authorize(conversation_id, ConversationMutation::CompensationRecord)
-            {
-                self.repository
-                    .mark_lifecycle_recovery_required_locked(&compensation, conversation_id);
-            }
+            let primary_code = error.stable_code();
+            let compensation = self.creation.record_agent_compensation_failure_locked(
+                conversation_id,
+                &primary_code,
+                None,
+                None,
+                Some(binding.binding_id),
+            );
+            let code = if compensation.has_secondary_failure() {
+                ConversationLifecycleErrorCode::AcpCompensationFailed
+            } else {
+                ConversationLifecycleErrorCode::ConversationRecoveryRequired
+            };
             return Err(lifecycle_error(
-                ConversationLifecycleErrorCode::ConversationRecoveryRequired,
+                code,
                 "suspend_binding",
                 Some(conversation_id),
-                format!("provider closed the session but canonical append failed: {error}"),
+                compensation.wire_detail(),
             ));
         }
         self.repository
@@ -439,19 +461,30 @@ impl ConversationLifecycleService {
             replacement.clone(),
             replacement.bound_at_utc,
         ) {
-            if let Ok(compensation) = self
-                .writer
-                .authorize(conversation_id, ConversationMutation::CompensationRecord)
-            {
-                self.repository
-                    .mark_lifecycle_recovery_required_locked(&compensation, conversation_id);
-            }
-            self.provider.abort_replacement(&replacement).await;
+            let provider_close_code = self
+                .provider
+                .abort_replacement(&replacement)
+                .await
+                .err()
+                .map(|source| provider_error_code(source.kind));
+            let primary_code = error.stable_code();
+            let compensation = self.creation.record_agent_compensation_failure_locked(
+                conversation_id,
+                &primary_code,
+                provider_close_code.as_deref(),
+                None,
+                Some(replacement.binding_id),
+            );
+            let code = if compensation.has_secondary_failure() {
+                ConversationLifecycleErrorCode::AcpCompensationFailed
+            } else {
+                ConversationLifecycleErrorCode::ConversationRecoveryRequired
+            };
             return Err(lifecycle_error(
-                ConversationLifecycleErrorCode::ConversationRecoveryRequired,
+                code,
                 "replace_binding",
                 Some(conversation_id),
-                format!("provider created a replacement but canonical append failed: {error}"),
+                compensation.wire_detail(),
             ));
         }
         self.provider
@@ -648,6 +681,14 @@ impl ConversationLifecycleService {
     }
 }
 
+fn provider_error_code(kind: AgentLifecycleProviderErrorKind) -> String {
+    match kind {
+        AgentLifecycleProviderErrorKind::Unsupported => "ACP_CLOSE_UNSUPPORTED",
+        AgentLifecycleProviderErrorKind::Failed => "ACP_CLOSE_FAILED",
+    }
+    .to_string()
+}
+
 fn map_repository_error(source: RepositoryError) -> ConversationLifecycleError {
     use crate::conversation::contracts::ConversationErrorCode;
     let code = match source.code {
@@ -705,7 +746,7 @@ mod tests {
     use super::*;
     use crate::conversation::contracts::{
         parse_created_at_utc, ConversationCreator, CreationPartition, ExecutionTarget,
-        CONVERSATION_SCHEMA_VERSION,
+        ProjectAttachment, CONVERSATION_SCHEMA_VERSION, PROJECT_ATTACHMENT_SCHEMA_VERSION,
     };
     use crate::conversation::durable_fs::DurableFileSystem;
     use crate::conversation::locator::{ConversationLocator, SessionWorkspaceLocator};
@@ -723,6 +764,8 @@ mod tests {
         owns: Mutex<bool>,
         suspend_error: Mutex<Option<AgentLifecycleProviderError>>,
         replace_error: Mutex<Option<AgentLifecycleProviderError>>,
+        abort_error: Mutex<Option<AgentLifecycleProviderError>>,
+        replacement_execution_cwds: Mutex<Vec<String>>,
         suspend_calls: AtomicUsize,
         replace_calls: AtomicUsize,
         abort_calls: AtomicUsize,
@@ -748,11 +791,14 @@ mod tests {
         fn replace<'a>(
             &'a self,
             _previous_binding: &'a AgentSessionBinding,
-            _prepared: &'a PreparedConversation,
+            prepared: &'a PreparedConversation,
         ) -> ProviderFuture<'a, std::result::Result<AgentBindingResult, AgentLifecycleProviderError>>
         {
             self.replace_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
+                self.replacement_execution_cwds
+                    .lock()
+                    .push(prepared.execution_cwd.clone());
                 if let Some(error) = self.replace_error.lock().clone() {
                     return Err(error);
                 }
@@ -767,9 +813,9 @@ mod tests {
         fn abort_replacement<'a>(
             &'a self,
             _binding: &'a AgentSessionBinding,
-        ) -> ProviderFuture<'a, ()> {
+        ) -> ProviderFuture<'a, std::result::Result<(), AgentLifecycleProviderError>> {
             self.abort_calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async {})
+            Box::pin(async move { self.abort_error.lock().clone().map_or(Ok(()), Err) })
         }
 
         fn register_binding(&self, agent_session_id: &str, _conversation_id: ConversationId) {
@@ -1071,6 +1117,141 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].state, AgentSessionBindingState::Replaced);
         assert_eq!(history[1].state, AgentSessionBindingState::Active);
+    }
+
+    #[tokio::test]
+    async fn replacement_uses_latest_canonical_attachment_and_target_not_stale_request_projection()
+    {
+        let fixture = fixture().await;
+        let project_root = fixture._temp.path().join("trusted-project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let project_root = std::fs::canonicalize(project_root).unwrap();
+        let attachment = ProjectAttachment {
+            schema_version: PROJECT_ATTACHMENT_SCHEMA_VERSION,
+            project_id: "project-1".to_string(),
+            attached_at_utc: parse_created_at_utc("2026-08-15T10:00:00.000Z").unwrap(),
+            project_path_snapshot: project_root.to_string_lossy().into_owned(),
+            worktree_path: None,
+            worktree_branch: None,
+        };
+        fixture
+            .creation
+            .writer()
+            .attach_project(fixture.id, revision(&fixture), attachment, Utc::now())
+            .await
+            .unwrap();
+        fixture
+            .creation
+            .writer()
+            .update_execution_target(
+                fixture.id,
+                revision(&fixture),
+                ExecutionTarget::ProjectRoot {
+                    project_id: "project-1".to_string(),
+                    project_root: project_root.to_string_lossy().into_owned(),
+                },
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        let before = fixture.repository.get_conversation(fixture.id).unwrap();
+
+        fixture
+            .service
+            .replace_agent_binding(
+                fixture.id,
+                PrepareConversationRequest {
+                    schema_version: 1,
+                    conversation_id: Some(fixture.id),
+                    project_attachment: None,
+                    execution_target: ExecutionTarget::Workspace,
+                },
+                before.last_seq,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fixture
+                .provider
+                .replacement_execution_cwds
+                .lock()
+                .as_slice(),
+            &[project_root.to_string_lossy().into_owned()]
+        );
+        let after = fixture.repository.get_conversation(fixture.id).unwrap();
+        assert_eq!(after.project_attachment, before.project_attachment);
+        assert_eq!(after.execution_target, before.execution_target);
+        assert_eq!(after.conversation_id, before.conversation_id);
+        assert_eq!(after.created_at_utc, before.created_at_utc);
+        assert_eq!(after.creation_partition, before.creation_partition);
+        assert_eq!(after.workspace_cwd, before.workspace_cwd);
+    }
+
+    #[tokio::test]
+    async fn replacement_append_and_abort_failure_never_publishes_provisional_binding() {
+        let fixture = fixture().await;
+        let before = fixture.repository.get_conversation(fixture.id).unwrap();
+        fixture.repository.fail_next_agent_binding_appends(1);
+        *fixture.provider.abort_error.lock() = Some(AgentLifecycleProviderError {
+            kind: AgentLifecycleProviderErrorKind::Failed,
+            detail: "provider leaked SUPER_SECRET=do-not-return".to_string(),
+        });
+
+        let error = fixture
+            .service
+            .replace_agent_binding(
+                fixture.id,
+                PrepareConversationRequest {
+                    schema_version: 1,
+                    conversation_id: Some(fixture.id),
+                    project_attachment: None,
+                    execution_target: ExecutionTarget::Workspace,
+                },
+                before.last_seq,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            ConversationLifecycleErrorCode::AcpCompensationFailed
+        );
+        let failure: crate::conversation::AgentCompensationFailure =
+            serde_json::from_str(&error.detail).unwrap();
+        assert_eq!(failure.primary_code, "CONVERSATION_DURABILITY_FAILED");
+        assert_eq!(
+            failure.provider_close_code.as_deref(),
+            Some("ACP_CLOSE_FAILED")
+        );
+        assert!(failure.recovery_id.is_some());
+        assert!(!error.detail.contains("SUPER_SECRET"));
+        assert!(!error.detail.contains("opaque/replacement"));
+        assert_eq!(fixture.provider.abort_calls.load(Ordering::SeqCst), 1);
+        assert!(fixture.provider.registered.lock().is_empty());
+
+        let current = fixture
+            .repository
+            .current_binding(fixture.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(current.agent_session_id, "opaque/original");
+        assert_eq!(current.state, AgentSessionBindingState::Active);
+        let after = fixture.repository.get_conversation(fixture.id).unwrap();
+        assert_eq!(
+            after.lifecycle_state,
+            ConversationLifecycleState::RecoveryRequired
+        );
+        assert_eq!(after.conversation_id, before.conversation_id);
+        assert_eq!(after.workspace_cwd, before.workspace_cwd);
+        assert_eq!(after.created_at_utc, before.created_at_utc);
+        assert_eq!(
+            fixture
+                .repository
+                .binding_history(fixture.id)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

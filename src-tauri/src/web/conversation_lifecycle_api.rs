@@ -268,7 +268,7 @@ fn failure(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::AcpManager;
+    use crate::acp::{AcpManager, AgentId};
     use crate::conversation::contracts::{
         parse_created_at_utc, AgentSessionBinding, AgentSessionBindingState, ConversationCreator,
         ConversationLifecycleState, ConversationRecordV2, CreationPartition, ExecutionTarget,
@@ -296,7 +296,12 @@ mod tests {
 
     const ID: &str = "018f7a1c-1b4d-7c8a-9f01-0123456789ab";
 
-    async fn state() -> (tempfile::TempDir, AppState, u64) {
+    async fn state() -> (
+        tempfile::TempDir,
+        AppState,
+        u64,
+        Arc<ConversationRepository>,
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
         let private = base.join("state/conversations/v2");
@@ -365,6 +370,12 @@ mod tests {
             creation,
             persistence,
         ));
+        let (observed_tx, _observed_rx) = std::sync::mpsc::sync_channel(1);
+        acp.install_test_agent_for_new_session_with_close_result(
+            AgentId("agent-http".to_string()),
+            observed_tx,
+            Err("provider close leaked SUPER_SECRET=do-not-return".to_string()),
+        );
         let pty = crate::web::test_pty_manager();
         acp.set_pty_manager(&pty);
         let migration_map = MigrationMapV1 {
@@ -407,7 +418,7 @@ mod tests {
             acp_catalog: None,
             acp_install: None,
         };
-        (temp, state, revision)
+        (temp, state, revision, repository)
     }
 
     fn router(state: AppState) -> axum::Router {
@@ -421,6 +432,10 @@ mod tests {
             .route(
                 "/conversations/{conversationId}/lifecycle/delete",
                 post(delete),
+            )
+            .route(
+                "/conversations/{conversationId}/lifecycle/replace",
+                post(replace),
             )
             .with_state(state)
             .layer(Extension(principal))
@@ -436,7 +451,7 @@ mod tests {
 
     #[tokio::test]
     async fn detach_and_stale_last_seq_use_stable_camel_case_contract() {
-        let (_temp, state, revision) = state().await;
+        let (_temp, state, revision, _repository) = state().await;
         let app = router(state);
         let response = app
             .clone()
@@ -471,5 +486,48 @@ mod tests {
             body(response).await.code.as_deref(),
             Some("CONVERSATION_CONFLICT")
         );
+    }
+
+    #[tokio::test]
+    async fn replacement_double_failure_returns_compensation_receipt_and_recovery_state() {
+        let (_temp, state, revision, repository) = state().await;
+        repository.fail_next_agent_binding_appends(1);
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/conversations/{ID}/lifecycle/replace"))
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 3000))))
+                    .body(Body::from(format!(
+                        "{{\"expectedRevision\":{revision},\"request\":{{\"schemaVersion\":1,\"conversationId\":\"{ID}\",\"projectAttachment\":null,\"executionTarget\":{{\"kind\":\"workspace\"}}}}}}"
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let failed = body(response).await;
+        assert_eq!(failed.code.as_deref(), Some("ACP_COMPENSATION_FAILED"));
+        let detail = failed.error.unwrap();
+        let failure: crate::conversation::AgentCompensationFailure =
+            serde_json::from_str(&detail).unwrap();
+        assert_eq!(failure.primary_code, "CONVERSATION_DURABILITY_FAILED");
+        assert_eq!(
+            failure.provider_close_code.as_deref(),
+            Some("ACP_CLOSE_FAILED")
+        );
+        assert!(failure.recovery_id.is_some());
+        assert!(!detail.contains("SUPER_SECRET"));
+        assert!(!detail.contains("opaque/fake-session"));
+
+        let id = ConversationId::parse(ID).unwrap();
+        let record = repository.get_conversation(id).unwrap();
+        assert_eq!(
+            record.lifecycle_state,
+            ConversationLifecycleState::RecoveryRequired
+        );
+        let current = repository.current_binding(id).unwrap().unwrap();
+        assert_eq!(current.agent_session_id, "opaque/http");
+        assert_eq!(current.state, AgentSessionBindingState::Active);
     }
 }

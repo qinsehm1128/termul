@@ -1,4 +1,10 @@
-import type { ConversationId, ConversationRecordV2 } from '@shared/types/conversation.types'
+import type {
+  ConversationAggregateMutationOutcome,
+  ConversationId,
+  ConversationRecordV2,
+  ExecutionTarget,
+  ProjectAttachment
+} from '@shared/types/conversation.types'
 import type {
   ConversationHostStatus,
   ConversationOpenOutcome
@@ -29,6 +35,7 @@ interface ConversationState {
   projectFilter: ConversationProjectFilter
   loadingList: boolean
   openingById: Record<ConversationId, boolean | undefined>
+  aggregateBusyById: Record<ConversationId, boolean | undefined>
   errorsById: Record<ConversationId, ConversationStoreError | undefined>
   listError: ConversationStoreError | null
   replaceSummaries: (summaries: ConversationRecordV2[]) => void
@@ -38,6 +45,18 @@ interface ConversationState {
   setActiveConversationId: (conversationId: ConversationId | null) => void
   loadConversations: () => Promise<boolean>
   openConversation: (conversationId: ConversationId) => Promise<ConversationOpenOutcome | null>
+  applyAggregateOutcome: (outcome: ConversationAggregateMutationOutcome) => boolean
+  attachProject: (
+    conversationId: ConversationId,
+    attachment: ProjectAttachment
+  ) => Promise<ConversationAggregateMutationOutcome | null>
+  detachProject: (
+    conversationId: ConversationId
+  ) => Promise<ConversationAggregateMutationOutcome | null>
+  updateExecutionTarget: (
+    conversationId: ConversationId,
+    executionTarget: ExecutionTarget
+  ) => Promise<ConversationAggregateMutationOutcome | null>
   clearConversationError: (conversationId: ConversationId) => void
   reset: () => void
 }
@@ -52,6 +71,7 @@ const initialState = {
   projectFilter: null,
   loadingList: false,
   openingById: {},
+  aggregateBusyById: {},
   errorsById: {},
   listError: null
 } satisfies Pick<
@@ -65,6 +85,7 @@ const initialState = {
   | 'projectFilter'
   | 'loadingList'
   | 'openingById'
+  | 'aggregateBusyById'
   | 'errorsById'
   | 'listError'
 >
@@ -96,7 +117,95 @@ function stableError(code: string, message?: string): ConversationStoreError {
   return { code, message: message || code }
 }
 
-export const useConversationStore = create<ConversationState>((set) => ({
+function sameValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right)
+}
+
+function identityMatchesRecord(
+  identity: ConversationAggregateMutationOutcome['identityBefore'],
+  record: ConversationRecordV2
+): boolean {
+  return (
+    identity.conversationId === record.conversationId &&
+    identity.createdAtUtc === record.createdAtUtc &&
+    sameValue(identity.creationPartition, record.creationPartition) &&
+    identity.workspaceCwd === record.workspaceCwd
+  )
+}
+
+function validateAggregateOutcome(
+  outcome: ConversationAggregateMutationOutcome,
+  current: ConversationRecordV2 | undefined
+): ConversationStoreError | null {
+  if (
+    !identityMatchesRecord(outcome.identityBefore, outcome.conversation) ||
+    !identityMatchesRecord(outcome.identityAfter, outcome.conversation) ||
+    !sameValue(outcome.identityBefore, outcome.identityAfter) ||
+    outcome.conversationId !== outcome.conversation.conversationId
+  ) {
+    return stableError(
+      'CONVERSATION_IDENTITY_CHANGED',
+      'The host returned an aggregate mutation that changed immutable Conversation identity.'
+    )
+  }
+  if (
+    outcome.status !== 'updated' ||
+    outcome.revision !== outcome.conversation.lastSeq ||
+    outcome.revision !== outcome.previousRevision + 1 ||
+    (current &&
+      (outcome.previousRevision !== current.lastSeq ||
+        !identityMatchesRecord(outcome.identityBefore, current)))
+  ) {
+    return stableError(
+      'CONVERSATION_CONFLICT',
+      'The aggregate mutation result is stale or does not advance the expected revision.'
+    )
+  }
+  if (
+    !sameValue(outcome.projectAttachment, outcome.conversation.projectAttachment) ||
+    !sameValue(outcome.executionTarget, outcome.conversation.executionTarget)
+  ) {
+    return stableError(
+      'CONVERSATION_AGGREGATE_INVALID',
+      'The aggregate mutation result does not match the returned Conversation record.'
+    )
+  }
+  if (!current) return null
+  const attachmentChanged = !sameValue(current.projectAttachment, outcome.projectAttachment)
+  const targetChanged = !sameValue(current.executionTarget, outcome.executionTarget)
+  const actionIsValid =
+    (outcome.action === 'attachProject' &&
+      current.projectAttachment === null &&
+      outcome.projectAttachment !== null &&
+      !targetChanged) ||
+    (outcome.action === 'detachProject' &&
+      current.projectAttachment !== null &&
+      outcome.projectAttachment === null &&
+      !targetChanged) ||
+    (outcome.action === 'updateExecutionTarget' && !attachmentChanged && targetChanged)
+  return actionIsValid
+    ? null
+    : stableError(
+        'CONVERSATION_AGGREGATE_INVALID',
+        'The aggregate mutation changed fields outside its declared action.'
+      )
+}
+
+function currentConversationRecord(
+  state: ConversationState,
+  conversationId: ConversationId
+): ConversationRecordV2 | undefined {
+  return state.summariesById[conversationId] ?? state.detailsById[conversationId]?.conversation
+}
+
+export function getCurrentConversation(
+  state: ConversationState,
+  conversationId: ConversationId
+): ConversationRecordV2 | undefined {
+  return currentConversationRecord(state, conversationId)
+}
+
+export const useConversationStore = create<ConversationState>((set, get) => ({
   ...initialState,
 
   replaceSummaries: (summaries) => set(indexSummaries(summaries)),
@@ -206,6 +315,224 @@ export const useConversationStore = create<ConversationState>((set) => ({
         level: 'warn',
         source: 'conversation-store.open',
         message: `conversationId=${conversationId} code=CONVERSATION_OPEN_FAILED`
+      })
+      return null
+    }
+  },
+
+  applyAggregateOutcome: (outcome) => {
+    const validationError = validateAggregateOutcome(
+      outcome,
+      currentConversationRecord(get(), outcome.conversationId)
+    )
+    if (validationError) {
+      set((state) => ({
+        aggregateBusyById: {
+          ...state.aggregateBusyById,
+          [outcome.conversationId]: false
+        },
+        errorsById: {
+          ...state.errorsById,
+          [outcome.conversationId]: validationError
+        }
+      }))
+      void logFrontendError({
+        level: 'error',
+        source: 'conversation-store.aggregate',
+        message: `conversationId=${outcome.conversationId} code=${validationError.code}`
+      })
+      return false
+    }
+
+    set((state) => {
+      const alreadyListed = Boolean(state.summariesById[outcome.conversationId])
+      const detail = state.detailsById[outcome.conversationId]
+      return {
+        summariesById: {
+          ...state.summariesById,
+          [outcome.conversationId]: outcome.conversation
+        },
+        conversationIds: alreadyListed
+          ? state.conversationIds
+          : [outcome.conversationId, ...state.conversationIds],
+        detailsById: detail
+          ? {
+              ...state.detailsById,
+              [outcome.conversationId]: {
+                ...detail,
+                conversation: outcome.conversation
+              }
+            }
+          : state.detailsById,
+        aggregateBusyById: {
+          ...state.aggregateBusyById,
+          [outcome.conversationId]: false
+        },
+        errorsById: {
+          ...state.errorsById,
+          [outcome.conversationId]: undefined
+        }
+      }
+    })
+    return true
+  },
+
+  attachProject: async (conversationId, attachment) => {
+    const current = currentConversationRecord(get(), conversationId)
+    if (!current) {
+      set((state) => ({
+        errorsById: {
+          ...state.errorsById,
+          [conversationId]: stableError('CONVERSATION_NOT_FOUND')
+        }
+      }))
+      return null
+    }
+    set((state) => ({
+      aggregateBusyById: { ...state.aggregateBusyById, [conversationId]: true },
+      errorsById: { ...state.errorsById, [conversationId]: undefined }
+    }))
+    try {
+      const result = await conversationApi.attachProject(
+        conversationId,
+        current.lastSeq,
+        attachment
+      )
+      if (!result.success) {
+        set((state) => ({
+          aggregateBusyById: { ...state.aggregateBusyById, [conversationId]: false },
+          errorsById: {
+            ...state.errorsById,
+            [conversationId]: stableError(result.code, result.error)
+          }
+        }))
+        void logFrontendError({
+          level: 'warn',
+          source: 'conversation-store.attachProject',
+          message: `conversationId=${conversationId} code=${result.code}`
+        })
+        return null
+      }
+      return get().applyAggregateOutcome(result.data) ? result.data : null
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      set((state) => ({
+        aggregateBusyById: { ...state.aggregateBusyById, [conversationId]: false },
+        errorsById: {
+          ...state.errorsById,
+          [conversationId]: stableError('CONVERSATION_MUTATION_FAILED', message)
+        }
+      }))
+      void logFrontendError({
+        level: 'warn',
+        source: 'conversation-store.attachProject',
+        message: `conversationId=${conversationId} code=CONVERSATION_MUTATION_FAILED`
+      })
+      return null
+    }
+  },
+
+  detachProject: async (conversationId) => {
+    const current = currentConversationRecord(get(), conversationId)
+    if (!current) {
+      set((state) => ({
+        errorsById: {
+          ...state.errorsById,
+          [conversationId]: stableError('CONVERSATION_NOT_FOUND')
+        }
+      }))
+      return null
+    }
+    set((state) => ({
+      aggregateBusyById: { ...state.aggregateBusyById, [conversationId]: true },
+      errorsById: { ...state.errorsById, [conversationId]: undefined }
+    }))
+    try {
+      const result = await conversationApi.detachProject(conversationId, current.lastSeq)
+      if (!result.success) {
+        set((state) => ({
+          aggregateBusyById: { ...state.aggregateBusyById, [conversationId]: false },
+          errorsById: {
+            ...state.errorsById,
+            [conversationId]: stableError(result.code, result.error)
+          }
+        }))
+        void logFrontendError({
+          level: 'warn',
+          source: 'conversation-store.detachProject',
+          message: `conversationId=${conversationId} code=${result.code}`
+        })
+        return null
+      }
+      return get().applyAggregateOutcome(result.data) ? result.data : null
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      set((state) => ({
+        aggregateBusyById: { ...state.aggregateBusyById, [conversationId]: false },
+        errorsById: {
+          ...state.errorsById,
+          [conversationId]: stableError('CONVERSATION_MUTATION_FAILED', message)
+        }
+      }))
+      void logFrontendError({
+        level: 'warn',
+        source: 'conversation-store.detachProject',
+        message: `conversationId=${conversationId} code=CONVERSATION_MUTATION_FAILED`
+      })
+      return null
+    }
+  },
+
+  updateExecutionTarget: async (conversationId, executionTarget) => {
+    const current = currentConversationRecord(get(), conversationId)
+    if (!current) {
+      set((state) => ({
+        errorsById: {
+          ...state.errorsById,
+          [conversationId]: stableError('CONVERSATION_NOT_FOUND')
+        }
+      }))
+      return null
+    }
+    set((state) => ({
+      aggregateBusyById: { ...state.aggregateBusyById, [conversationId]: true },
+      errorsById: { ...state.errorsById, [conversationId]: undefined }
+    }))
+    try {
+      const result = await conversationApi.updateExecutionTarget(
+        conversationId,
+        current.lastSeq,
+        executionTarget
+      )
+      if (!result.success) {
+        set((state) => ({
+          aggregateBusyById: { ...state.aggregateBusyById, [conversationId]: false },
+          errorsById: {
+            ...state.errorsById,
+            [conversationId]: stableError(result.code, result.error)
+          }
+        }))
+        void logFrontendError({
+          level: 'warn',
+          source: 'conversation-store.updateExecutionTarget',
+          message: `conversationId=${conversationId} code=${result.code}`
+        })
+        return null
+      }
+      return get().applyAggregateOutcome(result.data) ? result.data : null
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      set((state) => ({
+        aggregateBusyById: { ...state.aggregateBusyById, [conversationId]: false },
+        errorsById: {
+          ...state.errorsById,
+          [conversationId]: stableError('CONVERSATION_MUTATION_FAILED', message)
+        }
+      }))
+      void logFrontendError({
+        level: 'warn',
+        source: 'conversation-store.updateExecutionTarget',
+        message: `conversationId=${conversationId} code=CONVERSATION_MUTATION_FAILED`
       })
       return null
     }

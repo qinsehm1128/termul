@@ -290,6 +290,9 @@ pub fn rebuild_catalog(
         if scan.frontier.attachment.has_events {
             record.project_attachment = scan.frontier.attachment.current.clone();
         }
+        if let Some(execution_target) = &scan.frontier.execution_target {
+            record.execution_target = execution_target.clone();
+        }
         if let Some(lifecycle_state) = scan.frontier.lifecycle_state {
             record.lifecycle_state = lifecycle_state;
         }

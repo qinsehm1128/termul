@@ -1,5 +1,6 @@
 import { type ConversationId, parseConversationId } from '@shared/types/conversation.types'
 import type {
+  AcpCompensationFailure,
   ConversationLifecycleApi,
   ConversationLifecycleErrorCode,
   ConversationLifecycleOutcome,
@@ -14,13 +15,36 @@ import { isTauriContext } from './tauri-runtime'
 type IpcBody<T> = { success: true; data?: T } | { success: false; error: string; code: string }
 type ConversationLifecycleRuntime = 'tauri' | 'web'
 
+function parseCompensationFailure(message: string): AcpCompensationFailure | null {
+  try {
+    const value = JSON.parse(message) as Partial<AcpCompensationFailure>
+    if (
+      typeof value.conversationId !== 'string' ||
+      typeof value.primaryCode !== 'string' ||
+      (value.providerCloseCode !== undefined && typeof value.providerCloseCode !== 'string') ||
+      (value.failureRecordCode !== undefined && typeof value.failureRecordCode !== 'string') ||
+      (value.recoveryMarkerCode !== undefined && typeof value.recoveryMarkerCode !== 'string') ||
+      (value.recoveryRecordCode !== undefined && typeof value.recoveryRecordCode !== 'string') ||
+      (value.recoveryId !== undefined && typeof value.recoveryId !== 'string')
+    ) {
+      return null
+    }
+    return value as AcpCompensationFailure
+  } catch {
+    return null
+  }
+}
+
 export class ConversationLifecycleApiError extends Error {
   readonly code: ConversationLifecycleErrorCode
+  readonly compensation: AcpCompensationFailure | null
 
   constructor(code: ConversationLifecycleErrorCode, message: string) {
     super(message)
     this.name = 'ConversationLifecycleApiError'
     this.code = code
+    this.compensation =
+      code === 'ACP_COMPENSATION_FAILED' ? parseCompensationFailure(message) : null
   }
 }
 

@@ -29,12 +29,24 @@ export const CONVERSATION_LIFECYCLE_ERROR_CODES = [
   'ACP_CLOSE_UNSUPPORTED',
   'ACP_CLOSE_FAILED',
   'ACP_REPLACE_FAILED',
+  'ACP_COMPENSATION_FAILED',
   'VALIDATION_ERROR',
   'FORBIDDEN',
   'NETWORK_ERROR'
 ] as const
 
 export type ConversationLifecycleErrorCode = (typeof CONVERSATION_LIFECYCLE_ERROR_CODES)[number]
+
+/** Secret-safe compound detail returned with ACP_COMPENSATION_FAILED. */
+export interface AcpCompensationFailure {
+  conversationId: ConversationId
+  primaryCode: string
+  providerCloseCode?: string
+  failureRecordCode?: string
+  recoveryMarkerCode?: string
+  recoveryRecordCode?: string
+  recoveryId?: string
+}
 
 export interface ConversationLifecycleMutationRequest {
   expectedRevision: number

@@ -23,9 +23,11 @@ mod native_durability_tests;
 mod validation_tests;
 
 pub use application::{
+    ConversationAggregateMutationAction, ConversationAggregateMutationOutcome,
     ConversationApplicationError, ConversationApplicationService, ConversationHostKind,
-    ConversationHostState, ConversationHostStatus, ConversationOpenOutcome, LegacyConversationKey,
-    LegacyConversationResolution, LegacyConversationSourceKind,
+    ConversationHostState, ConversationHostStatus, ConversationIdentitySnapshot,
+    ConversationOpenOutcome, LegacyConversationKey, LegacyConversationResolution,
+    LegacyConversationSourceKind,
 };
 pub use bootstrap::{
     BootstrapError, BootstrapOutcome, ConversationBootstrap, HostConversationRoots,
@@ -46,10 +48,11 @@ pub use contracts::{
     TERMINAL_RESOURCE_REF_SCHEMA_VERSION,
 };
 pub use creation::{
-    AgentBindingResult, AgentCreationFailure, Clock, ConversationCreationError,
-    ConversationCreationService, ConversationIdGenerator, DefaultConversationIdGenerator,
-    PrepareConversationRequest, PreparedConversation, SystemClock,
-    PREPARED_CONVERSATION_SCHEMA_VERSION, PREPARE_CONVERSATION_SCHEMA_VERSION,
+    AgentBindingResult, AgentCompensationFailure, AgentCreationFailure, Clock,
+    ConversationCreationError, ConversationCreationService, ConversationIdGenerator,
+    DefaultConversationIdGenerator, PrepareConversationRequest, PreparedConversation, SystemClock,
+    ACP_COMPENSATION_FAILED, PREPARED_CONVERSATION_SCHEMA_VERSION,
+    PREPARE_CONVERSATION_SCHEMA_VERSION,
 };
 pub use durable_fs::{
     append_jsonl, create_dir_durable, replace_bytes, sync_file_and_namespace, CrashInjector,
@@ -60,7 +63,8 @@ pub use event_log::{
     materialize_records, replay_conversation, AttachmentMaterialization, BindingEventPayloadV1,
     BindingMaterialization, BindingReplacementPayloadV1, ConversationEventRecordV2,
     ConversationEventStream, ConversationEventType, ConversationReplay, EventLogError,
-    EventLogErrorKind, EventLogRepairWarning, ProjectAttachmentEventPayloadV1, ATTACHMENTS_FILE,
+    EventLogErrorKind, EventLogRepairWarning, ExecutionTargetEventPayloadV1,
+    ProjectAttachmentEventPayloadV1, ATTACHMENTS_FILE,
     BINDINGS_FILE, CONVERSATION_EVENT_SCHEMA_VERSION, EVENT_LOG_FILES, MESSAGES_FILE,
     TOOL_CALLS_FILE,
 };
@@ -91,8 +95,8 @@ pub use ordered_persistence::{
 };
 pub use persistence_adapter::{ConversationPersistenceAdapter, ConversationPersistenceError};
 pub use repository::{
-    ConversationMetadataUpdate, ConversationRepository, RepositoryError, RepositoryOpenReport,
-    RepositoryRecoveryItem, RepositoryRecoveryKind,
+    ConversationAggregateMutationRecord, ConversationMetadataUpdate, ConversationRepository,
+    RepositoryError, RepositoryOpenReport, RepositoryRecoveryItem, RepositoryRecoveryKind,
 };
 pub use session_workspace::{
     SessionWorkspaceError, SessionWorkspaceErrorCode, SessionWorkspaceLeafNode,

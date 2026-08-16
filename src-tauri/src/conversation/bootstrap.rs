@@ -698,6 +698,94 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn binding_and_close_failures_return_safe_compound_receipt_and_persist_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let bootstrap = ConversationBootstrap::run(
+            HostConversationRoots::desktop(state.clone(), temp.path().join("visible")),
+            MigrationHostMode::Desktop,
+        )
+        .unwrap();
+        bootstrap.repository.fail_next_agent_binding_appends(2);
+        let manager = Arc::new(crate::AcpManager::with_conversation_services(
+            Vec::new(),
+            Arc::clone(&bootstrap.creation),
+            Arc::clone(&bootstrap.persistence_adapter),
+        ));
+        let agent_id = crate::acp::AgentId("fake-agent".to_string());
+        let (observed_tx, _observed_rx) = std::sync::mpsc::sync_channel(1);
+        manager.install_test_agent_for_new_session_with_close_result(
+            agent_id.clone(),
+            observed_tx,
+            Err("provider close leaked SUPER_SECRET=do-not-return".to_string()),
+        );
+
+        let error = manager
+            .new_session_with_context(
+                &agent_id,
+                temp.path()
+                    .join("ignored-cwd")
+                    .to_string_lossy()
+                    .into_owned(),
+                Vec::new(),
+                crate::acp::SessionCreationContext {
+                    execution_target: Some(crate::conversation::ExecutionTarget::Workspace),
+                    ..crate::acp::SessionCreationContext::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        let failure = crate::conversation::AgentCompensationFailure::from_wire_error(&error)
+            .expect("compound failure must use the stable wire receipt");
+        assert_eq!(failure.primary_code, "CONVERSATION_BIND_FAILED");
+        assert_eq!(
+            failure.provider_close_code.as_deref(),
+            Some("ACP_CLOSE_FAILED")
+        );
+        assert_eq!(
+            failure.failure_record_code.as_deref(),
+            Some("CONVERSATION_DURABILITY_FAILED")
+        );
+        assert!(failure.recovery_marker_code.is_none());
+        assert!(failure.recovery_record_code.is_none());
+        assert!(failure.recovery_id.is_some());
+        assert!(!error.contains("SUPER_SECRET"));
+        assert!(!error.contains("opaque/fake-session"));
+
+        let record = bootstrap
+            .repository
+            .list_conversations()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(record.conversation_id, failure.conversation_id);
+        assert_eq!(
+            record.lifecycle_state,
+            crate::conversation::ConversationLifecycleState::RecoveryRequired
+        );
+        assert!(bootstrap
+            .repository
+            .current_binding(record.conversation_id)
+            .unwrap()
+            .is_none());
+
+        let recovery_bytes = fs::read(
+            state
+                .join("conversation-migrations")
+                .join("workspace-recovery-v1")
+                .join(crate::conversation::migration::RECOVERY_ITEMS_FILE),
+        )
+        .unwrap();
+        let recovery: crate::conversation::migration::RecoveryQueueV1 =
+            serde_json::from_slice(&recovery_bytes).unwrap();
+        assert_eq!(recovery.items.len(), 1);
+        let serialized = String::from_utf8(recovery_bytes).unwrap();
+        assert!(!serialized.contains("SUPER_SECRET"));
+        assert!(!serialized.contains("opaque/fake-session"));
+        assert!(serialized.contains("acpCompensationFailed"));
+    }
+
     #[test]
     fn successful_bootstrap_does_not_self_conflict() {
         let temp = tempfile::tempdir().unwrap();

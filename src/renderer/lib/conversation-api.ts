@@ -28,6 +28,12 @@ export function createConversationFacadeApi(
     getConversation: (conversationId) => coreApi.getConversation(conversationId),
     openConversation: (conversationId) => coreApi.openConversation(conversationId),
     resolveLegacyConversationId: (key) => coreApi.resolveLegacyConversationId(key),
+    attachProject: (conversationId, expectedRevision, attachment) =>
+      coreApi.attachProject(conversationId, expectedRevision, attachment),
+    detachProject: (conversationId, expectedRevision) =>
+      coreApi.detachProject(conversationId, expectedRevision),
+    updateExecutionTarget: (conversationId, expectedRevision, executionTarget) =>
+      coreApi.updateExecutionTarget(conversationId, expectedRevision, executionTarget),
     subscribeHostStatus: (listener) => coreApi.subscribeHostStatus(listener),
     getWorkspace: (conversationId) => workspaceApi.getWorkspace(conversationId),
     writeWorkspace: (conversationId, basedRevision, workspace) =>

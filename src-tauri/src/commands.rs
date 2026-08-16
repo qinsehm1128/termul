@@ -4936,6 +4936,143 @@ pub async fn conversation_recovery_resolve(
     Ok(outcome)
 }
 
+pub(crate) async fn conversation_attach_project_inner(
+    service: &crate::conversation::ConversationApplicationService,
+    conversation_id: &str,
+    expected_revision: u64,
+    attachment: serde_json::Value,
+) -> IpcResult<crate::conversation::ConversationAggregateMutationOutcome> {
+    let conversation_id = match parse_conversation_id(conversation_id) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let attachment: crate::conversation::ProjectAttachment = match serde_json::from_value(attachment)
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return IpcResult::error(
+                format!("payload validation failed: {error}"),
+                "VALIDATION_ERROR",
+            )
+        }
+    };
+    match service
+        .attach_project(conversation_id, expected_revision, attachment)
+        .await
+    {
+        Ok(outcome) => IpcResult::success(outcome),
+        Err(error) => conversation_application_failure(error),
+    }
+}
+
+#[tauri::command]
+pub async fn conversation_attach_project(
+    app: AppHandle,
+    conversation_id: String,
+    expected_revision: u64,
+    attachment: serde_json::Value,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::ConversationAggregateMutationOutcome>, String> {
+    let outcome = conversation_attach_project_inner(
+        service.inner(),
+        &conversation_id,
+        expected_revision,
+        attachment,
+    )
+    .await;
+    if outcome.success {
+        let _ = app.emit("conversation:aggregate", outcome.data.as_ref());
+    }
+    Ok(outcome)
+}
+
+pub(crate) async fn conversation_detach_project_inner(
+    service: &crate::conversation::ConversationApplicationService,
+    conversation_id: &str,
+    expected_revision: u64,
+) -> IpcResult<crate::conversation::ConversationAggregateMutationOutcome> {
+    let conversation_id = match parse_conversation_id(conversation_id) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    match service
+        .detach_project(conversation_id, expected_revision)
+        .await
+    {
+        Ok(outcome) => IpcResult::success(outcome),
+        Err(error) => conversation_application_failure(error),
+    }
+}
+
+#[tauri::command]
+pub async fn conversation_detach_project(
+    app: AppHandle,
+    conversation_id: String,
+    expected_revision: u64,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::ConversationAggregateMutationOutcome>, String> {
+    let outcome = conversation_detach_project_inner(
+        service.inner(),
+        &conversation_id,
+        expected_revision,
+    )
+    .await;
+    if outcome.success {
+        let _ = app.emit("conversation:aggregate", outcome.data.as_ref());
+    }
+    Ok(outcome)
+}
+
+pub(crate) async fn conversation_update_execution_target_inner(
+    service: &crate::conversation::ConversationApplicationService,
+    conversation_id: &str,
+    expected_revision: u64,
+    execution_target: serde_json::Value,
+) -> IpcResult<crate::conversation::ConversationAggregateMutationOutcome> {
+    let conversation_id = match parse_conversation_id(conversation_id) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let execution_target: crate::conversation::ExecutionTarget =
+        match serde_json::from_value(execution_target) {
+            Ok(value) => value,
+            Err(error) => {
+                return IpcResult::error(
+                    format!("payload validation failed: {error}"),
+                    "VALIDATION_ERROR",
+                )
+            }
+        };
+    match service
+        .update_execution_target(conversation_id, expected_revision, execution_target)
+        .await
+    {
+        Ok(outcome) => IpcResult::success(outcome),
+        Err(error) => conversation_application_failure(error),
+    }
+}
+
+#[tauri::command]
+pub async fn conversation_update_execution_target(
+    app: AppHandle,
+    conversation_id: String,
+    expected_revision: u64,
+    execution_target: serde_json::Value,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::ConversationAggregateMutationOutcome>, String> {
+    let outcome = conversation_update_execution_target_inner(
+        service.inner(),
+        &conversation_id,
+        expected_revision,
+        execution_target,
+    )
+    .await;
+    if outcome.success {
+        let _ = app.emit("conversation:aggregate", outcome.data.as_ref());
+    }
+    Ok(outcome)
+}
+
 async fn run_conversation_lifecycle_command(
     app: &AppHandle,
     _conversation_id: String,

@@ -15,6 +15,8 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
@@ -25,8 +27,14 @@ use crate::conversation::contracts::{
     CONVERSATION_SCHEMA_VERSION,
 };
 use crate::conversation::durable_fs::{DirectoryPermissions, DurableFileSystem, DurableFsError};
-use crate::conversation::event_log::{ConversationEventRecordV2, ConversationEventType};
+use crate::conversation::event_log::{
+    ConversationEventRecordV2, ConversationEventType, BINDINGS_FILE,
+};
 use crate::conversation::locator::{ConversationLocator, LocatorError, SessionWorkspaceLocator};
+use crate::conversation::migration::{
+    RecoveryItemV1, RecoveryKind, RecoveryProvenanceV1, RecoveryQueueV1, RecoverySeverity,
+    RECOVERY_ITEMS_FILE,
+};
 use crate::conversation::repository::{
     ConversationMetadataUpdate, ConversationRepository, RepositoryError,
 };
@@ -34,6 +42,8 @@ use crate::conversation::write_authority::{ConversationMutation, ConversationWri
 
 pub const PREPARE_CONVERSATION_SCHEMA_VERSION: u32 = 1;
 pub const PREPARED_CONVERSATION_SCHEMA_VERSION: u32 = 1;
+pub const ACP_COMPENSATION_FAILED: &str = "ACP_COMPENSATION_FAILED";
+const RUNTIME_RECOVERY_OPERATION: &str = "workspace-recovery-v1";
 
 /// Request for a new Conversation or a retry of a retained failed creation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +106,57 @@ impl AgentCreationFailure {
             code: code.into(),
             message: message.into(),
         }
+    }
+}
+
+/// Secret-safe compound receipt for ACP cleanup plus canonical recovery persistence failures.
+/// Opaque provider session ids, provider error bodies, prompts, tool payloads, credentials, and
+/// environment values are deliberately absent from this wire shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentCompensationFailure {
+    pub conversation_id: ConversationId,
+    pub primary_code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_close_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_record_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_marker_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_record_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_id: Option<String>,
+}
+
+impl AgentCompensationFailure {
+    #[must_use]
+    pub fn wire_detail(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| {
+            format!(
+                "{{\"conversationId\":\"{}\",\"primaryCode\":\"{}\",\"recoveryRecordCode\":\"CONVERSATION_DURABILITY_FAILED\"}}",
+                self.conversation_id, self.primary_code
+            )
+        })
+    }
+
+    #[must_use]
+    pub fn wire_error(&self) -> String {
+        format!("{ACP_COMPENSATION_FAILED}:{}", self.wire_detail())
+    }
+
+    #[must_use]
+    pub fn from_wire_error(value: &str) -> Option<Self> {
+        let detail = value.strip_prefix(ACP_COMPENSATION_FAILED)?.strip_prefix(':')?;
+        serde_json::from_str(detail).ok()
+    }
+
+    #[must_use]
+    pub fn has_secondary_failure(&self) -> bool {
+        self.provider_close_code.is_some()
+            || self.failure_record_code.is_some()
+            || self.recovery_marker_code.is_some()
+            || self.recovery_record_code.is_some()
     }
 }
 
@@ -249,29 +310,14 @@ impl ConversationCreationService {
                 "Conversation lifecycle does not admit replacement",
             ));
         }
-        if request
-            .project_attachment
-            .as_ref()
-            .is_some_and(|requested| record.project_attachment.as_ref() != Some(requested))
-        {
-            return Err(creation_error(
-                ConversationErrorCode::ConversationCreateFailed,
-                "prepare_replacement",
-                Some(conversation_id),
-                "replacement cannot change project attachment",
-            ));
-        }
-        if request.execution_target != record.execution_target {
-            return Err(creation_error(
-                ConversationErrorCode::ConversationCreateFailed,
-                "prepare_replacement",
-                Some(conversation_id),
-                "replacement executionTarget must match canonical Conversation metadata",
-            ));
-        }
+        // Replacement is not an aggregate metadata mutation. Post-ready attachment/target changes
+        // are authoritative in the canonical record, so stale renderer projection fields in the
+        // replacement request are ignored rather than rejected or applied. This preserves
+        // Conversation identity/workspace and resolves the replacement provider cwd exclusively
+        // from the latest canonical attachment and execution target.
         let workspace = self.canonical_workspace_for(&record)?;
         let execution_cwd = self.resolve_execution_cwd(
-            &request.execution_target,
+            &record.execution_target,
             &workspace,
             record.project_attachment.as_ref(),
         )?;
@@ -388,6 +434,88 @@ impl ConversationCreationService {
         let _guard = lock.lock().await;
         self.record_agent_creation_failure_locked(conversation_id, code, message)
             .await
+    }
+
+    /// Persist fail-closed lifecycle state plus one private, actionable recovery receipt after ACP
+    /// cleanup or canonical failure recording cannot complete. This entry point owns both the
+    /// creation lock and repository lifecycle lock; lifecycle replacement code that already holds
+    /// the repository lock uses [`Self::record_agent_compensation_failure_locked`] instead.
+    pub async fn record_agent_compensation_failure(
+        self: &Arc<Self>,
+        conversation_id: ConversationId,
+        primary_code: &str,
+        provider_close_code: Option<&str>,
+        failure_record_code: Option<&str>,
+        binding_id: Option<Uuid>,
+    ) -> AgentCompensationFailure {
+        let lock = self.creation_lock(conversation_id);
+        let _guard = lock.lock().await;
+        let _lifecycle_guard = self.repository.lifecycle_lock(conversation_id).await;
+        self.record_agent_compensation_failure_locked(
+            conversation_id,
+            primary_code,
+            provider_close_code,
+            failure_record_code,
+            binding_id,
+        )
+    }
+
+    /// Locked variant used when a lifecycle transaction already owns the per-Conversation lock.
+    /// Marker and receipt persistence are both attempted so the compound result never masks the
+    /// primary failure and always reports every failed compensation component by stable code.
+    pub(crate) fn record_agent_compensation_failure_locked(
+        &self,
+        conversation_id: ConversationId,
+        primary_code: &str,
+        provider_close_code: Option<&str>,
+        failure_record_code: Option<&str>,
+        binding_id: Option<Uuid>,
+    ) -> AgentCompensationFailure {
+        let primary_code = stable_compensation_code(primary_code);
+        let provider_close_code = provider_close_code.map(stable_compensation_code);
+        let failure_record_code = failure_record_code.map(stable_compensation_code);
+
+        let recovery_marker_code = match self
+            .writer
+            .authorize(conversation_id, ConversationMutation::CompensationRecord)
+            .and_then(|permit| {
+                self.repository
+                    .mark_lifecycle_recovery_required_locked(&permit, conversation_id)
+            }) {
+            Ok(_) => None,
+            Err(error) => Some(stable_conversation_error_code(error.code)),
+        };
+
+        let (recovery_id, recovery_record_code) = match self.persist_compensation_recovery_item(
+            conversation_id,
+            &primary_code,
+            provider_close_code.as_deref(),
+            failure_record_code.as_deref(),
+            binding_id,
+        ) {
+            Ok(recovery_id) => (Some(recovery_id), None),
+            Err(error) => (None, Some(stable_conversation_error_code(error.code))),
+        };
+
+        let failure = AgentCompensationFailure {
+            conversation_id,
+            primary_code,
+            provider_close_code,
+            failure_record_code,
+            recovery_marker_code,
+            recovery_record_code,
+            recovery_id,
+        };
+        log::error!(
+            "[conversation-compensation] conversation_id={} primary_code={} provider_close_code={} failure_record_code={} recovery_marker_code={} recovery_record_code={} recovery_required=true",
+            failure.conversation_id,
+            failure.primary_code,
+            failure.provider_close_code.as_deref().unwrap_or("OK"),
+            failure.failure_record_code.as_deref().unwrap_or("OK"),
+            failure.recovery_marker_code.as_deref().unwrap_or("OK"),
+            failure.recovery_record_code.as_deref().unwrap_or("OK")
+        );
+        failure
     }
 
     /// Reconcile interrupted creation without assuming an ACP subprocess survived restart.
@@ -801,7 +929,7 @@ impl ConversationCreationService {
                 conversation_id,
                 self.clock.now_utc(),
                 ConversationEventType::CreationFailed,
-                serde_json::json!({
+                json!({
                     "code": code,
                     "retryable": true,
                     "message": message,
@@ -820,6 +948,130 @@ impl ConversationCreationService {
             code
         );
         Ok(event)
+    }
+
+    fn persist_compensation_recovery_item(
+        &self,
+        conversation_id: ConversationId,
+        primary_code: &str,
+        provider_close_code: Option<&str>,
+        failure_record_code: Option<&str>,
+        binding_id: Option<Uuid>,
+    ) -> Result<String> {
+        self.writer
+            .authorize(conversation_id, ConversationMutation::RecoveryQueueWrite)
+            .map_err(map_repository_error)?;
+        let record = self
+            .repository
+            .get_conversation(conversation_id)
+            .map_err(map_repository_error)?;
+        let relative_path = format!(
+            "{}/{}/{}",
+            record.creation_partition.path, conversation_id, BINDINGS_FILE
+        );
+        let mut candidate = json!({
+            "reasonCode": "acpCompensationFailed",
+            "primaryCode": primary_code,
+            "providerCloseCode": provider_close_code,
+            "failureRecordCode": failure_record_code
+        });
+        if let (Some(binding_id), Some(candidate)) = (binding_id, candidate.as_object_mut()) {
+            candidate.insert("bindingId".to_string(), json!(binding_id));
+        }
+        let evidence = serde_json::to_vec(&candidate).map_err(|error| {
+            creation_error(
+                ConversationErrorCode::ConversationRecoveryRequired,
+                "persist_compensation_recovery",
+                Some(conversation_id),
+                error.to_string(),
+            )
+        })?;
+        let digest = Sha256::digest(&evidence)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let item = RecoveryItemV1::new(
+            RecoveryKind::ConflictingSessionMetadata,
+            RecoverySeverity::Blocking,
+            vec![relative_path.clone()],
+            vec![conversation_id],
+            vec![digest.clone()],
+            vec![candidate],
+            vec![RecoveryProvenanceV1 {
+                source_kind: "canonical_agent_binding_compensation".to_string(),
+                relative_path,
+                sha256: digest,
+                preserved_read_only: true,
+            }],
+        );
+        let recovery_id = item.recovery_id.clone();
+        let repository_root = self.repository.root();
+        let state_root = if repository_root.file_name().and_then(|name| name.to_str()) == Some("v2")
+            && repository_root
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                == Some("conversations")
+        {
+            repository_root.parent().and_then(Path::parent)
+        } else {
+            // Unit-test/injected roots may not use the production suffix. Keep their recovery
+            // queue inside the owning temporary root rather than widening to a shared ancestor.
+            repository_root.parent()
+        }
+        .ok_or_else(|| {
+            creation_error(
+                ConversationErrorCode::ConversationRecoveryRequired,
+                "persist_compensation_recovery",
+                Some(conversation_id),
+                "canonical repository root has no owning state directory",
+            )
+        })?;
+        let operation_dir = state_root
+            .join("conversation-migrations")
+            .join(RUNTIME_RECOVERY_OPERATION);
+        let queue_path = operation_dir.join(RECOVERY_ITEMS_FILE);
+        let mut queue = match fs::read(&queue_path) {
+            Ok(bytes) => serde_json::from_slice::<RecoveryQueueV1>(&bytes).map_err(|error| {
+                creation_error(
+                    ConversationErrorCode::ConversationRecoveryRequired,
+                    "persist_compensation_recovery",
+                    Some(conversation_id),
+                    error.to_string(),
+                )
+            })?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                RecoveryQueueV1::new(Uuid::new_v4(), Vec::new())
+            }
+            Err(error) => {
+                return Err(creation_error(
+                    ConversationErrorCode::ConversationDurabilityFailed,
+                    "persist_compensation_recovery",
+                    Some(conversation_id),
+                    error.to_string(),
+                ))
+            }
+        };
+        if queue
+            .items
+            .iter()
+            .any(|existing| existing.recovery_id == recovery_id)
+        {
+            return Ok(recovery_id);
+        }
+        queue.items.push(item);
+        queue
+            .items
+            .sort_by(|left, right| left.recovery_id.cmp(&right.recovery_id));
+        queue.persist(&operation_dir).map_err(|error| {
+            creation_error(
+                ConversationErrorCode::ConversationDurabilityFailed,
+                "persist_compensation_recovery",
+                Some(conversation_id),
+                error.to_string(),
+            )
+        })?;
+        Ok(recovery_id)
     }
 
     fn canonical_workspace_for(&self, record: &ConversationRecordV2) -> Result<PathBuf> {
@@ -1028,6 +1280,27 @@ fn sanitize_failure_message(message: &str) -> String {
     } else {
         sanitized.to_string()
     }
+}
+
+fn stable_compensation_code(code: &str) -> String {
+    let code = code.trim();
+    if !code.is_empty()
+        && code.len() <= 64
+        && code
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        code.to_string()
+    } else {
+        "CONVERSATION_RECOVERY_REQUIRED".to_string()
+    }
+}
+
+fn stable_conversation_error_code(code: ConversationErrorCode) -> String {
+    serde_json::to_value(code)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "CONVERSATION_RECOVERY_REQUIRED".to_string())
 }
 
 fn target_validation_error(detail: &str) -> ConversationCreationError {

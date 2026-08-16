@@ -1,4 +1,10 @@
-import type { ConversationId, ConversationRecordV2 } from './conversation.types'
+import type {
+  ConversationAggregateMutationOutcome,
+  ConversationId,
+  ConversationRecordV2,
+  ExecutionTarget,
+  ProjectAttachment
+} from './conversation.types'
 import type { RecoveryItemV1 } from './conversation-recovery.types'
 import type { IpcResult } from './ipc.types'
 import type { SessionWorkspaceLoadOutcome } from './session-workspace.types'
@@ -73,6 +79,9 @@ export type ConversationApplicationRequestType =
   | 'get_session_workspace'
   | 'write_session_workspace'
   | 'resolve_recovery_item'
+  | 'attach_project'
+  | 'detach_project'
+  | 'update_execution_target'
 
 export interface ConversationApi {
   getHostStatus(): Promise<IpcResult<ConversationHostStatus>>
@@ -82,5 +91,19 @@ export interface ConversationApi {
   resolveLegacyConversationId(
     key: LegacyConversationKey
   ): Promise<IpcResult<LegacyConversationResolution>>
+  attachProject(
+    conversationId: ConversationId,
+    expectedRevision: number,
+    attachment: ProjectAttachment
+  ): Promise<IpcResult<ConversationAggregateMutationOutcome>>
+  detachProject(
+    conversationId: ConversationId,
+    expectedRevision: number
+  ): Promise<IpcResult<ConversationAggregateMutationOutcome>>
+  updateExecutionTarget(
+    conversationId: ConversationId,
+    expectedRevision: number,
+    executionTarget: ExecutionTarget
+  ): Promise<IpcResult<ConversationAggregateMutationOutcome>>
   subscribeHostStatus(listener: () => void): () => void
 }

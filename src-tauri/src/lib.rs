@@ -1943,6 +1943,9 @@ pub fn run() {
             commands::conversation_get,
             commands::conversation_open,
             commands::conversation_resolve_legacy_id,
+            commands::conversation_attach_project,
+            commands::conversation_detach_project,
+            commands::conversation_update_execution_target,
             // Per-Conversation SessionWorkspace (Conversation stage 5)
             commands::session_workspace_get,
             commands::session_workspace_write,

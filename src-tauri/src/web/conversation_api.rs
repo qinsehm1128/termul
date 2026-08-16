@@ -9,12 +9,12 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::conversation::migration::{RecoveryActionResult, RecoveryAuthorizationClass};
 use crate::conversation::{
-    ConversationApplicationService, ConversationId, LegacyConversationKey,
-    LegacyConversationResolution,
+    ConversationAggregateMutationOutcome, ConversationApplicationService, ConversationId,
+    ExecutionTarget, LegacyConversationKey, LegacyConversationResolution, ProjectAttachment,
 };
 use crate::web::auth::{status_for_code, RemoteAccessAuthority, RemoteCapability, RemotePrincipal};
 use crate::web::fs_api::IpcBody;
@@ -89,6 +89,133 @@ pub async fn open(
                 .map_err(|error| (error.code, error.detail)),
             Err(error) => Err(error),
         },
+        Err(error) => Err(error),
+    };
+    respond(result)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AttachProjectRequest {
+    expected_revision: u64,
+    attachment: ProjectAttachment,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DetachProjectRequest {
+    expected_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateExecutionTargetRequest {
+    expected_revision: u64,
+    execution_target: ExecutionTarget,
+}
+
+pub async fn attach_project(
+    State(state): State<AppState>,
+    Path(conversation_id): Path<String>,
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    Extension(principal): Extension<RemotePrincipal>,
+    body: Bytes,
+) -> impl IntoResponse {
+    if let Err(error) = require(&authority, &principal, RemoteCapability::Mutate) {
+        return respond::<ConversationAggregateMutationOutcome>(Err(error));
+    }
+    let conversation_id = match parse_id(&conversation_id) {
+        Ok(value) => value,
+        Err(error) => return respond::<ConversationAggregateMutationOutcome>(Err(error)),
+    };
+    let request: AttachProjectRequest = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return respond::<ConversationAggregateMutationOutcome>(Err((
+                "VALIDATION_ERROR".to_string(),
+                format!("payload validation failed: {error}"),
+            )))
+        }
+    };
+    let result = match service(&state) {
+        Ok(service) => service
+            .attach_project(
+                conversation_id,
+                request.expected_revision,
+                request.attachment,
+            )
+            .await
+            .map_err(|error| (error.code, error.detail)),
+        Err(error) => Err(error),
+    };
+    respond(result)
+}
+
+pub async fn detach_project(
+    State(state): State<AppState>,
+    Path(conversation_id): Path<String>,
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    Extension(principal): Extension<RemotePrincipal>,
+    body: Bytes,
+) -> impl IntoResponse {
+    if let Err(error) = require(&authority, &principal, RemoteCapability::Mutate) {
+        return respond::<ConversationAggregateMutationOutcome>(Err(error));
+    }
+    let conversation_id = match parse_id(&conversation_id) {
+        Ok(value) => value,
+        Err(error) => return respond::<ConversationAggregateMutationOutcome>(Err(error)),
+    };
+    let request: DetachProjectRequest = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return respond::<ConversationAggregateMutationOutcome>(Err((
+                "VALIDATION_ERROR".to_string(),
+                format!("payload validation failed: {error}"),
+            )))
+        }
+    };
+    let result = match service(&state) {
+        Ok(service) => service
+            .detach_project(conversation_id, request.expected_revision)
+            .await
+            .map_err(|error| (error.code, error.detail)),
+        Err(error) => Err(error),
+    };
+    respond(result)
+}
+
+pub async fn update_execution_target(
+    State(state): State<AppState>,
+    Path(conversation_id): Path<String>,
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    Extension(principal): Extension<RemotePrincipal>,
+    body: Bytes,
+) -> impl IntoResponse {
+    if let Err(error) = require(&authority, &principal, RemoteCapability::Mutate) {
+        return respond::<ConversationAggregateMutationOutcome>(Err(error));
+    }
+    let conversation_id = match parse_id(&conversation_id) {
+        Ok(value) => value,
+        Err(error) => return respond::<ConversationAggregateMutationOutcome>(Err(error)),
+    };
+    let request: UpdateExecutionTargetRequest = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return respond::<ConversationAggregateMutationOutcome>(Err((
+                "VALIDATION_ERROR".to_string(),
+                format!("payload validation failed: {error}"),
+            )))
+        }
+    };
+    let result = match service(&state) {
+        Ok(service) => service
+            .update_execution_target(
+                conversation_id,
+                request.expected_revision,
+                request.execution_target,
+            )
+            .await
+            .map_err(|error| (error.code, error.detail)),
         Err(error) => Err(error),
     };
     respond(result)
