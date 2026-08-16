@@ -5939,6 +5939,7 @@ dependencies = [
  "gtk",
  "keyring",
  "lazy_static",
+ "libc",
  "log",
  "minisign-verify",
  "parking_lot",
