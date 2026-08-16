@@ -1,13 +1,9 @@
-import type {
-  GitStatus,
-  RotatedClaim,
-  SpawnedTerminal,
-  TerminalAttachResult,
-  TerminalSpawnOptions
-} from './ipc.types'
+import type { ConversationId } from './conversation.types'
+import type { GitStatus, RotatedClaim, SpawnedTerminal, TerminalAttachResult } from './ipc.types'
 
 export type WebTerminalRequestType =
   | 'spawn'
+  | 'resume'
   | 'write'
   | 'resize'
   | 'terminate'
@@ -26,11 +22,44 @@ export type WebTerminalRequestType =
   | 'set_protected'
   | 'update_orphan_detection'
 
-export interface WebTerminalRequest {
-  id: string
-  type: WebTerminalRequestType
-  payload: Record<string, unknown> | TerminalSpawnOptions
+export type TerminalCwdSource = 'workspace' | 'executionTarget'
+
+/**
+ * Remote spawn authority is intentionally narrow. The host resolves cwd from
+ * the Conversation and derives shell/program/argv/environment itself.
+ */
+export interface TerminalSpawnIntentV1 {
+  conversationId: ConversationId
+  projectId?: string
+  cwdSource: TerminalCwdSource
+  cols: number
+  rows: number
 }
+
+/** Cold-renderer request for a host-authorized, one-time claim rotation. */
+export interface TerminalResumeRequest {
+  conversationId: ConversationId
+  terminalId: string
+  lastSeq: number
+}
+
+/**
+ * Authenticated resume handoff. `claim` is response-only and in-memory-only;
+ * it must never be added to SessionWorkspace or renderer persistence.
+ */
+export interface TerminalResumeGrant {
+  terminal: TerminalAttachResult
+  claim: string
+}
+
+export type WebTerminalRequest =
+  | { id: string; type: 'spawn'; payload: TerminalSpawnIntentV1 }
+  | { id: string; type: 'resume'; payload: TerminalResumeRequest }
+  | {
+      id: string
+      type: Exclude<WebTerminalRequestType, 'spawn' | 'resume'>
+      payload: Record<string, unknown>
+    }
 
 export type WebTerminalReply<T = unknown> =
   | { id: string; success: true; data: T }
@@ -97,6 +126,9 @@ export type WebTerminalSpawnReply = WebTerminalReply<SpawnedTerminal>
 
 /** CAP-3: attach reply — shared TerminalAttachResult shape (never a claim). */
 export type WebTerminalAttachReply = WebTerminalReply<TerminalAttachResult>
+
+/** Authenticated cold-resume reply — identical to desktop TerminalResumeGrant. */
+export type WebTerminalResumeReply = WebTerminalReply<TerminalResumeGrant>
 
 /** CAP-3: rotate reply — the fresh credential. */
 export type WebTerminalRotateClaimReply = WebTerminalReply<RotatedClaim>

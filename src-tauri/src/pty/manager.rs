@@ -3,7 +3,7 @@
 //! This module provides terminal spawning, I/O, and lifecycle management
 //! ported from the Electron implementation.
 
-use crate::conversation::ConversationId;
+use crate::conversation::{ConversationId, ConversationRecordV2, ExecutionTarget};
 use crate::pty::claims::ClaimError;
 use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEvent, TerminalEventHub};
 use parking_lot::RwLock;
@@ -478,14 +478,24 @@ pub struct TerminalInfo {
 ///
 /// Serializes FLATTENED — `{id, shell, cwd, pid, cols, rows, claim}` — so both
 /// transports (desktop `terminal_spawn` IpcResult data and the web `spawn`
-/// reply data) expose the same top-level camelCase shape. This is the only
-/// issuance path for the credential.
-#[derive(Debug, Clone, Serialize)]
+/// reply data) expose the same top-level camelCase shape. This is the initial
+/// issuance path; authenticated resume and explicit rotation can replace it.
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpawnedTerminal {
     #[serde(flatten)]
     pub info: TerminalInfo,
     pub claim: String,
+}
+
+impl std::fmt::Debug for SpawnedTerminal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SpawnedTerminal")
+            .field("info", &self.info)
+            .field("claim", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Shared attach response — byte-identical camelCase shape on both transports
@@ -507,6 +517,25 @@ pub struct TerminalAttachResult {
     pub gap: bool,
 }
 
+/// Cold-renderer resume request. Unknown fields are rejected so this path can
+/// never grow into a raw spawn or environment override surface.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TerminalResumeRequest {
+    pub conversation_id: ConversationId,
+    pub terminal_id: String,
+    pub last_seq: u64,
+}
+
+/// One-time resume handoff. The claim exists only in this authenticated
+/// response and the renderer's memory; it is never persisted or logged.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalResumeGrant {
+    pub terminal: TerminalAttachResult,
+    pub claim: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalOutputChunk {
@@ -520,6 +549,9 @@ pub struct TerminalReplay {
     pub gap: bool,
     pub latest_seq: u64,
     pub receiver: tokio::sync::broadcast::Receiver<TerminalOutputChunk>,
+    /// Exact claim generation authorized for a trusted resume. This is
+    /// process-local control metadata and is never serialized.
+    pub(crate) claim_generation: Option<u64>,
 }
 
 /// Broadcast channel capacity (number of buffered output batches per terminal).
@@ -533,7 +565,86 @@ const TERM_BROADCAST_CAPACITY: usize = 1024;
 /// even for very chatty terminals. Oldest bytes are evicted first.
 pub const SCROLLBACK_CAP: usize = 256 * 1024;
 
-/// Options for spawning a new terminal
+/// Host-authorized remote terminal spawn intent.
+///
+/// Remote callers may select only the canonical Conversation, optional project
+/// attribution, one of the two host-owned cwd sources, and terminal dimensions.
+/// Program, shell, argv, environment, and raw cwd never cross this boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TerminalSpawnIntentV1 {
+    pub conversation_id: ConversationId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    pub cwd_source: TerminalCwdSource,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TerminalCwdSource {
+    Workspace,
+    ExecutionTarget,
+}
+
+impl TerminalSpawnIntentV1 {
+    fn into_trusted_options(
+        self,
+        conversation: &ConversationRecordV2,
+    ) -> Result<SpawnOptions, String> {
+        if self.conversation_id != conversation.conversation_id {
+            return Err("terminal spawn scope is unauthorized".to_string());
+        }
+        if self.cols == 0 || self.rows == 0 {
+            return Err("terminal dimensions must be greater than zero".to_string());
+        }
+
+        let authoritative_project_id = match &conversation.execution_target {
+            ExecutionTarget::ProjectRoot { project_id, .. }
+            | ExecutionTarget::Worktree { project_id, .. } => Some(project_id.as_str()),
+            ExecutionTarget::Workspace => conversation
+                .project_attachment
+                .as_ref()
+                .map(|attachment| attachment.project_id.as_str()),
+        };
+        if let Some(project_id) = self.project_id.as_deref() {
+            if project_id.trim().is_empty() || authoritative_project_id != Some(project_id) {
+                return Err("terminal spawn project scope is unauthorized".to_string());
+            }
+        }
+
+        let cwd = match (&self.cwd_source, &conversation.execution_target) {
+            (TerminalCwdSource::Workspace, _)
+            | (TerminalCwdSource::ExecutionTarget, ExecutionTarget::Workspace) => {
+                conversation.workspace_cwd.clone()
+            }
+            (
+                TerminalCwdSource::ExecutionTarget,
+                ExecutionTarget::ProjectRoot { project_root, .. },
+            ) => project_root.clone(),
+            (
+                TerminalCwdSource::ExecutionTarget,
+                ExecutionTarget::Worktree { worktree_path, .. },
+            ) => worktree_path.clone(),
+        };
+
+        Ok(SpawnOptions {
+            shell: None,
+            cwd: Some(cwd),
+            env: None,
+            conversation_id: Some(self.conversation_id),
+            project_id: self.project_id,
+            cols: Some(self.cols),
+            rows: Some(self.rows),
+            program: None,
+            args: None,
+            kind: None,
+        })
+    }
+}
+
+/// Options for spawning a new terminal on trusted local/internal paths.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpawnOptions {
@@ -717,6 +828,7 @@ impl TerminalInstance {
             gap,
             latest_seq,
             receiver,
+            claim_generation: None,
         }
     }
 }
@@ -1024,6 +1136,7 @@ impl PtyManager {
     /// verification can never diverge). Any failure path rolls the issuance
     /// back via the RAII guard, so a credential never outlives its terminal.
     /// Returns the shared [`SpawnedTerminal`] shape feeding both transports.
+    /// This is initial issuance; authenticated resume may later rotate it.
     pub async fn spawn(
         &self,
         options: SpawnOptions,
@@ -1067,6 +1180,20 @@ impl PtyManager {
         claim_guard.commit();
         slot_reservation.commit();
         Ok(SpawnedTerminal { info, claim })
+    }
+
+    /// Spawn an interactive terminal from the narrow remote intent. All
+    /// executable, shell, argv, environment, and cwd values are derived from
+    /// host-owned Conversation metadata before entering the ordinary trusted
+    /// spawn path.
+    pub async fn spawn_for_conversation(
+        &self,
+        intent: TerminalSpawnIntentV1,
+        conversation: &ConversationRecordV2,
+        on_data: Option<Channel<Response>>,
+    ) -> Result<SpawnedTerminal, String> {
+        let options = intent.into_trusted_options(conversation)?;
+        self.spawn(options, on_data).await
     }
 
     /// Platform-specific PTY creation (the former `spawn` body). `id` and the
@@ -1837,6 +1964,46 @@ impl PtyManager {
     /// when it changes (rotate/revoke) or disappears (kill/reap).
     pub fn claim_generation(&self, terminal_id: &str) -> Option<u64> {
         self.claims.generation(terminal_id)
+    }
+
+    /// Authorize a cold renderer against the live typed Conversation scope,
+    /// rotate the in-memory claim generation, and snapshot cursor replay. This
+    /// never spawns, terminates, changes cwd, or mutates the passive workspace
+    /// reference.
+    pub fn resume_for_conversation(
+        &self,
+        conversation_id: ConversationId,
+        terminal_id: &str,
+        last_seq: u64,
+    ) -> Result<(TerminalResumeGrant, TerminalReplay), ClaimError> {
+        let instance = self
+            .get(terminal_id)
+            .filter(|instance| {
+                instance.workspace_ref_tracked && instance.conversation_matches(conversation_id)
+            })
+            .ok_or(ClaimError)?;
+
+        // Subscribe before rotating so output produced during the rotation is
+        // retained by the live receiver. The registry returns the exact new
+        // generation from the same lock hold that installs the successor
+        // digest, preventing a concurrent resume from authorizing this replay.
+        let mut replay = instance.subscribe_from(last_seq);
+        let (claim, generation) = self.claims.rotate_for_resume(
+            terminal_id,
+            conversation_id,
+            instance.project_id.as_deref(),
+        )?;
+        replay.claim_generation = Some(generation);
+        let terminal = self.build_attach_result(&instance, &replay);
+
+        log::info!(
+            "[terminal-resume] granted terminal_id={} conversation_id={} latest_seq={} gap={}",
+            terminal_id,
+            conversation_id,
+            terminal.latest_seq,
+            terminal.gap
+        );
+        Ok((TerminalResumeGrant { terminal, claim }, replay))
     }
 
     /// Build the shared attach result (byte-identical camelCase shape on both
@@ -3056,6 +3223,172 @@ mod tests {
         ));
     }
 
+    fn conversation_record(
+        conversation_id: ConversationId,
+        workspace_cwd: &str,
+        execution_target: ExecutionTarget,
+    ) -> ConversationRecordV2 {
+        let created_at =
+            crate::conversation::parse_created_at_utc("2026-08-15T09:45:15.123Z").unwrap();
+        ConversationRecordV2 {
+            schema_version: crate::conversation::CONVERSATION_SCHEMA_VERSION,
+            conversation_id,
+            created_at_utc: created_at,
+            creation_partition: crate::conversation::CreationPartition::from_created_at(created_at),
+            workspace_cwd: workspace_cwd.to_string(),
+            execution_target,
+            project_attachment: None,
+            lifecycle_state: crate::conversation::ConversationLifecycleState::Ready,
+            last_seq: 0,
+            created_by: crate::conversation::ConversationCreator::Termul,
+        }
+    }
+
+    #[test]
+    fn trusted_spawn_intent_derives_host_options() {
+        let conversation_id =
+            ConversationId::parse("018f7a1c-1b4d-7c8a-9f01-0123456789ab").unwrap();
+        let record = conversation_record(
+            conversation_id,
+            "/host/workspace",
+            ExecutionTarget::Worktree {
+                project_id: "project-1".to_string(),
+                worktree_path: "/host/worktree".to_string(),
+                worktree_branch: "chat/test".to_string(),
+            },
+        );
+        let intent = TerminalSpawnIntentV1 {
+            conversation_id,
+            project_id: Some("project-1".to_string()),
+            cwd_source: TerminalCwdSource::ExecutionTarget,
+            cols: 120,
+            rows: 40,
+        };
+
+        let options = intent.into_trusted_options(&record).unwrap();
+        assert_eq!(options.conversation_id, Some(conversation_id));
+        assert_eq!(options.project_id.as_deref(), Some("project-1"));
+        assert_eq!(options.cwd.as_deref(), Some("/host/worktree"));
+        assert_eq!(options.cols, Some(120));
+        assert_eq!(options.rows, Some(40));
+        assert!(options.shell.is_none());
+        assert!(options.program.is_none());
+        assert!(options.args.is_none());
+        assert!(options.env.is_none());
+        assert!(options.kind.is_none());
+
+        let wrong_project = TerminalSpawnIntentV1 {
+            conversation_id,
+            project_id: Some("project-other".to_string()),
+            cwd_source: TerminalCwdSource::Workspace,
+            cols: 80,
+            rows: 24,
+        };
+        assert!(wrong_project.into_trusted_options(&record).is_err());
+    }
+
+    #[tokio::test]
+    async fn resume_preserves_pty_and_replays_cursor() {
+        let manager = crate::web::test_pty_manager();
+        let conversation_id =
+            ConversationId::parse("018f7a1c-1b4d-7c8a-9f01-0123456789ab").unwrap();
+        let other_conversation_id =
+            ConversationId::parse("5f7a1c01-4d1b-4c8a-af01-0123456789ab").unwrap();
+        let terminal_id = "terminal-resume-test".to_string();
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(8);
+        let chunks = std::collections::VecDeque::from([
+            TerminalOutputChunk {
+                seq: 1,
+                data: b"one".to_vec(),
+            },
+            TerminalOutputChunk {
+                seq: 2,
+                data: b"two".to_vec(),
+            },
+        ]);
+        let instance = Arc::new(TerminalInstance {
+            id: terminal_id.clone(),
+            conversation_id,
+            workspace_ref_tracked: true,
+            project_id: Some("project-1".to_string()),
+            child: Arc::new(AsyncMutex::new(None)),
+            master: Arc::new(AsyncMutex::new(None)),
+            writer: Arc::new(AsyncMutex::new(None)),
+            reader_handle: Arc::new(AsyncMutex::new(None)),
+            flusher_handle: Arc::new(AsyncMutex::new(None)),
+            shell: "host-shell".to_string(),
+            cwd: "/host/workspace".to_string(),
+            pid: 42,
+            last_activity: Arc::new(RwLock::new(Instant::now())),
+            orphan_since: Arc::new(RwLock::new(None)),
+            renderer_refs: Arc::new(RwLock::new(HashSet::new())),
+            protected: Arc::new(AtomicBool::new(true)),
+            cols: Arc::new(RwLock::new(80)),
+            rows: Arc::new(RwLock::new(24)),
+            broadcast_tx: Arc::new(broadcast_tx),
+            output_log: Arc::new(RwLock::new(chunks)),
+            output_log_bytes: Arc::new(AtomicUsize::new(6)),
+            next_output_seq: Arc::new(AtomicU64::new(3)),
+            #[cfg(target_os = "windows")]
+            conpty_handles: None,
+        });
+        manager
+            .terminals
+            .write()
+            .insert(terminal_id.clone(), instance);
+        manager.active_terminal_slots.store(1, Ordering::SeqCst);
+        let old_claim = manager
+            .claims
+            .issue(&terminal_id, conversation_id, Some("project-1"));
+        let generation_before = manager.claim_generation(&terminal_id).unwrap();
+
+        assert!(manager
+            .resume_for_conversation(other_conversation_id, &terminal_id, 1)
+            .is_err());
+        assert!(manager
+            .resume_for_conversation(conversation_id, "terminal-unknown", 1)
+            .is_err());
+        assert_eq!(
+            manager.claim_generation(&terminal_id),
+            Some(generation_before)
+        );
+
+        let (grant, replay) = manager
+            .resume_for_conversation(conversation_id, &terminal_id, 1)
+            .unwrap();
+        assert_eq!(grant.terminal.id, terminal_id);
+        assert_eq!(grant.terminal.latest_seq, 2);
+        assert!(!grant.terminal.gap);
+        assert_eq!(replay.chunks.len(), 1);
+        assert_eq!(replay.chunks[0].seq, 2);
+        assert_eq!(replay.chunks[0].data, b"two");
+        assert!(replay.claim_generation.unwrap() > generation_before);
+        assert!(manager.get(&terminal_id).is_some(), "resume preserves PTY");
+        assert_eq!(
+            manager.verify_claim(&terminal_id, &old_claim),
+            Err(ClaimError)
+        );
+        assert!(manager.verify_claim(&terminal_id, &grant.claim).is_ok());
+
+        let first_handoff = grant.claim;
+        let (successor, _) = manager
+            .resume_for_conversation(conversation_id, &terminal_id, 2)
+            .unwrap();
+        assert_eq!(
+            manager.verify_claim(&terminal_id, &first_handoff),
+            Err(ClaimError)
+        );
+        assert!(manager.verify_claim(&terminal_id, &successor.claim).is_ok());
+        assert!(
+            manager.get(&terminal_id).is_some(),
+            "rotation preserves PTY"
+        );
+
+        manager.terminals.write().remove(&terminal_id);
+        manager.claims.remove(&terminal_id);
+        manager.active_terminal_slots.store(0, Ordering::SeqCst);
+    }
+
     #[test]
     fn test_spawn_options_default() {
         let options = SpawnOptions::default();
@@ -3120,6 +3453,10 @@ mod tests {
             },
             claim: "f3a9".to_string(),
         };
+
+        let debug = format!("{spawned:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains(&spawned.claim));
 
         let value: serde_json::Value = serde_json::to_value(&spawned).unwrap();
         let obj = value.as_object().expect("spawn reply is an object");
@@ -3194,6 +3531,45 @@ mod tests {
             .into_iter()
             .collect::<std::collections::BTreeSet<&str>>()
         );
+    }
+
+    #[test]
+    fn terminal_resume_grant_serializes_exact_camelcase_shape() {
+        let grant = TerminalResumeGrant {
+            terminal: TerminalAttachResult {
+                id: "terminal-123-0".to_string(),
+                shell: "pwsh".to_string(),
+                cwd: "C:\\work".to_string(),
+                pid: 42,
+                cols: 120,
+                rows: 32,
+                latest_seq: 87,
+                gap: false,
+            },
+            claim: "one-time-claim".to_string(),
+        };
+
+        let value = serde_json::to_value(grant).unwrap();
+        let object = value.as_object().expect("resume grant is an object");
+        let keys = object
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            ["claim", "terminal"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        let terminal = object["terminal"]
+            .as_object()
+            .expect("terminal metadata is nested");
+        assert_eq!(
+            terminal.get("latestSeq").and_then(|value| value.as_u64()),
+            Some(87)
+        );
+        assert!(!terminal.contains_key("claim"));
+        assert_eq!(object["claim"], "one-time-claim");
     }
 
     // ========== Git Bash resolution tests ==========

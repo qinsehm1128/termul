@@ -1755,6 +1755,7 @@ pub fn run() {
             commands::conversation_migration_control,
             // Terminal commands
             commands::terminal_spawn,
+            commands::terminal_resume,
             commands::terminal_attach,
             commands::terminal_rotate_claim,
             commands::terminal_revoke_claim,

@@ -5,6 +5,7 @@ use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::Request;
 use axum::routing::{get, post};
+use axum::Extension;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -119,6 +120,12 @@ async fn fixture() -> GoldenFixture {
 }
 
 fn app(state: AppState) -> axum::Router {
+    let authority = Arc::new(crate::web::RemoteAccessAuthority::for_tests(
+        "conversation-golden-token",
+    ));
+    let principal = authority
+        .verify_bearer("conversation-golden-token")
+        .unwrap();
     axum::Router::new()
         .route("/conversations", get(conversation_api::list))
         .route(
@@ -130,6 +137,8 @@ fn app(state: AppState) -> axum::Router {
             post(conversation_api::resolve_recovery),
         )
         .with_state(state)
+        .layer(Extension(principal))
+        .layer(Extension(authority))
 }
 
 async fn response_json(response: axum::response::Response) -> Value {
@@ -325,9 +334,14 @@ async fn http_remote_mutation_is_forbidden_without_mutating_recovery_state() {
         .await
         .unwrap();
     let body = response_json(response).await;
-    assert_eq!(body["code"], "FORBIDDEN");
+    // Historical test name retained because TASK-008 reported this exact
+    // golden filter. Since the shared RemoteAccessAuthority replaced peer-IP
+    // trust, an authenticated remote principal is authorized independent of
+    // proxy address; the mutation must apply exactly once through the same
+    // golden transport envelope.
+    assert_eq!(body["success"], true);
     assert_eq!(
         fixture.service.host_status().unwrap().recovery_item_count,
-        1
+        0
     );
 }

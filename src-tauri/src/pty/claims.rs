@@ -4,8 +4,8 @@
 //! bytes from `getrandom`, hex-encoded to 64 chars). The host stores ONLY the
 //! SHA-256 digest of the credential — never the raw credential — and verifies
 //! presented credentials in constant time against that digest. Credentials are
-//! never logged and never returned except by the issuance (spawn) and rotation
-//! responses.
+//! never logged and never returned except by initial spawn, possession-based
+//! rotation, and authenticated scope-bound resume responses.
 //!
 //! All verification failures (unknown terminal, oversized probe, wrong
 //! credential, revoked credential, project-binding mismatch) collapse into the
@@ -22,8 +22,8 @@
 //! surface's generic-error policy is the primary leak defense.
 //!
 //! Per-terminal monotonically increasing GENERATION counters are bumped on
-//! rotate/revoke so derived access (e.g. desktop attach output forwarders) can
-//! observe invalidation and terminate.
+//! rotate/revoke/resume so derived access (e.g. desktop attach output
+//! forwarders) can observe invalidation and terminate.
 
 use crate::conversation::ConversationId;
 use parking_lot::Mutex;
@@ -41,12 +41,21 @@ const DUMMY_DIGEST: [u8; 32] = [0xA5; 32];
 
 /// Wire shape of the rotate response — byte-identical on both transports
 /// (desktop `terminal_rotate_claim` IpcResult data; web `rotate_claim` reply
-/// data). Issuance-on-rotation is the only time a credential leaves the host
-/// besides spawn.
-#[derive(Debug, Clone, serde::Serialize)]
+/// data). Possession-based rotation is one of the explicit response-only
+/// issuance paths, alongside initial spawn and authenticated cold resume.
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RotatedClaim {
     pub claim: String,
+}
+
+impl std::fmt::Debug for RotatedClaim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RotatedClaim")
+            .field("claim", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Single collapsed failure type for every claim operation.
@@ -121,7 +130,7 @@ impl TerminalClaimRegistry {
         Self::default()
     }
 
-    /// Issue a fresh credential for `terminal_id`, bound to `project_id`.
+    /// Issue the initial fresh credential for `terminal_id`, bound to `project_id`.
     ///
     /// The host retains only the SHA-256 digest; the returned credential string
     /// exists nowhere else in the process. Any previous record for the terminal
@@ -332,6 +341,70 @@ impl TerminalClaimRegistry {
         Ok(credential)
     }
 
+    /// Trusted cold-resume rotation after the host has independently
+    /// authorized the exact Conversation/terminal pair through its passive
+    /// SessionWorkspace reference. No old credential is accepted on this path.
+    /// The successor digest and generation are installed under one lock hold;
+    /// every mismatch returns the same data-free [`ClaimError`].
+    pub fn rotate_for_resume(
+        &self,
+        terminal_id: &str,
+        conversation_id: ConversationId,
+        project_id: Option<&str>,
+    ) -> Result<(String, u64), ClaimError> {
+        let mut raw = [0u8; 32];
+        getrandom::getrandom(&mut raw).expect("OS CSPRNG is available");
+        let credential = hex_encode(&raw);
+        let digest = sha256_digest(credential.as_bytes());
+        for byte in raw.iter_mut() {
+            *byte = 0;
+        }
+
+        let mut records = self.records.lock();
+        let Some(record) = records.get_mut(terminal_id) else {
+            drop(records);
+            log::warn!(
+                "[claims] resume rotation failed terminal_id={} conversation_id={} project_id={}",
+                terminal_id,
+                conversation_id,
+                project_id.unwrap_or("<none>")
+            );
+            return Err(ClaimError);
+        };
+        let project_matches = match (&record.project_id, project_id) {
+            (Some(bound), Some(presented)) => {
+                bool::from(bound.as_bytes().ct_eq(presented.as_bytes()))
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if record.conversation_id != conversation_id || !project_matches {
+            drop(records);
+            log::warn!(
+                "[claims] resume rotation failed terminal_id={} conversation_id={} project_id={}",
+                terminal_id,
+                conversation_id,
+                project_id.unwrap_or("<none>")
+            );
+            return Err(ClaimError);
+        }
+
+        record.digest = digest;
+        record.revoked = false;
+        record.generation = record.generation.wrapping_add(1);
+        let generation = record.generation;
+        drop(records);
+
+        log::info!(
+            "[claims] resume claim rotated terminal_id={} conversation_id={} project_id={} generation={}",
+            terminal_id,
+            conversation_id,
+            project_id.unwrap_or("<none>"),
+            generation
+        );
+        Ok((credential, generation))
+    }
+
     /// Revoke: invalidate the presented credential. The PTY is untouched —
     /// revocation only severs credential-derived access.
     ///
@@ -440,6 +513,16 @@ mod tests {
     }
 
     #[test]
+    fn rotated_claim_debug_output_is_redacted() {
+        let rotated = RotatedClaim {
+            claim: "raw-claim-must-not-reach-logs".to_string(),
+        };
+        let debug = format!("{rotated:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains(&rotated.claim));
+    }
+
+    #[test]
     fn issued_credentials_are_unguessable_distinct() {
         let registry = TerminalClaimRegistry::new();
         let a = registry.issue("t1", conversation_id(), Some("p1"));
@@ -524,6 +607,39 @@ mod tests {
             .verify("t1", &new, conversation_id(), Some("p1"))
             .is_ok());
         assert_ne!(registry.generation("t1"), gen0);
+    }
+
+    #[test]
+    fn resume_rotates_scope_bound_claim() {
+        let registry = TerminalClaimRegistry::new();
+        let old = registry.issue("t1", conversation_id(), Some("p1"));
+        let old_generation = registry.generation("t1").unwrap();
+
+        assert_eq!(
+            registry.rotate_for_resume("t1", other_conversation_id(), Some("p1")),
+            Err(ClaimError)
+        );
+        assert_eq!(
+            registry.rotate_for_resume("missing", conversation_id(), Some("p1")),
+            Err(ClaimError)
+        );
+        assert_eq!(registry.generation("t1"), Some(old_generation));
+        assert!(registry
+            .verify("t1", &old, conversation_id(), Some("p1"))
+            .is_ok());
+
+        let (successor, generation) = registry
+            .rotate_for_resume("t1", conversation_id(), Some("p1"))
+            .unwrap();
+        assert_ne!(successor, old);
+        assert!(generation > old_generation);
+        assert_eq!(
+            registry.verify("t1", &old, conversation_id(), Some("p1")),
+            Err(ClaimError)
+        );
+        assert!(registry
+            .verify("t1", &successor, conversation_id(), Some("p1"))
+            .is_ok());
     }
 
     #[test]

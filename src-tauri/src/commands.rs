@@ -3,8 +3,11 @@ use crate::migrations::{
     MigrationInfo, MigrationManager, MigrationRecord, MigrationResult, SchemaVersion,
 };
 use crate::path_validation;
-use crate::pty::claims::RotatedClaim;
-use crate::pty::manager::{SpawnedTerminal, TerminalAttachResult};
+use crate::pty::claims::{ClaimError, RotatedClaim};
+use crate::pty::manager::{
+    SpawnedTerminal, TerminalAttachResult, TerminalReplay, TerminalResumeGrant,
+    TerminalResumeRequest, TerminalSpawnIntentV1,
+};
 use crate::pty::{PtyManager, SpawnOptions};
 use crate::remote;
 use crate::trackers::{
@@ -285,7 +288,8 @@ pub fn read_attachment_bytes(path: String) -> Result<Response, String> {
 ///
 /// CAP-3: the response carries the terminal info PLUS the issued `claim`
 /// credential (flattened camelCase, same shape as the web `spawn` reply).
-/// This is the only issuance path.
+/// This is the initial issuance path; authenticated resume and explicit
+/// rotation can later replace the claim.
 #[tauri::command]
 pub async fn terminal_spawn(
     options: SpawnOptions,
@@ -309,6 +313,38 @@ pub(crate) async fn terminal_spawn_resource(
     workspace: &Arc<crate::conversation::SessionWorkspaceService>,
 ) -> IpcResult<SpawnedTerminal> {
     terminal_spawn_resource_impl(options, on_data, pty_manager, workspace, None).await
+}
+
+/// Remote-only spawn path. The wire payload is already narrowed to
+/// [`TerminalSpawnIntentV1`]; `PtyManager` derives every executable, shell,
+/// environment, and cwd value from the host-owned Conversation record.
+pub(crate) async fn terminal_spawn_intent_resource(
+    intent: TerminalSpawnIntentV1,
+    conversation: &crate::conversation::ConversationRecordV2,
+    pty_manager: &Arc<PtyManager>,
+    workspace: &Arc<crate::conversation::SessionWorkspaceService>,
+) -> IpcResult<SpawnedTerminal> {
+    let conversation_id = intent.conversation_id;
+    if let Err(error) = workspace.ensure_terminal_ref_writable(conversation_id, true) {
+        log::warn!(
+            "[terminal-command] remote spawn admission rejected conversation_id={} code={}",
+            conversation_id,
+            error.code.as_str()
+        );
+        return IpcResult::error(error.detail, error.code.as_str());
+    }
+
+    let spawned = match pty_manager
+        .spawn_for_conversation(intent, conversation, None)
+        .await
+    {
+        Ok(spawned) => spawned,
+        Err(error) if error.ends_with("scope is unauthorized") => {
+            return IpcResult::error("Unauthorized", "UNAUTHORIZED")
+        }
+        Err(error) => return IpcResult::error(error, "SPAWN_FAILED"),
+    };
+    commit_terminal_spawn_resource(spawned, conversation_id, pty_manager, workspace, None).await
 }
 
 #[cfg(test)]
@@ -357,7 +393,23 @@ async fn terminal_spawn_resource_impl(
     let Some(conversation_id) = conversation_id else {
         return IpcResult::success(spawned);
     };
+    commit_terminal_spawn_resource(
+        spawned,
+        conversation_id,
+        pty_manager,
+        workspace,
+        rollback_result_override,
+    )
+    .await
+}
 
+async fn commit_terminal_spawn_resource(
+    spawned: SpawnedTerminal,
+    conversation_id: crate::conversation::ConversationId,
+    pty_manager: &Arc<PtyManager>,
+    workspace: &Arc<crate::conversation::SessionWorkspaceService>,
+    rollback_result_override: Option<Result<(), String>>,
+) -> IpcResult<SpawnedTerminal> {
     if let Err(primary) = workspace
         .add_terminal_ref(conversation_id, &spawned.info.id)
         .await
@@ -473,6 +525,93 @@ mod forwarder_teardown_tests {
         // still be total.
         assert!(forwarder_should_terminate(None, Some(1)));
     }
+}
+
+/// Validate the passive SessionWorkspace reference and rotate a one-time claim
+/// for a matching live PTY. Every missing, unknown, corrupt, or mismatched case
+/// collapses to the same data-free [`ClaimError`].
+pub(crate) async fn terminal_resume_resource(
+    request: &TerminalResumeRequest,
+    pty_manager: &Arc<PtyManager>,
+    workspace: &Arc<crate::conversation::SessionWorkspaceService>,
+) -> Result<(TerminalResumeGrant, TerminalReplay), ClaimError> {
+    let has_passive_ref = match workspace.load(request.conversation_id).await {
+        Ok(crate::conversation::SessionWorkspaceLoadOutcome::Loaded { workspace }) => {
+            workspace.resources.iter().any(|resource| {
+                matches!(
+                    resource,
+                    crate::conversation::SessionWorkspaceResourceDescriptor::Terminal {
+                        terminal_id,
+                        conversation_id,
+                        ..
+                    } if terminal_id == &request.terminal_id
+                        && *conversation_id == request.conversation_id
+                )
+            })
+        }
+        Ok(
+            crate::conversation::SessionWorkspaceLoadOutcome::Missing { .. }
+            | crate::conversation::SessionWorkspaceLoadOutcome::RecoveryRequired { .. },
+        )
+        | Err(_) => false,
+    };
+    if !has_passive_ref {
+        log::warn!(
+            "[terminal-resume] denied conversation_id={} terminal_id={} code=UNAUTHORIZED",
+            request.conversation_id,
+            request.terminal_id
+        );
+        return Err(ClaimError);
+    }
+
+    pty_manager.resume_for_conversation(
+        request.conversation_id,
+        &request.terminal_id,
+        request.last_seq,
+    )
+}
+
+/// Resume a passive terminal reference after a cold desktop renderer start.
+/// The local Tauri invoke boundary is trusted, but the exact Conversation and
+/// terminal scope is still validated before the old claim generation rotates.
+#[tauri::command]
+pub async fn terminal_resume(
+    request: TerminalResumeRequest,
+    on_data: Channel<Response>,
+    pty_manager: State<'_, Arc<PtyManager>>,
+    workspace: State<'_, Arc<crate::conversation::SessionWorkspaceService>>,
+) -> Result<IpcResult<TerminalResumeGrant>, String> {
+    let (grant, replay) =
+        match terminal_resume_resource(&request, pty_manager.inner(), workspace.inner()).await {
+            Ok(value) => value,
+            Err(_) => return Ok(IpcResult::error("Unauthorized", "UNAUTHORIZED")),
+        };
+
+    // Rotation invalidates any predecessor forwarder. Abort the local tracked
+    // handle immediately rather than waiting for its generation-check tick.
+    if let Some((_, forwarder)) = lock_forwarders().remove(&request.terminal_id) {
+        forwarder.abort();
+    }
+    for chunk in &replay.chunks {
+        if on_data.send(Response::new(chunk.data.clone())).is_err() {
+            log::warn!(
+                "[terminal-resume] replay channel closed conversation_id={} terminal_id={} latest_seq={} gap={}",
+                request.conversation_id,
+                request.terminal_id,
+                grant.terminal.latest_seq,
+                grant.terminal.gap
+            );
+            break;
+        }
+    }
+    log::info!(
+        "[terminal-resume] desktop grant delivered conversation_id={} terminal_id={} latest_seq={} gap={}",
+        request.conversation_id,
+        request.terminal_id,
+        grant.terminal.latest_seq,
+        grant.terminal.gap
+    );
+    Ok(IpcResult::success(grant))
 }
 
 /// Attach to a terminal's output stream with a claim credential (CAP-3).
@@ -5268,6 +5407,120 @@ mod tests {
         for forbidden in ["claim=", "env=", "argv=", "terminal_output="] {
             assert!(!production.contains(forbidden));
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_resume_requires_passive_ref_and_returns_grant() {
+        use crate::conversation::{
+            parse_created_at_utc, ConversationCreator, ConversationLifecycleState,
+            ConversationMutation, ConversationRecordV2, ConversationWriter, CreationPartition,
+            ExecutionTarget, SessionWorkspaceService, CONVERSATION_SCHEMA_VERSION,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let (repository, _) =
+            crate::conversation::ConversationRepository::open(base.join("conversations/v2"))
+                .unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
+        let conversation_id =
+            crate::conversation::ConversationId::parse("018f7a1c-1b4d-7c8a-9f01-0123456789ab")
+                .unwrap();
+        let created_at = parse_created_at_utc("2026-08-15T09:45:15.123Z").unwrap();
+        writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: base.to_string_lossy().into_owned(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::Ready,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                },
+                ConversationMutation::CreateConversation,
+            )
+            .await
+            .unwrap();
+        let workspace = Arc::new(SessionWorkspaceService::new(writer));
+        let pty = crate::web::test_pty_manager();
+
+        // A live PTY without the passive descriptor is not resumable and its
+        // original claim remains untouched.
+        let untracked = pty
+            .spawn(
+                SpawnOptions {
+                    conversation_id: Some(conversation_id),
+                    cwd: Some(base.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let denied = TerminalResumeRequest {
+            conversation_id,
+            terminal_id: untracked.info.id.clone(),
+            last_seq: 0,
+        };
+        assert!(matches!(
+            terminal_resume_resource(&denied, &pty, &workspace).await,
+            Err(ClaimError)
+        ));
+        assert!(pty
+            .verify_claim(&untracked.info.id, &untracked.claim)
+            .is_ok());
+        pty.terminate(&untracked.info.id).await.unwrap();
+
+        // The shared spawn resource path commits the passive ref. Resume then
+        // rotates the handoff without spawning or terminating the PTY.
+        let spawned = terminal_spawn_resource(
+            SpawnOptions {
+                conversation_id: Some(conversation_id),
+                cwd: Some(base.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            None,
+            &pty,
+            &workspace,
+        )
+        .await;
+        assert!(spawned.success, "spawn failed: {:?}", spawned.error);
+        let spawned = spawned.data.unwrap();
+        let request = TerminalResumeRequest {
+            conversation_id,
+            terminal_id: spawned.info.id.clone(),
+            last_seq: 0,
+        };
+        let (grant, _replay) = terminal_resume_resource(&request, &pty, &workspace)
+            .await
+            .unwrap();
+        assert_eq!(grant.terminal.id, spawned.info.id);
+        assert!(pty.get(&spawned.info.id).is_some());
+        assert_eq!(
+            pty.verify_claim(&spawned.info.id, &spawned.claim),
+            Err(ClaimError)
+        );
+        assert!(pty.verify_claim(&spawned.info.id, &grant.claim).is_ok());
+
+        let workspace_bytes = repository
+            .read_workspace_bytes(conversation_id)
+            .unwrap()
+            .expect("spawn committed a passive workspace ref");
+        let workspace_json = String::from_utf8(workspace_bytes).unwrap();
+        assert!(!workspace_json.contains(&spawned.claim));
+        assert!(!workspace_json.contains(&grant.claim));
+        assert!(!workspace_json.contains("\"claim\""));
+
+        let terminated = terminal_terminate_resource(&spawned.info.id, &pty, &workspace).await;
+        assert!(
+            terminated.success,
+            "terminate failed: {:?}",
+            terminated.error
+        );
     }
 
     /// The host-owned list maps `SessionIndexEntry` (camelCase wire) into the
