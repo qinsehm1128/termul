@@ -26,6 +26,7 @@ import type {
 import {
   type AcpAuthenticateReply,
   type AcpRuntimePolicy,
+  type AuthenticatePayload,
   type HistoryMode,
   type PersistedSessionSummary,
   type SessionSnapshotEvent,
@@ -387,6 +388,23 @@ export function resolveWsUrl(
   return `${proto}//${locationLike.host}/ws`
 }
 
+/**
+ * Consume the QR-delivered credential from the URL fragment into process
+ * memory. Fragments are not sent to the server; removing it immediately keeps
+ * the credential out of copied URLs, browser history updates, and later logs.
+ */
+function consumeRemoteAccessToken(): string {
+  if (typeof window === 'undefined') return ''
+  const rawHash = window.location.hash.startsWith('#')
+    ? window.location.hash.slice(1)
+    : window.location.hash
+  const token = new URLSearchParams(rawHash).get('access_token') ?? ''
+  if (token) {
+    window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`)
+  }
+  return token
+}
+
 const REQUEST_TIMEOUT_MS = 60_000
 /**
  * Grace margin added on top of the server turn budget so the server's typed
@@ -497,6 +515,7 @@ export class WsAcpTransport implements AcpTransport {
   private reconnectPriorityProvider?: () => SessionId[]
   private readonly wsUrl: string
   private readonly webSocketCtor: typeof WebSocket
+  private readonly remoteAccessToken: string
   /**
    * Story 5.3 (AC3): transport-level reconnect listener. Fired `true` when
    * `scheduleReconnect` runs (WS drop detected) and `false` when `reconnect`
@@ -507,9 +526,10 @@ export class WsAcpTransport implements AcpTransport {
    */
   private onReconnectStateChange?: (reconnecting: boolean) => void
 
-  constructor(opts?: { url?: string; WebSocketImpl?: typeof WebSocket }) {
+  constructor(opts?: { url?: string; token?: string; WebSocketImpl?: typeof WebSocket }) {
     this.wsUrl =
       opts?.url ?? (typeof window !== 'undefined' ? resolveWsUrl() : 'ws://127.0.0.1:8080/ws')
+    this.remoteAccessToken = opts?.token ?? consumeRemoteAccessToken()
     this.webSocketCtor = opts?.WebSocketImpl ?? WebSocket
   }
 
@@ -1464,13 +1484,12 @@ export class WsAcpTransport implements AcpTransport {
 
   private async handleEvent(evt: WsEvent): Promise<void> {
     if (evt.type === 'auth_required') {
-      // Placeholder relay token until Epic 2 — never store in localStorage/query.
-      // Send directly (socket is already open); do NOT call request()→connect()
-      // or we deadlock on the in-flight connect promise.
+      // Send the fragment-delivered credential directly (socket is already
+      // open); do NOT call request()→connect() or we deadlock on the in-flight
+      // connect promise. The token remains process-memory-only.
       try {
-        const auth = await this.sendWhenOpen<AcpAuthenticateReply>('authenticate', {
-          token: 'dev'
-        })
+        const payload: AuthenticatePayload = { token: this.remoteAccessToken }
+        const auth = await this.sendWhenOpen<AcpAuthenticateReply>('authenticate', payload)
         this.negotiatedHistoryMode = auth?.historyMode ?? 'live_only'
         this.runtimePolicy = auth?.runtimePolicy ?? null
         this.authed = true
@@ -1709,7 +1728,7 @@ let singleton: AcpTransport | null = null
 /** Create (or return) the process-wide ACP transport. */
 export function createAcpTransport(opts?: {
   force?: 'tauri' | 'ws'
-  ws?: { url?: string; WebSocketImpl?: typeof WebSocket }
+  ws?: { url?: string; token?: string; WebSocketImpl?: typeof WebSocket }
 }): AcpTransport {
   if (opts?.force === 'tauri') return createTauriAcpTransport()
   if (opts?.force === 'ws') return new WsAcpTransport(opts.ws)

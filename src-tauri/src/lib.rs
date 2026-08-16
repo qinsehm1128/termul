@@ -347,7 +347,10 @@ pub use trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub};
 // (byte-for-byte unchanged from before Story 1.1). The headless `termul-server`
 // binary (Story 1.2) will instead pass a `WsRelaySink`-backed list with no
 // `AppHandle` at all.
-use web::{PermissionRendezvous, ProjectRegistry, QuestionRendezvous, TauriEventSink, WsRelaySink};
+use web::{
+    PermissionRendezvous, ProjectRegistry, QuestionRendezvous, RemoteAccessAuthority,
+    TauriEventSink, WsRelaySink,
+};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -1604,8 +1607,24 @@ pub fn run() {
             let migration_manager = Arc::new(MigrationManager::new(handle.clone()));
             app.manage(migration_manager.clone());
 
-            // Create Remote Server State
-            let remote_state = Arc::new(RemoteServerState::new());
+            // Provision exactly one desktop remote-access authority from the
+            // existing OS keyring. Only the SHA-256 digest remains in memory;
+            // the raw credential is dropped immediately and is read again only
+            // when constructing the one-time QR/copy pairing URL.
+            let (remote_authority, pairing_token) =
+                RemoteAccessAuthority::issue_or_load_desktop("remote-access-v1")
+                    .map_err(|error| {
+                        format!("failed to provision desktop remote access: {error}")
+                    })?;
+            drop(pairing_token);
+            let remote_authority = Arc::new(remote_authority);
+            app.manage(Arc::clone(&remote_authority));
+
+            // The shared-live host receives the exact same authority instance
+            // managed above and threads it into the HTTP/ACP WebSocket router.
+            let remote_state = Arc::new(RemoteServerState::with_desktop_authority(
+                remote_authority,
+            ));
             app.manage(remote_state);
 
             // Register default migrations

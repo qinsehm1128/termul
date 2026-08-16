@@ -8,6 +8,8 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use url::Url;
+
 /// Resolve the default project-root boundary for the fs_api routes (PR-S4).
 ///
 /// Prefers `$TERMUL_PROJECT_ROOT` when set; otherwise falls back to the
@@ -193,6 +195,31 @@ pub struct ServerConfig {
     /// reads this field; it constructs its own `AcpCatalogService` under
     /// `<app_data_dir>/acp-catalog`.
     pub acp_catalog_dir: Option<PathBuf>,
+    /// Explicit operator-owned bearer credential file for standalone remote
+    /// access. The file is permission-validated before any router admission.
+    pub remote_access_token_file: Option<PathBuf>,
+    /// Exact normalized browser Origins allowed to open the ACP WebSocket.
+    pub allowed_origins: Vec<Url>,
+}
+
+fn parse_allowed_origin(value: &str) -> Result<Url, ParseCliError> {
+    let parsed = Url::parse(value.trim()).map_err(|_| {
+        ParseCliError::Message("invalid --allowed-origin: expected http(s) Origin".into())
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(ParseCliError::Message(
+            "invalid --allowed-origin: expected scheme://host[:port] without path, query, credentials, or fragment"
+                .into(),
+        ));
+    }
+    Ok(parsed)
 }
 
 impl ServerConfig {
@@ -300,6 +327,8 @@ impl ServerConfig {
         // CAP-6 / Story 8: acp-catalog root override. Same pattern as
         // `workspace_manifests_dir` — `None` means resolve at startup.
         let mut acp_catalog_dir: Option<PathBuf> = None;
+        let mut remote_access_token_file: Option<PathBuf> = None;
+        let mut allowed_origins: Vec<Url> = Vec::new();
 
         let mut iter = args.into_iter().peekable();
         while let Some(arg) = iter.next() {
@@ -475,6 +504,29 @@ impl ServerConfig {
                     // Validation of each root's path happens at load.
                     projects_file = Some(PathBuf::from(trimmed));
                 }
+                "--remote-access-token-file" => {
+                    let value = iter.next().ok_or_else(|| {
+                        ParseCliError::Message(
+                            "missing value for --remote-access-token-file".into(),
+                        )
+                    })?;
+                    let trimmed = value.as_ref().trim();
+                    if trimmed.is_empty() {
+                        return Err(ParseCliError::Message(
+                            "invalid --remote-access-token-file: must be a non-empty path".into(),
+                        ));
+                    }
+                    remote_access_token_file = Some(PathBuf::from(trimmed));
+                }
+                "--allowed-origin" => {
+                    let value = iter.next().ok_or_else(|| {
+                        ParseCliError::Message("missing value for --allowed-origin".into())
+                    })?;
+                    let origin = parse_allowed_origin(value.as_ref())?;
+                    if !allowed_origins.contains(&origin) {
+                        allowed_origins.push(origin);
+                    }
+                }
                 other if other.starts_with('-') => {
                     return Err(ParseCliError::Message(format!("unknown option '{other}'")));
                 }
@@ -541,6 +593,15 @@ impl ServerConfig {
             })
             .unwrap_or_else(|| project_root.join("Termul"));
 
+        if BindMode::parse(&host) == Some(BindMode::All)
+            && (remote_access_token_file.is_none() || allowed_origins.is_empty())
+        {
+            return Err(ParseCliError::Message(
+                "non-loopback --host requires --remote-access-token-file and at least one --allowed-origin"
+                    .into(),
+            ));
+        }
+
         Ok(Self {
             host,
             port,
@@ -553,6 +614,8 @@ impl ServerConfig {
             conversation_workspace_root,
             workspace_manifests_dir,
             acp_catalog_dir,
+            remote_access_token_file,
+            allowed_origins,
         })
     }
 }
@@ -679,6 +742,8 @@ mod tests {
             conversation_workspace_root: PathBuf::from("/tmp/Termul"),
             workspace_manifests_dir: None,
             acp_catalog_dir: None,
+            remote_access_token_file: None,
+            allowed_origins: Vec::new(),
         };
         assert_eq!(
             cfg.bind_addr(),
@@ -697,6 +762,8 @@ mod tests {
             conversation_workspace_root: PathBuf::from("/tmp/Termul"),
             workspace_manifests_dir: None,
             acp_catalog_dir: None,
+            remote_access_token_file: None,
+            allowed_origins: Vec::new(),
         };
         assert_eq!(bad.bind_addr(), None);
     }
@@ -729,10 +796,36 @@ mod tests {
     }
 
     #[test]
-    fn from_args_host_and_port() {
-        let cfg = ServerConfig::from_args(["--host", "0.0.0.0", "--port", "9090"]).expect("parse");
+    fn from_args_rejects_non_loopback_without_remote_auth_config() {
+        let error = ServerConfig::from_args(["--host", "0.0.0.0", "--port", "9090"])
+            .expect_err("non-loopback admission must fail closed");
+        assert!(error.to_string().contains("--remote-access-token-file"));
+        assert!(error.to_string().contains("--allowed-origin"));
+    }
+
+    #[test]
+    fn from_args_accepts_non_loopback_with_token_file_and_origin() {
+        let cfg = ServerConfig::from_args([
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "9090",
+            "--remote-access-token-file",
+            "/var/lib/termul/remote-access-token",
+            "--allowed-origin",
+            "https://termul.example.test",
+        ])
+        .expect("explicit remote access config parses");
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.port, 9090);
+        assert_eq!(
+            cfg.remote_access_token_file,
+            Some(PathBuf::from("/var/lib/termul/remote-access-token"))
+        );
+        assert_eq!(
+            cfg.allowed_origins,
+            vec![Url::parse("https://termul.example.test").unwrap()]
+        );
     }
 
     #[test]
@@ -935,6 +1028,8 @@ mod tests {
             conversation_workspace_root: PathBuf::from("/tmp/Termul"),
             workspace_manifests_dir: None,
             acp_catalog_dir: None,
+            remote_access_token_file: None,
+            allowed_origins: Vec::new(),
         };
         // We cannot safely mutate the real process env vars in a parallel
         // test runner, so we assert the contract indirectly: the resolved

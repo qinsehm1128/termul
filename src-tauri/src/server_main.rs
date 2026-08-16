@@ -23,8 +23,8 @@ use termul_manager_lib::server_update::{
 };
 use termul_manager_lib::web::config::ParseCliError;
 use termul_manager_lib::web::{
-    seed_from_file, serve, PermissionRendezvous, ProjectRegistry, QuestionRendezvous, ServerConfig,
-    WsRelaySink,
+    seed_from_file, serve, PermissionRendezvous, ProjectRegistry, QuestionRendezvous,
+    RemoteAccessAuthority, ServerConfig, WsRelaySink,
 };
 use termul_manager_lib::{
     AcpCatalogService, AcpInstallService, AcpManager, CwdTracker, ExitCodeTracker,
@@ -71,6 +71,37 @@ fn main() -> ExitCode {
     };
 
     init_tracing();
+
+    // Provision standalone remote-access policy before opening any application
+    // store, manager, PTY, listener, or router. Non-loopback configuration was
+    // already rejected by `ServerConfig::from_args` when either the token file
+    // or Origin allow-list was omitted; file ownership/permissions and contents
+    // are validated here. Credential bytes are never logged.
+    let authority = match cfg.remote_access_token_file.as_deref() {
+        Some(path) => match RemoteAccessAuthority::from_token_file(path) {
+            Ok(authority) => authority,
+            Err(error) => {
+                error!(
+                    target: "termul::web::auth",
+                    stable_code = error.code(),
+                    "standalone remote-access authority provisioning failed"
+                );
+                return ExitCode::from(1);
+            }
+        },
+        None => RemoteAccessAuthority::unconfigured(),
+    };
+    if !cfg.allowed_origins.is_empty() {
+        if let Err(error) = authority.set_allowed_origins(cfg.allowed_origins.clone()) {
+            error!(
+                target: "termul::web::auth",
+                stable_code = error.code(),
+                "standalone remote-access Origin policy rejected"
+            );
+            return ExitCode::from(1);
+        }
+    }
+    let authority = Arc::new(authority);
 
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -291,6 +322,7 @@ fn main() -> ExitCode {
             workspace_manifest,
             acp_catalog,
             acp_install,
+            authority,
         )
         .await
         {
@@ -514,7 +546,7 @@ fn spawn_periodic_update_loop() {
 }
 
 fn usage() -> &'static str {
-    "Usage: termul-server [--host HOST] [--port PORT] [--event-log-capacity N] [--permission-timeout SECS] [--permission-reconnect-grace SECS] [--project-root PATH] [--projects-file PATH] [--sessions-dir PATH] [--conversation-workspace-root PATH] [--workspace-manifests-dir PATH] [--acp-catalog-dir PATH] [--check-update]\n\n\
+    "Usage: termul-server [--host HOST] [--port PORT] [--event-log-capacity N] [--permission-timeout SECS] [--permission-reconnect-grace SECS] [--project-root PATH] [--projects-file PATH] [--sessions-dir PATH] [--conversation-workspace-root PATH] [--workspace-manifests-dir PATH] [--acp-catalog-dir PATH] [--remote-access-token-file PATH] [--allowed-origin ORIGIN] [--check-update]\n\n\
      Options:\n\
         --host HOST                 Bind host (default: 127.0.0.1; use 0.0.0.0 to expose)\n\
         --port PORT                 Bind port (default: 8080)\n\
@@ -527,6 +559,8 @@ fn usage() -> &'static str {
         --conversation-workspace-root PATH  Visible Conversation workspaces (default: $TERMUL_CONVERSATION_WORKSPACE_ROOT or <project-root>/Termul)\n\
         --workspace-manifests-dir PATH  Legacy workspace-manifests input root (default: <state dir>/workspace-manifests)\n\
         --acp-catalog-dir PATH      ACP catalog root (default: <state dir>/acp-catalog)\n\
+        --remote-access-token-file PATH  Operator-owned bearer token file (required for --host 0.0.0.0)\n\
+        --allowed-origin ORIGIN     Allowed browser Origin; repeatable (required for --host 0.0.0.0)\n\
         --check-update              Run one opt-in self-update now: fetch the channel manifest,\n\
                                      verify the downloaded binary signature, atomically swap, and\n\
                                      reexec. Defaults to the stable channel when\n\

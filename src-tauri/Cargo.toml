@@ -150,6 +150,7 @@ getrandom = "0.2"
 # digest-only storage of issued credentials + constant-time comparison.
 sha2 = "0.10"
 subtle = "2"
+url = "2"
 
 # Structured logging for remote server
 tracing = "0.1"

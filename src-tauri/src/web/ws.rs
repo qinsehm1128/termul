@@ -20,19 +20,22 @@
 //!
 //! # Scope fence
 //!
-//! `authenticate` is a placeholder (accepts any token; Epic 2 replaces).
+//! `authenticate` is enforced by the host-injected remote-access authority.
 //! `subscribe` is wired (Story 1.6): binds the connection to a session log with
 //! optional `lastSeq` cursor replay. Other ACP request types still return
 //! `err.code: "not_implemented"` until Stories 1.7/1.8/Epic 4.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
+use axum::http::HeaderMap;
 use axum::response::IntoResponse;
+use axum::Extension;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -43,6 +46,7 @@ use crate::acp::config::AgentConfig;
 use crate::acp::{AcpManager, AgentId, FileProjectRegistry, SessionCreationContext, SessionId};
 use crate::pty::PtyManager;
 use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub};
+use crate::web::auth::{auth_error_response, RemoteAccessAuthority, RemoteAuthError};
 use crate::web::permissions::{TurnClaim, DEFAULT_PERMISSION_RECONNECT_GRACE};
 use crate::web::project_registry::{ProjectRegistry, ProjectSwitchContext};
 use crate::web::sink::{broadcast_projects_changed, AcpEvent, ClientId, ReplayResult, WsRelaySink};
@@ -446,15 +450,41 @@ fn auth_required_event() -> SequencedEvent {
 
 /// Axum WS upgrade handler for `/ws` (AC1).
 ///
-/// The upgrade is gated behind a placeholder `pre_auth` check (AC1): the
-/// primary auth gate is the first-frame `auth_required` emission (AC9). The
-/// default bind stays localhost per `web/config.rs`.
-pub async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    // Placeholder pre_auth check (AC1) — Epic 2 wires the real token gate.
-    // Until then, the upgrade always proceeds; the first frame is auth_required.
+/// The upgrade validates the exact browser Origin before switching protocols;
+/// the first `authenticate` frame then verifies the bearer credential with
+/// bounded per-peer failure throttling.
+pub async fn ws_upgrade(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let started = Instant::now();
+    let origin = headers.get(axum::http::header::ORIGIN);
+    if let Err(error) = authority.verify_origin(origin) {
+        warn!(
+            target: "termul::web::ws",
+            request_type = "GET /ws",
+            auth_class = "origin",
+            stable_code = error.code(),
+            duration_ms = started.elapsed().as_millis(),
+            "WebSocket upgrade rejected by Origin policy"
+        );
+        return auth_error_response(error);
+    }
+    info!(
+        target: "termul::web::ws",
+        request_type = "GET /ws",
+        auth_class = "origin",
+        stable_code = "OK",
+        duration_ms = started.elapsed().as_millis(),
+        "WebSocket upgrade Origin accepted"
+    );
     ws.on_upgrade(move |socket| async move {
-        run_relay(socket, state).await;
+        run_relay(socket, state, authority, peer).await;
     })
+    .into_response()
 }
 
 /// Keepalive Ping interval for the `/ws` relay.
@@ -505,7 +535,12 @@ fn now_ms() -> u64 {
 
 /// Run the per-connection relay loop: a write task draining the outbound
 /// channel + a read task routing requests. Returns when either half closes.
-async fn run_relay(socket: WebSocket, state: AppState) {
+async fn run_relay(
+    socket: WebSocket,
+    state: AppState,
+    authority: Arc<RemoteAccessAuthority>,
+    peer: SocketAddr,
+) {
     let (mut sink, mut stream) = socket.split();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Outbound>();
     let relay = Arc::clone(&state.relay);
@@ -661,6 +696,8 @@ async fn run_relay(socket: WebSocket, state: AppState) {
                         acp_catalog.as_ref(),
                         acp_install.as_ref(),
                         conversation.as_ref(),
+                        &authority,
+                        peer,
                     )
                     .await
                     {
@@ -799,6 +836,8 @@ async fn dispatch_connection_text_with_conversation(
     acp_catalog: Option<&Arc<crate::acp::AcpCatalogService>>,
     acp_install: Option<&Arc<crate::acp::install::AcpInstallService>>,
     conversation: Option<&Arc<crate::conversation::ConversationApplicationService>>,
+    authority: &Arc<RemoteAccessAuthority>,
+    peer: SocketAddr,
 ) -> bool {
     if let Some((id, payload)) = authenticated_send_prompt(text, *authed) {
         return match accept_send_prompt(id, &payload, acp, relay).await {
@@ -835,6 +874,8 @@ async fn dispatch_connection_text_with_conversation(
         acp_catalog,
         acp_install,
         conversation,
+        authority,
+        peer,
     )
     .await;
     write_tx.send(Outbound::Reply(reply)).is_ok()
@@ -861,6 +902,7 @@ async fn dispatch_connection_text(
     acp_install: Option<&Arc<crate::acp::install::AcpInstallService>>,
 ) -> bool {
     let current_conversation = Arc::new(parking_lot::Mutex::new(None));
+    let authority = Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token"));
     dispatch_connection_text_with_conversation(
         text,
         authed,
@@ -880,6 +922,8 @@ async fn dispatch_connection_text(
         acp_catalog,
         acp_install,
         None,
+        &authority,
+        SocketAddr::from(([127, 0, 0, 1], 3000)),
     )
     .await
 }
@@ -983,8 +1027,16 @@ async fn handle_request(
         acp_catalog,
         acp_install,
         None,
+        &Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token")),
+        SocketAddr::from(([127, 0, 0, 1], 3000)),
     )
     .await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthenticatePayload {
+    token: String,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1007,6 +1059,8 @@ async fn handle_request_with_conversation(
     acp_catalog: Option<&Arc<crate::acp::AcpCatalogService>>,
     acp_install: Option<&Arc<crate::acp::install::AcpInstallService>>,
     conversation: Option<&Arc<crate::conversation::ConversationApplicationService>>,
+    authority: &Arc<RemoteAccessAuthority>,
+    peer: SocketAddr,
 ) -> WsReply {
     let req: WsRequest = match serde_json::from_str(text) {
         Ok(r) => r,
@@ -1020,12 +1074,52 @@ async fn handle_request_with_conversation(
     };
     let id = req.id.clone();
 
-    // Pre-auth gate (AC9): only authenticate is allowed.
+    // Pre-auth gate (AC9): only a valid authenticate request is allowed.
     if !*authed {
         if req.type_ == "authenticate" {
-            // Placeholder (AC10): accept any token, mark authed. Epic 2 wires
-            // the real cookie/token gate.
-            *authed = true;
+            let auth_started = Instant::now();
+            let payload: AuthenticatePayload = match serde_json::from_value(req.payload) {
+                Ok(payload) => payload,
+                Err(_) => {
+                    let reported = authority
+                        .verify_bearer_for_peer("", peer.ip())
+                        .err()
+                        .unwrap_or(RemoteAuthError::InvalidCredential);
+                    warn!(
+                        target: "termul::web::ws",
+                        request_type = "authenticate",
+                        auth_class = "bearer",
+                        stable_code = reported.code(),
+                        duration_ms = auth_started.elapsed().as_millis(),
+                        "WebSocket authentication rejected"
+                    );
+                    return WsReply::err_with_code(id, reported.code(), reported.to_string());
+                }
+            };
+            match authority.verify_bearer_for_peer(&payload.token, peer.ip()) {
+                Ok(_) => {
+                    *authed = true;
+                    info!(
+                        target: "termul::web::ws",
+                        request_type = "authenticate",
+                        auth_class = "bearer",
+                        stable_code = "OK",
+                        duration_ms = auth_started.elapsed().as_millis(),
+                        "WebSocket authentication completed"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        target: "termul::web::ws",
+                        request_type = "authenticate",
+                        auth_class = "bearer",
+                        stable_code = error.code(),
+                        duration_ms = auth_started.elapsed().as_millis(),
+                        "WebSocket authentication rejected"
+                    );
+                    return WsReply::err_with_code(id, error.code(), error.to_string());
+                }
+            }
             let reconnect_grace = relay
                 .rendezvous()
                 .map_or(DEFAULT_PERMISSION_RECONNECT_GRACE, |rendezvous| {
@@ -1055,10 +1149,7 @@ async fn handle_request_with_conversation(
 
     // Post-auth routing.
     match req.type_.as_str() {
-        "authenticate" => {
-            // Idempotent re-auth — accept and succeed.
-            WsReply::ok(id, Some(json!({})))
-        }
+        "authenticate" => WsReply::ok(id, Some(json!({}))),
         // Application-level heartbeat: a client-emitted `ping` request keeps
         // the keepalive watchdog (`last_activity`) fresh through proxies that
         // strip WS-level Ping/Pong control frames (Cloudflare tunnels, etc.).
@@ -4097,6 +4188,8 @@ pub(crate) async fn dispatch_conversation_golden_request(
         None,
         None,
         Some(service),
+        &Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token")),
+        SocketAddr::from(([127, 0, 0, 1], 3000)),
     )
     .await
 }
@@ -5155,14 +5248,83 @@ mod tests {
     }
 
     #[test]
-    fn handle_request_authenticate_marks_authed() {
+    fn authentication_valid_token_marks_connection_authed() {
         let mut authed = false;
         let reply = handle_sync(
-            r#"{"id":"r1","type":"authenticate","payload":{"token":"any"}}"#,
+            r#"{"id":"r1","type":"authenticate","payload":{"token":"test-remote-access-token"}}"#,
             &mut authed,
         );
         assert!(reply.ok);
         assert!(authed, "authenticate must flip authed");
+    }
+
+    #[test]
+    fn authentication_missing_and_wrong_tokens_are_rejected() {
+        for frame in [
+            r#"{"id":"missing","type":"authenticate","payload":{}}"#,
+            r#"{"id":"empty","type":"authenticate","payload":{"token":""}}"#,
+            r#"{"id":"wrong","type":"authenticate","payload":{"token":"wrong"}}"#,
+        ] {
+            let mut authed = false;
+            let reply = handle_sync(frame, &mut authed);
+            assert!(!reply.ok);
+            assert_eq!(reply.err.unwrap().code, "UNAUTHORIZED");
+            assert!(!authed);
+        }
+    }
+
+    #[tokio::test]
+    async fn authentication_sixth_failed_attempt_is_rate_limited_before_dispatch() {
+        let relay = Arc::new(WsRelaySink::new());
+        let acp = Arc::new(AcpManager::new(vec![]));
+        let registry = Arc::new(ProjectRegistry::new());
+        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let mut subscriptions = Vec::new();
+        let mut current_agent = None;
+        let current_session = Arc::new(parking_lot::Mutex::new(None));
+        let current_conversation = Arc::new(parking_lot::Mutex::new(None));
+        let current_project = Arc::new(parking_lot::Mutex::new(None));
+        let switch_queue = Arc::new(tokio::sync::Mutex::new(ProjectSwitchQueue::default()));
+        let authority = Arc::new(RemoteAccessAuthority::for_tests("expected-token"));
+        let peer = SocketAddr::from(([192, 0, 2, 44], 3000));
+        let mut authed = false;
+
+        for attempt in 1..=6 {
+            let reply = handle_request_with_conversation(
+                &format!(
+                    r#"{{"id":"auth-{attempt}","type":"authenticate","payload":{{"token":"wrong"}}}}"#
+                ),
+                &mut authed,
+                &acp,
+                &relay,
+                &registry,
+                None,
+                None,
+                &tx,
+                &mut subscriptions,
+                &mut current_agent,
+                &current_session,
+                &current_conversation,
+                &current_project,
+                &switch_queue,
+                HistoryMode::LiveOnly,
+                None,
+                None,
+                None,
+                &authority,
+                peer,
+            )
+            .await;
+            assert_eq!(
+                reply.err.unwrap().code,
+                if attempt == 6 {
+                    "RATE_LIMITED"
+                } else {
+                    "UNAUTHORIZED"
+                }
+            );
+            assert!(!authed);
+        }
     }
 
     #[test]
@@ -7563,6 +7725,8 @@ mod tests {
                 None,
                 None,
                 Some(&service),
+                &Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token")),
+                SocketAddr::from(([127, 0, 0, 1], 3000)),
             )
             .await;
             assert_eq!(reply.err.unwrap().code, "UNAUTHORIZED");

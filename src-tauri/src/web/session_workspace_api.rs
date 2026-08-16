@@ -1,21 +1,23 @@
 //! HTTP facade for revisioned per-Conversation SessionWorkspace and recovery actions.
 
-use std::net::SocketAddr;
+use std::sync::Arc;
 
 use axum::{
     body::Bytes,
-    extract::{ConnectInfo, Path, State},
+    extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
+    Extension, Json,
 };
 use serde::Deserialize;
 use tracing::warn;
 
+use crate::conversation::migration::RecoveryAuthorizationClass;
 use crate::conversation::{
     ConversationApplicationService, ConversationId, SessionWorkspaceLoadOutcome,
     SessionWorkspaceV1, SessionWorkspaceWriteOutcome,
 };
+use crate::web::auth::{status_for_code, RemoteAccessAuthority, RemoteCapability, RemotePrincipal};
 use crate::web::fs_api::IpcBody;
 use crate::web::ws::AppState;
 
@@ -39,13 +41,20 @@ fn service(
 
 pub async fn get(
     State(state): State<AppState>,
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    Extension(principal): Extension<RemotePrincipal>,
     Path(conversation_id): Path<String>,
 ) -> impl IntoResponse {
+    if let Err(response) =
+        require::<SessionWorkspaceLoadOutcome>(&authority, &principal, RemoteCapability::Read)
+    {
+        return response;
+    }
     let conversation_id = match ConversationId::parse_path_component(&conversation_id) {
         Ok(value) => value,
         Err(error) => {
             return (
-                StatusCode::OK,
+                status_for_code("CONVERSATION_INVALID_ID"),
                 Json(IpcBody::<SessionWorkspaceLoadOutcome>::err(
                     error.to_string(),
                     "CONVERSATION_INVALID_ID",
@@ -57,13 +66,23 @@ pub async fn get(
         Ok(service) => service,
         Err((code, detail)) => {
             return (
-                StatusCode::OK,
+                status_for_code(code),
                 Json(IpcBody::<SessionWorkspaceLoadOutcome>::err(detail, code)),
             )
         }
     };
     match service.get_workspace(conversation_id).await {
-        Ok(outcome) => (StatusCode::OK, Json(IpcBody::ok(outcome))),
+        Ok(outcome) => {
+            let status = if matches!(
+                outcome,
+                SessionWorkspaceLoadOutcome::RecoveryRequired { .. }
+            ) {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::OK
+            };
+            (status, Json(IpcBody::ok(outcome)))
+        }
         Err(error) => {
             warn!(
                 target: "termul::web::session_workspace_api",
@@ -72,7 +91,7 @@ pub async fn get(
                 "workspace get failed"
             );
             (
-                StatusCode::OK,
+                status_for_code(&error.code),
                 Json(IpcBody::<SessionWorkspaceLoadOutcome>::err(
                     error.detail,
                     error.code,
@@ -84,18 +103,21 @@ pub async fn get(
 
 pub async fn write(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    Extension(principal): Extension<RemotePrincipal>,
     Path(conversation_id): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
-    if let Some(forbidden) = check_local_only::<SessionWorkspaceWriteOutcome>(peer) {
-        return (StatusCode::OK, Json(forbidden));
+    if let Err(response) =
+        require::<SessionWorkspaceWriteOutcome>(&authority, &principal, RemoteCapability::Mutate)
+    {
+        return response;
     }
     let conversation_id = match ConversationId::parse_path_component(&conversation_id) {
         Ok(value) => value,
         Err(error) => {
             return (
-                StatusCode::OK,
+                status_for_code("CONVERSATION_INVALID_ID"),
                 Json(IpcBody::<SessionWorkspaceWriteOutcome>::err(
                     error.to_string(),
                     "CONVERSATION_INVALID_ID",
@@ -107,7 +129,7 @@ pub async fn write(
         Ok(request) => request,
         Err(error) => {
             return (
-                StatusCode::OK,
+                status_for_code("VALIDATION_ERROR"),
                 Json(IpcBody::<SessionWorkspaceWriteOutcome>::err(
                     format!("payload validation failed: {error}"),
                     "VALIDATION_ERROR",
@@ -119,7 +141,7 @@ pub async fn write(
         Ok(service) => service,
         Err((code, detail)) => {
             return (
-                StatusCode::OK,
+                status_for_code(code),
                 Json(IpcBody::<SessionWorkspaceWriteOutcome>::err(detail, code)),
             )
         }
@@ -128,7 +150,19 @@ pub async fn write(
         .write_workspace(conversation_id, request.based_revision, request.workspace)
         .await
     {
-        Ok(outcome) => (StatusCode::OK, Json(IpcBody::ok(outcome))),
+        Ok(outcome) => {
+            let status = if matches!(outcome, SessionWorkspaceWriteOutcome::Conflict { .. }) {
+                StatusCode::CONFLICT
+            } else if matches!(
+                outcome,
+                SessionWorkspaceWriteOutcome::RecoveryRequired { .. }
+            ) {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::OK
+            };
+            (status, Json(IpcBody::ok(outcome)))
+        }
         Err(error) => {
             warn!(
                 target: "termul::web::session_workspace_api",
@@ -137,7 +171,7 @@ pub async fn write(
                 "workspace write failed"
             );
             (
-                StatusCode::OK,
+                status_for_code(&error.code),
                 Json(IpcBody::<SessionWorkspaceWriteOutcome>::err(
                     error.detail,
                     error.code,
@@ -149,20 +183,16 @@ pub async fn write(
 
 pub async fn resolve_recovery(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    Extension(principal): Extension<RemotePrincipal>,
     body: Bytes,
 ) -> impl IntoResponse {
-    if let Some(forbidden) =
-        check_local_only::<crate::conversation::migration::RecoveryActionResult>(peer)
-    {
-        return (StatusCode::OK, Json(forbidden));
-    }
     let request: crate::conversation::migration::ResolveRecoveryItemRequest =
         match serde_json::from_slice(&body) {
             Ok(request) => request,
             Err(error) => {
                 return (
-                    StatusCode::OK,
+                    status_for_code("VALIDATION_ERROR"),
                     Json(IpcBody::<
                         crate::conversation::migration::RecoveryActionResult,
                     >::err(
@@ -172,11 +202,21 @@ pub async fn resolve_recovery(
                 )
             }
         };
+    let capability = if request.action.authorization() == RecoveryAuthorizationClass::Mutation {
+        RemoteCapability::Mutate
+    } else {
+        RemoteCapability::RecoveryInspect
+    };
+    if let Err(response) = require::<crate::conversation::migration::RecoveryActionResult>(
+        &authority, &principal, capability,
+    ) {
+        return response;
+    }
     let service = match service(&state) {
         Ok(service) => service,
         Err((code, detail)) => {
             return (
-                StatusCode::OK,
+                status_for_code(code),
                 Json(IpcBody::<
                     crate::conversation::migration::RecoveryActionResult,
                 >::err(detail, code)),
@@ -184,9 +224,15 @@ pub async fn resolve_recovery(
         }
     };
     match service.resolve_recovery_item(request).await {
-        Ok(outcome) => (StatusCode::OK, Json(IpcBody::ok(outcome))),
+        Ok(mut outcome) => {
+            outcome.source_paths.clear();
+            outcome.source_sha256.clear();
+            outcome.candidate_facts.clear();
+            outcome.provenance.clear();
+            (StatusCode::OK, Json(IpcBody::ok(outcome)))
+        }
         Err(error) => (
-            StatusCode::OK,
+            status_for_code(&error.code),
             Json(IpcBody::<
                 crate::conversation::migration::RecoveryActionResult,
             >::err(error.detail, error.code)),
@@ -194,15 +240,17 @@ pub async fn resolve_recovery(
     }
 }
 
-fn check_local_only<T>(peer: SocketAddr) -> Option<IpcBody<T>> {
-    if peer.ip().is_loopback() {
-        None
-    } else {
-        Some(IpcBody::err(
-            "Conversation workspace mutation routes are localhost-only",
-            "FORBIDDEN",
-        ))
-    }
+fn require<T>(
+    authority: &RemoteAccessAuthority,
+    principal: &RemotePrincipal,
+    capability: RemoteCapability,
+) -> Result<(), (StatusCode, Json<IpcBody<T>>)> {
+    authority.authorize(principal, capability).map_err(|error| {
+        (
+            error.status(),
+            Json(IpcBody::err(error.to_string(), error.code())),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -223,8 +271,10 @@ mod tests {
     };
     use crate::web::ws::HistoryMode;
     use axum::body::Body;
+    use axum::extract::ConnectInfo;
     use axum::http::Request;
     use axum::routing::{get, post};
+    use std::net::SocketAddr;
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -300,6 +350,8 @@ mod tests {
     }
 
     fn router(state: AppState) -> axum::Router {
+        let authority = Arc::new(RemoteAccessAuthority::for_tests("workspace-api-token"));
+        let principal = authority.verify_bearer("workspace-api-token").unwrap();
         axum::Router::new()
             .route(
                 "/conversations/{conversationId}/workspace",
@@ -307,6 +359,8 @@ mod tests {
             )
             .route("/conversation-recovery/resolve", post(resolve_recovery))
             .with_state(state)
+            .layer(Extension(principal))
+            .layer(Extension(authority))
     }
 
     fn workspace() -> SessionWorkspaceV1 {
@@ -450,6 +504,7 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(conflict_response.status(), StatusCode::CONFLICT);
         let conflict: IpcBody<SessionWorkspaceWriteOutcome> = body(conflict_response).await;
         assert!(matches!(
             conflict.data,
@@ -471,8 +526,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let forbidden: IpcBody<SessionWorkspaceWriteOutcome> = body(forbidden_response).await;
-        assert_eq!(forbidden.code.as_deref(), Some("FORBIDDEN"));
+        let proxied: IpcBody<SessionWorkspaceWriteOutcome> = body(forbidden_response).await;
+        assert!(
+            proxied.success,
+            "authenticated proxy requests must not rely on peer IP"
+        );
     }
 
     #[tokio::test]
@@ -547,8 +605,10 @@ mod tests {
             );
             assert_eq!(result.recovery_revision, expected_revision);
             assert_eq!(result.workspace_changed, workspace_changed);
-            assert_eq!(result.source_paths, item.source_paths);
-            assert_eq!(result.source_sha256, item.source_sha256);
+            assert!(result.source_paths.is_empty());
+            assert!(result.source_sha256.is_empty());
+            assert!(result.candidate_facts.is_empty());
+            assert!(result.provenance.is_empty());
             let persisted: crate::conversation::migration::RecoveryQueueV1 =
                 serde_json::from_slice(
                     &std::fs::read(

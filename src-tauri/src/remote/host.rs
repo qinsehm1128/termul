@@ -37,7 +37,9 @@ use tracing::{info, warn};
 use crate::acp::{AcpCatalogService, AcpInstallService, AcpManager, WorkspaceManifestService};
 use crate::pty::PtyManager;
 use crate::web::sink::WsRelaySink;
-use crate::web::{serve_router, ProjectRegistry, ServerConfig};
+use crate::web::{serve_router, ProjectRegistry, RemoteAccessAuthority, ServerConfig};
+
+const REMOTE_ACCESS_KEYRING_ACCOUNT: &str = "remote-access-v1";
 
 /// Which network interface(s) the in-process web server binds to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,12 +204,62 @@ impl Drop for RemoteServer {
 /// Tauri-managed wrapper tracking the in-process web server's start/stop state.
 pub struct RemoteServerState {
     inner: std::sync::Mutex<Option<RemoteServer>>,
+    authority: Arc<RemoteAccessAuthority>,
+    credential_source: RemoteCredentialSource,
+}
+
+#[derive(Clone)]
+enum RemoteCredentialSource {
+    DesktopKeyring,
+    #[cfg(test)]
+    Test(String),
+    #[allow(dead_code)]
+    Unavailable,
 }
 
 impl RemoteServerState {
-    pub fn new() -> Self {
+    pub fn with_desktop_authority(authority: Arc<RemoteAccessAuthority>) -> Self {
         Self {
             inner: std::sync::Mutex::new(None),
+            authority,
+            credential_source: RemoteCredentialSource::DesktopKeyring,
+        }
+    }
+
+    pub fn new() -> Self {
+        #[cfg(test)]
+        {
+            let token = "test-remote-access-token".to_string();
+            return Self {
+                inner: std::sync::Mutex::new(None),
+                authority: Arc::new(RemoteAccessAuthority::for_tests(&token)),
+                credential_source: RemoteCredentialSource::Test(token),
+            };
+        }
+        #[cfg(not(test))]
+        Self {
+            inner: std::sync::Mutex::new(None),
+            authority: Arc::new(RemoteAccessAuthority::unconfigured()),
+            credential_source: RemoteCredentialSource::Unavailable,
+        }
+    }
+
+    fn pairing_token(&self) -> Result<String, String> {
+        match &self.credential_source {
+            RemoteCredentialSource::DesktopKeyring => {
+                crate::secure_storage::keyring_get(REMOTE_ACCESS_KEYRING_ACCOUNT)
+                    .map_err(|_| {
+                        "failed to read remote-access credential from OS keyring".to_string()
+                    })?
+                    .ok_or_else(|| {
+                        "remote-access credential is missing from OS keyring".to_string()
+                    })
+            }
+            #[cfg(test)]
+            RemoteCredentialSource::Test(token) => Ok(token.clone()),
+            RemoteCredentialSource::Unavailable => {
+                Err("remote-access authority is not configured".to_string())
+            }
         }
     }
 
@@ -289,24 +341,21 @@ impl RemoteServerState {
         // and rebind live. A `warn!` is logged so the operator notices.
         let project_root = {
             // 1. Try the registry's default-project path first.
-            let from_registry = registry
-                .default_project_path()
-                .and_then(|p| {
-                    match crate::web::config::resolve_and_validate_project_root(
-                        std::path::Path::new(&p),
-                    ) {
-                        Ok(canonical) => Some(canonical),
-                        Err(e) => {
-                            warn!(
-                                "shared-live: registry default project path '{}' failed \
+            let from_registry = registry.default_project_path().and_then(|p| {
+                match crate::web::config::resolve_and_validate_project_root(std::path::Path::new(
+                    &p,
+                )) {
+                    Ok(canonical) => Some(canonical),
+                    Err(e) => {
+                        warn!(
+                            "shared-live: registry default project path '{}' failed \
                                  canonicalization: {}; falling back to home",
-                                p,
-                                e
-                            );
-                            None
-                        }
+                            p, e
+                        );
+                        None
                     }
-                });
+                }
+            });
             if let Some(root) = from_registry {
                 root
             } else {
@@ -359,6 +408,8 @@ impl RemoteServerState {
             // from the config here — `None` degrades nothing on this path.
             workspace_manifests_dir: None,
             acp_catalog_dir: None,
+            remote_access_token_file: None,
+            allowed_origins: Vec::new(),
         };
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -384,6 +435,7 @@ impl RemoteServerState {
             workspace_manifest,
             acp_catalog,
             acp_install,
+            Arc::clone(&self.authority),
         )
         .await
         .map_err(|e| format!("Failed to start remote server: {}", e))?;
@@ -509,6 +561,41 @@ impl RemoteServerState {
     /// real cloudflared binary.
     pub fn attach_tunnel(&self, url: String, child: Child) -> Result<(), String> {
         let mut child = Some(child);
+        let parsed_origin = match url::Url::parse(&url) {
+            Ok(origin) => origin,
+            Err(_) => {
+                if let Some(child) = child.as_mut() {
+                    let _ = child.start_kill();
+                }
+                return Err("cloudflared returned an invalid public Origin".to_string());
+            }
+        };
+        if let Err(error) = self.authority.set_public_origin(parsed_origin.clone()) {
+            if let Some(child) = child.as_mut() {
+                let _ = child.start_kill();
+            }
+            return Err(format!("failed to register public Origin: {error}"));
+        }
+        let token = match self.pairing_token() {
+            Ok(token) => token,
+            Err(error) => {
+                if let Some(child) = child.as_mut() {
+                    let _ = child.start_kill();
+                }
+                return Err(error);
+            }
+        };
+        if self.authority.verify_bearer(&token).is_err() {
+            if let Some(child) = child.as_mut() {
+                let _ = child.start_kill();
+            }
+            return Err(
+                "remote-access keyring credential does not match host authority".to_string(),
+            );
+        }
+        let mut access_url = parsed_origin;
+        access_url.set_fragment(Some(&format!("access_token={token}")));
+        drop(token);
         let mut slot = self.inner.lock().unwrap();
         match slot.as_mut() {
             Some(server) if !server.task_finished() => {
@@ -526,7 +613,7 @@ impl RemoteServerState {
                     let _ = child.wait().await;
                     flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 });
-                server.tunnel_url = Some(url);
+                server.tunnel_url = Some(access_url.into());
                 server.tunnel_dead = Some(dead_flag);
                 server.tunnel_watchdog = Some(watchdog);
                 Ok(())
@@ -703,7 +790,7 @@ mod tests {
                 None,
                 None,
                 None,
-                )
+            )
             .await
             .expect("start on localhost binds an OS-assigned port");
         assert!(status.running, "start returns a running status");
@@ -737,7 +824,7 @@ mod tests {
                 None,
                 None,
                 None,
-                )
+            )
             .await
             .expect("restart after stop succeeds");
         assert!(again.running);
@@ -762,7 +849,7 @@ mod tests {
                 None,
                 None,
                 None,
-                )
+            )
             .await
             .expect("first start succeeds");
 
@@ -777,7 +864,7 @@ mod tests {
                 None,
                 None,
                 None,
-                )
+            )
             .await;
         assert!(
             second.is_err(),
@@ -810,7 +897,7 @@ mod tests {
                 None,
                 None,
                 None,
-                )
+            )
             .await
             .expect("start succeeds");
         // The serve task holds `Arc::clone(&acp)`; stop drains it. The desktop
@@ -842,7 +929,7 @@ mod tests {
                 None,
                 None,
                 None,
-                )
+            )
             .await
             .expect("start");
 
@@ -1078,11 +1165,9 @@ mod tests {
                 ["config", "user.name", "Test"].as_slice(),
                 ["config", "commit.gpgsign", "false"].as_slice(),
             ] {
-                let out = crate::trackers::GitTracker::run_git_command(
-                    dir_a.to_str().unwrap(),
-                    args,
-                )
-                .expect("git command runs");
+                let out =
+                    crate::trackers::GitTracker::run_git_command(dir_a.to_str().unwrap(), args)
+                        .expect("git command runs");
                 assert!(
                     out.status.success(),
                     "git {:?} failed: {}",
@@ -1145,12 +1230,10 @@ mod tests {
         // The route canonicalizes dir_a and checks it against project_root
         // (which is now dir_a's canonical form, not the home dir). Build the
         // URL with percent-encoding so Windows backslash paths parse correctly.
-        let skills_url_a = format!(
-            "{url}/skills?projectRoot={}",
-            percent_encode_path(&dir_a)
-        );
+        let skills_url_a = format!("{url}/skills?projectRoot={}", percent_encode_path(&dir_a));
         let resp = client
             .get(&skills_url_a)
+            .bearer_auth("test-remote-access-token")
             .send()
             .await
             .expect("GET /skills");
@@ -1171,6 +1254,7 @@ mod tests {
         // passed).
         let resp = client
             .post(format!("{url}/git/status"))
+            .bearer_auth("test-remote-access-token")
             .json(&serde_json::json!({ "cwd": dir_a.to_string_lossy() }))
             .send()
             .await
@@ -1182,7 +1266,9 @@ mod tests {
         );
         if git_available {
             assert!(
-                body.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
+                body.get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
                 "/git/status should succeed for a git repo, got: {body}"
             );
         }
@@ -1197,12 +1283,10 @@ mod tests {
         );
 
         // GET /skills?projectRoot=dir_b — must succeed with the new boundary.
-        let skills_url_b = format!(
-            "{url}/skills?projectRoot={}",
-            percent_encode_path(&dir_b)
-        );
+        let skills_url_b = format!("{url}/skills?projectRoot={}", percent_encode_path(&dir_b));
         let resp = client
             .get(&skills_url_b)
+            .bearer_auth("test-remote-access-token")
             .send()
             .await
             .expect("GET /skills after switch");
@@ -1218,6 +1302,7 @@ mod tests {
         // rebound boundary actually moved (not just widened to cover both).
         let resp = client
             .get(&skills_url_a)
+            .bearer_auth("test-remote-access-token")
             .send()
             .await
             .expect("GET /skills old project after switch");

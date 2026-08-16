@@ -1,13 +1,13 @@
 //! HTTP adapters for canonical Conversation binding and tombstone lifecycle operations.
 
-use std::net::SocketAddr;
+use std::sync::Arc;
 
 use axum::{
     body::Bytes,
-    extract::{ConnectInfo, Path, State},
+    extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
+    Extension, Json,
 };
 use serde::Deserialize;
 use tracing::warn;
@@ -16,6 +16,7 @@ use crate::conversation::{
     ConversationApplicationService, ConversationId, ConversationLifecycleOutcome,
     PrepareConversationRequest,
 };
+use crate::web::auth::{status_for_code, RemoteAccessAuthority, RemoteCapability, RemotePrincipal};
 use crate::web::fs_api::IpcBody;
 use crate::web::sink::AcpEvent;
 use crate::web::ws::AppState;
@@ -36,48 +37,85 @@ struct ReplaceRequest {
 
 pub async fn detach(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    Extension(principal): Extension<RemotePrincipal>,
     Path(conversation_id): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
-    mutate_revision(state, peer, conversation_id, body, Mutation::Detach).await
+    mutate_revision(
+        state,
+        authority,
+        principal,
+        conversation_id,
+        body,
+        Mutation::Detach,
+    )
+    .await
 }
 
 pub async fn rebind(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    Extension(principal): Extension<RemotePrincipal>,
     Path(conversation_id): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
-    mutate_revision(state, peer, conversation_id, body, Mutation::Rebind).await
+    mutate_revision(
+        state,
+        authority,
+        principal,
+        conversation_id,
+        body,
+        Mutation::Rebind,
+    )
+    .await
 }
 
 pub async fn suspend(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    Extension(principal): Extension<RemotePrincipal>,
     Path(conversation_id): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
-    mutate_revision(state, peer, conversation_id, body, Mutation::Suspend).await
+    mutate_revision(
+        state,
+        authority,
+        principal,
+        conversation_id,
+        body,
+        Mutation::Suspend,
+    )
+    .await
 }
 
 pub async fn delete(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    Extension(principal): Extension<RemotePrincipal>,
     Path(conversation_id): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
-    mutate_revision(state, peer, conversation_id, body, Mutation::Delete).await
+    mutate_revision(
+        state,
+        authority,
+        principal,
+        conversation_id,
+        body,
+        Mutation::Delete,
+    )
+    .await
 }
 
 pub async fn replace(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    Extension(principal): Extension<RemotePrincipal>,
     Path(conversation_id): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
-    if !peer.ip().is_loopback() {
-        return forbidden();
+    if let Err(response) = require_mutation(&authority, &principal) {
+        return response;
     }
     let conversation_id = match parse_id(&conversation_id) {
         Ok(value) => value,
@@ -110,13 +148,14 @@ enum Mutation {
 
 async fn mutate_revision(
     state: AppState,
-    peer: SocketAddr,
+    authority: Arc<RemoteAccessAuthority>,
+    principal: RemotePrincipal,
     conversation_id: String,
     body: Bytes,
     mutation: Mutation,
 ) -> (StatusCode, Json<IpcBody<ConversationLifecycleOutcome>>) {
-    if !peer.ip().is_loopback() {
-        return forbidden();
+    if let Err(response) = require_mutation(&authority, &principal) {
+        return response;
     }
     let conversation_id = match parse_id(&conversation_id) {
         Ok(value) => value,
@@ -206,11 +245,13 @@ fn validation(detail: String) -> (StatusCode, Json<IpcBody<ConversationLifecycle
     )
 }
 
-fn forbidden() -> (StatusCode, Json<IpcBody<ConversationLifecycleOutcome>>) {
-    failure(
-        "FORBIDDEN".to_string(),
-        "Conversation lifecycle mutation routes are localhost-only".to_string(),
-    )
+fn require_mutation(
+    authority: &RemoteAccessAuthority,
+    principal: &RemotePrincipal,
+) -> Result<(), (StatusCode, Json<IpcBody<ConversationLifecycleOutcome>>)> {
+    authority
+        .authorize(principal, RemoteCapability::Mutate)
+        .map_err(|error| failure(error.code().to_string(), error.to_string()))
 }
 
 fn failure(
@@ -218,7 +259,7 @@ fn failure(
     detail: String,
 ) -> (StatusCode, Json<IpcBody<ConversationLifecycleOutcome>>) {
     (
-        StatusCode::OK,
+        status_for_code(&code),
         Json(IpcBody::<ConversationLifecycleOutcome>::err(detail, code)),
     )
 }
@@ -243,8 +284,10 @@ mod tests {
     };
     use crate::web::ws::HistoryMode;
     use axum::body::Body;
+    use axum::extract::ConnectInfo;
     use axum::http::Request;
     use axum::routing::post;
+    use std::net::SocketAddr;
     use std::sync::Arc;
     use tower::ServiceExt;
     use uuid::Uuid;
@@ -361,6 +404,8 @@ mod tests {
     }
 
     fn router(state: AppState) -> axum::Router {
+        let authority = Arc::new(RemoteAccessAuthority::for_tests("lifecycle-api-token"));
+        let principal = authority.verify_bearer("lifecycle-api-token").unwrap();
         axum::Router::new()
             .route(
                 "/conversations/{conversationId}/lifecycle/detach",
@@ -371,6 +416,8 @@ mod tests {
                 post(delete),
             )
             .with_state(state)
+            .layer(Extension(principal))
+            .layer(Extension(authority))
     }
 
     async fn body(response: axum::response::Response) -> IpcBody<ConversationLifecycleOutcome> {
@@ -412,6 +459,7 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
         assert_eq!(
             body(response).await.code.as_deref(),
             Some("CONVERSATION_CONFLICT")

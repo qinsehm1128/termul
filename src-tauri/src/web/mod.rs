@@ -15,6 +15,7 @@
 //! event log, cursor, tiers) is [`ws`] (Story 1.4).
 
 pub mod assets;
+pub mod auth;
 pub mod catalog_api;
 pub mod config;
 pub mod conversation_api;
@@ -41,6 +42,7 @@ pub mod ws;
 #[cfg(test)]
 mod conversation_golden_tests;
 
+pub use auth::{RemoteAccessAuthority, RemoteCapability, RemotePrincipal};
 pub use config::ServerConfig;
 pub use permissions::PermissionRendezvous;
 pub use permissions::QuestionRendezvous;
@@ -130,6 +132,7 @@ pub async fn serve(
     workspace_manifest: Option<Arc<crate::acp::WorkspaceManifestService>>,
     acp_catalog: Option<Arc<crate::acp::AcpCatalogService>>,
     acp_install: Option<Arc<crate::acp::install::AcpInstallService>>,
+    authority: Arc<RemoteAccessAuthority>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (_addr, handle) = serve_router(
         acp.clone(),
@@ -148,6 +151,7 @@ pub async fn serve(
         workspace_manifest,
         acp_catalog,
         acp_install,
+        authority,
     )
     .await?;
 
@@ -218,6 +222,7 @@ pub async fn serve_router(
     workspace_manifest: Option<Arc<crate::acp::WorkspaceManifestService>>,
     acp_catalog: Option<Arc<crate::acp::AcpCatalogService>>,
     acp_install: Option<Arc<crate::acp::install::AcpInstallService>>,
+    authority: Arc<RemoteAccessAuthority>,
 ) -> Result<(SocketAddr, JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
     let bind_addr = cfg.bind_addr().ok_or_else(|| {
         format!(
@@ -228,6 +233,16 @@ pub async fn serve_router(
 
     let listener = TcpListener::bind(bind_addr).await?;
     let addr = listener.local_addr()?;
+
+    // Same-origin browser clients use the concrete listener Origin. Register
+    // it before router construction without weakening any explicit public
+    // Origin policy (desktop cloudflared adds its HTTPS Origin later).
+    if addr.ip().is_loopback() {
+        let local_origin = url::Url::parse(&format!("http://{addr}"))?;
+        authority
+            .set_public_origin(local_origin)
+            .map_err(|error| format!("failed to register listener Origin: {error}"))?;
+    }
     info!("ACP web server listening on http://{}", addr);
 
     if !assets::dist_web_ready() {
@@ -262,6 +277,7 @@ pub async fn serve_router(
         workspace_manifest,
         acp_catalog,
         acp_install,
+        authority,
     );
 
     let handle = tokio::spawn(async move {

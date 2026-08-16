@@ -60,52 +60,53 @@ fn get_entry(key: &str) -> Result<Entry, String> {
     Entry::new(SERVICE_NAME, key).map_err(|e| format!("Failed to create keyring entry: {}", e))
 }
 
+/// Crate-private keyring helpers for host-owned credentials. Callers must not
+/// log returned values or include them in error messages.
+pub(crate) fn keyring_get(key: &str) -> Result<Option<String>, String> {
+    match get_entry(key)?.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(format!("Failed to retrieve keyring credential: {error}")),
+    }
+}
+
+pub(crate) fn keyring_set(key: &str, value: &str) -> Result<(), String> {
+    get_entry(key)?
+        .set_password(value)
+        .map_err(|error| format!("Failed to store keyring credential: {error}"))
+}
+
+pub(crate) fn keyring_delete(key: &str) -> Result<(), String> {
+    match get_entry(key)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(format!("Failed to delete keyring credential: {error}")),
+    }
+}
+
 #[tauri::command]
 pub fn secure_storage_set(request: SecureStorageSetRequest) -> SecureStorageResponse<()> {
-    match get_entry(&request.key) {
-        Ok(entry) => match entry.set_password(&request.value) {
-            Ok(_) => SecureStorageResponse::success_void(),
-            Err(e) => SecureStorageResponse::error(
-                format!("Failed to store secret: {}", e),
-                "STORAGE_ERROR".to_string(),
-            ),
-        },
-        Err(e) => SecureStorageResponse::error(e, "KEYRING_ERROR".to_string()),
+    match keyring_set(&request.key, &request.value) {
+        Ok(()) => SecureStorageResponse::success_void(),
+        Err(error) => SecureStorageResponse::error(error, "STORAGE_ERROR".to_string()),
     }
 }
 
 #[tauri::command]
 pub fn secure_storage_get(request: SecureStorageRequest) -> SecureStorageResponse<String> {
-    match get_entry(&request.key) {
-        Ok(entry) => match entry.get_password() {
-            Ok(value) => SecureStorageResponse::success(value),
-            Err(keyring::Error::NoEntry) => SecureStorageResponse::error(
-                format!("Secret not found for key: {}", request.key),
-                "KEY_NOT_FOUND".to_string(),
-            ),
-            Err(e) => SecureStorageResponse::error(
-                format!("Failed to retrieve secret: {}", e),
-                "RETRIEVAL_ERROR".to_string(),
-            ),
-        },
-        Err(e) => SecureStorageResponse::error(e, "KEYRING_ERROR".to_string()),
+    match keyring_get(&request.key) {
+        Ok(Some(value)) => SecureStorageResponse::success(value),
+        Ok(None) => SecureStorageResponse::error(
+            format!("Secret not found for key: {}", request.key),
+            "KEY_NOT_FOUND".to_string(),
+        ),
+        Err(error) => SecureStorageResponse::error(error, "RETRIEVAL_ERROR".to_string()),
     }
 }
 
 #[tauri::command]
 pub fn secure_storage_delete(request: SecureStorageRequest) -> SecureStorageResponse<()> {
-    match get_entry(&request.key) {
-        Ok(entry) => match entry.delete_credential() {
-            Ok(_) => SecureStorageResponse::success_void(),
-            Err(keyring::Error::NoEntry) => {
-                // Deleting a non-existent key is considered success
-                SecureStorageResponse::success_void()
-            }
-            Err(e) => SecureStorageResponse::error(
-                format!("Failed to delete secret: {}", e),
-                "DELETE_ERROR".to_string(),
-            ),
-        },
-        Err(e) => SecureStorageResponse::error(e, "KEYRING_ERROR".to_string()),
+    match keyring_delete(&request.key) {
+        Ok(()) => SecureStorageResponse::success_void(),
+        Err(error) => SecureStorageResponse::error(error, "DELETE_ERROR".to_string()),
     }
 }

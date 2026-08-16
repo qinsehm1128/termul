@@ -1,14 +1,13 @@
 //! Thin HTTP adapters for the shared Conversation application service.
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
     body::Bytes,
-    extract::{ConnectInfo, Path, State},
+    extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
+    Extension, Json,
 };
 use serde::Serialize;
 
@@ -17,6 +16,7 @@ use crate::conversation::{
     ConversationApplicationService, ConversationId, LegacyConversationKey,
     LegacyConversationResolution,
 };
+use crate::web::auth::{status_for_code, RemoteAccessAuthority, RemoteCapability, RemotePrincipal};
 use crate::web::fs_api::IpcBody;
 use crate::web::ws::AppState;
 
@@ -29,39 +29,59 @@ fn service(state: &AppState) -> Result<Arc<ConversationApplicationService>, (Str
     })
 }
 
-pub async fn host_status(State(state): State<AppState>) -> impl IntoResponse {
-    let result = service(&state).and_then(|service| {
-        service
-            .host_status()
-            .map_err(|error| (error.code, error.detail))
-    });
-    respond(result)
-}
-
-pub async fn list(State(state): State<AppState>) -> impl IntoResponse {
-    let result = service(&state).map(|service| service.list_conversations());
-    respond(result)
-}
-
-pub async fn get(
+pub async fn host_status(
     State(state): State<AppState>,
-    Path(conversation_id): Path<String>,
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    Extension(principal): Extension<RemotePrincipal>,
 ) -> impl IntoResponse {
-    let result = parse_id(&conversation_id).and_then(|conversation_id| {
+    let result = require(&authority, &principal, RemoteCapability::Read).and_then(|()| {
         service(&state).and_then(|service| {
             service
-                .get_conversation(conversation_id)
+                .host_status()
+                .map(redact_host_status)
                 .map_err(|error| (error.code, error.detail))
         })
     });
     respond(result)
 }
 
+pub async fn list(
+    State(state): State<AppState>,
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    Extension(principal): Extension<RemotePrincipal>,
+) -> impl IntoResponse {
+    let result = require(&authority, &principal, RemoteCapability::Read)
+        .and_then(|()| service(&state).map(|service| service.list_conversations()));
+    respond(result)
+}
+
+pub async fn get(
+    State(state): State<AppState>,
+    Path(conversation_id): Path<String>,
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    Extension(principal): Extension<RemotePrincipal>,
+) -> impl IntoResponse {
+    let result = require(&authority, &principal, RemoteCapability::Read)
+        .and_then(|()| parse_id(&conversation_id))
+        .and_then(|conversation_id| {
+            service(&state).and_then(|service| {
+                service
+                    .get_conversation(conversation_id)
+                    .map_err(|error| (error.code, error.detail))
+            })
+        });
+    respond(result)
+}
+
 pub async fn open(
     State(state): State<AppState>,
     Path(conversation_id): Path<String>,
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    Extension(principal): Extension<RemotePrincipal>,
 ) -> impl IntoResponse {
-    let result = match parse_id(&conversation_id) {
+    let result = match require(&authority, &principal, RemoteCapability::Read)
+        .and_then(|()| parse_id(&conversation_id))
+    {
         Ok(conversation_id) => match service(&state) {
             Ok(service) => service
                 .open_conversation(conversation_id)
@@ -74,7 +94,15 @@ pub async fn open(
     respond(result)
 }
 
-pub async fn resolve_legacy(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
+pub async fn resolve_legacy(
+    State(state): State<AppState>,
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    Extension(principal): Extension<RemotePrincipal>,
+    body: Bytes,
+) -> impl IntoResponse {
+    if let Err(error) = require(&authority, &principal, RemoteCapability::Read) {
+        return respond::<LegacyConversationResolution>(Err(error));
+    }
     let request: LegacyConversationKey = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(error) => {
@@ -94,7 +122,8 @@ pub async fn resolve_legacy(State(state): State<AppState>, body: Bytes) -> impl 
 
 pub async fn resolve_recovery(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    Extension(principal): Extension<RemotePrincipal>,
     body: Bytes,
 ) -> impl IntoResponse {
     let request: crate::conversation::migration::ResolveRecoveryItemRequest =
@@ -107,23 +136,53 @@ pub async fn resolve_recovery(
                 )))
             }
         };
-    if request.action.authorization() == RecoveryAuthorizationClass::Mutation
-        && !peer.ip().is_loopback()
-    {
-        return respond::<RecoveryActionResult>(Err((
-            "FORBIDDEN".to_string(),
-            "Conversation recovery mutations are localhost-only over HTTP; use authenticated WebSocket remotely"
-                .to_string(),
-        )));
+    let capability = if request.action.authorization() == RecoveryAuthorizationClass::Mutation {
+        RemoteCapability::Mutate
+    } else {
+        RemoteCapability::RecoveryInspect
+    };
+    if let Err(error) = require(&authority, &principal, capability) {
+        return respond::<RecoveryActionResult>(Err(error));
     }
     let result = match service(&state) {
         Ok(service) => service
             .resolve_recovery_item(request)
             .await
+            .map(redact_recovery_result)
             .map_err(|error| (error.code, error.detail)),
         Err(error) => Err(error),
     };
     respond(result)
+}
+
+fn require(
+    authority: &RemoteAccessAuthority,
+    principal: &RemotePrincipal,
+    capability: RemoteCapability,
+) -> Result<(), (String, String)> {
+    authority
+        .authorize(principal, capability)
+        .map_err(|error| (error.code().to_string(), error.to_string()))
+}
+
+fn redact_host_status(
+    mut status: crate::conversation::application::ConversationHostStatus,
+) -> crate::conversation::application::ConversationHostStatus {
+    for item in &mut status.recovery_items {
+        item.source_paths.clear();
+        item.source_sha256.clear();
+        item.candidate_facts.clear();
+        item.provenance.clear();
+    }
+    status
+}
+
+fn redact_recovery_result(mut result: RecoveryActionResult) -> RecoveryActionResult {
+    result.source_paths.clear();
+    result.source_sha256.clear();
+    result.candidate_facts.clear();
+    result.provenance.clear();
+    result
 }
 
 fn parse_id(value: &str) -> Result<ConversationId, (String, String)> {
@@ -134,7 +193,7 @@ fn parse_id(value: &str) -> Result<ConversationId, (String, String)> {
 fn respond<T: Serialize>(result: Result<T, (String, String)>) -> (StatusCode, Json<IpcBody<T>>) {
     match result {
         Ok(value) => (StatusCode::OK, Json(IpcBody::ok(value))),
-        Err((code, detail)) => (StatusCode::OK, Json(IpcBody::err(detail, code))),
+        Err((code, detail)) => (status_for_code(&code), Json(IpcBody::err(detail, code))),
     }
 }
 
@@ -155,8 +214,10 @@ mod tests {
     };
     use crate::web::ws::HistoryMode;
     use axum::body::Body;
+    use axum::extract::ConnectInfo;
     use axum::http::Request;
     use axum::routing::{get, post};
+    use std::net::SocketAddr;
     use tower::ServiceExt;
     use uuid::Uuid;
 
@@ -245,6 +306,8 @@ mod tests {
     }
 
     fn app(state: AppState) -> axum::Router {
+        let authority = Arc::new(RemoteAccessAuthority::for_tests("conversation-api-token"));
+        let principal = authority.verify_bearer("conversation-api-token").unwrap();
         axum::Router::new()
             .route("/conversations/host-status", get(host_status))
             .route("/conversations", get(list))
@@ -253,6 +316,8 @@ mod tests {
             .route("/conversations/{conversationId}/open", post(open))
             .route("/conversation-recovery/resolve", post(resolve_recovery))
             .with_state(state)
+            .layer(Extension(principal))
+            .layer(Extension(authority))
     }
 
     async fn json<T: serde::de::DeserializeOwned>(response: axum::response::Response) -> T {
@@ -393,8 +458,10 @@ mod tests {
             assert!(body.success, "{action}: {:?}", body.error);
             let result = body.data.unwrap();
             assert_eq!(serde_json::to_value(result.action).unwrap(), action);
-            assert_eq!(result.source_paths, item.source_paths);
-            assert_eq!(result.source_sha256, item.source_sha256);
+            assert!(result.source_paths.is_empty());
+            assert!(result.source_sha256.is_empty());
+            assert!(result.candidate_facts.is_empty());
+            assert!(result.provenance.is_empty());
         }
 
         let (_temp, repository, state) = state_with_repository().await;
@@ -420,7 +487,10 @@ mod tests {
             .await
             .unwrap();
         let body: IpcBody<RecoveryActionResult> = json(response).await;
-        assert_eq!(body.code.as_deref(), Some("FORBIDDEN"));
+        assert!(
+            body.success,
+            "authenticated proxy requests must not rely on peer IP"
+        );
     }
 
     #[tokio::test]
@@ -440,6 +510,7 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let body: IpcBody<LegacyConversationResolution> = json(response).await;
         assert_eq!(body.code.as_deref(), Some("CONVERSATION_NOT_FOUND"));
 
@@ -455,6 +526,7 @@ mod tests {
             )
             .await
             .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body: IpcBody<LegacyConversationResolution> = json(response).await;
         assert_eq!(body.code.as_deref(), Some("VALIDATION_ERROR"));
     }

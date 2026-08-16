@@ -11,9 +11,10 @@ use std::sync::Arc;
 
 use axum::{
     http::StatusCode,
+    middleware,
     response::IntoResponse,
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
 
 use crate::acp::{
@@ -21,6 +22,7 @@ use crate::acp::{
 };
 use crate::pty::PtyManager;
 use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub};
+use crate::web::auth::{capability_middleware, RemoteAccessAuthority};
 use crate::web::catalog_api;
 use crate::web::conversation_api;
 use crate::web::conversation_lifecycle_api;
@@ -81,6 +83,7 @@ pub fn router(
     workspace_manifest: Option<Arc<WorkspaceManifestService>>,
     acp_catalog: Option<Arc<AcpCatalogService>>,
     acp_install: Option<Arc<AcpInstallService>>,
+    authority: Arc<RemoteAccessAuthority>,
 ) -> Router {
     acp.set_pty_manager(&pty);
     let mut r = Router::new()
@@ -274,6 +277,8 @@ pub fn router(
         acp_install,
         project_root: project_root_handle,
     })
+    .layer(middleware::from_fn(capability_middleware))
+    .layer(Extension(authority))
 }
 
 /// Same as [`router`], but with an injectable static-root for unit tests.
@@ -432,6 +437,8 @@ pub fn router_with_static(
                 project_root: project_root_handle,
             }
         })
+        .layer(middleware::from_fn(capability_middleware))
+        .layer(Extension(Arc::new(RemoteAccessAuthority::unconfigured())))
 }
 
 /// Liveness probe for the ACP web server.
@@ -517,6 +524,10 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri("/ws")
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        3000,
+                    ))))
                     .body(Body::empty())
                     .expect("build request"),
             )

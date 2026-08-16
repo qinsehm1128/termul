@@ -1,7 +1,7 @@
 //! Dedicated interactive terminal websocket.
 //!
-//! This endpoint intentionally stays separate from the ACP relay. Authentication
-//! is not implemented yet; never expose it to an untrusted network. All
+//! This endpoint intentionally stays separate from the ACP relay. The shared
+//! router admits it only after bearer capability middleware succeeds. All
 //! operations are Conversation-scoped: `conversationId` is the primary PTY
 //! ownership/claim scope. `projectId` is optional attribution only.
 
@@ -58,7 +58,7 @@ async fn run(socket: WebSocket, state: AppState) {
     // Per-terminal output forwarding tasks.
     let attachments: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
 
-    info!("[terminal-ws] client connected (authentication deferred)");
+    info!("[terminal-ws] client connected after router authentication");
 
     let event_tx = tx.clone();
     let event_state = state.clone();

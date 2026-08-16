@@ -1033,6 +1033,9 @@ mod tests {
             None,
             None,
             None,
+            Arc::new(crate::web::RemoteAccessAuthority::for_tests(
+                "test-remote-access-token",
+            )),
         )
     }
 
@@ -1054,6 +1057,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/worktree/list")
+                    .header("authorization", "Bearer test-remote-access-token")
                     .header("content-type", "application/json")
                     .extension(ConnectInfo(loopback()))
                     .body(Body::from(bytes))
@@ -1092,6 +1096,7 @@ mod tests {
                 Request::builder()
                     .method("GET")
                     .uri(&uri)
+                    .header("authorization", "Bearer test-remote-access-token")
                     .body(Body::empty())
                     .expect("build request"),
             )
@@ -1128,6 +1133,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/worktree/resolve-base-branch")
+                    .header("authorization", "Bearer test-remote-access-token")
                     .header("content-type", "application/json")
                     .extension(ConnectInfo(loopback()))
                     .body(Body::from(bytes))
@@ -1159,6 +1165,7 @@ mod tests {
                 Request::builder()
                     .method("POST")
                     .uri("/worktree/nonexistent-route")
+                    .header("authorization", "Bearer test-remote-access-token")
                     .header("content-type", "application/json")
                     .extension(ConnectInfo(loopback()))
                     .body(Body::from(

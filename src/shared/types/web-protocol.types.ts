@@ -174,8 +174,13 @@ export const WS_REQUEST_TYPES = [
 /** Union of all WS request `type` strings. */
 export type WsRequestType = (typeof WS_REQUEST_TYPES)[number]
 
+/** First-frame credential handshake payload. Never persist or log `token`. */
+export interface AuthenticatePayload {
+  token: string
+}
+
 // ============================================================================
-// Error codes (9) — stable machine strings (AC2)
+// Error codes — stable machine strings (AC2)
 // ============================================================================
 
 /**
@@ -203,6 +208,8 @@ export const WS_ERROR_CODES = {
 export const CONVERSATION_APPLICATION_ERROR_CODES = [
   'UNAUTHORIZED',
   'FORBIDDEN',
+  'RATE_LIMITED',
+  'AUTH_CONFIGURATION_ERROR',
   'VALIDATION_ERROR',
   'CONVERSATION_INVALID_ID',
   'CONVERSATION_NOT_FOUND',
