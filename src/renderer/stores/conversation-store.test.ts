@@ -5,10 +5,21 @@ import type {
   ExecutionTarget,
   ProjectAttachment
 } from '@shared/types/conversation.types'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import type { ConversationLifecycleOutcome } from '@shared/types/conversation-lifecycle.types'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { conversationApi } from '@/lib/conversation-api'
+import { setRouterNavigate } from '@/lib/router-navigate'
 import { useAcpStore } from '@/stores/acp-store'
 import { selectVisibleConversations, useConversationStore } from '@/stores/conversation-store'
+import { useWorkspaceStore } from '@/stores/workspace-store'
+
+const { loadSessionWorkspaceMock, openHistorySessionMock, addAgentChatTabMock } = vi.hoisted(
+  () => ({
+    loadSessionWorkspaceMock: vi.fn(),
+    openHistorySessionMock: vi.fn(),
+    addAgentChatTabMock: vi.fn()
+  })
+)
 
 vi.mock('@/lib/conversation-api', () => ({
   conversationApi: {
@@ -20,10 +31,16 @@ vi.mock('@/lib/conversation-api', () => ({
   }
 }))
 
+vi.mock('@/hooks/use-session-workspace-sync', () => ({
+  loadSessionWorkspace: loadSessionWorkspaceMock
+}))
+
 vi.mock('@/lib/log-api', () => ({ logFrontendError: vi.fn() }))
 
 const projectlessId = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
 const attachedId = '028f7a1c-1b4d-7c8a-9f01-0123456789ab'
+const rustCanonicalNonVariantId = '038f7a1c-1b4d-1c8a-1f01-0123456789ab'
+const navigateMock = vi.fn()
 
 function summary(
   conversationId: string,
@@ -97,10 +114,78 @@ function aggregateOutcome(
   }
 }
 
+function lifecycleOutcome(
+  conversation: ConversationRecordV2,
+  revision: number,
+  action: 'detachBinding' | 'rebindDetachedBinding' | 'suspendBinding' | 'replaceBinding',
+  bindingState: 'active' | 'detached' | 'suspended' = 'active'
+): ConversationLifecycleOutcome {
+  return {
+    status: 'updated',
+    action,
+    conversationId: conversation.conversationId,
+    previousRevision: revision - 1,
+    revision,
+    workspaceCwd: conversation.workspaceCwd,
+    lifecycleState: 'ready',
+    currentBinding: {
+      schemaVersion: 1,
+      bindingId: `binding-${conversation.conversationId}`,
+      agentSessionId: `session-${conversation.conversationId}`,
+      runtimeAgentId: 'agent-1',
+      stableAgentNamespace: 'config:test',
+      executionCwd: conversation.workspaceCwd,
+      boundAtUtc: '2026-08-15T10:30:00.000Z',
+      state: bindingState
+    }
+  }
+}
+
+function deleteOutcome(
+  conversation: ConversationRecordV2,
+  revision: number
+): ConversationLifecycleOutcome {
+  return {
+    status: 'updated',
+    action: 'deleteConversation',
+    conversationId: conversation.conversationId,
+    previousRevision: revision - 1,
+    revision,
+    workspaceCwd: conversation.workspaceCwd,
+    lifecycleState: 'deleted',
+    currentBinding: null
+  }
+}
+
+function deferred<T>(): {
+  promise: Promise<T>
+  resolve: (value: T) => void
+} {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   useConversationStore.getState().reset()
-  useAcpStore.setState({ activeSessionId: null, sessionIndex: [] })
+  loadSessionWorkspaceMock.mockResolvedValue(true)
+  openHistorySessionMock.mockResolvedValue(undefined)
+  useAcpStore.setState({
+    sessions: {},
+    activeSessionId: null,
+    sessionIndex: [],
+    openHistorySession: openHistorySessionMock
+  })
+  useWorkspaceStore.setState({ addAgentChatTab: addAgentChatTabMock })
+  setRouterNavigate(navigateMock)
+  window.location.hash = ''
+})
+
+afterEach(() => {
+  setRouterNavigate(null)
 })
 
 describe('ConversationStore canonical authority', () => {
@@ -117,7 +202,7 @@ describe('ConversationStore canonical authority', () => {
     expect(state.summariesById[attachedId].projectAttachment?.projectId).toBe('project-1')
   })
 
-  it('opens and activates only by canonical ConversationId without changing ACP active session', async () => {
+  it('opens canonical Conversation details without claiming route activation', async () => {
     vi.mocked(conversationApi.openConversation).mockResolvedValue({
       success: true,
       data: {
@@ -129,14 +214,14 @@ describe('ConversationStore canonical authority', () => {
     await expect(
       useConversationStore.getState().openConversation(projectlessId)
     ).resolves.toMatchObject({ conversation: { conversationId: projectlessId } })
-    expect(useConversationStore.getState().activeConversationId).toBe(projectlessId)
+    expect(useConversationStore.getState().activeConversationId).toBeNull()
     expect(useConversationStore.getState().detailsById[projectlessId]?.conversation).toEqual(
       projectless
     )
     expect(useAcpStore.getState().activeSessionId).toBeNull()
 
     useAcpStore.setState({ activeSessionId: 'opaque-runtime-session' })
-    expect(useConversationStore.getState().activeConversationId).toBe(projectlessId)
+    expect(useConversationStore.getState().activeConversationId).toBeNull()
     expect(useConversationStore.getState().conversationIds).toEqual([projectlessId])
   })
 
@@ -147,6 +232,197 @@ describe('ConversationStore canonical authority', () => {
     expect(conversationApi.openConversation).not.toHaveBeenCalled()
     expect(useConversationStore.getState().conversationIds).toEqual([])
     expect(useConversationStore.getState().activeConversationId).toBeNull()
+  })
+
+  it('uses the shared Rust-compatible parser for canonical non-variant UUID spellings', async () => {
+    const migrated = summary(rustCanonicalNonVariantId, '/conversations/migrated', null)
+    vi.mocked(conversationApi.openConversation).mockResolvedValue({
+      success: true,
+      data: {
+        conversation: migrated,
+        workspace: { status: 'missing', conversationId: rustCanonicalNonVariantId }
+      }
+    })
+
+    await expect(
+      useConversationStore.getState().openConversation(rustCanonicalNonVariantId)
+    ).resolves.toMatchObject({ conversation: { conversationId: rustCanonicalNonVariantId } })
+    expect(conversationApi.openConversation).toHaveBeenCalledWith(rustCanonicalNonVariantId)
+  })
+
+  it('applies lifecycle outcomes by revision and ignores stale or duplicate outcomes', () => {
+    useConversationStore.getState().replaceSummaries([projectless])
+    useConversationStore.setState({
+      detailsById: {
+        [projectlessId]: {
+          conversation: projectless,
+          workspace: { status: 'missing', conversationId: projectlessId }
+        }
+      }
+    })
+
+    const newest = lifecycleOutcome(projectless, 6, 'suspendBinding', 'suspended')
+    const stale = lifecycleOutcome(projectless, 5, 'detachBinding', 'detached')
+
+    expect(useConversationStore.getState().applyLifecycleOutcome(newest)).toBe(true)
+    expect(useConversationStore.getState().applyLifecycleOutcome(stale)).toBe(false)
+    expect(useConversationStore.getState().applyLifecycleOutcome(newest)).toBe(false)
+
+    const state = useConversationStore.getState()
+    expect(state.summariesById[projectlessId]).toMatchObject({
+      lifecycleState: 'ready',
+      lastSeq: 6
+    })
+    expect(state.detailsById[projectlessId]?.conversation.lastSeq).toBe(6)
+    expect(state.conversationIds).toEqual([projectlessId])
+  })
+
+  it('deletes active and non-active Conversation state without removing terminal tabs', () => {
+    useConversationStore.getState().replaceSummaries([projectless, attached])
+    useConversationStore.setState({
+      activeConversationId: projectlessId,
+      detailsById: {
+        [projectlessId]: {
+          conversation: projectless,
+          workspace: { status: 'missing', conversationId: projectlessId }
+        },
+        [attachedId]: {
+          conversation: attached,
+          workspace: { status: 'missing', conversationId: attachedId }
+        }
+      },
+      openingById: { [projectlessId]: true, [attachedId]: true },
+      aggregateBusyById: { [projectlessId]: true, [attachedId]: true },
+      errorsById: {
+        [projectlessId]: { code: 'TEST', message: 'test' },
+        [attachedId]: { code: 'TEST', message: 'test' }
+      }
+    })
+    useWorkspaceStore.setState({
+      root: {
+        type: 'leaf',
+        id: 'pane-lifecycle',
+        activeTabId: `chat-${projectlessId}`,
+        tabs: [
+          { type: 'terminal', id: 'term-live', terminalId: 'terminal-live' },
+          { type: 'agent-chat', id: `chat-${projectlessId}`, conversationId: projectlessId },
+          { type: 'agent-chat', id: `chat-${attachedId}`, conversationId: attachedId }
+        ]
+      },
+      activePaneId: 'pane-lifecycle'
+    })
+
+    expect(useConversationStore.getState().applyLifecycleOutcome(deleteOutcome(attached, 5))).toBe(
+      true
+    )
+    expect(useConversationStore.getState().activeConversationId).toBe(projectlessId)
+    expect(useConversationStore.getState().summariesById[attachedId]).toBeUndefined()
+
+    window.location.hash = `#/c/${projectlessId}`
+    expect(
+      useConversationStore.getState().applyLifecycleOutcome(deleteOutcome(projectless, 5))
+    ).toBe(true)
+    const state = useConversationStore.getState()
+    expect(state.activeConversationId).toBeNull()
+    expect(state.conversationIds).toEqual([])
+    expect(state.detailsById[projectlessId]).toBeUndefined()
+    expect(state.openingById[projectlessId]).toBeUndefined()
+    expect(state.aggregateBusyById[projectlessId]).toBeUndefined()
+    expect(state.errorsById[projectlessId]).toBeUndefined()
+    expect(navigateMock).toHaveBeenCalledWith('/')
+
+    useConversationStore.getState().replaceSummaries([projectless, attached])
+    expect(useConversationStore.getState().conversationIds).toEqual([])
+
+    expect(useWorkspaceStore.getState().root).toMatchObject({
+      type: 'leaf',
+      tabs: [{ type: 'terminal', id: 'term-live', terminalId: 'terminal-live' }]
+    })
+  })
+
+  it('uses one epoch for A to B to A and suppresses both older completions', async () => {
+    const firstA = deferred<Awaited<ReturnType<typeof conversationApi.openConversation>>>()
+    const middleB = deferred<Awaited<ReturnType<typeof conversationApi.openConversation>>>()
+    const latestA = deferred<Awaited<ReturnType<typeof conversationApi.openConversation>>>()
+    let aCalls = 0
+    vi.mocked(conversationApi.openConversation).mockImplementation((conversationId) => {
+      if (conversationId === attachedId) return middleB.promise
+      aCalls += 1
+      return aCalls === 1 ? firstA.promise : latestA.promise
+    })
+    useAcpStore.setState({
+      sessions: {
+        'session-a': {
+          id: 'session-a',
+          conversationId: projectlessId,
+          agentId: 'agent-a',
+          cwd: projectless.workspaceCwd,
+          projectId: '',
+          status: 'active',
+          activeTurn: false,
+          openTurnId: null,
+          modes: null,
+          configOptions: [],
+          lastError: null,
+          createdAt: 1
+        },
+        'session-b': {
+          id: 'session-b',
+          conversationId: attachedId,
+          agentId: 'agent-b',
+          cwd: attached.workspaceCwd,
+          projectId: 'project-1',
+          status: 'active',
+          activeTurn: false,
+          openTurnId: null,
+          modes: null,
+          configOptions: [],
+          lastError: null,
+          createdAt: 2
+        }
+      },
+      sessionIndex: []
+    })
+
+    const store = useConversationStore.getState()
+    const epochA1 = store.beginConversationActivation(projectlessId)
+    const activationA1 = store.activateConversation(projectlessId, epochA1)
+    const epochB = store.beginConversationActivation(attachedId)
+    const activationB = store.activateConversation(attachedId, epochB)
+    const epochA2 = store.beginConversationActivation(projectlessId)
+    const activationA2 = store.activateConversation(projectlessId, epochA2)
+
+    latestA.resolve({
+      success: true,
+      data: {
+        conversation: projectless,
+        workspace: { status: 'missing', conversationId: projectlessId }
+      }
+    })
+    await expect(activationA2).resolves.toBe(true)
+
+    middleB.resolve({
+      success: true,
+      data: {
+        conversation: attached,
+        workspace: { status: 'missing', conversationId: attachedId }
+      }
+    })
+    firstA.resolve({
+      success: true,
+      data: {
+        conversation: projectless,
+        workspace: { status: 'missing', conversationId: projectlessId }
+      }
+    })
+    await expect(Promise.all([activationA1, activationB])).resolves.toEqual([false, false])
+
+    expect(useConversationStore.getState().activeConversationId).toBe(projectlessId)
+    expect(useAcpStore.getState().activeSessionId).toBe('session-a')
+    expect(loadSessionWorkspaceMock).toHaveBeenCalledTimes(1)
+    expect(loadSessionWorkspaceMock).toHaveBeenCalledWith(projectlessId, expect.any(Function))
+    expect(addAgentChatTabMock).toHaveBeenCalledTimes(1)
+    expect(addAgentChatTabMock).toHaveBeenCalledWith(projectlessId, undefined, false)
   })
 
   it('applies optional search/project filters without mutating attachment or cwd invariants', () => {

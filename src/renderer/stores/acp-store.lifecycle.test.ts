@@ -1,3 +1,4 @@
+import type { ConversationRecordV2 } from '@shared/types/conversation.types'
 import type { ConversationLifecycleOutcome } from '@shared/types/conversation-lifecycle.types'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -33,8 +34,22 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeSpy }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn() }))
 
 import { useAcpStore } from './acp-store'
+import { useConversationStore } from './conversation-store'
 
 const conversationId = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+
+const conversation: ConversationRecordV2 = {
+  schemaVersion: 2,
+  conversationId,
+  createdAtUtc: '2026-08-15T09:45:15.123Z',
+  creationPartition: { year: 2026, month: 8, day: 15, path: '2026/08/15' },
+  workspaceCwd: '/visible/conversation',
+  executionTarget: { kind: 'workspace' },
+  projectAttachment: null,
+  lifecycleState: 'ready',
+  lastSeq: 4,
+  createdBy: 'termul'
+}
 
 function updated(
   action: 'detachBinding' | 'rebindDetachedBinding' | 'suspendBinding' | 'replaceBinding',
@@ -64,6 +79,8 @@ function updated(
 }
 
 function seed(): void {
+  useConversationStore.getState().reset()
+  useConversationStore.getState().replaceSummaries([conversation])
   useAcpStore.setState({
     sessionIndex: [
       {
@@ -145,6 +162,30 @@ describe('ACP Conversation lifecycle store', () => {
 
     expect(useAcpStore.getState().sessions['session-old']?.status).toBe('closed')
     expect(useAcpStore.getState().messages['session-old']).toHaveLength(1)
+  })
+
+  it('keeps ACP lifecycle handling as a derived projection with no route ownership', () => {
+    useAcpStore.getState()._onConversationLifecycle({
+      status: 'updated',
+      action: 'deleteConversation',
+      conversationId,
+      previousRevision: 4,
+      revision: 5,
+      workspaceCwd: '/visible/conversation',
+      lifecycleState: 'deleted',
+      currentBinding: null
+    })
+
+    expect(useConversationStore.getState().summariesById[conversationId]).toEqual(conversation)
+    expect(useAcpStore.getState().sessionIndex).toEqual([])
+    expect(closeViewSpy).not.toHaveBeenCalled()
+  })
+
+  it('rejects a non-canonical lifecycle id before the production facade dispatches', async () => {
+    await expect(
+      useAcpStore.getState().detachAgentBinding('018F7A1C-1B4D-7C8A-9F01-0123456789AB')
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+    expect(invokeSpy).not.toHaveBeenCalled()
   })
 
   it('dispatches detach, rebind, and suspend through the real production lifecycle factory', async () => {

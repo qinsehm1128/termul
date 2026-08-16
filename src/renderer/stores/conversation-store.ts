@@ -5,18 +5,19 @@ import type {
   ExecutionTarget,
   ProjectAttachment
 } from '@shared/types/conversation.types'
+import { isConversationId } from '@shared/types/conversation.types'
 import type {
   ConversationHostStatus,
   ConversationOpenOutcome
 } from '@shared/types/conversation-api.types'
+import type { ConversationLifecycleOutcome } from '@shared/types/conversation-lifecycle.types'
 import type { RecoveryItemV1 } from '@shared/types/conversation-recovery.types'
 import { create } from 'zustand'
 import { useShallow } from 'zustand/shallow'
 import { conversationApi } from '@/lib/conversation-api'
 import { logFrontendError } from '@/lib/log-api'
-
-const canonicalConversationIdPattern =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
+import { useWorkspaceStore } from '@/stores/workspace-store'
 
 export type ConversationProjectFilter = string | 'projectless' | null
 
@@ -31,6 +32,11 @@ interface ConversationState {
   detailsById: Record<ConversationId, ConversationOpenOutcome | undefined>
   recoveryItems: RecoveryItemV1[]
   activeConversationId: ConversationId | null
+  lifecycleRevisionById: Record<ConversationId, number | undefined>
+  deletedRevisionById: Record<ConversationId, number | undefined>
+  lifecycleOutcomeKeyById: Record<ConversationId, string | undefined>
+  activationEpoch: number
+  activationRouteValue: string | null
   searchQuery: string
   projectFilter: ConversationProjectFilter
   loadingList: boolean
@@ -43,8 +49,12 @@ interface ConversationState {
   setSearchQuery: (query: string) => void
   setProjectFilter: (projectFilter: ConversationProjectFilter) => void
   setActiveConversationId: (conversationId: ConversationId | null) => void
+  beginConversationActivation: (conversationId: string) => number
+  activateConversation: (conversationId: string, activationEpoch: number) => Promise<boolean>
+  cancelConversationActivation: (activationEpoch: number) => void
   loadConversations: () => Promise<boolean>
   openConversation: (conversationId: ConversationId) => Promise<ConversationOpenOutcome | null>
+  applyLifecycleOutcome: (outcome: ConversationLifecycleOutcome) => boolean
   applyAggregateOutcome: (outcome: ConversationAggregateMutationOutcome) => boolean
   attachProject: (
     conversationId: ConversationId,
@@ -67,6 +77,11 @@ const initialState = {
   detailsById: {},
   recoveryItems: [],
   activeConversationId: null,
+  lifecycleRevisionById: {},
+  deletedRevisionById: {},
+  lifecycleOutcomeKeyById: {},
+  activationEpoch: 0,
+  activationRouteValue: null,
   searchQuery: '',
   projectFilter: null,
   loadingList: false,
@@ -81,6 +96,11 @@ const initialState = {
   | 'detailsById'
   | 'recoveryItems'
   | 'activeConversationId'
+  | 'lifecycleRevisionById'
+  | 'deletedRevisionById'
+  | 'lifecycleOutcomeKeyById'
+  | 'activationEpoch'
+  | 'activationRouteValue'
   | 'searchQuery'
   | 'projectFilter'
   | 'loadingList'
@@ -90,10 +110,6 @@ const initialState = {
   | 'listError'
 >
 
-export function isCanonicalConversationId(value: string): value is ConversationId {
-  return canonicalConversationIdPattern.test(value)
-}
-
 function indexSummaries(summaries: ConversationRecordV2[]): {
   summariesById: Record<ConversationId, ConversationRecordV2>
   conversationIds: ConversationId[]
@@ -101,7 +117,7 @@ function indexSummaries(summaries: ConversationRecordV2[]): {
   const summariesById: Record<ConversationId, ConversationRecordV2> = {}
   const conversationIds: ConversationId[] = []
   for (const summary of summaries) {
-    if (!isCanonicalConversationId(summary.conversationId)) continue
+    if (!isConversationId(summary.conversationId)) continue
     summariesById[summary.conversationId] = summary
     conversationIds.push(summary.conversationId)
   }
@@ -205,10 +221,98 @@ export function getCurrentConversation(
   return currentConversationRecord(state, conversationId)
 }
 
+function indexRevisionOrderedSummaries(
+  state: ConversationState,
+  summaries: ConversationRecordV2[]
+): ReturnType<typeof indexSummaries> {
+  const ordered = new Map<ConversationId, ConversationRecordV2>()
+  for (const incoming of summaries) {
+    if (!isConversationId(incoming.conversationId)) continue
+    const knownRevision = state.lifecycleRevisionById[incoming.conversationId] ?? -1
+    const deletedRevision = state.deletedRevisionById[incoming.conversationId]
+    if (deletedRevision !== undefined && incoming.lastSeq <= deletedRevision) continue
+    const current = currentConversationRecord(state, incoming.conversationId)
+    if (incoming.lastSeq < knownRevision) {
+      if (current && current.lastSeq >= knownRevision) ordered.set(incoming.conversationId, current)
+      continue
+    }
+    ordered.set(incoming.conversationId, incoming)
+  }
+  return indexSummaries(Array.from(ordered.values()))
+}
+
+function withSummaryRevisions(
+  revisions: Record<ConversationId, number | undefined>,
+  summariesById: Record<ConversationId, ConversationRecordV2>
+): Record<ConversationId, number | undefined> {
+  const next = { ...revisions }
+  for (const summary of Object.values(summariesById)) {
+    next[summary.conversationId] = Math.max(next[summary.conversationId] ?? -1, summary.lastSeq)
+  }
+  return next
+}
+
+function lifecycleOutcomeKey(outcome: ConversationLifecycleOutcome): string {
+  return `${outcome.status}:${outcome.action}:${outcome.revision}`
+}
+
+function withoutConversationKey<T>(
+  record: Record<ConversationId, T>,
+  conversationId: ConversationId
+): Record<ConversationId, T> {
+  const next = { ...record }
+  delete next[conversationId]
+  return next
+}
+
+function activationIsCurrent(
+  state: ConversationState,
+  conversationId: string,
+  activationEpoch: number
+): boolean {
+  return state.activationEpoch === activationEpoch && state.activationRouteValue === conversationId
+}
+
+function logStaleActivation(
+  conversationId: ConversationId,
+  activationEpoch: number,
+  stage: string
+): void {
+  void logFrontendError({
+    level: 'warn',
+    source: 'conversation-store.activation',
+    message: `conversationId=${conversationId} epoch=${activationEpoch} stage=${stage} code=STALE_ACTIVATION`
+  })
+}
+
+function bindingSessionId(
+  state: {
+    sessions: Record<string, { id: string; conversationId?: string; status: string }>
+    sessionIndex: Array<{ id: string; conversationId?: string }>
+  },
+  conversationId: ConversationId
+): string | null {
+  const live = Object.values(state.sessions).find(
+    (session) => session.conversationId === conversationId
+  )
+  if (live) return live.id
+  return state.sessionIndex.find((entry) => entry.conversationId === conversationId)?.id ?? null
+}
+
 export const useConversationStore = create<ConversationState>((set, get) => ({
   ...initialState,
 
-  replaceSummaries: (summaries) => set(indexSummaries(summaries)),
+  replaceSummaries: (summaries) =>
+    set((state) => {
+      const indexed = indexRevisionOrderedSummaries(state, summaries)
+      return {
+        ...indexed,
+        lifecycleRevisionById: withSummaryRevisions(
+          state.lifecycleRevisionById,
+          indexed.summariesById
+        )
+      }
+    }),
 
   setRecoveryItems: (recoveryItems) => set({ recoveryItems: [...recoveryItems] }),
 
@@ -216,7 +320,51 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
 
   setProjectFilter: (projectFilter) => set({ projectFilter }),
 
-  setActiveConversationId: (activeConversationId) => set({ activeConversationId }),
+  setActiveConversationId: (activeConversationId) => {
+    set({ activeConversationId })
+    useSessionWorkspaceSyncStore.getState().setActiveConversationId(activeConversationId)
+  },
+
+  beginConversationActivation: (conversationId) => {
+    let activationEpoch = 0
+    let previousRouteValue: string | null = null
+    set((state) => {
+      activationEpoch = state.activationEpoch + 1
+      previousRouteValue = state.activationRouteValue
+      const openingById = { ...state.openingById }
+      if (previousRouteValue) openingById[previousRouteValue] = false
+      openingById[conversationId] = true
+      return {
+        activationEpoch,
+        activationRouteValue: conversationId,
+        openingById,
+        errorsById: { ...state.errorsById, [conversationId]: undefined }
+      }
+    })
+    if (previousRouteValue && isConversationId(previousRouteValue)) {
+      useSessionWorkspaceSyncStore.getState().setRestoreInProgress(previousRouteValue, false)
+    }
+    return activationEpoch
+  },
+
+  cancelConversationActivation: (activationEpoch) => {
+    let cancelledConversationId: ConversationId | null = null
+    set((state) => {
+      if (state.activationEpoch !== activationEpoch) return {}
+      const routeValue = state.activationRouteValue
+      const openingById = { ...state.openingById }
+      if (routeValue) openingById[routeValue] = false
+      if (routeValue && isConversationId(routeValue)) cancelledConversationId = routeValue
+      return {
+        activationEpoch: state.activationEpoch + 1,
+        activationRouteValue: null,
+        openingById
+      }
+    })
+    if (cancelledConversationId) {
+      useSessionWorkspaceSyncStore.getState().setRestoreInProgress(cancelledConversationId, false)
+    }
+  },
 
   loadConversations: async () => {
     set({ loadingList: true, listError: null })
@@ -231,7 +379,18 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         })
         return false
       }
-      set({ ...indexSummaries(result.data), loadingList: false, listError: null })
+      set((state) => {
+        const indexed = indexRevisionOrderedSummaries(state, result.data)
+        return {
+          ...indexed,
+          lifecycleRevisionById: withSummaryRevisions(
+            state.lifecycleRevisionById,
+            indexed.summariesById
+          ),
+          loadingList: false,
+          listError: null
+        }
+      })
       return true
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
@@ -246,7 +405,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
   },
 
   openConversation: async (conversationId) => {
-    if (!isCanonicalConversationId(conversationId)) {
+    if (!isConversationId(conversationId)) {
       const error = stableError(
         'CONVERSATION_INVALID_ID',
         'The Conversation address is not a canonical ConversationId.'
@@ -284,24 +443,72 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         })
         return null
       }
+      if (result.data.conversation.conversationId !== conversationId) {
+        set((state) => ({
+          openingById: { ...state.openingById, [conversationId]: false },
+          errorsById: {
+            ...state.errorsById,
+            [conversationId]: stableError('CONVERSATION_OPEN_FAILED')
+          }
+        }))
+        void logFrontendError({
+          level: 'error',
+          source: 'conversation-store.open',
+          message: `conversationId=${conversationId} code=CONVERSATION_IDENTITY_MISMATCH`
+        })
+        return null
+      }
 
+      let opened: ConversationOpenOutcome | null = null
       set((state) => {
+        const knownRevision = state.lifecycleRevisionById[conversationId] ?? -1
+        const deletedRevision = state.deletedRevisionById[conversationId]
+        const current = currentConversationRecord(state, conversationId)
+        const incoming = result.data.conversation
+        const conversation =
+          deletedRevision !== undefined && incoming.lastSeq <= deletedRevision
+            ? undefined
+            : incoming.lastSeq < knownRevision && (!current || current.lastSeq < knownRevision)
+              ? undefined
+              : incoming.lastSeq < knownRevision
+                ? current
+                : incoming
+        if (!conversation) {
+          return {
+            openingById: { ...state.openingById, [conversationId]: false },
+            errorsById: {
+              ...state.errorsById,
+              [conversationId]: stableError('CONVERSATION_CONFLICT')
+            }
+          }
+        }
+        opened = { ...result.data, conversation }
         const summaryAlreadyListed = Boolean(state.summariesById[conversationId])
         return {
           summariesById: {
             ...state.summariesById,
-            [conversationId]: result.data.conversation
+            [conversationId]: conversation
           },
           conversationIds: summaryAlreadyListed
             ? state.conversationIds
             : [conversationId, ...state.conversationIds],
-          detailsById: { ...state.detailsById, [conversationId]: result.data },
+          detailsById: { ...state.detailsById, [conversationId]: opened },
+          lifecycleRevisionById: {
+            ...state.lifecycleRevisionById,
+            [conversationId]: Math.max(knownRevision, conversation.lastSeq)
+          },
           openingById: { ...state.openingById, [conversationId]: false },
-          errorsById: { ...state.errorsById, [conversationId]: undefined },
-          activeConversationId: conversationId
+          errorsById: { ...state.errorsById, [conversationId]: undefined }
         }
       })
-      return result.data
+      if (!opened) {
+        void logFrontendError({
+          level: 'warn',
+          source: 'conversation-store.open',
+          message: `conversationId=${conversationId} code=CONVERSATION_STALE_OPEN`
+        })
+      }
+      return opened
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       set((state) => ({
@@ -318,6 +525,374 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       })
       return null
     }
+  },
+
+  activateConversation: async (routeValue, activationEpoch) => {
+    const isCurrent = (): boolean => activationIsCurrent(get(), routeValue, activationEpoch)
+    if (!isCurrent()) return false
+    if (!isConversationId(routeValue)) {
+      set((state) =>
+        activationIsCurrent(state, routeValue, activationEpoch)
+          ? {
+              openingById: { ...state.openingById, [routeValue]: false },
+              errorsById: {
+                ...state.errorsById,
+                [routeValue]: stableError(
+                  'CONVERSATION_INVALID_ID',
+                  'The Conversation address is not a canonical ConversationId.'
+                )
+              }
+            }
+          : {}
+      )
+      void logFrontendError({
+        level: 'warn',
+        source: 'conversation-store.activation',
+        message: `epoch=${activationEpoch} stage=validate code=CONVERSATION_INVALID_ID`
+      })
+      return false
+    }
+
+    const conversationId = routeValue
+    let openResult: Awaited<ReturnType<typeof conversationApi.openConversation>>
+    try {
+      openResult = await conversationApi.openConversation(conversationId)
+    } catch (error) {
+      if (!isCurrent()) {
+        logStaleActivation(conversationId, activationEpoch, 'open-error')
+        return false
+      }
+      const message = error instanceof Error ? error.message : String(error)
+      set((state) => ({
+        openingById: { ...state.openingById, [conversationId]: false },
+        errorsById: {
+          ...state.errorsById,
+          [conversationId]: stableError('CONVERSATION_OPEN_FAILED', message)
+        }
+      }))
+      void logFrontendError({
+        level: 'warn',
+        source: 'conversation-store.activation',
+        message: `conversationId=${conversationId} epoch=${activationEpoch} stage=open code=CONVERSATION_OPEN_FAILED`
+      })
+      return false
+    }
+    if (!isCurrent()) {
+      logStaleActivation(conversationId, activationEpoch, 'open')
+      return false
+    }
+    if (!openResult.success) {
+      set((state) => ({
+        openingById: { ...state.openingById, [conversationId]: false },
+        errorsById: {
+          ...state.errorsById,
+          [conversationId]: stableError(openResult.code, openResult.error)
+        }
+      }))
+      void logFrontendError({
+        level: 'warn',
+        source: 'conversation-store.activation',
+        message: `conversationId=${conversationId} epoch=${activationEpoch} stage=open code=${openResult.code}`
+      })
+      return false
+    }
+    if (openResult.data.conversation.conversationId !== conversationId) {
+      set((state) => ({
+        openingById: { ...state.openingById, [conversationId]: false },
+        errorsById: {
+          ...state.errorsById,
+          [conversationId]: stableError('CONVERSATION_OPEN_FAILED')
+        }
+      }))
+      void logFrontendError({
+        level: 'error',
+        source: 'conversation-store.activation',
+        message: `conversationId=${conversationId} epoch=${activationEpoch} stage=open code=CONVERSATION_IDENTITY_MISMATCH`
+      })
+      return false
+    }
+
+    let activatedOutcome: ConversationOpenOutcome | null = null
+    set((state) => {
+      if (!activationIsCurrent(state, conversationId, activationEpoch)) return {}
+      const knownRevision = state.lifecycleRevisionById[conversationId] ?? -1
+      const deletedRevision = state.deletedRevisionById[conversationId]
+      const current = currentConversationRecord(state, conversationId)
+      const incoming = openResult.data.conversation
+      const conversation =
+        deletedRevision !== undefined && incoming.lastSeq <= deletedRevision
+          ? undefined
+          : incoming.lastSeq < knownRevision && (!current || current.lastSeq < knownRevision)
+            ? undefined
+            : incoming.lastSeq < knownRevision
+              ? current
+              : incoming
+      if (!conversation) {
+        return {
+          openingById: { ...state.openingById, [conversationId]: false },
+          errorsById: {
+            ...state.errorsById,
+            [conversationId]: stableError('CONVERSATION_CONFLICT')
+          }
+        }
+      }
+      activatedOutcome = { ...openResult.data, conversation }
+      const alreadyListed = Boolean(state.summariesById[conversationId])
+      return {
+        summariesById: {
+          ...state.summariesById,
+          [conversationId]: conversation
+        },
+        conversationIds: alreadyListed
+          ? state.conversationIds
+          : [conversationId, ...state.conversationIds],
+        detailsById: { ...state.detailsById, [conversationId]: activatedOutcome },
+        lifecycleRevisionById: {
+          ...state.lifecycleRevisionById,
+          [conversationId]: Math.max(knownRevision, conversation.lastSeq)
+        },
+        activeConversationId: conversationId,
+        errorsById: { ...state.errorsById, [conversationId]: undefined }
+      }
+    })
+    if (!activatedOutcome) {
+      if (!isCurrent()) logStaleActivation(conversationId, activationEpoch, 'open-commit')
+      else {
+        void logFrontendError({
+          level: 'warn',
+          source: 'conversation-store.activation',
+          message: `conversationId=${conversationId} epoch=${activationEpoch} stage=open-commit code=CONVERSATION_STALE_OPEN`
+        })
+      }
+      return false
+    }
+    useSessionWorkspaceSyncStore.getState().setActiveConversationId(conversationId)
+
+    const workspaceModule = await import('@/hooks/use-session-workspace-sync')
+    if (!isCurrent()) {
+      logStaleActivation(conversationId, activationEpoch, 'workspace-import')
+      return false
+    }
+    await workspaceModule.loadSessionWorkspace(conversationId, isCurrent)
+    if (!isCurrent()) {
+      logStaleActivation(conversationId, activationEpoch, 'workspace')
+      return false
+    }
+
+    const { useAcpStore } = await import('@/stores/acp-store')
+    if (!isCurrent()) {
+      logStaleActivation(conversationId, activationEpoch, 'binding-import')
+      return false
+    }
+    let acp = useAcpStore.getState()
+    const sessionId = bindingSessionId(acp, conversationId)
+    if (!sessionId) {
+      acp.setActiveSession(null)
+      set((state) =>
+        activationIsCurrent(state, conversationId, activationEpoch)
+          ? { openingById: { ...state.openingById, [conversationId]: false } }
+          : {}
+      )
+      return true
+    }
+
+    try {
+      const live = acp.sessions[sessionId]
+      if (!live || live.status === 'closed') {
+        await acp.openHistorySession(sessionId)
+        if (!isCurrent()) {
+          logStaleActivation(conversationId, activationEpoch, 'binding-open')
+          return false
+        }
+        acp = useAcpStore.getState()
+      }
+      if (!isCurrent()) return false
+      acp.setActiveSession(sessionId)
+      useWorkspaceStore.getState().addAgentChatTab(conversationId, undefined, false)
+    } catch {
+      if (!isCurrent()) {
+        logStaleActivation(conversationId, activationEpoch, 'binding-error')
+        return false
+      }
+      set((state) => ({
+        openingById: { ...state.openingById, [conversationId]: false },
+        errorsById: {
+          ...state.errorsById,
+          [conversationId]: stableError('CONVERSATION_BINDING_OPEN_FAILED')
+        }
+      }))
+      void logFrontendError({
+        level: 'warn',
+        source: 'conversation-store.activation',
+        message: `conversationId=${conversationId} epoch=${activationEpoch} stage=binding code=CONVERSATION_BINDING_OPEN_FAILED`
+      })
+      return false
+    }
+
+    set((state) =>
+      activationIsCurrent(state, conversationId, activationEpoch)
+        ? { openingById: { ...state.openingById, [conversationId]: false } }
+        : {}
+    )
+    return true
+  },
+
+  applyLifecycleOutcome: (outcome) => {
+    if (!isConversationId(outcome.conversationId)) {
+      void logFrontendError({
+        level: 'warn',
+        source: 'conversation-store.lifecycle',
+        message: 'code=CONVERSATION_INVALID_ID applied=false'
+      })
+      return false
+    }
+
+    const conversationId = outcome.conversationId
+    const outcomeKey = lifecycleOutcomeKey(outcome)
+    let applied = false
+    let stale = false
+    let duplicate = false
+    let invariantViolation = false
+    let deleted = false
+    let deletedActive = false
+    set((state) => {
+      const summary = state.summariesById[conversationId]
+      const detail = state.detailsById[conversationId]
+      const storedRevision = Math.max(
+        state.lifecycleRevisionById[conversationId] ?? -1,
+        summary?.lastSeq ?? -1,
+        detail?.conversation.lastSeq ?? -1
+      )
+      if (outcome.revision < storedRevision) {
+        stale = true
+        return {}
+      }
+      const deletedRevision = state.deletedRevisionById[conversationId]
+      if (deletedRevision !== undefined && outcome.action !== 'deleteConversation') {
+        if (outcome.revision <= deletedRevision) duplicate = true
+        else invariantViolation = true
+        return {}
+      }
+      if (state.lifecycleOutcomeKeyById[conversationId] === outcomeKey) {
+        duplicate = true
+        return {}
+      }
+      if (outcome.status === 'blocked') {
+        applied = true
+        return {
+          lifecycleRevisionById: {
+            ...state.lifecycleRevisionById,
+            [conversationId]: Math.max(storedRevision, outcome.revision)
+          },
+          lifecycleOutcomeKeyById: {
+            ...state.lifecycleOutcomeKeyById,
+            [conversationId]: outcomeKey
+          }
+        }
+      }
+
+      const records = [summary, detail?.conversation].filter(
+        (record): record is ConversationRecordV2 => Boolean(record)
+      )
+      if (records.some((record) => record.workspaceCwd !== outcome.workspaceCwd)) {
+        invariantViolation = true
+        return {}
+      }
+      if (outcome.action === 'deleteConversation') {
+        const alreadyDeleted =
+          !summary &&
+          !detail &&
+          !state.conversationIds.includes(conversationId) &&
+          state.lifecycleRevisionById[conversationId] === outcome.revision
+        if (alreadyDeleted) {
+          duplicate = true
+          return {}
+        }
+        applied = true
+        deleted = true
+        deletedActive = state.activeConversationId === conversationId
+        const cancelsActivation = state.activationRouteValue === conversationId
+        return {
+          summariesById: withoutConversationKey(state.summariesById, conversationId),
+          conversationIds: state.conversationIds.filter((id) => id !== conversationId),
+          detailsById: withoutConversationKey(state.detailsById, conversationId),
+          activeConversationId: deletedActive ? null : state.activeConversationId,
+          lifecycleRevisionById: {
+            ...state.lifecycleRevisionById,
+            [conversationId]: outcome.revision
+          },
+          deletedRevisionById: {
+            ...state.deletedRevisionById,
+            [conversationId]: outcome.revision
+          },
+          lifecycleOutcomeKeyById: {
+            ...state.lifecycleOutcomeKeyById,
+            [conversationId]: outcomeKey
+          },
+          activationEpoch: cancelsActivation ? state.activationEpoch + 1 : state.activationEpoch,
+          activationRouteValue: cancelsActivation ? null : state.activationRouteValue,
+          openingById: withoutConversationKey(state.openingById, conversationId),
+          aggregateBusyById: withoutConversationKey(state.aggregateBusyById, conversationId),
+          errorsById: withoutConversationKey(state.errorsById, conversationId)
+        }
+      }
+
+      applied = true
+      const updateRecord = (record: ConversationRecordV2): ConversationRecordV2 => ({
+        ...record,
+        lifecycleState: outcome.lifecycleState,
+        lastSeq: outcome.revision
+      })
+      return {
+        summariesById: summary
+          ? { ...state.summariesById, [conversationId]: updateRecord(summary) }
+          : state.summariesById,
+        detailsById: detail
+          ? {
+              ...state.detailsById,
+              [conversationId]: {
+                ...detail,
+                conversation: updateRecord(detail.conversation)
+              }
+            }
+          : state.detailsById,
+        lifecycleRevisionById: {
+          ...state.lifecycleRevisionById,
+          [conversationId]: outcome.revision
+        },
+        lifecycleOutcomeKeyById: {
+          ...state.lifecycleOutcomeKeyById,
+          [conversationId]: outcomeKey
+        },
+        errorsById: { ...state.errorsById, [conversationId]: undefined }
+      }
+    })
+
+    if (invariantViolation) {
+      void logFrontendError({
+        level: 'error',
+        source: 'conversation-store.lifecycle',
+        message: `conversationId=${conversationId} revision=${outcome.revision} action=${outcome.action} code=CONVERSATION_IDENTITY_MISMATCH`
+      })
+      return false
+    }
+    if (stale) {
+      void logFrontendError({
+        level: 'warn',
+        source: 'conversation-store.lifecycle',
+        message: `conversationId=${conversationId} revision=${outcome.revision} action=${outcome.action} applied=false reason=stale`
+      })
+      return false
+    }
+    if (duplicate) return false
+    if (deleted) {
+      if (deletedActive) {
+        useSessionWorkspaceSyncStore.getState().setActiveConversationId(null)
+      }
+      useSessionWorkspaceSyncStore.getState().setRestoreInProgress(conversationId, false)
+      useWorkspaceStore.getState().closeChatView(conversationId)
+    }
+    return applied
   },
 
   applyAggregateOutcome: (outcome) => {
@@ -364,6 +939,10 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
               }
             }
           : state.detailsById,
+        lifecycleRevisionById: {
+          ...state.lifecycleRevisionById,
+          [outcome.conversationId]: outcome.revision
+        },
         aggregateBusyById: {
           ...state.aggregateBusyById,
           [outcome.conversationId]: false
@@ -543,7 +1122,19 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       errorsById: { ...state.errorsById, [conversationId]: undefined }
     })),
 
-  reset: () => set(initialState)
+  reset: () => {
+    let restoringConversationId: ConversationId | null = null
+    set((state) => {
+      if (state.activationRouteValue && isConversationId(state.activationRouteValue)) {
+        restoringConversationId = state.activationRouteValue
+      }
+      return { ...initialState, activationEpoch: state.activationEpoch + 1 }
+    })
+    useSessionWorkspaceSyncStore.getState().setActiveConversationId(null)
+    if (restoringConversationId) {
+      useSessionWorkspaceSyncStore.getState().setRestoreInProgress(restoringConversationId, false)
+    }
+  }
 }))
 
 export function selectVisibleConversations(state: ConversationState): ConversationRecordV2[] {

@@ -26,7 +26,10 @@ import { editorTabId, terminalTabId, useWorkspaceStore } from '@/stores/workspac
 import type { LeafNode, PaneNode, SplitNode } from '@/types/workspace.types'
 
 const WRITE_DEBOUNCE_MS = 500
+const alwaysCurrent = (): boolean => true
 let updateIdentity: string | null = null
+
+export type SessionWorkspaceActivationGuard = () => boolean
 
 function rendererIdentity(): string {
   updateIdentity ??= `renderer-${randomUUID()}`
@@ -196,8 +199,10 @@ function projectIdForConversation(conversationId: ConversationId): string {
 
 async function reconcileTerminalResources(
   conversationId: ConversationId,
-  workspace: SessionWorkspaceV1
-): Promise<void> {
+  workspace: SessionWorkspaceV1,
+  isCurrent: SessionWorkspaceActivationGuard
+): Promise<boolean> {
+  if (!isCurrent()) return false
   const descriptors = new Map<string, TerminalResourceDescriptor>()
   for (const resource of workspace.resources) {
     if (
@@ -212,6 +217,7 @@ async function reconcileTerminalResources(
   const terminalStore = useTerminalStore.getState()
   const projectId = projectIdForConversation(conversationId)
   for (const descriptor of descriptors.values()) {
+    if (!isCurrent()) return false
     // Materialize the passive record before requesting replay so the global
     // detached-output listener can capture bytes delivered during resume.
     terminalStore.hydrateTerminalResource(descriptor, undefined, projectId)
@@ -219,8 +225,10 @@ async function reconcileTerminalResources(
 
   await Promise.all(
     Array.from(descriptors.values(), async (descriptor) => {
+      if (!isCurrent()) return
       const recordId = descriptor.terminalRecordId ?? descriptor.terminalId
       const result = await useTerminalStore.getState().resumeTerminalResource(recordId)
+      if (!isCurrent()) return
       if (!result.success) {
         void logFrontendError({
           level: 'warn',
@@ -230,12 +238,15 @@ async function reconcileTerminalResources(
       }
     })
   )
+  return isCurrent()
 }
 
 function loadConversationWorkspace(
   conversationId: ConversationId,
-  workspace: SessionWorkspaceV1
-): void {
+  workspace: SessionWorkspaceV1,
+  isCurrent: SessionWorkspaceActivationGuard
+): boolean {
+  if (!isCurrent()) return false
   const terminals = new Map<string, TerminalResourceDescriptor>()
   const editors = new Map<string, EditorResourceDescriptor>()
   for (const resource of workspace.resources) {
@@ -255,20 +266,28 @@ function loadConversationWorkspace(
     workspace.activePaneId && findLeafId(root, workspace.activePaneId)
       ? workspace.activePaneId
       : firstPaneId
+  if (!isCurrent()) return false
   useWorkspaceStore.setState({ root, activePaneId })
   const editorStore = useEditorStore.getState()
   for (const editor of editors.values()) {
+    if (!isCurrent()) return false
     if (!editorStore.openFiles.has(editor.filePath)) {
       void editorStore.openFile(editor.filePath).catch(() => undefined)
     }
   }
+  return true
 }
 
-export async function loadSessionWorkspace(conversationId: ConversationId): Promise<boolean> {
+export async function loadSessionWorkspace(
+  conversationId: ConversationId,
+  isCurrent: SessionWorkspaceActivationGuard = alwaysCurrent
+): Promise<boolean> {
+  if (!isCurrent()) return false
   const store = useSessionWorkspaceSyncStore.getState()
   store.setRestoreInProgress(conversationId, true)
   try {
     const result = await sessionWorkspaceApi.getWorkspace(conversationId)
+    if (!isCurrent()) return false
     if (!result.success) {
       void logFrontendError({
         source: 'session-workspace-sync',
@@ -277,14 +296,30 @@ export async function loadSessionWorkspace(conversationId: ConversationId): Prom
       return false
     }
     const outcome = result.data
+    const outcomeConversationId =
+      outcome.status === 'loaded' ? outcome.workspace.conversationId : outcome.conversationId
+    if (outcomeConversationId !== conversationId) {
+      void logFrontendError({
+        level: 'error',
+        source: 'session-workspace-sync',
+        message: `conversationId=${conversationId} code=CONVERSATION_WORKSPACE_IDENTITY_MISMATCH`
+      })
+      return false
+    }
     store.setLoadOutcome(conversationId, outcome)
     if (outcome.status === 'loaded') {
-      await reconcileTerminalResources(conversationId, outcome.workspace)
-      loadConversationWorkspace(conversationId, outcome.workspace)
+      const reconciled = await reconcileTerminalResources(
+        conversationId,
+        outcome.workspace,
+        isCurrent
+      )
+      if (!isCurrent() || !reconciled) return false
+      if (!loadConversationWorkspace(conversationId, outcome.workspace, isCurrent)) return false
       store.setBasedRevision(conversationId, outcome.workspace.revision)
       store.setRecoveryItems(conversationId, [])
       return true
     }
+    if (!isCurrent()) return false
     store.setBasedRevision(conversationId, null)
     store.setRecoveryItems(
       conversationId,
@@ -292,7 +327,7 @@ export async function loadSessionWorkspace(conversationId: ConversationId): Prom
     )
     return false
   } finally {
-    store.setRestoreInProgress(conversationId, false)
+    if (isCurrent()) store.setRestoreInProgress(conversationId, false)
   }
 }
 
@@ -309,6 +344,8 @@ export async function performSessionWorkspaceWrite(
   const store = useSessionWorkspaceSyncStore.getState()
   if (
     !conversationId ||
+    getActiveConversationId() !== conversationId ||
+    store.activeConversationId !== conversationId ||
     store.isRestoreInProgress(conversationId) ||
     isTerminalRestoreInProgress() ||
     store.getConflict(conversationId)
@@ -434,7 +471,6 @@ export function useSessionWorkspaceBootstrap(): void {
   const conversationId = useConversationStore((state) => state.activeConversationId)
   useEffect(() => {
     useSessionWorkspaceSyncStore.getState().setActiveConversationId(conversationId)
-    if (conversationId) void loadSessionWorkspace(conversationId)
   }, [conversationId])
 }
 

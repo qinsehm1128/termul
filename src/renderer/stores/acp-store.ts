@@ -22,7 +22,12 @@
  * prepared-chat reaping) and is **not** a cross-tab isolation boundary.
  */
 
-import type { ExecutionTarget, ProjectAttachment } from '@shared/types/conversation.types'
+import {
+  type ConversationRecordV2,
+  type ExecutionTarget,
+  isConversationId,
+  type ProjectAttachment
+} from '@shared/types/conversation.types'
 import type {
   ConversationLifecycleOutcome,
   ConversationReplacementRequest
@@ -132,7 +137,7 @@ import { logFrontendError } from '@/lib/log-api'
 import { isTauriContext } from '@/lib/tauri-runtime'
 import { randomUUID } from '@/lib/uuid'
 import { getTabFocusedSessionId, setTabFocusedSessionId } from '@/lib/web-tab-session'
-import { useConversationStore } from '@/stores/conversation-store'
+import { getCurrentConversation, useConversationStore } from '@/stores/conversation-store'
 import { useProjectStore } from '@/stores/project-store'
 import { useWorkspaceStore } from '@/stores/workspace-store'
 import {
@@ -1449,48 +1454,29 @@ function persistSession(
  * locally and not yet flushed to the durable index). The initial empty-load
  * case (no local entries) applies the host response verbatim.
  */
-function conversationLifecycleContext(
-  state: AcpState,
-  conversationId: string
-): {
-  entry: SessionIndexEntry
-  session: AcpSession | undefined
-} {
-  const entry = state.sessionIndex.find((candidate) => candidate.conversationId === conversationId)
-  const session = Object.values(state.sessions).find(
-    (candidate) => candidate.conversationId === conversationId
-  )
-  const resolvedEntry =
-    entry ?? state.sessionIndex.find((candidate) => candidate.id === session?.id)
-  if (!resolvedEntry) {
+function conversationLifecycleRecord(conversationId: string): ConversationRecordV2 {
+  if (!isConversationId(conversationId)) {
     throw new ConversationLifecycleApiError(
-      'CONVERSATION_NOT_FOUND',
-      `Conversation ${conversationId} is not present in the canonical history index`
+      'VALIDATION_ERROR',
+      'conversationId must be a canonical lowercase-hyphenated UUID'
     )
   }
-  return { entry: resolvedEntry, session }
+  const record = getCurrentConversation(useConversationStore.getState(), conversationId)
+  if (!record) {
+    throw new ConversationLifecycleApiError(
+      'CONVERSATION_NOT_FOUND',
+      `Conversation ${conversationId} is not present in ConversationStore`
+    )
+  }
+  return record
 }
 
-function replacementRequest(
-  conversationId: string,
-  entry: SessionIndexEntry,
-  session: AcpSession | undefined
-): ConversationReplacementRequest {
-  const projectId = session?.projectId || entry.projectId
-  const cwd = session?.cwd || entry.cwd
-  const worktreePath = session?.worktreePath ?? entry.worktreePath
-  const worktreeBranch = session?.worktreeBranch ?? entry.worktreeBranch
-  const executionTarget =
-    projectId && worktreePath && worktreeBranch
-      ? { kind: 'worktree' as const, projectId, worktreePath, worktreeBranch }
-      : projectId
-        ? { kind: 'project_root' as const, projectId, projectRoot: cwd }
-        : { kind: 'workspace' as const }
+function replacementRequest(record: ConversationRecordV2): ConversationReplacementRequest {
   return {
     schemaVersion: 1,
-    conversationId,
-    projectAttachment: null,
-    executionTarget
+    conversationId: record.conversationId,
+    projectAttachment: record.projectAttachment,
+    executionTarget: record.executionTarget
   }
 }
 
@@ -3324,50 +3310,63 @@ export const useAcpStore = create<AcpState>((set, get) => ({
   },
 
   detachAgentBinding: async (conversationId) => {
-    const { entry } = conversationLifecycleContext(get(), conversationId)
-    const outcome = await conversationLifecycleApi.detachBinding(conversationId, entry.lastSeq ?? 0)
-    get()._onConversationLifecycle(outcome)
+    const record = conversationLifecycleRecord(conversationId)
+    const outcome = await conversationLifecycleApi.detachBinding(
+      record.conversationId,
+      record.lastSeq
+    )
+    if (useConversationStore.getState().applyLifecycleOutcome(outcome)) {
+      get()._onConversationLifecycle(outcome)
+    }
     return outcome
   },
 
   rebindDetachedBinding: async (conversationId) => {
-    const { entry } = conversationLifecycleContext(get(), conversationId)
+    const record = conversationLifecycleRecord(conversationId)
     const outcome = await conversationLifecycleApi.rebindDetachedBinding(
-      conversationId,
-      entry.lastSeq ?? 0
+      record.conversationId,
+      record.lastSeq
     )
-    get()._onConversationLifecycle(outcome)
+    if (useConversationStore.getState().applyLifecycleOutcome(outcome)) {
+      get()._onConversationLifecycle(outcome)
+    }
     return outcome
   },
 
   suspendAgentBinding: async (conversationId) => {
-    const { entry } = conversationLifecycleContext(get(), conversationId)
+    const record = conversationLifecycleRecord(conversationId)
     const outcome = await conversationLifecycleApi.suspendBinding(
-      conversationId,
-      entry.lastSeq ?? 0
+      record.conversationId,
+      record.lastSeq
     )
-    get()._onConversationLifecycle(outcome)
+    if (useConversationStore.getState().applyLifecycleOutcome(outcome)) {
+      get()._onConversationLifecycle(outcome)
+    }
     return outcome
   },
 
   replaceAgentBinding: async (conversationId) => {
-    const { entry, session } = conversationLifecycleContext(get(), conversationId)
+    const record = conversationLifecycleRecord(conversationId)
     const outcome = await conversationLifecycleApi.replaceBinding(
-      conversationId,
-      replacementRequest(conversationId, entry, session),
-      entry.lastSeq ?? 0
+      record.conversationId,
+      replacementRequest(record),
+      record.lastSeq
     )
-    get()._onConversationLifecycle(outcome)
+    if (useConversationStore.getState().applyLifecycleOutcome(outcome)) {
+      get()._onConversationLifecycle(outcome)
+    }
     return outcome
   },
 
   deleteConversation: async (conversationId) => {
-    const { entry } = conversationLifecycleContext(get(), conversationId)
+    const record = conversationLifecycleRecord(conversationId)
     const outcome = await conversationLifecycleApi.deleteConversation(
-      conversationId,
-      entry.lastSeq ?? 0
+      record.conversationId,
+      record.lastSeq
     )
-    get()._onConversationLifecycle(outcome)
+    if (useConversationStore.getState().applyLifecycleOutcome(outcome)) {
+      get()._onConversationLifecycle(outcome)
+    }
     return outcome
   },
 
@@ -5989,10 +5988,6 @@ export const useAcpStore = create<AcpState>((set, get) => ({
             : state.activeSessionId
       }
     })
-
-    if (sourceId && deleting) {
-      useWorkspaceStore.getState().closeChatView(outcome.conversationId)
-    }
   }
 }))
 

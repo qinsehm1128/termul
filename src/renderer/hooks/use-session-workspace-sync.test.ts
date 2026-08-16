@@ -57,6 +57,17 @@ import {
 const one = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
 const two = '5f7a1c01-4d1b-4c8a-af01-0123456789ab'
 
+function deferred<T>(): {
+  promise: Promise<T>
+  resolve: (value: T) => void
+} {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
 function workspace(conversationId: string, revision: number, leafId: string): SessionWorkspaceV1 {
   return {
     schemaVersion: 1,
@@ -123,6 +134,28 @@ describe('Conversation-scoped SessionWorkspace sync', () => {
     const store = useSessionWorkspaceSyncStore.getState()
     expect(store.getBasedRevision(one)).toBe(3)
     expect(store.getBasedRevision(two)).toBe(8)
+  })
+
+  it('refuses to replace WorkspaceStore after an activation guard becomes stale', async () => {
+    const response = deferred<{
+      success: true
+      data: { status: 'loaded'; workspace: SessionWorkspaceV1 }
+    }>()
+    getMock.mockReturnValue(response.promise)
+    const originalRoot = useWorkspaceStore.getState().root
+    let current = true
+
+    const loading = loadSessionWorkspace(one, () => current)
+    current = false
+    response.resolve({
+      success: true,
+      data: { status: 'loaded', workspace: workspace(one, 3, 'stale-leaf') }
+    })
+
+    await expect(loading).resolves.toBe(false)
+    expect(useWorkspaceStore.getState().root).toBe(originalRoot)
+    expect(useSessionWorkspaceSyncStore.getState().loadOutcomeByConversation[one]).toBeUndefined()
+    expect(useSessionWorkspaceSyncStore.getState().getBasedRevision(one)).toBeNull()
   })
 
   it('hydrates live and denied terminal descriptors before rebuilding topology', async () => {
@@ -419,6 +452,7 @@ describe('Conversation-scoped SessionWorkspace sync', () => {
         currentUpdateIdentity: 'other'
       }
     })
+    useConversationStore.getState().setActiveConversationId(one)
     useSessionWorkspaceSyncStore.getState().setBasedRevision(one, 4)
     const { unmount } = renderHook(() => useSessionWorkspaceSync(one))
     act(() => useWorkspaceStore.setState({ activePaneId: 'changed' }))
@@ -434,6 +468,7 @@ describe('Conversation-scoped SessionWorkspace sync', () => {
   })
 
   it('resolves reload and overwrite without changing another Conversation base', async () => {
+    useConversationStore.getState().setActiveConversationId(one)
     const store = useSessionWorkspaceSyncStore.getState()
     store.setBasedRevision(one, 2)
     store.setBasedRevision(two, 9)
@@ -510,6 +545,7 @@ describe('Conversation-scoped SessionWorkspace sync', () => {
   })
 
   it('returns recoveryRequired from a write without advancing revision', async () => {
+    useConversationStore.getState().setActiveConversationId(one)
     useSessionWorkspaceSyncStore.getState().setBasedRevision(one, 4)
     writeMock.mockResolvedValue({
       success: true,

@@ -1,5 +1,5 @@
 import type { ConversationRecordV2 } from '@shared/types/conversation.types'
-import { render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ChatRoute } from '@/components/ChatRoute'
@@ -31,6 +31,7 @@ vi.mock('@/hooks/use-session-workspace-sync', () => ({
 vi.mock('@/lib/log-api', () => ({ logFrontendError: vi.fn() }))
 
 const conversationId = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+const secondConversationId = '028f7a1c-1b4d-7c8a-9f01-0123456789ab'
 
 const conversation: ConversationRecordV2 = {
   schemaVersion: 2,
@@ -45,6 +46,24 @@ const conversation: ConversationRecordV2 = {
   createdBy: 'termul'
 }
 
+const secondConversation: ConversationRecordV2 = {
+  ...conversation,
+  conversationId: secondConversationId,
+  workspaceCwd: '/workspace/second-conversation',
+  lastSeq: 4
+}
+
+function deferred<T>(): {
+  promise: Promise<T>
+  resolve: (value: T) => void
+} {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
   useConversationStore.getState().reset()
@@ -52,6 +71,7 @@ beforeEach(() => {
   mockOpenHistorySession.mockResolvedValue(undefined)
   useAcpStore.setState({
     sessions: {},
+    activeSessionId: null,
     sessionIndex: [
       {
         id: 'opaque-agent-session',
@@ -95,11 +115,211 @@ describe('ConversationRoute canonical open', () => {
 
     await waitFor(() => {
       expect(conversationApi.openConversation).toHaveBeenCalledWith(conversationId)
-      expect(mockLoadSessionWorkspace).toHaveBeenCalledWith(conversationId)
+      expect(mockLoadSessionWorkspace).toHaveBeenCalledWith(conversationId, expect.any(Function))
       expect(mockOpenHistorySession).toHaveBeenCalledWith('opaque-agent-session')
       expect(mockAddAgentChatTab).toHaveBeenCalledWith(conversationId, undefined, false)
     })
     expect(useConversationStore.getState().activeConversationId).toBe(conversationId)
+  })
+
+  it('suppresses a late A open after B has installed its workspace, binding, and tab', async () => {
+    const first = deferred<Awaited<ReturnType<typeof conversationApi.openConversation>>>()
+    const second = deferred<Awaited<ReturnType<typeof conversationApi.openConversation>>>()
+    vi.mocked(conversationApi.openConversation).mockImplementation((id) =>
+      id === conversationId ? first.promise : second.promise
+    )
+    useAcpStore.setState({
+      sessions: {},
+      sessionIndex: [
+        {
+          id: 'session-a',
+          conversationId,
+          agentId: 'agent-a',
+          title: 'A',
+          cwd: conversation.workspaceCwd,
+          projectId: '',
+          createdAt: 1,
+          lastActivityAt: 2,
+          messageCount: 0,
+          status: 'closed'
+        },
+        {
+          id: 'session-b',
+          conversationId: secondConversationId,
+          agentId: 'agent-b',
+          title: 'B',
+          cwd: secondConversation.workspaceCwd,
+          projectId: '',
+          createdAt: 3,
+          lastActivityAt: 4,
+          messageCount: 0,
+          status: 'closed'
+        }
+      ],
+      activeSessionId: null,
+      openHistorySession: mockOpenHistorySession
+    })
+    mockLoadSessionWorkspace.mockImplementation(async (id, isCurrent: () => boolean) => {
+      if (!isCurrent()) return false
+      useWorkspaceStore.setState({
+        root: { type: 'leaf', id: `workspace-${id}`, tabs: [], activeTabId: null },
+        activePaneId: `workspace-${id}`
+      })
+      return isCurrent()
+    })
+
+    const view = render(<ConversationRoute conversationId={conversationId} />)
+    await waitFor(() =>
+      expect(conversationApi.openConversation).toHaveBeenCalledWith(conversationId)
+    )
+    view.rerender(<ConversationRoute conversationId={secondConversationId} />)
+    await waitFor(() =>
+      expect(conversationApi.openConversation).toHaveBeenCalledWith(secondConversationId)
+    )
+
+    await act(async () => {
+      second.resolve({
+        success: true,
+        data: {
+          conversation: secondConversation,
+          workspace: { status: 'missing', conversationId: secondConversationId }
+        }
+      })
+    })
+    await waitFor(() => {
+      expect(useConversationStore.getState().activeConversationId).toBe(secondConversationId)
+      expect(useAcpStore.getState().activeSessionId).toBe('session-b')
+      expect(useWorkspaceStore.getState().root.id).toBe(`workspace-${secondConversationId}`)
+      expect(mockAddAgentChatTab).toHaveBeenCalledWith(secondConversationId, undefined, false)
+    })
+
+    await act(async () => {
+      first.resolve({
+        success: true,
+        data: {
+          conversation,
+          workspace: { status: 'missing', conversationId }
+        }
+      })
+      await first.promise
+    })
+
+    expect(useConversationStore.getState().activeConversationId).toBe(secondConversationId)
+    expect(useAcpStore.getState().activeSessionId).toBe('session-b')
+    expect(useWorkspaceStore.getState().root.id).toBe(`workspace-${secondConversationId}`)
+    expect(mockLoadSessionWorkspace).toHaveBeenCalledTimes(1)
+    expect(mockAddAgentChatTab).not.toHaveBeenCalledWith(conversationId, undefined, false)
+  })
+
+  it('suppresses a late A binding open after B becomes the active binding and tab', async () => {
+    const staleBinding = deferred<void>()
+    vi.mocked(conversationApi.openConversation).mockImplementation(async (id) => ({
+      success: true,
+      data: {
+        conversation: id === conversationId ? conversation : secondConversation,
+        workspace: { status: 'missing', conversationId: id }
+      }
+    }))
+    mockOpenHistorySession.mockImplementation((sessionId) =>
+      sessionId === 'session-a' ? staleBinding.promise : Promise.resolve()
+    )
+    useAcpStore.setState({
+      sessions: {},
+      sessionIndex: [
+        {
+          id: 'session-a',
+          conversationId,
+          agentId: 'agent-a',
+          title: 'A',
+          cwd: conversation.workspaceCwd,
+          projectId: '',
+          createdAt: 1,
+          lastActivityAt: 2,
+          messageCount: 0,
+          status: 'closed'
+        },
+        {
+          id: 'session-b',
+          conversationId: secondConversationId,
+          agentId: 'agent-b',
+          title: 'B',
+          cwd: secondConversation.workspaceCwd,
+          projectId: '',
+          createdAt: 3,
+          lastActivityAt: 4,
+          messageCount: 0,
+          status: 'closed'
+        }
+      ],
+      activeSessionId: null,
+      openHistorySession: mockOpenHistorySession
+    })
+    mockLoadSessionWorkspace.mockImplementation(async (id, isCurrent: () => boolean) => {
+      if (!isCurrent()) return false
+      useWorkspaceStore.setState({
+        root: { type: 'leaf', id: `binding-workspace-${id}`, tabs: [], activeTabId: null },
+        activePaneId: `binding-workspace-${id}`
+      })
+      return isCurrent()
+    })
+
+    const view = render(<ConversationRoute conversationId={conversationId} />)
+    await waitFor(() => expect(mockOpenHistorySession).toHaveBeenCalledWith('session-a'))
+
+    view.rerender(<ConversationRoute conversationId={secondConversationId} />)
+    await waitFor(() => {
+      expect(useConversationStore.getState().activeConversationId).toBe(secondConversationId)
+      expect(useAcpStore.getState().activeSessionId).toBe('session-b')
+      expect(mockAddAgentChatTab).toHaveBeenCalledWith(secondConversationId, undefined, false)
+    })
+
+    await act(async () => {
+      staleBinding.resolve()
+      await staleBinding.promise
+    })
+
+    expect(useConversationStore.getState().activeConversationId).toBe(secondConversationId)
+    expect(useAcpStore.getState().activeSessionId).toBe('session-b')
+    expect(useWorkspaceStore.getState().root.id).toBe(`binding-workspace-${secondConversationId}`)
+    expect(mockAddAgentChatTab).not.toHaveBeenCalledWith(conversationId, undefined, false)
+    expect(mockLoadSessionWorkspace.mock.calls.map(([id]) => id)).toEqual([
+      conversationId,
+      secondConversationId
+    ])
+  })
+
+  it('cancels the latest activation epoch on unmount before a workspace response can apply', async () => {
+    const workspaceResponse = deferred<void>()
+    vi.mocked(conversationApi.openConversation).mockResolvedValue({
+      success: true,
+      data: {
+        conversation,
+        workspace: { status: 'missing', conversationId }
+      }
+    })
+    const originalRoot = useWorkspaceStore.getState().root
+    mockLoadSessionWorkspace.mockImplementation(async (id, isCurrent: () => boolean) => {
+      await workspaceResponse.promise
+      if (!isCurrent()) return false
+      useWorkspaceStore.setState({
+        root: { type: 'leaf', id: `unmounted-${id}`, tabs: [], activeTabId: null },
+        activePaneId: `unmounted-${id}`
+      })
+      return true
+    })
+
+    const view = render(<ConversationRoute conversationId={conversationId} />)
+    await waitFor(() => expect(mockLoadSessionWorkspace).toHaveBeenCalledTimes(1))
+    view.unmount()
+
+    await act(async () => {
+      workspaceResponse.resolve()
+      await workspaceResponse.promise
+    })
+
+    expect(useWorkspaceStore.getState().root).toBe(originalRoot)
+    expect(mockOpenHistorySession).not.toHaveBeenCalled()
+    expect(mockAddAgentChatTab).not.toHaveBeenCalled()
   })
 
   it('renders a stable not-found error and never stores the route value as an ACP id', async () => {

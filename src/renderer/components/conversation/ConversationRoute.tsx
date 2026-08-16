@@ -1,14 +1,8 @@
-import type { ConversationId } from '@shared/types/conversation.types'
 import { AlertTriangle, LoaderCircle } from 'lucide-react'
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useParams } from 'react-router-dom'
-import { loadSessionWorkspace } from '@/hooks/use-session-workspace-sync'
-import { logFrontendError } from '@/lib/log-api'
-import { useAcpStore } from '@/stores/acp-store'
-import { isCanonicalConversationId, useConversationStore } from '@/stores/conversation-store'
-import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
-import { useWorkspaceStore } from '@/stores/workspace-store'
+import { useConversationStore } from '@/stores/conversation-store'
 
 interface ConversationRouteProps {
   conversationId?: string
@@ -33,57 +27,42 @@ export function conversationRouteErrorKey(
   )
 }
 
-function bindingSessionId(conversationId: ConversationId): string | null {
-  const acp = useAcpStore.getState()
-  const live = Object.values(acp.sessions).find(
-    (session) => session.conversationId === conversationId
-  )
-  if (live) return live.id
-  return acp.sessionIndex.find((entry) => entry.conversationId === conversationId)?.id ?? null
-}
-
 export function ConversationRoute({
   conversationId: conversationIdProp
 }: ConversationRouteProps = {}): React.JSX.Element | null {
   const { t } = useTranslation('common')
   const params = useParams<{ conversationId: string }>()
   const routeValue = conversationIdProp ?? params.conversationId ?? ''
-  const openConversation = useConversationStore((state) => state.openConversation)
+  const beginConversationActivation = useConversationStore(
+    (state) => state.beginConversationActivation
+  )
+  const activateConversation = useConversationStore((state) => state.activateConversation)
+  const cancelConversationActivation = useConversationStore(
+    (state) => state.cancelConversationActivation
+  )
   const opening = useConversationStore((state) => state.openingById[routeValue] === true)
   const storeError = useConversationStore((state) => state.errorsById[routeValue])
-  const [bindingErrorCode, setBindingErrorCode] = useState<string | null>(null)
+  const activationEpochRef = useRef<number | null>(null)
 
-  const open = useCallback(async (): Promise<void> => {
-    setBindingErrorCode(null)
-    const outcome = await openConversation(routeValue)
-    if (!outcome || !isCanonicalConversationId(routeValue)) return
-
-    useSessionWorkspaceSyncStore.getState().setActiveConversationId(routeValue)
-    await loadSessionWorkspace(routeValue)
-
-    const sessionId = bindingSessionId(routeValue)
-    if (!sessionId) return
-    try {
-      const acp = useAcpStore.getState()
-      const live = acp.sessions[sessionId]
-      if (!live || live.status === 'closed') await acp.openHistorySession(sessionId)
-      acp.setActiveSession(sessionId)
-      useWorkspaceStore.getState().addAgentChatTab(routeValue, undefined, false)
-    } catch {
-      setBindingErrorCode('CONVERSATION_BINDING_OPEN_FAILED')
-      void logFrontendError({
-        level: 'warn',
-        source: 'conversation-route.binding',
-        message: `conversationId=${routeValue} code=CONVERSATION_BINDING_OPEN_FAILED`
-      })
-    }
-  }, [openConversation, routeValue])
+  const open = useCallback((): number => {
+    const activationEpoch = beginConversationActivation(routeValue)
+    activationEpochRef.current = activationEpoch
+    void activateConversation(routeValue, activationEpoch)
+    return activationEpoch
+  }, [activateConversation, beginConversationActivation, routeValue])
 
   useEffect(() => {
-    void open()
-  }, [open])
+    open()
+    return () => {
+      if (activationEpochRef.current !== null) {
+        const activationEpoch = activationEpochRef.current
+        activationEpochRef.current = null
+        cancelConversationActivation(activationEpoch)
+      }
+    }
+  }, [cancelConversationActivation, open])
 
-  const errorCode = storeError?.code ?? bindingErrorCode
+  const errorCode = storeError?.code
   if (opening && !errorCode) {
     return (
       <div
@@ -119,7 +98,9 @@ export function ConversationRoute({
         <button
           type="button"
           className="mt-3 min-h-9 rounded-md border border-destructive/40 px-3 text-xs font-medium hover:bg-destructive/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-destructive"
-          onClick={() => void open()}
+          onClick={() => {
+            open()
+          }}
         >
           {t('actions.retry')}
         </button>
