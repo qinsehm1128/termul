@@ -1,4 +1,4 @@
-import type { ConversationId } from '@shared/types/conversation.types'
+import { type ConversationId, isConversationId } from '@shared/types/conversation.types'
 import {
   parseResolveRecoveryItemRequest,
   type RecoveryActionResult,
@@ -12,9 +12,8 @@ import type {
   SessionWorkspaceWriteOutcome,
   SessionWorkspaceWriteRequestBody
 } from '@shared/types/session-workspace.types'
+import { remoteAccessHeaders } from './acp-transport'
 import { isTauriContext } from './tauri-runtime'
-
-const canonicalUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 
 type IpcBody<T> = { success: true; data?: T } | { success: false; error: string; code: string }
 
@@ -37,20 +36,26 @@ function invalidConversationId(): IpcResult<never> {
 }
 
 async function parseBody<T>(response: Response): Promise<IpcResult<T>> {
-  if (!response.ok) return networkError(`HTTP ${response.status} ${response.statusText}`)
   try {
     const body = (await response.json()) as IpcBody<T>
     return body.success
       ? { success: true, data: body.data as T }
       : { success: false, error: body.error, code: body.code }
   } catch (error) {
-    return networkError(error instanceof Error ? error.message : 'invalid JSON')
+    return response.ok
+      ? networkError(error instanceof Error ? error.message : 'invalid JSON')
+      : networkError(`HTTP ${response.status} ${response.statusText}`)
   }
 }
 
 async function getJson<T>(path: string): Promise<IpcResult<T>> {
   try {
-    return await parseBody<T>(await fetch(`${serverBase()}${path}`, { method: 'GET' }))
+    return await parseBody<T>(
+      await fetch(`${serverBase()}${path}`, {
+        method: 'GET',
+        headers: remoteAccessHeaders()
+      })
+    )
   } catch (error) {
     return networkError(error instanceof Error ? error.message : String(error))
   }
@@ -61,7 +66,7 @@ async function postJson<T>(path: string, body: unknown): Promise<IpcResult<T>> {
     return await parseBody<T>(
       await fetch(`${serverBase()}${path}`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: remoteAccessHeaders({ 'content-type': 'application/json' }),
         body: JSON.stringify(body)
       })
     )
@@ -72,7 +77,7 @@ async function postJson<T>(path: string, body: unknown): Promise<IpcResult<T>> {
 
 export const webSessionWorkspaceApi: SessionWorkspaceApi = {
   getWorkspace(conversationId: ConversationId): Promise<IpcResult<SessionWorkspaceLoadOutcome>> {
-    if (!canonicalUuid.test(conversationId)) return Promise.resolve(invalidConversationId())
+    if (!isConversationId(conversationId)) return Promise.resolve(invalidConversationId())
     return getJson(`/conversations/${encodeURIComponent(conversationId)}/workspace`)
   },
 
@@ -81,7 +86,7 @@ export const webSessionWorkspaceApi: SessionWorkspaceApi = {
     basedRevision: number | null,
     workspace: SessionWorkspaceV1
   ): Promise<IpcResult<SessionWorkspaceWriteOutcome>> {
-    if (!canonicalUuid.test(conversationId) || workspace.conversationId !== conversationId) {
+    if (!isConversationId(conversationId) || workspace.conversationId !== conversationId) {
       return Promise.resolve(invalidConversationId())
     }
     const body: SessionWorkspaceWriteRequestBody = { basedRevision, workspace }

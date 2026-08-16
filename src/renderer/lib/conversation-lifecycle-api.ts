@@ -1,4 +1,4 @@
-import type { ConversationId } from '@shared/types/conversation.types'
+import { type ConversationId, parseConversationId } from '@shared/types/conversation.types'
 import type {
   ConversationLifecycleApi,
   ConversationLifecycleErrorCode,
@@ -8,12 +8,11 @@ import type {
 import type { IpcResult } from '@shared/types/ipc.types'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
-import { AcpTransportError, getAcpTransport } from './acp-transport'
+import { AcpTransportError, getAcpTransport, remoteAccessHeaders } from './acp-transport'
 import { isTauriContext } from './tauri-runtime'
 
-const canonicalUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{12}$/
-
 type IpcBody<T> = { success: true; data?: T } | { success: false; error: string; code: string }
+type ConversationLifecycleRuntime = 'tauri' | 'web'
 
 export class ConversationLifecycleApiError extends Error {
   readonly code: ConversationLifecycleErrorCode
@@ -37,7 +36,11 @@ function assertRequest(
   expectedRevision: number,
   request?: ConversationReplacementRequest
 ): void {
-  if (!canonicalUuid.test(conversationId)) invalidConversationId()
+  try {
+    parseConversationId(conversationId)
+  } catch {
+    invalidConversationId()
+  }
   if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
     throw new ConversationLifecycleApiError(
       'VALIDATION_ERROR',
@@ -85,11 +88,23 @@ async function httpMutation(
     `${serverBase()}/conversations/${encodeURIComponent(conversationId)}/lifecycle/${action}`,
     {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: remoteAccessHeaders({ 'content-type': 'application/json' }),
       body: JSON.stringify({ expectedRevision, ...(request ? { request } : {}) })
     }
   )
   if (!response.ok) {
+    let body: IpcBody<ConversationLifecycleOutcome> | null = null
+    try {
+      body = (await response.json()) as IpcBody<ConversationLifecycleOutcome>
+    } catch {
+      // Preserve the generic network failure when the response has no application envelope.
+    }
+    if (body && !body.success) {
+      throw new ConversationLifecycleApiError(
+        body.code as ConversationLifecycleErrorCode,
+        body.error
+      )
+    }
     throw new ConversationLifecycleApiError(
       'NETWORK_ERROR',
       `HTTP ${response.status} ${response.statusText}`
@@ -133,56 +148,65 @@ async function webMutation(
   }
 }
 
-export const conversationLifecycleApi: ConversationLifecycleApi = {
-  detachBinding(conversationId, expectedRevision) {
-    return isTauriContext()
-      ? tauriMutation('conversation_detach_binding', conversationId, expectedRevision)
-      : webMutation('detach', conversationId, expectedRevision)
-  },
+/** Build the same lifecycle stack used by the production singleton. */
+export function createConversationLifecycleApi(
+  runtime: ConversationLifecycleRuntime = isTauriContext() ? 'tauri' : 'web'
+): ConversationLifecycleApi {
+  const useTauri = runtime === 'tauri'
+  return {
+    detachBinding(conversationId, expectedRevision) {
+      return useTauri
+        ? tauriMutation('conversation_detach_binding', conversationId, expectedRevision)
+        : webMutation('detach', conversationId, expectedRevision)
+    },
 
-  rebindDetachedBinding(conversationId, expectedRevision) {
-    return isTauriContext()
-      ? tauriMutation('conversation_rebind_detached_binding', conversationId, expectedRevision)
-      : webMutation('rebind', conversationId, expectedRevision)
-  },
+    rebindDetachedBinding(conversationId, expectedRevision) {
+      return useTauri
+        ? tauriMutation('conversation_rebind_detached_binding', conversationId, expectedRevision)
+        : webMutation('rebind', conversationId, expectedRevision)
+    },
 
-  suspendBinding(conversationId, expectedRevision) {
-    return isTauriContext()
-      ? tauriMutation('conversation_suspend_binding', conversationId, expectedRevision)
-      : webMutation('suspend', conversationId, expectedRevision)
-  },
+    suspendBinding(conversationId, expectedRevision) {
+      return useTauri
+        ? tauriMutation('conversation_suspend_binding', conversationId, expectedRevision)
+        : webMutation('suspend', conversationId, expectedRevision)
+    },
 
-  replaceBinding(conversationId, request, expectedRevision) {
-    return isTauriContext()
-      ? tauriMutation('conversation_replace_binding', conversationId, expectedRevision, request)
-      : webMutation('replace', conversationId, expectedRevision, request)
-  },
+    replaceBinding(conversationId, request, expectedRevision) {
+      return useTauri
+        ? tauriMutation('conversation_replace_binding', conversationId, expectedRevision, request)
+        : webMutation('replace', conversationId, expectedRevision, request)
+    },
 
-  deleteConversation(conversationId, expectedRevision) {
-    return isTauriContext()
-      ? tauriMutation('conversation_delete', conversationId, expectedRevision)
-      : webMutation('delete', conversationId, expectedRevision)
-  },
+    deleteConversation(conversationId, expectedRevision) {
+      return useTauri
+        ? tauriMutation('conversation_delete', conversationId, expectedRevision)
+        : webMutation('delete', conversationId, expectedRevision)
+    },
 
-  subscribe(listener) {
-    if (isTauriContext()) {
-      let resolved: UnlistenFn | null = null
-      let cancelled = false
-      void listen<ConversationLifecycleOutcome>('conversation:lifecycle', (event) => {
-        listener(event.payload)
-      }).then((unlisten) => {
-        if (cancelled) unlisten()
-        else resolved = unlisten
-      })
-      return () => {
-        cancelled = true
-        resolved?.()
-        resolved = null
+    subscribe(listener) {
+      if (useTauri) {
+        let resolved: UnlistenFn | null = null
+        let cancelled = false
+        void listen<ConversationLifecycleOutcome>('conversation:lifecycle', (event) => {
+          listener(event.payload)
+        }).then((unlisten) => {
+          if (cancelled) unlisten()
+          else resolved = unlisten
+        })
+        return () => {
+          cancelled = true
+          resolved?.()
+          resolved = null
+        }
       }
+      return getAcpTransport().onEvent<ConversationLifecycleOutcome>(
+        'conversation_lifecycle',
+        listener
+      )
     }
-    return getAcpTransport().onEvent<ConversationLifecycleOutcome>(
-      'conversation_lifecycle',
-      listener
-    )
   }
 }
+
+/** Exact lifecycle singleton imported by production hooks and stores. */
+export const conversationLifecycleApi = createConversationLifecycleApi()

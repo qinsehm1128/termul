@@ -522,8 +522,10 @@ export interface RemoteStatus {
   bindMode: RemoteBindMode | null
   /** `127.0.0.1` or `0.0.0.0` while running. */
   bindHost: string | null
-  /** Ephemeral `https://*.trycloudflare.com` tunnel URL (QR-encoded). */
+  /** Ephemeral public tunnel origin without a separately displayed credential. */
   tunnelUrl: string | null
+  /** Credentialed scan/copy URL. The credential stays in its fragment and is never displayed alone. */
+  accessUrl?: string | null
 }
 
 // Remote terminal server control API

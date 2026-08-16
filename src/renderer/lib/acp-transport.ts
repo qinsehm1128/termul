@@ -388,21 +388,43 @@ export function resolveWsUrl(
   return `${proto}//${locationLike.host}/ws`
 }
 
+/** Process-memory-only credential shared by authenticated HTTP and WebSocket transports. */
+let remoteAccessCredential: string | null = null
+let remoteAccessCredentialConsumed = false
+
 /**
- * Consume the QR-delivered credential from the URL fragment into process
- * memory. Fragments are not sent to the server; removing it immediately keeps
- * the credential out of copied URLs, browser history updates, and later logs.
+ * Consume the QR-delivered credential fragment exactly once. Fragments are not
+ * sent to the server; clearing it immediately keeps the credential out of
+ * browser history updates, query parameters, storage, and later copied URLs.
  */
-function consumeRemoteAccessToken(): string {
+export function getRemoteAccessCredential(): string {
+  if (remoteAccessCredentialConsumed) return remoteAccessCredential ?? ''
   if (typeof window === 'undefined') return ''
+
+  remoteAccessCredentialConsumed = true
   const rawHash = window.location.hash.startsWith('#')
     ? window.location.hash.slice(1)
     : window.location.hash
-  const token = new URLSearchParams(rawHash).get('access_token') ?? ''
-  if (token) {
+  const fragment = new URLSearchParams(rawHash)
+  remoteAccessCredential = fragment.get('access_token')
+  if (fragment.has('access_token')) {
     window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`)
   }
-  return token
+  return remoteAccessCredential ?? ''
+}
+
+/** Add the in-memory bearer credential without persisting or logging it. */
+export function remoteAccessHeaders(initial?: HeadersInit): Headers {
+  const headers = new Headers(initial)
+  const credential = getRemoteAccessCredential()
+  if (credential) headers.set('authorization', `Bearer ${credential}`)
+  return headers
+}
+
+/** @internal test helper */
+export function _resetRemoteAccessCredentialForTests(): void {
+  remoteAccessCredential = null
+  remoteAccessCredentialConsumed = false
 }
 
 const REQUEST_TIMEOUT_MS = 60_000
@@ -529,7 +551,7 @@ export class WsAcpTransport implements AcpTransport {
   constructor(opts?: { url?: string; token?: string; WebSocketImpl?: typeof WebSocket }) {
     this.wsUrl =
       opts?.url ?? (typeof window !== 'undefined' ? resolveWsUrl() : 'ws://127.0.0.1:8080/ws')
-    this.remoteAccessToken = opts?.token ?? consumeRemoteAccessToken()
+    this.remoteAccessToken = opts?.token ?? getRemoteAccessCredential()
     this.webSocketCtor = opts?.WebSocketImpl ?? WebSocket
   }
 

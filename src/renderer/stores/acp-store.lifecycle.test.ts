@@ -1,16 +1,11 @@
 import type { ConversationLifecycleOutcome } from '@shared/types/conversation-lifecycle.types'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { closeViewSpy, remapViewSpy, detachSpy, rebindSpy, suspendSpy, replaceSpy, deleteSpy } =
-  vi.hoisted(() => ({
-    closeViewSpy: vi.fn(),
-    remapViewSpy: vi.fn(),
-    detachSpy: vi.fn(),
-    rebindSpy: vi.fn(),
-    suspendSpy: vi.fn(),
-    replaceSpy: vi.fn(),
-    deleteSpy: vi.fn()
-  }))
+const { closeViewSpy, remapViewSpy, invokeSpy } = vi.hoisted(() => ({
+  closeViewSpy: vi.fn(),
+  remapViewSpy: vi.fn(),
+  invokeSpy: vi.fn()
+}))
 
 vi.mock('@/stores/workspace-store', () => ({
   useWorkspaceStore: {
@@ -23,27 +18,6 @@ vi.mock('@/stores/workspace-store', () => ({
   }
 }))
 
-vi.mock('@/lib/conversation-lifecycle-api', () => {
-  class ConversationLifecycleApiError extends Error {
-    code: string
-    constructor(code: string, message: string) {
-      super(message)
-      this.code = code
-    }
-  }
-  return {
-    ConversationLifecycleApiError,
-    conversationLifecycleApi: {
-      detachBinding: detachSpy,
-      rebindDetachedBinding: rebindSpy,
-      suspendBinding: suspendSpy,
-      replaceBinding: replaceSpy,
-      deleteConversation: deleteSpy,
-      subscribe: vi.fn(() => vi.fn())
-    }
-  }
-})
-
 vi.mock('@/lib/acp-history-persistence', async (importActual) => {
   const actual = await importActual<typeof import('@/lib/acp-history-persistence')>()
   return {
@@ -55,7 +29,7 @@ vi.mock('@/lib/acp-history-persistence', async (importActual) => {
 })
 vi.mock('@/lib/log-api', () => ({ logFrontendError: vi.fn() }))
 vi.mock('@/lib/tauri-runtime', () => ({ isTauriContext: () => true }))
-vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }))
+vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeSpy }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn() }))
 
 import { useAcpStore } from './acp-store'
@@ -159,9 +133,7 @@ describe('ACP Conversation lifecycle store', () => {
     useAcpStore.getState().closeChatView(conversationId)
 
     expect(closeViewSpy).toHaveBeenCalledWith(conversationId)
-    expect(detachSpy).not.toHaveBeenCalled()
-    expect(suspendSpy).not.toHaveBeenCalled()
-    expect(deleteSpy).not.toHaveBeenCalled()
+    expect(invokeSpy).not.toHaveBeenCalled()
     expect(useAcpStore.getState().sessions['session-old']).toBeDefined()
     expect(useAcpStore.getState().messages['session-old']?.[0].blocks[0]).toMatchObject({
       text: 'retained transcript'
@@ -175,36 +147,57 @@ describe('ACP Conversation lifecycle store', () => {
     expect(useAcpStore.getState().messages['session-old']).toHaveLength(1)
   })
 
-  it('uses canonical lastSeq before detach, rebind, and suspend mutations', async () => {
-    detachSpy.mockResolvedValue(updated('detachBinding', 'detached'))
+  it('dispatches detach, rebind, and suspend through the real production lifecycle factory', async () => {
+    invokeSpy.mockResolvedValueOnce({ success: true, data: updated('detachBinding', 'detached') })
     await useAcpStore.getState().detachAgentBinding(conversationId)
-    expect(detachSpy).toHaveBeenCalledWith(conversationId, 4)
+    expect(invokeSpy).toHaveBeenNthCalledWith(1, 'conversation_detach_binding', {
+      conversationId,
+      expectedRevision: 4
+    })
 
     useAcpStore.setState((state) => ({
       sessionIndex: state.sessionIndex.map((entry) => ({ ...entry, lastSeq: 5 }))
     }))
-    rebindSpy.mockResolvedValue(updated('rebindDetachedBinding', 'active', 'session-old', 6))
+    invokeSpy.mockResolvedValueOnce({
+      success: true,
+      data: updated('rebindDetachedBinding', 'active', 'session-old', 6)
+    })
     await useAcpStore.getState().rebindDetachedBinding(conversationId)
-    expect(rebindSpy).toHaveBeenCalledWith(conversationId, 5)
+    expect(invokeSpy).toHaveBeenNthCalledWith(2, 'conversation_rebind_detached_binding', {
+      conversationId,
+      expectedRevision: 5
+    })
 
-    suspendSpy.mockResolvedValue(updated('suspendBinding', 'suspended', 'session-old', 7))
+    invokeSpy.mockResolvedValueOnce({
+      success: true,
+      data: updated('suspendBinding', 'suspended', 'session-old', 7)
+    })
     await useAcpStore.getState().suspendAgentBinding(conversationId)
-    expect(suspendSpy).toHaveBeenCalledWith(conversationId, 6)
+    expect(invokeSpy).toHaveBeenNthCalledWith(3, 'conversation_suspend_binding', {
+      conversationId,
+      expectedRevision: 6
+    })
     expect(useAcpStore.getState().messages['session-old']).toHaveLength(1)
   })
 
-  it('replaces the opaque session id while retaining Conversation identity and transcript maps', async () => {
-    replaceSpy.mockResolvedValue(updated('replaceBinding', 'active', 'session-new'))
+  it('dispatches replace through the real factory while retaining identity and transcript maps', async () => {
+    invokeSpy.mockResolvedValueOnce({
+      success: true,
+      data: updated('replaceBinding', 'active', 'session-new')
+    })
 
     await useAcpStore.getState().replaceAgentBinding(conversationId)
 
-    expect(replaceSpy).toHaveBeenCalledWith(
-      conversationId,
+    expect(invokeSpy).toHaveBeenCalledWith(
+      'conversation_replace_binding',
       expect.objectContaining({
         conversationId,
-        executionTarget: { kind: 'workspace' }
-      }),
-      4
+        expectedRevision: 4,
+        request: expect.objectContaining({
+          conversationId,
+          executionTarget: { kind: 'workspace' }
+        })
+      })
     )
     expect(useAcpStore.getState().sessions['session-old']).toBeUndefined()
     expect(useAcpStore.getState().sessions['session-new']?.conversationId).toBe(conversationId)
@@ -212,45 +205,58 @@ describe('ACP Conversation lifecycle store', () => {
     expect(remapViewSpy).not.toHaveBeenCalled()
   })
 
-  it('keeps state intact when delete is blocked by live bindings or terminals', async () => {
-    deleteSpy.mockResolvedValue({
-      status: 'blocked',
-      action: 'deleteConversation',
-      conversationId,
-      revision: 4,
-      code: 'CONVERSATION_LIVE_RESOURCES',
-      blockers: [
-        { kind: 'liveBinding', count: 1, ids: ['session-old'] },
-        { kind: 'terminalResources', count: 1, ids: ['terminal-live'] }
-      ]
+  it('dispatches blocked delete through the real factory and keeps state intact', async () => {
+    invokeSpy.mockResolvedValueOnce({
+      success: true,
+      data: {
+        status: 'blocked',
+        action: 'deleteConversation',
+        conversationId,
+        revision: 4,
+        code: 'CONVERSATION_LIVE_RESOURCES',
+        blockers: [
+          { kind: 'liveBinding', count: 1, ids: ['session-old'] },
+          { kind: 'terminalResources', count: 1, ids: ['terminal-live'] }
+        ]
+      }
     })
 
     const outcome = await useAcpStore.getState().deleteConversation(conversationId)
 
+    expect(invokeSpy).toHaveBeenCalledWith('conversation_delete', {
+      conversationId,
+      expectedRevision: 4
+    })
     expect(outcome.status).toBe('blocked')
     expect(useAcpStore.getState().sessionIndex).toHaveLength(1)
     expect(useAcpStore.getState().sessions['session-old']).toBeDefined()
     expect(closeViewSpy).not.toHaveBeenCalled()
   })
 
-  it('applies explicit tombstone without invoking resource teardown', async () => {
-    deleteSpy.mockResolvedValue({
-      status: 'updated',
-      action: 'deleteConversation',
-      conversationId,
-      previousRevision: 4,
-      revision: 4,
-      workspaceCwd: '/visible/conversation',
-      lifecycleState: 'deleted',
-      currentBinding: {
-        ...updated('suspendBinding', 'suspended').currentBinding!,
-        state: 'suspended'
+  it('applies explicit tombstone returned by the real delete route without resource teardown', async () => {
+    invokeSpy.mockResolvedValueOnce({
+      success: true,
+      data: {
+        status: 'updated',
+        action: 'deleteConversation',
+        conversationId,
+        previousRevision: 4,
+        revision: 4,
+        workspaceCwd: '/visible/conversation',
+        lifecycleState: 'deleted',
+        currentBinding: {
+          ...updated('suspendBinding', 'suspended').currentBinding!,
+          state: 'suspended'
+        }
       }
     })
 
     await useAcpStore.getState().deleteConversation(conversationId)
 
-    expect(deleteSpy).toHaveBeenCalledWith(conversationId, 4)
+    expect(invokeSpy).toHaveBeenCalledWith('conversation_delete', {
+      conversationId,
+      expectedRevision: 4
+    })
     expect(useAcpStore.getState().sessionIndex).toEqual([])
     expect(useAcpStore.getState().sessions['session-old']).toBeUndefined()
     expect(closeViewSpy).toHaveBeenCalledWith(conversationId)

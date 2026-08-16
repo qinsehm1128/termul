@@ -1,19 +1,7 @@
 import type { ConversationId, ConversationRecordV2 } from './conversation.types'
-import type {
-  ConversationLifecycleOutcome,
-  ConversationReplacementRequest
-} from './conversation-lifecycle.types'
-import type {
-  RecoveryActionResult,
-  RecoveryItemV1,
-  ResolveRecoveryItemRequest
-} from './conversation-recovery.types'
+import type { RecoveryItemV1 } from './conversation-recovery.types'
 import type { IpcResult } from './ipc.types'
-import type {
-  SessionWorkspaceLoadOutcome,
-  SessionWorkspaceV1,
-  SessionWorkspaceWriteOutcome
-} from './session-workspace.types'
+import type { SessionWorkspaceLoadOutcome } from './session-workspace.types'
 
 export type {
   RecoveryAction,
@@ -94,33 +82,5 @@ export interface ConversationApi {
   resolveLegacyConversationId(
     key: LegacyConversationKey
   ): Promise<IpcResult<LegacyConversationResolution>>
-  getWorkspace(conversationId: ConversationId): Promise<IpcResult<SessionWorkspaceLoadOutcome>>
-  writeWorkspace(
-    conversationId: ConversationId,
-    basedRevision: number | null,
-    workspace: SessionWorkspaceV1
-  ): Promise<IpcResult<SessionWorkspaceWriteOutcome>>
-  resolveRecovery(request: ResolveRecoveryItemRequest): Promise<IpcResult<RecoveryActionResult>>
-  detachBinding(
-    conversationId: ConversationId,
-    expectedRevision: number
-  ): Promise<IpcResult<ConversationLifecycleOutcome>>
-  rebindDetachedBinding(
-    conversationId: ConversationId,
-    expectedRevision: number
-  ): Promise<IpcResult<ConversationLifecycleOutcome>>
-  suspendBinding(
-    conversationId: ConversationId,
-    expectedRevision: number
-  ): Promise<IpcResult<ConversationLifecycleOutcome>>
-  replaceBinding(
-    conversationId: ConversationId,
-    request: ConversationReplacementRequest,
-    expectedRevision: number
-  ): Promise<IpcResult<ConversationLifecycleOutcome>>
-  deleteConversation(
-    conversationId: ConversationId,
-    expectedRevision: number
-  ): Promise<IpcResult<ConversationLifecycleOutcome>>
   subscribeHostStatus(listener: () => void): () => void
 }

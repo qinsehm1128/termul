@@ -22,9 +22,8 @@ const statusBarTriggerClass =
  * phone can reach on any network. That URL is rendered as a QR — scan to open.
  * No bind selector, no URL text row: the QR is the connect UI.
  *
- * Security posture (until Epic 2 ships a real token): cloudflared provides edge
- * TLS; the random ephemeral URL is the only gate. The warning below makes that
- * explicit and tells the user to toggle off to rotate.
+ * The credential is carried only inside the access URL fragment used by the QR/copy controls.
+ * It is never rendered as standalone text; the browser consumes and clears the fragment on load.
  */
 export function RemoteAccessPopover(): React.JSX.Element {
   const t = useSshTranslation()
@@ -34,16 +33,21 @@ export function RemoteAccessPopover(): React.JSX.Element {
   const [copiedUrl, setCopiedUrl] = useState(false)
 
   const isRunning = remoteStatus?.running ?? false
-  // The QR encodes the public tunnel URL only — never the localhost `url`.
-  const tunnelUrl = remoteStatus?.tunnelUrl ?? null
+  // Prefer the paired credentialed URL. The fallback supports an in-flight host rollout where
+  // tunnelUrl already contains that fragment; the localhost diagnostic `url` is never shared.
+  const accessUrl = remoteStatus
+    ? 'accessUrl' in remoteStatus
+      ? (remoteStatus.accessUrl ?? null)
+      : remoteStatus.tunnelUrl
+    : null
   // Track whether a tunnel URL was ever seen this session so the popover can
   // distinguish "Starting tunnel…" (never connected) from "Tunnel
   // disconnected" (was connected, now gone — the 3s status poll cleared it).
   const [sawUrl, setSawUrl] = useState(false)
   useEffect(() => {
-    if (tunnelUrl) setSawUrl(true)
+    if (accessUrl) setSawUrl(true)
     if (!isRunning) setSawUrl(false)
-  }, [tunnelUrl, isRunning])
+  }, [accessUrl, isRunning])
 
   const handleRemoteToggle = async (enable: boolean): Promise<void> => {
     setRemoteBusy(true)
@@ -81,9 +85,9 @@ export function RemoteAccessPopover(): React.JSX.Element {
   }
 
   const handleCopyLink = async (): Promise<void> => {
-    if (!tunnelUrl) return
+    if (!accessUrl) return
     try {
-      await navigator.clipboard.writeText(tunnelUrl)
+      await navigator.clipboard.writeText(accessUrl)
       setCopiedUrl(true)
       setTimeout(() => setCopiedUrl(false), 1500)
     } catch {
@@ -131,12 +135,12 @@ export function RemoteAccessPopover(): React.JSX.Element {
             </div>
           )}
 
-          {isRunning && tunnelUrl && (
+          {isRunning && accessUrl && (
             <div className="space-y-2">
               {/* White pad so the black QR modules are legible in dark themes. */}
               <div className="flex justify-center">
                 <div className="rounded-lg bg-white p-2">
-                  <QRCodeSVG value={tunnelUrl} size={160} level="M" />
+                  <QRCodeSVG value={accessUrl} size={160} level="M" />
                 </div>
               </div>
               <div className="flex items-start gap-2 text-xs text-amber-600 dark:text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-md px-3 py-2">
@@ -155,7 +159,7 @@ export function RemoteAccessPopover(): React.JSX.Element {
             </div>
           )}
 
-          {isRunning && !tunnelUrl && (
+          {isRunning && !accessUrl && (
             <div className="flex items-center justify-center text-xs text-muted-foreground py-2">
               {sawUrl ? t('remote.disconnected') : t('remote.starting')}
             </div>

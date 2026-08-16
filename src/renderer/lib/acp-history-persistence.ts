@@ -1,5 +1,6 @@
 /** Desktop ACP history persistence boundary. */
 
+import { isConversationId } from '@shared/types/conversation.types'
 import type { PersistedSessionSummary } from '@shared/types/web-protocol.types'
 import { runtimeT } from '@/i18n/runtime'
 import type { ToolCall } from '@/lib/acp-api'
@@ -12,8 +13,6 @@ import type { ChatMessage, SessionStatus } from '@/stores/acp-store'
 export const SESSION_INDEX_KEY = 'acp/sessions/index'
 export const WIPE_MIGRATION_KEY = 'acp/sessions/migrated-v2'
 export const INACTIVE_PAYLOAD_CACHE_BUDGET = 3
-const canonicalConversationId =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 
 export function sessionPayloadKey(id: string): string {
   return `acp/sessions/${id}`
@@ -341,7 +340,7 @@ function historyMode(): 'server' | 'live_only' | 'tauri_store' | undefined {
 export function fromPersistedSessionSummary(entry: PersistedSessionSummary): SessionIndexEntry {
   return {
     id: entry.sessionId,
-    conversationId: canonicalConversationId.test(entry.storageKey) ? entry.storageKey : undefined,
+    conversationId: isConversationId(entry.storageKey) ? entry.storageKey : undefined,
     agentId: entry.runtimeAgentId ?? '',
     agentConfigId: entry.stableAgentNamespace?.startsWith('config:')
       ? entry.stableAgentNamespace.slice('config:'.length)

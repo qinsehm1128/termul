@@ -1,5 +1,7 @@
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import type { ConversationId } from '@shared/types/conversation.types'
+import { parseConversationId } from '@shared/types/conversation.types'
 import {
   RECOVERY_ACTION_FIXTURES,
   type ResolveRecoveryItemRequest
@@ -8,36 +10,67 @@ import { invoke } from '@tauri-apps/api/core'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   _resetAcpTransportForTests,
+  _resetRemoteAccessCredentialForTests,
   _setAcpTransportForTests,
   type AcpTransport,
-  AcpTransportError
+  getRemoteAccessCredential,
+  remoteAccessHeaders
 } from '@/lib/acp-transport'
 import {
-  createTauriConversationApi,
-  normalizeConversationError
-} from '@/lib/tauri-conversation-api'
-import { createWebConversationApi } from '@/lib/web-conversation-api'
+  conversationApi,
+  createConversationFacadeApi,
+  webConversationApi
+} from '@/lib/conversation-api'
+import {
+  conversationLifecycleApi,
+  createConversationLifecycleApi
+} from '@/lib/conversation-lifecycle-api'
+import { sessionWorkspaceApi } from '@/lib/session-workspace-api'
+import { normalizeConversationError, tauriConversationApi } from '@/lib/tauri-conversation-api'
+import { tauriSessionWorkspaceApi } from '@/lib/tauri-session-workspace-api'
+import { webSessionWorkspaceApi } from '@/lib/web-session-workspace-api'
 
-const ID = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+const ID = parseConversationId('018f7a1c-1b4d-7c8a-9f01-0123456789ab')
+const ACCESS_TOKEN = 'memory-only-access-credential'
 
-function response(body: unknown): Response {
+function response(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
-    status: 200,
+    status,
     headers: { 'content-type': 'application/json' }
   })
 }
 
+function workspace(conversationId: ConversationId = ID) {
+  return {
+    schemaVersion: 1 as const,
+    conversationId,
+    revision: 0,
+    updatedAtUtc: '',
+    resources: [],
+    projectionState: { status: 'native' as const }
+  }
+}
+
 beforeEach(() => {
   vi.clearAllMocks()
+  _resetAcpTransportForTests()
+  _resetRemoteAccessCredentialForTests()
+  window.localStorage.clear()
+  window.sessionStorage.clear()
+  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__
+  window.history.replaceState(null, '', '/')
 })
 
 afterEach(() => {
   _resetAcpTransportForTests()
+  _resetRemoteAccessCredentialForTests()
   vi.unstubAllGlobals()
+  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__
+  window.history.replaceState(null, '', '/')
 })
 
-describe('Conversation transport golden parity', () => {
-  it('pins Tauri list/open/legacy request names, camelCase payloads, and stable failures', async () => {
+describe('Conversation production transport golden parity', () => {
+  it('pins the exact Tauri core singleton request names, payload casing, and stable failures', async () => {
     vi.mocked(invoke).mockImplementation(async (command, args) => {
       if (command === 'conversation_resolve_legacy_id') {
         expect(args).toEqual({
@@ -59,121 +92,127 @@ describe('Conversation transport golden parity', () => {
       return { success: true, data: [] }
     })
 
-    const api = createTauriConversationApi()
-    await expect(api.listConversations()).resolves.toEqual({ success: true, data: [] })
+    await expect(tauriConversationApi.listConversations()).resolves.toEqual({
+      success: true,
+      data: []
+    })
     await expect(
-      api.resolveLegacyConversationId({ sourceKind: 'legacyStorageKey', value: 'legacy-one' })
+      tauriConversationApi.resolveLegacyConversationId({
+        sourceKind: 'legacyStorageKey',
+        value: 'legacy-one'
+      })
     ).resolves.toEqual({
       success: true,
       data: { conversationId: ID, canonicalRoute: `#/c/${ID}` }
     })
-    await expect(api.openConversation(ID)).resolves.toEqual({
+    await expect(tauriConversationApi.openConversation(ID)).resolves.toEqual({
       success: false,
       code: 'CONVERSATION_RECOVERY_REQUIRED',
       error: 'recovery required'
     })
   })
 
-  it('uses same-origin HTTP for reads and explicit FORBIDDEN for denied mutations', async () => {
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = String(input)
-      if (url.endsWith('/conversations/resolve-legacy')) {
-        expect(init?.body).toBe(
-          JSON.stringify({ sourceKind: 'legacyChatHistoryId', value: 'history-one' })
-        )
-        return response({
-          success: true,
-          data: { conversationId: ID, canonicalRoute: `#/c/${ID}` }
-        })
-      }
-      return response({ success: false, code: 'FORBIDDEN', error: 'localhost-only' })
-    })
-    vi.stubGlobal('fetch', fetchMock)
-
-    const api = createWebConversationApi()
-    await expect(
-      api.resolveLegacyConversationId({
-        sourceKind: 'legacyChatHistoryId',
-        value: 'history-one'
-      })
-    ).resolves.toEqual({
-      success: true,
-      data: { conversationId: ID, canonicalRoute: `#/c/${ID}` }
-    })
-    await expect(
-      api.writeWorkspace(ID, null, {
-        schemaVersion: 1,
-        conversationId: ID,
-        revision: 0,
-        updatedAtUtc: '',
-        resources: [],
-        projectionState: { status: 'native' }
-      })
-    ).resolves.toEqual({ success: false, code: 'FORBIDDEN', error: 'localhost-only' })
-  })
-
-  it('uses authenticated WS for remote recovery mutations and preserves application codes', async () => {
-    vi.spyOn(window, 'location', 'get').mockReturnValue({
-      hostname: 'phone.example',
-      origin: 'https://phone.example'
-    } as Location)
-    const request = RECOVERY_ACTION_FIXTURES[1].request as ResolveRecoveryItemRequest
-    const conversationRequest = vi.fn(async (type: string, payload: unknown) => {
-      expect(type).toBe('resolve_recovery_item')
-      expect(payload).toEqual(request)
-      return RECOVERY_ACTION_FIXTURES[1].result
-    })
+  it('routes the production web compatibility facade through exact specialized singletons', async () => {
+    window.history.replaceState(null, '', `/#access_token=${ACCESS_TOKEN}`)
+    const lifecycle = vi.fn(async () => ({
+      status: 'blocked' as const,
+      action: 'deleteConversation' as const,
+      conversationId: ID,
+      revision: 7,
+      code: 'CONVERSATION_LIVE_RESOURCES' as const,
+      blockers: [{ kind: 'terminalResources' as const, count: 1, ids: ['terminal-live'] }]
+    }))
     _setAcpTransportForTests({
-      conversationRequest,
+      conversationLifecycle: lifecycle,
+      onEvent: vi.fn(() => vi.fn()),
       dispose: vi.fn()
     } as unknown as AcpTransport)
 
-    const api = createWebConversationApi()
-    await expect(api.resolveRecovery(request)).resolves.toEqual({
-      success: true,
-      data: RECOVERY_ACTION_FIXTURES[1].result
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      expect(new Headers(init?.headers).get('authorization')).toBe(`Bearer ${ACCESS_TOKEN}`)
+      if (url.endsWith('/conversations')) {
+        return response({ success: true, data: [] })
+      }
+      if (url.endsWith(`/conversations/${ID}/workspace`)) {
+        expect(init?.method).toBe('POST')
+        expect(init?.body).toBe(JSON.stringify({ basedRevision: null, workspace: workspace() }))
+        return response({ success: false, code: 'FORBIDDEN', error: 'localhost-only' }, 403)
+      }
+      throw new Error(`unexpected request ${url}`)
     })
-    expect(conversationRequest).toHaveBeenCalledTimes(1)
+    vi.stubGlobal('fetch', fetchMock)
 
-    conversationRequest.mockRejectedValueOnce(
-      new AcpTransportError('LEGACY_COMPATIBILITY_READ_ONLY', 'legacy source is read-only')
-    )
-    await expect(api.resolveRecovery(request)).resolves.toEqual({
+    expect(conversationApi.listConversations).not.toBe(webConversationApi.listConversations)
+    expect(conversationApi.getWorkspace).not.toBe(sessionWorkspaceApi.getWorkspace)
+    await expect(conversationApi.listConversations()).resolves.toEqual({ success: true, data: [] })
+    await expect(conversationApi.writeWorkspace(ID, null, workspace())).resolves.toEqual({
       success: false,
-      code: 'LEGACY_COMPATIBILITY_READ_ONLY',
-      error: 'legacy source is read-only'
+      code: 'FORBIDDEN',
+      error: 'localhost-only'
     })
+    await expect(conversationApi.deleteConversation(ID, 7)).resolves.toMatchObject({
+      status: 'blocked',
+      code: 'CONVERSATION_LIVE_RESOURCES'
+    })
+    expect(lifecycle).toHaveBeenCalledWith('delete', ID, 7, undefined)
   })
 
-  it('preserves every release-stable application code without transport remapping', () => {
-    const stableCodes = [
-      'CONVERSATION_INVALID_ID',
-      'CONVERSATION_NOT_FOUND',
-      'CONVERSATION_CONFLICT',
-      'CONVERSATION_RECOVERY_REQUIRED',
-      'CONVERSATION_LIVE_RESOURCES',
-      'CONVERSATION_BINDING_NOT_FOUND',
-      'CONVERSATION_BINDING_NOT_ACTIVE',
-      'CONVERSATION_BINDING_NOT_DETACHED',
-      'CONVERSATION_BINDING_NOT_ADDRESSABLE',
-      'CONVERSATION_DURABILITY_FAILED',
-      'LEGACY_COMPATIBILITY_READ_ONLY',
-      'LEGACY_ID_AMBIGUOUS',
-      'MIGRATION_IDEMPOTENCY_CONFLICT',
-      'VALIDATION_ERROR',
-      'FORBIDDEN',
-      'UNAUTHORIZED'
-    ]
-    for (const code of stableCodes) {
-      expect(normalizeConversationError({ code, message: `stable:${code}` })).toEqual({
-        success: false,
-        code,
-        error: `stable:${code}`
+  it('dispatches all five web lifecycle mutations through the real production factory', async () => {
+    const lifecycle = vi.fn(
+      async (
+        action: 'detach' | 'rebind' | 'suspend' | 'replace' | 'delete',
+        conversationId: string,
+        expectedRevision: number
+      ) => ({
+        status: 'updated' as const,
+        action:
+          action === 'detach'
+            ? ('detachBinding' as const)
+            : action === 'rebind'
+              ? ('rebindDetachedBinding' as const)
+              : action === 'suspend'
+                ? ('suspendBinding' as const)
+                : action === 'replace'
+                  ? ('replaceBinding' as const)
+                  : ('deleteConversation' as const),
+        conversationId: parseConversationId(conversationId),
+        previousRevision: expectedRevision,
+        revision: expectedRevision + 1,
+        workspaceCwd: '/visible/conversation',
+        lifecycleState: action === 'delete' ? ('deleted' as const) : ('ready' as const),
+        currentBinding: null
       })
+    )
+    _setAcpTransportForTests({
+      conversationLifecycle: lifecycle,
+      onEvent: vi.fn(() => vi.fn()),
+      dispose: vi.fn()
+    } as unknown as AcpTransport)
+
+    const api = createConversationLifecycleApi('web')
+    const replacement = {
+      schemaVersion: 1 as const,
+      conversationId: ID,
+      executionTarget: { kind: 'workspace' as const }
     }
+    await api.detachBinding(ID, 1)
+    await api.rebindDetachedBinding(ID, 2)
+    await api.suspendBinding(ID, 3)
+    await api.replaceBinding(ID, replacement, 4)
+    await api.deleteConversation(ID, 5)
+
+    expect(lifecycle.mock.calls).toEqual([
+      ['detach', ID, 1, undefined],
+      ['rebind', ID, 2, undefined],
+      ['suspend', ID, 3, undefined],
+      ['replace', ID, 4, replacement],
+      ['delete', ID, 5, undefined]
+    ])
   })
 
-  it('passes workspace success/conflict/recovery and lifecycle/resource outcomes unchanged', async () => {
+  it('passes workspace success/conflict and lifecycle resource outcomes unchanged on Tauri', async () => {
+    ;(window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {}
     vi.mocked(invoke).mockImplementation(async (command) => {
       if (command === 'session_workspace_get') {
         return { success: true, data: { status: 'missing', conversationId: ID } }
@@ -204,35 +243,147 @@ describe('Conversation transport golden parity', () => {
       }
       return { success: false, code: 'CONVERSATION_RECOVERY_REQUIRED', error: 'recovery' }
     })
-    const api = createTauriConversationApi()
-    await expect(api.getWorkspace(ID)).resolves.toMatchObject({
+
+    await expect(tauriSessionWorkspaceApi.getWorkspace(ID)).resolves.toMatchObject({
       success: true,
       data: { status: 'missing', conversationId: ID }
     })
     await expect(
-      api.writeWorkspace(ID, 6, {
-        schemaVersion: 1,
-        conversationId: ID,
-        revision: 6,
-        updatedAtUtc: '',
-        resources: [],
-        projectionState: { status: 'native' }
-      })
+      tauriSessionWorkspaceApi.writeWorkspace(ID, 6, workspace())
     ).resolves.toMatchObject({
       success: true,
       data: { status: 'conflict', currentRevision: 7 }
     })
-    await expect(api.deleteConversation(ID, 7)).resolves.toMatchObject({
-      success: true,
-      data: {
-        status: 'blocked',
-        code: 'CONVERSATION_LIVE_RESOURCES',
-        blockers: [{ kind: 'terminalResources', ids: ['terminal-live'] }]
-      }
+    await expect(
+      createConversationLifecycleApi('tauri').deleteConversation(ID, 7)
+    ).resolves.toMatchObject({
+      status: 'blocked',
+      code: 'CONVERSATION_LIVE_RESOURCES',
+      blockers: [{ kind: 'terminalResources', ids: ['terminal-live'] }]
     })
+    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__
+  })
+
+  it.each([
+    '018F7A1C-1B4D-7C8A-9F01-0123456789AB',
+    '018f7a1c1b4d7c8a9f010123456789ab',
+    '018f7a1c-1b4d-7c8a-9f01-0123456789ab/child',
+    ' 018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+  ])('rejects malformed ids before every production transport dispatch: %s', async (value) => {
+    const malformed = value as ConversationId
+    const lifecycle = vi.fn()
+    _setAcpTransportForTests({
+      conversationLifecycle: lifecycle,
+      onEvent: vi.fn(() => vi.fn()),
+      dispose: vi.fn()
+    } as unknown as AcpTransport)
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(tauriConversationApi.openConversation(malformed)).resolves.toMatchObject({
+      success: false,
+      code: 'CONVERSATION_INVALID_ID'
+    })
+    await expect(webConversationApi.openConversation(malformed)).resolves.toMatchObject({
+      success: false,
+      code: 'CONVERSATION_INVALID_ID'
+    })
+    await expect(tauriSessionWorkspaceApi.getWorkspace(malformed)).resolves.toMatchObject({
+      success: false,
+      code: 'CONVERSATION_INVALID_ID'
+    })
+    await expect(webSessionWorkspaceApi.getWorkspace(malformed)).resolves.toMatchObject({
+      success: false,
+      code: 'CONVERSATION_INVALID_ID'
+    })
+    await expect(
+      createConversationLifecycleApi('tauri').detachBinding(malformed, 0)
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+    await expect(
+      createConversationLifecycleApi('web').detachBinding(malformed, 0)
+    ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
+
+    expect(invoke).not.toHaveBeenCalled()
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(lifecycle).not.toHaveBeenCalled()
+  })
+
+  it('consumes the access fragment once, clears it, and retains only in-memory bearer state', () => {
+    const localWrite = vi.spyOn(Storage.prototype, 'setItem')
+    window.history.replaceState(null, '', `/conversation?view=active#access_token=${ACCESS_TOKEN}`)
+
+    expect(getRemoteAccessCredential()).toBe(ACCESS_TOKEN)
+    expect(window.location.hash).toBe('')
+    expect(window.location.search).toBe('?view=active')
+    expect(remoteAccessHeaders().get('authorization')).toBe(`Bearer ${ACCESS_TOKEN}`)
+    expect(getRemoteAccessCredential()).toBe(ACCESS_TOKEN)
+    expect(localWrite).not.toHaveBeenCalled()
+    expect(window.localStorage.length).toBe(0)
+    expect(window.sessionStorage.length).toBe(0)
+  })
+
+  it('preserves release-stable application codes without transport remapping', () => {
+    const stableCodes = [
+      'CONVERSATION_INVALID_ID',
+      'CONVERSATION_NOT_FOUND',
+      'CONVERSATION_CONFLICT',
+      'CONVERSATION_RECOVERY_REQUIRED',
+      'CONVERSATION_LIVE_RESOURCES',
+      'CONVERSATION_BINDING_NOT_FOUND',
+      'CONVERSATION_BINDING_NOT_ACTIVE',
+      'CONVERSATION_BINDING_NOT_DETACHED',
+      'CONVERSATION_BINDING_NOT_ADDRESSABLE',
+      'CONVERSATION_DURABILITY_FAILED',
+      'LEGACY_COMPATIBILITY_READ_ONLY',
+      'LEGACY_ID_AMBIGUOUS',
+      'MIGRATION_IDEMPOTENCY_CONFLICT',
+      'VALIDATION_ERROR',
+      'FORBIDDEN',
+      'UNAUTHORIZED'
+    ]
+    for (const code of stableCodes) {
+      expect(normalizeConversationError({ code, message: `stable:${code}` })).toEqual({
+        success: false,
+        code,
+        error: `stable:${code}`
+      })
+    }
+  })
+
+  it('keeps the compatibility facade as zero-logic delegation', async () => {
+    const core = {
+      getHostStatus: vi.fn(),
+      listConversations: vi.fn(async () => ({ success: true as const, data: [] })),
+      getConversation: vi.fn(),
+      openConversation: vi.fn(),
+      resolveLegacyConversationId: vi.fn(),
+      subscribeHostStatus: vi.fn()
+    }
+    const workspaces = {
+      getWorkspace: vi.fn(),
+      writeWorkspace: vi.fn(),
+      resolveRecovery: vi.fn()
+    }
+    const lifecycle = {
+      detachBinding: vi.fn(),
+      rebindDetachedBinding: vi.fn(),
+      suspendBinding: vi.fn(),
+      replaceBinding: vi.fn(),
+      deleteConversation: vi.fn(),
+      subscribe: vi.fn()
+    }
+    const facade = createConversationFacadeApi(core, workspaces, lifecycle)
+
+    await facade.listConversations()
+    expect(core.listConversations).toHaveBeenCalledTimes(1)
+    expect(workspaces.getWorkspace).not.toHaveBeenCalled()
+    expect(lifecycle.deleteConversation).not.toHaveBeenCalled()
   })
 
   it('reuses the authoritative RecoveryAction union without local action aliases', () => {
+    const request = RECOVERY_ACTION_FIXTURES[1].request as ResolveRecoveryItemRequest
+    expect(request.action).toBe('associateConversation')
+
     const root = join(__dirname, '..', '..', '..', '..')
     const files = [
       'src/shared/types/conversation-api.types.ts',
@@ -250,5 +401,11 @@ describe('Conversation transport golden parity', () => {
     const contract = readFileSync(join(root, 'src/shared/types/conversation-api.types.ts'), 'utf8')
     expect(contract).toContain("from './conversation-recovery.types'")
     expect(contract).toContain('export type {')
+  })
+
+  it('pins the production web lifecycle singleton to the same factory contract', () => {
+    expect(Object.keys(conversationLifecycleApi).sort()).toEqual(
+      Object.keys(createConversationLifecycleApi('web')).sort()
+    )
   })
 })

@@ -1,4 +1,4 @@
-import type { ConversationId } from '@shared/types/conversation.types'
+import { type ConversationId, isConversationId } from '@shared/types/conversation.types'
 import type {
   RecoveryActionResult,
   ResolveRecoveryItemRequest
@@ -13,8 +13,6 @@ import type {
 } from '@shared/types/session-workspace.types'
 import { type InvokeArgs, invoke } from '@tauri-apps/api/core'
 import { isTauriContext } from './tauri-runtime'
-
-const canonicalUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 
 async function invokeIpc<T>(command: string, args?: InvokeArgs): Promise<IpcResult<T>> {
   try {
@@ -41,7 +39,7 @@ export function createTauriSessionWorkspaceApi(): SessionWorkspaceApi {
     async getWorkspace(
       conversationId: ConversationId
     ): Promise<IpcResult<SessionWorkspaceLoadOutcome>> {
-      if (!canonicalUuid.test(conversationId)) return invalidConversationId()
+      if (!isConversationId(conversationId)) return invalidConversationId()
       if (!isTauriContext()) {
         return {
           success: false,
@@ -57,7 +55,7 @@ export function createTauriSessionWorkspaceApi(): SessionWorkspaceApi {
       basedRevision: number | null,
       workspace: SessionWorkspaceV1
     ): Promise<IpcResult<SessionWorkspaceWriteOutcome>> {
-      if (!canonicalUuid.test(conversationId) || workspace.conversationId !== conversationId) {
+      if (!isConversationId(conversationId) || workspace.conversationId !== conversationId) {
         return invalidConversationId()
       }
       if (!isTauriContext()) {
@@ -94,3 +92,6 @@ export function createTauriSessionWorkspaceApi(): SessionWorkspaceApi {
     }
   }
 }
+
+/** Exact Tauri workspace singleton selected by the production workspace facade. */
+export const tauriSessionWorkspaceApi = createTauriSessionWorkspaceApi()

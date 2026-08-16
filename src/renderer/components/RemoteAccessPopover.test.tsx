@@ -59,14 +59,17 @@ vi.mock('sonner', () => ({ toast: { error: vi.fn() } }))
 import { syncProjects } from '@/lib/api'
 import { useRemoteStatus } from '@/stores/remote-status-store'
 
+const RAW_CREDENTIAL = 'secret-bootstrap-credential'
 const RUNNING: RemoteStatus = {
   running: true,
   url: 'http://127.0.0.1:5123',
   port: 5123,
   bindMode: 'localhost',
   bindHost: '127.0.0.1',
-  tunnelUrl: 'https://foo-bar.trycloudflare.com'
+  tunnelUrl: 'https://foo-bar.trycloudflare.com',
+  accessUrl: `https://foo-bar.trycloudflare.com/#access_token=${RAW_CREDENTIAL}`
 }
+const clipboardWrite = vi.fn(async () => undefined)
 
 function renderPopover(): ReturnType<typeof render> {
   return render(
@@ -87,6 +90,10 @@ async function openPopover(): Promise<HTMLElement> {
 beforeEach(() => {
   vi.clearAllMocks()
   vi.mocked(useRemoteStatus).mockReturnValue(null)
+  Object.defineProperty(navigator, 'clipboard', {
+    configurable: true,
+    value: { writeText: clipboardWrite }
+  })
 })
 
 afterEach(() => {
@@ -103,17 +110,34 @@ describe('RemoteAccessPopover', () => {
     expect(screen.queryByText('Copy link')).toBeNull()
   })
 
-  it('renders a QR from tunnelUrl when running (no bind selector, no URL row)', async () => {
+  it('uses only the credentialed accessUrl for QR/copy without displaying the raw credential', async () => {
     vi.mocked(useRemoteStatus).mockReturnValue(RUNNING)
     renderPopover()
     await openPopover()
 
     const qr = screen.getByTestId('qr')
-    expect(qr.getAttribute('data-value')).toBe(RUNNING.tunnelUrl)
+    expect(qr.getAttribute('data-value')).toBe(RUNNING.accessUrl)
+    expect(qr.getAttribute('data-value')).not.toBe(RUNNING.tunnelUrl)
+    expect(screen.queryByText(RAW_CREDENTIAL)).toBeNull()
+    expect(document.body.textContent).not.toContain(RAW_CREDENTIAL)
+
+    const copyButton = screen.getByRole('button', { name: 'Copy tunnel link' })
+    await fireEvent.click(copyButton)
+    await waitFor(() => expect(clipboardWrite).toHaveBeenCalledWith(RUNNING.accessUrl))
+
     // The simplify goal: no bind selector, no open-in-browser text row.
     expect(screen.queryByText('Listen on')).toBeNull()
     expect(screen.queryByText('Open in browser')).toBeNull()
-    expect(screen.getByText('Copy link')).toBeDefined()
+    expect(await screen.findByText('Copied')).toBeDefined()
+  })
+
+  it('does not fall back to an uncredentialed tunnel URL when accessUrl is explicitly absent', async () => {
+    vi.mocked(useRemoteStatus).mockReturnValue({ ...RUNNING, accessUrl: null })
+    renderPopover()
+    await openPopover()
+
+    expect(screen.queryByTestId('qr')).toBeNull()
+    expect(screen.queryByText('Copy link')).toBeNull()
   })
 
   it('shows an inline error when start fails (no QR)', async () => {

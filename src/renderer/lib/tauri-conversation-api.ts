@@ -1,4 +1,8 @@
-import type { ConversationId, ConversationRecordV2 } from '@shared/types/conversation.types'
+import {
+  type ConversationId,
+  type ConversationRecordV2,
+  isConversationId
+} from '@shared/types/conversation.types'
 import type {
   ConversationApi,
   ConversationHostStatus,
@@ -6,24 +10,9 @@ import type {
   LegacyConversationKey,
   LegacyConversationResolution
 } from '@shared/types/conversation-api.types'
-import type {
-  ConversationLifecycleOutcome,
-  ConversationReplacementRequest
-} from '@shared/types/conversation-lifecycle.types'
-import {
-  parseResolveRecoveryItemRequest,
-  type RecoveryActionResult,
-  type ResolveRecoveryItemRequest
-} from '@shared/types/conversation-recovery.types'
 import type { IpcResult } from '@shared/types/ipc.types'
-import type {
-  SessionWorkspaceLoadOutcome,
-  SessionWorkspaceWriteOutcome
-} from '@shared/types/session-workspace.types'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
-
-const canonicalUuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/
 
 export function normalizeConversationError(error: unknown): IpcResult<never> {
   if (error && typeof error === 'object') {
@@ -71,7 +60,7 @@ function withConversationId<T>(
   conversationId: ConversationId,
   operation: () => Promise<IpcResult<T>>
 ): Promise<IpcResult<T>> {
-  return canonicalUuid.test(conversationId) ? operation() : Promise.resolve(invalidConversationId())
+  return isConversationId(conversationId) ? operation() : Promise.resolve(invalidConversationId())
 }
 
 export function createTauriConversationApi(): ConversationApi {
@@ -98,73 +87,6 @@ export function createTauriConversationApi(): ConversationApi {
         request
       })
     },
-    getWorkspace: (conversationId) =>
-      withConversationId(conversationId, () =>
-        invokeConversation<SessionWorkspaceLoadOutcome>('session_workspace_get', { conversationId })
-      ),
-    writeWorkspace: (conversationId, basedRevision, workspace) => {
-      if (!canonicalUuid.test(conversationId) || workspace.conversationId !== conversationId) {
-        return Promise.resolve(invalidConversationId())
-      }
-      return invokeConversation<SessionWorkspaceWriteOutcome>('session_workspace_write', {
-        conversationId,
-        basedRevision,
-        workspace
-      })
-    },
-    resolveRecovery: (request: ResolveRecoveryItemRequest) => {
-      try {
-        return invokeConversation<RecoveryActionResult>('conversation_recovery_resolve', {
-          request: parseResolveRecoveryItemRequest(request)
-        })
-      } catch (error) {
-        return Promise.resolve({
-          success: false,
-          code: 'VALIDATION_ERROR',
-          error: error instanceof Error ? error.message : String(error)
-        })
-      }
-    },
-    detachBinding: (conversationId, expectedRevision) =>
-      withConversationId(conversationId, () =>
-        invokeConversation<ConversationLifecycleOutcome>('conversation_detach_binding', {
-          conversationId,
-          expectedRevision
-        })
-      ),
-    rebindDetachedBinding: (conversationId, expectedRevision) =>
-      withConversationId(conversationId, () =>
-        invokeConversation<ConversationLifecycleOutcome>('conversation_rebind_detached_binding', {
-          conversationId,
-          expectedRevision
-        })
-      ),
-    suspendBinding: (conversationId, expectedRevision) =>
-      withConversationId(conversationId, () =>
-        invokeConversation<ConversationLifecycleOutcome>('conversation_suspend_binding', {
-          conversationId,
-          expectedRevision
-        })
-      ),
-    replaceBinding: (
-      conversationId: ConversationId,
-      request: ConversationReplacementRequest,
-      expectedRevision: number
-    ) =>
-      withConversationId(conversationId, () =>
-        invokeConversation<ConversationLifecycleOutcome>('conversation_replace_binding', {
-          conversationId,
-          request,
-          expectedRevision
-        })
-      ),
-    deleteConversation: (conversationId, expectedRevision) =>
-      withConversationId(conversationId, () =>
-        invokeConversation<ConversationLifecycleOutcome>('conversation_delete', {
-          conversationId,
-          expectedRevision
-        })
-      ),
     subscribeHostStatus(listener) {
       let active = true
       let unlisten: (() => void) | undefined
@@ -179,3 +101,6 @@ export function createTauriConversationApi(): ConversationApi {
     }
   }
 }
+
+/** Exact core singleton selected by the production Conversation facade on Tauri. */
+export const tauriConversationApi = createTauriConversationApi()

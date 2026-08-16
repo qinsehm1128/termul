@@ -9,11 +9,13 @@ import {
   CONVERSATION_SCHEMA_VERSION,
   type ConversationRecordV2,
   type ExecutionTarget,
+  isConversationId,
+  parseConversationId,
   TERMINAL_RESOURCE_REF_SCHEMA_VERSION,
   type TerminalResourceRef
 } from './conversation.types'
 
-const canonicalConversationId = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+const canonicalConversationId = parseConversationId('018f7a1c-1b4d-7c8a-9f01-0123456789ab')
 const opaqueAgentSessionId = 'agent/session:not-a-uuid?generation=2'
 
 const projectlessConversation: ConversationRecordV2 = {
@@ -46,6 +48,32 @@ const opaqueBinding: AgentSessionBinding = {
 }
 
 describe('Conversation runtime-neutral wire contracts', () => {
+  it('matches Rust canonical path parsing without UUID version restrictions', () => {
+    const accepted = [
+      '018f7a1c-1b4d-1c8a-1f01-0123456789ab',
+      '018f7a1c-1b4d-4c8a-2f01-0123456789ab',
+      '018f7a1c-1b4d-7c8a-ff01-0123456789ab'
+    ]
+    for (const value of accepted) {
+      expect(isConversationId(value)).toBe(true)
+      expect(parseConversationId(value)).toBe(value)
+    }
+  })
+
+  it.each([
+    '018F7A1C-1B4D-7C8A-9F01-0123456789AB',
+    '018f7a1c1b4d7c8a9f010123456789ab',
+    '018f7a1c-1b4d-7c8a-9f01-0123456789a',
+    '018f7a1c-1b4d-7c8a-9f01-0123456789ab/child',
+    ' 018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+    '018f7a1c-1b4d-7c8a-9f01-0123456789ab '
+  ])('rejects non-canonical ConversationId %s', (value) => {
+    expect(isConversationId(value)).toBe(false)
+    expect(() => parseConversationId(value)).toThrow(
+      'conversationId must be a canonical lowercase-hyphenated UUID'
+    )
+  })
+
   it('round-trips a project-less Conversation separately from its opaque ACP binding', () => {
     const fixture = { conversation: projectlessConversation, binding: opaqueBinding }
     const roundTripped: unknown = JSON.parse(JSON.stringify(fixture))

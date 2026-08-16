@@ -140,10 +140,10 @@ const P0_DOMAINS: DomainCheck[] = [
   {
     domain: 'SessionWorkspace',
     priority: 'P0',
-    tauriAdapterFile: 'tauri-conversation-api.ts',
-    adapterExportName: 'createTauriConversationApi',
+    tauriAdapterFile: 'tauri-session-workspace-api.ts',
+    adapterExportName: 'createTauriSessionWorkspaceApi',
     methods: ['getWorkspace', 'writeWorkspace', 'resolveRecovery'],
-    apiBridgeExport: 'conversationApi',
+    apiBridgeExport: 'sessionWorkspaceApi',
     testFile: 'conversation-parity-golden.test.ts'
   },
   {
@@ -170,8 +170,8 @@ const P1_DOMAINS: DomainCheck[] = [
   {
     domain: 'ConversationLifecycle',
     priority: 'P1',
-    tauriAdapterFile: 'tauri-conversation-api.ts',
-    adapterExportName: 'createTauriConversationApi',
+    tauriAdapterFile: 'conversation-lifecycle-api.ts',
+    adapterExportName: 'createConversationLifecycleApi',
     methods: [
       'detachBinding',
       'rebindDetachedBinding',
@@ -185,10 +185,10 @@ const P1_DOMAINS: DomainCheck[] = [
   {
     domain: 'ConversationTerminalResources',
     priority: 'P1',
-    tauriAdapterFile: 'tauri-conversation-api.ts',
-    adapterExportName: 'createTauriConversationApi',
+    tauriAdapterFile: 'tauri-session-workspace-api.ts',
+    adapterExportName: 'createTauriSessionWorkspaceApi',
     methods: ['getWorkspace', 'writeWorkspace'],
-    apiBridgeExport: 'conversationApi',
+    apiBridgeExport: 'sessionWorkspaceApi',
     testFile: 'conversation-parity-golden.test.ts'
   },
   {
@@ -384,6 +384,61 @@ describe('Parity Checklist Automation', () => {
   })
 
   describe('Regression Prevention', () => {
+    it('keeps core ConversationApi transport-free for workspace and lifecycle domains', () => {
+      const shared = readFileSync(
+        join(LIB_DIR, '..', '..', 'shared', 'types', 'conversation-api.types.ts'),
+        'utf-8'
+      )
+      const tauriCore = readFileSync(join(LIB_DIR, 'tauri-conversation-api.ts'), 'utf-8')
+      const webCore = readFileSync(join(LIB_DIR, 'web-conversation-api.ts'), 'utf-8')
+      const compatibilityFacade = readFileSync(join(LIB_DIR, 'conversation-api.ts'), 'utf-8')
+
+      for (const method of [
+        'getWorkspace',
+        'writeWorkspace',
+        'resolveRecovery',
+        'detachBinding',
+        'rebindDetachedBinding',
+        'suspendBinding',
+        'replaceBinding',
+        'deleteConversation'
+      ]) {
+        expect(shared, `ConversationApi must not declare ${method}`).not.toMatch(
+          new RegExp(`\\b${method}\\s*\\(`)
+        )
+        expect(tauriCore, `Tauri core must not implement ${method}`).not.toMatch(
+          new RegExp(`\\b${method}\\s*(?:\\(|:)`)
+        )
+        expect(webCore, `web core must not implement ${method}`).not.toMatch(
+          new RegExp(`\\b${method}\\s*(?:\\(|:)`)
+        )
+      }
+
+      expect(compatibilityFacade).toMatch(/sessionWorkspaceApi/)
+      expect(compatibilityFacade).toMatch(/conversationLifecycleApi/)
+      expect(compatibilityFacade).toMatch(/tauriConversationApi/)
+      expect(compatibilityFacade).toMatch(/webConversationApi/)
+      expect(compatibilityFacade).toMatch(/createConversationFacadeApi/)
+    })
+
+    it('specialized production facades use the shared ConversationId parser only', () => {
+      const files = [
+        'tauri-conversation-api.ts',
+        'web-conversation-api.ts',
+        'conversation-lifecycle-api.ts',
+        'tauri-session-workspace-api.ts',
+        'web-session-workspace-api.ts',
+        'acp-history-persistence.ts'
+      ]
+      for (const file of files) {
+        const content = readFileSync(join(LIB_DIR, file), 'utf-8')
+        expect(content, `${file} should import shared ConversationId validation`).toMatch(
+          /isConversationId|parseConversationId/
+        )
+        expect(content, `${file} must not own a UUID regex`).not.toMatch(/\^\[0-9a-f\]\\?\{8\}/)
+      }
+    })
+
     it('Session API uses Tauri-only export pattern', () => {
       const apiPath = join(LIB_DIR, 'api.ts')
       const apiContent = readFileSync(apiPath, 'utf-8')

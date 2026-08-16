@@ -10,8 +10,25 @@ export const PROJECT_ATTACHMENT_SCHEMA_VERSION = 1 as const
 export const AGENT_SESSION_BINDING_SCHEMA_VERSION = 1 as const
 export const TERMINAL_RESOURCE_REF_SCHEMA_VERSION = 1 as const
 
+declare const conversationIdBrand: unique symbol
+
 /** Canonical lowercase-hyphenated Termul-owned UUID. */
-export type ConversationId = string
+export type ConversationId = string & { readonly [conversationIdBrand]?: true }
+
+const canonicalConversationId = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/
+
+/** True only for the canonical path spelling accepted by Rust `ConversationId`. */
+export function isConversationId(value: string): value is ConversationId {
+  return canonicalConversationId.test(value)
+}
+
+/** Parse a canonical Conversation path id without UUID version or variant restrictions. */
+export function parseConversationId(value: string): ConversationId {
+  if (!isConversationId(value)) {
+    throw new Error('conversationId must be a canonical lowercase-hyphenated UUID')
+  }
+  return value
+}
 
 /** UTC date partition derived only from immutable createdAtUtc. */
 export interface CreationPartition {
