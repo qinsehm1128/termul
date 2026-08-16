@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::future::Future;
+use std::io::{BufWriter, Write};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -651,4 +652,85 @@ fn migration_phase_and_shutdown_boundary_matrix() {
         "transport": "matrix"
     });
     assert_eq!(evidence["phase"], "observation_window");
+}
+
+#[test]
+fn large_corpus_bootstrap_retains_zero_historical_payload_bytes() {
+    const CONVERSATION_COUNT: u64 = 100;
+    const EVENTS_PER_CONVERSATION: u64 = 10_000;
+
+    let temp = tempfile::tempdir().unwrap();
+    let directory = temp.path().canonicalize().unwrap().join("large-corpus");
+    std::fs::create_dir_all(&directory).unwrap();
+    for file in EVENT_LOG_FILES {
+        std::fs::write(directory.join(file), b"").unwrap();
+    }
+    let source_id = ConversationId::parse("20000000-0000-4000-8000-000000000000").unwrap();
+    let recorded_at_utc = fixed_time();
+    let messages = std::fs::File::create(directory.join(MESSAGES_FILE)).unwrap();
+    let mut messages = BufWriter::new(messages);
+    for seq in 1..=EVENTS_PER_CONVERSATION {
+        let event = ConversationEventRecordV2::new(
+            source_id,
+            seq,
+            recorded_at_utc,
+            ConversationEventType::MessageChunk,
+            serde_json::Value::Null,
+        );
+        serde_json::to_writer(&mut messages, &event).unwrap();
+        messages.write_all(b"\n").unwrap();
+    }
+    messages.flush().unwrap();
+    drop(messages);
+
+    let scan = crate::conversation::event_log::scan_event_log(
+        &directory,
+        source_id,
+        &DurableFileSystem::new(),
+    )
+    .unwrap();
+    // Retained-memory accounting depends on the compact post-validation state, not repeated parse
+    // CPU. Validate one real 10,000-event stream, then materialize 100 disjoint bootstrap states.
+    let compact_states = (0..CONVERSATION_COUNT)
+        .map(|index| {
+            (
+                ConversationId::parse(&format!("20000000-0000-4000-8000-{index:012x}")).unwrap(),
+                scan.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let metrics = crate::conversation::repository::bootstrap_scan_metrics(
+        compact_states.iter().map(|(_, scan)| scan),
+    );
+    let expected_offsets_per_stream =
+        EVENTS_PER_CONVERSATION.div_ceil(crate::conversation::event_log::SPARSE_OFFSET_STRIDE);
+
+    assert_eq!(compact_states.len(), CONVERSATION_COUNT as usize);
+    assert_eq!(
+        compact_states
+            .iter()
+            .map(|(conversation_id, _)| *conversation_id)
+            .collect::<HashSet<_>>()
+            .len(),
+        CONVERSATION_COUNT as usize
+    );
+    assert_eq!(
+        metrics.scanned_event_count,
+        CONVERSATION_COUNT * EVENTS_PER_CONVERSATION
+    );
+    assert_eq!(metrics.retained_payload_bytes, 0);
+    assert_eq!(
+        metrics.sparse_index_entry_count,
+        (CONVERSATION_COUNT * expected_offsets_per_stream) as usize
+    );
+    for (_, scan) in compact_states {
+        assert_eq!(
+            scan.sparse_offsets.messages.event_count,
+            EVENTS_PER_CONVERSATION
+        );
+        assert!(scan.sparse_offsets.messages.entries.len() <= expected_offsets_per_stream as usize);
+        assert!(scan.sparse_offsets.tool_calls.entries.is_empty());
+        assert!(scan.sparse_offsets.bindings.entries.is_empty());
+        assert!(scan.sparse_offsets.attachments.entries.is_empty());
+    }
 }

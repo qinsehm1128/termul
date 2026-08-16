@@ -8,7 +8,8 @@
 #[cfg(test)]
 use std::cell::Cell;
 use std::fmt;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{copy, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -18,12 +19,15 @@ use uuid::Uuid;
 
 use crate::conversation::contracts::{
     format_created_at_utc, parse_created_at_utc, AgentSessionBinding, AgentSessionBindingState,
-    ConversationErrorCode, ConversationId, ConversationTitleSource, ProjectAttachment,
-    AGENT_SESSION_BINDING_SCHEMA_VERSION, PROJECT_ATTACHMENT_SCHEMA_VERSION,
+    ConversationErrorCode, ConversationId, ConversationLifecycleState, ConversationTitleSource,
+    ProjectAttachment, AGENT_SESSION_BINDING_SCHEMA_VERSION, PROJECT_ATTACHMENT_SCHEMA_VERSION,
 };
 use crate::conversation::durable_fs::DurableFileSystem;
 
 pub const CONVERSATION_EVENT_SCHEMA_VERSION: u32 = 2;
+pub const SPARSE_OFFSET_STRIDE: u64 = 256;
+pub const MIN_EVENT_PAGE_LIMIT: usize = 1;
+pub const MAX_EVENT_PAGE_LIMIT: usize = 1_000;
 pub const MESSAGES_FILE: &str = "messages.jsonl";
 pub const TOOL_CALLS_FILE: &str = "tool-calls.jsonl";
 pub const BINDINGS_FILE: &str = "bindings.jsonl";
@@ -192,17 +196,81 @@ pub struct ConversationFrontier {
     pub binding: BindingMaterialization,
     pub attachment: AttachmentMaterialization,
     pub summary: ConversationSummaryFrontier,
+    pub lifecycle_state: Option<ConversationLifecycleState>,
     pub last_seq: u64,
 }
 
-#[derive(Debug, Clone)]
-pub struct ConversationReplay {
-    pub records: Vec<ConversationEventRecordV2>,
-    pub repairs: Vec<EventLogRepairWarning>,
-    pub frontier: ConversationFrontier,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SparseEventOffset {
+    pub seq: u64,
+    pub byte_offset: u64,
 }
 
-impl ConversationReplay {
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StreamSparseOffsets {
+    pub entries: Vec<SparseEventOffset>,
+    pub event_count: u64,
+    pub validated_bytes: u64,
+    pub last_seq: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventLogSparseOffsets {
+    pub messages: StreamSparseOffsets,
+    pub tool_calls: StreamSparseOffsets,
+    pub bindings: StreamSparseOffsets,
+    pub attachments: StreamSparseOffsets,
+}
+
+impl EventLogSparseOffsets {
+    #[must_use]
+    pub fn stream(&self, stream: ConversationEventStream) -> &StreamSparseOffsets {
+        match stream {
+            ConversationEventStream::Messages => &self.messages,
+            ConversationEventStream::ToolCalls => &self.tool_calls,
+            ConversationEventStream::Bindings => &self.bindings,
+            ConversationEventStream::Attachments => &self.attachments,
+        }
+    }
+
+    fn stream_mut(&mut self, stream: ConversationEventStream) -> &mut StreamSparseOffsets {
+        match stream {
+            ConversationEventStream::Messages => &mut self.messages,
+            ConversationEventStream::ToolCalls => &mut self.tool_calls,
+            ConversationEventStream::Bindings => &mut self.bindings,
+            ConversationEventStream::Attachments => &mut self.attachments,
+        }
+    }
+
+    #[must_use]
+    pub fn entry_count(&self) -> usize {
+        self.messages.entries.len()
+            + self.tool_calls.entries.len()
+            + self.bindings.entries.len()
+            + self.attachments.entries.len()
+    }
+
+    #[must_use]
+    pub fn event_count(&self) -> u64 {
+        self.messages
+            .event_count
+            .saturating_add(self.tool_calls.event_count)
+            .saturating_add(self.bindings.event_count)
+            .saturating_add(self.attachments.event_count)
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EventLogScan {
+    pub frontier: ConversationFrontier,
+    pub repairs: Vec<EventLogRepairWarning>,
+    pub sparse_offsets: EventLogSparseOffsets,
+}
+
+/// Source-compatible compact replacement for the historical replay container.
+pub type ConversationReplay = EventLogScan;
+
+impl EventLogScan {
     #[must_use]
     pub fn last_seq(&self) -> u64 {
         self.frontier.last_seq
@@ -211,6 +279,34 @@ impl ConversationReplay {
     #[must_use]
     pub fn last_recorded_at_utc(&self) -> Option<DateTime<Utc>> {
         self.frontier.summary.last_activity_at_utc
+    }
+
+    #[must_use]
+    pub fn event_count(&self) -> u64 {
+        self.sparse_offsets.event_count()
+    }
+
+    #[must_use]
+    pub fn sparse_index_entry_count(&self) -> usize {
+        self.sparse_offsets.entry_count()
+    }
+
+    pub(crate) fn record_appended(
+        &mut self,
+        stream: ConversationEventStream,
+        seq: u64,
+        byte_offset: u64,
+        encoded_line_bytes: u64,
+    ) {
+        let offsets = self.sparse_offsets.stream_mut(stream);
+        debug_assert_eq!(offsets.validated_bytes, byte_offset);
+        debug_assert!(seq > offsets.last_seq);
+        if offsets.event_count.is_multiple_of(SPARSE_OFFSET_STRIDE) {
+            offsets.entries.push(SparseEventOffset { seq, byte_offset });
+        }
+        offsets.event_count = offsets.event_count.saturating_add(1);
+        offsets.validated_bytes = byte_offset.saturating_add(encoded_line_bytes);
+        offsets.last_seq = seq;
     }
 }
 
@@ -247,6 +343,7 @@ pub struct AttachmentMaterialization {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventLogErrorKind {
     Io,
+    InvalidPageLimit,
     CorruptRecord,
     UnsupportedSchema,
     ConversationMismatch,
@@ -263,6 +360,8 @@ pub struct EventLogError {
     pub kind: EventLogErrorKind,
     pub conversation_id: ConversationId,
     pub path: PathBuf,
+    pub seq: Option<u64>,
+    pub byte_offset: Option<u64>,
     pub detail: String,
 }
 
@@ -270,8 +369,8 @@ impl fmt::Display for EventLogError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "{:?} for Conversation {} at '{}': {}",
-            self.code,
+            "{} for Conversation {} at '{}': {}",
+            self.stable_code(),
             self.conversation_id,
             self.path.display(),
             self.detail
@@ -281,31 +380,50 @@ impl fmt::Display for EventLogError {
 
 impl std::error::Error for EventLogError {}
 
+impl EventLogError {
+    #[must_use]
+    pub fn stable_code(&self) -> String {
+        if self.kind == EventLogErrorKind::InvalidPageLimit {
+            "VALIDATION_ERROR".to_string()
+        } else {
+            stable_error_code(self.code)
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, EventLogError>;
 
-/// Load, conservatively repair, merge, and materialize every canonical stream.
-pub fn replay_conversation(
+/// Stream, conservatively repair, globally merge, and materialize compact canonical state.
+///
+/// At most one decoded record per physical stream is retained while scanning. Historical payloads
+/// are discarded after they update the compact frontier; only every 256th physical record offset
+/// remains for later bounded page reads.
+pub fn scan_event_log(
     directory: &Path,
     conversation_id: ConversationId,
     durable_fs: &DurableFileSystem,
-) -> Result<ConversationReplay> {
-    let mut records = Vec::new();
-    let mut repairs = Vec::new();
-    for stream in [
-        ConversationEventStream::Messages,
-        ConversationEventStream::ToolCalls,
-        ConversationEventStream::Bindings,
-        ConversationEventStream::Attachments,
-    ] {
-        let loaded = load_stream(directory, conversation_id, stream, durable_fs)?;
-        records.extend(loaded.records);
-        repairs.extend(loaded.repairs);
-    }
+) -> Result<EventLogScan> {
+    let mut scanners = event_streams()
+        .into_iter()
+        .map(|stream| StreamScanner::open(directory, conversation_id, stream))
+        .collect::<Result<Vec<_>>>()?;
+    let mut pending = scanners
+        .iter_mut()
+        .map(|scanner| scanner.next_record(directory, conversation_id, durable_fs))
+        .collect::<Result<Vec<_>>>()?;
+    let mut frontier = ConversationFrontier::default();
 
-    records.sort_by_key(|record| record.seq);
-    let mut previous = 0u64;
-    for record in &records {
-        if record.seq == 0 || record.seq <= previous {
+    while let Some(next_index) = pending
+        .iter()
+        .enumerate()
+        .filter_map(|(index, record)| record.as_ref().map(|record| (index, record.seq)))
+        .min_by_key(|(_, seq)| *seq)
+        .map(|(index, _)| index)
+    {
+        let record = pending[next_index]
+            .take()
+            .expect("selected pending event exists");
+        if record.seq == 0 || record.seq <= frontier.last_seq {
             return Err(error(
                 ConversationErrorCode::ConversationRecoveryRequired,
                 EventLogErrorKind::SequenceConflict,
@@ -314,18 +432,32 @@ pub fn replay_conversation(
                 format!("global sequence conflict at seq {}", record.seq),
             ));
         }
-        previous = record.seq;
+        apply_event(&mut frontier, &record)?;
+        pending[next_index] =
+            scanners[next_index].next_record(directory, conversation_id, durable_fs)?;
     }
 
-    let mut frontier = ConversationFrontier::default();
-    for record in &records {
-        apply_event(&mut frontier, record)?;
+    let mut repairs = Vec::new();
+    let mut sparse_offsets = EventLogSparseOffsets::default();
+    for scanner in scanners {
+        repairs.extend(scanner.repairs);
+        *sparse_offsets.stream_mut(scanner.stream) = scanner.offsets;
     }
-    Ok(ConversationReplay {
-        records,
-        repairs,
+    Ok(EventLogScan {
         frontier,
+        repairs,
+        sparse_offsets,
     })
+}
+
+/// Compatibility name retained for callers that previously replayed during validation.
+/// The returned value is compact and contains no historical payload vector.
+pub fn replay_conversation(
+    directory: &Path,
+    conversation_id: ConversationId,
+    durable_fs: &DurableFileSystem,
+) -> Result<EventLogScan> {
+    scan_event_log(directory, conversation_id, durable_fs)
 }
 
 /// Validate and materialize an already seq-ordered record set.
@@ -386,170 +518,667 @@ pub fn apply_event(
     apply_binding_event(&mut frontier.binding, record, path)?;
     apply_attachment_event(&mut frontier.attachment, record, path)?;
     apply_summary_event(&mut frontier.summary, record)?;
+    match record.type_ {
+        ConversationEventType::CreationFailed => {
+            frontier.lifecycle_state = Some(ConversationLifecycleState::AgentFailed);
+        }
+        ConversationEventType::BindingBound
+        | ConversationEventType::BindingReplaced
+        | ConversationEventType::BindingRebound => {
+            frontier.lifecycle_state = Some(ConversationLifecycleState::Ready);
+        }
+        _ => {}
+    }
     frontier.last_seq = record.seq;
     #[cfg(test)]
     APPLY_EVENT_COUNT.set(APPLY_EVENT_COUNT.get() + 1);
     Ok(())
 }
 
-struct LoadedStream {
-    records: Vec<ConversationEventRecordV2>,
+const fn event_streams() -> [ConversationEventStream; 4] {
+    [
+        ConversationEventStream::Messages,
+        ConversationEventStream::ToolCalls,
+        ConversationEventStream::Bindings,
+        ConversationEventStream::Attachments,
+    ]
+}
+
+struct StreamScanner {
+    stream: ConversationEventStream,
+    path: PathBuf,
+    reader: Option<BufReader<File>>,
+    offset: u64,
+    previous_seq: u64,
+    offsets: StreamSparseOffsets,
     repairs: Vec<EventLogRepairWarning>,
 }
 
-fn load_stream(
-    directory: &Path,
-    conversation_id: ConversationId,
-    stream: ConversationEventStream,
-    durable_fs: &DurableFileSystem,
-) -> Result<LoadedStream> {
-    let path = directory.join(stream.file_name());
-    let bytes = fs::read(&path).map_err(|source| {
-        error(
-            ConversationErrorCode::ConversationRecoveryRequired,
-            EventLogErrorKind::Io,
-            conversation_id,
-            &path,
-            format!("required stream cannot be read: {source}"),
-        )
-    })?;
-    let mut records = Vec::new();
-    let mut repairs = Vec::new();
-    let mut offset = 0usize;
-    let mut previous_seq = 0u64;
-
-    while offset < bytes.len() {
-        let remainder = &bytes[offset..];
-        let newline = remainder.iter().position(|byte| *byte == b'\n');
-        let Some(position) = newline else {
-            let backup_name = format!("{}.corrupt-{}.bak", stream.file_name(), Uuid::new_v4());
-            let backup = directory.join(&backup_name);
-            durable_fs
-                .replace_bytes(&backup, &bytes)
-                .map_err(|source| {
-                    error(
-                        ConversationErrorCode::ConversationDurabilityFailed,
-                        EventLogErrorKind::Durability,
-                        conversation_id,
-                        &path,
-                        format!("torn-tail backup failed: {source}"),
-                    )
-                })?;
-            durable_fs
-                .replace_bytes(&path, &bytes[..offset])
-                .map_err(|source| {
-                    error(
-                        ConversationErrorCode::ConversationDurabilityFailed,
-                        EventLogErrorKind::Durability,
-                        conversation_id,
-                        &path,
-                        format!("torn-tail truncation failed: {source}"),
-                    )
-                })?;
-            let truncated_bytes = (bytes.len() - offset) as u64;
-            log::warn!(
-                "[conversation-repository] torn tail repaired conversation_id={} stream={} truncated_bytes={}",
-                conversation_id,
-                stream.file_name(),
-                truncated_bytes
-            );
-            repairs.push(EventLogRepairWarning {
-                conversation_id,
-                stream: stream.file_name().to_string(),
-                backup_file: backup_name,
-                truncated_bytes,
-            });
-            break;
-        };
-
-        let line = &remainder[..position];
-        if line.is_empty() {
-            return Err(error(
+impl StreamScanner {
+    fn open(
+        directory: &Path,
+        conversation_id: ConversationId,
+        stream: ConversationEventStream,
+    ) -> Result<Self> {
+        let path = directory.join(stream.file_name());
+        let file = File::open(&path).map_err(|source| {
+            error(
                 ConversationErrorCode::ConversationRecoveryRequired,
-                EventLogErrorKind::CorruptRecord,
+                EventLogErrorKind::Io,
                 conversation_id,
                 &path,
-                format!("empty JSONL record at byte offset {offset}"),
-            ));
+                format!("required stream cannot be read: {source}"),
+            )
+        })?;
+        Ok(Self {
+            stream,
+            path,
+            reader: Some(BufReader::new(file)),
+            offset: 0,
+            previous_seq: 0,
+            offsets: StreamSparseOffsets::default(),
+            repairs: Vec::new(),
+        })
+    }
+
+    fn next_record(
+        &mut self,
+        directory: &Path,
+        conversation_id: ConversationId,
+        durable_fs: &DurableFileSystem,
+    ) -> Result<Option<ConversationEventRecordV2>> {
+        let line_offset = self.offset;
+        let mut line = Vec::new();
+        let bytes_read = self
+            .reader
+            .as_mut()
+            .expect("stream reader remains open until EOF or torn-tail repair")
+            .read_until(b'\n', &mut line)
+            .map_err(|source| {
+                error(
+                    ConversationErrorCode::ConversationRecoveryRequired,
+                    EventLogErrorKind::Io,
+                    conversation_id,
+                    &self.path,
+                    format!("stream read failed at byte offset {line_offset}: {source}"),
+                )
+            })?;
+        if bytes_read == 0 {
+            self.offsets.validated_bytes = self.offset;
+            return Ok(None);
         }
-        let value: Value = serde_json::from_slice(line).map_err(|source| {
+        if line.last() != Some(&b'\n') {
+            self.reader.take();
+            let warning = repair_torn_tail(
+                directory,
+                conversation_id,
+                self.stream,
+                &self.path,
+                line_offset,
+                durable_fs,
+            )?;
+            self.offsets.validated_bytes = line_offset;
+            self.repairs.push(warning);
+            return Ok(None);
+        }
+        self.offset = self.offset.checked_add(bytes_read as u64).ok_or_else(|| {
             error(
                 ConversationErrorCode::ConversationRecoveryRequired,
                 EventLogErrorKind::CorruptRecord,
                 conversation_id,
-                &path,
-                format!("invalid newline-terminated JSON record at byte offset {offset}: {source}"),
+                &self.path,
+                "stream byte offset overflow".to_string(),
             )
         })?;
-        let found_version = value.get("schemaVersion").and_then(Value::as_u64);
-        if found_version != Some(u64::from(CONVERSATION_EVENT_SCHEMA_VERSION)) {
-            return Err(error(
-                ConversationErrorCode::ConversationUnsupportedSchema,
-                EventLogErrorKind::UnsupportedSchema,
+        let record = decode_record(
+            &line[..line.len() - 1],
+            conversation_id,
+            self.stream,
+            &self.path,
+            line_offset,
+            self.previous_seq,
+        )?;
+        if self
+            .offsets
+            .event_count
+            .is_multiple_of(SPARSE_OFFSET_STRIDE)
+        {
+            self.offsets.entries.push(SparseEventOffset {
+                seq: record.seq,
+                byte_offset: line_offset,
+            });
+        }
+        self.offsets.event_count = self.offsets.event_count.checked_add(1).ok_or_else(|| {
+            error(
+                ConversationErrorCode::ConversationRecoveryRequired,
+                EventLogErrorKind::CorruptRecord,
                 conversation_id,
-                &path,
+                &self.path,
+                "stream event count overflow".to_string(),
+            )
+        })?;
+        self.offsets.validated_bytes = self.offset;
+        self.offsets.last_seq = record.seq;
+        self.previous_seq = record.seq;
+        Ok(Some(record))
+    }
+}
+
+fn repair_torn_tail(
+    directory: &Path,
+    conversation_id: ConversationId,
+    stream: ConversationEventStream,
+    path: &Path,
+    valid_bytes: u64,
+    durable_fs: &DurableFileSystem,
+) -> Result<EventLogRepairWarning> {
+    let backup_name = format!("{}.corrupt-{}.bak", stream.file_name(), Uuid::new_v4());
+    let backup = directory.join(&backup_name);
+    let mut source_file = File::open(path).map_err(|source| {
+        error(
+            ConversationErrorCode::ConversationRecoveryRequired,
+            EventLogErrorKind::Io,
+            conversation_id,
+            path,
+            format!("torn stream cannot be reopened for repair: {source}"),
+        )
+    })?;
+    let mut backup_options = OpenOptions::new();
+    backup_options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        backup_options.mode(0o600);
+    }
+    let mut backup_file = backup_options.open(&backup).map_err(|source| {
+        error(
+            ConversationErrorCode::ConversationDurabilityFailed,
+            EventLogErrorKind::Durability,
+            conversation_id,
+            path,
+            format!("torn-tail backup creation failed: {source}"),
+        )
+    })?;
+    let copied_bytes = match copy(&mut source_file, &mut backup_file) {
+        Ok(copied_bytes) => copied_bytes,
+        Err(source) => {
+            drop(backup_file);
+            drop(source_file);
+            let _ = fs::remove_file(&backup);
+            return Err(error(
+                ConversationErrorCode::ConversationDurabilityFailed,
+                EventLogErrorKind::Durability,
+                conversation_id,
+                path,
+                format!("torn-tail backup copy failed: {source}"),
+            ));
+        }
+    };
+    backup_file.flush().map_err(|source| {
+        error(
+            ConversationErrorCode::ConversationDurabilityFailed,
+            EventLogErrorKind::Durability,
+            conversation_id,
+            path,
+            format!("torn-tail backup flush failed: {source}"),
+        )
+    })?;
+    drop(backup_file);
+    drop(source_file);
+    if copied_bytes < valid_bytes {
+        return Err(error(
+            ConversationErrorCode::ConversationRecoveryRequired,
+            EventLogErrorKind::CorruptRecord,
+            conversation_id,
+            path,
+            "stream changed while repairing its torn tail".to_string(),
+        ));
+    }
+    durable_fs
+        .sync_file_and_namespace(&backup)
+        .map_err(|source| {
+            error(
+                ConversationErrorCode::ConversationDurabilityFailed,
+                EventLogErrorKind::Durability,
+                conversation_id,
+                path,
+                format!("torn-tail backup durability failed: {source}"),
+            )
+        })?;
+    let original = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|source| {
+            error(
+                ConversationErrorCode::ConversationDurabilityFailed,
+                EventLogErrorKind::Durability,
+                conversation_id,
+                path,
+                format!("torn-tail truncation open failed: {source}"),
+            )
+        })?;
+    original.set_len(valid_bytes).map_err(|source| {
+        error(
+            ConversationErrorCode::ConversationDurabilityFailed,
+            EventLogErrorKind::Durability,
+            conversation_id,
+            path,
+            format!("torn-tail truncation failed: {source}"),
+        )
+    })?;
+    drop(original);
+    durable_fs.sync_file_and_namespace(path).map_err(|source| {
+        error(
+            ConversationErrorCode::ConversationDurabilityFailed,
+            EventLogErrorKind::Durability,
+            conversation_id,
+            path,
+            format!("torn-tail truncation durability failed: {source}"),
+        )
+    })?;
+    let truncated_bytes = copied_bytes - valid_bytes;
+    log::warn!(
+        "[conversation-repository] torn tail repaired conversation_id={} stream={} truncated_bytes={}",
+        conversation_id,
+        stream.file_name(),
+        truncated_bytes
+    );
+    Ok(EventLogRepairWarning {
+        conversation_id,
+        stream: stream.file_name().to_string(),
+        backup_file: backup_name,
+        truncated_bytes,
+    })
+}
+
+fn decode_record(
+    line: &[u8],
+    conversation_id: ConversationId,
+    stream: ConversationEventStream,
+    path: &Path,
+    offset: u64,
+    previous_seq: u64,
+) -> Result<ConversationEventRecordV2> {
+    if line.is_empty() {
+        return Err(error_at(
+            ConversationErrorCode::ConversationRecoveryRequired,
+            EventLogErrorKind::CorruptRecord,
+            conversation_id,
+            path,
+            None,
+            Some(offset),
+            format!("empty JSONL record at byte offset {offset}"),
+        ));
+    }
+    let value: Value = serde_json::from_slice(line).map_err(|source| {
+        error_at(
+            ConversationErrorCode::ConversationRecoveryRequired,
+            EventLogErrorKind::CorruptRecord,
+            conversation_id,
+            path,
+            None,
+            Some(offset),
+            format!("invalid newline-terminated JSON record at byte offset {offset}: {source}"),
+        )
+    })?;
+    let found_version = value.get("schemaVersion").and_then(Value::as_u64);
+    if found_version != Some(u64::from(CONVERSATION_EVENT_SCHEMA_VERSION)) {
+        return Err(error_at(
+            ConversationErrorCode::ConversationUnsupportedSchema,
+            EventLogErrorKind::UnsupportedSchema,
+            conversation_id,
+            path,
+            value.get("seq").and_then(Value::as_u64),
+            Some(offset),
+            format!(
+                "event schemaVersion {:?} is unsupported; expected {}",
+                found_version, CONVERSATION_EVENT_SCHEMA_VERSION
+            ),
+        ));
+    }
+    let canonical_id = conversation_id.to_string();
+    if value.get("conversationId").and_then(Value::as_str) != Some(canonical_id.as_str()) {
+        return Err(error_at(
+            ConversationErrorCode::ConversationRecoveryRequired,
+            EventLogErrorKind::ConversationMismatch,
+            conversation_id,
+            path,
+            value.get("seq").and_then(Value::as_u64),
+            Some(offset),
+            format!(
+                "record at byte offset {offset} has a non-canonical or mismatched conversationId"
+            ),
+        ));
+    }
+    let record: ConversationEventRecordV2 = serde_json::from_value(value).map_err(|source| {
+        error_at(
+            ConversationErrorCode::ConversationRecoveryRequired,
+            EventLogErrorKind::CorruptRecord,
+            conversation_id,
+            path,
+            None,
+            Some(offset),
+            format!("invalid v2 event at byte offset {offset}: {source}"),
+        )
+    })?;
+    if record.conversation_id != conversation_id {
+        return Err(error_at(
+            ConversationErrorCode::ConversationRecoveryRequired,
+            EventLogErrorKind::ConversationMismatch,
+            conversation_id,
+            path,
+            Some(record.seq),
+            Some(offset),
+            format!("record seq {} has a mismatched conversationId", record.seq),
+        ));
+    }
+    if record.type_.stream() != stream {
+        return Err(error_at(
+            ConversationErrorCode::ConversationRecoveryRequired,
+            EventLogErrorKind::StreamMismatch,
+            conversation_id,
+            path,
+            Some(record.seq),
+            Some(offset),
+            format!("record seq {} is routed to the wrong stream", record.seq),
+        ));
+    }
+    if record.seq == 0 || record.seq <= previous_seq {
+        return Err(error_at(
+            ConversationErrorCode::ConversationRecoveryRequired,
+            EventLogErrorKind::SequenceConflict,
+            conversation_id,
+            path,
+            Some(record.seq),
+            Some(offset),
+            format!(
+                "physical stream sequence decreases or duplicates at {}",
+                record.seq
+            ),
+        ));
+    }
+    Ok(record)
+}
+
+struct PageStreamReader {
+    stream: ConversationEventStream,
+    path: PathBuf,
+    reader: BufReader<File>,
+    offset: u64,
+    validated_bytes: u64,
+    previous_seq: u64,
+    expected_anchor_seq: Option<u64>,
+}
+
+impl PageStreamReader {
+    fn open(
+        directory: &Path,
+        conversation_id: ConversationId,
+        stream: ConversationEventStream,
+        offsets: &StreamSparseOffsets,
+        anchor: SparseEventOffset,
+    ) -> Result<Self> {
+        if anchor.byte_offset >= offsets.validated_bytes {
+            return Err(error_at(
+                ConversationErrorCode::ConversationRecoveryRequired,
+                EventLogErrorKind::CorruptRecord,
+                conversation_id,
+                &directory.join(stream.file_name()),
+                Some(anchor.seq),
+                Some(anchor.byte_offset),
                 format!(
-                    "event schemaVersion {:?} is unsupported; expected {}",
-                    found_version, CONVERSATION_EVENT_SCHEMA_VERSION
+                    "sparse offset {} is outside validated stream bytes {}",
+                    anchor.byte_offset, offsets.validated_bytes
                 ),
             ));
         }
-        let canonical_id = conversation_id.to_string();
-        if value.get("conversationId").and_then(Value::as_str) != Some(canonical_id.as_str()) {
-            return Err(error(
+        let path = directory.join(stream.file_name());
+        let mut file = File::open(&path).map_err(|source| {
+            error_at(
                 ConversationErrorCode::ConversationRecoveryRequired,
-                EventLogErrorKind::ConversationMismatch,
+                EventLogErrorKind::Io,
                 conversation_id,
                 &path,
-                format!("record at byte offset {offset} has a non-canonical or mismatched conversationId"),
+                Some(anchor.seq),
+                Some(anchor.byte_offset),
+                format!("paged stream cannot be opened: {source}"),
+            )
+        })?;
+        file.seek(SeekFrom::Start(anchor.byte_offset))
+            .map_err(|source| {
+                error_at(
+                    ConversationErrorCode::ConversationRecoveryRequired,
+                    EventLogErrorKind::Io,
+                    conversation_id,
+                    &path,
+                    Some(anchor.seq),
+                    Some(anchor.byte_offset),
+                    format!(
+                        "paged stream seek failed at byte offset {}: {source}",
+                        anchor.byte_offset
+                    ),
+                )
+            })?;
+        Ok(Self {
+            stream,
+            path,
+            reader: BufReader::new(file),
+            offset: anchor.byte_offset,
+            validated_bytes: offsets.validated_bytes,
+            previous_seq: 0,
+            expected_anchor_seq: Some(anchor.seq),
+        })
+    }
+
+    fn next_after(
+        &mut self,
+        conversation_id: ConversationId,
+        after_seq: u64,
+    ) -> Result<Option<ConversationEventRecordV2>> {
+        while let Some(record) = self.next_record(conversation_id)? {
+            if record.seq > after_seq {
+                return Ok(Some(record));
+            }
+        }
+        Ok(None)
+    }
+
+    fn next_record(
+        &mut self,
+        conversation_id: ConversationId,
+    ) -> Result<Option<ConversationEventRecordV2>> {
+        if self.offset == self.validated_bytes {
+            return Ok(None);
+        }
+        if self.offset > self.validated_bytes {
+            return Err(error_at(
+                ConversationErrorCode::ConversationRecoveryRequired,
+                EventLogErrorKind::CorruptRecord,
+                conversation_id,
+                &self.path,
+                None,
+                Some(self.offset),
+                format!(
+                    "page cursor offset {} exceeds validated bytes {}",
+                    self.offset, self.validated_bytes
+                ),
             ));
         }
-        let record: ConversationEventRecordV2 =
-            serde_json::from_value(value).map_err(|source| {
-                error(
+        let line_offset = self.offset;
+        let mut line = Vec::new();
+        let bytes_read = self.reader.read_until(b'\n', &mut line).map_err(|source| {
+            error_at(
+                ConversationErrorCode::ConversationRecoveryRequired,
+                EventLogErrorKind::Io,
+                conversation_id,
+                &self.path,
+                None,
+                Some(line_offset),
+                format!("paged stream read failed at byte offset {line_offset}: {source}"),
+            )
+        })?;
+        if bytes_read == 0 || line.last() != Some(&b'\n') {
+            return Err(error_at(
+                ConversationErrorCode::ConversationRecoveryRequired,
+                EventLogErrorKind::CorruptRecord,
+                conversation_id,
+                &self.path,
+                None,
+                Some(line_offset),
+                format!("validated stream ended unexpectedly at byte offset {line_offset}"),
+            ));
+        }
+        let next_offset = self.offset.checked_add(bytes_read as u64).ok_or_else(|| {
+            error_at(
+                ConversationErrorCode::ConversationRecoveryRequired,
+                EventLogErrorKind::CorruptRecord,
+                conversation_id,
+                &self.path,
+                None,
+                Some(line_offset),
+                "page cursor byte offset overflow".to_string(),
+            )
+        })?;
+        if next_offset > self.validated_bytes {
+            return Err(error_at(
+                ConversationErrorCode::ConversationRecoveryRequired,
+                EventLogErrorKind::CorruptRecord,
+                conversation_id,
+                &self.path,
+                None,
+                Some(line_offset),
+                format!(
+                    "record at byte offset {line_offset} crosses validated stream boundary {}",
+                    self.validated_bytes
+                ),
+            ));
+        }
+        let record = decode_record(
+            &line[..line.len() - 1],
+            conversation_id,
+            self.stream,
+            &self.path,
+            line_offset,
+            self.previous_seq,
+        )?;
+        if let Some(expected_seq) = self.expected_anchor_seq.take() {
+            if record.seq != expected_seq {
+                return Err(error_at(
                     ConversationErrorCode::ConversationRecoveryRequired,
                     EventLogErrorKind::CorruptRecord,
                     conversation_id,
-                    &path,
-                    format!("invalid v2 event at byte offset {offset}: {source}"),
-                )
-            })?;
-        if record.conversation_id != conversation_id {
+                    &self.path,
+                    Some(record.seq),
+                    Some(line_offset),
+                    format!(
+                        "sparse offset at byte {line_offset} expected seq {expected_seq}, found {}",
+                        record.seq
+                    ),
+                ));
+            }
+        }
+        self.offset = next_offset;
+        self.previous_seq = record.seq;
+        Ok(Some(record))
+    }
+}
+
+/// Read one globally ordered page by seeking each stream to its nearest validated sparse offset.
+pub fn read_event_page(
+    directory: &Path,
+    conversation_id: ConversationId,
+    scan: &EventLogScan,
+    after_seq: u64,
+    limit: usize,
+) -> Result<Vec<ConversationEventRecordV2>> {
+    if !(MIN_EVENT_PAGE_LIMIT..=MAX_EVENT_PAGE_LIMIT).contains(&limit) {
+        return Err(error(
+            ConversationErrorCode::ConversationInvalidId,
+            EventLogErrorKind::InvalidPageLimit,
+            conversation_id,
+            directory,
+            format!(
+                "event page limit must be between {MIN_EVENT_PAGE_LIMIT} and {MAX_EVENT_PAGE_LIMIT}"
+            ),
+        ));
+    }
+    if after_seq > scan.last_seq() {
+        return Err(error(
+            ConversationErrorCode::ConversationRecoveryRequired,
+            EventLogErrorKind::SequenceConflict,
+            conversation_id,
+            directory,
+            format!(
+                "page cursor {after_seq} is ahead of validated lastSeq {}",
+                scan.last_seq()
+            ),
+        ));
+    }
+    if after_seq == scan.last_seq() {
+        return Ok(Vec::new());
+    }
+
+    let mut readers = Vec::new();
+    let mut pending = Vec::new();
+    for stream in event_streams() {
+        let offsets = scan.sparse_offsets.stream(stream);
+        if offsets.event_count == 0 {
+            continue;
+        }
+        let Some(anchor) = offsets
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| entry.seq <= after_seq)
+            .or_else(|| offsets.entries.first())
+            .copied()
+        else {
             return Err(error(
                 ConversationErrorCode::ConversationRecoveryRequired,
-                EventLogErrorKind::ConversationMismatch,
+                EventLogErrorKind::CorruptRecord,
                 conversation_id,
-                &path,
-                format!("record seq {} has a mismatched conversationId", record.seq),
+                &directory.join(stream.file_name()),
+                "validated non-empty stream has no sparse offset".to_string(),
             ));
-        }
-        if record.type_.stream() != stream {
-            return Err(error(
-                ConversationErrorCode::ConversationRecoveryRequired,
-                EventLogErrorKind::StreamMismatch,
-                conversation_id,
-                &path,
-                format!("record seq {} is routed to the wrong stream", record.seq),
-            ));
-        }
-        if record.seq == 0 || record.seq <= previous_seq {
-            return Err(error(
+        };
+        let mut reader =
+            PageStreamReader::open(directory, conversation_id, stream, offsets, anchor)?;
+        let next = reader.next_after(conversation_id, after_seq)?;
+        readers.push(reader);
+        pending.push(next);
+    }
+
+    let mut records = Vec::with_capacity(limit);
+    let mut previous_seq = after_seq;
+    while records.len() < limit {
+        let Some(next_index) = pending
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| record.as_ref().map(|record| (index, record.seq)))
+            .min_by_key(|(_, seq)| *seq)
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        let record = pending[next_index]
+            .take()
+            .expect("selected paged event exists");
+        if record.seq <= previous_seq {
+            return Err(error_at(
                 ConversationErrorCode::ConversationRecoveryRequired,
                 EventLogErrorKind::SequenceConflict,
                 conversation_id,
-                &path,
-                format!(
-                    "physical stream sequence decreases or duplicates at {}",
-                    record.seq
-                ),
+                &directory.join(record.type_.stream().file_name()),
+                Some(record.seq),
+                None,
+                format!("global paged sequence conflict at seq {}", record.seq),
             ));
         }
         previous_seq = record.seq;
         records.push(record);
-        offset += position + 1;
+        pending[next_index] = readers[next_index].next_record(conversation_id)?;
     }
-
-    Ok(LoadedStream { records, repairs })
+    Ok(records)
 }
 
 fn apply_binding_event(
@@ -1019,11 +1648,20 @@ fn attachment_history_error(
     )
 }
 
-fn error(
+fn stable_error_code(code: ConversationErrorCode) -> String {
+    serde_json::to_value(code)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "CONVERSATION_RECOVERY_REQUIRED".to_string())
+}
+
+fn error_at(
     code: ConversationErrorCode,
     kind: EventLogErrorKind,
     conversation_id: ConversationId,
     path: &Path,
+    seq: Option<u64>,
+    byte_offset: Option<u64>,
     detail: String,
 ) -> EventLogError {
     EventLogError {
@@ -1031,8 +1669,20 @@ fn error(
         kind,
         conversation_id,
         path: path.to_path_buf(),
+        seq,
+        byte_offset,
         detail,
     }
+}
+
+fn error(
+    code: ConversationErrorCode,
+    kind: EventLogErrorKind,
+    conversation_id: ConversationId,
+    path: &Path,
+    detail: String,
+) -> EventLogError {
+    error_at(code, kind, conversation_id, path, None, None, detail)
 }
 
 #[cfg(test)]
@@ -1070,7 +1720,7 @@ mod tests {
         ConversationEventRecordV2::new(
             ConversationId::parse(ID).unwrap(),
             seq,
-            parse_created_at_utc(&format!("2026-08-15T09:45:{seq:02}.000Z")).unwrap(),
+            parse_created_at_utc("2026-08-15T09:45:15.000Z").unwrap(),
             type_,
             json!({}),
         )
@@ -1172,16 +1822,66 @@ mod tests {
         ] {
             append(&durable_fs, &directory, &record);
         }
-        let replay = replay_conversation(&directory, id, &durable_fs).unwrap();
+        let scan = replay_conversation(&directory, id, &durable_fs).unwrap();
         assert_eq!(
-            replay
-                .records
+            read_event_page(&directory, id, &scan, 0, 10)
+                .unwrap()
                 .iter()
                 .map(|record| record.seq)
                 .collect::<Vec<_>>(),
             vec![1, 2, 3, 4]
         );
-        assert_eq!(replay.last_seq(), 4);
+        assert_eq!(scan.last_seq(), 4);
+        assert_eq!(scan.event_count(), 4);
+    }
+
+    #[test]
+    fn paged_read_seeks_sparse_offsets_and_matches_global_full_order() {
+        let (_temp, directory, id, durable_fs) = fixture();
+        let mut expected = Vec::new();
+        for seq in 1..=1_030_u64 {
+            let type_ = if seq % 2 == 0 {
+                ConversationEventType::ToolCall
+            } else {
+                ConversationEventType::MessageChunk
+            };
+            let mut event = record(seq, type_);
+            event.payload = json!({"marker":seq});
+            append(&durable_fs, &directory, &event);
+            expected.push(event);
+        }
+        let scan = scan_event_log(&directory, id, &durable_fs).unwrap();
+        assert_eq!(scan.event_count(), 1_030);
+        assert_eq!(scan.sparse_offsets.messages.entries.len(), 3);
+        assert_eq!(scan.sparse_offsets.tool_calls.entries.len(), 3);
+
+        for limit in [1, 17, 256, 1_000] {
+            let mut actual = Vec::new();
+            let mut cursor = 0;
+            while cursor < scan.last_seq() {
+                let page = read_event_page(&directory, id, &scan, cursor, limit).unwrap();
+                assert!(!page.is_empty());
+                assert!(page.len() <= limit);
+                cursor = page.last().unwrap().seq;
+                actual.extend(page);
+            }
+            assert_eq!(actual, expected, "limit={limit}");
+        }
+
+        for invalid_limit in [0, MAX_EVENT_PAGE_LIMIT + 1] {
+            let error = read_event_page(&directory, id, &scan, 0, invalid_limit).unwrap_err();
+            assert_eq!(error.stable_code(), "VALIDATION_ERROR");
+            assert_eq!(error.kind, EventLogErrorKind::InvalidPageLimit);
+        }
+
+        let mut corrupt_offsets = scan.clone();
+        corrupt_offsets.sparse_offsets.messages.entries[0].byte_offset += 1;
+        let error = read_event_page(&directory, id, &corrupt_offsets, 0, 17).unwrap_err();
+        assert_eq!(
+            error.code,
+            ConversationErrorCode::ConversationRecoveryRequired
+        );
+        assert_eq!(error.byte_offset, Some(1));
     }
 
     #[test]

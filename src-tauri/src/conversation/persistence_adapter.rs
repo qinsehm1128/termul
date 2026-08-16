@@ -19,7 +19,7 @@ use crate::acp::session_persistence::{
 use crate::conversation::contracts::{
     AgentSessionBindingState, ConversationId, ConversationLifecycleState, ConversationTitleSource,
 };
-use crate::conversation::event_log::ConversationEventType;
+use crate::conversation::event_log::{ConversationEventType, MAX_EVENT_PAGE_LIMIT};
 use crate::conversation::migration::ConversationReader;
 use crate::conversation::repository::ConversationRepository;
 use crate::conversation::write_authority::{ConversationMutation, ConversationWriter};
@@ -275,29 +275,8 @@ impl ConversationPersistenceAdapter {
                     source.to_string(),
                 )
             })?;
-        let events = self
-            .repository
-            .read_events(conversation_id, 0)
-            .map_err(|source| {
-                error(
-                    "CONVERSATION_READ_FAILED",
-                    "materialize_events",
-                    source.to_string(),
-                )
-            })?;
-        let persisted = events
-            .into_iter()
-            .filter_map(|event| {
-                legacy_event_type(event.type_).map(|type_| PersistedEventRecord {
-                    schema_version: SESSION_SCHEMA_VERSION,
-                    session_id: agent_session_id.to_string(),
-                    seq: event.seq,
-                    type_: type_.to_string(),
-                    recorded_at: event.recorded_at_utc.timestamp_millis().max(0) as u64,
-                    payload: event.payload,
-                })
-            })
-            .collect::<Vec<_>>();
+        let persisted =
+            self.legacy_events_after(conversation_id, agent_session_id, 0, record.last_seq)?;
         let created_at = record.created_at_utc.timestamp_millis().max(0) as u64;
         Ok((
             SessionMetadata {
@@ -348,11 +327,75 @@ impl ConversationPersistenceAdapter {
         agent_session_id: &str,
         cursor: u64,
     ) -> Result<Vec<PersistedEventRecord>> {
-        let (_, records) = self.legacy_materialization(agent_session_id)?;
-        Ok(records
-            .into_iter()
-            .filter(|record| record.seq > cursor)
-            .collect())
+        let conversation_id = self
+            .conversation_id_for_history_binding(agent_session_id)
+            .ok_or_else(|| {
+                error(
+                    "CONVERSATION_NOT_FOUND",
+                    "replay_after",
+                    "binding not found",
+                )
+            })?;
+        let last_seq = self
+            .reader
+            .get(conversation_id)
+            .map_err(|source| {
+                error(
+                    "CONVERSATION_READ_FAILED",
+                    "replay_after",
+                    source.to_string(),
+                )
+            })?
+            .last_seq;
+        self.legacy_events_after(conversation_id, agent_session_id, cursor, last_seq)
+    }
+
+    fn legacy_events_after(
+        &self,
+        conversation_id: ConversationId,
+        agent_session_id: &str,
+        after_seq: u64,
+        target_last_seq: u64,
+    ) -> Result<Vec<PersistedEventRecord>> {
+        let mut cursor = after_seq;
+        let mut persisted = Vec::new();
+        while cursor < target_last_seq {
+            let page = self
+                .repository
+                .read_event_page(conversation_id, cursor, MAX_EVENT_PAGE_LIMIT)
+                .map_err(|source| {
+                    error(
+                        "CONVERSATION_READ_FAILED",
+                        "materialize_events",
+                        source.to_string(),
+                    )
+                })?;
+            let page = page
+                .into_iter()
+                .take_while(|event| event.seq <= target_last_seq)
+                .collect::<Vec<_>>();
+            let Some(last_seq) = page.last().map(|event| event.seq) else {
+                return Err(error(
+                    "CONVERSATION_READ_FAILED",
+                    "materialize_events",
+                    format!(
+                        "paged history stopped at seq {cursor} before lastSeq {target_last_seq}"
+                    ),
+                ));
+            };
+            cursor = last_seq;
+            persisted.extend(page.into_iter().filter_map(|event| {
+                legacy_event_type(event.type_).map(|type_| PersistedEventRecord {
+                    schema_version: SESSION_SCHEMA_VERSION,
+                    session_id: agent_session_id.to_string(),
+                    seq: event.seq,
+                    type_: type_.to_string(),
+                    recorded_at: event.recorded_at_utc.timestamp_millis().max(0) as u64,
+                    payload: event.payload,
+                })
+            }));
+        }
+        Ok(persisted)
     }
 
     pub async fn flush_all(&self) -> Result<()> {
@@ -441,6 +484,7 @@ mod tests {
     use crate::conversation::creation::ConversationCreationService;
     use crate::conversation::locator::{ConversationLocator, SessionWorkspaceLocator};
     use chrono::TimeZone;
+    use std::io::{BufWriter, Write};
     use uuid::Uuid;
 
     #[tokio::test]
@@ -691,6 +735,99 @@ mod tests {
         assert_eq!(sessions[0].message_count, 4);
         assert_eq!(sessions[0].tool_count, 2);
         assert_eq!(sessions[0].status, PersistedSessionStatus::Closed);
+    }
+
+    #[tokio::test]
+    async fn paged_legacy_materialization_matches_full_wrapper_beyond_1000_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let private = root.join("private");
+        let visible = root.join("visible");
+        std::fs::create_dir_all(&visible).unwrap();
+        let (repository, _) = ConversationRepository::open(private.clone()).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
+        let id = ConversationId::parse("33333333-3333-4333-8333-333333333333").unwrap();
+        let created_at = Utc
+            .timestamp_millis_opt(1_766_000_000_000)
+            .single()
+            .unwrap();
+        let record = ConversationRecordV2 {
+            schema_version: CONVERSATION_SCHEMA_VERSION,
+            conversation_id: id,
+            created_at_utc: created_at,
+            creation_partition: CreationPartition::from_created_at(created_at),
+            workspace_cwd: visible.join("workspace").to_string_lossy().into_owned(),
+            execution_target: ExecutionTarget::Workspace,
+            project_attachment: None,
+            lifecycle_state: ConversationLifecycleState::InitializingAgent,
+            last_seq: 0,
+            created_by: ConversationCreator::Termul,
+        };
+        writer
+            .create_conversation(record.clone(), ConversationMutation::CreateConversation)
+            .await
+            .unwrap();
+        writer
+            .bind_agent_session(
+                id,
+                AgentSessionBinding {
+                    schema_version: AGENT_SESSION_BINDING_SCHEMA_VERSION,
+                    binding_id: Uuid::new_v4(),
+                    agent_session_id: "opaque/paged".to_string(),
+                    runtime_agent_id: "runtime".to_string(),
+                    stable_agent_namespace: "stable".to_string(),
+                    execution_cwd: visible.to_string_lossy().into_owned(),
+                    bound_at_utc: created_at,
+                    state: AgentSessionBindingState::Active,
+                },
+                created_at,
+            )
+            .await
+            .unwrap();
+        let directory = private
+            .join(&record.creation_partition.path)
+            .join(id.to_string());
+        drop(writer);
+        drop(repository);
+
+        let messages = std::fs::OpenOptions::new()
+            .append(true)
+            .open(directory.join(crate::conversation::event_log::MESSAGES_FILE))
+            .unwrap();
+        let mut messages = BufWriter::new(messages);
+        for seq in 2..=1_051_u64 {
+            let event = crate::conversation::event_log::ConversationEventRecordV2::new(
+                id,
+                seq,
+                created_at,
+                ConversationEventType::MessageChunk,
+                serde_json::json!({"marker":seq}),
+            );
+            serde_json::to_writer(&mut messages, &event).unwrap();
+            messages.write_all(b"\n").unwrap();
+        }
+        messages.flush().unwrap();
+        drop(messages);
+
+        let (repository, _) = ConversationRepository::open(private).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
+        let reader = Arc::new(crate::conversation::ConversationReader::new(
+            Arc::clone(&repository),
+            crate::conversation::LegacyConversationReader::default(),
+            crate::conversation::ReaderPrecedence::ConversationV2Only,
+        ));
+        let adapter = ConversationPersistenceAdapter::new(writer, reader);
+        let full = repository.read_events(id, 0).unwrap();
+        assert_eq!(full.len(), 1_051);
+        let (metadata, materialized) = adapter.legacy_materialization("opaque/paged").unwrap();
+        assert_eq!(metadata.last_seq, 1_051);
+        assert_eq!(materialized.len(), 1_050);
+        assert_eq!(materialized.first().unwrap().seq, 2);
+        assert_eq!(materialized.last().unwrap().seq, 1_051);
+        let after = adapter.replay_after("opaque/paged", 1_000).unwrap();
+        assert_eq!(after.len(), 51);
+        assert_eq!(after.first().unwrap().seq, 1_001);
+        assert_eq!(after.last().unwrap().seq, 1_051);
     }
 
     #[tokio::test]

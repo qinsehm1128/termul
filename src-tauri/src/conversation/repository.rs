@@ -31,9 +31,10 @@ use crate::conversation::contracts::{
 };
 use crate::conversation::durable_fs::{DirectoryPermissions, DurableFileSystem};
 use crate::conversation::event_log::{
-    apply_event, BindingEventPayloadV1, BindingReplacementPayloadV1, ConversationEventRecordV2,
-    ConversationEventType, ConversationFrontier, ConversationReplay, EventLogRepairWarning,
-    ProjectAttachmentEventPayloadV1, CONVERSATION_EVENT_SCHEMA_VERSION, EVENT_LOG_FILES,
+    apply_event, read_event_page as read_event_page_from_log, BindingEventPayloadV1,
+    BindingReplacementPayloadV1, ConversationEventRecordV2, ConversationEventType,
+    ConversationFrontier, EventLogRepairWarning, EventLogScan, ProjectAttachmentEventPayloadV1,
+    CONVERSATION_EVENT_SCHEMA_VERSION, EVENT_LOG_FILES, MAX_EVENT_PAGE_LIMIT, MIN_EVENT_PAGE_LIMIT,
 };
 use crate::conversation::locator::ConversationLocator;
 use crate::conversation::write_authority::RepositoryWritePermit;
@@ -67,6 +68,32 @@ pub struct RepositoryRecoveryItem {
 pub struct RepositoryOpenReport {
     pub valid_conversation_count: usize,
     pub recovery_items: Vec<RepositoryRecoveryItem>,
+    pub scanned_event_count: u64,
+    pub sparse_index_entry_count: usize,
+    pub retained_payload_bytes: usize,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct BootstrapScanMetrics {
+    pub scanned_event_count: u64,
+    pub sparse_index_entry_count: usize,
+    pub retained_payload_bytes: usize,
+}
+
+pub(crate) fn bootstrap_scan_metrics<'a>(
+    scans: impl IntoIterator<Item = &'a EventLogScan>,
+) -> BootstrapScanMetrics {
+    let mut metrics = BootstrapScanMetrics::default();
+    for scan in scans {
+        metrics.scanned_event_count = metrics
+            .scanned_event_count
+            .saturating_add(scan.event_count());
+        metrics.sparse_index_entry_count = metrics
+            .sparse_index_entry_count
+            .saturating_add(scan.sparse_index_entry_count());
+    }
+    metrics
 }
 
 #[derive(Debug, Clone, Default)]
@@ -78,7 +105,7 @@ pub struct ConversationMetadataUpdate {
 #[derive(Debug, Clone)]
 struct ConversationState {
     record: ConversationRecordV2,
-    replay: ConversationReplay,
+    scan: Arc<EventLogScan>,
     provenance: Option<ConversationProvenanceFileV1>,
 }
 
@@ -88,6 +115,185 @@ struct CatalogCacheState {
     generation: u64,
     flush_count: u64,
     last_conversation_id: Option<ConversationId>,
+}
+
+pub const ACTIVE_TAIL_CACHE_MAX_CONVERSATIONS: usize = 8;
+pub const ACTIVE_TAIL_CACHE_MAX_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Debug, Clone)]
+struct ActiveTailCacheEntry {
+    after_seq: u64,
+    range_end_seq: u64,
+    limit: usize,
+    scan_last_seq: u64,
+    records: Vec<ConversationEventRecordV2>,
+    retained_bytes: usize,
+    last_used: u64,
+}
+
+#[derive(Debug, Default)]
+struct ActiveTailCache {
+    entries: HashMap<ConversationId, ActiveTailCacheEntry>,
+    retained_bytes: usize,
+    clock: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveTailCacheStats {
+    pub conversation_count: usize,
+    pub retained_bytes: usize,
+    pub conversation_ids: Vec<ConversationId>,
+}
+
+impl ActiveTailCache {
+    fn get(
+        &mut self,
+        conversation_id: ConversationId,
+        after_seq: u64,
+        limit: usize,
+        scan_last_seq: u64,
+    ) -> Option<Vec<ConversationEventRecordV2>> {
+        let entry = self.entries.get(&conversation_id)?;
+        let expected_end = entry.records.last().map_or(after_seq, |record| record.seq);
+        if entry.after_seq != after_seq
+            || entry.range_end_seq != expected_end
+            || entry.limit != limit
+            || entry.scan_last_seq != scan_last_seq
+            || entry
+                .records
+                .iter()
+                .any(|record| record.conversation_id != conversation_id)
+        {
+            return None;
+        }
+        self.clock = self.clock.saturating_add(1);
+        let entry = self
+            .entries
+            .get_mut(&conversation_id)
+            .expect("validated cache entry remains present");
+        entry.last_used = self.clock;
+        Some(entry.records.clone())
+    }
+
+    fn insert(
+        &mut self,
+        conversation_id: ConversationId,
+        after_seq: u64,
+        limit: usize,
+        scan_last_seq: u64,
+        records: Vec<ConversationEventRecordV2>,
+    ) {
+        self.invalidate(conversation_id);
+        if records.is_empty()
+            || records
+                .iter()
+                .any(|record| record.conversation_id != conversation_id)
+            || records.iter().any(event_contains_sensitive_cache_data)
+        {
+            return;
+        }
+        let retained_bytes = encoded_page_bytes(&records);
+        if retained_bytes > ACTIVE_TAIL_CACHE_MAX_BYTES {
+            return;
+        }
+        while self.entries.len() >= ACTIVE_TAIL_CACHE_MAX_CONVERSATIONS
+            || self.retained_bytes.saturating_add(retained_bytes) > ACTIVE_TAIL_CACHE_MAX_BYTES
+        {
+            let Some(lru_id) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(conversation_id, _)| *conversation_id)
+            else {
+                break;
+            };
+            self.invalidate(lru_id);
+        }
+        self.clock = self.clock.saturating_add(1);
+        let range_end_seq = records.last().map_or(after_seq, |record| record.seq);
+        self.retained_bytes = self.retained_bytes.saturating_add(retained_bytes);
+        self.entries.insert(
+            conversation_id,
+            ActiveTailCacheEntry {
+                after_seq,
+                range_end_seq,
+                limit,
+                scan_last_seq,
+                records,
+                retained_bytes,
+                last_used: self.clock,
+            },
+        );
+    }
+
+    fn invalidate(&mut self, conversation_id: ConversationId) {
+        if let Some(entry) = self.entries.remove(&conversation_id) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(entry.retained_bytes);
+        }
+    }
+
+    fn stats(&self) -> ActiveTailCacheStats {
+        let mut conversation_ids = self.entries.keys().copied().collect::<Vec<_>>();
+        conversation_ids.sort_by_key(ToString::to_string);
+        ActiveTailCacheStats {
+            conversation_count: conversation_ids.len(),
+            retained_bytes: self.retained_bytes,
+            conversation_ids,
+        }
+    }
+}
+
+fn encoded_page_bytes(records: &[ConversationEventRecordV2]) -> usize {
+    let structural_bytes = records
+        .len()
+        .saturating_mul(std::mem::size_of::<ConversationEventRecordV2>());
+    records.iter().fold(structural_bytes, |total, record| {
+        let encoded_bytes = serde_json::to_vec(record).map_or(usize::MAX, |encoded| encoded.len());
+        total
+            .saturating_add(encoded_bytes)
+            .saturating_add(value_heap_bytes(&record.payload))
+    })
+}
+
+fn value_heap_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+        Value::String(value) => value.capacity(),
+        Value::Array(values) => values
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Value>())
+            .saturating_add(values.iter().fold(0usize, |total, value| {
+                total.saturating_add(value_heap_bytes(value))
+            })),
+        Value::Object(object) => object
+            .len()
+            .saturating_mul(
+                std::mem::size_of::<String>()
+                    .saturating_add(std::mem::size_of::<Value>())
+                    .saturating_add(3 * std::mem::size_of::<usize>()),
+            )
+            .saturating_add(object.iter().fold(0usize, |total, (key, value)| {
+                total
+                    .saturating_add(key.capacity())
+                    .saturating_add(value_heap_bytes(value))
+            })),
+    }
+}
+
+fn event_contains_sensitive_cache_data(record: &ConversationEventRecordV2) -> bool {
+    fn contains_sensitive_key(value: &Value) -> bool {
+        match value {
+            Value::Object(object) => object.iter().any(|(key, value)| {
+                key.eq_ignore_ascii_case("claim")
+                    || key.eq_ignore_ascii_case("credentials")
+                    || contains_sensitive_key(value)
+            }),
+            Value::Array(values) => values.iter().any(contains_sensitive_key),
+            _ => false,
+        }
+    }
+
+    contains_sensitive_key(&record.payload)
 }
 
 #[derive(Debug)]
@@ -100,7 +306,12 @@ pub struct RepositoryError {
 
 impl fmt::Display for RepositoryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{:?} during {}", self.code, self.operation)?;
+        write!(
+            formatter,
+            "{} during {}",
+            self.stable_code(),
+            self.operation
+        )?;
         if let Some(conversation_id) = self.conversation_id {
             write!(formatter, " for Conversation {conversation_id}")?;
         }
@@ -109,6 +320,19 @@ impl fmt::Display for RepositoryError {
 }
 
 impl std::error::Error for RepositoryError {}
+
+impl RepositoryError {
+    #[must_use]
+    pub fn stable_code(&self) -> String {
+        if self.operation == "read_event_page"
+            && self.code == ConversationErrorCode::ConversationInvalidId
+        {
+            "VALIDATION_ERROR".to_string()
+        } else {
+            stable_code(self.code)
+        }
+    }
+}
 
 pub type Result<T> = std::result::Result<T, RepositoryError>;
 
@@ -127,8 +351,12 @@ pub struct ConversationRepository {
     recovery_by_id: ParkingMutex<HashMap<ConversationId, RepositoryRecoveryItem>>,
     recovery_items: ParkingMutex<Vec<RepositoryRecoveryItem>>,
     conversation_locks: ParkingMutex<HashMap<ConversationId, Arc<TokioMutex<()>>>>,
+    active_tail_cache: ParkingMutex<ActiveTailCache>,
     catalog: ParkingMutex<CatalogCacheState>,
     catalog_lock: TokioMutex<()>,
+    bootstrap_scanned_event_count: u64,
+    bootstrap_sparse_index_entry_count: usize,
+    bootstrap_duration_ms: u64,
     #[cfg(test)]
     fail_next_workspace_replace: std::sync::atomic::AtomicBool,
 }
@@ -265,6 +493,8 @@ impl ConversationRepository {
                     .cmp(&right.conversation_id.map(|id| id.to_string()))
             })
         });
+        let scan_metrics =
+            bootstrap_scan_metrics(rebuilt.accepted.iter().map(|accepted| &accepted.scan));
         let states = rebuilt
             .accepted
             .into_iter()
@@ -273,7 +503,7 @@ impl ConversationRepository {
                     accepted.record.conversation_id,
                     ConversationState {
                         record: accepted.record,
-                        replay: accepted.replay,
+                        scan: Arc::new(accepted.scan),
                         provenance: accepted.provenance,
                     },
                 )
@@ -284,9 +514,14 @@ impl ConversationRepository {
             .filter(|item| item.requires_action)
             .filter_map(|item| item.conversation_id.map(|id| (id, item.clone())))
             .collect::<HashMap<_, _>>();
+        let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         let report = RepositoryOpenReport {
             valid_conversation_count: states.len(),
             recovery_items: recovery_items.clone(),
+            scanned_event_count: scan_metrics.scanned_event_count,
+            sparse_index_entry_count: scan_metrics.sparse_index_entry_count,
+            retained_payload_bytes: scan_metrics.retained_payload_bytes,
+            duration_ms,
         };
         let repository = Arc::new(Self {
             instance_id: Uuid::new_v4(),
@@ -297,6 +532,7 @@ impl ConversationRepository {
             recovery_by_id: ParkingMutex::new(recovery_by_id),
             recovery_items: ParkingMutex::new(recovery_items),
             conversation_locks: ParkingMutex::new(HashMap::new()),
+            active_tail_cache: ParkingMutex::new(ActiveTailCache::default()),
             catalog: ParkingMutex::new(CatalogCacheState {
                 catalog,
                 dirty: false,
@@ -305,15 +541,21 @@ impl ConversationRepository {
                 last_conversation_id: None,
             }),
             catalog_lock: TokioMutex::new(()),
+            bootstrap_scanned_event_count: report.scanned_event_count,
+            bootstrap_sparse_index_entry_count: report.sparse_index_entry_count,
+            bootstrap_duration_ms: report.duration_ms,
             #[cfg(test)]
             fail_next_workspace_replace: std::sync::atomic::AtomicBool::new(false),
         });
         log::info!(
-            "[conversation-repository] open complete root={} valid_count={} recovery_item_count={} duration_ms={}",
+            "[conversation-repository] open complete root={} valid_count={} recovery_item_count={} scanned_event_count={} sparse_index_entry_count={} retained_payload_bytes={} duration_ms={}",
             private_root.display(),
             report.valid_conversation_count,
             report.recovery_items.len(),
-            started_at.elapsed().as_millis()
+            report.scanned_event_count,
+            report.sparse_index_entry_count,
+            report.retained_payload_bytes,
+            report.duration_ms
         );
         Ok((repository, report))
     }
@@ -412,7 +654,42 @@ impl ConversationRepository {
         RepositoryOpenReport {
             valid_conversation_count: self.states.lock().len(),
             recovery_items: self.recovery_items.lock().clone(),
+            scanned_event_count: self.bootstrap_scanned_event_count,
+            sparse_index_entry_count: self.bootstrap_sparse_index_entry_count,
+            retained_payload_bytes: 0,
+            duration_ms: self.bootstrap_duration_ms,
         }
+    }
+
+    #[must_use]
+    pub const fn retained_payload_bytes(&self) -> usize {
+        0
+    }
+
+    #[must_use]
+    pub fn sparse_index_entry_count(&self) -> usize {
+        self.states
+            .lock()
+            .values()
+            .map(|state| state.scan.sparse_index_entry_count())
+            .sum()
+    }
+
+    #[must_use]
+    pub fn active_tail_cache_stats(&self) -> ActiveTailCacheStats {
+        self.active_tail_cache.lock().stats()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn event_log_scan(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Result<Arc<EventLogScan>> {
+        self.states
+            .lock()
+            .get(&conversation_id)
+            .map(|state| Arc::clone(&state.scan))
+            .ok_or_else(|| not_found("event_log_scan", conversation_id))
     }
 
     pub(crate) async fn create_conversation(
@@ -472,11 +749,7 @@ impl ConversationRepository {
         }
         let state = ConversationState {
             record: record.clone(),
-            replay: ConversationReplay {
-                records: Vec::new(),
-                repairs: Vec::new(),
-                frontier: ConversationFrontier::default(),
-            },
+            scan: Arc::new(EventLogScan::default()),
             provenance: None,
         };
         self.states.lock().insert(record.conversation_id, state);
@@ -576,34 +849,142 @@ impl ConversationRepository {
         Ok(event)
     }
 
+    pub fn read_event_page(
+        &self,
+        conversation_id: ConversationId,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<ConversationEventRecordV2>> {
+        if !(MIN_EVENT_PAGE_LIMIT..=MAX_EVENT_PAGE_LIMIT).contains(&limit) {
+            return Err(repository_error(
+                ConversationErrorCode::ConversationInvalidId,
+                "read_event_page",
+                Some(conversation_id),
+                format!(
+                    "event page limit must be between {MIN_EVENT_PAGE_LIMIT} and {MAX_EVENT_PAGE_LIMIT}"
+                ),
+            ));
+        }
+        self.check_recovery(conversation_id, "read_event_page")?;
+        let (record, scan) = self
+            .states
+            .lock()
+            .get(&conversation_id)
+            .map(|state| (state.record.clone(), Arc::clone(&state.scan)))
+            .ok_or_else(|| not_found("read_event_page", conversation_id))?;
+        if record.last_seq != scan.last_seq() {
+            return Err(repository_error(
+                ConversationErrorCode::ConversationRecoveryRequired,
+                "read_event_page",
+                Some(conversation_id),
+                "metadata lastSeq does not match the validated event-log frontier".to_string(),
+            ));
+        }
+        if after_seq > record.last_seq {
+            return Err(repository_error(
+                ConversationErrorCode::ConversationRecoveryRequired,
+                "read_event_page",
+                Some(conversation_id),
+                format!("cursor {after_seq} is ahead of lastSeq {}", record.last_seq),
+            ));
+        }
+        if let Some(records) =
+            self.active_tail_cache
+                .lock()
+                .get(conversation_id, after_seq, limit, scan.last_seq())
+        {
+            return Ok(records);
+        }
+        let directory = self.conversation_dir(&record, "read_event_page")?;
+        let records = read_event_page_from_log(
+            &directory,
+            conversation_id,
+            scan.as_ref(),
+            after_seq,
+            limit,
+        )
+        .map_err(|source| {
+            log::error!(
+                "[conversation-repository] event page rejected code={} conversation_id={} stream_file={} seq={} offset={}",
+                source.stable_code(),
+                conversation_id,
+                source
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("unknown"),
+                source.seq.unwrap_or(after_seq),
+                source
+                    .byte_offset
+                    .map_or_else(|| "unknown".to_string(), |offset| offset.to_string())
+            );
+            repository_error(
+                source.code,
+                "read_event_page",
+                Some(conversation_id),
+                source.detail,
+            )
+        })?;
+        let scan_is_current = self
+            .states
+            .lock()
+            .get(&conversation_id)
+            .is_some_and(|state| state.scan.last_seq() == scan.last_seq());
+        if scan_is_current {
+            self.active_tail_cache.lock().insert(
+                conversation_id,
+                after_seq,
+                limit,
+                scan.last_seq(),
+                records.clone(),
+            );
+        }
+        Ok(records)
+    }
+
+    /// Compatibility full-history wrapper implemented exclusively through bounded pages.
     pub fn read_events(
         &self,
         conversation_id: ConversationId,
         after_seq: u64,
     ) -> Result<Vec<ConversationEventRecordV2>> {
         self.check_recovery(conversation_id, "read_events")?;
-        let states = self.states.lock();
-        let state = states
+        let target_last_seq = self
+            .states
+            .lock()
             .get(&conversation_id)
+            .map(|state| state.record.last_seq)
             .ok_or_else(|| not_found("read_events", conversation_id))?;
-        if after_seq > state.record.last_seq {
+        if after_seq > target_last_seq {
             return Err(repository_error(
                 ConversationErrorCode::ConversationRecoveryRequired,
                 "read_events",
                 Some(conversation_id),
-                format!(
-                    "cursor {after_seq} is ahead of lastSeq {}",
-                    state.record.last_seq
-                ),
+                format!("cursor {after_seq} is ahead of lastSeq {target_last_seq}"),
             ));
         }
-        Ok(state
-            .replay
-            .records
-            .iter()
-            .filter(|event| event.seq > after_seq)
-            .cloned()
-            .collect())
+        let mut cursor = after_seq;
+        let mut records = Vec::new();
+        while cursor < target_last_seq {
+            let page = self.read_event_page(conversation_id, cursor, MAX_EVENT_PAGE_LIMIT)?;
+            let page = page
+                .into_iter()
+                .take_while(|record| record.seq <= target_last_seq)
+                .collect::<Vec<_>>();
+            let Some(last_seq) = page.last().map(|record| record.seq) else {
+                return Err(repository_error(
+                    ConversationErrorCode::ConversationRecoveryRequired,
+                    "read_events",
+                    Some(conversation_id),
+                    format!(
+                        "paged compatibility read stopped at seq {cursor} before lastSeq {target_last_seq}"
+                    ),
+                ));
+            };
+            cursor = last_seq;
+            records.extend(page);
+        }
+        Ok(records)
     }
 
     pub fn current_binding(
@@ -614,7 +995,7 @@ impl ConversationRepository {
         self.states
             .lock()
             .get(&conversation_id)
-            .map(|state| state.replay.frontier.binding.current.clone())
+            .map(|state| state.scan.frontier.binding.current.clone())
             .ok_or_else(|| not_found("current_binding", conversation_id))
     }
 
@@ -626,7 +1007,7 @@ impl ConversationRepository {
         self.states
             .lock()
             .get(&conversation_id)
-            .map(|state| state.replay.frontier.binding.history.clone())
+            .map(|state| state.scan.frontier.binding.history.clone())
             .ok_or_else(|| not_found("binding_history", conversation_id))
     }
 
@@ -640,18 +1021,18 @@ impl ConversationRepository {
             .get(&conversation_id)
             .map(|state| ConversationHistorySummaryV1 {
                 conversation_id,
-                title: state.replay.frontier.summary.title.clone(),
-                title_source: state.replay.frontier.summary.title_source,
+                title: state.scan.frontier.summary.title.clone(),
+                title_source: state.scan.frontier.summary.title_source,
                 last_activity_at_utc: state
-                    .replay
+                    .scan
                     .frontier
                     .summary
                     .last_activity_at_utc
                     .map_or(state.record.created_at_utc, |event_time| {
                         event_time.max(state.record.created_at_utc)
                     }),
-                message_count: state.replay.frontier.summary.message_count,
-                tool_count: state.replay.frontier.summary.tool_count,
+                message_count: state.scan.frontier.summary.message_count,
+                tool_count: state.scan.frontier.summary.tool_count,
             })
             .ok_or_else(|| not_found("history_summary", conversation_id))
     }
@@ -664,7 +1045,7 @@ impl ConversationRepository {
         self.states
             .lock()
             .get(&conversation_id)
-            .map(|state| state.replay.frontier.clone())
+            .map(|state| state.scan.frontier.clone())
             .ok_or_else(|| not_found("conversation_frontier", conversation_id))
     }
 
@@ -1230,11 +1611,18 @@ impl ConversationRepository {
         payload: Value,
     ) -> Result<ConversationEventRecordV2> {
         self.check_recovery(conversation_id, "append_event")?;
-        let (record, mut frontier) = self
+        let stream = type_.stream();
+        let (record, mut frontier, expected_stream_bytes) = self
             .states
             .lock()
             .get(&conversation_id)
-            .map(|state| (state.record.clone(), state.replay.frontier.clone()))
+            .map(|state| {
+                (
+                    state.record.clone(),
+                    state.scan.frontier.clone(),
+                    state.scan.sparse_offsets.stream(stream).validated_bytes,
+                )
+            })
             .ok_or_else(|| not_found("append_event", conversation_id))?;
         if record.lifecycle_state == ConversationLifecycleState::RecoveryRequired
             || record.lifecycle_state == ConversationLifecycleState::Deleted
@@ -1290,36 +1678,62 @@ impl ConversationRepository {
                 error.to_string(),
             )
         })?;
+        let stream_path = directory.join(stream.file_name());
+        let actual_stream_bytes = fs::metadata(&stream_path)
+            .map_err(|error| {
+                repository_error(
+                    ConversationErrorCode::ConversationRecoveryRequired,
+                    "append_event",
+                    Some(conversation_id),
+                    format!("event stream metadata cannot be read: {error}"),
+                )
+            })?
+            .len();
+        if actual_stream_bytes != expected_stream_bytes {
+            return Err(repository_error(
+                ConversationErrorCode::ConversationRecoveryRequired,
+                "append_event",
+                Some(conversation_id),
+                format!(
+                    "event stream length {actual_stream_bytes} differs from validated bytes {expected_stream_bytes}"
+                ),
+            ));
+        }
         self.durable_fs
-            .append_jsonl(&directory.join(type_.stream().file_name()), &bytes)
+            .append_jsonl(&stream_path, &bytes)
             .map_err(|error| durability_error("append_event", conversation_id, error))?;
+        let encoded_line_bytes = u64::try_from(bytes.len())
+            .ok()
+            .and_then(|length| length.checked_add(1))
+            .ok_or_else(|| {
+                repository_error(
+                    ConversationErrorCode::ConversationRecoveryRequired,
+                    "append_event",
+                    Some(conversation_id),
+                    "encoded event length overflow".to_string(),
+                )
+            })?;
 
         let persisted_record = {
             let mut states = self.states.lock();
             let state = states
                 .get_mut(&conversation_id)
                 .expect("per-Conversation lock preserves state");
-            state.replay.records.push(event.clone());
-            state.replay.frontier = frontier;
+            let scan = Arc::make_mut(&mut state.scan);
+            scan.frontier = frontier;
+            scan.record_appended(stream, seq, expected_stream_bytes, encoded_line_bytes);
             state.record.last_seq = seq;
-            if state.replay.frontier.attachment.has_events {
-                state.record.project_attachment = state.replay.frontier.attachment.current.clone();
+            if scan.frontier.attachment.has_events {
+                state.record.project_attachment = scan.frontier.attachment.current.clone();
             }
-            match type_ {
-                ConversationEventType::CreationFailed => {
-                    state.record.lifecycle_state = ConversationLifecycleState::AgentFailed;
-                }
-                ConversationEventType::BindingBound
-                | ConversationEventType::BindingReplaced
-                | ConversationEventType::BindingRebound => {
-                    state.record.lifecycle_state = ConversationLifecycleState::Ready;
-                }
-                _ => {}
+            if let Some(lifecycle_state) = scan.frontier.lifecycle_state {
+                state.record.lifecycle_state = lifecycle_state;
             }
             state.record.clone()
         };
-        // The append is already authoritative. Retain its in-memory frontier even if metadata
+        // The append is already authoritative. Retain its compact frontier even if metadata
         // materialization fails, preventing a duplicate seq in the same process.
+        self.active_tail_cache.lock().invalidate(conversation_id);
         self.mark_catalog_entry_dirty(conversation_id);
         self.persist_record_metadata(&persisted_record, "append_event")?;
         Ok(event)
@@ -1423,7 +1837,7 @@ impl ConversationRepository {
             return;
         };
         let mut cache = self.catalog.lock();
-        cache.catalog.upsert(&state.record, &state.replay.frontier);
+        cache.catalog.upsert(&state.record, &state.scan.frontier);
         cache.dirty = true;
         cache.generation = cache.generation.wrapping_add(1);
         cache.last_conversation_id = Some(conversation_id);
@@ -1757,6 +2171,7 @@ mod tests {
     };
     use crate::conversation::write_authority::{ConversationMutation, ConversationWriter};
     use serde_json::json;
+    use std::io::{BufWriter, Write};
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -1789,6 +2204,14 @@ mod tests {
             last_seq: 0,
             created_by: ConversationCreator::Termul,
         }
+    }
+
+    fn record_for_id(id: ConversationId) -> ConversationRecordV2 {
+        let mut value = record();
+        value.conversation_id = id;
+        value.workspace_cwd = format!("/visible/sessions/2026/08/15/{id}");
+        value.lifecycle_state = ConversationLifecycleState::Ready;
+        value
     }
 
     fn time(second: u32) -> DateTime<Utc> {
@@ -2112,6 +2535,185 @@ mod tests {
             ),
             identity
         );
+    }
+
+    #[tokio::test]
+    async fn bootstrap_retains_no_payload_and_full_wrapper_matches_pages() {
+        let (_temp, repository, writer) = fixture();
+        let value = record_for_id(ConversationId::parse(ID).unwrap());
+        writer
+            .create_conversation(value.clone(), ConversationMutation::CreateConversation)
+            .await
+            .unwrap();
+        let root = repository.root().to_path_buf();
+        let directory = repository
+            .locator
+            .private_dir(value.conversation_id, &value.creation_partition)
+            .unwrap();
+        drop(writer);
+        drop(repository);
+
+        let messages =
+            fs::File::create(directory.join(crate::conversation::event_log::MESSAGES_FILE))
+                .unwrap();
+        let mut messages = BufWriter::new(messages);
+        for seq in 1..=2_048_u64 {
+            let event = ConversationEventRecordV2::new(
+                value.conversation_id,
+                seq,
+                time(20),
+                ConversationEventType::MessageChunk,
+                json!({"marker":seq}),
+            );
+            serde_json::to_writer(&mut messages, &event).unwrap();
+            messages.write_all(b"\n").unwrap();
+        }
+        messages.flush().unwrap();
+        drop(messages);
+
+        let (repository, report) = ConversationRepository::open(root).unwrap();
+        assert_eq!(report.scanned_event_count, 2_048);
+        assert_eq!(report.sparse_index_entry_count, 8);
+        assert_eq!(report.retained_payload_bytes, 0);
+        assert_eq!(repository.retained_payload_bytes(), 0);
+        assert_eq!(repository.active_tail_cache_stats().retained_bytes, 0);
+        let scan = repository.event_log_scan(value.conversation_id).unwrap();
+        assert_eq!(scan.sparse_offsets.messages.entries.len(), 8);
+        assert_eq!(scan.sparse_offsets.messages.event_count, 2_048);
+        assert!(scan
+            .sparse_offsets
+            .messages
+            .entries
+            .windows(2)
+            .all(|window| window[1].seq - window[0].seq == 256));
+
+        let compatibility = repository.read_events(value.conversation_id, 0).unwrap();
+        assert_eq!(compatibility.len(), 2_048);
+        for limit in [1, 17, 256, 1_000] {
+            let mut cursor = 0;
+            let mut paged = Vec::new();
+            while cursor < 2_048 {
+                let page = repository
+                    .read_event_page(value.conversation_id, cursor, limit)
+                    .unwrap();
+                assert!(!page.is_empty());
+                assert!(page.len() <= limit);
+                cursor = page.last().unwrap().seq;
+                paged.extend(page);
+            }
+            assert_eq!(paged, compatibility, "limit={limit}");
+        }
+
+        let missing = ConversationId::parse("ffffffff-ffff-4fff-8fff-ffffffffffff").unwrap();
+        for invalid_limit in [0, MAX_EVENT_PAGE_LIMIT + 1] {
+            let error = repository
+                .read_event_page(missing, 0, invalid_limit)
+                .unwrap_err();
+            assert_eq!(error.stable_code(), "VALIDATION_ERROR");
+            assert!(error.to_string().starts_with("VALIDATION_ERROR during"));
+            assert_eq!(error.operation, "read_event_page");
+        }
+    }
+
+    #[tokio::test]
+    async fn active_tail_cache_bounds_lru_invalidation_and_conversation_isolation() {
+        let (_temp, repository, writer) = fixture();
+        let mut ids = Vec::new();
+        for index in 0..10_u64 {
+            let id =
+                ConversationId::parse(&format!("10000000-0000-4000-8000-{index:012x}")).unwrap();
+            writer
+                .create_conversation(record_for_id(id), ConversationMutation::CreateConversation)
+                .await
+                .unwrap();
+            writer
+                .append_event(
+                    id,
+                    time(20),
+                    ConversationEventType::MessageChunk,
+                    json!({"conversationMarker":index}),
+                    ConversationMutation::AcpEventAppend,
+                )
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+
+        for id in ids.iter().take(ACTIVE_TAIL_CACHE_MAX_CONVERSATIONS) {
+            let page = repository.read_event_page(*id, 0, 17).unwrap();
+            assert!(page.iter().all(|event| event.conversation_id == *id));
+        }
+        let full = repository.active_tail_cache_stats();
+        assert_eq!(full.conversation_count, ACTIVE_TAIL_CACHE_MAX_CONVERSATIONS);
+        assert!(full.retained_bytes <= ACTIVE_TAIL_CACHE_MAX_BYTES);
+
+        repository.read_event_page(ids[0], 0, 17).unwrap();
+        repository.read_event_page(ids[8], 0, 17).unwrap();
+        let after_lru = repository.active_tail_cache_stats();
+        assert!(after_lru.conversation_ids.contains(&ids[0]));
+        assert!(!after_lru.conversation_ids.contains(&ids[1]));
+        assert!(after_lru.conversation_ids.contains(&ids[8]));
+
+        writer
+            .append_event(
+                ids[0],
+                time(21),
+                ConversationEventType::MessageChunk,
+                json!({"conversationMarker":"appended"}),
+                ConversationMutation::AcpEventAppend,
+            )
+            .await
+            .unwrap();
+        let invalidated = repository.active_tail_cache_stats();
+        assert!(!invalidated.conversation_ids.contains(&ids[0]));
+        assert!(invalidated.conversation_ids.contains(&ids[8]));
+        let appended = repository.read_event_page(ids[0], 1, 17).unwrap();
+        assert_eq!(appended.len(), 1);
+        assert_eq!(appended[0].conversation_id, ids[0]);
+
+        writer
+            .append_event(
+                ids[9],
+                time(21),
+                ConversationEventType::MessageChunk,
+                json!({"credentials":"never-cache-or-cross-conversation"}),
+                ConversationMutation::AcpEventAppend,
+            )
+            .await
+            .unwrap();
+        let sensitive = repository.read_event_page(ids[9], 0, 17).unwrap();
+        assert!(sensitive
+            .iter()
+            .all(|event| event.conversation_id == ids[9]));
+        assert!(!repository
+            .active_tail_cache_stats()
+            .conversation_ids
+            .contains(&ids[9]));
+        let isolated = repository.read_event_page(ids[8], 0, 17).unwrap();
+        assert!(isolated.iter().all(|event| event.conversation_id == ids[8]));
+        assert!(isolated
+            .iter()
+            .all(|event| event.payload.get("credentials").is_none()));
+
+        for id in ids.iter().take(8) {
+            let after_seq = repository.get_conversation(*id).unwrap().last_seq;
+            writer
+                .append_event(
+                    *id,
+                    time(22),
+                    ConversationEventType::MessageChunk,
+                    json!({"blob":"x".repeat(300_000)}),
+                    ConversationMutation::AcpEventAppend,
+                )
+                .await
+                .unwrap();
+            let page = repository.read_event_page(*id, after_seq, 17).unwrap();
+            assert_eq!(page.len(), 1);
+            assert_eq!(page[0].conversation_id, *id);
+        }
+        let bounded = repository.active_tail_cache_stats();
+        assert!(bounded.conversation_count <= ACTIVE_TAIL_CACHE_MAX_CONVERSATIONS);
+        assert!(bounded.retained_bytes <= ACTIVE_TAIL_CACHE_MAX_BYTES);
     }
 
     #[tokio::test]

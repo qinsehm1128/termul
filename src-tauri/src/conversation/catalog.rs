@@ -21,8 +21,7 @@ use crate::conversation::contracts::{
 };
 use crate::conversation::durable_fs::DurableFileSystem;
 use crate::conversation::event_log::{
-    replay_conversation, ConversationEventType, ConversationFrontier, ConversationReplay,
-    EventLogRepairWarning,
+    scan_event_log, ConversationFrontier, EventLogRepairWarning, EventLogScan,
 };
 use crate::conversation::locator::{
     bounded_scan, ConversationLocator, LocatorError, MAX_CONVERSATIONS_PER_SCAN,
@@ -172,7 +171,7 @@ impl ConversationProvenanceFileV1 {
 pub struct AcceptedCanonicalConversation {
     pub directory: PathBuf,
     pub record: ConversationRecordV2,
-    pub replay: ConversationReplay,
+    pub scan: EventLogScan,
     pub provenance: Option<ConversationProvenanceFileV1>,
 }
 
@@ -260,8 +259,8 @@ pub fn rebuild_catalog(
         // cached or caller-constructed path.
         let directory =
             locator.private_dir(located.conversation_id, &located.creation_partition)?;
-        let replay = match replay_conversation(&directory, located.conversation_id, durable_fs) {
-            Ok(replay) => replay,
+        let scan = match scan_event_log(&directory, located.conversation_id, durable_fs) {
+            Ok(scan) => scan,
             Err(error) => {
                 log::error!(
                     "[conversation-repository] authoritative event log rejected code={} conversation_id={} stream_file={}",
@@ -278,7 +277,7 @@ pub fn rebuild_catalog(
                 continue;
             }
         };
-        repairs.extend(replay.repairs.clone());
+        repairs.extend(scan.repairs.clone());
         let provenance = match load_provenance(&directory, located.conversation_id) {
             Ok(provenance) => provenance,
             Err(issue) => {
@@ -287,27 +286,17 @@ pub fn rebuild_catalog(
             }
         };
         let mut record = located.record;
-        record.last_seq = replay.last_seq();
-        if replay.frontier.attachment.has_events {
-            record.project_attachment = replay.frontier.attachment.current.clone();
+        record.last_seq = scan.last_seq();
+        if scan.frontier.attachment.has_events {
+            record.project_attachment = scan.frontier.attachment.current.clone();
         }
-        for event in &replay.records {
-            match event.type_ {
-                ConversationEventType::CreationFailed => {
-                    record.lifecycle_state = ConversationLifecycleState::AgentFailed;
-                }
-                ConversationEventType::BindingBound
-                | ConversationEventType::BindingReplaced
-                | ConversationEventType::BindingRebound => {
-                    record.lifecycle_state = ConversationLifecycleState::Ready;
-                }
-                _ => {}
-            }
+        if let Some(lifecycle_state) = scan.frontier.lifecycle_state {
+            record.lifecycle_state = lifecycle_state;
         }
         accepted.push(AcceptedCanonicalConversation {
             directory,
             record,
-            replay,
+            scan,
             provenance,
         });
     }
@@ -321,7 +310,7 @@ pub fn rebuild_catalog(
 
     let conversations = accepted
         .iter()
-        .map(|entry| entry_from_frontier(&entry.record, &entry.replay.frontier))
+        .map(|entry| entry_from_frontier(&entry.record, &entry.scan.frontier))
         .collect::<Vec<_>>();
     let generated_at_utc = conversations
         .iter()

@@ -86,6 +86,10 @@ pub struct BootstrapOutcome {
     pub reader_precedence: ReaderPrecedence,
     pub migration_phase: MigrationPhase,
     pub recovery_item_count: usize,
+    pub repository_scanned_event_count: u64,
+    pub repository_sparse_index_entry_count: usize,
+    pub repository_retained_payload_bytes: usize,
+    pub repository_open_duration_ms: u64,
     pub repository_root: PathBuf,
     pub workspace_base: PathBuf,
 }
@@ -252,7 +256,7 @@ impl ConversationBootstrap {
         }
 
         let repository_root = roots.private_conversation_root();
-        let (repository, _open_report) = ConversationRepository::open(repository_root.clone())
+        let (repository, open_report) = ConversationRepository::open(repository_root.clone())
             .map_err(|source| {
                 bootstrap_error(
                     "CONVERSATION_REPOSITORY_OPEN_FAILED",
@@ -405,10 +409,14 @@ impl ConversationBootstrap {
         }
         drop(lock_guard);
         log::info!(
-            "[conversation-bootstrap] complete host_mode={host_mode:?} phase={:?} precedence={:?} recovery_count={}",
+            "[conversation-bootstrap] complete host_mode={host_mode:?} phase={:?} precedence={:?} recovery_count={} scanned_event_count={} sparse_index_entry_count={} retained_payload_bytes={} repository_open_duration_ms={}",
             report.phase,
             report.reader_precedence,
-            recovery_item_count
+            recovery_item_count,
+            open_report.scanned_event_count,
+            open_report.sparse_index_entry_count,
+            open_report.retained_payload_bytes,
+            open_report.duration_ms
         );
         Ok(BootstrapOutcome {
             repository,
@@ -423,6 +431,10 @@ impl ConversationBootstrap {
             reader_precedence: report.reader_precedence,
             migration_phase: report.phase,
             recovery_item_count,
+            repository_scanned_event_count: open_report.scanned_event_count,
+            repository_sparse_index_entry_count: open_report.sparse_index_entry_count,
+            repository_retained_payload_bytes: open_report.retained_payload_bytes,
+            repository_open_duration_ms: open_report.duration_ms,
             repository_root,
             workspace_base: roots.workspace_base,
         })
