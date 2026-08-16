@@ -109,8 +109,9 @@ impl EventSink for TauriEventSink {
 /// Owns the per-session append-only bounded event logs (the canonical replay
 /// source, D5), per-session monotonic `seq` counters, and the per-client
 /// subscriber set. `emit` is called from the per-agent driver thread (via
-/// [`fan_out`]) and is NON-blocking: it assigns `seq`, appends to the log, and
-/// fans out to each subscribed client's `tokio::sync::mpsc::UnboundedSender`.
+/// [`fan_out`]); it assigns `seq`, submits canonical Conversation events through a bounded
+/// per-session writer (blocking only that session's producer when its durable queue is full), and
+/// then fans out to each subscribed client's `tokio::sync::mpsc::UnboundedSender`.
 ///
 /// # Tier handling (AC5)
 ///
@@ -161,10 +162,15 @@ pub struct WsRelaySink {
     turn_watermark: crate::web::permissions::TurnWatermark,
     /// Read-only legacy history provider retained for compatibility reads.
     persistence: Option<Arc<SessionPersistence>>,
-    /// Canonical live writer after Conversation bootstrap.
+    /// Canonical Conversation adapter used for reads and binding resolution.
     conversation_persistence: Option<Arc<crate::conversation::ConversationPersistenceAdapter>>,
+    /// Bounded retained writers for the canonical live ACP append path.
+    ordered_conversation_persistence:
+        Option<Arc<crate::conversation::OrderedConversationPersistence>>,
+    /// Per-session gate spanning relay sequence assignment and ordered submission. Different
+    /// sessions never share this gate, so backpressure remains isolated to the saturated session.
+    persistence_submission_gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Serializes each session's durable replay/catch-up/register handoff.
-    /// Emits remain non-blocking and use the synchronous session state lock.
     replay_gates: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
@@ -247,6 +253,8 @@ impl WsRelaySink {
             turn_watermark: crate::web::permissions::TurnWatermark::new(),
             persistence: None,
             conversation_persistence: None,
+            ordered_conversation_persistence: None,
+            persistence_submission_gates: Mutex::new(HashMap::new()),
             replay_gates: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -282,6 +290,9 @@ impl WsRelaySink {
         legacy_read_only: Option<Arc<SessionPersistence>>,
     ) -> Self {
         let mut sink = Self::with_capacity(event_log_capacity, DEFAULT_LOSSY_CAPACITY);
+        sink.ordered_conversation_persistence = Some(Arc::new(
+            crate::conversation::OrderedConversationPersistence::new(Arc::clone(&persistence)),
+        ));
         sink.conversation_persistence = Some(persistence);
         sink.persistence = legacy_read_only;
         sink
@@ -292,6 +303,35 @@ impl WsRelaySink {
         &self,
     ) -> Option<Arc<crate::conversation::ConversationPersistenceAdapter>> {
         self.conversation_persistence.clone()
+    }
+
+    #[must_use]
+    pub fn ordered_conversation_persistence(
+        &self,
+    ) -> Option<Arc<crate::conversation::OrderedConversationPersistence>> {
+        self.ordered_conversation_persistence.clone()
+    }
+
+    /// Await the canonical ordered-writer durability frontier.
+    pub async fn flush_conversation_persistence(&self) -> Result<(), String> {
+        match &self.ordered_conversation_persistence {
+            Some(persistence) => persistence
+                .flush_all()
+                .await
+                .map_err(|error| error.to_string()),
+            None => Ok(()),
+        }
+    }
+
+    /// Final host-owned drain for the canonical ordered writers.
+    pub async fn shutdown_conversation_persistence(&self) -> Result<(), String> {
+        match &self.ordered_conversation_persistence {
+            Some(persistence) => persistence
+                .shutdown()
+                .await
+                .map_err(|error| error.to_string()),
+            None => Ok(()),
+        }
     }
 
     #[must_use]
@@ -382,6 +422,14 @@ impl WsRelaySink {
             },
             |state| state.last_seq,
         )
+    }
+
+    fn persistence_submission_gate(&self, sid: &str) -> Arc<Mutex<()>> {
+        self.persistence_submission_gates
+            .lock()
+            .entry(sid.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// Assign seq + append under the sessions lock (atomic w.r.t. concurrent emits).
@@ -552,6 +600,11 @@ impl WsRelaySink {
         let _replay_guard = gate.lock().await;
         let mut by_seq = std::collections::BTreeMap::new();
         loop {
+            if let Some(ordered) = &self.ordered_conversation_persistence {
+                if ordered.flush_all().await.is_err() {
+                    return (client_id, rx, ReplayResult::Stale);
+                }
+            }
             if let Some(persistence) = &self.conversation_persistence {
                 let durable = match persistence.replay_after(sid, cursor) {
                     Ok(records) => records,
@@ -683,6 +736,12 @@ impl WsRelaySink {
                 .clone()
         };
         let _replay_guard = gate.lock().await;
+        if let Some(ordered) = &self.ordered_conversation_persistence {
+            ordered
+                .flush_all()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         if let Some(persistence) = &self.conversation_persistence {
             let watermark = persistence
                 .last_seq(sid)
@@ -748,18 +807,29 @@ impl WsRelaySink {
         sid: &str,
         payload: Value,
     ) -> Result<SequencedEvent, String> {
-        let event = self.assign_and_append(sid, "user_prompt", payload);
-        if let Some(persistence) = &self.conversation_persistence {
+        let event = if let Some(persistence) = &self.ordered_conversation_persistence {
+            let gate = self.persistence_submission_gate(sid);
+            let submission_guard = gate.lock();
+            let event = self.assign_and_append(sid, "user_prompt", payload);
             persistence
-                .append_acp_event(sid, "user_prompt", event.payload.clone())
+                .submit(sid, event.seq, "user_prompt", event.payload.clone())
+                .map_err(|error| error.to_string())?;
+            drop(submission_guard);
+            persistence
+                .flush_all()
                 .await
                 .map_err(|error| error.to_string())?;
-        } else if let Some(persistence) = &self.persistence {
-            persistence
-                .flush_session(sid)
-                .await
-                .map_err(|error| error.to_string())?;
-        }
+            event
+        } else {
+            let event = self.assign_and_append(sid, "user_prompt", payload);
+            if let Some(persistence) = &self.persistence {
+                persistence
+                    .flush_session(sid)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            event
+        };
         let targets: Vec<ClientId> = self
             .session_subs
             .lock()
@@ -832,6 +902,7 @@ impl WsRelaySink {
             }
         }
         self.turn_watermark.forget_session(sid);
+        self.persistence_submission_gates.lock().remove(sid);
         self.replay_gates.lock().await.remove(sid);
     }
 
@@ -923,33 +994,40 @@ impl EventSink for WsRelaySink {
 
         match &event.sid {
             Some(sid) => {
-                // Session-scoped: assign seq + append atomically, then fan out.
-                let se = self.assign_and_append(sid, type_, event.payload.clone());
-                if matches!(
+                // Session-scoped: serialize sequence assignment + ordered submission for this
+                // session only. A saturated writer backpressures the affected ACP producer without
+                // spawning detached tasks or reordering another session.
+                let persists_conversation_event = matches!(
                     type_,
                     "message_chunk"
                         | "prompt_complete"
                         | "tool_call"
                         | "tool_call_update"
                         | "session_info_update"
-                ) {
-                    if let Some(persistence) = self.conversation_persistence() {
-                        let sid = sid.clone();
-                        let type_ = type_.to_string();
-                        let payload = event.payload.clone();
-                        tokio::spawn(async move {
-                            if let Err(error) =
-                                persistence.append_acp_event(&sid, &type_, payload).await
-                            {
-                                log::error!(
-                                    "[conversation-persistence] ACP event append failed event_type={} code={}",
-                                    type_,
-                                    error.code
-                                );
-                            }
-                        });
+                );
+                let se = if persists_conversation_event {
+                    if let Some(persistence) = &self.ordered_conversation_persistence {
+                        let gate = self.persistence_submission_gate(sid);
+                        let _submission_guard = gate.lock();
+                        let sequenced = self.assign_and_append(sid, type_, event.payload.clone());
+                        if let Err(error) =
+                            persistence.submit(sid, sequenced.seq, type_, sequenced.payload.clone())
+                        {
+                            // The ordered writer logs authorized ConversationId context when one is
+                            // available. This boundary log intentionally carries only the stable
+                            // code: never the payload, prompt, credentials, or opaque session id.
+                            log::error!(
+                                "[conversation-persistence] ordered ACP submission rejected code={}",
+                                error.code
+                            );
+                        }
+                        sequenced
+                    } else {
+                        self.assign_and_append(sid, type_, event.payload.clone())
                     }
-                }
+                } else {
+                    self.assign_and_append(sid, type_, event.payload.clone())
+                };
                 let targets: Vec<ClientId> = self
                     .session_subs
                     .lock()
@@ -1183,6 +1261,7 @@ mod tests {
         now_millis, PersistedEventRecord, SessionPersistence, SessionRegistration,
         SESSION_SCHEMA_VERSION,
     };
+    use chrono::Utc;
     use serde::Serialize;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1948,6 +2027,177 @@ mod tests {
         );
 
         persistence.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    async fn conversation_fixture(
+        label: &str,
+        session_id: &str,
+    ) -> (
+        PathBuf,
+        Arc<crate::conversation::ConversationRepository>,
+        Arc<crate::conversation::ConversationPersistenceAdapter>,
+        crate::conversation::ConversationId,
+    ) {
+        use crate::conversation::{
+            AgentSessionBinding, AgentSessionBindingState, ConversationCreator,
+            ConversationLifecycleState, ConversationRecordV2, CreationPartition, ExecutionTarget,
+            ReaderPrecedence, AGENT_SESSION_BINDING_SCHEMA_VERSION, CONVERSATION_SCHEMA_VERSION,
+        };
+
+        let root = temp_dir(label).canonicalize().unwrap();
+        let private = root.join("private");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let (repository, _) = crate::conversation::ConversationRepository::open(private).unwrap();
+        let conversation_id = crate::conversation::ConversationId::new_v4();
+        let created_at = Utc::now();
+        repository
+            .create_conversation(ConversationRecordV2 {
+                schema_version: CONVERSATION_SCHEMA_VERSION,
+                conversation_id,
+                created_at_utc: created_at,
+                creation_partition: CreationPartition::from_created_at(created_at),
+                workspace_cwd: workspace.to_string_lossy().into_owned(),
+                execution_target: ExecutionTarget::Workspace,
+                project_attachment: None,
+                lifecycle_state: ConversationLifecycleState::InitializingAgent,
+                last_seq: 0,
+                created_by: ConversationCreator::Termul,
+            })
+            .await
+            .unwrap();
+        repository
+            .bind_agent_session(
+                conversation_id,
+                AgentSessionBinding {
+                    schema_version: AGENT_SESSION_BINDING_SCHEMA_VERSION,
+                    binding_id: Uuid::new_v4(),
+                    agent_session_id: session_id.to_string(),
+                    runtime_agent_id: "runtime-test".to_string(),
+                    stable_agent_namespace: "stable-test".to_string(),
+                    execution_cwd: workspace.to_string_lossy().into_owned(),
+                    bound_at_utc: created_at,
+                    state: AgentSessionBindingState::Active,
+                },
+                created_at,
+            )
+            .await
+            .unwrap();
+        let reader = Arc::new(crate::conversation::ConversationReader::new(
+            Arc::clone(&repository),
+            crate::conversation::LegacyConversationReader::default(),
+            ReaderPrecedence::ConversationV2Only,
+        ));
+        let adapter = Arc::new(crate::conversation::ConversationPersistenceAdapter::new(
+            Arc::clone(&repository),
+            reader,
+        ));
+        (root, repository, adapter, conversation_id)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conversation_events_persist_in_emission_order() {
+        let (root, repository, adapter, conversation_id) =
+            conversation_fixture("ordered-emission", "opaque-ordered-session").await;
+        let relay = Arc::new(WsRelaySink::with_conversation_persistence(
+            32, adapter, None,
+        ));
+        let event_types = [
+            "acp:message_chunk",
+            "acp:tool_call",
+            "acp:tool_call_update",
+            "acp:prompt_complete",
+            "acp:session_info_update",
+        ];
+        let expected_payloads = (1..=100_u64)
+            .map(|ordinal| json!({"ordinal": ordinal, "text": format!("event-{ordinal}")}))
+            .collect::<Vec<_>>();
+        for (index, payload) in expected_payloads.iter().enumerate() {
+            relay.emit(&AcpEvent {
+                sid: Some("opaque-ordered-session".to_string()),
+                type_: event_types[index % event_types.len()],
+                payload: payload.clone(),
+            });
+        }
+        relay.flush_conversation_persistence().await.unwrap();
+        let durable_payloads = repository
+            .read_events(conversation_id, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.payload.get("ordinal").is_some())
+            .map(|event| event.payload)
+            .collect::<Vec<_>>();
+        assert_eq!(durable_payloads, expected_payloads);
+        let health = relay
+            .ordered_conversation_persistence()
+            .unwrap()
+            .health("opaque-ordered-session")
+            .unwrap()
+            .unwrap();
+        assert_eq!(health.pending_count, 0);
+        assert_eq!(health.last_accepted_source_seq, 100);
+        assert_eq!(health.last_persisted_source_seq, 100);
+        relay.shutdown_conversation_persistence().await.unwrap();
+        drop(relay);
+        drop(repository);
+        let (restarted_repository, _) =
+            crate::conversation::ConversationRepository::open(root.join("private")).unwrap();
+        let restarted_payloads = restarted_repository
+            .read_events(conversation_id, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.payload.get("ordinal").is_some())
+            .map(|event| event.payload)
+            .collect::<Vec<_>>();
+        assert_eq!(restarted_payloads, expected_payloads);
+        drop(restarted_repository);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_backpressure_and_shutdown_drain() {
+        let (root, repository, adapter, conversation_id) =
+            conversation_fixture("bounded-drain", "opaque-drain-session").await;
+        let relay = Arc::new(WsRelaySink::with_conversation_persistence(
+            16, adapter, None,
+        ));
+        for ordinal in 1..=40_u64 {
+            relay.emit(&AcpEvent {
+                sid: Some("opaque-drain-session".to_string()),
+                type_: "acp:message_chunk",
+                payload: json!({"ordinal": ordinal}),
+            });
+            let pending = relay
+                .ordered_conversation_persistence()
+                .unwrap()
+                .health("opaque-drain-session")
+                .unwrap()
+                .unwrap()
+                .pending_count;
+            assert!(pending <= crate::conversation::QUEUE_CAPACITY);
+        }
+        relay.shutdown_conversation_persistence().await.unwrap();
+        let health = relay
+            .ordered_conversation_persistence()
+            .unwrap()
+            .health("opaque-drain-session")
+            .unwrap()
+            .unwrap();
+        assert_eq!(health.pending_count, 0);
+        assert_eq!(
+            health.last_persisted_source_seq,
+            health.last_accepted_source_seq
+        );
+        let durable = repository
+            .read_events(conversation_id, 0)
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| event.payload.get("ordinal").and_then(Value::as_u64))
+            .collect::<Vec<_>>();
+        assert_eq!(durable, (1..=40).collect::<Vec<_>>());
+        drop(relay);
+        drop(repository);
         let _ = std::fs::remove_dir_all(root);
     }
 

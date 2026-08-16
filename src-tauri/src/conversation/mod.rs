@@ -10,6 +10,7 @@ pub mod event_log;
 pub mod lifecycle;
 pub mod locator;
 pub mod migration;
+pub mod ordered_persistence;
 pub mod persistence_adapter;
 pub mod repository;
 pub mod session_workspace;
@@ -81,6 +82,9 @@ pub use migration::{
     MigrationControlContext, MigrationError, MigrationErrorCode, MigrationHostMode,
     MigrationJournalV1, MigrationPhase, MigrationReport, MigrationStepOutput,
     ObservationEvidenceV1, ReaderPrecedence, StepReceiptV1,
+};
+pub use ordered_persistence::{
+    OrderedConversationPersistence, OrderedPersistenceHealth, QUEUE_CAPACITY,
 };
 pub use persistence_adapter::{ConversationPersistenceAdapter, ConversationPersistenceError};
 pub use repository::{
