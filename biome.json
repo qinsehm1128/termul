@@ -20,6 +20,7 @@
       "!**/_bmad-output",
       "!**/.agents",
       "!**/.workflow",
+      "!**/.tests",
       "!**/public"
     ]
   },

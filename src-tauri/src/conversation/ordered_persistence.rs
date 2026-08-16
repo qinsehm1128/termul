@@ -25,7 +25,10 @@ use crate::conversation::{
 /// Maximum accepted-but-not-yet-persisted records for one agent session.
 pub const QUEUE_CAPACITY: usize = 256;
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+// A production flush is a durability barrier, not an interactive latency budget. Keep it bounded,
+// but allow heavily loaded hosts and full-suite CI enough time to drain accepted records without
+// reporting a false durability failure. Focused backpressure tests use shorter injected timeouts.
+const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 const SOURCE_SEQUENCE_INVALID: &str = "CONVERSATION_SOURCE_SEQUENCE_INVALID";
 const WRITER_UNHEALTHY: &str = "CONVERSATION_PERSISTENCE_UNHEALTHY";

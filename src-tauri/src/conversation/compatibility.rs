@@ -337,8 +337,14 @@ fn not_found_repository() -> crate::conversation::repository::RepositoryError {
 fn repository_compatibility_error(
     error: crate::conversation::repository::RepositoryError,
 ) -> CompatibilityError {
+    let code = match error.code {
+        crate::conversation::contracts::ConversationErrorCode::ConversationNotFound => {
+            "CONVERSATION_NOT_FOUND"
+        }
+        _ => "CONVERSATION_READ_FAILED",
+    };
     CompatibilityError {
-        code: "CONVERSATION_READ_FAILED",
+        code,
         detail: error.to_string(),
     }
 }

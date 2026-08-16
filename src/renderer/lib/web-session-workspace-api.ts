@@ -15,8 +15,6 @@ import type {
 import { remoteAccessHeaders } from './acp-transport'
 import { isTauriContext } from './tauri-runtime'
 
-type IpcBody<T> = { success: true; data?: T } | { success: false; error: string; code: string }
-
 function serverBase(): string {
   if (isTauriContext()) return ''
   if (typeof window === 'undefined' || !window.location) return ''
@@ -36,16 +34,39 @@ function invalidConversationId(): IpcResult<never> {
 }
 
 async function parseBody<T>(response: Response): Promise<IpcResult<T>> {
+  let body: unknown
   try {
-    const body = (await response.json()) as IpcBody<T>
-    return body.success
-      ? { success: true, data: body.data as T }
-      : { success: false, error: body.error, code: body.code }
+    body = await response.json()
   } catch (error) {
     return response.ok
       ? networkError(error instanceof Error ? error.message : 'invalid JSON')
       : networkError(`HTTP ${response.status} ${response.statusText}`)
   }
+
+  if (typeof body === 'object' && body !== null && 'success' in body) {
+    const envelope = body as {
+      success?: unknown
+      data?: unknown
+      error?: unknown
+      code?: unknown
+    }
+    if (response.ok && envelope.success === true) {
+      return { success: true, data: envelope.data as T }
+    }
+    if (
+      envelope.success === false &&
+      typeof envelope.error === 'string' &&
+      envelope.error.length > 0 &&
+      typeof envelope.code === 'string' &&
+      envelope.code.length > 0
+    ) {
+      return { success: false, error: envelope.error, code: envelope.code }
+    }
+  }
+
+  return response.ok
+    ? networkError('invalid response envelope')
+    : networkError(`HTTP ${response.status} ${response.statusText}`)
 }
 
 async function getJson<T>(path: string): Promise<IpcResult<T>> {

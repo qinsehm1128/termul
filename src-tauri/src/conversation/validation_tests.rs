@@ -89,6 +89,23 @@ fn fixed_time() -> DateTime<Utc> {
     parse_created_at_utc("2026-08-15T09:45:15.123Z").unwrap()
 }
 
+#[derive(Clone)]
+struct FixedClock(DateTime<Utc>);
+
+impl Clock for FixedClock {
+    fn now_utc(&self) -> DateTime<Utc> {
+        self.0
+    }
+}
+
+struct FixedConversationId(ConversationId);
+
+impl ConversationIdGenerator for FixedConversationId {
+    fn generate(&self) -> ConversationId {
+        self.0
+    }
+}
+
 async fn fixture() -> MatrixFixture {
     let temp = tempfile::tempdir().unwrap();
     let base = temp.path().canonicalize().unwrap();
@@ -192,6 +209,77 @@ fn revision(fixture: &MatrixFixture) -> u64 {
         .get_conversation(fixture.id)
         .unwrap()
         .last_seq
+}
+
+#[tokio::test]
+async fn projectless_creation_is_durable_before_opaque_agent_binding() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let private = base.join("state/conversations/v2");
+    let visible = base.join("visible");
+    let (repository, report) = ConversationRepository::open(private.clone()).unwrap();
+    assert_eq!(report.valid_conversation_count, 0);
+    let writer = ConversationWriter::for_test(Arc::clone(&repository));
+    let conversation_id = ConversationId::parse(ID).unwrap();
+    let created_at = fixed_time();
+    let service = Arc::new(
+        ConversationCreationService::with_sources(
+            writer,
+            ConversationLocator::new(private.clone()).unwrap(),
+            SessionWorkspaceLocator::new(visible).unwrap(),
+            DurableFileSystem::new(),
+            Arc::new(FixedClock(created_at)),
+            Arc::new(FixedConversationId(conversation_id)),
+        )
+        .unwrap(),
+    );
+    let repository_at_gate = Arc::clone(&repository);
+
+    let prepared = service
+        .create_with_agent_gate(
+            PrepareConversationRequest::new(ExecutionTarget::Workspace),
+            move |prepared| async move {
+                let canonical = repository_at_gate
+                    .get_conversation(prepared.conversation_id)
+                    .unwrap();
+                assert_eq!(
+                    canonical.lifecycle_state,
+                    ConversationLifecycleState::InitializingAgent
+                );
+                assert!(std::path::Path::new(&prepared.workspace_cwd).is_dir());
+                assert!(private
+                    .join("2026/08/15")
+                    .join(prepared.conversation_id.to_string())
+                    .join(CONVERSATION_METADATA_FILE)
+                    .is_file());
+                assert!(repository_at_gate
+                    .current_binding(prepared.conversation_id)
+                    .unwrap()
+                    .is_none());
+                Ok(AgentBindingResult {
+                    agent_session_id: "opaque/provider/session".to_string(),
+                    runtime_agent_id: "runtime-agent".to_string(),
+                    stable_agent_namespace: "config:provider".to_string(),
+                })
+            },
+        )
+        .await
+        .unwrap();
+
+    let completed = repository.get_conversation(conversation_id).unwrap();
+    assert_eq!(prepared.conversation_id, conversation_id);
+    assert_eq!(prepared.created_at_utc, format_created_at_utc(&created_at));
+    assert_eq!(completed.conversation_id, conversation_id);
+    assert_eq!(completed.created_at_utc, created_at);
+    assert_eq!(completed.creation_partition.path, "2026/08/15");
+    assert_eq!(completed.workspace_cwd, prepared.workspace_cwd);
+    assert_eq!(completed.lifecycle_state, ConversationLifecycleState::Ready);
+    let binding = repository
+        .current_binding(conversation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(binding.agent_session_id, "opaque/provider/session");
+    assert_ne!(binding.agent_session_id, conversation_id.to_string());
 }
 
 #[tokio::test]
@@ -311,6 +399,102 @@ async fn lifecycle_matrix() {
     ] {
         assert!(events.iter().any(|event| event.type_ == expected));
     }
+}
+
+#[tokio::test]
+async fn ready_aggregate_mutations_preserve_identity_workspace_and_revision_cas() {
+    let fixture = fixture().await;
+    let before = fixture.repository.get_conversation(fixture.id).unwrap();
+    let project_root = fixture._temp.path().join("project-root");
+    std::fs::create_dir_all(&project_root).unwrap();
+    let project_root = project_root.canonicalize().unwrap();
+    let attachment = ProjectAttachment {
+        schema_version: PROJECT_ATTACHMENT_SCHEMA_VERSION,
+        project_id: "project-validation".to_string(),
+        attached_at_utc: parse_created_at_utc("2026-08-15T10:00:00.000Z").unwrap(),
+        project_path_snapshot: project_root.to_string_lossy().into_owned(),
+        worktree_path: None,
+        worktree_branch: None,
+    };
+
+    let attached = fixture
+        .application
+        .attach_project(fixture.id, before.last_seq, attachment.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        attached.action,
+        ConversationAggregateMutationAction::AttachProject
+    );
+    assert_eq!(attached.identity_before, attached.identity_after);
+    assert_eq!(
+        attached.identity_before.conversation_id,
+        before.conversation_id
+    );
+    assert_eq!(
+        attached.identity_before.created_at_utc,
+        format_created_at_utc(&before.created_at_utc)
+    );
+    assert_eq!(
+        attached.identity_before.creation_partition,
+        before.creation_partition
+    );
+    assert_eq!(attached.identity_before.workspace_cwd, before.workspace_cwd);
+    assert_eq!(attached.project_attachment, Some(attachment.clone()));
+
+    let target = ExecutionTarget::ProjectRoot {
+        project_id: attachment.project_id.clone(),
+        project_root: attachment.project_path_snapshot.clone(),
+    };
+    let retargeted = fixture
+        .application
+        .update_execution_target(fixture.id, attached.revision, target.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        retargeted.action,
+        ConversationAggregateMutationAction::UpdateExecutionTarget
+    );
+    assert_eq!(retargeted.execution_target, target);
+    assert_eq!(retargeted.identity_before, retargeted.identity_after);
+
+    let stale = fixture
+        .application
+        .detach_project(fixture.id, attached.revision)
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code, "CONVERSATION_CONFLICT");
+    assert_eq!(
+        fixture.repository.get_conversation(fixture.id).unwrap(),
+        retargeted.conversation
+    );
+
+    let workspace = fixture
+        .application
+        .update_execution_target(fixture.id, retargeted.revision, ExecutionTarget::Workspace)
+        .await
+        .unwrap();
+    let detached = fixture
+        .application
+        .detach_project(fixture.id, workspace.revision)
+        .await
+        .unwrap();
+    assert_eq!(
+        detached.action,
+        ConversationAggregateMutationAction::DetachProject
+    );
+    assert!(detached.project_attachment.is_none());
+    assert_eq!(detached.execution_target, ExecutionTarget::Workspace);
+    assert_eq!(
+        detached.conversation.conversation_id,
+        before.conversation_id
+    );
+    assert_eq!(detached.conversation.created_at_utc, before.created_at_utc);
+    assert_eq!(
+        detached.conversation.creation_partition,
+        before.creation_partition
+    );
+    assert_eq!(detached.conversation.workspace_cwd, before.workspace_cwd);
 }
 
 #[tokio::test]

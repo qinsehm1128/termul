@@ -59,9 +59,9 @@ describe('web-protocol.types — event/request type registries (AC2)', () => {
     expect(WS_REQUEST_TYPES).toContain('get_session_payload')
   })
 
-  it('exports exactly 43 request types including Conversation-first operations', () => {
-    expect(WS_REQUEST_TYPES).toHaveLength(43)
-    const expected = [
+  it('exports exactly 46 request types including Conversation-first aggregate operations', () => {
+    expect(WS_REQUEST_TYPES).toHaveLength(46)
+    expect(WS_REQUEST_TYPES).toEqual([
       'send_prompt',
       'cancel_prompt',
       'set_config_option',
@@ -89,13 +89,13 @@ describe('web-protocol.types — event/request type registries (AC2)', () => {
       'list_persisted_sessions',
       'open_persisted_session',
       'get_session_payload',
+      'recover_session_snapshot',
       'get_session_cursor',
       // CAP-6 / Story 8: host-owned ACP catalog resolution.
       'list_acp_catalog',
       'set_catalog_opt_in',
       // CAP-6 / Story 9: host-owned verified-atomic ACP install.
       'install_acp_agent',
-      'recover_session_snapshot',
       'detach_binding',
       'rebind_binding',
       'suspend_binding',
@@ -108,13 +108,11 @@ describe('web-protocol.types — event/request type registries (AC2)', () => {
       'resolve_legacy_conversation_id',
       'get_session_workspace',
       'write_session_workspace',
-      'resolve_recovery_item'
-    ]
-    for (const name of expected) {
-      expect(WS_REQUEST_TYPES).toContain(name)
-    }
-    // create_session maps to acp_new_session, NOT acp_create_session.
-    expect(WS_REQUEST_TYPES).toContain('create_session')
+      'resolve_recovery_item',
+      'attach_project',
+      'detach_project',
+      'update_execution_target'
+    ])
   })
 
   it('event and request type namespaces are disjoint', () => {

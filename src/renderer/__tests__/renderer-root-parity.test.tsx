@@ -48,11 +48,11 @@ vi.mock('@/pages/NotFound', () => ({
 }))
 
 vi.mock('@/components/conversation/ConversationHostStatus', () => ({
-  ConversationHostStatus: () => null
+  ConversationHostStatus: () => <div data-testid="conversation-host-status" />
 }))
 
 vi.mock('@/components/conversation/ConversationRecoveryPanel', () => ({
-  ConversationRecoveryPanel: () => null
+  ConversationRecoveryPanel: () => <div data-testid="conversation-recovery-panel" />
 }))
 
 vi.mock('@/components/ErrorBoundary', () => ({
@@ -108,7 +108,12 @@ async function navigateRoot(
   Root: ComponentType,
   path: string,
   expected: string
-): Promise<{ route: string; hasPortableEffects: boolean }> {
+): Promise<{
+  route: string
+  hasPortableEffects: boolean
+  hasHostStatus: boolean
+  hasRecoveryPanel: boolean
+}> {
   window.location.hash = `#${path}`
   window.dispatchEvent(new HashChangeEvent('hashchange'))
   const view = render(<Root />)
@@ -117,7 +122,9 @@ async function navigateRoot(
   })
   const result = {
     route: screen.getByTestId('portable-route').getAttribute('data-component') ?? '',
-    hasPortableEffects: screen.queryByTestId('portable-app-effects') !== null
+    hasPortableEffects: screen.queryByTestId('portable-app-effects') !== null,
+    hasHostStatus: screen.queryByTestId('conversation-host-status') !== null,
+    hasRecoveryPanel: screen.queryByTestId('conversation-recovery-panel') !== null
   }
   view.unmount()
   cleanup()
@@ -134,7 +141,12 @@ describe('renderer root runtime parity', () => {
     const web = await navigateRoot(App, path, expected)
     const native = await navigateRoot(TauriApp, path, expected)
 
-    expect(web).toEqual({ route: expected, hasPortableEffects: true })
+    expect(web).toEqual({
+      route: expected,
+      hasPortableEffects: true,
+      hasHostStatus: true,
+      hasRecoveryPanel: true
+    })
     expect(native).toEqual(web)
   })
 

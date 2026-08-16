@@ -1,3 +1,9 @@
+import type {
+  ConversationAggregateMutationOutcome,
+  ConversationRecordV2,
+  ExecutionTarget,
+  ProjectAttachment
+} from '@shared/types/conversation.types'
 import type { RecoveryItemV1 } from '@shared/types/conversation-recovery.types'
 import type { SessionWorkspaceV1 } from '@shared/types/session-workspace.types'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
@@ -12,13 +18,27 @@ import { useProjectStore } from '@/stores/project-store'
 import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
 import { useTerminalStore } from '@/stores/terminal-store'
 import { useWorkspaceStore } from '@/stores/workspace-store'
+import type { Project } from '@/types/project'
+
+if (!HTMLElement.prototype.hasPointerCapture) {
+  HTMLElement.prototype.hasPointerCapture = () => false
+  HTMLElement.prototype.setPointerCapture = () => undefined
+  HTMLElement.prototype.releasePointerCapture = () => undefined
+}
+
+if (!HTMLElement.prototype.scrollIntoView) {
+  HTMLElement.prototype.scrollIntoView = () => undefined
+}
 
 const ID = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
 const { mockConversationApi, mockTerminalApi, mockSessionWorkspaceApi } = vi.hoisted(() => ({
   mockConversationApi: {
     listConversations: vi.fn(),
     openConversation: vi.fn(),
-    resolveRecovery: vi.fn()
+    resolveRecovery: vi.fn(),
+    attachProject: vi.fn(),
+    detachProject: vi.fn(),
+    updateExecutionTarget: vi.fn()
   },
   mockTerminalApi: {
     resume: vi.fn(),
@@ -42,6 +62,70 @@ vi.mock('@/components/terminal/ConnectedTerminal', () => ({
     <div data-testid="mobile-connected-terminal">connected:{terminalId}</div>
   )
 }))
+
+const mobileConversation: ConversationRecordV2 = {
+  schemaVersion: 2,
+  conversationId: ID,
+  createdAtUtc: '2026-08-15T09:45:15.123Z',
+  creationPartition: { year: 2026, month: 8, day: 15, path: '2026/08/15' },
+  workspaceCwd: `/visible/sessions/2026/08/15/${ID}`,
+  executionTarget: { kind: 'workspace' },
+  projectAttachment: null,
+  lifecycleState: 'ready',
+  lastSeq: 0,
+  createdBy: 'termul'
+}
+
+const mobileProject: Project = {
+  id: 'phone-project',
+  name: 'Phone project',
+  color: 'green',
+  path: '/projects/phone',
+  isGitRepo: true,
+  gitBranch: 'main',
+  worktrees: []
+}
+
+const mobileAttachment: ProjectAttachment = {
+  schemaVersion: 1,
+  projectId: mobileProject.id,
+  attachedAtUtc: '2026-08-15T10:00:00.000Z',
+  projectPathSnapshot: mobileProject.path,
+  worktreePath: null,
+  worktreeBranch: null
+}
+
+function mobileAggregateOutcome(
+  current: ConversationRecordV2,
+  action: ConversationAggregateMutationOutcome['action'],
+  attachment: ProjectAttachment | null,
+  executionTarget: ExecutionTarget
+): ConversationAggregateMutationOutcome {
+  const next = {
+    ...current,
+    projectAttachment: attachment,
+    executionTarget,
+    lastSeq: current.lastSeq + 1
+  }
+  const identity = {
+    conversationId: current.conversationId,
+    createdAtUtc: current.createdAtUtc,
+    creationPartition: current.creationPartition,
+    workspaceCwd: current.workspaceCwd
+  }
+  return {
+    status: 'updated',
+    action,
+    conversationId: current.conversationId,
+    previousRevision: current.lastSeq,
+    revision: next.lastSeq,
+    identityBefore: identity,
+    identityAfter: identity,
+    projectAttachment: attachment,
+    executionTarget,
+    conversation: next
+  }
+}
 
 const recoveryItem: RecoveryItemV1 = {
   recoveryId: 'b'.repeat(64),
@@ -153,6 +237,33 @@ function PhoneHarness(): React.JSX.Element {
   )
 }
 
+function MobileReadyTargetHarness(): React.JSX.Element {
+  const current = useConversationStore((state) => state.summariesById[ID]) ?? mobileConversation
+  const [target, setTarget] = useState(current.executionTarget)
+  const [attachment, setAttachment] = useState(current.projectAttachment)
+  return (
+    <main style={{ width: 390 }}>
+      <ExecutionTargetPicker
+        projects={[mobileProject]}
+        value={target}
+        attachment={attachment}
+        conversation={current}
+        workspaceCwd={current.workspaceCwd}
+        onChange={setTarget}
+        onAttachmentChange={setAttachment}
+        nowUtc={() => mobileAttachment.attachedAtUtc}
+      />
+    </main>
+  )
+}
+
+async function chooseMobileTarget(option: string): Promise<void> {
+  const trigger = screen.getByRole('combobox', { name: 'Execution target' })
+  trigger.focus()
+  fireEvent.keyDown(trigger, { key: 'ArrowDown' })
+  fireEvent.click(await screen.findByRole('option', { name: option }))
+}
+
 describe('Conversation-first responsive phone matrix', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -218,6 +329,57 @@ describe('Conversation-first responsive phone matrix', () => {
     expect(screen.getByLabelText('Execution target')).toHaveTextContent('Conversation workspace')
   })
 
+  it('persists ready attach, retarget, workspace, and detach at phone width', async () => {
+    useConversationStore.getState().replaceSummaries([mobileConversation])
+    const attached = mobileAggregateOutcome(
+      mobileConversation,
+      'attachProject',
+      mobileAttachment,
+      mobileConversation.executionTarget
+    )
+    const projectTarget: ExecutionTarget = {
+      kind: 'project_root',
+      projectId: mobileProject.id,
+      projectRoot: mobileProject.path
+    }
+    const retargeted = mobileAggregateOutcome(
+      attached.conversation,
+      'updateExecutionTarget',
+      mobileAttachment,
+      projectTarget
+    )
+    const workspace = mobileAggregateOutcome(
+      retargeted.conversation,
+      'updateExecutionTarget',
+      mobileAttachment,
+      { kind: 'workspace' }
+    )
+    const detached = mobileAggregateOutcome(workspace.conversation, 'detachProject', null, {
+      kind: 'workspace'
+    })
+    mockConversationApi.attachProject.mockResolvedValue({ success: true, data: attached })
+    mockConversationApi.updateExecutionTarget
+      .mockResolvedValueOnce({ success: true, data: retargeted })
+      .mockResolvedValueOnce({ success: true, data: workspace })
+    mockConversationApi.detachProject.mockResolvedValue({ success: true, data: detached })
+
+    render(<MobileReadyTargetHarness />)
+    fireEvent.click(screen.getByRole('button', { name: 'Attach project context' }))
+    expect(await screen.findByText(/Project context attached/)).toBeVisible()
+    await chooseMobileTarget('Project root')
+    expect(await screen.findByText(/Execution target updated/)).toBeVisible()
+    await chooseMobileTarget('Conversation workspace')
+    await waitFor(() => expect(mockConversationApi.updateExecutionTarget).toHaveBeenCalledTimes(2))
+    fireEvent.click(screen.getByRole('button', { name: 'Detach project context' }))
+    expect(await screen.findByText(/Project context detached/)).toBeVisible()
+
+    const finalRecord = useConversationStore.getState().summariesById[ID]
+    expect(finalRecord).toEqual(detached.conversation)
+    expect(finalRecord.workspaceCwd).toBe(mobileConversation.workspaceCwd)
+    expect(finalRecord.createdAtUtc).toBe(mobileConversation.createdAtUtc)
+    expect(finalRecord.creationPartition).toEqual(mobileConversation.creationPartition)
+  })
+
   it('keeps terminal close-view, reopen, and explicit terminate distinct at phone width', async () => {
     render(<PhoneHarness />)
     fireEvent.click(screen.getByRole('button', { name: 'Close terminal view' }))
@@ -233,9 +395,17 @@ describe('Conversation-first responsive phone matrix', () => {
 
   it('reopens the same canonical Conversation after background/reconnect without terminating PTY', async () => {
     document.dispatchEvent(new Event('visibilitychange'))
-    await useConversationStore.getState().openConversation(ID)
+    const backgroundEpoch = useConversationStore.getState().beginConversationActivation(ID)
+    await expect(
+      useConversationStore.getState().activateConversation(ID, backgroundEpoch)
+    ).resolves.toBe(true)
+
     window.dispatchEvent(new Event('online'))
-    await useConversationStore.getState().openConversation(ID)
+    const reconnectEpoch = useConversationStore.getState().beginConversationActivation(ID)
+    await expect(
+      useConversationStore.getState().activateConversation(ID, reconnectEpoch)
+    ).resolves.toBe(true)
+
     expect(mockConversationApi.openConversation).toHaveBeenCalledTimes(2)
     expect(useConversationStore.getState().activeConversationId).toBe(ID)
     expect(mockTerminalApi.terminate).not.toHaveBeenCalled()

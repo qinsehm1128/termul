@@ -160,6 +160,30 @@ describe('Conversation production transport golden parity', () => {
     })
   })
 
+  it.each([
+    [400, 'VALIDATION_ERROR'],
+    [401, 'UNAUTHORIZED'],
+    [403, 'FORBIDDEN'],
+    [404, 'CONVERSATION_NOT_FOUND'],
+    [409, 'CONVERSATION_CONFLICT'],
+    [422, 'CONVERSATION_RECOVERY_REQUIRED'],
+    [503, 'CONVERSATION_SERVICE_UNAVAILABLE']
+  ])('preserves authenticated HTTP status %s with stable code %s', async (status, code) => {
+    window.history.replaceState(null, '', `/#access_token=${ACCESS_TOKEN}`)
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      expect(new Headers(init?.headers).get('authorization')).toBe(`Bearer ${ACCESS_TOKEN}`)
+      return response({ success: false, code, error: `stable:${code}` }, status)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(webConversationApi.listConversations()).resolves.toEqual({
+      success: false,
+      code,
+      error: `stable:${code}`
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
   it('pins aggregate mutation commands and authenticated HTTP routes with identical outcomes', async () => {
     const attached = aggregateOutcome('attachProject', 4, attachment, { kind: 'workspace' })
     const target = {

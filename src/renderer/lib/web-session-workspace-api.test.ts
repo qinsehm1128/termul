@@ -54,7 +54,7 @@ describe('webSessionWorkspaceApi', () => {
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
       `${window.location.origin}/conversations/${conversationId}/workspace`,
-      { method: 'GET' }
+      { method: 'GET', headers: new Headers() }
     )
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
@@ -99,7 +99,7 @@ describe('webSessionWorkspaceApi', () => {
     )
 
     fetchMock.mockResolvedValueOnce(
-      response({ success: false, error: 'localhost only', code: 'FORBIDDEN' })
+      response({ success: false, error: 'localhost only', code: 'FORBIDDEN' }, 403)
     )
     expect(await webSessionWorkspaceApi.writeWorkspace(conversationId, null, workspace)).toEqual({
       success: false,
@@ -115,8 +115,9 @@ describe('webSessionWorkspaceApi', () => {
       code: 'NETWORK_ERROR'
     })
     fetchMock.mockResolvedValueOnce(response({}, 500))
-    expect(await webSessionWorkspaceApi.getWorkspace(conversationId)).toMatchObject({
+    expect(await webSessionWorkspaceApi.getWorkspace(conversationId)).toEqual({
       success: false,
+      error: 'HTTP 500 Error',
       code: 'NETWORK_ERROR'
     })
     fetchMock.mockResolvedValueOnce({

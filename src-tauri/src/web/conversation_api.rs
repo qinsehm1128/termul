@@ -275,7 +275,6 @@ pub async fn resolve_recovery(
         Ok(service) => service
             .resolve_recovery_item(request)
             .await
-            .map(redact_recovery_result)
             .map_err(|error| (error.code, error.detail)),
         Err(error) => Err(error),
     };
@@ -302,14 +301,6 @@ fn redact_host_status(
         item.provenance.clear();
     }
     status
-}
-
-fn redact_recovery_result(mut result: RecoveryActionResult) -> RecoveryActionResult {
-    result.source_paths.clear();
-    result.source_sha256.clear();
-    result.candidate_facts.clear();
-    result.provenance.clear();
-    result
 }
 
 fn parse_id(value: &str) -> Result<ConversationId, (String, String)> {
@@ -590,10 +581,10 @@ mod tests {
             assert!(body.success, "{action}: {:?}", body.error);
             let result = body.data.unwrap();
             assert_eq!(serde_json::to_value(result.action).unwrap(), action);
-            assert!(result.source_paths.is_empty());
-            assert!(result.source_sha256.is_empty());
-            assert!(result.candidate_facts.is_empty());
-            assert!(result.provenance.is_empty());
+            assert_eq!(result.source_paths, item.source_paths);
+            assert_eq!(result.source_sha256, item.source_sha256);
+            assert_eq!(result.candidate_facts, item.candidate_facts);
+            assert_eq!(result.provenance, item.provenance);
         }
 
         let (_temp, repository, state) = state_with_repository().await;

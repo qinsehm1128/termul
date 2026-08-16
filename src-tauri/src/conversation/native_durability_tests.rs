@@ -1,9 +1,17 @@
 use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
+use uuid::Uuid;
 
-use super::{CrashInjector, CrashPoint, DurableFileSystem, NamespaceState, OwnedTempDisposition};
+use super::migration::{inventory_legacy_roots, LegacyRootConfiguration};
+use super::{
+    CrashInjector, CrashPoint, DurableFileSystem, HostMigrationLock, MigrationErrorCode,
+    NamespaceState, OwnedTempDisposition,
+};
 
 #[derive(Debug)]
 struct InterruptAt(CrashPoint);
@@ -21,6 +29,12 @@ fn injected(point: CrashPoint) -> DurableFileSystem {
 fn generation(path: &std::path::Path) -> String {
     let value: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
     value["generation"].as_str().unwrap().to_string()
+}
+
+fn fixed_time() -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339("2026-08-15T09:45:15.123Z")
+        .unwrap()
+        .with_timezone(&Utc)
 }
 
 #[test]
@@ -106,6 +120,120 @@ fn native_workspace_revision_and_jsonl_restart_matrix() {
     DurableFileSystem::new()
         .sync_file_and_namespace(&log)
         .unwrap();
+}
+
+#[test]
+fn native_kernel_lock_owner() {
+    let Some(root) = std::env::var_os("TERMUL_NATIVE_LOCK_ROOT") else {
+        return;
+    };
+    let barrier = PathBuf::from(std::env::var_os("TERMUL_NATIVE_LOCK_BARRIER").unwrap());
+    let lock = HostMigrationLock::new(&PathBuf::from(root)).unwrap();
+    let _guard = lock.acquire().unwrap();
+    fs::write(barrier, b"locked").unwrap();
+    std::thread::sleep(Duration::from_secs(60));
+}
+
+#[test]
+fn native_kernel_lock_releases_after_forced_process_exit() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("state");
+    fs::create_dir_all(&root).unwrap();
+    let root = root.canonicalize().unwrap();
+    let barrier = temp.path().join("native-lock-acquired");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "conversation::native_durability_tests::native_kernel_lock_owner",
+            "--nocapture",
+        ])
+        .env("TERMUL_NATIVE_LOCK_ROOT", &root)
+        .env("TERMUL_NATIVE_LOCK_BARRIER", &barrier)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !barrier.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        barrier.exists(),
+        "subprocess did not acquire native kernel lock"
+    );
+
+    let contender = HostMigrationLock::new(&root).unwrap();
+    assert_eq!(
+        contender.acquire().unwrap_err().code,
+        MigrationErrorCode::MigrationInProgress
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    let recovered = HostMigrationLock::new(&root).unwrap();
+    let _guard = recovered
+        .acquire()
+        .expect("kernel must release migration lock after process death");
+}
+
+#[cfg(unix)]
+#[test]
+fn native_inventory_refuses_symlinked_root_component_without_reading_source() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let outside = base.join("outside");
+    let sessions = outside.join("acp-sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let source = sessions.join("sessions.json");
+    fs::write(&source, br#"{"preserved":true}"#).unwrap();
+    let host_link = base.join("linked-host-state");
+    symlink(&outside, &host_link).unwrap();
+
+    let error = inventory_legacy_roots(
+        &LegacyRootConfiguration {
+            host_state_root: host_link,
+            ..Default::default()
+        },
+        Uuid::new_v4(),
+        fixed_time(),
+        &base.join("operation"),
+    )
+    .unwrap_err();
+    assert_eq!(error.code, MigrationErrorCode::MigrationVerificationFailed);
+    assert_eq!(fs::read(source).unwrap(), br#"{"preserved":true}"#);
+}
+
+#[cfg(windows)]
+#[test]
+fn native_inventory_refuses_windows_junction_root_without_reading_source() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let outside = base.join("outside");
+    let sessions = outside.join("acp-sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let source = sessions.join("sessions.json");
+    fs::write(&source, br#"{"preserved":true}"#).unwrap();
+    let junction = base.join("junction-host-state");
+    let status = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&junction)
+        .arg(&outside)
+        .status()
+        .unwrap();
+    assert!(status.success(), "junction fixture creation failed");
+
+    let error = inventory_legacy_roots(
+        &LegacyRootConfiguration {
+            host_state_root: junction,
+            ..Default::default()
+        },
+        Uuid::new_v4(),
+        fixed_time(),
+        &base.join("operation"),
+    )
+    .unwrap_err();
+    assert_eq!(error.code, MigrationErrorCode::MigrationVerificationFailed);
+    assert_eq!(fs::read(source).unwrap(), br#"{"preserved":true}"#);
 }
 
 #[test]

@@ -366,23 +366,135 @@ describe('Parity Checklist Automation', () => {
       expect(existsSync(parityPath), 'renderer-root-parity.test.tsx should exist').toBe(true)
     })
 
-    it('pins identical portable Conversation routes and hooks in both roots', () => {
+    it('pins one portable route/effect source consumed by both roots', () => {
       const app = readFileSync(join(LIB_DIR, '..', 'App.tsx'), 'utf-8')
       const tauri = readFileSync(join(LIB_DIR, '..', 'TauriApp.tsx'), 'utf-8')
-      for (const token of [
+      const portableRouter = readFileSync(
+        join(LIB_DIR, '..', 'app', 'portable-router.tsx'),
+        'utf-8'
+      )
+      const portableEffects = readFileSync(
+        join(LIB_DIR, '..', 'app', 'PortableAppEffects.tsx'),
+        'utf-8'
+      )
+
+      for (const root of [app, tauri]) {
+        expect(root).toContain("from '@/app/PortableAppEffects'")
+        expect(root).toContain("from '@/app/portable-router'")
+        expect(root).toContain('createPortableRouter()')
+        expect(root).toContain('<PortableAppEffects />')
+        expect(root).toContain('<ConversationHostStatus />')
+        expect(root).toContain('<ConversationRecoveryPanel />')
+        expect(root).not.toMatch(/createHashRouter\s*\(/)
+      }
+      for (const route of [
         "path: 'c/:conversationId'",
         "path: 'legacy/session/:legacyValue'",
         "path: 'legacy/storage/:legacyValue'",
         "path: 'legacy/history/:legacyValue'",
+        "path: 'snapshots'",
+        "path: 'settings'",
+        "path: 'preferences'"
+      ]) {
+        expect(portableRouter, `portable router missing ${route}`).toContain(route)
+      }
+      for (const hook of [
         'useSessionWorkspaceBootstrap()',
         'useConversationHostBootstrap()',
         'useConversationLifecycle()',
         'useTerminalResourceLifecycle()',
-        '<ConversationHostStatus />',
-        '<ConversationRecoveryPanel />'
+        'useTerminalRestore()',
+        'usePreventNativeContextMenu()'
       ]) {
-        expect(app, `App.tsx missing ${token}`).toContain(token)
-        expect(tauri, `TauriApp.tsx missing ${token}`).toContain(token)
+        expect(portableEffects, `portable effects missing ${hook}`).toContain(hook)
+      }
+    })
+  })
+
+  describe('Conversation-first release boundary coverage', () => {
+    const REPOSITORY_ROOT = join(LIB_DIR, '..', '..', '..')
+
+    it('requires every P0/P1 Conversation-first domain in the release checklist', () => {
+      expect(ALL_DOMAINS.map((domain) => domain.domain)).toEqual(
+        expect.arrayContaining([
+          'Conversation',
+          'SessionWorkspace',
+          'ConversationLifecycle',
+          'ConversationTerminalResources',
+          'Terminal',
+          'Data Migration'
+        ])
+      )
+    })
+
+    it('pins authenticated HTTP/ACP/terminal boundaries and narrow remote spawn', () => {
+      const auth = readFileSync(join(REPOSITORY_ROOT, 'src-tauri/src/web/auth.rs'), 'utf-8')
+      const router = readFileSync(join(REPOSITORY_ROOT, 'src-tauri/src/web/router.rs'), 'utf-8')
+      const relay = readFileSync(join(REPOSITORY_ROOT, 'src-tauri/src/web/ws.rs'), 'utf-8')
+      const terminal = readFileSync(
+        join(REPOSITORY_ROOT, 'src-tauri/src/web/terminal_ws.rs'),
+        'utf-8'
+      )
+      const terminalProtocol = readFileSync(
+        join(REPOSITORY_ROOT, 'src/shared/types/web-terminal-protocol.types.ts'),
+        'utf-8'
+      )
+
+      expect(auth).toContain('subtle::ConstantTimeEq')
+      expect(auth).toContain('capability_middleware')
+      expect(auth).toContain('"/conversations"')
+      expect(auth).toContain('"/conversation-recovery/"')
+      expect(auth).toContain('"/terminal/ws"')
+      expect(router).toContain('.layer(middleware::from_fn(capability_middleware))')
+      expect(relay).toContain('authority.verify_bearer_for_peer(&payload.token')
+      expect(terminal).toContain('Extension(principal): Extension<RemotePrincipal>')
+      expect(terminal).toContain('TerminalSpawnIntentV1')
+      expect(terminalProtocol).toMatch(/interface TerminalSpawnIntentV1/)
+      const spawnIntent = terminalProtocol
+        .split('export interface TerminalSpawnIntentV1')[1]
+        ?.split('\n}')[0]
+      expect(spawnIntent).toBeDefined()
+      expect(spawnIntent).not.toMatch(/^\s*(?:program|args|env|cwd|shell)\??\s*:/m)
+    })
+
+    it('pins crash-releasable migration locking and bootstrap-owned write admission', () => {
+      const lock = readFileSync(
+        join(REPOSITORY_ROOT, 'src-tauri/src/conversation/migration/lock.rs'),
+        'utf-8'
+      )
+      const authority = readFileSync(
+        join(REPOSITORY_ROOT, 'src-tauri/src/conversation/write_authority.rs'),
+        'utf-8'
+      )
+      const repository = readFileSync(
+        join(REPOSITORY_ROOT, 'src-tauri/src/conversation/repository.rs'),
+        'utf-8'
+      )
+
+      expect(lock).toContain('try_lock_exclusive')
+      expect(lock).not.toMatch(/create_new\(true\)|remove_file\(&self\.lock_path\)/)
+      expect(authority).toContain('ReaderPrecedence::HybridLegacyFirst')
+      expect(authority).toContain('ConversationErrorCode::LegacyCompatibilityReadOnly')
+      expect(authority).toContain('pub(crate) struct RepositoryWritePermit')
+      expect(repository).toContain('permit: &RepositoryWritePermit')
+      expect(repository).not.toContain('lookup_single_open')
+    })
+
+    it('pins Linux/macOS/Windows native jobs and locked standalone commands without receipts', () => {
+      const workflow = readFileSync(
+        join(REPOSITORY_ROOT, '.github/workflows/pr-validation.yml'),
+        'utf-8'
+      )
+      for (const token of [
+        'conversation-native-durability:',
+        'platform: linux',
+        'platform: macos',
+        'platform: windows',
+        'cargo test --locked conversation::native_durability_tests',
+        'cargo build --locked --bin termul-server --features standalone-server',
+        'cargo clippy --locked --bin termul-server --features standalone-server -- -D warnings'
+      ]) {
+        expect(workflow, `CI wiring missing ${token}`).toContain(token)
       }
     })
   })
