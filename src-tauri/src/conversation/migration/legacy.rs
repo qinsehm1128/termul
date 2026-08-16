@@ -591,22 +591,11 @@ async fn stage_one(
     let staged_events = repository
         .read_events(plan.map.conversation_id, 0)
         .map_err(repository_error)?;
-    let message_count = staged_events
-        .iter()
-        .filter(|event| {
-            matches!(
-                event.type_,
-                ConversationEventType::UserPrompt
-                    | ConversationEventType::MessageChunk
-                    | ConversationEventType::PromptComplete
-                    | ConversationEventType::CreationFailed
-            )
-        })
-        .count() as u64;
-    let tool_count = staged_events
-        .iter()
-        .filter(|event| event.type_ == ConversationEventType::ToolCall)
-        .count() as u64;
+    let summary = repository
+        .history_summary(plan.map.conversation_id)
+        .map_err(repository_error)?;
+    let message_count = summary.message_count;
+    let tool_count = summary.tool_count;
     let receipt = StageReceiptV1 {
         source_key: plan.map.source_key.clone(),
         conversation_id: plan.map.conversation_id,
@@ -1199,11 +1188,12 @@ fn read_legacy_jsonl(file: &SourceFile) -> Result<Vec<LegacyEvent>> {
 fn map_event_type(value: &str) -> Option<ConversationEventType> {
     match value {
         "user_prompt" => Some(ConversationEventType::UserPrompt),
-        "message_chunk" | "local_title_generated" | "session_info_update" => {
-            Some(ConversationEventType::MessageChunk)
-        }
+        "message_chunk" => Some(ConversationEventType::MessageChunk),
+        "session_info_update" => Some(ConversationEventType::SessionInfoUpdate),
+        "local_title_generated" => Some(ConversationEventType::LocalTitleGenerated),
         "prompt_complete" => Some(ConversationEventType::PromptComplete),
-        "tool_call" | "tool_call_update" => Some(ConversationEventType::ToolCall),
+        "tool_call" => Some(ConversationEventType::ToolCall),
+        "tool_call_update" => Some(ConversationEventType::ToolCallUpdate),
         _ => None,
     }
 }
@@ -1566,6 +1556,70 @@ mod tests {
         )
         .unwrap();
         fs::write(path.join("tool-calls.jsonl"), b"").unwrap();
+    }
+
+    #[test]
+    fn legacy_frontier_matches_native_append_for_identical_events() {
+        use crate::conversation::event_log::{apply_event, ConversationFrontier};
+
+        let conversation_id =
+            ConversationId::parse("018f7a1c-1b4d-7c8a-9f01-0123456789ab").unwrap();
+        let recorded_at_utc = Utc.timestamp_millis_opt(1_700_000_001_000).unwrap();
+        let fixtures = [
+            (
+                "user_prompt",
+                ConversationEventType::UserPrompt,
+                json!({"content":[{"type":"text","text":"Derived"}]}),
+            ),
+            (
+                "session_info_update",
+                ConversationEventType::SessionInfoUpdate,
+                json!({"title":"Agent"}),
+            ),
+            (
+                "local_title_generated",
+                ConversationEventType::LocalTitleGenerated,
+                json!({"title":"Background"}),
+            ),
+            (
+                "tool_call",
+                ConversationEventType::ToolCall,
+                json!({"toolCall":{"id":"one"}}),
+            ),
+            (
+                "tool_call_update",
+                ConversationEventType::ToolCallUpdate,
+                json!({"update":{"id":"one"}}),
+            ),
+        ];
+        let mut legacy = ConversationFrontier::default();
+        let mut native = ConversationFrontier::default();
+        for (index, (legacy_type, native_type, payload)) in fixtures.into_iter().enumerate() {
+            let seq = index as u64 + 1;
+            apply_event(
+                &mut legacy,
+                &ConversationEventRecordV2::new(
+                    conversation_id,
+                    seq,
+                    recorded_at_utc,
+                    map_event_type(legacy_type).unwrap(),
+                    payload.clone(),
+                ),
+            )
+            .unwrap();
+            apply_event(
+                &mut native,
+                &ConversationEventRecordV2::new(
+                    conversation_id,
+                    seq,
+                    recorded_at_utc,
+                    native_type,
+                    payload,
+                ),
+            )
+            .unwrap();
+        }
+        assert_eq!(legacy, native);
     }
 
     #[tokio::test]

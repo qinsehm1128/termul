@@ -5,7 +5,8 @@
 //! `seq`, and rejects duplicate or mismatched records. Recovery repairs only an unterminated final
 //! line, preserving the original bytes beside the log before atomically truncating it.
 
-use std::collections::HashMap;
+#[cfg(test)]
+use std::cell::Cell;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -17,8 +18,8 @@ use uuid::Uuid;
 
 use crate::conversation::contracts::{
     format_created_at_utc, parse_created_at_utc, AgentSessionBinding, AgentSessionBindingState,
-    ConversationErrorCode, ConversationId, ProjectAttachment, AGENT_SESSION_BINDING_SCHEMA_VERSION,
-    PROJECT_ATTACHMENT_SCHEMA_VERSION,
+    ConversationErrorCode, ConversationId, ConversationTitleSource, ProjectAttachment,
+    AGENT_SESSION_BINDING_SCHEMA_VERSION, PROJECT_ATTACHMENT_SCHEMA_VERSION,
 };
 use crate::conversation::durable_fs::DurableFileSystem;
 
@@ -59,8 +60,11 @@ impl ConversationEventStream {
 pub enum ConversationEventType {
     UserPrompt,
     MessageChunk,
+    SessionInfoUpdate,
+    LocalTitleGenerated,
     PromptComplete,
     ToolCall,
+    ToolCallUpdate,
     BindingBound,
     BindingDetached,
     BindingRebound,
@@ -75,16 +79,19 @@ impl ConversationEventType {
     #[must_use]
     pub const fn stream(self) -> ConversationEventStream {
         match self {
-            Self::ToolCall => ConversationEventStream::ToolCalls,
+            Self::ToolCall | Self::ToolCallUpdate => ConversationEventStream::ToolCalls,
             Self::BindingBound
             | Self::BindingDetached
             | Self::BindingRebound
             | Self::BindingSuspended
             | Self::BindingReplaced => ConversationEventStream::Bindings,
             Self::ProjectAttached | Self::ProjectDetached => ConversationEventStream::Attachments,
-            Self::UserPrompt | Self::MessageChunk | Self::PromptComplete | Self::CreationFailed => {
-                ConversationEventStream::Messages
-            }
+            Self::UserPrompt
+            | Self::MessageChunk
+            | Self::SessionInfoUpdate
+            | Self::LocalTitleGenerated
+            | Self::PromptComplete
+            | Self::CreationFailed => ConversationEventStream::Messages,
         }
     }
 }
@@ -171,27 +178,57 @@ pub struct EventLogRepairWarning {
     pub truncated_bytes: u64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConversationSummaryFrontier {
+    pub title: Option<String>,
+    pub title_source: Option<ConversationTitleSource>,
+    pub last_activity_at_utc: Option<DateTime<Utc>>,
+    pub message_count: u64,
+    pub tool_count: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConversationFrontier {
+    pub binding: BindingMaterialization,
+    pub attachment: AttachmentMaterialization,
+    pub summary: ConversationSummaryFrontier,
+    pub last_seq: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ConversationReplay {
     pub records: Vec<ConversationEventRecordV2>,
     pub repairs: Vec<EventLogRepairWarning>,
-    pub binding: BindingMaterialization,
-    pub attachment: AttachmentMaterialization,
+    pub frontier: ConversationFrontier,
 }
 
 impl ConversationReplay {
     #[must_use]
     pub fn last_seq(&self) -> u64 {
-        self.records.last().map_or(0, |record| record.seq)
+        self.frontier.last_seq
     }
 
     #[must_use]
     pub fn last_recorded_at_utc(&self) -> Option<DateTime<Utc>> {
-        self.records
-            .iter()
-            .map(|record| record.recorded_at_utc)
-            .max()
+        self.frontier.summary.last_activity_at_utc
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static APPLY_EVENT_COUNT: Cell<u64> = const { Cell::new(0) };
+    static FULL_MATERIALIZATION_COUNT: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_operation_counters() {
+    APPLY_EVENT_COUNT.set(0);
+    FULL_MATERIALIZATION_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn operation_counters() -> (u64, u64) {
+    (APPLY_EVENT_COUNT.get(), FULL_MATERIALIZATION_COUNT.get())
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -280,37 +317,79 @@ pub fn replay_conversation(
         previous = record.seq;
     }
 
-    let (binding, attachment) = materialize_records(&records, conversation_id, directory)?;
+    let mut frontier = ConversationFrontier::default();
+    for record in &records {
+        apply_event(&mut frontier, record)?;
+    }
     Ok(ConversationReplay {
         records,
         repairs,
-        binding,
-        attachment,
+        frontier,
     })
 }
 
-/// Validate and materialize an already seq-ordered prospective record set before append.
+/// Validate and materialize an already seq-ordered record set.
+///
+/// This compatibility helper is intentionally reserved for explicit recovery/tests. Live appends
+/// call [`apply_event`] once against the compact in-memory frontier.
 pub fn materialize_records(
     records: &[ConversationEventRecordV2],
     conversation_id: ConversationId,
     directory: &Path,
 ) -> Result<(BindingMaterialization, AttachmentMaterialization)> {
-    let mut previous = 0u64;
+    #[cfg(test)]
+    FULL_MATERIALIZATION_COUNT.set(FULL_MATERIALIZATION_COUNT.get() + 1);
+    let mut frontier = ConversationFrontier::default();
     for record in records {
-        if record.conversation_id != conversation_id || record.seq == 0 || record.seq <= previous {
+        if record.conversation_id != conversation_id {
             return Err(error(
                 ConversationErrorCode::ConversationRecoveryRequired,
-                EventLogErrorKind::SequenceConflict,
+                EventLogErrorKind::ConversationMismatch,
                 conversation_id,
                 directory,
-                format!("prospective global sequence conflict at seq {}", record.seq),
+                format!("record seq {} has a mismatched conversationId", record.seq),
             ));
         }
-        previous = record.seq;
+        apply_event(&mut frontier, record)?;
     }
-    let binding = materialize_bindings(records, conversation_id, directory)?;
-    let attachment = materialize_attachments(records, conversation_id, directory)?;
-    Ok((binding, attachment))
+    Ok((frontier.binding, frontier.attachment))
+}
+
+/// Apply one validated canonical event to the compact Conversation frontier.
+pub fn apply_event(
+    frontier: &mut ConversationFrontier,
+    record: &ConversationEventRecordV2,
+) -> Result<()> {
+    let path = Path::new(record.type_.stream().file_name());
+    if record.schema_version != CONVERSATION_EVENT_SCHEMA_VERSION {
+        return Err(error(
+            ConversationErrorCode::ConversationUnsupportedSchema,
+            EventLogErrorKind::UnsupportedSchema,
+            record.conversation_id,
+            path,
+            format!(
+                "event schemaVersion {} is unsupported; expected {}",
+                record.schema_version, CONVERSATION_EVENT_SCHEMA_VERSION
+            ),
+        ));
+    }
+    if record.seq == 0 || record.seq <= frontier.last_seq {
+        return Err(error(
+            ConversationErrorCode::ConversationRecoveryRequired,
+            EventLogErrorKind::SequenceConflict,
+            record.conversation_id,
+            path,
+            format!("global sequence conflict at seq {}", record.seq),
+        ));
+    }
+
+    apply_binding_event(&mut frontier.binding, record, path)?;
+    apply_attachment_event(&mut frontier.attachment, record, path)?;
+    apply_summary_event(&mut frontier.summary, record)?;
+    frontier.last_seq = record.seq;
+    #[cfg(test)]
+    APPLY_EVENT_COUNT.set(APPLY_EVENT_COUNT.get() + 1);
+    Ok(())
 }
 
 struct LoadedStream {
@@ -473,224 +552,394 @@ fn load_stream(
     Ok(LoadedStream { records, repairs })
 }
 
-fn materialize_bindings(
-    records: &[ConversationEventRecordV2],
-    conversation_id: ConversationId,
-    directory: &Path,
-) -> Result<BindingMaterialization> {
-    let path = directory.join(BINDINGS_FILE);
-    let mut bindings: HashMap<Uuid, AgentSessionBinding> = HashMap::new();
-    let mut order = Vec::new();
-    let mut current: Option<Uuid> = None;
-
-    for record in records
-        .iter()
-        .filter(|record| record.type_.stream() == ConversationEventStream::Bindings)
-    {
-        match record.type_ {
-            ConversationEventType::BindingBound => {
-                let payload = binding_payload(record, conversation_id, &path)?;
-                validate_binding(
-                    &payload.binding,
-                    AgentSessionBindingState::Active,
-                    record,
-                    &path,
-                )?;
-                if current.is_some() || bindings.contains_key(&payload.binding.binding_id) {
-                    return Err(history_error(
-                        conversation_id,
-                        &path,
-                        record.seq,
-                        "binding_bound requires no current binding and a new bindingId",
-                    ));
-                }
-                current = Some(payload.binding.binding_id);
-                order.push(payload.binding.binding_id);
-                bindings.insert(payload.binding.binding_id, payload.binding);
-            }
-            ConversationEventType::BindingDetached => {
-                let payload = binding_payload(record, conversation_id, &path)?;
-                validate_binding(
-                    &payload.binding,
-                    AgentSessionBindingState::Detached,
-                    record,
-                    &path,
-                )?;
-                let existing = current_binding(&bindings, current, record, conversation_id, &path)?;
-                if existing.state != AgentSessionBindingState::Active
-                    || !same_opaque_binding(existing, &payload.binding)
-                {
-                    return Err(history_error(
-                        conversation_id,
-                        &path,
-                        record.seq,
-                        "binding_detached requires the current active opaque binding",
-                    ));
-                }
-                bindings.insert(payload.binding.binding_id, payload.binding);
-            }
-            ConversationEventType::BindingRebound => {
-                let payload = binding_payload(record, conversation_id, &path)?;
-                validate_binding(
-                    &payload.binding,
-                    AgentSessionBindingState::Active,
-                    record,
-                    &path,
-                )?;
-                let existing = current_binding(&bindings, current, record, conversation_id, &path)?;
-                if existing.state != AgentSessionBindingState::Detached
-                    || !same_opaque_binding(existing, &payload.binding)
-                {
-                    return Err(history_error(
-                        conversation_id,
-                        &path,
-                        record.seq,
-                        "binding_rebound requires the same detached opaque binding",
-                    ));
-                }
-                bindings.insert(payload.binding.binding_id, payload.binding);
-            }
-            ConversationEventType::BindingSuspended => {
-                let payload = binding_payload(record, conversation_id, &path)?;
-                validate_binding(
-                    &payload.binding,
-                    AgentSessionBindingState::Suspended,
-                    record,
-                    &path,
-                )?;
-                let existing = current_binding(&bindings, current, record, conversation_id, &path)?;
-                if existing.state != AgentSessionBindingState::Active
-                    || !same_opaque_binding(existing, &payload.binding)
-                {
-                    return Err(history_error(
-                        conversation_id,
-                        &path,
-                        record.seq,
-                        "binding_suspended requires the current active opaque binding",
-                    ));
-                }
-                bindings.insert(payload.binding.binding_id, payload.binding);
-            }
-            ConversationEventType::BindingReplaced => {
-                let payload: BindingReplacementPayloadV1 =
-                    serde_json::from_value(record.payload.clone()).map_err(|source| {
-                        history_error(
-                            conversation_id,
-                            &path,
-                            record.seq,
-                            &format!("invalid binding_replaced payload: {source}"),
-                        )
-                    })?;
-                validate_binding(
-                    &payload.previous_binding,
-                    AgentSessionBindingState::Replaced,
-                    record,
-                    &path,
-                )?;
-                validate_binding(
-                    &payload.binding,
-                    AgentSessionBindingState::Active,
-                    record,
-                    &path,
-                )?;
-                let existing = current_binding(&bindings, current, record, conversation_id, &path)?;
-                if !same_opaque_binding(existing, &payload.previous_binding)
-                    || payload.binding.binding_id == payload.previous_binding.binding_id
-                    || bindings.contains_key(&payload.binding.binding_id)
-                {
-                    return Err(history_error(
-                        conversation_id,
-                        &path,
-                        record.seq,
-                        "binding_replaced must retain the current old binding and add a new bindingId",
-                    ));
-                }
-                bindings.insert(
-                    payload.previous_binding.binding_id,
-                    payload.previous_binding,
-                );
-                current = Some(payload.binding.binding_id);
-                order.push(payload.binding.binding_id);
-                bindings.insert(payload.binding.binding_id, payload.binding);
-            }
-            _ => {}
-        }
-    }
-
-    let history = order
-        .into_iter()
-        .filter_map(|binding_id| bindings.get(&binding_id).cloned())
-        .collect::<Vec<_>>();
-    let current = current.and_then(|binding_id| bindings.get(&binding_id).cloned());
-    Ok(BindingMaterialization { current, history })
-}
-
-fn materialize_attachments(
-    records: &[ConversationEventRecordV2],
-    conversation_id: ConversationId,
-    directory: &Path,
-) -> Result<AttachmentMaterialization> {
-    let path = directory.join(ATTACHMENTS_FILE);
-    let mut materialized = AttachmentMaterialization::default();
-    for record in records
-        .iter()
-        .filter(|record| record.type_.stream() == ConversationEventStream::Attachments)
-    {
-        let payload: ProjectAttachmentEventPayloadV1 =
-            serde_json::from_value(record.payload.clone()).map_err(|source| {
-                attachment_history_error(
-                    conversation_id,
-                    &path,
-                    record.seq,
-                    &format!("invalid attachment payload: {source}"),
-                )
-            })?;
-        if payload.attachment.schema_version != PROJECT_ATTACHMENT_SCHEMA_VERSION {
-            return Err(attachment_history_error(
-                conversation_id,
-                &path,
-                record.seq,
-                "unsupported project attachment schemaVersion",
-            ));
-        }
-        materialized.has_events = true;
-        match record.type_ {
-            ConversationEventType::ProjectAttached => {
-                if materialized.current.is_some() {
-                    return Err(attachment_history_error(
-                        conversation_id,
-                        &path,
-                        record.seq,
-                        "project_attached requires no materialized attachment",
-                    ));
-                }
-                materialized.history.push(payload.attachment.clone());
-                materialized.current = Some(payload.attachment);
-            }
-            ConversationEventType::ProjectDetached => {
-                if let Some(current) = &materialized.current {
-                    if current.project_id != payload.attachment.project_id {
-                        return Err(attachment_history_error(
-                            conversation_id,
-                            &path,
-                            record.seq,
-                            "project_detached does not match the current attachment",
-                        ));
-                    }
-                }
-                if !materialized
+fn apply_binding_event(
+    materialized: &mut BindingMaterialization,
+    record: &ConversationEventRecordV2,
+    path: &Path,
+) -> Result<()> {
+    match record.type_ {
+        ConversationEventType::BindingBound => {
+            let payload = binding_payload(record, record.conversation_id, path)?;
+            validate_binding(
+                &payload.binding,
+                AgentSessionBindingState::Active,
+                record,
+                path,
+            )?;
+            if materialized.current.is_some()
+                || materialized
                     .history
                     .iter()
-                    .any(|entry| entry == &payload.attachment)
-                {
-                    materialized.history.push(payload.attachment);
-                }
-                materialized.current = None;
+                    .any(|entry| entry.binding_id == payload.binding.binding_id)
+            {
+                return Err(history_error(
+                    record.conversation_id,
+                    path,
+                    record.seq,
+                    "binding_bound requires no current binding and a new bindingId",
+                ));
             }
-            _ => {}
+            materialized.history.push(payload.binding.clone());
+            materialized.current = Some(payload.binding);
+        }
+        ConversationEventType::BindingDetached => {
+            apply_same_binding_transition(
+                materialized,
+                record,
+                path,
+                AgentSessionBindingState::Active,
+                AgentSessionBindingState::Detached,
+                "binding_detached requires the current active opaque binding",
+            )?;
+        }
+        ConversationEventType::BindingRebound => {
+            apply_same_binding_transition(
+                materialized,
+                record,
+                path,
+                AgentSessionBindingState::Detached,
+                AgentSessionBindingState::Active,
+                "binding_rebound requires the same detached opaque binding",
+            )?;
+        }
+        ConversationEventType::BindingSuspended => {
+            apply_same_binding_transition(
+                materialized,
+                record,
+                path,
+                AgentSessionBindingState::Active,
+                AgentSessionBindingState::Suspended,
+                "binding_suspended requires the current active opaque binding",
+            )?;
+        }
+        ConversationEventType::BindingReplaced => {
+            let payload: BindingReplacementPayloadV1 =
+                serde_json::from_value(record.payload.clone()).map_err(|source| {
+                    history_error(
+                        record.conversation_id,
+                        path,
+                        record.seq,
+                        &format!("invalid binding_replaced payload: {source}"),
+                    )
+                })?;
+            validate_binding(
+                &payload.previous_binding,
+                AgentSessionBindingState::Replaced,
+                record,
+                path,
+            )?;
+            validate_binding(
+                &payload.binding,
+                AgentSessionBindingState::Active,
+                record,
+                path,
+            )?;
+            let existing = materialized.current.as_ref().ok_or_else(|| {
+                history_error(
+                    record.conversation_id,
+                    path,
+                    record.seq,
+                    "binding transition requires a current binding",
+                )
+            })?;
+            if !same_opaque_binding(existing, &payload.previous_binding)
+                || payload.binding.binding_id == payload.previous_binding.binding_id
+                || materialized
+                    .history
+                    .iter()
+                    .any(|entry| entry.binding_id == payload.binding.binding_id)
+            {
+                return Err(history_error(
+                    record.conversation_id,
+                    path,
+                    record.seq,
+                    "binding_replaced must retain the current old binding and add a new bindingId",
+                ));
+            }
+            let previous_index = materialized
+                .history
+                .iter()
+                .position(|entry| entry.binding_id == payload.previous_binding.binding_id)
+                .ok_or_else(|| {
+                    history_error(
+                        record.conversation_id,
+                        path,
+                        record.seq,
+                        "current binding is missing from binding history",
+                    )
+                })?;
+            materialized.history[previous_index] = payload.previous_binding;
+            materialized.history.push(payload.binding.clone());
+            materialized.current = Some(payload.binding);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn apply_same_binding_transition(
+    materialized: &mut BindingMaterialization,
+    record: &ConversationEventRecordV2,
+    path: &Path,
+    previous_state: AgentSessionBindingState,
+    next_state: AgentSessionBindingState,
+    failure_detail: &str,
+) -> Result<()> {
+    let payload = binding_payload(record, record.conversation_id, path)?;
+    validate_binding(&payload.binding, next_state, record, path)?;
+    let existing = materialized.current.as_ref().ok_or_else(|| {
+        history_error(
+            record.conversation_id,
+            path,
+            record.seq,
+            "binding transition requires a current binding",
+        )
+    })?;
+    if existing.state != previous_state || !same_opaque_binding(existing, &payload.binding) {
+        return Err(history_error(
+            record.conversation_id,
+            path,
+            record.seq,
+            failure_detail,
+        ));
+    }
+    let history_index = materialized
+        .history
+        .iter()
+        .position(|entry| entry.binding_id == payload.binding.binding_id)
+        .ok_or_else(|| {
+            history_error(
+                record.conversation_id,
+                path,
+                record.seq,
+                "current binding is missing from binding history",
+            )
+        })?;
+    materialized.history[history_index] = payload.binding.clone();
+    materialized.current = Some(payload.binding);
+    Ok(())
+}
+
+fn apply_attachment_event(
+    materialized: &mut AttachmentMaterialization,
+    record: &ConversationEventRecordV2,
+    path: &Path,
+) -> Result<()> {
+    if !matches!(
+        record.type_,
+        ConversationEventType::ProjectAttached | ConversationEventType::ProjectDetached
+    ) {
+        return Ok(());
+    }
+    let payload: ProjectAttachmentEventPayloadV1 = serde_json::from_value(record.payload.clone())
+        .map_err(|source| {
+        attachment_history_error(
+            record.conversation_id,
+            path,
+            record.seq,
+            &format!("invalid attachment payload: {source}"),
+        )
+    })?;
+    if payload.attachment.schema_version != PROJECT_ATTACHMENT_SCHEMA_VERSION {
+        return Err(attachment_history_error(
+            record.conversation_id,
+            path,
+            record.seq,
+            "unsupported project attachment schemaVersion",
+        ));
+    }
+    match record.type_ {
+        ConversationEventType::ProjectAttached => {
+            if materialized.current.is_some() {
+                return Err(attachment_history_error(
+                    record.conversation_id,
+                    path,
+                    record.seq,
+                    "project_attached requires no materialized attachment",
+                ));
+            }
+            materialized.history.push(payload.attachment.clone());
+            materialized.current = Some(payload.attachment);
+        }
+        ConversationEventType::ProjectDetached => {
+            if let Some(current) = &materialized.current {
+                if current.project_id != payload.attachment.project_id {
+                    return Err(attachment_history_error(
+                        record.conversation_id,
+                        path,
+                        record.seq,
+                        "project_detached does not match the current attachment",
+                    ));
+                }
+            }
+            if !materialized
+                .history
+                .iter()
+                .any(|entry| entry == &payload.attachment)
+            {
+                materialized.history.push(payload.attachment);
+            }
+            materialized.current = None;
+        }
+        _ => unreachable!("attachment variants were filtered above"),
+    }
+    materialized.has_events = true;
+    Ok(())
+}
+
+fn apply_summary_event(
+    summary: &mut ConversationSummaryFrontier,
+    record: &ConversationEventRecordV2,
+) -> Result<()> {
+    let path = Path::new(record.type_.stream().file_name());
+    match record.type_.stream() {
+        ConversationEventStream::Messages => {
+            summary.message_count = summary.message_count.checked_add(1).ok_or_else(|| {
+                error(
+                    ConversationErrorCode::ConversationRecoveryRequired,
+                    EventLogErrorKind::CorruptRecord,
+                    record.conversation_id,
+                    path,
+                    format!("message count overflow at seq {}", record.seq),
+                )
+            })?;
+        }
+        ConversationEventStream::ToolCalls => {
+            summary.tool_count = summary.tool_count.checked_add(1).ok_or_else(|| {
+                error(
+                    ConversationErrorCode::ConversationRecoveryRequired,
+                    EventLogErrorKind::CorruptRecord,
+                    record.conversation_id,
+                    path,
+                    format!("tool count overflow at seq {}", record.seq),
+                )
+            })?;
+        }
+        ConversationEventStream::Bindings | ConversationEventStream::Attachments => {}
+    }
+    summary.last_activity_at_utc = Some(
+        summary
+            .last_activity_at_utc
+            .map_or(record.recorded_at_utc, |current| {
+                current.max(record.recorded_at_utc)
+            }),
+    );
+
+    match record.type_ {
+        ConversationEventType::UserPrompt if summary.title.is_none() => {
+            summary.title = Some(derive_title(&record.payload));
+            summary.title_source = Some(ConversationTitleSource::DerivedFirstMessage);
+        }
+        ConversationEventType::SessionInfoUpdate
+            if title_precedence(summary.title_source)
+                < title_precedence(Some(ConversationTitleSource::BackgroundGenerated)) =>
+        {
+            summary.title = record
+                .payload
+                .get("title")
+                .and_then(Value::as_str)
+                .map(normalize_title);
+            summary.title_source = Some(ConversationTitleSource::AgentSupplied);
+        }
+        ConversationEventType::LocalTitleGenerated => {
+            let source = if record.payload.get("titleSource").and_then(Value::as_str)
+                == Some("local_alias")
+            {
+                ConversationTitleSource::LocalAlias
+            } else {
+                ConversationTitleSource::BackgroundGenerated
+            };
+            if title_precedence(summary.title_source) <= title_precedence(Some(source)) {
+                if let Some(title) = record
+                    .payload
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(normalize_title)
+                {
+                    summary.title = Some(title);
+                    summary.title_source = Some(source);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn title_precedence(source: Option<ConversationTitleSource>) -> u8 {
+    match source {
+        None => 0,
+        Some(ConversationTitleSource::DerivedFirstMessage) => 1,
+        Some(ConversationTitleSource::AgentSupplied) => 2,
+        Some(ConversationTitleSource::BackgroundGenerated) => 3,
+        Some(ConversationTitleSource::LocalAlias) => 4,
+    }
+}
+
+fn derive_title(payload: &Value) -> String {
+    let text = payload
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find_map(|block| {
+            (block.get("type").and_then(Value::as_str) == Some("text"))
+                .then(|| block.get("text").and_then(Value::as_str))
+                .flatten()
+        })
+        .unwrap_or("Untitled Chat");
+    normalize_title(text)
+}
+
+fn normalize_title(text: &str) -> String {
+    fn strip_wrappers(mut value: &str) -> &str {
+        loop {
+            let next = value
+                .trim()
+                .trim_matches(['"', '\'', '`'])
+                .trim_matches('_')
+                .trim_matches('*')
+                .trim();
+            if next == value {
+                return next;
+            }
+            value = next;
         }
     }
-    Ok(materialized)
+
+    let mut lines = text
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    let mut sanitized = strip_wrappers(lines.next().unwrap_or_default());
+    let lowercase = sanitized.to_ascii_lowercase();
+    const PREAMBLES: &[&str] = &[
+        "sure! here's the title:",
+        "sure, here's the title:",
+        "here's the title:",
+        "the title is:",
+        "title:",
+    ];
+    if let Some(prefix) = PREAMBLES
+        .iter()
+        .find(|prefix| lowercase.starts_with(**prefix))
+    {
+        sanitized = strip_wrappers(&sanitized[prefix.len()..]);
+        if sanitized.is_empty() {
+            sanitized = strip_wrappers(lines.next().unwrap_or_default());
+        }
+    } else if lowercase == "what should we do?" {
+        sanitized = strip_wrappers(lines.next().unwrap_or_default());
+    }
+    if sanitized.is_empty() {
+        return "Untitled Chat".to_string();
+    }
+    let bounded = sanitized.chars().take(48).collect::<String>();
+    if sanitized.chars().count() > 48 {
+        format!("{bounded}…")
+    } else {
+        bounded
+    }
 }
 
 fn binding_payload(
@@ -729,25 +978,6 @@ fn validate_binding(
         ));
     }
     Ok(())
-}
-
-fn current_binding<'a>(
-    bindings: &'a HashMap<Uuid, AgentSessionBinding>,
-    current: Option<Uuid>,
-    record: &ConversationEventRecordV2,
-    conversation_id: ConversationId,
-    path: &Path,
-) -> Result<&'a AgentSessionBinding> {
-    current
-        .and_then(|binding_id| bindings.get(&binding_id))
-        .ok_or_else(|| {
-            history_error(
-                conversation_id,
-                path,
-                record.seq,
-                "binding transition requires a current binding",
-            )
-        })
 }
 
 fn same_opaque_binding(left: &AgentSessionBinding, right: &AgentSessionBinding) -> bool {
@@ -857,6 +1087,78 @@ mod tests {
                 &serde_json::to_vec(record).unwrap(),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn incremental_frontier_preserves_distinct_events_title_precedence_and_constant_work() {
+        reset_operation_counters();
+        let conversation_id = ConversationId::parse(ID).unwrap();
+        let recorded_at_utc = parse_created_at_utc("2026-08-15T09:45:15.000Z").unwrap();
+        let mut frontier = ConversationFrontier::default();
+        let fixtures = [
+            (
+                ConversationEventType::UserPrompt,
+                json!({"content":[{"type":"text","text":"Derived title"}]}),
+            ),
+            (
+                ConversationEventType::SessionInfoUpdate,
+                json!({"title":"Agent title"}),
+            ),
+            (
+                ConversationEventType::LocalTitleGenerated,
+                json!({"title":"Background title"}),
+            ),
+            (
+                ConversationEventType::SessionInfoUpdate,
+                json!({"title":"Must not overwrite"}),
+            ),
+            (
+                ConversationEventType::ToolCall,
+                json!({"toolCall":{"id":"one"}}),
+            ),
+            (
+                ConversationEventType::ToolCallUpdate,
+                json!({"update":{"id":"one","status":"completed"}}),
+            ),
+            (
+                ConversationEventType::LocalTitleGenerated,
+                json!({"title":"Local alias","titleSource":"local_alias"}),
+            ),
+            (
+                ConversationEventType::LocalTitleGenerated,
+                json!({"title":"Must not replace alias"}),
+            ),
+            (
+                ConversationEventType::SessionInfoUpdate,
+                json!({"title":42}),
+            ),
+        ];
+        for seq in 1..=10_000_u64 {
+            let (type_, payload) = fixtures
+                .get((seq - 1) as usize)
+                .cloned()
+                .unwrap_or((ConversationEventType::MessageChunk, json!({"role":"agent"})));
+            apply_event(
+                &mut frontier,
+                &ConversationEventRecordV2::new(
+                    conversation_id,
+                    seq,
+                    recorded_at_utc,
+                    type_,
+                    payload,
+                ),
+            )
+            .unwrap();
+        }
+        assert_eq!(frontier.last_seq, 10_000);
+        assert_eq!(frontier.summary.title.as_deref(), Some("Local alias"));
+        assert_eq!(
+            frontier.summary.title_source,
+            Some(ConversationTitleSource::LocalAlias)
+        );
+        assert_eq!(frontier.summary.tool_count, 2);
+        assert_eq!(frontier.summary.message_count, 9_998);
+        assert_eq!(operation_counters(), (10_000, 0));
     }
 
     #[test]

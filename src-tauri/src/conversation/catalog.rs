@@ -5,22 +5,24 @@
 //! ConversationId. Its timestamp is derived only from accepted canonical timestamps, so deleting,
 //! corrupting, or replacing the cache cannot change the rebuilt bytes.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::conversation::contracts::{
     format_created_at_utc, ConversationErrorCode, ConversationId, ConversationLifecycleState,
-    ConversationRecordV2, CreationPartition, CONVERSATION_SCHEMA_VERSION,
+    ConversationRecordV2, ConversationTitleSource, CreationPartition, CONVERSATION_SCHEMA_VERSION,
 };
 use crate::conversation::durable_fs::DurableFileSystem;
 use crate::conversation::event_log::{
-    replay_conversation, ConversationEventType, ConversationReplay, EventLogRepairWarning,
+    replay_conversation, ConversationEventType, ConversationFrontier, ConversationReplay,
+    EventLogRepairWarning,
 };
 use crate::conversation::locator::{
     bounded_scan, ConversationLocator, LocatorError, MAX_CONVERSATIONS_PER_SCAN,
@@ -43,7 +45,11 @@ pub struct ConversationCatalogEntryV1 {
     pub workspace_cwd: String,
     pub project_id: Option<String>,
     pub lifecycle_state: ConversationLifecycleState,
+    pub title: Option<String>,
+    pub title_source: Option<ConversationTitleSource>,
     pub last_activity_at_utc: String,
+    pub message_count: u64,
+    pub tool_count: u64,
     pub last_seq: u64,
 }
 
@@ -63,6 +69,64 @@ impl ConversationCatalogFileV1 {
         bytes.push(b'\n');
         bytes
     }
+}
+
+/// In-memory disposable cache updated from validated Conversation frontiers.
+#[derive(Debug, Clone)]
+pub struct ConversationCatalog {
+    file: ConversationCatalogFileV1,
+}
+
+impl ConversationCatalog {
+    #[must_use]
+    pub fn from_file(file: ConversationCatalogFileV1) -> Self {
+        Self { file }
+    }
+
+    /// Insert or replace exactly one canonical entry and recompute deterministic cache metadata.
+    pub fn upsert(&mut self, record: &ConversationRecordV2, frontier: &ConversationFrontier) {
+        let entry = entry_from_frontier(record, frontier);
+        self.file.generated_at_utc = self
+            .file
+            .generated_at_utc
+            .clone()
+            .max(entry.created_at_utc.clone())
+            .max(entry.last_activity_at_utc.clone());
+        match self
+            .file
+            .conversations
+            .binary_search_by_key(&record.conversation_id.to_string(), |entry| {
+                entry.conversation_id.to_string()
+            }) {
+            Ok(index) => self.file.conversations[index] = entry,
+            Err(index) => self.file.conversations.insert(index, entry),
+        }
+    }
+
+    #[must_use]
+    pub fn deterministic_bytes(&self) -> Vec<u8> {
+        self.file.deterministic_bytes()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.file.conversations.len()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CATALOG_SCAN_COUNT: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_catalog_scan_counter() {
+    CATALOG_SCAN_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn catalog_scan_count() -> u64 {
+    CATALOG_SCAN_COUNT.get()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,6 +238,8 @@ pub fn rebuild_catalog(
     locator: &ConversationLocator,
     durable_fs: &DurableFileSystem,
 ) -> Result<CatalogRebuildResult> {
+    #[cfg(test)]
+    CATALOG_SCAN_COUNT.set(CATALOG_SCAN_COUNT.get() + 1);
     let scan = bounded_scan(locator)?;
     let located = scan.collect::<Vec<_>>();
     let accepted_metadata = located
@@ -217,8 +283,8 @@ pub fn rebuild_catalog(
         };
         let mut record = located.record;
         record.last_seq = replay.last_seq();
-        if replay.attachment.has_events {
-            record.project_attachment = replay.attachment.current.clone();
+        if replay.frontier.attachment.has_events {
+            record.project_attachment = replay.frontier.attachment.current.clone();
         }
         for event in &replay.records {
             match event.type_ {
@@ -248,39 +314,15 @@ pub fn rebuild_catalog(
             .then_with(|| format!("{:?}", left.code).cmp(&format!("{:?}", right.code)))
     });
 
-    let mut generated_at: Option<DateTime<Utc>> = None;
-    let mut conversations = Vec::with_capacity(accepted.len());
-    for entry in &accepted {
-        let record = &entry.record;
-        generated_at = Some(generated_at.map_or(record.created_at_utc, |current| {
-            current.max(record.created_at_utc)
-        }));
-        if let Some(event_time) = entry.replay.last_recorded_at_utc() {
-            generated_at = Some(generated_at.map_or(event_time, |current| current.max(event_time)));
-        }
-        let last_activity_at_utc = entry
-            .replay
-            .last_recorded_at_utc()
-            .map_or(record.created_at_utc, |event_time| {
-                event_time.max(record.created_at_utc)
-            });
-        conversations.push(ConversationCatalogEntryV1 {
-            conversation_id: record.conversation_id,
-            created_at_utc: format_created_at_utc(&record.created_at_utc),
-            creation_partition: record.creation_partition.path.clone(),
-            workspace_cwd: record.workspace_cwd.clone(),
-            project_id: record
-                .project_attachment
-                .as_ref()
-                .map(|attachment| attachment.project_id.clone()),
-            lifecycle_state: record.lifecycle_state,
-            last_activity_at_utc: format_created_at_utc(&last_activity_at_utc),
-            last_seq: record.last_seq,
-        });
-    }
-
-    let generated_at_utc = generated_at
-        .map(|timestamp| format_created_at_utc(&timestamp))
+    let conversations = accepted
+        .iter()
+        .map(|entry| entry_from_frontier(&entry.record, &entry.replay.frontier))
+        .collect::<Vec<_>>();
+    let generated_at_utc = conversations
+        .iter()
+        .flat_map(|entry| [&entry.created_at_utc, &entry.last_activity_at_utc])
+        .max()
+        .cloned()
         .unwrap_or_else(|| EMPTY_CATALOG_GENERATED_AT_UTC.to_string());
     Ok(CatalogRebuildResult {
         catalog: ConversationCatalogFileV1 {
@@ -292,6 +334,35 @@ pub fn rebuild_catalog(
         recovery_issues,
         repairs,
     })
+}
+
+fn entry_from_frontier(
+    record: &ConversationRecordV2,
+    frontier: &ConversationFrontier,
+) -> ConversationCatalogEntryV1 {
+    let last_activity_at_utc = frontier
+        .summary
+        .last_activity_at_utc
+        .map_or(record.created_at_utc, |event_time| {
+            event_time.max(record.created_at_utc)
+        });
+    ConversationCatalogEntryV1 {
+        conversation_id: record.conversation_id,
+        created_at_utc: format_created_at_utc(&record.created_at_utc),
+        creation_partition: record.creation_partition.path.clone(),
+        workspace_cwd: record.workspace_cwd.clone(),
+        project_id: record
+            .project_attachment
+            .as_ref()
+            .map(|attachment| attachment.project_id.clone()),
+        lifecycle_state: record.lifecycle_state,
+        title: frontier.summary.title.clone(),
+        title_source: frontier.summary.title_source,
+        last_activity_at_utc: format_created_at_utc(&last_activity_at_utc),
+        message_count: frontier.summary.message_count,
+        tool_count: frontier.summary.tool_count,
+        last_seq: frontier.last_seq,
+    }
 }
 
 fn load_provenance(
@@ -607,6 +678,44 @@ mod tests {
             EMPTY_CATALOG_GENERATED_AT_UTC
         );
         assert_eq!(rebuilt.catalog.schema_version, CATALOG_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn incremental_upsert_matches_explicit_rebuild_for_1000_conversations() {
+        let (_temp, locator, durable_fs) = fixture();
+        let mut records = Vec::new();
+        for index in 0..1_000_u64 {
+            let id = format!("00000000-0000-4000-8000-{index:012x}");
+            let value = record(&id, "2026-08-15T09:45:15.000Z");
+            let directory = locator
+                .private_dir(value.conversation_id, &value.creation_partition)
+                .unwrap();
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(
+                directory.join(CONVERSATION_METADATA_FILE),
+                serde_json::to_vec_pretty(&value).unwrap(),
+            )
+            .unwrap();
+            for file in EVENT_LOG_FILES {
+                fs::write(directory.join(file), b"").unwrap();
+            }
+            records.push(value);
+        }
+
+        let mut incremental = ConversationCatalog::from_file(ConversationCatalogFileV1 {
+            schema_version: CATALOG_SCHEMA_VERSION,
+            generated_at_utc: EMPTY_CATALOG_GENERATED_AT_UTC.to_string(),
+            conversations: Vec::new(),
+        });
+        for value in records.iter().rev() {
+            incremental.upsert(value, &ConversationFrontier::default());
+        }
+        let rebuilt = rebuild_catalog(&locator, &durable_fs).unwrap();
+        assert_eq!(incremental.len(), 1_000);
+        assert_eq!(
+            incremental.deterministic_bytes(),
+            rebuilt.catalog.deterministic_bytes()
+        );
     }
 
     #[test]

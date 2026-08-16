@@ -19,21 +19,20 @@ use serde_json::Value;
 use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
 
 use crate::conversation::catalog::{
-    rebuild_catalog, AcceptedCanonicalConversation, CatalogRecoveryIssue,
+    rebuild_catalog, AcceptedCanonicalConversation, CatalogRecoveryIssue, ConversationCatalog,
     ConversationProvenanceFileV1, CATALOG_FILE, CONVERSATION_METADATA_FILE, PROVENANCE_FILE,
 };
 use crate::conversation::contracts::{
-    AgentSessionBinding, AgentSessionBindingState, ConversationErrorCode, ConversationId,
-    ConversationLifecycleState, ConversationRecordV2, ExecutionTarget, ProjectAttachment,
-    AGENT_SESSION_BINDING_SCHEMA_VERSION, CONVERSATION_SCHEMA_VERSION,
-    PROJECT_ATTACHMENT_SCHEMA_VERSION,
+    AgentSessionBinding, AgentSessionBindingState, ConversationErrorCode,
+    ConversationHistorySummaryV1, ConversationId, ConversationLifecycleState, ConversationRecordV2,
+    ExecutionTarget, ProjectAttachment, AGENT_SESSION_BINDING_SCHEMA_VERSION,
+    CONVERSATION_SCHEMA_VERSION, PROJECT_ATTACHMENT_SCHEMA_VERSION,
 };
 use crate::conversation::durable_fs::{DirectoryPermissions, DurableFileSystem};
 use crate::conversation::event_log::{
-    materialize_records, BindingEventPayloadV1, BindingMaterialization,
-    BindingReplacementPayloadV1, ConversationEventRecordV2, ConversationEventType,
-    ConversationReplay, EventLogRepairWarning, ProjectAttachmentEventPayloadV1,
-    CONVERSATION_EVENT_SCHEMA_VERSION, EVENT_LOG_FILES,
+    apply_event, BindingEventPayloadV1, BindingReplacementPayloadV1, ConversationEventRecordV2,
+    ConversationEventType, ConversationFrontier, ConversationReplay, EventLogRepairWarning,
+    ProjectAttachmentEventPayloadV1, CONVERSATION_EVENT_SCHEMA_VERSION, EVENT_LOG_FILES,
 };
 use crate::conversation::locator::ConversationLocator;
 
@@ -81,6 +80,14 @@ struct ConversationState {
     provenance: Option<ConversationProvenanceFileV1>,
 }
 
+struct CatalogCacheState {
+    catalog: ConversationCatalog,
+    dirty: bool,
+    generation: u64,
+    flush_count: u64,
+    last_conversation_id: Option<ConversationId>,
+}
+
 #[derive(Debug)]
 pub struct RepositoryError {
     pub code: ConversationErrorCode,
@@ -113,6 +120,7 @@ pub struct ConversationRepository {
     recovery_by_id: ParkingMutex<HashMap<ConversationId, RepositoryRecoveryItem>>,
     recovery_items: ParkingMutex<Vec<RepositoryRecoveryItem>>,
     conversation_locks: ParkingMutex<HashMap<ConversationId, Arc<TokioMutex<()>>>>,
+    catalog: ParkingMutex<CatalogCacheState>,
     catalog_lock: TokioMutex<()>,
 }
 
@@ -228,6 +236,7 @@ impl ConversationRepository {
             });
         }
 
+        let catalog = ConversationCatalog::from_file(rebuilt.catalog.clone());
         recovery_items.sort_by(|left, right| {
             left.relative_path.cmp(&right.relative_path).then_with(|| {
                 left.conversation_id
@@ -265,6 +274,13 @@ impl ConversationRepository {
             recovery_by_id: ParkingMutex::new(recovery_by_id),
             recovery_items: ParkingMutex::new(recovery_items),
             conversation_locks: ParkingMutex::new(HashMap::new()),
+            catalog: ParkingMutex::new(CatalogCacheState {
+                catalog,
+                dirty: false,
+                generation: 0,
+                flush_count: 0,
+                last_conversation_id: None,
+            }),
             catalog_lock: TokioMutex::new(()),
         });
         OPEN_REPOSITORIES
@@ -433,13 +449,13 @@ impl ConversationRepository {
             replay: ConversationReplay {
                 records: Vec::new(),
                 repairs: Vec::new(),
-                binding: BindingMaterialization::default(),
-                attachment: Default::default(),
+                frontier: ConversationFrontier::default(),
             },
             provenance: None,
         };
         self.states.lock().insert(record.conversation_id, state);
-        self.refresh_catalog_best_effort().await;
+        self.mark_catalog_entry_dirty(record.conversation_id);
+        self.flush_catalog_best_effort().await;
         log::info!(
             "[conversation-repository] conversation created conversation_id={}",
             record.conversation_id
@@ -492,17 +508,27 @@ impl ConversationRepository {
     ) -> Result<ConversationRecordV2> {
         let lock = self.conversation_lock(conversation_id);
         let _guard = lock.lock().await;
-        let mut state = self.state(conversation_id, "update_metadata")?;
+        self.check_recovery(conversation_id, "update_metadata")?;
+        let mut record = self
+            .states
+            .lock()
+            .get(&conversation_id)
+            .map(|state| state.record.clone())
+            .ok_or_else(|| not_found("update_metadata", conversation_id))?;
         if let Some(lifecycle_state) = update.lifecycle_state {
-            state.record.lifecycle_state = lifecycle_state;
+            record.lifecycle_state = lifecycle_state;
         }
         if let Some(execution_target) = update.execution_target {
-            state.record.execution_target = execution_target;
+            record.execution_target = execution_target;
         }
-        self.persist_state_metadata(&state, "update_metadata")?;
-        let record = state.record.clone();
-        self.states.lock().insert(conversation_id, state);
-        self.refresh_catalog_best_effort().await;
+        self.persist_record_metadata(&record, "update_metadata")?;
+        self.states
+            .lock()
+            .get_mut(&conversation_id)
+            .expect("per-Conversation lock preserves state")
+            .record = record.clone();
+        self.mark_catalog_entry_dirty(conversation_id);
+        self.flush_catalog_best_effort().await;
         Ok(record)
     }
 
@@ -516,7 +542,7 @@ impl ConversationRepository {
         let lock = self.conversation_lock(conversation_id);
         let _guard = lock.lock().await;
         let event = self.append_event_locked(conversation_id, recorded_at_utc, type_, payload)?;
-        self.refresh_catalog_best_effort().await;
+        self.flush_catalog_best_effort().await;
         Ok(event)
     }
 
@@ -525,7 +551,11 @@ impl ConversationRepository {
         conversation_id: ConversationId,
         after_seq: u64,
     ) -> Result<Vec<ConversationEventRecordV2>> {
-        let state = self.state(conversation_id, "read_events")?;
+        self.check_recovery(conversation_id, "read_events")?;
+        let states = self.states.lock();
+        let state = states
+            .get(&conversation_id)
+            .ok_or_else(|| not_found("read_events", conversation_id))?;
         if after_seq > state.record.last_seq {
             return Err(repository_error(
                 ConversationErrorCode::ConversationRecoveryRequired,
@@ -540,8 +570,9 @@ impl ConversationRepository {
         Ok(state
             .replay
             .records
-            .into_iter()
+            .iter()
             .filter(|event| event.seq > after_seq)
+            .cloned()
             .collect())
     }
 
@@ -549,22 +580,62 @@ impl ConversationRepository {
         &self,
         conversation_id: ConversationId,
     ) -> Result<Option<AgentSessionBinding>> {
-        Ok(self
-            .state(conversation_id, "current_binding")?
-            .replay
-            .binding
-            .current)
+        self.check_recovery(conversation_id, "current_binding")?;
+        self.states
+            .lock()
+            .get(&conversation_id)
+            .map(|state| state.replay.frontier.binding.current.clone())
+            .ok_or_else(|| not_found("current_binding", conversation_id))
     }
 
     pub fn binding_history(
         &self,
         conversation_id: ConversationId,
     ) -> Result<Vec<AgentSessionBinding>> {
-        Ok(self
-            .state(conversation_id, "binding_history")?
-            .replay
-            .binding
-            .history)
+        self.check_recovery(conversation_id, "binding_history")?;
+        self.states
+            .lock()
+            .get(&conversation_id)
+            .map(|state| state.replay.frontier.binding.history.clone())
+            .ok_or_else(|| not_found("binding_history", conversation_id))
+    }
+
+    pub fn history_summary(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Result<ConversationHistorySummaryV1> {
+        self.check_recovery(conversation_id, "history_summary")?;
+        self.states
+            .lock()
+            .get(&conversation_id)
+            .map(|state| ConversationHistorySummaryV1 {
+                conversation_id,
+                title: state.replay.frontier.summary.title.clone(),
+                title_source: state.replay.frontier.summary.title_source,
+                last_activity_at_utc: state
+                    .replay
+                    .frontier
+                    .summary
+                    .last_activity_at_utc
+                    .map_or(state.record.created_at_utc, |event_time| {
+                        event_time.max(state.record.created_at_utc)
+                    }),
+                message_count: state.replay.frontier.summary.message_count,
+                tool_count: state.replay.frontier.summary.tool_count,
+            })
+            .ok_or_else(|| not_found("history_summary", conversation_id))
+    }
+
+    pub fn conversation_frontier(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Result<ConversationFrontier> {
+        self.check_recovery(conversation_id, "conversation_frontier")?;
+        self.states
+            .lock()
+            .get(&conversation_id)
+            .map(|state| state.replay.frontier.clone())
+            .ok_or_else(|| not_found("conversation_frontier", conversation_id))
     }
 
     pub async fn bind_agent_session(
@@ -598,7 +669,7 @@ impl ConversationRepository {
     ) -> Result<ConversationEventRecordV2> {
         let _guard = self.lifecycle_lock(conversation_id).await;
         let event = self.detach_agent_binding_locked(conversation_id, recorded_at_utc)?;
-        self.refresh_catalog_best_effort().await;
+        self.flush_catalog_best_effort().await;
         Ok(event)
     }
 
@@ -609,7 +680,7 @@ impl ConversationRepository {
     ) -> Result<ConversationEventRecordV2> {
         let _guard = self.lifecycle_lock(conversation_id).await;
         let event = self.rebind_detached_binding_locked(conversation_id, recorded_at_utc)?;
-        self.refresh_catalog_best_effort().await;
+        self.flush_catalog_best_effort().await;
         Ok(event)
     }
 
@@ -626,7 +697,7 @@ impl ConversationRepository {
         }
         let _guard = self.lifecycle_lock(conversation_id).await;
         let event = self.suspend_agent_binding_locked(conversation_id, recorded_at_utc)?;
-        self.refresh_catalog_best_effort().await;
+        self.flush_catalog_best_effort().await;
         Ok(Some(event))
     }
 
@@ -638,7 +709,7 @@ impl ConversationRepository {
     ) -> Result<ConversationEventRecordV2> {
         let _guard = self.lifecycle_lock(conversation_id).await;
         let event = self.replace_agent_binding_locked(conversation_id, binding, recorded_at_utc)?;
-        self.refresh_catalog_best_effort().await;
+        self.flush_catalog_best_effort().await;
         Ok(event)
     }
 
@@ -655,7 +726,13 @@ impl ConversationRepository {
         expected_revision: u64,
         operation: &'static str,
     ) -> Result<ConversationRecordV2> {
-        let record = self.state(conversation_id, operation)?.record;
+        self.check_recovery(conversation_id, operation)?;
+        let record = self
+            .states
+            .lock()
+            .get(&conversation_id)
+            .map(|state| state.record.clone())
+            .ok_or_else(|| not_found(operation, conversation_id))?;
         if record.last_seq != expected_revision {
             log::warn!(
                 "[conversation-repository] stale lifecycle revision conversation_id={} expected_revision={} current_revision={}",
@@ -801,7 +878,7 @@ impl ConversationRepository {
     }
 
     pub(crate) async fn refresh_lifecycle_catalog(&self) {
-        self.refresh_catalog_best_effort().await;
+        self.flush_catalog_best_effort().await;
     }
 
     pub async fn append_project_attachment(
@@ -891,8 +968,14 @@ impl ConversationRepository {
         })?;
         let lock = self.conversation_lock(conversation_id);
         let _guard = lock.lock().await;
-        let mut state = self.state(conversation_id, "write_provenance")?;
-        let directory = self.conversation_dir(&state.record, "write_provenance")?;
+        self.check_recovery(conversation_id, "write_provenance")?;
+        let record = self
+            .states
+            .lock()
+            .get(&conversation_id)
+            .map(|state| state.record.clone())
+            .ok_or_else(|| not_found("write_provenance", conversation_id))?;
+        let directory = self.conversation_dir(&record, "write_provenance")?;
         let path = directory.join(PROVENANCE_FILE);
         let mut bytes = serde_json::to_vec_pretty(&provenance).map_err(|error| {
             repository_error(
@@ -917,9 +1000,11 @@ impl ConversationRepository {
         self.durable_fs
             .replace_bytes(&path, &bytes)
             .map_err(|error| durability_error("write_provenance", conversation_id, error))?;
-        state.provenance = Some(provenance);
-        self.states.lock().insert(conversation_id, state);
-        self.refresh_catalog_best_effort().await;
+        self.states
+            .lock()
+            .get_mut(&conversation_id)
+            .expect("per-Conversation lock preserves state")
+            .provenance = Some(provenance);
         Ok(())
     }
 
@@ -927,7 +1012,12 @@ impl ConversationRepository {
         &self,
         conversation_id: ConversationId,
     ) -> Result<Option<ConversationProvenanceFileV1>> {
-        Ok(self.state(conversation_id, "read_provenance")?.provenance)
+        self.check_recovery(conversation_id, "read_provenance")?;
+        self.states
+            .lock()
+            .get(&conversation_id)
+            .map(|state| state.provenance.clone())
+            .ok_or_else(|| not_found("read_provenance", conversation_id))
     }
 
     pub async fn sync_conversation(
@@ -936,8 +1026,14 @@ impl ConversationRepository {
     ) -> Result<()> {
         let lock = self.conversation_lock(conversation_id);
         let _guard = lock.lock().await;
-        let state = self.state(conversation_id, "sync_conversation")?;
-        let directory = self.conversation_dir(&state.record, "sync_conversation")?;
+        self.check_recovery(conversation_id, "sync_conversation")?;
+        let record = self
+            .states
+            .lock()
+            .get(&conversation_id)
+            .map(|state| state.record.clone())
+            .ok_or_else(|| not_found("sync_conversation", conversation_id))?;
+        let directory = self.conversation_dir(&record, "sync_conversation")?;
         for file in std::iter::once(CONVERSATION_METADATA_FILE).chain(EVENT_LOG_FILES) {
             self.durable_fs
                 .sync_file_and_namespace(&directory.join(file))
@@ -995,7 +1091,7 @@ impl ConversationRepository {
     ) -> Result<ConversationRecordV2> {
         let _guard = self.lifecycle_lock(conversation_id).await;
         let record = self.tombstone_conversation_locked(conversation_id)?;
-        self.refresh_catalog_best_effort().await;
+        self.flush_catalog_best_effort().await;
         Ok(record)
     }
 
@@ -1003,14 +1099,24 @@ impl ConversationRepository {
         &self,
         conversation_id: ConversationId,
     ) -> Result<ConversationRecordV2> {
-        let mut state = self.state(conversation_id, "tombstone_conversation")?;
-        if state.record.lifecycle_state == ConversationLifecycleState::Deleted {
-            return Ok(state.record);
+        self.check_recovery(conversation_id, "tombstone_conversation")?;
+        let mut record = self
+            .states
+            .lock()
+            .get(&conversation_id)
+            .map(|state| state.record.clone())
+            .ok_or_else(|| not_found("tombstone_conversation", conversation_id))?;
+        if record.lifecycle_state == ConversationLifecycleState::Deleted {
+            return Ok(record);
         }
-        state.record.lifecycle_state = ConversationLifecycleState::Deleted;
-        self.persist_state_metadata(&state, "tombstone_conversation")?;
-        let record = state.record.clone();
-        self.states.lock().insert(conversation_id, state);
+        record.lifecycle_state = ConversationLifecycleState::Deleted;
+        self.persist_record_metadata(&record, "tombstone_conversation")?;
+        self.states
+            .lock()
+            .get_mut(&conversation_id)
+            .expect("per-Conversation lock preserves state")
+            .record = record.clone();
+        self.mark_catalog_entry_dirty(conversation_id);
         log::info!(
             "[conversation-repository] conversation deletion tombstoned conversation_id={}",
             conversation_id
@@ -1022,12 +1128,28 @@ impl ConversationRepository {
     /// materialization falsely advertising an active binding. This fail-closed marker is best
     /// effort durable and always updates the in-memory frontier before returning recovery-required.
     pub(crate) fn mark_lifecycle_recovery_required_locked(&self, conversation_id: ConversationId) {
-        let Ok(mut state) = self.state(conversation_id, "lifecycle_recovery") else {
+        if self
+            .check_recovery(conversation_id, "lifecycle_recovery")
+            .is_err()
+        {
+            return;
+        }
+        let Some(mut record) = self
+            .states
+            .lock()
+            .get(&conversation_id)
+            .map(|state| state.record.clone())
+        else {
             return;
         };
-        state.record.lifecycle_state = ConversationLifecycleState::RecoveryRequired;
-        self.states.lock().insert(conversation_id, state.clone());
-        if let Err(error) = self.persist_state_metadata(&state, "lifecycle_recovery") {
+        record.lifecycle_state = ConversationLifecycleState::RecoveryRequired;
+        self.states
+            .lock()
+            .get_mut(&conversation_id)
+            .expect("per-Conversation lock preserves state")
+            .record = record.clone();
+        self.mark_catalog_entry_dirty(conversation_id);
+        if let Err(error) = self.persist_record_metadata(&record, "lifecycle_recovery") {
             log::error!(
                 "[conversation-repository] lifecycle recovery marker persistence failed conversation_id={} code={}",
                 conversation_id,
@@ -1043,9 +1165,15 @@ impl ConversationRepository {
         type_: ConversationEventType,
         payload: Value,
     ) -> Result<ConversationEventRecordV2> {
-        let mut state = self.state(conversation_id, "append_event")?;
-        if state.record.lifecycle_state == ConversationLifecycleState::RecoveryRequired
-            || state.record.lifecycle_state == ConversationLifecycleState::Deleted
+        self.check_recovery(conversation_id, "append_event")?;
+        let (record, mut frontier) = self
+            .states
+            .lock()
+            .get(&conversation_id)
+            .map(|state| (state.record.clone(), state.replay.frontier.clone()))
+            .ok_or_else(|| not_found("append_event", conversation_id))?;
+        if record.lifecycle_state == ConversationLifecycleState::RecoveryRequired
+            || record.lifecycle_state == ConversationLifecycleState::Deleted
         {
             return Err(repository_error(
                 ConversationErrorCode::ConversationRecoveryRequired,
@@ -1054,7 +1182,15 @@ impl ConversationRepository {
                 "Conversation lifecycle does not admit appends".to_string(),
             ));
         }
-        let seq = state.record.last_seq.checked_add(1).ok_or_else(|| {
+        if record.last_seq != frontier.last_seq {
+            return Err(repository_error(
+                ConversationErrorCode::ConversationRecoveryRequired,
+                "append_event",
+                Some(conversation_id),
+                "metadata lastSeq does not match the validated frontier".to_string(),
+            ));
+        }
+        let seq = record.last_seq.checked_add(1).ok_or_else(|| {
             repository_error(
                 ConversationErrorCode::ConversationRecoveryRequired,
                 "append_event",
@@ -1070,18 +1206,18 @@ impl ConversationRepository {
             type_,
             payload,
         };
-        let directory = self.conversation_dir(&state.record, "append_event")?;
-        let mut prospective = state.replay.records.clone();
-        prospective.push(event.clone());
-        let (binding, attachment) = materialize_records(&prospective, conversation_id, &directory)
-            .map_err(|error| {
-                repository_error(
-                    error.code,
-                    "append_event",
-                    Some(conversation_id),
-                    error.detail,
-                )
-            })?;
+        apply_event(&mut frontier, &event).map_err(|error| {
+            repository_error(
+                error.code,
+                "append_event",
+                Some(conversation_id),
+                format!(
+                    "frontier validation conflict at seq {} type {:?}: {}",
+                    event.seq, event.type_, error.detail
+                ),
+            )
+        })?;
+        let directory = self.conversation_dir(&record, "append_event")?;
         let bytes = serde_json::to_vec(&event).map_err(|error| {
             repository_error(
                 ConversationErrorCode::ConversationRecoveryRequired,
@@ -1094,38 +1230,44 @@ impl ConversationRepository {
             .append_jsonl(&directory.join(type_.stream().file_name()), &bytes)
             .map_err(|error| durability_error("append_event", conversation_id, error))?;
 
-        state.replay.records = prospective;
-        state.replay.binding = binding;
-        state.replay.attachment = attachment;
-        state.record.last_seq = seq;
-        if state.replay.attachment.has_events {
-            state.record.project_attachment = state.replay.attachment.current.clone();
-        }
-        match type_ {
-            ConversationEventType::CreationFailed => {
-                state.record.lifecycle_state = ConversationLifecycleState::AgentFailed;
+        let persisted_record = {
+            let mut states = self.states.lock();
+            let state = states
+                .get_mut(&conversation_id)
+                .expect("per-Conversation lock preserves state");
+            state.replay.records.push(event.clone());
+            state.replay.frontier = frontier;
+            state.record.last_seq = seq;
+            if state.replay.frontier.attachment.has_events {
+                state.record.project_attachment = state.replay.frontier.attachment.current.clone();
             }
-            ConversationEventType::BindingBound
-            | ConversationEventType::BindingReplaced
-            | ConversationEventType::BindingRebound => {
-                state.record.lifecycle_state = ConversationLifecycleState::Ready;
+            match type_ {
+                ConversationEventType::CreationFailed => {
+                    state.record.lifecycle_state = ConversationLifecycleState::AgentFailed;
+                }
+                ConversationEventType::BindingBound
+                | ConversationEventType::BindingReplaced
+                | ConversationEventType::BindingRebound => {
+                    state.record.lifecycle_state = ConversationLifecycleState::Ready;
+                }
+                _ => {}
             }
-            _ => {}
-        }
-        // The append is already authoritative. Retain its recovered in-memory frontier even if
-        // metadata materialization fails, preventing a duplicate seq in the same process.
-        self.states.lock().insert(conversation_id, state.clone());
-        self.persist_state_metadata(&state, "append_event")?;
+            state.record.clone()
+        };
+        // The append is already authoritative. Retain its in-memory frontier even if metadata
+        // materialization fails, preventing a duplicate seq in the same process.
+        self.mark_catalog_entry_dirty(conversation_id);
+        self.persist_record_metadata(&persisted_record, "append_event")?;
         Ok(event)
     }
 
-    fn persist_state_metadata(
+    fn persist_record_metadata(
         &self,
-        state: &ConversationState,
+        record: &ConversationRecordV2,
         operation: &'static str,
     ) -> Result<()> {
-        let directory = self.conversation_dir(&state.record, operation)?;
-        persist_metadata_at(&self.durable_fs, &directory, &state.record)
+        let directory = self.conversation_dir(record, operation)?;
+        persist_metadata_at(&self.durable_fs, &directory, record)
     }
 
     fn conversation_dir(
@@ -1145,11 +1287,11 @@ impl ConversationRepository {
             })
     }
 
-    fn state(
+    fn check_recovery(
         &self,
         conversation_id: ConversationId,
         operation: &'static str,
-    ) -> Result<ConversationState> {
+    ) -> Result<()> {
         if let Some(item) = self.recovery_by_id.lock().get(&conversation_id).cloned() {
             return Err(repository_error(
                 item.code,
@@ -1158,18 +1300,7 @@ impl ConversationRepository {
                 item.detail,
             ));
         }
-        self.states
-            .lock()
-            .get(&conversation_id)
-            .cloned()
-            .ok_or_else(|| {
-                repository_error(
-                    ConversationErrorCode::ConversationNotFound,
-                    operation,
-                    Some(conversation_id),
-                    "canonical Conversation was not found".to_string(),
-                )
-            })
+        Ok(())
     }
 
     fn conversation_lock(&self, conversation_id: ConversationId) -> Arc<TokioMutex<()>> {
@@ -1181,26 +1312,62 @@ impl ConversationRepository {
         )
     }
 
-    async fn refresh_catalog_best_effort(&self) {
+    fn mark_catalog_entry_dirty(&self, conversation_id: ConversationId) {
+        let states = self.states.lock();
+        let Some(state) = states.get(&conversation_id) else {
+            return;
+        };
+        let mut cache = self.catalog.lock();
+        cache.catalog.upsert(&state.record, &state.replay.frontier);
+        cache.dirty = true;
+        cache.generation = cache.generation.wrapping_add(1);
+        cache.last_conversation_id = Some(conversation_id);
+    }
+
+    async fn flush_catalog_best_effort(&self) {
+        // Give concurrent mutations one scheduling turn to join this cache write. Every caller
+        // awaits the same lock, so the last caller still observes a completed flush.
+        tokio::task::yield_now().await;
         let _guard = self.catalog_lock.lock().await;
-        match rebuild_catalog(&self.locator, &self.durable_fs) {
-            Ok(rebuilt) => {
-                let path = self.locator.root().join(CATALOG_FILE);
-                if let Err(error) = self
-                    .durable_fs
-                    .replace_bytes(&path, &rebuilt.catalog.deterministic_bytes())
-                {
-                    log::warn!(
-                        "[conversation-repository] cache rewrite failure root={} error={}",
-                        self.locator.root().display(),
-                        error
-                    );
+        let (bytes, generation, conversation_id, entry_count) = {
+            let cache = self.catalog.lock();
+            if !cache.dirty {
+                return;
+            }
+            (
+                cache.catalog.deterministic_bytes(),
+                cache.generation,
+                cache.last_conversation_id,
+                cache.catalog.len(),
+            )
+        };
+        let started_at = Instant::now();
+        let path = self.locator.root().join(CATALOG_FILE);
+        match self.durable_fs.replace_bytes(&path, &bytes) {
+            Ok(_) => {
+                let mut cache = self.catalog.lock();
+                cache.flush_count = cache.flush_count.saturating_add(1);
+                let flush_count = cache.flush_count;
+                if cache.generation == generation {
+                    cache.dirty = false;
                 }
+                log::info!(
+                    "[conversation-repository] catalog flush complete conversation_id={} entry_count={} flush_count={} duration_ms={}",
+                    conversation_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "coalesced".to_string()),
+                    entry_count,
+                    flush_count,
+                    started_at.elapsed().as_millis()
+                );
             }
             Err(error) => {
                 log::warn!(
-                    "[conversation-repository] cache rebuild failure root={} error={}",
-                    self.locator.root().display(),
+                    "[conversation-repository] coalesced cache write failure conversation_id={} entry_count={} error={}",
+                    conversation_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_else(|| "coalesced".to_string()),
+                    entry_count,
                     error
                 );
             }
@@ -1415,6 +1582,15 @@ fn map_repairs(repairs: &[EventLogRepairWarning]) -> Vec<RepositoryRecoveryItem>
         .collect()
 }
 
+fn not_found(operation: &'static str, conversation_id: ConversationId) -> RepositoryError {
+    repository_error(
+        ConversationErrorCode::ConversationNotFound,
+        operation,
+        Some(conversation_id),
+        "canonical Conversation was not found".to_string(),
+    )
+}
+
 fn repository_error(
     code: ConversationErrorCode,
     operation: &'static str,
@@ -1624,6 +1800,36 @@ mod tests {
                 .unwrap()
                 .last_seq,
             20
+        );
+    }
+
+    #[tokio::test]
+    async fn append_work_is_constant_and_mutations_do_not_scan_the_catalog() {
+        let (_temp, repository) = fixture();
+        repository.create_conversation(record()).await.unwrap();
+        crate::conversation::event_log::reset_operation_counters();
+        crate::conversation::catalog::reset_catalog_scan_counter();
+
+        for seq in 1..=3_u32 {
+            repository
+                .append_event(
+                    ConversationId::parse(ID).unwrap(),
+                    time(20 + seq),
+                    ConversationEventType::MessageChunk,
+                    json!({"role":"agent"}),
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(crate::conversation::event_log::operation_counters(), (3, 0));
+        assert_eq!(crate::conversation::catalog::catalog_scan_count(), 0);
+        assert_eq!(
+            repository
+                .history_summary(ConversationId::parse(ID).unwrap())
+                .unwrap()
+                .message_count,
+            3
         );
     }
 

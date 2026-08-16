@@ -13,11 +13,11 @@ use parking_lot::RwLock;
 use serde_json::Value;
 
 use crate::acp::session_persistence::{
-    PersistedEventRecord, PersistedSessionStatus, SessionIndexEntry, SessionMetadata,
+    PersistedEventRecord, PersistedSessionStatus, SessionIndexEntry, SessionMetadata, TitleSource,
     SESSION_SCHEMA_VERSION,
 };
 use crate::conversation::contracts::{
-    AgentSessionBindingState, ConversationId, ConversationLifecycleState,
+    AgentSessionBindingState, ConversationId, ConversationLifecycleState, ConversationTitleSource,
 };
 use crate::conversation::event_log::ConversationEventType;
 use crate::conversation::migration::ConversationReader;
@@ -83,6 +83,14 @@ impl ConversationPersistenceAdapter {
 
     #[must_use]
     pub fn conversation_id_for_session(&self, agent_session_id: &str) -> Option<ConversationId> {
+        self.conversation_id_for_active_binding(agent_session_id)
+    }
+
+    #[must_use]
+    pub fn conversation_id_for_active_binding(
+        &self,
+        agent_session_id: &str,
+    ) -> Option<ConversationId> {
         if let Some(conversation_id) = self.bindings.read().get(agent_session_id).copied() {
             let active = self
                 .repository
@@ -107,6 +115,14 @@ impl ConversationPersistenceAdapter {
         &self,
         agent_session_id: &str,
     ) -> Option<ConversationId> {
+        self.conversation_id_for_history_binding(agent_session_id)
+    }
+
+    #[must_use]
+    pub fn conversation_id_for_history_binding(
+        &self,
+        agent_session_id: &str,
+    ) -> Option<ConversationId> {
         self.repository
             .list_conversations()
             .into_iter()
@@ -127,10 +143,10 @@ impl ConversationPersistenceAdapter {
         payload: Value,
     ) -> Result<u64> {
         let conversation_id = self
-            .conversation_id_for_session(agent_session_id)
+            .conversation_id_for_active_binding(agent_session_id)
             .ok_or_else(|| {
                 log::error!(
-                    "[conversation-persistence] unmapped ACP event rejected event_type={type_}"
+                    "[conversation-persistence] inactive or unmapped ACP event rejected event_type={type_}"
                 );
                 error(
                     "CONVERSATION_BINDING_NOT_FOUND",
@@ -169,19 +185,10 @@ impl ConversationPersistenceAdapter {
             let Ok(Some(binding)) = self.repository.current_binding(record.conversation_id) else {
                 continue;
             };
-            let status = match binding.state {
-                AgentSessionBindingState::Active
-                    if record.lifecycle_state == ConversationLifecycleState::Ready =>
-                {
-                    PersistedSessionStatus::Active
-                }
-                AgentSessionBindingState::Detached | AgentSessionBindingState::Suspended => {
-                    PersistedSessionStatus::Closed
-                }
-                AgentSessionBindingState::Active | AgentSessionBindingState::Replaced => {
-                    PersistedSessionStatus::Error
-                }
+            let Ok(summary) = self.repository.history_summary(record.conversation_id) else {
+                continue;
             };
+            let status = history_status(record.lifecycle_state, binding.state);
             sessions.push(SessionIndexEntry {
                 storage_key: record.conversation_id.to_string(),
                 session_id: binding.agent_session_id,
@@ -192,13 +199,13 @@ impl ConversationPersistenceAdapter {
                     .as_ref()
                     .map(|attachment| attachment.project_id.clone()),
                 cwd: binding.execution_cwd,
-                title: None,
-                title_source: None,
+                title: summary.title,
+                title_source: summary.title_source.map(acp_title_source),
                 created_at: record.created_at_utc.timestamp_millis().max(0) as u64,
-                last_activity_at: record.created_at_utc.timestamp_millis().max(0) as u64,
+                last_activity_at: summary.last_activity_at_utc.timestamp_millis().max(0) as u64,
                 status,
-                message_count: 0,
-                tool_count: 0,
+                message_count: summary.message_count,
+                tool_count: summary.tool_count,
                 last_seq: record.last_seq,
                 discovered: false,
                 resume_eligible: true,
@@ -220,7 +227,7 @@ impl ConversationPersistenceAdapter {
         agent_session_id: &str,
     ) -> Result<(SessionMetadata, Vec<PersistedEventRecord>)> {
         let conversation_id = self
-            .conversation_id_for_session(agent_session_id)
+            .conversation_id_for_history_binding(agent_session_id)
             .ok_or_else(|| error("CONVERSATION_NOT_FOUND", "materialize", "binding not found"))?;
         let record = self.reader.get(conversation_id).map_err(|source| {
             error(
@@ -244,6 +251,16 @@ impl ConversationPersistenceAdapter {
                     "CONVERSATION_BINDING_NOT_FOUND",
                     "materialize",
                     "binding not found",
+                )
+            })?;
+        let summary = self
+            .repository
+            .history_summary(conversation_id)
+            .map_err(|source| {
+                error(
+                    "CONVERSATION_READ_FAILED",
+                    "materialize_summary",
+                    source.to_string(),
                 )
             })?;
         let events = self
@@ -282,21 +299,13 @@ impl ConversationPersistenceAdapter {
                     .as_ref()
                     .map(|attachment| attachment.project_id.clone()),
                 cwd: binding.execution_cwd,
-                title: None,
-                title_source: None,
+                title: summary.title,
+                title_source: summary.title_source.map(acp_title_source),
                 created_at,
-                last_activity_at: persisted
-                    .last()
-                    .map_or(created_at, |event| event.recorded_at),
-                status: PersistedSessionStatus::Active,
-                message_count: persisted
-                    .iter()
-                    .filter(|event| matches!(event.type_.as_str(), "user_prompt" | "message_chunk"))
-                    .count() as u64,
-                tool_count: persisted
-                    .iter()
-                    .filter(|event| event.type_ == "tool_call")
-                    .count() as u64,
+                last_activity_at: summary.last_activity_at_utc.timestamp_millis().max(0) as u64,
+                status: history_status(record.lifecycle_state, binding.state),
+                message_count: summary.message_count,
+                tool_count: summary.tool_count,
                 last_seq: record.last_seq,
                 discovered: false,
                 worktree_path: record
@@ -314,7 +323,7 @@ impl ConversationPersistenceAdapter {
 
     pub fn last_seq(&self, agent_session_id: &str) -> Result<u64> {
         let conversation_id = self
-            .conversation_id_for_session(agent_session_id)
+            .conversation_id_for_history_binding(agent_session_id)
             .ok_or_else(|| error("CONVERSATION_NOT_FOUND", "last_seq", "binding not found"))?;
         self.reader
             .get(conversation_id)
@@ -344,11 +353,12 @@ impl ConversationPersistenceAdapter {
 fn canonical_event_type(value: &str) -> Option<ConversationEventType> {
     match value {
         "user_prompt" => Some(ConversationEventType::UserPrompt),
-        "message_chunk" | "session_info_update" | "local_title_generated" => {
-            Some(ConversationEventType::MessageChunk)
-        }
+        "message_chunk" => Some(ConversationEventType::MessageChunk),
+        "session_info_update" => Some(ConversationEventType::SessionInfoUpdate),
+        "local_title_generated" => Some(ConversationEventType::LocalTitleGenerated),
         "prompt_complete" => Some(ConversationEventType::PromptComplete),
-        "tool_call" | "tool_call_update" => Some(ConversationEventType::ToolCall),
+        "tool_call" => Some(ConversationEventType::ToolCall),
+        "tool_call_update" => Some(ConversationEventType::ToolCallUpdate),
         // Transport/lifecycle/config events remain live-only until their explicit Conversation
         // lifecycle mapping lands. They must not be guessed into a canonical stream.
         _ => None,
@@ -359,9 +369,40 @@ fn legacy_event_type(value: ConversationEventType) -> Option<&'static str> {
     match value {
         ConversationEventType::UserPrompt => Some("user_prompt"),
         ConversationEventType::MessageChunk => Some("message_chunk"),
+        ConversationEventType::SessionInfoUpdate => Some("session_info_update"),
+        ConversationEventType::LocalTitleGenerated => Some("local_title_generated"),
         ConversationEventType::PromptComplete => Some("prompt_complete"),
         ConversationEventType::ToolCall => Some("tool_call"),
+        ConversationEventType::ToolCallUpdate => Some("tool_call_update"),
         _ => None,
+    }
+}
+
+fn acp_title_source(source: ConversationTitleSource) -> TitleSource {
+    match source {
+        ConversationTitleSource::BackgroundGenerated => TitleSource::BackgroundGenerated,
+        ConversationTitleSource::AgentSupplied => TitleSource::AgentSupplied,
+        ConversationTitleSource::DerivedFirstMessage => TitleSource::DerivedFirstMessage,
+        ConversationTitleSource::LocalAlias => TitleSource::LocalAlias,
+    }
+}
+
+fn history_status(
+    lifecycle_state: ConversationLifecycleState,
+    binding_state: AgentSessionBindingState,
+) -> PersistedSessionStatus {
+    match binding_state {
+        AgentSessionBindingState::Active
+            if lifecycle_state == ConversationLifecycleState::Ready =>
+        {
+            PersistedSessionStatus::Active
+        }
+        AgentSessionBindingState::Detached | AgentSessionBindingState::Suspended => {
+            PersistedSessionStatus::Closed
+        }
+        AgentSessionBindingState::Active | AgentSessionBindingState::Replaced => {
+            PersistedSessionStatus::Error
+        }
     }
 }
 
@@ -469,6 +510,163 @@ mod tests {
             SessionWorkspaceLocator::new(visible).unwrap(),
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn history_summary_and_detached_reads_survive_restart_while_writes_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let private = root.join("private");
+        let visible = root.join("visible");
+        std::fs::create_dir_all(&visible).unwrap();
+        let (repository, _) = ConversationRepository::open(private.clone()).unwrap();
+        let id = ConversationId::parse("22222222-2222-4222-8222-222222222222").unwrap();
+        let created_at = Utc
+            .timestamp_millis_opt(1_766_000_000_000)
+            .single()
+            .unwrap();
+        repository
+            .create_conversation(ConversationRecordV2 {
+                schema_version: CONVERSATION_SCHEMA_VERSION,
+                conversation_id: id,
+                created_at_utc: created_at,
+                creation_partition: CreationPartition::from_created_at(created_at),
+                workspace_cwd: visible.join("workspace").to_string_lossy().into_owned(),
+                execution_target: ExecutionTarget::Workspace,
+                project_attachment: None,
+                lifecycle_state: ConversationLifecycleState::InitializingAgent,
+                last_seq: 0,
+                created_by: ConversationCreator::Termul,
+            })
+            .await
+            .unwrap();
+        repository
+            .bind_agent_session(
+                id,
+                AgentSessionBinding {
+                    schema_version: AGENT_SESSION_BINDING_SCHEMA_VERSION,
+                    binding_id: Uuid::new_v4(),
+                    agent_session_id: "opaque/detached".to_string(),
+                    runtime_agent_id: "runtime".to_string(),
+                    stable_agent_namespace: "stable".to_string(),
+                    execution_cwd: visible.to_string_lossy().into_owned(),
+                    bound_at_utc: created_at,
+                    state: AgentSessionBindingState::Active,
+                },
+                created_at,
+            )
+            .await
+            .unwrap();
+        for (type_, payload) in [
+            (
+                ConversationEventType::UserPrompt,
+                serde_json::json!({"content":[{"type":"text","text":"Derived"}]}),
+            ),
+            (
+                ConversationEventType::SessionInfoUpdate,
+                serde_json::json!({"title":"Agent"}),
+            ),
+            (
+                ConversationEventType::LocalTitleGenerated,
+                serde_json::json!({"title":"Background"}),
+            ),
+            (
+                ConversationEventType::SessionInfoUpdate,
+                serde_json::json!({"title":"Ignored"}),
+            ),
+            (
+                ConversationEventType::ToolCall,
+                serde_json::json!({"toolCall":{"id":"one"}}),
+            ),
+            (
+                ConversationEventType::ToolCallUpdate,
+                serde_json::json!({"update":{"id":"one"}}),
+            ),
+        ] {
+            repository
+                .append_event(id, created_at, type_, payload)
+                .await
+                .unwrap();
+        }
+        repository
+            .detach_agent_binding(id, created_at)
+            .await
+            .unwrap();
+
+        let reader = Arc::new(crate::conversation::ConversationReader::new(
+            Arc::clone(&repository),
+            crate::conversation::LegacyConversationReader::default(),
+            crate::conversation::ReaderPrecedence::ConversationV2Only,
+        ));
+        let adapter = Arc::new(ConversationPersistenceAdapter::new(
+            Arc::clone(&repository),
+            reader,
+        ));
+        assert!(adapter
+            .conversation_id_for_active_binding("opaque/detached")
+            .is_none());
+        assert_eq!(
+            adapter.conversation_id_for_history_binding("opaque/detached"),
+            Some(id)
+        );
+        let sessions = adapter.list_sessions();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title.as_deref(), Some("Background"));
+        assert_eq!(
+            sessions[0].title_source,
+            Some(TitleSource::BackgroundGenerated)
+        );
+        assert_eq!(sessions[0].message_count, 4);
+        assert_eq!(sessions[0].tool_count, 2);
+        assert_eq!(sessions[0].status, PersistedSessionStatus::Closed);
+        let (metadata, events) = adapter.legacy_materialization("opaque/detached").unwrap();
+        assert_eq!(metadata.title, sessions[0].title);
+        assert_eq!(events.len(), 6);
+        assert!(adapter
+            .append_acp_event("opaque/detached", "message_chunk", serde_json::json!({}))
+            .await
+            .is_err());
+
+        repository
+            .rebind_detached_binding(id, created_at)
+            .await
+            .unwrap();
+        repository
+            .suspend_agent_binding(id, true, created_at)
+            .await
+            .unwrap();
+        assert_eq!(
+            repository.current_binding(id).unwrap().unwrap().state,
+            AgentSessionBindingState::Suspended
+        );
+        assert_eq!(
+            adapter.conversation_id_for_history_binding("opaque/detached"),
+            Some(id)
+        );
+        assert_eq!(
+            adapter.list_sessions()[0].status,
+            PersistedSessionStatus::Closed
+        );
+        assert!(adapter
+            .append_acp_event("opaque/detached", "message_chunk", serde_json::json!({}))
+            .await
+            .is_err());
+
+        drop(adapter);
+        drop(repository);
+        let (repository, _) = ConversationRepository::open(private).unwrap();
+        let reader = Arc::new(crate::conversation::ConversationReader::new(
+            Arc::clone(&repository),
+            crate::conversation::LegacyConversationReader::default(),
+            crate::conversation::ReaderPrecedence::ConversationV2Only,
+        ));
+        let reopened = ConversationPersistenceAdapter::new(repository, reader);
+        let sessions = reopened.list_sessions();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].title.as_deref(), Some("Background"));
+        assert_eq!(sessions[0].message_count, 4);
+        assert_eq!(sessions[0].tool_count, 2);
+        assert_eq!(sessions[0].status, PersistedSessionStatus::Closed);
     }
 
     #[tokio::test]

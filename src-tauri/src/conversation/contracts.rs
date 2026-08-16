@@ -51,11 +51,7 @@ impl ConversationId {
 
 impl fmt::Display for ConversationId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let canonical = self
-            .0
-            .hyphenated()
-            .to_string()
-            .to_ascii_lowercase();
+        let canonical = self.0.hyphenated().to_string().to_ascii_lowercase();
         formatter.write_str(&canonical)
     }
 }
@@ -330,6 +326,35 @@ impl ConversationErrorCode {
     }
 }
 
+/// Canonical provenance for a Conversation history title.
+///
+/// Precedence is `LocalAlias > BackgroundGenerated > AgentSupplied > DerivedFirstMessage`;
+/// absence represents the untitled floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationTitleSource {
+    BackgroundGenerated,
+    AgentSupplied,
+    DerivedFirstMessage,
+    LocalAlias,
+}
+
+/// Canonical event-derived history summary exposed to persistence adapters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConversationHistorySummaryV1 {
+    pub conversation_id: ConversationId,
+    pub title: Option<String>,
+    pub title_source: Option<ConversationTitleSource>,
+    #[serde(
+        serialize_with = "serialize_utc_millis",
+        deserialize_with = "deserialize_utc_millis"
+    )]
+    pub last_activity_at_utc: DateTime<Utc>,
+    pub message_count: u64,
+    pub tool_count: u64,
+}
+
 /// Canonical Conversation metadata. Binding and terminal-resource history are stored separately.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -376,10 +401,16 @@ mod tests {
     #[test]
     fn utc_partition_handles_midnight_leap_day_and_invalid_dates() {
         let midnight = parse_created_at_utc("2026-01-01T00:00:00.000Z").unwrap();
-        assert_eq!(CreationPartition::from_created_at(midnight).path, "2026/01/01");
+        assert_eq!(
+            CreationPartition::from_created_at(midnight).path,
+            "2026/01/01"
+        );
 
         let leap_day = parse_created_at_utc("2028-02-29T23:59:59.999Z").unwrap();
-        assert_eq!(CreationPartition::from_created_at(leap_day).path, "2028/02/29");
+        assert_eq!(
+            CreationPartition::from_created_at(leap_day).path,
+            "2028/02/29"
+        );
         assert_eq!(
             CreationPartition::try_new(2028, 2, 29).unwrap().path,
             "2028/02/29"
@@ -443,7 +474,10 @@ mod tests {
             binding_value["agentSessionId"],
             "agent/session:not-a-uuid?generation=2"
         );
-        assert_ne!(binding_value["agentSessionId"], record.conversation_id.to_string());
+        assert_ne!(
+            binding_value["agentSessionId"],
+            record.conversation_id.to_string()
+        );
     }
 
     #[test]
@@ -498,8 +532,7 @@ mod tests {
             ConversationErrorCode::ConversationDurabilityFailed
         );
         assert_eq!(
-            serde_json::to_value(ConversationErrorCode::ConversationDurabilityUnsupported)
-                .unwrap(),
+            serde_json::to_value(ConversationErrorCode::ConversationDurabilityUnsupported).unwrap(),
             json!("CONVERSATION_DURABILITY_UNSUPPORTED")
         );
     }
