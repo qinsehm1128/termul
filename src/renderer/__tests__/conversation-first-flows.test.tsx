@@ -1,33 +1,47 @@
 import type { ConversationRecordV2 } from '@shared/types/conversation.types'
 import type { RecoveryItemV1 } from '@shared/types/conversation-recovery.types'
+import type { SessionWorkspaceV1 } from '@shared/types/session-workspace.types'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { useState } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ConversationRecoveryPanel } from '@/components/conversation/ConversationRecoveryPanel'
 import { ExecutionTargetPicker } from '@/components/conversation/ExecutionTargetPicker'
+import { PaneContent } from '@/components/workspace/PaneContent'
+import { loadSessionWorkspace } from '@/hooks/use-session-workspace-sync'
 import { useConversationStore } from '@/stores/conversation-store'
+import { useProjectStore } from '@/stores/project-store'
 import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
 import { useTerminalStore } from '@/stores/terminal-store'
+import { useWorkspaceStore } from '@/stores/workspace-store'
 
 const ID = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
-const { mockConversationApi, mockTerminalApi, mockLoadSessionWorkspace } = vi.hoisted(() => ({
+const { mockConversationApi, mockTerminalApi, mockSessionWorkspaceApi } = vi.hoisted(() => ({
   mockConversationApi: {
     listConversations: vi.fn(),
     openConversation: vi.fn(),
     resolveRecovery: vi.fn()
   },
   mockTerminalApi: {
+    resume: vi.fn(),
+    spawn: vi.fn(),
     closeView: vi.fn(),
     terminate: vi.fn()
   },
-  mockLoadSessionWorkspace: vi.fn()
+  mockSessionWorkspaceApi: {
+    getWorkspace: vi.fn(),
+    writeWorkspace: vi.fn(),
+    resolveRecovery: vi.fn()
+  }
 }))
 
 vi.mock('@/lib/conversation-api', () => ({ conversationApi: mockConversationApi }))
 vi.mock('@/lib/terminal-api', () => ({ terminalApi: mockTerminalApi }))
+vi.mock('@/lib/session-workspace-api', () => ({ sessionWorkspaceApi: mockSessionWorkspaceApi }))
 vi.mock('@/lib/log-api', () => ({ logFrontendError: vi.fn() }))
-vi.mock('@/hooks/use-session-workspace-sync', () => ({
-  loadSessionWorkspace: mockLoadSessionWorkspace
+vi.mock('@/components/terminal/ConnectedTerminal', () => ({
+  ConnectedTerminal: ({ terminalId }: { terminalId?: string }) => (
+    <div data-testid="connected-terminal">connected:{terminalId}</div>
+  )
 }))
 
 const conversation: ConversationRecordV2 = {
@@ -41,6 +55,32 @@ const conversation: ConversationRecordV2 = {
   lifecycleState: 'ready',
   lastSeq: 0,
   createdBy: 'termul'
+}
+
+function coldTerminalWorkspace(): SessionWorkspaceV1 {
+  return {
+    schemaVersion: 1,
+    conversationId: ID,
+    revision: 9,
+    updatedAtUtc: '2026-08-15T10:00:00.000Z',
+    topology: {
+      type: 'leaf',
+      id: 'cold-terminal-pane',
+      terminalIds: ['cold-terminal-record'],
+      editorIds: [],
+      activeTabId: 'term-cold-terminal-record'
+    },
+    activePaneId: 'cold-terminal-pane',
+    resources: [
+      {
+        kind: 'terminal',
+        terminalId: 'pty-cold-live',
+        terminalRecordId: 'cold-terminal-record',
+        conversationId: ID
+      }
+    ],
+    projectionState: { status: 'native' }
+  }
 }
 
 const recoveryItem: RecoveryItemV1 = {
@@ -110,8 +150,24 @@ describe('Conversation-first desktop/browser flow matrix', () => {
       restoreInProgressByConversation: {}
     })
     useTerminalStore.setState({ terminals: [], activeTerminalId: '', ptyIdIndex: new Map() })
+    useWorkspaceStore.getState().resetLayout()
+    useProjectStore.setState({ activeProjectId: '' })
+    mockTerminalApi.resume.mockResolvedValue({
+      success: false,
+      error: 'Unauthorized',
+      code: 'UNAUTHORIZED'
+    })
+    mockTerminalApi.spawn.mockResolvedValue({
+      success: false,
+      error: 'not expected',
+      code: 'SPAWN_FAILED'
+    })
     mockTerminalApi.closeView.mockResolvedValue({ success: true, data: undefined })
     mockTerminalApi.terminate.mockResolvedValue({ success: true, data: undefined })
+    mockSessionWorkspaceApi.getWorkspace.mockResolvedValue({
+      success: true,
+      data: { status: 'missing', conversationId: ID }
+    })
   })
 
   it('supports zero-project New Chat target selection without changing canonical identity', () => {
@@ -139,6 +195,73 @@ describe('Conversation-first desktop/browser flow matrix', () => {
     await useConversationStore.getState().openConversation(ID)
     expect(useConversationStore.getState().activeConversationId).toBe(ID)
     expect(mockConversationApi.openConversation).toHaveBeenCalledTimes(2)
+  })
+
+  it('cold-loads a persisted terminal tab and replay without spawning a replacement', async () => {
+    const persisted = coldTerminalWorkspace()
+    useConversationStore.getState().replaceSummaries([conversation])
+    useConversationStore.getState().setActiveConversationId(ID)
+    mockSessionWorkspaceApi.getWorkspace.mockResolvedValue({
+      success: true,
+      data: { status: 'loaded', workspace: persisted }
+    })
+    mockTerminalApi.resume.mockImplementation(async (request) => {
+      const hydrated = useTerminalStore.getState().findTerminalByPtyId(request.terminalId)
+      expect(hydrated).toMatchObject({
+        id: 'cold-terminal-record',
+        healthStatus: 'disconnected',
+        conversationId: ID
+      })
+      useTerminalStore.getState().appendTranscript(request.terminalId, 'replayed cold output')
+      return {
+        success: true,
+        data: {
+          terminal: {
+            id: request.terminalId,
+            shell: 'bash',
+            cwd: conversation.workspaceCwd,
+            pid: 73,
+            cols: 100,
+            rows: 30,
+            latestSeq: 21,
+            gap: false
+          },
+          claim: 'renderer-memory-only'
+        }
+      }
+    })
+
+    await expect(loadSessionWorkspace(ID)).resolves.toBe(true)
+
+    const root = useWorkspaceStore.getState().root
+    if (root.type !== 'leaf') throw new Error('expected restored leaf')
+    render(<PaneContent pane={root} />)
+    expect(await screen.findByTestId('connected-terminal')).toHaveTextContent(
+      'connected:pty-cold-live'
+    )
+    expect(root.tabs).toEqual([
+      {
+        type: 'terminal',
+        id: 'term-cold-terminal-record',
+        terminalId: 'cold-terminal-record'
+      }
+    ])
+    expect(useTerminalStore.getState().peekTranscript('pty-cold-live')).toBe('replayed cold output')
+    expect(useTerminalStore.getState().terminals[0]).toMatchObject({
+      id: 'cold-terminal-record',
+      ptyId: 'pty-cold-live',
+      healthStatus: 'running',
+      resumeCursor: 21,
+      claim: 'renderer-memory-only'
+    })
+    expect(mockTerminalApi.resume).toHaveBeenCalledWith({
+      conversationId: ID,
+      terminalId: 'pty-cold-live',
+      lastSeq: 0
+    })
+    expect(mockTerminalApi.spawn).not.toHaveBeenCalled()
+    expect(mockTerminalApi.terminate).not.toHaveBeenCalled()
+    expect(JSON.stringify(persisted)).not.toMatch(/claim|token|terminalOutput/i)
   })
 
   it('surfaces independent workspace conflicts without replacing Conversation identity', () => {

@@ -1,3 +1,8 @@
+import type { IpcResult, TerminalResumeGrant } from '@shared/types/ipc.types'
+import type {
+  TerminalResourceDescriptor,
+  TerminalResourceHydrationStatus
+} from '@shared/types/session-workspace.types'
 import { create } from 'zustand'
 import { useShallow } from 'zustand/shallow'
 import { i18n } from '@/i18n'
@@ -12,6 +17,7 @@ export const HIDDEN_BUFFER_TRUNCATION_DELAY = 15 * 60 * 1000 // 15 minutes
 export const TRUNCATED_BUFFER_SIZE = 5000
 export const MAX_TRANSCRIPT_CHARS = 1_500_000
 const LINE_BREAK_PATTERN = /\r\n|\r|\n/
+const terminalResumeInFlight = new Map<string, Promise<IpcResult<void>>>()
 
 // ADR-004.4: descriptive-only agent metadata applied to a Terminal record.
 export interface TerminalAgentMetadata {
@@ -59,6 +65,12 @@ export interface TerminalState {
   renameTerminal: (id: string, name: string) => void
   reorderTerminals: (projectId: string, orderedIds: string[]) => void
   setTerminals: (terminals: Terminal[]) => void
+  hydrateTerminalResource: (
+    descriptor: TerminalResourceDescriptor,
+    grant?: TerminalResumeGrant,
+    projectId?: string
+  ) => void
+  resumeTerminalResource: (id: string) => Promise<IpcResult<void>>
   setTerminalPtyId: (id: string, ptyId: string) => boolean
   setTerminalClaim: (ptyId: string, claim: string | undefined) => void
   findTerminalByPtyId: (ptyId: string) => Terminal | undefined
@@ -249,6 +261,137 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
       if (t.ptyId) newIndex.set(t.ptyId, t.id)
     }
     set({ terminals, ptyIdIndex: newIndex })
+  },
+
+  /**
+   * Materialize a passive SessionWorkspace terminal descriptor in renderer
+   * memory. This action never spawns, terminates, or otherwise claims PTY
+   * ownership; it only reconciles the renderer record and its ptyId index.
+   */
+  hydrateTerminalResource: (
+    descriptor: TerminalResourceDescriptor,
+    grant?: TerminalResumeGrant,
+    projectId?: string
+  ): void => {
+    const recordId = descriptor.terminalRecordId ?? descriptor.terminalId
+    const fallbackProjectId = projectId ?? useProjectStore.getState().activeProjectId
+
+    set((state) => {
+      const byRecord = state.terminals.find((terminal) => terminal.id === recordId)
+      const indexedOwner = state.ptyIdIndex.get(descriptor.terminalId)
+      const byPty = indexedOwner
+        ? state.terminals.find((terminal) => terminal.id === indexedOwner)
+        : state.terminals.find((terminal) => terminal.ptyId === descriptor.terminalId)
+      const base = byRecord ?? byPty
+      const firstIndex = state.terminals.findIndex(
+        (terminal) => terminal.id === recordId || terminal.ptyId === descriptor.terminalId
+      )
+      const healthStatus: TerminalResourceHydrationStatus = grant ? 'running' : 'disconnected'
+      const hydrated: Terminal = {
+        ...base,
+        id: recordId,
+        conversationId: descriptor.conversationId,
+        ptyId: descriptor.terminalId,
+        name:
+          base?.name ??
+          i18n.t('resume.restoredName', {
+            ns: 'terminal',
+            defaultValue: 'Restored terminal'
+          }),
+        projectId: base?.projectId ?? fallbackProjectId,
+        shell: grant?.terminal.shell ?? base?.shell ?? 'shell',
+        cwd: grant?.terminal.cwd ?? base?.cwd,
+        healthStatus,
+        resumeCursor: grant?.terminal.latestSeq ?? base?.resumeCursor,
+        claim: grant?.claim,
+        viewState: base?.viewState ?? 'visible',
+        isHidden: base?.isHidden ?? false,
+        rendererAttachmentCount: base?.rendererAttachmentCount ?? 0
+      }
+
+      const terminals = state.terminals.filter(
+        (terminal) => terminal.id !== recordId && terminal.ptyId !== descriptor.terminalId
+      )
+      terminals.splice(firstIndex >= 0 ? firstIndex : terminals.length, 0, hydrated)
+
+      const nextIndex = new Map<string, string>()
+      for (const terminal of terminals) {
+        if (terminal.ptyId) nextIndex.set(terminal.ptyId, terminal.id)
+      }
+
+      return {
+        terminals,
+        ptyIdIndex: nextIndex,
+        activeTerminalId:
+          state.activeTerminalId === byPty?.id || state.activeTerminalId === byRecord?.id
+            ? recordId
+            : state.activeTerminalId
+      }
+    })
+  },
+
+  /**
+   * Ensure a hydrated terminal has a fresh host-authorized resume grant. A
+   * running record with an in-memory claim is already reconciled and returns
+   * immediately; all other records use the narrow resume path and never spawn.
+   */
+  resumeTerminalResource: (id: string): Promise<IpcResult<void>> => {
+    const existing = terminalResumeInFlight.get(id)
+    if (existing) return existing
+
+    const task = (async (): Promise<IpcResult<void>> => {
+      const terminal = get().terminals.find((candidate) => candidate.id === id)
+      if (!terminal?.ptyId || !terminal.conversationId) {
+        return { success: false, error: 'Terminal unavailable', code: 'TERMINAL_NOT_FOUND' }
+      }
+      if (terminal.healthStatus === 'running' && terminal.claim) {
+        return { success: true, data: undefined }
+      }
+
+      const descriptor: TerminalResourceDescriptor = {
+        kind: 'terminal',
+        terminalId: terminal.ptyId,
+        terminalRecordId: terminal.id,
+        conversationId: terminal.conversationId
+      }
+      let result: IpcResult<TerminalResumeGrant>
+      try {
+        result = await terminalApi.resume({
+          conversationId: terminal.conversationId,
+          terminalId: terminal.ptyId,
+          lastSeq: terminal.resumeCursor ?? 0
+        })
+      } catch {
+        result = { success: false, error: 'Terminal resume failed', code: 'NETWORK_ERROR' }
+      }
+
+      const current = get().terminals.find((candidate) => candidate.id === id)
+      if (
+        !current ||
+        current.ptyId !== terminal.ptyId ||
+        current.conversationId !== terminal.conversationId
+      ) {
+        return { success: false, error: 'Terminal resume failed', code: 'NETWORK_ERROR' }
+      }
+
+      if (result.success && result.data.terminal.id === terminal.ptyId && result.data.claim) {
+        get().hydrateTerminalResource(descriptor, result.data, terminal.projectId)
+        return { success: true, data: undefined }
+      }
+
+      get().hydrateTerminalResource(descriptor, undefined, terminal.projectId)
+      if (result.success) {
+        return { success: false, error: 'Terminal resume failed', code: 'NETWORK_ERROR' }
+      }
+      return result
+    })()
+
+    terminalResumeInFlight.set(id, task)
+    const clearInFlight = (): void => {
+      if (terminalResumeInFlight.get(id) === task) terminalResumeInFlight.delete(id)
+    }
+    void task.then(clearInFlight, clearInFlight)
+    return task
   },
 
   setTerminalPtyId: (id: string, ptyId: string): boolean => {
@@ -626,6 +769,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
                 ...candidate,
                 ptyId: undefined,
                 claim: undefined,
+                resumeCursor: undefined,
                 healthStatus: 'crashed'
               }
             : candidate
@@ -656,6 +800,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
                 ...candidate,
                 ptyId: spawned.data.id,
                 claim: spawned.data.claim,
+                resumeCursor: 0,
                 healthStatus: 'running',
                 viewState: 'visible',
                 isHidden: false,
@@ -689,7 +834,9 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
         terminals: state.terminals.map((t) =>
           // CAP-3: the claim is bound to the PTY — dropping the ptyId drops
           // the lease with it.
-          t.ptyId === ptyId ? { ...t, ptyId: undefined, claim: undefined } : t
+          t.ptyId === ptyId
+            ? { ...t, ptyId: undefined, claim: undefined, resumeCursor: undefined }
+            : t
         ),
         ptyIdIndex: newIndex
       }

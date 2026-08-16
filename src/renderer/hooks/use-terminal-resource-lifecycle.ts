@@ -32,8 +32,13 @@ export function useTerminalResourceLifecycle(): void {
     const offExit = terminalApi.onExit((ptyId, exitCode) => {
       const terminal = useTerminalStore.getState().findTerminalByPtyId(ptyId)
       if (!terminal || terminal.conversationId !== conversationId) return
-      useTerminalStore.getState().updateTerminalExitCode(terminal.id, exitCode)
-      useTerminalStore.getState().setTerminalHealthStatus(terminal.id, 'crashed')
+      const store = useTerminalStore.getState()
+      store.updateTerminalExitCode(terminal.id, exitCode)
+      store.setTerminalClaim(ptyId, undefined)
+      store.setTerminalHealthStatus(
+        terminal.id,
+        terminal.healthStatus === 'disconnected' ? 'disconnected' : 'crashed'
+      )
       void performSessionWorkspaceWrite(conversationId)
     })
 

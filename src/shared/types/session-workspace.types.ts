@@ -38,6 +38,9 @@ export interface TerminalResourceDescriptor {
   conversationId: ConversationId
 }
 
+/** Renderer-only result of reconciling a passive terminal reference with its host. */
+export type TerminalResourceHydrationStatus = 'running' | 'disconnected'
+
 /** Passive editor reference. Unsaved contents, cursor state, and viewport state are excluded. */
 export interface EditorResourceDescriptor {
   kind: 'editor'

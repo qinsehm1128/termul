@@ -205,8 +205,15 @@ vi.mock('@/stores/terminal-store', async () => {
     healthStatus: 'running',
     restartTerminal: v.fn(),
     restartTerminalResource: v.fn(async () => true),
+    resumeTerminalResource: v.fn(async () => ({ success: true, data: undefined })),
     setRendererAttached: v.fn(),
-    findTerminalByPtyId: v.fn(),
+    findTerminalByPtyId: v.fn((ptyId: string) => ({
+      id: ptyId,
+      ptyId,
+      conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+      claim: 'test-memory-grant',
+      healthStatus: 'running'
+    })),
     peekTranscript: v.fn(() => ''),
     consumeTranscript: v.fn(() => ''),
     updateTerminalActivityBatch: v.fn(),

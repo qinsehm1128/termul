@@ -25,6 +25,7 @@ import { isTerminalPendingPtyAssignment } from '@/hooks/use-terminal-restore'
 import { systemApi, terminalApi } from '@/lib/api'
 import { openTerminalUrl } from '@/lib/browser/terminal-url-navigation'
 import { buildTerminalPathLinks, openFilePathFromTerminal } from '@/lib/file-path-links'
+import { logFrontendError } from '@/lib/log-api'
 import { isMac, isPlatformModifier } from '@/lib/platform'
 import { addRendererRef, removeRendererRef } from '@/lib/terminal-api'
 import {
@@ -166,6 +167,70 @@ function getInstrumentationProjectId(spawnOptions?: TerminalSpawnOptions): strin
   return typeof candidate === 'string' ? candidate : undefined
 }
 
+async function attachResumedTerminalRenderer(
+  terminalId: string,
+  storeTerminalId: string | undefined,
+  rendererId: string
+): Promise<boolean> {
+  const store = useTerminalStore.getState()
+  const record =
+    (storeTerminalId
+      ? store.terminals.find((terminal) => terminal.id === storeTerminalId)
+      : undefined) ?? store.findTerminalByPtyId(terminalId)
+  if (!record) {
+    void logFrontendError({
+      level: 'warn',
+      source: 'connected-terminal.resume',
+      message: 'code=TERMINAL_NOT_FOUND'
+    })
+    return false
+  }
+
+  const resumed = await store.resumeTerminalResource(record.id)
+  if (!resumed.success) {
+    void logFrontendError({
+      level: 'warn',
+      source: 'connected-terminal.resume',
+      message: `code=${resumed.code} terminalRecordId=${record.id}`
+    })
+    return false
+  }
+
+  const reconciledStore = useTerminalStore.getState()
+  const reconciled =
+    reconciledStore.terminals.find((terminal) => terminal.id === record.id) ??
+    reconciledStore.findTerminalByPtyId(terminalId)
+  if (
+    !reconciled?.claim ||
+    reconciled.ptyId !== terminalId ||
+    reconciled.healthStatus === 'disconnected'
+  ) {
+    useTerminalStore.getState().setTerminalHealthStatus(record.id, 'disconnected')
+    void logFrontendError({
+      level: 'warn',
+      source: 'connected-terminal.resume',
+      message: `code=UNAUTHORIZED terminalRecordId=${record.id}`
+    })
+    return false
+  }
+
+  const rendererRef = await addRendererRef(terminalId, rendererId)
+  if (!rendererRef.success) {
+    const nextStore = useTerminalStore.getState()
+    nextStore.setTerminalClaim(terminalId, undefined)
+    nextStore.setTerminalHealthStatus(record.id, 'disconnected')
+    void logFrontendError({
+      level: 'warn',
+      source: 'connected-terminal.renderer-ref',
+      message: `code=${rendererRef.code} terminalRecordId=${record.id}`
+    })
+    return false
+  }
+
+  useTerminalStore.getState().setRendererAttached(terminalId, true)
+  return true
+}
+
 function ConnectedTerminalComponent({
   terminalId: externalTerminalId,
   storeTerminalId,
@@ -238,6 +303,7 @@ function ConnectedTerminalComponent({
   shortcutsRef.current = shortcuts
   const cleanupDataListenerRef = useRef<(() => void) | null>(null)
   const cleanupExitListenerRef = useRef<(() => void) | null>(null)
+  const rendererRefAttachedRef = useRef(false)
   const ptyIdRef = useRef<string | null>(null)
   const spawnInFlightRef = useRef(false)
   const didInitRef = useRef(false)
@@ -396,14 +462,6 @@ function ConnectedTerminalComponent({
       continuityProjectIdRef.current = getInstrumentationProjectId(spawnOptionsRef.current)
   }, [spawnOptions])
 
-  useEffect(() => {
-    if (!externalTerminalId || isTerminalPendingPtyAssignment(externalTerminalId)) return
-    useTerminalStore.getState().setRendererAttached(externalTerminalId, true)
-    return () => {
-      useTerminalStore.getState().setRendererAttached(externalTerminalId, false)
-    }
-  }, [externalTerminalId])
-
   const instrumentationProjectId = getInstrumentationProjectId(spawnOptions)
 
   useEffect(() => {
@@ -468,6 +526,7 @@ function ConnectedTerminalComponent({
   // biome-ignore lint/correctness/useExhaustiveDependencies: intentionally narrow deps; a full list would recreate the terminal instance on every render
   useEffect(() => {
     const debugId = `${instanceId}-${Date.now().toString().slice(-6)}`
+    let disposed = false
 
     devLog(`[ConnectedTerminal] MOUNT [${debugId}]`, {
       instanceId,
@@ -1114,12 +1173,26 @@ function ConnectedTerminalComponent({
         // work for external terminals just like spawned ones. Without this, the TUI app
         // never receives SIGWINCH on project-switch restore and can't redraw.
         ptyIdRef.current = externalTerminalId
-        // Renderer-attached tracking is handled by the externalTerminalId effect
-        // above (with proper lifecycle cleanup). The effect also calls
-        // setRendererAttached, so we avoid duplicating it here. The backend ref
-        // (addRendererRef) is still registered here since it is async and not
-        // managed by the effect's lifecycle.
-        void addRendererRef(externalTerminalId, instanceIdRef.current)
+        // A cold renderer must complete the host-authorized resume path before
+        // it registers a renderer reference. Missing/denied grants stay as
+        // disconnected placeholders and never fall back to spawning.
+        const attached = await attachResumedTerminalRenderer(
+          externalTerminalId,
+          storeTerminalId,
+          instanceIdRef.current
+        )
+        if (!attached) {
+          if (!disposed && onErrorRef.current) {
+            onErrorRef.current(tRef.current('resume.disconnectedTitle'))
+          }
+          return
+        }
+        if (disposed) {
+          useTerminalStore.getState().setRendererAttached(externalTerminalId, false)
+          void removeRendererRef(externalTerminalId, instanceIdRef.current)
+          return
+        }
+        rendererRefAttachedRef.current = true
         registerTerminal(externalTerminalId, terminal)
         const terminalStoreState = useTerminalStore.getState()
         const transcript = terminalStoreState.peekTranscript(externalTerminalId)
@@ -1241,6 +1314,7 @@ function ConnectedTerminalComponent({
     initTerminal()
 
     return () => {
+      disposed = true
       devLog(`[ConnectedTerminal] UNMOUNT [${debugId}]`, {
         instanceId,
         ptyId: ptyIdRef.current,
@@ -1250,8 +1324,11 @@ function ConnectedTerminalComponent({
       const terminalId = ptyIdRef.current || externalTerminalId
       if (terminalId && terminalRef.current) {
         captureScrollPosition(terminalId)
-        useTerminalStore.getState().setRendererAttached(terminalId, false)
-        void removeRendererRef(terminalId, instanceId)
+        if (!externalTerminalId || rendererRefAttachedRef.current) {
+          useTerminalStore.getState().setRendererAttached(terminalId, false)
+          void removeRendererRef(terminalId, instanceId)
+        }
+        rendererRefAttachedRef.current = false
       }
 
       // Unregister terminal from registry
@@ -1572,6 +1649,7 @@ function ConnectedTerminalComponent({
   useEffect(() => {
     if (!containerRef.current || !targetId) return
     if (didInitRef.current) return
+    let disposed = false
     didInitRef.current = true
     initializedTerminalIdRef.current = targetId
     const terminalOptions = {
@@ -1759,7 +1837,23 @@ function ConnectedTerminalComponent({
           spawnInFlightRef.current = false
         }
       } else {
-        void addRendererRef(externalTerminalId, instanceIdRef.current)
+        const attached = await attachResumedTerminalRenderer(
+          externalTerminalId,
+          storeTerminalId,
+          instanceIdRef.current
+        )
+        if (!attached) {
+          if (!disposed && onErrorRef.current) {
+            onErrorRef.current(tRef.current('resume.disconnectedTitle'))
+          }
+          return
+        }
+        if (disposed) {
+          useTerminalStore.getState().setRendererAttached(externalTerminalId, false)
+          void removeRendererRef(externalTerminalId, instanceIdRef.current)
+          return
+        }
+        rendererRefAttachedRef.current = true
         registerTerminal(externalTerminalId, terminal)
         const transcript = useTerminalStore.getState().peekTranscript(externalTerminalId)
         if (transcript) {
@@ -1774,11 +1868,15 @@ function ConnectedTerminalComponent({
     }
     spawnTerminal()
     return () => {
+      disposed = true
       const tId = ptyIdRef.current || externalTerminalId
       if (tId && terminalRef.current) {
         captureScrollPosition(tId)
-        if (!externalTerminalId) useTerminalStore.getState().setRendererAttached(tId, false)
-        void removeRendererRef(tId, instanceId)
+        if (!externalTerminalId || rendererRefAttachedRef.current) {
+          useTerminalStore.getState().setRendererAttached(tId, false)
+          void removeRendererRef(tId, instanceId)
+        }
+        rendererRefAttachedRef.current = false
       }
       if (ptyIdRef.current) unregisterTerminal(ptyIdRef.current)
       else if (externalTerminalId) unregisterTerminal(externalTerminalId)
@@ -1812,7 +1910,7 @@ function ConnectedTerminalComponent({
     clearTerminalActivityOnUnmount
   ])
 
-  const isCrashed = healthStatus === 'disconnected' || healthStatus === 'crashed'
+  const isCrashed = healthStatus === 'crashed'
 
   return (
     <ContextMenu>
@@ -1855,6 +1953,7 @@ function ConnectedTerminalComponent({
                   </p>
                   <div className="flex flex-col sm:flex-row items-center gap-4">
                     <button
+                      type="button"
                       onClick={(e) => {
                         e.stopPropagation()
                         if (targetId) void restartTerminalResource(targetId)

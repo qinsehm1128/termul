@@ -208,6 +208,7 @@ const P1_DOMAINS: DomainCheck[] = [
       'onExit',
       // CAP-3 reclaimable leases: attach/rotate/revoke must exist on the
       // Tauri adapter — pins desktop↔web terminal parity.
+      'resume',
       'attach',
       'rotateClaim',
       'revokeClaim'
@@ -1007,20 +1008,23 @@ describe('Parity Checklist Automation', () => {
       const facade = readFileSync(TerminalFacade, 'utf-8')
       expect(facade).toMatch(/isTauriContext\(\)/)
       expect(facade).toMatch(/createTauriTerminalApi/)
+      expect(facade).toMatch(/export function resumeTerminal/)
       expect(facade).not.toMatch(/localStorage(?:\.|\[)/)
-      // The Tauri adapter implements attach/rotateClaim/revokeClaim via invoke.
+      // The Tauri adapter implements resume/attach/rotateClaim/revokeClaim via invoke.
       expect(existsSync(TauriTerminalAdapter)).toBe(true)
       const tauri = readFileSync(TauriTerminalAdapter, 'utf-8')
       expect(tauri).toMatch(/invoke/)
-      for (const m of ['attach', 'rotateClaim', 'revokeClaim']) {
+      for (const m of ['resume', 'attach', 'rotateClaim', 'revokeClaim']) {
         expect(tauri, `tauri-terminal-api.ts should implement ${m}`).toMatch(
-          new RegExp(`\\b${m}\\s*\\(`)
+          new RegExp(`\\b${m}\\s*(?:\\(|:)`)
         )
       }
       expect(tauri).not.toMatch(/localStorage(?:\.|\[)/)
       // The web adapter is WS-backed (the host WS is the authority) — no localStorage.
       expect(existsSync(WebTerminalAdapter)).toBe(true)
-      expect(readFileSync(WebTerminalAdapter, 'utf-8')).not.toMatch(/localStorage(?:\.|\[)/)
+      const web = readFileSync(WebTerminalAdapter, 'utf-8')
+      expect(web).toMatch(/\bresume\s*(?:\(|:)/)
+      expect(web).not.toMatch(/localStorage(?:\.|\[)/)
     })
 
     it('use-workspace-manifest-sync reads via workspaceManifestApi.getManifest, never localStorage', () => {

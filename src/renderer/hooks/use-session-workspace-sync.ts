@@ -16,8 +16,9 @@ import { isTerminalRestoreInProgress } from '@/hooks/useTerminalAutoSave'
 import { logFrontendError } from '@/lib/log-api'
 import { sessionWorkspaceApi } from '@/lib/session-workspace-api'
 import { randomUUID } from '@/lib/uuid'
-import { useConversationStore } from '@/stores/conversation-store'
+import { getCurrentConversation, useConversationStore } from '@/stores/conversation-store'
 import { useEditorStore } from '@/stores/editor-store'
+import { useProjectStore } from '@/stores/project-store'
 import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
 import { useTerminalStore } from '@/stores/terminal-store'
 import type { WorkspaceTab } from '@/stores/workspace-store'
@@ -184,6 +185,53 @@ function findLeafId(node: PaneNode, id: string): boolean {
   return node.children.some((child) => findLeafId(child, id))
 }
 
+function projectIdForConversation(conversationId: ConversationId): string {
+  const conversation = getCurrentConversation(useConversationStore.getState(), conversationId)
+  if (conversation?.projectAttachment?.projectId) return conversation.projectAttachment.projectId
+  if (conversation && conversation.executionTarget.kind !== 'workspace') {
+    return conversation.executionTarget.projectId
+  }
+  return useProjectStore.getState().activeProjectId
+}
+
+async function reconcileTerminalResources(
+  conversationId: ConversationId,
+  workspace: SessionWorkspaceV1
+): Promise<void> {
+  const descriptors = new Map<string, TerminalResourceDescriptor>()
+  for (const resource of workspace.resources) {
+    if (
+      resource.kind === 'terminal' &&
+      resource.conversationId === conversationId &&
+      !descriptors.has(resource.terminalId)
+    ) {
+      descriptors.set(resource.terminalId, resource)
+    }
+  }
+
+  const terminalStore = useTerminalStore.getState()
+  const projectId = projectIdForConversation(conversationId)
+  for (const descriptor of descriptors.values()) {
+    // Materialize the passive record before requesting replay so the global
+    // detached-output listener can capture bytes delivered during resume.
+    terminalStore.hydrateTerminalResource(descriptor, undefined, projectId)
+  }
+
+  await Promise.all(
+    Array.from(descriptors.values(), async (descriptor) => {
+      const recordId = descriptor.terminalRecordId ?? descriptor.terminalId
+      const result = await useTerminalStore.getState().resumeTerminalResource(recordId)
+      if (!result.success) {
+        void logFrontendError({
+          level: 'warn',
+          source: 'session-workspace-sync.terminal-resume',
+          message: `code=${result.code} conversationId=${conversationId} terminalId=${descriptor.terminalId}`
+        })
+      }
+    })
+  )
+}
+
 function loadConversationWorkspace(
   conversationId: ConversationId,
   workspace: SessionWorkspaceV1
@@ -231,6 +279,7 @@ export async function loadSessionWorkspace(conversationId: ConversationId): Prom
     const outcome = result.data
     store.setLoadOutcome(conversationId, outcome)
     if (outcome.status === 'loaded') {
+      await reconcileTerminalResources(conversationId, outcome.workspace)
       loadConversationWorkspace(conversationId, outcome.workspace)
       store.setBasedRevision(conversationId, outcome.workspace.revision)
       store.setRecoveryItems(conversationId, [])

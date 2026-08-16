@@ -1,11 +1,22 @@
 import { act, cleanup, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { getMock, writeMock, recoveryMock, logMock } = vi.hoisted(() => ({
+const {
+  getMock,
+  writeMock,
+  recoveryMock,
+  logMock,
+  terminalResumeMock,
+  terminalSpawnMock,
+  terminalTerminateMock
+} = vi.hoisted(() => ({
   getMock: vi.fn(),
   writeMock: vi.fn(),
   recoveryMock: vi.fn(),
-  logMock: vi.fn()
+  logMock: vi.fn(),
+  terminalResumeMock: vi.fn(),
+  terminalSpawnMock: vi.fn(),
+  terminalTerminateMock: vi.fn()
 }))
 
 vi.mock('@/lib/session-workspace-api', () => ({
@@ -16,6 +27,14 @@ vi.mock('@/lib/session-workspace-api', () => ({
   }
 }))
 vi.mock('@/lib/log-api', () => ({ logFrontendError: logMock }))
+vi.mock('@/lib/terminal-api', () => ({
+  terminalApi: {
+    resume: terminalResumeMock,
+    spawn: terminalSpawnMock,
+    terminate: terminalTerminateMock,
+    closeView: vi.fn()
+  }
+}))
 vi.mock('@/hooks/useTerminalAutoSave', () => ({ isTerminalRestoreInProgress: () => false }))
 
 import type { SessionWorkspaceV1 } from '@shared/types/session-workspace.types'
@@ -72,6 +91,12 @@ beforeEach(() => {
   useAcpStore.setState({ sessions: {}, activeSessionId: null })
   useEditorStore.getState().clearAllFiles()
   useTerminalStore.setState({ terminals: [], activeTerminalId: '', ptyIdIndex: new Map() })
+  terminalSpawnMock.mockResolvedValue({
+    success: false,
+    error: 'not expected',
+    code: 'SPAWN_FAILED'
+  })
+  terminalTerminateMock.mockResolvedValue({ success: true, data: undefined })
 })
 
 afterEach(() => {
@@ -98,6 +123,236 @@ describe('Conversation-scoped SessionWorkspace sync', () => {
     const store = useSessionWorkspaceSyncStore.getState()
     expect(store.getBasedRevision(one)).toBe(3)
     expect(store.getBasedRevision(two)).toBe(8)
+  })
+
+  it('hydrates live and denied terminal descriptors before rebuilding topology', async () => {
+    const coldWorkspace = workspace(one, 4, 'leaf-cold')
+    if (coldWorkspace.topology?.type !== 'leaf') {
+      throw new Error('expected leaf')
+    }
+    coldWorkspace.topology.terminalIds = ['record-live', 'record-denied']
+    coldWorkspace.topology.activeTabId = 'term-record-live'
+    coldWorkspace.resources = [
+      {
+        kind: 'terminal',
+        terminalId: 'pty-live',
+        terminalRecordId: 'record-live',
+        conversationId: one
+      },
+      {
+        kind: 'terminal',
+        terminalId: 'pty-denied',
+        terminalRecordId: 'record-denied',
+        conversationId: one
+      },
+      {
+        kind: 'terminal',
+        terminalId: 'pty-live',
+        terminalRecordId: 'record-live',
+        conversationId: one
+      }
+    ]
+    getMock.mockResolvedValue({
+      success: true,
+      data: { status: 'loaded', workspace: coldWorkspace }
+    })
+    const rootBeforeLoad = useWorkspaceStore.getState().root.id
+    terminalResumeMock.mockImplementation(async (request: { terminalId: string }) => {
+      const terminal = useTerminalStore.getState().findTerminalByPtyId(request.terminalId)
+      expect(terminal).toMatchObject({
+        ptyId: request.terminalId,
+        healthStatus: 'disconnected',
+        conversationId: one
+      })
+      expect(useWorkspaceStore.getState().root.id).toBe(rootBeforeLoad)
+      if (request.terminalId === 'pty-denied') {
+        return { success: false, error: 'Unauthorized', code: 'UNAUTHORIZED' }
+      }
+      return {
+        success: true,
+        data: {
+          terminal: {
+            id: 'pty-live',
+            shell: 'bash',
+            cwd: '/workspace/live',
+            pid: 42,
+            cols: 100,
+            rows: 30,
+            latestSeq: 17,
+            gap: false
+          },
+          claim: 'memory-only-resume-grant'
+        }
+      }
+    })
+
+    await expect(loadSessionWorkspace(one)).resolves.toBe(true)
+
+    expect(terminalResumeMock).toHaveBeenCalledTimes(2)
+    expect(terminalResumeMock).toHaveBeenCalledWith({
+      conversationId: one,
+      terminalId: 'pty-live',
+      lastSeq: 0
+    })
+    expect(terminalResumeMock).toHaveBeenCalledWith({
+      conversationId: one,
+      terminalId: 'pty-denied',
+      lastSeq: 0
+    })
+    expect(terminalSpawnMock).not.toHaveBeenCalled()
+    expect(terminalTerminateMock).not.toHaveBeenCalled()
+
+    const terminals = useTerminalStore.getState().terminals
+    expect(terminals.find((terminal) => terminal.id === 'record-live')).toMatchObject({
+      ptyId: 'pty-live',
+      shell: 'bash',
+      cwd: '/workspace/live',
+      healthStatus: 'running',
+      resumeCursor: 17,
+      claim: 'memory-only-resume-grant'
+    })
+    expect(terminals.find((terminal) => terminal.id === 'record-denied')).toMatchObject({
+      ptyId: 'pty-denied',
+      healthStatus: 'disconnected',
+      claim: undefined
+    })
+
+    const root = useWorkspaceStore.getState().root
+    expect(root).toMatchObject({
+      type: 'leaf',
+      id: 'leaf-cold',
+      activeTabId: 'term-record-live',
+      tabs: [
+        { type: 'terminal', id: 'term-record-live', terminalId: 'record-live' },
+        { type: 'terminal', id: 'term-record-denied', terminalId: 'record-denied' }
+      ]
+    })
+    expect(logMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        source: 'session-workspace-sync.terminal-resume',
+        message: expect.stringContaining('code=UNAUTHORIZED')
+      })
+    )
+  })
+
+  it('keeps a disconnected placeholder when the resume boundary throws', async () => {
+    const coldWorkspace = workspace(one, 5, 'leaf-network')
+    if (coldWorkspace.topology?.type !== 'leaf') {
+      throw new Error('expected leaf')
+    }
+    coldWorkspace.topology.terminalIds = ['record-network']
+    coldWorkspace.resources = [
+      {
+        kind: 'terminal',
+        terminalId: 'pty-network',
+        terminalRecordId: 'record-network',
+        conversationId: one
+      }
+    ]
+    getMock.mockResolvedValue({
+      success: true,
+      data: { status: 'loaded', workspace: coldWorkspace }
+    })
+    terminalResumeMock.mockRejectedValue(new Error('transport exploded with private details'))
+
+    await expect(loadSessionWorkspace(one)).resolves.toBe(true)
+
+    expect(useTerminalStore.getState().terminals).toEqual([
+      expect.objectContaining({
+        id: 'record-network',
+        ptyId: 'pty-network',
+        healthStatus: 'disconnected',
+        claim: undefined
+      })
+    ])
+    expect(useWorkspaceStore.getState().root).toMatchObject({
+      type: 'leaf',
+      tabs: [{ type: 'terminal', id: 'term-record-network', terminalId: 'record-network' }]
+    })
+    expect(logMock).toHaveBeenCalledWith(
+      expect.objectContaining({ message: expect.stringContaining('code=NETWORK_ERROR') })
+    )
+    expect(JSON.stringify(useTerminalStore.getState().terminals)).not.toContain(
+      'transport exploded with private details'
+    )
+  })
+
+  it('deduplicates concurrent resume attempts and reuses the in-memory replay cursor', async () => {
+    useTerminalStore.getState().setTerminals([
+      {
+        id: 'record-single-flight',
+        conversationId: one,
+        ptyId: 'pty-single-flight',
+        name: 'Restored terminal',
+        projectId: '',
+        shell: 'bash',
+        healthStatus: 'disconnected',
+        resumeCursor: 33
+      }
+    ])
+    let resolveResume:
+      | ((value: {
+          success: true
+          data: {
+            terminal: {
+              id: string
+              shell: string
+              cwd: string
+              pid: number
+              cols: number
+              rows: number
+              latestSeq: number
+              gap: boolean
+            }
+            claim: string
+          }
+        }) => void)
+      | undefined
+    terminalResumeMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveResume = resolve
+        })
+    )
+
+    const first = useTerminalStore.getState().resumeTerminalResource('record-single-flight')
+    const second = useTerminalStore.getState().resumeTerminalResource('record-single-flight')
+
+    expect(second).toBe(first)
+    expect(terminalResumeMock).toHaveBeenCalledTimes(1)
+    expect(terminalResumeMock).toHaveBeenCalledWith({
+      conversationId: one,
+      terminalId: 'pty-single-flight',
+      lastSeq: 33
+    })
+    resolveResume?.({
+      success: true,
+      data: {
+        terminal: {
+          id: 'pty-single-flight',
+          shell: 'bash',
+          cwd: '/workspace/single-flight',
+          pid: 19,
+          cols: 80,
+          rows: 24,
+          latestSeq: 41,
+          gap: false
+        },
+        claim: 'single-flight-memory-grant'
+      }
+    })
+
+    await expect(Promise.all([first, second])).resolves.toEqual([
+      { success: true, data: undefined },
+      { success: true, data: undefined }
+    ])
+    expect(useTerminalStore.getState().terminals[0]).toMatchObject({
+      healthStatus: 'running',
+      resumeCursor: 41,
+      claim: 'single-flight-memory-grant'
+    })
+    expect(terminalSpawnMock).not.toHaveBeenCalled()
+    expect(terminalTerminateMock).not.toHaveBeenCalled()
   })
 
   it('serializes only exact Conversation-bound terminal refs and referenced editors', () => {

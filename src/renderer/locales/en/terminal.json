@@ -54,6 +54,13 @@
   "restore": {
     "partialNote": "Restore note: alternate-screen or redraw-heavy output may be partially reconstructed from transcript replay"
   },
+  "resume": {
+    "restoredName": "Restored terminal",
+    "disconnectedTitle": "Terminal is disconnected",
+    "disconnectedDescription": "The saved terminal is unavailable or could not be authorized. Its tab is preserved; retry reconnecting without starting a replacement process.",
+    "retry": "Retry connection",
+    "retrying": "Retrying…"
+  },
   "environment": {
     "applied_one": "Project env: {{formattedCount}} variable applied",
     "applied_other": "Project env: {{formattedCount}} variables applied"

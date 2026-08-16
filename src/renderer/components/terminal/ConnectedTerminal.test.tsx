@@ -289,6 +289,7 @@ const mockTerminalStoreState = {
   renameTerminal: vi.fn(),
   reorderTerminals: vi.fn(),
   setTerminals: vi.fn(),
+  resumeTerminalResource: vi.fn(async () => ({ success: true, data: undefined })),
   setTerminalPtyId: vi.fn(),
   setTerminalClaim: vi.fn(),
   findTerminalByPtyId: vi.fn(),
@@ -388,8 +389,21 @@ describe('ConnectedTerminal', () => {
       return vi.fn()
     })
 
+    mockTerminalStoreState.terminals = []
     mockTerminalStoreState.findTerminalByPtyId.mockReset()
-    mockTerminalStoreState.findTerminalByPtyId.mockReturnValue({ cwd: '/terminal-cwd' })
+    mockTerminalStoreState.findTerminalByPtyId.mockImplementation((ptyId: string) => ({
+      id: ptyId,
+      ptyId,
+      conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+      claim: 'test-memory-grant',
+      healthStatus: 'running',
+      cwd: '/terminal-cwd'
+    }))
+    mockTerminalStoreState.resumeTerminalResource.mockReset()
+    mockTerminalStoreState.resumeTerminalResource.mockResolvedValue({
+      success: true,
+      data: undefined
+    })
     mockTerminalStoreState.updateTerminalActivity.mockReset()
     mockTerminalStoreState.updateTerminalLastActivityTimestamp.mockReset()
     mockTerminalStoreState.updateTerminalActivityBatch.mockReset()

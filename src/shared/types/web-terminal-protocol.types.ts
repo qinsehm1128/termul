@@ -1,5 +1,14 @@
 import type { ConversationId } from './conversation.types'
-import type { GitStatus, RotatedClaim, SpawnedTerminal, TerminalAttachResult } from './ipc.types'
+import type {
+  GitStatus,
+  RotatedClaim,
+  SpawnedTerminal,
+  TerminalAttachResult,
+  TerminalResumeGrant,
+  TerminalResumeRequest
+} from './ipc.types'
+
+export type { TerminalResumeGrant, TerminalResumeRequest } from './ipc.types'
 
 export type WebTerminalRequestType =
   | 'spawn'
@@ -34,22 +43,6 @@ export interface TerminalSpawnIntentV1 {
   cwdSource: TerminalCwdSource
   cols: number
   rows: number
-}
-
-/** Cold-renderer request for a host-authorized, one-time claim rotation. */
-export interface TerminalResumeRequest {
-  conversationId: ConversationId
-  terminalId: string
-  lastSeq: number
-}
-
-/**
- * Authenticated resume handoff. `claim` is response-only and in-memory-only;
- * it must never be added to SessionWorkspace or renderer persistence.
- */
-export interface TerminalResumeGrant {
-  terminal: TerminalAttachResult
-  claim: string
 }
 
 export type WebTerminalRequest =

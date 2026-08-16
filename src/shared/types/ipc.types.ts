@@ -93,6 +93,25 @@ export interface TerminalAttachResult {
   gap: boolean
 }
 
+/**
+ * Cold-renderer request for a host-authorized, one-time claim rotation.
+ * The narrow request cannot override spawn authority, cwd, argv, or env.
+ */
+export interface TerminalResumeRequest {
+  conversationId: ConversationId
+  terminalId: string
+  lastSeq: number
+}
+
+/**
+ * Authenticated resume handoff. `claim` is response-only and memory-only; it
+ * must never be added to SessionWorkspace or renderer persistence.
+ */
+export interface TerminalResumeGrant {
+  terminal: TerminalAttachResult
+  claim: string
+}
+
 /** CAP-3 rotate response: the fresh credential. */
 export interface RotatedClaim {
   claim: string
@@ -143,6 +162,7 @@ export type ConversationIpcChannels = {
 
 export type TerminalIpcChannels = {
   'terminal:spawn': (options: TerminalSpawnOptions) => IpcResult<SpawnedTerminal>
+  'terminal:resume': (request: TerminalResumeRequest) => IpcResult<TerminalResumeGrant>
   'terminal:attach': (
     terminalId: string,
     claim: string,
@@ -299,6 +319,12 @@ export interface GitApi {
 // Terminal API exposed via preload
 export interface TerminalApi {
   spawn: (options?: TerminalSpawnOptions) => Promise<IpcResult<SpawnedTerminal>>
+  /**
+   * Resume a passive SessionWorkspace terminal reference without spawning.
+   * The host validates the Conversation scope, rotates a one-time claim, and
+   * replays from `lastSeq`; the returned claim remains renderer-memory-only.
+   */
+  resume: (request: TerminalResumeRequest) => Promise<IpcResult<TerminalResumeGrant>>
   /**
    * CAP-3: attach to a terminal's output stream with terminalId + claim +
    * lastSeq. Verification is the gate — any failure (unknown terminal,

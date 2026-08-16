@@ -6,7 +6,12 @@
  * destroys a terminal.
  */
 
-import type { IpcResult, TerminalApi } from '@shared/types/ipc.types'
+import type {
+  IpcResult,
+  TerminalApi,
+  TerminalResumeGrant,
+  TerminalResumeRequest
+} from '@shared/types/ipc.types'
 import { isTauriContext } from './tauri-runtime'
 import {
   addRendererRef as addTauriRendererRef,
@@ -19,6 +24,13 @@ import { createWebTerminalApi, webTerminalInternals } from './web-terminal-api'
 export const terminalApi: TerminalApi = isTauriContext()
   ? createTauriTerminalApi()
   : createWebTerminalApi()
+
+/** Transport-neutral cold-resume entry point; never spawns or terminates a PTY. */
+export function resumeTerminal(
+  request: TerminalResumeRequest
+): Promise<IpcResult<TerminalResumeGrant>> {
+  return terminalApi.resume(request)
+}
 
 export function addRendererRef(terminalId: string, rendererId: string): Promise<IpcResult<void>> {
   return isTauriContext()

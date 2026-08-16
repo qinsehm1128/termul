@@ -35,6 +35,44 @@ class FakeWebSocket {
       this.emitReply({ id: req.id, success: true, data: spawnReplyData })
       return
     }
+    if (req.type === 'resume') {
+      if (resumeReply === 'unauthorized') {
+        this.emitReply({
+          id: req.id,
+          success: false,
+          error: 'Unauthorized',
+          code: 'UNAUTHORIZED'
+        })
+        return
+      }
+      queueMicrotask(() => {
+        if (resumeReply === 'ok') {
+          this.emit({
+            type: 'replay',
+            terminalId: req.payload.terminalId,
+            chunks: resumeReplayChunks,
+            gap: false,
+            latestSeq: resumeGrantData.terminal.latestSeq,
+            snapshot: {
+              cwd: resumeGrantData.terminal.cwd,
+              gitBranch: null,
+              gitStatus: null,
+              exitCode: null,
+              exited: false
+            }
+          })
+        }
+        this.emit({
+          id: req.id,
+          success: true,
+          data:
+            resumeReply === 'invalid'
+              ? { ...resumeGrantData, terminal: { ...resumeGrantData.terminal, id: 'wrong-id' } }
+              : resumeGrantData
+        })
+      })
+      return
+    }
     if (req.type === 'attach') {
       if (attachReply === 'unauthorized') {
         // The single generic rejection — no distinguishing detail. The real
@@ -102,10 +140,31 @@ let spawnReplyData: Record<string, unknown> = {
 /** Test knob: credential returned by rotate_claim replies. */
 let rotateReplyClaim = 'rotated-claim-64-hex'
 
+/** Test knobs for authenticated cold resume. */
+let resumeReply: 'ok' | 'unauthorized' | 'invalid' = 'ok'
+let resumeGrantData = {
+  terminal: {
+    id: 't1',
+    shell: 'bash',
+    cwd: '/workspace/resumed',
+    pid: 77,
+    cols: 100,
+    rows: 30,
+    latestSeq: 12,
+    gap: false
+  },
+  claim: 'resume-claim-rotated'
+}
+let resumeReplayChunks = [
+  { seq: 8, data: [114, 101, 112, 108, 97, 121, 45] },
+  { seq: 12, data: [111, 107] }
+]
+
 type Tracker = {
   lastSeq: number
   exited: boolean
   refCount: number
+  streamAttached: boolean
   claim?: string
   disconnected: boolean
 }
@@ -137,6 +196,27 @@ function restoreVisibility(): void {
     value: 'visible'
   })
 }
+
+afterEach(() => {
+  resumeReply = 'ok'
+  resumeGrantData = {
+    terminal: {
+      id: 't1',
+      shell: 'bash',
+      cwd: '/workspace/resumed',
+      pid: 77,
+      cols: 100,
+      rows: 30,
+      latestSeq: 12,
+      gap: false
+    },
+    claim: 'resume-claim-rotated'
+  }
+  resumeReplayChunks = [
+    { seq: 8, data: [114, 101, 112, 108, 97, 121, 45] },
+    { seq: 12, data: [111, 107] }
+  ]
+})
 
 /** Find the LAST sent request frame of a given type on a FakeWebSocket. */
 function findSentRequest(
@@ -505,6 +585,158 @@ describe('WebTerminalClient frame handling & request lifecycle', () => {
       client.dispose()
     })
 
+    it('resumes with the exact scoped payload, adopts the rotated grant, and delivers replay without spawning', async () => {
+      vi.useFakeTimers()
+      const { client, internals } = makeClient()
+      const received: number[] = []
+      const off = client.onData((terminalId, bytes) => {
+        expect(terminalId).toBe('t1')
+        received.push(...bytes)
+      })
+
+      const result = await client.resume({
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        terminalId: 't1',
+        lastSeq: 7
+      })
+
+      expect(result).toEqual({ success: true, data: resumeGrantData })
+      const resumeRequest = findSentRequest(internals.socket, 'resume')
+      expect(resumeRequest?.payload).toEqual({
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        terminalId: 't1',
+        lastSeq: 7
+      })
+      expect(findSentRequest(internals.socket, 'spawn')).toBeUndefined()
+      expect(findSentRequest(internals.socket, 'attach')).toBeUndefined()
+      expect(new TextDecoder().decode(Uint8Array.from(received))).toBe('replay-ok')
+      expect(internals.trackers.get('t1')).toMatchObject({
+        claim: 'resume-claim-rotated',
+        lastSeq: 12,
+        refCount: 0,
+        streamAttached: true,
+        disconnected: false,
+        exited: false
+      })
+
+      off()
+      client.dispose()
+    })
+
+    it('collapses a denied resume to generic UNAUTHORIZED and drops the stale tracker grant', async () => {
+      vi.useFakeTimers()
+      const { client, internals } = makeClient()
+      await client.connect()
+      await client.attach('t1', 'old-claim')
+      resumeReply = 'unauthorized'
+
+      const result = await client.resume({
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        terminalId: 't1',
+        lastSeq: 5
+      })
+
+      expect(result).toEqual({ success: false, error: 'Unauthorized', code: 'UNAUTHORIZED' })
+      expect(internals.trackers.get('t1')).toMatchObject({
+        claim: undefined,
+        refCount: 0,
+        streamAttached: false,
+        disconnected: true,
+        exited: false
+      })
+      expect(findSentRequest(internals.socket, 'resume')?.payload).toEqual({
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        terminalId: 't1',
+        lastSeq: 5
+      })
+      expect(findSentRequest(internals.socket, 'spawn')).toBeUndefined()
+
+      client.dispose()
+    })
+
+    it('rejects a stolen predecessor without erasing the newer resume grant', async () => {
+      vi.useFakeTimers()
+      const { client, internals } = makeClient()
+      await client.resume({
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        terminalId: 't1',
+        lastSeq: 0
+      })
+      attachReply = 'unauthorized'
+
+      const rejected = await client.attachWithCursor('t1', 'stolen-pre-resume-claim', 12)
+
+      expect(rejected).toEqual({ success: false, error: 'Unauthorized', code: 'UNAUTHORIZED' })
+      expect(internals.trackers.get('t1')).toMatchObject({
+        claim: 'resume-claim-rotated',
+        lastSeq: 12,
+        refCount: 0,
+        streamAttached: true,
+        disconnected: false
+      })
+      expect(findSentRequest(internals.socket, 'spawn')).toBeUndefined()
+
+      client.dispose()
+    })
+
+    it('reconnects a mounted resumed terminal from its replay cursor without spawning', async () => {
+      vi.useFakeTimers()
+      const { client, internals } = makeClient()
+      await client.resume({
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        terminalId: 't1',
+        lastSeq: 0
+      })
+      const firstSocket = internals.socket
+
+      const mounted = await client.attach('t1')
+      expect(mounted.success).toBe(true)
+      expect(internals.trackers.get('t1')?.refCount).toBe(1)
+      expect(findSentRequest(firstSocket, 'attach')).toBeUndefined()
+
+      firstSocket.close()
+      await vi.advanceTimersByTimeAsync(600)
+      await Promise.resolve()
+
+      expect(internals.socket).not.toBe(firstSocket)
+      expect(findSentRequest(internals.socket, 'attach')?.payload).toEqual({
+        terminalId: 't1',
+        claim: 'resume-claim-rotated',
+        lastSeq: 12
+      })
+      expect(findSentRequest(internals.socket, 'spawn')).toBeUndefined()
+
+      if (internals.reconnectTimer) {
+        clearTimeout(internals.reconnectTimer)
+        internals.reconnectTimer = null
+      }
+      client.dispose()
+    })
+
+    it('fails closed on a mismatched resume grant without adopting it', async () => {
+      vi.useFakeTimers()
+      const { client, internals } = makeClient()
+      resumeReply = 'invalid'
+
+      const result = await client.resume({
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        terminalId: 't1',
+        lastSeq: 0
+      })
+
+      expect(result.success).toBe(false)
+      if (!result.success) expect(result.code).toBe('NETWORK_ERROR')
+      expect(internals.trackers.get('t1')).toMatchObject({
+        claim: undefined,
+        refCount: 0,
+        streamAttached: false,
+        disconnected: true
+      })
+      expect(findSentRequest(internals.socket, 'spawn')).toBeUndefined()
+
+      client.dispose()
+    })
+
     it('attaches with claim + lastSeq and adopts both only on server-confirmed success', async () => {
       vi.useFakeTimers()
       const { client, internals } = makeClient()
@@ -636,7 +868,13 @@ describe('WebTerminalClient frame handling & request lifecycle', () => {
       // t1 holds a lease; t3 does not (e.g. a cross-client record without a
       // credential).
       await client.attach('t1', 'lease-abc')
-      internals.trackers.set('t3', { lastSeq: 0, exited: false, refCount: 1, disconnected: false })
+      internals.trackers.set('t3', {
+        lastSeq: 0,
+        exited: false,
+        refCount: 1,
+        streamAttached: false,
+        disconnected: false
+      })
 
       internals.socket.close()
       await vi.advanceTimersByTimeAsync(600)

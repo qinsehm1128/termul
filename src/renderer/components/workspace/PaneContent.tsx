@@ -1,5 +1,5 @@
 import type { ShellInfo } from '@shared/types/ipc.types'
-import { X } from 'lucide-react'
+import { RefreshCcw, Unplug, X } from 'lucide-react'
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 // Import useShallow for selective re-rendering
@@ -9,6 +9,7 @@ import { AgentLauncher } from '@/components/agents/AgentLauncher'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useMobileWebShell } from '@/hooks/use-mobile-web-shell'
 import { usePaneDnd } from '@/hooks/use-pane-dnd'
+import { logFrontendError } from '@/lib/log-api'
 import { cn } from '@/lib/utils'
 import { useAcpStore } from '@/stores/acp-store'
 import { useProjectStore } from '@/stores/project-store'
@@ -90,7 +91,7 @@ export function PaneContent({
   closingTerminalIds = [],
   defaultShell
 }: PaneContentProps): React.JSX.Element {
-  const { t } = useTranslation('workspace')
+  const { t } = useTranslation(['workspace', 'terminal'])
   // CRITICAL FIX: Get terminal IDs from this pane's tabs
   const terminalIdsInPane = useMemo(
     () => new Set(pane.tabs.filter((t) => t.type === 'terminal').map((t) => t.terminalId)),
@@ -133,6 +134,7 @@ export function PaneContent({
   // is first seen. The xterm renderer attaches almost instantly (same frame),
   // so rendererAttachmentCount alone isn't enough for a visible loading state.
   const [agentLoadingIds, setAgentLoadingIds] = useState<Set<string>>(new Set())
+  const [retryingTerminalIds, setRetryingTerminalIds] = useState<Set<string>>(new Set())
   const agentLoadingTimers = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map())
   const prevAgentTerminalIdsRef = useRef<string[]>([])
   const AGENT_LOADING_MS = 1500
@@ -195,6 +197,26 @@ export function PaneContent({
       store.setTerminalNeedsAttention(activeTerminalIdInPane, false)
     }
   }, [activeTerminalIdInPane])
+
+  const retryDisconnectedTerminal = useCallback(async (terminalId: string): Promise<void> => {
+    setRetryingTerminalIds((current) => new Set(current).add(terminalId))
+    try {
+      const result = await useTerminalStore.getState().resumeTerminalResource(terminalId)
+      if (!result.success) {
+        void logFrontendError({
+          level: 'warn',
+          source: 'pane-content.terminal-resume',
+          message: `code=${result.code} terminalRecordId=${terminalId}`
+        })
+      }
+    } finally {
+      setRetryingTerminalIds((current) => {
+        const next = new Set(current)
+        next.delete(terminalId)
+        return next
+      })
+    }
+  }, [])
 
   const previewSpaceClass =
     panePreviewPosition === 'left'
@@ -289,6 +311,54 @@ export function PaneContent({
                 if (!terminal) {
                   return null
                 }
+                const isVisible = activeTab?.id === tab.id
+                if (terminal.healthStatus === 'disconnected') {
+                  const isRetrying = retryingTerminalIds.has(terminal.id)
+                  const disconnectedTitleId = `terminal-disconnected-${terminal.id}`
+                  return (
+                    <section
+                      key={tab.id}
+                      className={cn(
+                        isVisible ? 'w-full h-full' : INACTIVE_TAB_PANE_CLASS,
+                        'flex items-center justify-center p-6'
+                      )}
+                      aria-labelledby={disconnectedTitleId}
+                      data-terminal-health="disconnected"
+                    >
+                      <div className="flex w-full max-w-md flex-col items-center gap-4 rounded-xl border border-border/60 bg-card/80 p-6 text-center shadow-sm">
+                        <span className="flex h-12 w-12 items-center justify-center rounded-full bg-muted text-muted-foreground">
+                          <Unplug className="h-6 w-6" aria-hidden="true" />
+                        </span>
+                        <div className="space-y-2">
+                          <h2 id={disconnectedTitleId} className="text-base font-semibold">
+                            {t('resume.disconnectedTitle', { ns: 'terminal' })}
+                          </h2>
+                          <p
+                            className="text-sm leading-relaxed text-muted-foreground"
+                            role="status"
+                            aria-live="polite"
+                          >
+                            {t('resume.disconnectedDescription', { ns: 'terminal' })}
+                          </p>
+                        </div>
+                        <button
+                          type="button"
+                          className="inline-flex min-h-10 items-center justify-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60"
+                          disabled={isRetrying}
+                          onClick={() => void retryDisconnectedTerminal(terminal.id)}
+                        >
+                          <RefreshCcw
+                            className={cn('h-4 w-4', isRetrying && 'animate-spin')}
+                            aria-hidden="true"
+                          />
+                          {isRetrying
+                            ? t('resume.retrying', { ns: 'terminal' })
+                            : t('resume.retry', { ns: 'terminal' })}
+                        </button>
+                      </div>
+                    </section>
+                  )
+                }
                 // CRITICAL: Only skip rendering if terminal doesn't have a PTY
                 // ID yet — this prevents spawn loops when workspace tabs aren't
                 // fully synced. For agent terminals with a ptyId, ConnectedTerminal
@@ -297,7 +367,6 @@ export function PaneContent({
                 // we overlay the agent loading icon on top until the renderer
                 // attaches — see the overlay div after ConnectedTerminal.
                 if (!terminal.ptyId) {
-                  const isVisible = activeTab?.id === tab.id
                   const isAgent = terminal.kind === 'agent' && !!terminal.agentId
                   return (
                     <div
@@ -325,7 +394,6 @@ export function PaneContent({
                     </div>
                   )
                 }
-                const isVisible = activeTab?.id === tab.id
                 const isAgentLoading =
                   terminal.kind === 'agent' &&
                   !!terminal.agentId &&

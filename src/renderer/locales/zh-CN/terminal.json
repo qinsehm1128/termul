@@ -54,6 +54,13 @@
   "restore": {
     "partialNote": "恢复提示：备用屏幕或频繁重绘的输出可能只能通过转录重放进行部分还原"
   },
+  "resume": {
+    "restoredName": "已恢复的终端",
+    "disconnectedTitle": "终端连接已断开",
+    "disconnectedDescription": "保存的终端不可用或无法通过授权。此标签页会保留；你可以重试连接，而不会启动替代进程。",
+    "retry": "重试连接",
+    "retrying": "正在重试…"
+  },
   "environment": {
     "applied_one": "已应用 {{formattedCount}} 个项目环境变量",
     "applied_other": "已应用 {{formattedCount}} 个项目环境变量"

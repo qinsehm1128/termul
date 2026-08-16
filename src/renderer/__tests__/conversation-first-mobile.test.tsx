@@ -1,29 +1,47 @@
 import type { RecoveryItemV1 } from '@shared/types/conversation-recovery.types'
+import type { SessionWorkspaceV1 } from '@shared/types/session-workspace.types'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { useState } from 'react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ConversationRecoveryPanel } from '@/components/conversation/ConversationRecoveryPanel'
 import { ExecutionTargetPicker } from '@/components/conversation/ExecutionTargetPicker'
+import { PaneContent } from '@/components/workspace/PaneContent'
+import { loadSessionWorkspace } from '@/hooks/use-session-workspace-sync'
 import { useConversationStore } from '@/stores/conversation-store'
+import { useProjectStore } from '@/stores/project-store'
+import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
 import { useTerminalStore } from '@/stores/terminal-store'
+import { useWorkspaceStore } from '@/stores/workspace-store'
 
 const ID = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
-const { mockConversationApi, mockTerminalApi } = vi.hoisted(() => ({
+const { mockConversationApi, mockTerminalApi, mockSessionWorkspaceApi } = vi.hoisted(() => ({
   mockConversationApi: {
     listConversations: vi.fn(),
     openConversation: vi.fn(),
     resolveRecovery: vi.fn()
   },
   mockTerminalApi: {
+    resume: vi.fn(),
+    spawn: vi.fn(),
     closeView: vi.fn(),
     terminate: vi.fn()
+  },
+  mockSessionWorkspaceApi: {
+    getWorkspace: vi.fn(),
+    writeWorkspace: vi.fn(),
+    resolveRecovery: vi.fn()
   }
 }))
 
 vi.mock('@/lib/conversation-api', () => ({ conversationApi: mockConversationApi }))
 vi.mock('@/lib/terminal-api', () => ({ terminalApi: mockTerminalApi }))
+vi.mock('@/lib/session-workspace-api', () => ({ sessionWorkspaceApi: mockSessionWorkspaceApi }))
 vi.mock('@/lib/log-api', () => ({ logFrontendError: vi.fn() }))
-vi.mock('@/hooks/use-session-workspace-sync', () => ({ loadSessionWorkspace: vi.fn() }))
+vi.mock('@/components/terminal/ConnectedTerminal', () => ({
+  ConnectedTerminal: ({ terminalId }: { terminalId?: string }) => (
+    <div data-testid="mobile-connected-terminal">connected:{terminalId}</div>
+  )
+}))
 
 const recoveryItem: RecoveryItemV1 = {
   recoveryId: 'b'.repeat(64),
@@ -50,6 +68,32 @@ const recoveryItem: RecoveryItemV1 = {
   ],
   revision: 3,
   associationDecisions: []
+}
+
+function mobileTerminalWorkspace(): SessionWorkspaceV1 {
+  return {
+    schemaVersion: 1,
+    conversationId: ID,
+    revision: 6,
+    updatedAtUtc: '2026-08-15T10:00:00.000Z',
+    topology: {
+      type: 'leaf',
+      id: 'phone-terminal-pane',
+      terminalIds: ['phone-terminal-record'],
+      editorIds: [],
+      activeTabId: 'term-phone-terminal-record'
+    },
+    activePaneId: 'phone-terminal-pane',
+    resources: [
+      {
+        kind: 'terminal',
+        terminalId: 'pty-phone-cold',
+        terminalRecordId: 'phone-terminal-record',
+        conversationId: ID
+      }
+    ],
+    projectionState: { status: 'native' }
+  }
 }
 
 function PhoneHarness(): React.JSX.Element {
@@ -114,13 +158,37 @@ describe('Conversation-first responsive phone matrix', () => {
     vi.clearAllMocks()
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 })
     useConversationStore.getState().reset()
+    useSessionWorkspaceSyncStore.setState({
+      activeConversationId: null,
+      basedRevisionByConversation: {},
+      conflictsByConversation: {},
+      recoveryByConversation: {},
+      loadOutcomeByConversation: {},
+      restoreInProgressByConversation: {}
+    })
     useTerminalStore.setState({ terminals: [], activeTerminalId: '', ptyIdIndex: new Map() })
+    useWorkspaceStore.getState().resetLayout()
+    useProjectStore.setState({ activeProjectId: '' })
     const terminal = useTerminalStore
       .getState()
       .addTerminal('Phone shell', '', 'bash', `/visible/sessions/2026/08/15/${ID}`, [], ID)
     useTerminalStore.getState().setTerminalPtyId(terminal.id, 'pty-phone')
+    mockTerminalApi.resume.mockResolvedValue({
+      success: false,
+      error: 'Unauthorized',
+      code: 'UNAUTHORIZED'
+    })
+    mockTerminalApi.spawn.mockResolvedValue({
+      success: false,
+      error: 'not expected',
+      code: 'SPAWN_FAILED'
+    })
     mockTerminalApi.closeView.mockResolvedValue({ success: true, data: undefined })
     mockTerminalApi.terminate.mockResolvedValue({ success: true, data: undefined })
+    mockSessionWorkspaceApi.getWorkspace.mockResolvedValue({
+      success: true,
+      data: { status: 'missing', conversationId: ID }
+    })
     mockConversationApi.openConversation.mockResolvedValue({
       success: true,
       data: {
@@ -172,6 +240,80 @@ describe('Conversation-first responsive phone matrix', () => {
     expect(useConversationStore.getState().activeConversationId).toBe(ID)
     expect(mockTerminalApi.terminate).not.toHaveBeenCalled()
     expect(useTerminalStore.getState().terminals[0].ptyId).toBe('pty-phone')
+  })
+
+  it('preserves a denied cold terminal as a phone placeholder and retries without spawning', async () => {
+    useTerminalStore.setState({ terminals: [], activeTerminalId: '', ptyIdIndex: new Map() })
+    const persisted = mobileTerminalWorkspace()
+    mockSessionWorkspaceApi.getWorkspace.mockResolvedValue({
+      success: true,
+      data: { status: 'loaded', workspace: persisted }
+    })
+    mockTerminalApi.resume
+      .mockResolvedValueOnce({ success: false, error: 'Unauthorized', code: 'UNAUTHORIZED' })
+      .mockImplementationOnce(async (request) => {
+        useTerminalStore.getState().appendTranscript(request.terminalId, 'phone replay output')
+        return {
+          success: true,
+          data: {
+            terminal: {
+              id: request.terminalId,
+              shell: 'bash',
+              cwd: `/visible/sessions/2026/08/15/${ID}`,
+              pid: 91,
+              cols: 80,
+              rows: 24,
+              latestSeq: 14,
+              gap: false
+            },
+            claim: 'phone-memory-only-grant'
+          }
+        }
+      })
+
+    document.dispatchEvent(new Event('visibilitychange'))
+    await expect(loadSessionWorkspace(ID)).resolves.toBe(true)
+    window.dispatchEvent(new Event('online'))
+
+    const root = useWorkspaceStore.getState().root
+    if (root.type !== 'leaf') throw new Error('expected restored phone leaf')
+    render(<PaneContent pane={root} />)
+
+    expect(screen.getByRole('region', { name: 'Terminal is disconnected' })).toBeVisible()
+    expect(screen.getByText(/saved terminal is unavailable/i)).toBeVisible()
+    const retry = screen.getByRole('button', { name: 'Retry connection' })
+    expect(retry).toBeEnabled()
+    expect(useTerminalStore.getState().terminals[0]).toMatchObject({
+      id: 'phone-terminal-record',
+      ptyId: 'pty-phone-cold',
+      healthStatus: 'disconnected',
+      claim: undefined
+    })
+
+    fireEvent.click(retry)
+
+    expect(await screen.findByTestId('mobile-connected-terminal')).toHaveTextContent(
+      'connected:pty-phone-cold'
+    )
+    expect(screen.queryByRole('region', { name: 'Terminal is disconnected' })).toBeNull()
+    expect(useTerminalStore.getState().peekTranscript('pty-phone-cold')).toBe('phone replay output')
+    expect(useTerminalStore.getState().terminals[0]).toMatchObject({
+      healthStatus: 'running',
+      resumeCursor: 14,
+      claim: 'phone-memory-only-grant'
+    })
+    expect(mockTerminalApi.resume).toHaveBeenNthCalledWith(1, {
+      conversationId: ID,
+      terminalId: 'pty-phone-cold',
+      lastSeq: 0
+    })
+    expect(mockTerminalApi.resume).toHaveBeenNthCalledWith(2, {
+      conversationId: ID,
+      terminalId: 'pty-phone-cold',
+      lastSeq: 0
+    })
+    expect(mockTerminalApi.spawn).not.toHaveBeenCalled()
+    expect(mockTerminalApi.terminate).not.toHaveBeenCalled()
   })
 
   it('shows all recovery actions and immutable evidence at 390px', async () => {

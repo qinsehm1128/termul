@@ -145,6 +145,127 @@ describe('tauri-terminal-api', () => {
       }
     })
 
+    it('resumes with the exact scoped request, replays first, then attaches live from latestSeq', async () => {
+      const { api, Channel } = await loadApi()
+      const request = {
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        terminalId: 'terminal-1752-1',
+        lastSeq: 12
+      }
+      const grant = {
+        terminal: {
+          id: 'terminal-1752-1',
+          shell: 'pwsh',
+          cwd: 'C:/dev/project',
+          pid: 4242,
+          cols: 120,
+          rows: 32,
+          latestSeq: 87,
+          gap: false
+        },
+        claim: 'resume-claim-rotated'
+      }
+      mockInvoke
+        .mockImplementationOnce(async (_command: string, args: Record<string, unknown>) => {
+          const channel = args.onData as unknown as ChannelLike
+          channel.onmessage?.(new Uint8Array([114, 101, 112, 108, 97, 121]).buffer)
+          return { success: true, data: grant }
+        })
+        .mockResolvedValueOnce({ success: true, data: grant.terminal })
+
+      const received: Array<{ terminalId: string; bytes: Uint8Array }> = []
+      const off = api.onData((terminalId, bytes) => received.push({ terminalId, bytes }))
+
+      const result = await api.resume(request)
+
+      expect(result).toEqual({ success: true, data: grant })
+      expect(mockInvoke).toHaveBeenCalledTimes(2)
+      const [resumeCommand, resumeArgs] = mockInvoke.mock.calls[0]
+      expect(resumeCommand).toBe('terminal_resume')
+      expect(resumeArgs.request).toEqual(request)
+      expect(resumeArgs.onData).toBeInstanceOf(Channel)
+      expect(resumeArgs).not.toHaveProperty('program')
+      expect(resumeArgs).not.toHaveProperty('env')
+
+      const [attachCommand, attachArgs] = mockInvoke.mock.calls[1]
+      expect(attachCommand).toBe('terminal_attach')
+      expect(attachArgs).toMatchObject({
+        terminalId: 'terminal-1752-1',
+        claim: 'resume-claim-rotated',
+        lastSeq: 87
+      })
+      expect(attachArgs.onData).toBeInstanceOf(Channel)
+      ;(attachArgs.onData as unknown as ChannelLike).onmessage?.(
+        new Uint8Array([108, 105, 118, 101]).buffer
+      )
+      expect(received.map(({ terminalId }) => terminalId)).toEqual([
+        'terminal-1752-1',
+        'terminal-1752-1'
+      ])
+      expect(received.map(({ bytes }) => new TextDecoder().decode(bytes))).toEqual([
+        'replay',
+        'live'
+      ])
+
+      off()
+    })
+
+    it('returns generic UNAUTHORIZED for denied resume and never attempts attach', async () => {
+      const { api } = await loadApi()
+      mockInvoke.mockResolvedValue({ success: false, error: 'Unauthorized', code: 'UNAUTHORIZED' })
+      const received: Uint8Array[] = []
+      const off = api.onData((_terminalId, bytes) => received.push(bytes))
+
+      const result = await api.resume({
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        terminalId: 'unknown-or-wrong-scope',
+        lastSeq: 0
+      })
+
+      expect(result).toEqual({ success: false, error: 'Unauthorized', code: 'UNAUTHORIZED' })
+      expect(mockInvoke).toHaveBeenCalledTimes(1)
+      expect(mockInvoke.mock.calls[0][0]).toBe('terminal_resume')
+      const replayChannel = mockInvoke.mock.calls[0][1].onData as unknown as ChannelLike
+      replayChannel.onmessage?.(new Uint8Array([1, 2, 3]).buffer)
+      expect(received).toHaveLength(0)
+
+      off()
+    })
+
+    it('fails closed on a mismatched resume grant and never attaches it', async () => {
+      const { api } = await loadApi()
+      mockInvoke.mockResolvedValue({
+        success: true,
+        data: {
+          terminal: {
+            id: 'different-terminal',
+            shell: 'bash',
+            cwd: '/tmp',
+            pid: 1,
+            cols: 80,
+            rows: 24,
+            latestSeq: 4,
+            gap: false
+          },
+          claim: 'wrong-terminal-grant'
+        }
+      })
+
+      const result = await api.resume({
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        terminalId: 'expected-terminal',
+        lastSeq: 0
+      })
+
+      expect(result).toEqual({
+        success: false,
+        error: 'Terminal resume failed',
+        code: 'NETWORK_ERROR'
+      })
+      expect(mockInvoke).toHaveBeenCalledTimes(1)
+      expect(mockInvoke.mock.calls[0][0]).toBe('terminal_resume')
+    })
+
     it('attach passes terminalId + claim + lastSeq + Channel to terminal_attach and streams bytes by terminal id', async () => {
       const { api, Channel } = await loadApi()
       mockInvoke.mockResolvedValue({
