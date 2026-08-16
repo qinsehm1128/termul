@@ -1,13 +1,17 @@
 //! Bootstrap-owned host migration lock.
 //!
-//! Only bootstrap acquires this create-new process lock. The migration service accepts the guard,
-//! validates its canonical host-root identity before journal access, and never acquires it itself.
+//! The permanent file contains diagnostic owner metadata, but file existence never represents
+//! ownership. Exclusivity comes only from the kernel-backed lock held by the guard's open handle,
+//! so process termination releases ownership even when `Drop` cannot run.
 
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::conversation::durable_fs::{DirectoryPermissions, DurableFileSystem};
@@ -64,6 +68,40 @@ impl HostMigrationLock {
         self.acquire_count
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&self.lock_path).map_err(|error| {
+            MigrationError::new(
+                MigrationErrorCode::MigrationLockInvalid,
+                "open_lock",
+                error.to_string(),
+            )
+        })?;
+        if let Err(error) = FileExt::try_lock_exclusive(&file) {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                log::warn!(
+                    "[conversation-migration] active host lock contention pid={} root_digest={}",
+                    std::process::id(),
+                    host_root_digest(&self.canonical_host_root)
+                );
+                return Err(MigrationError::new(
+                    MigrationErrorCode::MigrationInProgress,
+                    "acquire_lock",
+                    "another process owns the kernel migration lock",
+                ));
+            }
+            return Err(MigrationError::new(
+                MigrationErrorCode::MigrationLockInvalid,
+                "acquire_lock",
+                error.to_string(),
+            ));
+        }
+
         let owner_token = Uuid::new_v4();
         let owner = LockOwnerV1 {
             schema_version: 1,
@@ -73,48 +111,34 @@ impl HostMigrationLock {
         let mut bytes = serde_json::to_vec(&owner).map_err(|error| {
             MigrationError::new(
                 MigrationErrorCode::MigrationLockInvalid,
-                "acquire_lock",
+                "write_lock_metadata",
                 error.to_string(),
             )
         })?;
         bytes.push(b'\n');
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&self.lock_path).map_err(|error| {
-            let code = if error.kind() == std::io::ErrorKind::AlreadyExists {
-                MigrationErrorCode::MigrationInProgress
-            } else {
-                MigrationErrorCode::MigrationLockInvalid
-            };
-            MigrationError::new(code, "acquire_lock", error.to_string())
-        })?;
         if let Err(error) = file
-            .write_all(&bytes)
+            .set_len(0)
+            .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
+            .and_then(|()| file.write_all(&bytes))
             .and_then(|()| file.flush())
             .and_then(|()| file.sync_all())
         {
-            drop(file);
-            let _ = fs::remove_file(&self.lock_path);
+            let _ = FileExt::unlock(&file);
             return Err(MigrationError::new(
                 MigrationErrorCode::MigrationDurabilityFailed,
-                "acquire_lock",
+                "write_lock_metadata",
                 error.to_string(),
             ));
         }
         log::info!(
-            "[conversation-migration] host lock acquired root={} operation=bootstrap_handoff",
-            self.canonical_host_root.display()
+            "[conversation-migration] host lock acquired pid={} root_digest={} operation=bootstrap_handoff",
+            std::process::id(),
+            host_root_digest(&self.canonical_host_root)
         );
         Ok(HostMigrationLockGuard {
             canonical_host_root: self.canonical_host_root.clone(),
-            lock_path: self.lock_path.clone(),
-            owner_token,
-            file: Some(file),
+            file,
+            acquired_at: Instant::now(),
         })
     }
 
@@ -127,9 +151,8 @@ impl HostMigrationLock {
 #[derive(Debug)]
 pub struct HostMigrationLockGuard {
     canonical_host_root: PathBuf,
-    lock_path: PathBuf,
-    owner_token: Uuid,
-    file: Option<File>,
+    file: File,
+    acquired_at: Instant,
 }
 
 impl HostMigrationLockGuard {
@@ -159,28 +182,33 @@ impl HostMigrationLockGuard {
 
 impl Drop for HostMigrationLockGuard {
     fn drop(&mut self) {
-        // Close the held handle before removing the owner file; Windows rejects unlinking an open
-        // file even when the current process owns it.
-        drop(self.file.take());
-        let owned = fs::read(&self.lock_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<LockOwnerV1>(&bytes).ok())
-            .is_some_and(|owner| owner.owner_token == self.owner_token);
-        if owned {
-            if let Err(error) = fs::remove_file(&self.lock_path) {
-                log::error!(
-                    "[conversation-migration] host lock release failed root={} error={}",
-                    self.canonical_host_root.display(),
-                    error
-                );
-            }
-        } else {
+        if let Err(error) = FileExt::unlock(&self.file) {
             log::error!(
-                "[conversation-migration] host lock ownership changed before release root={}",
-                self.canonical_host_root.display()
+                "[conversation-migration] kernel lock release failed pid={} root_digest={} error={}",
+                std::process::id(),
+                host_root_digest(&self.canonical_host_root),
+                error
             );
+            return;
         }
+        log::info!(
+            "[conversation-migration] host lock released pid={} root_digest={} duration_ms={}",
+            std::process::id(),
+            host_root_digest(&self.canonical_host_root),
+            self.acquired_at.elapsed().as_millis()
+        );
     }
+}
+
+fn host_root_digest(root: &Path) -> String {
+    let mut digest = Sha256::new();
+    digest.update(root.as_os_str().as_encoded_bytes());
+    digest
+        .finalize()
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[cfg(test)]
@@ -188,7 +216,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn create_new_lock_is_exclusive_and_guard_is_root_bound() {
+    fn kernel_lock_is_exclusive_guard_bound_and_file_is_permanent() {
         let root = tempfile::tempdir().unwrap();
         let canonical = root.path().canonicalize().unwrap();
         let lock = HostMigrationLock::new(&canonical).unwrap();
@@ -199,6 +227,16 @@ mod tests {
             MigrationErrorCode::MigrationInProgress
         );
         drop(guard);
+        assert!(lock.lock_path.is_file());
+        assert!(lock.acquire().is_ok());
+    }
+
+    #[test]
+    fn stale_metadata_file_without_kernel_owner_does_not_block() {
+        let root = tempfile::tempdir().unwrap();
+        let canonical = root.path().canonicalize().unwrap();
+        let lock = HostMigrationLock::new(&canonical).unwrap();
+        std::fs::write(&lock.lock_path, b"stale diagnostic metadata").unwrap();
         assert!(lock.acquire().is_ok());
     }
 }

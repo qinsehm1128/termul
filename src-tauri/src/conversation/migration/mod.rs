@@ -6,6 +6,7 @@
 
 #[path = "../compatibility.rs"]
 pub mod compatibility;
+pub mod control;
 pub mod inventory;
 pub mod journal;
 pub mod layout;
@@ -30,15 +31,21 @@ use crate::conversation::durable_fs::{DirectoryPermissions, DurableFileSystem};
 pub use compatibility::{
     CompatibilityError, ConversationReader, LegacyConversationProjection, LegacyConversationReader,
 };
+pub use control::{
+    ConversationMigrationControlService, MigrationMaintenanceAction,
+    MigrationMaintenanceCompletionReceiptV1, MigrationMaintenanceRequestV1,
+    MigrationMaintenanceScheduleReceiptV1, MIGRATION_MAINTENANCE_FILE,
+};
 pub use inventory::{
     inventory_legacy_roots, LegacyInventoryFileV1, LegacyInventoryRootV1, LegacyInventoryV1,
     LegacyRootConfiguration, LegacyRootSpec, LegacySourceKind, INVENTORY_FILE,
     LEGACY_INVENTORY_SCHEMA_VERSION,
 };
 pub use journal::{
-    advance_phase, ApprovalReceiptV1, BootstrapObservationReceiptV1, MigrationJournalV1,
-    MigrationPhase, ObservationEvidenceV1, StepReceiptV1, FINALIZATION_ACTION, MIGRATION_ID,
-    MIGRATION_JOURNAL_SCHEMA_VERSION, STEP_RECEIPT_SCHEMA_VERSION,
+    advance_phase, ApprovalReceiptV1, BootstrapObservationReceiptV1, MaintenanceReceiptState,
+    MaintenanceRequestReceiptV1, MigrationJournalV1, MigrationPhase, ObservationEvidenceV1,
+    StepReceiptV1, FINALIZATION_ACTION, MIGRATION_ID, MIGRATION_JOURNAL_SCHEMA_VERSION,
+    STEP_RECEIPT_SCHEMA_VERSION,
 };
 pub use layout::{
     recover_cutover, ActiveLayout, ConversationLayoutDescriptorV1, CutoverRecovery,
@@ -120,13 +127,13 @@ impl MigrationError {
         let detail = detail.into();
         if matches!(
             code,
-            MigrationErrorCode::MigrationInProgress
-                | MigrationErrorCode::MigrationIdempotencyConflict
+            MigrationErrorCode::MigrationIdempotencyConflict
                 | MigrationErrorCode::MigrationDurabilityFailed
                 | MigrationErrorCode::MigrationVerificationFailed
                 | MigrationErrorCode::MigrationSourceChanged
                 | MigrationErrorCode::MigrationIllegalTransition
                 | MigrationErrorCode::MigrationLockInvalid
+                | MigrationErrorCode::MigrationJournalCorrupt
         ) {
             log::error!(
                 "[conversation-migration] operation failed code={} operation={}",
@@ -341,6 +348,7 @@ pub struct MigrationReport {
     pub attempt: u32,
     pub target_generation: Uuid,
     pub reader_precedence: ReaderPrecedence,
+    pub validation_sha256: Option<String>,
     pub completed_step_count: usize,
     pub reused_step_count: usize,
 }
@@ -531,9 +539,10 @@ impl ConversationMigrationService {
             ));
         }
         let verify_prefix = format!("{}:verify:", journal.operation_key);
-        journal
-            .completed_steps
-            .retain(|key, _| !key.starts_with(&verify_prefix));
+        let observation_prefix = format!("{}:observation:", journal.operation_key);
+        journal.completed_steps.retain(|key, _| {
+            !key.starts_with(&verify_prefix) && !key.starts_with(&observation_prefix)
+        });
         journal.target_generation = Uuid::new_v4();
         journal.observation_evidence = None;
         journal.approval_receipt = None;
@@ -630,6 +639,151 @@ impl ConversationMigrationService {
         self.write_journal(&journal)?;
         self.complete_finalization(&mut journal, &mut descriptor, context.now_utc)?;
         Ok(report(&journal, &descriptor, 0))
+    }
+
+    /// Apply one durable restart-required maintenance request under the bootstrap-owned guard.
+    /// A journal receipt is written before mutation and completed afterward so a crash between
+    /// phase/layout writes and control-state acknowledgement resumes the same request safely.
+    pub fn apply_maintenance(
+        &self,
+        request: &MigrationMaintenanceRequestV1,
+        context: MigrationContext<'_>,
+    ) -> Result<MigrationReport> {
+        request.validate()?;
+        let lock_guard = context.lock_guard;
+        let host_state_root = context.host_state_root;
+        let now_utc = context.now_utc;
+        self.validate_guard(lock_guard, host_state_root)?;
+        self.ensure_migration_dir()?;
+        let request_sha256 = sha256_json(request)?;
+        let action = maintenance_action_name(request.action);
+        let mut journal = self.load_journal()?;
+        let existing = journal
+            .maintenance_request_receipts
+            .get(&request.request_id)
+            .cloned();
+        if let Some(receipt) = &existing {
+            if receipt.action != action || receipt.request_sha256 != request_sha256 {
+                return Err(MigrationError::new(
+                    MigrationErrorCode::MigrationIdempotencyConflict,
+                    "apply_maintenance",
+                    "maintenance requestId was reused with a different action or request body",
+                ));
+            }
+            if receipt.state == MaintenanceReceiptState::Completed {
+                let descriptor = self.load_layout()?;
+                return Ok(report(&journal, &descriptor, 0));
+            }
+        } else {
+            validate_maintenance_precondition(&journal, request)?;
+            journal.maintenance_request_receipts.insert(
+                request.request_id.clone(),
+                MaintenanceRequestReceiptV1 {
+                    action: action.to_string(),
+                    request_sha256,
+                    state: MaintenanceReceiptState::Started,
+                    started_at_utc: now_utc,
+                    completed_at_utc: None,
+                },
+            );
+            journal.updated_at_utc = now_utc;
+            self.write_journal(&journal)?;
+        }
+
+        let phase = self.load_journal()?.phase;
+        let maintenance_report = match request.action {
+            MigrationMaintenanceAction::Rollback => match phase {
+                MigrationPhase::RolledBack => {
+                    let journal = self.load_journal()?;
+                    let descriptor = self.load_layout()?;
+                    report(&journal, &descriptor, 0)
+                }
+                MigrationPhase::Committed
+                | MigrationPhase::ObservationWindow
+                | MigrationPhase::RollbackPending => {
+                    self.request_rollback(MigrationControlContext {
+                        lock_guard,
+                        host_state_root,
+                        now_utc,
+                    })?
+                }
+                _ => {
+                    return Err(MigrationError::new(
+                        MigrationErrorCode::MigrationIllegalTransition,
+                        "apply_maintenance",
+                        "rollback maintenance did not resume from a rollback-compatible phase",
+                    ));
+                }
+            },
+            MigrationMaintenanceAction::Reapply => match phase {
+                MigrationPhase::RolledBack => self.reapply_and_run(context)?,
+                MigrationPhase::Verifying
+                | MigrationPhase::CutoverPending
+                | MigrationPhase::Committed
+                | MigrationPhase::ObservationWindow => self.recover_and_run(context)?,
+                _ => {
+                    return Err(MigrationError::new(
+                        MigrationErrorCode::MigrationIllegalTransition,
+                        "apply_maintenance",
+                        "reapply maintenance did not resume from a reapply-compatible phase",
+                    ));
+                }
+            },
+            MigrationMaintenanceAction::Finalize => match phase {
+                MigrationPhase::Finalized => {
+                    let journal = self.load_journal()?;
+                    let descriptor = self.load_layout()?;
+                    report(&journal, &descriptor, 0)
+                }
+                MigrationPhase::ObservationWindow => {
+                    if self.load_journal()?.approval_receipt.is_some() {
+                        self.recover_and_run(context)?
+                    } else {
+                        self.finalize(
+                            MigrationControlContext {
+                                lock_guard,
+                                host_state_root,
+                                now_utc,
+                            },
+                            request
+                                .approval_receipt
+                                .clone()
+                                .expect("validated finalization request has approval"),
+                        )?
+                    }
+                }
+                _ => {
+                    return Err(MigrationError::new(
+                        MigrationErrorCode::MigrationIllegalTransition,
+                        "apply_maintenance",
+                        "finalization maintenance did not resume from observation or finalized",
+                    ));
+                }
+            },
+        };
+
+        let mut journal = self.load_journal()?;
+        let receipt = journal
+            .maintenance_request_receipts
+            .get_mut(&request.request_id)
+            .ok_or_else(|| {
+                MigrationError::new(
+                    MigrationErrorCode::MigrationJournalCorrupt,
+                    "complete_maintenance",
+                    "maintenance start receipt disappeared before completion",
+                )
+            })?;
+        receipt.state = MaintenanceReceiptState::Completed;
+        receipt.completed_at_utc = Some(now_utc);
+        journal.updated_at_utc = now_utc;
+        self.write_journal(&journal)?;
+        log::info!(
+            "[conversation-migration] maintenance journal receipt completed request_id={} action={} phase={:?}",
+            request.request_id,
+            action,
+            maintenance_report.phase
+        );
+        Ok(maintenance_report)
     }
 
     fn run_phase(
@@ -1125,6 +1279,10 @@ fn report(
         attempt: journal.attempt,
         target_generation: journal.target_generation,
         reader_precedence: descriptor.reader_precedence,
+        validation_sha256: journal
+            .observation_evidence
+            .as_ref()
+            .map(|evidence| evidence.validation_sha256.clone()),
         completed_step_count: journal.completed_steps.len(),
         reused_step_count,
     }
@@ -1149,6 +1307,62 @@ fn sha256_json(value: &impl Serialize) -> Result<String> {
         )
     })?;
     Ok(sha256_bytes(&bytes))
+}
+
+fn maintenance_action_name(action: MigrationMaintenanceAction) -> &'static str {
+    match action {
+        MigrationMaintenanceAction::Rollback => "rollback",
+        MigrationMaintenanceAction::Reapply => "reapply",
+        MigrationMaintenanceAction::Finalize => "finalize",
+    }
+}
+
+fn validate_maintenance_precondition(
+    journal: &MigrationJournalV1,
+    request: &MigrationMaintenanceRequestV1,
+) -> Result<()> {
+    match request.action {
+        MigrationMaintenanceAction::Rollback
+            if matches!(
+                journal.phase,
+                MigrationPhase::Committed
+                    | MigrationPhase::ObservationWindow
+                    | MigrationPhase::RollbackPending
+                    | MigrationPhase::RolledBack
+            ) =>
+        {
+            Ok(())
+        }
+        MigrationMaintenanceAction::Reapply if journal.phase == MigrationPhase::RolledBack => {
+            Ok(())
+        }
+        MigrationMaintenanceAction::Finalize
+            if journal.phase == MigrationPhase::ObservationWindow =>
+        {
+            let evidence = journal.observation_evidence.as_ref().ok_or_else(|| {
+                MigrationError::new(
+                    MigrationErrorCode::MigrationFinalizationNotReady,
+                    "validate_maintenance_precondition",
+                    "observation evidence is missing",
+                )
+            })?;
+            evidence.validate_ready()?;
+            request
+                .approval_receipt
+                .as_ref()
+                .expect("request validation requires finalization approval")
+                .validate(evidence)
+        }
+        _ => Err(MigrationError::new(
+            MigrationErrorCode::MigrationIllegalTransition,
+            "validate_maintenance_precondition",
+            format!(
+                "maintenance action {} is not allowed from phase {:?}",
+                maintenance_action_name(request.action),
+                journal.phase
+            ),
+        )),
+    }
 }
 
 fn operation_key_prefix(operation_key: &str) -> &str {
@@ -1562,6 +1776,131 @@ mod tests {
     }
 
     #[test]
+    fn durable_maintenance_intents_rollback_and_reapply_without_deleting_bytes() {
+        let (_temp, root, lock, service) = fixture();
+        let guard = lock.acquire().unwrap();
+        let control_service = ConversationMigrationControlService::new(&root).unwrap();
+        let mut callbacks = CountingCallbacks::default();
+        let committed = run(&service, &root, &guard, &mut callbacks, now()).unwrap();
+        let legacy = root.join("legacy-preserved");
+        let v2 = root.join("conversations/v2/v2-preserved");
+        fs::write(&legacy, b"legacy").unwrap();
+        fs::create_dir_all(v2.parent().unwrap()).unwrap();
+        fs::write(&v2, b"v2").unwrap();
+
+        let rollback = MigrationMaintenanceRequestV1 {
+            action: MigrationMaintenanceAction::Rollback,
+            request_id: Uuid::new_v4().to_string(),
+            requested_at_utc: now(),
+            approval_receipt: None,
+        };
+        control_service.request(rollback.clone()).unwrap();
+        let rolled_back = service
+            .apply_maintenance(
+                &rollback,
+                MigrationContext {
+                    lock_guard: &guard,
+                    host_state_root: &root,
+                    operation_key: OPERATION_KEY,
+                    host_mode: MigrationHostMode::Desktop,
+                    admission: MigrationAdmissionState::default(),
+                    now_utc: now(),
+                    callbacks: &mut callbacks,
+                },
+            )
+            .unwrap();
+        control_service
+            .complete(&rollback, &rolled_back, now())
+            .unwrap();
+        assert_eq!(rolled_back.phase, MigrationPhase::RolledBack);
+        assert_eq!(fs::read(&legacy).unwrap(), b"legacy");
+        assert_eq!(fs::read(&v2).unwrap(), b"v2");
+
+        let reapply = MigrationMaintenanceRequestV1 {
+            action: MigrationMaintenanceAction::Reapply,
+            request_id: Uuid::new_v4().to_string(),
+            requested_at_utc: now(),
+            approval_receipt: None,
+        };
+        control_service.request(reapply.clone()).unwrap();
+        let reapplied = service
+            .apply_maintenance(
+                &reapply,
+                MigrationContext {
+                    lock_guard: &guard,
+                    host_state_root: &root,
+                    operation_key: OPERATION_KEY,
+                    host_mode: MigrationHostMode::Desktop,
+                    admission: MigrationAdmissionState::default(),
+                    now_utc: now(),
+                    callbacks: &mut callbacks,
+                },
+            )
+            .unwrap();
+        control_service
+            .complete(&reapply, &reapplied, now())
+            .unwrap();
+        assert_eq!(reapplied.phase, MigrationPhase::ObservationWindow);
+        assert_ne!(reapplied.target_generation, committed.target_generation);
+        assert_eq!(fs::read(&legacy).unwrap(), b"legacy");
+        assert_eq!(fs::read(&v2).unwrap(), b"v2");
+        assert!(control_service.pending().unwrap().is_none());
+
+        for admitted_at_utc in [now(), now() + Duration::hours(1)] {
+            service
+                .record_bootstrap_observation(
+                    MigrationControlContext {
+                        lock_guard: &guard,
+                        host_state_root: &root,
+                        now_utc: admitted_at_utc,
+                    },
+                    BootstrapObservationReceiptV1 {
+                        bootstrap_run_id: Uuid::new_v4().to_string(),
+                        admitted_at_utc,
+                        validation_sha256: VALIDATION.to_string(),
+                        control_request_ids: vec![reapply.request_id.clone()],
+                    },
+                )
+                .unwrap();
+        }
+        let finalize_request_id = Uuid::new_v4().to_string();
+        let finalize = MigrationMaintenanceRequestV1 {
+            action: MigrationMaintenanceAction::Finalize,
+            request_id: finalize_request_id.clone(),
+            requested_at_utc: now() + Duration::hours(1),
+            approval_receipt: Some(ApprovalReceiptV1 {
+                approver_id: "operator".to_string(),
+                action: FINALIZATION_ACTION.to_string(),
+                request_id: finalize_request_id,
+                approved_at_utc: now() + Duration::hours(1),
+                observed_validation_sha256: VALIDATION.to_string(),
+            }),
+        };
+        control_service.request(finalize.clone()).unwrap();
+        let finalized = service
+            .apply_maintenance(
+                &finalize,
+                MigrationContext {
+                    lock_guard: &guard,
+                    host_state_root: &root,
+                    operation_key: OPERATION_KEY,
+                    host_mode: MigrationHostMode::Desktop,
+                    admission: MigrationAdmissionState::default(),
+                    now_utc: now() + Duration::hours(1),
+                    callbacks: &mut callbacks,
+                },
+            )
+            .unwrap();
+        control_service
+            .complete(&finalize, &finalized, now() + Duration::hours(1))
+            .unwrap();
+        assert_eq!(finalized.phase, MigrationPhase::Finalized);
+        assert_eq!(fs::read(&legacy).unwrap(), b"legacy");
+        assert_eq!(fs::read(&v2).unwrap(), b"v2");
+        assert!(control_service.pending().unwrap().is_none());
+    }
+
+    #[test]
     fn observation_and_finalization_policy() {
         let (_temp, root, lock, service) = fixture();
         let guard = lock.acquire().unwrap();
@@ -1605,6 +1944,7 @@ mod tests {
                     bootstrap_run_id: Uuid::new_v4().to_string(),
                     admitted_at_utc: now(),
                     validation_sha256: VALIDATION.to_string(),
+                    control_request_ids: Vec::new(),
                 },
             )
             .unwrap();
@@ -1615,6 +1955,7 @@ mod tests {
                     bootstrap_run_id: Uuid::new_v4().to_string(),
                     admitted_at_utc: now() + Duration::minutes(59),
                     validation_sha256: VALIDATION.to_string(),
+                    control_request_ids: Vec::new(),
                 },
             )
             .unwrap();
@@ -1642,6 +1983,7 @@ mod tests {
                     bootstrap_run_id: Uuid::new_v4().to_string(),
                     admitted_at_utc: now() + Duration::hours(1),
                     validation_sha256: VALIDATION.to_string(),
+                    control_request_ids: Vec::new(),
                 },
             )
             .unwrap();
@@ -1763,6 +2105,7 @@ mod tests {
             bootstrap_run_id: id.clone(),
             admitted_at_utc: now(),
             validation_sha256: VALIDATION.to_string(),
+            control_request_ids: Vec::new(),
         };
         assert!(evidence.record(receipt.clone()).unwrap());
         assert!(!evidence.record(receipt).unwrap());
@@ -1772,6 +2115,7 @@ mod tests {
                     bootstrap_run_id: id,
                     admitted_at_utc: now() + Duration::hours(1),
                     validation_sha256: VALIDATION.to_string(),
+                    control_request_ids: Vec::new(),
                 })
                 .unwrap_err()
                 .code,
@@ -1783,6 +2127,7 @@ mod tests {
                     bootstrap_run_id: Uuid::new_v4().to_string(),
                     admitted_at_utc: now() + Duration::hours(1),
                     validation_sha256: "e".repeat(64),
+                    control_request_ids: Vec::new(),
                 })
                 .unwrap_err()
                 .code,
@@ -1880,6 +2225,65 @@ mod tests {
             )
             .as_bytes()
         );
+    }
+
+    #[test]
+    fn subprocess_lock_owner() {
+        let Some(root) = std::env::var_os("TERMUL_TEST_MIGRATION_LOCK_ROOT") else {
+            return;
+        };
+        let barrier =
+            PathBuf::from(std::env::var_os("TERMUL_TEST_MIGRATION_LOCK_BARRIER").unwrap());
+        let root = PathBuf::from(root);
+        let lock = HostMigrationLock::new(&root).unwrap();
+        let _guard = lock.acquire().unwrap();
+        fs::write(barrier, b"locked").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn subprocess_kill_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("state");
+        let visible = temp.path().join("visible");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&visible).unwrap();
+        let root = root.canonicalize().unwrap();
+        let visible = visible.canonicalize().unwrap();
+        let barrier = temp.path().join("lock-acquired");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "conversation::migration::tests::subprocess_lock_owner",
+                "--nocapture",
+            ])
+            .env("TERMUL_TEST_MIGRATION_LOCK_ROOT", &root)
+            .env("TERMUL_TEST_MIGRATION_LOCK_BARRIER", &barrier)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !barrier.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            barrier.exists(),
+            "subprocess did not acquire migration lock"
+        );
+        let contender = HostMigrationLock::new(&root).unwrap();
+        assert_eq!(
+            contender.acquire().unwrap_err().code,
+            MigrationErrorCode::MigrationInProgress,
+            "a second process must be excluded while the subprocess owns the kernel lock"
+        );
+        child.kill().unwrap();
+        child.wait().unwrap();
+
+        let outcome = crate::conversation::ConversationBootstrap::run(
+            crate::conversation::HostConversationRoots::desktop(root, visible),
+            MigrationHostMode::Desktop,
+        )
+        .unwrap();
+        assert_eq!(outcome.migration_phase, MigrationPhase::ObservationWindow);
     }
 
     #[test]

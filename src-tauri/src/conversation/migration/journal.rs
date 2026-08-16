@@ -16,6 +16,23 @@ pub const STEP_RECEIPT_SCHEMA_VERSION: u32 = 1;
 pub const MIGRATION_ID: &str = "conversation-layout-v2";
 pub const FINALIZATION_ACTION: &str = "finalizeConversationV2";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaintenanceReceiptState {
+    Started,
+    Completed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MaintenanceRequestReceiptV1 {
+    pub action: String,
+    pub request_sha256: String,
+    pub state: MaintenanceReceiptState,
+    pub started_at_utc: DateTime<Utc>,
+    pub completed_at_utc: Option<DateTime<Utc>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MigrationPhase {
@@ -46,6 +63,8 @@ pub struct BootstrapObservationReceiptV1 {
     pub bootstrap_run_id: String,
     pub admitted_at_utc: DateTime<Utc>,
     pub validation_sha256: String,
+    #[serde(default)]
+    pub control_request_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +95,19 @@ impl ObservationEvidenceV1 {
             MigrationErrorCode::MigrationObservationInvalid,
         )?;
         validate_sha256(&receipt.validation_sha256)?;
+        let distinct_control_ids = receipt.control_request_ids.iter().collect::<HashSet<_>>();
+        if distinct_control_ids.len() != receipt.control_request_ids.len()
+            || receipt
+                .control_request_ids
+                .iter()
+                .any(|request_id| Uuid::parse_str(request_id).is_err())
+        {
+            return Err(MigrationError::new(
+                MigrationErrorCode::MigrationObservationInvalid,
+                "record_observation",
+                "bootstrap receipt control request IDs must be distinct UUIDs",
+            ));
+        }
         if receipt.validation_sha256 != self.validation_sha256 {
             return Err(MigrationError::new(
                 MigrationErrorCode::MigrationObservationInvalid,
@@ -196,6 +228,8 @@ pub struct MigrationJournalV1 {
     pub last_error: Option<String>,
     pub observation_evidence: Option<ObservationEvidenceV1>,
     pub approval_receipt: Option<ApprovalReceiptV1>,
+    #[serde(default)]
+    pub maintenance_request_receipts: BTreeMap<String, MaintenanceRequestReceiptV1>,
 }
 
 impl MigrationJournalV1 {
@@ -219,6 +253,7 @@ impl MigrationJournalV1 {
             last_error: None,
             observation_evidence: None,
             approval_receipt: None,
+            maintenance_request_receipts: BTreeMap::new(),
         }
     }
 
@@ -253,6 +288,22 @@ impl MigrationJournalV1 {
         }
         if let Some(value) = &self.staged_manifest_sha256 {
             validate_sha256(value)?;
+        }
+        for (request_id, receipt) in &self.maintenance_request_receipts {
+            if Uuid::parse_str(request_id).is_err()
+                || receipt.action.trim().is_empty()
+                || !valid_sha256(&receipt.request_sha256)
+                || (receipt.state == MaintenanceReceiptState::Completed
+                    && receipt.completed_at_utc.is_none())
+                || (receipt.state == MaintenanceReceiptState::Started
+                    && receipt.completed_at_utc.is_some())
+            {
+                return Err(MigrationError::new(
+                    MigrationErrorCode::MigrationJournalCorrupt,
+                    "validate_journal",
+                    "journal contains an invalid maintenance request receipt",
+                ));
+            }
         }
         Ok(())
     }

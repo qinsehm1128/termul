@@ -13,8 +13,11 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+
+use chrono::Utc;
 use std::sync::Arc;
 use std::time::Duration;
+use uuid::Uuid;
 
 use termul_manager_lib::server_update::{
     check_and_apply_update, current_version, embedded_public_key, is_update_enabled,
@@ -55,8 +58,18 @@ fn main() -> ExitCode {
         return ExitCode::from(termul_manager_lib::host_mcp::child::run() as u8);
     }
 
+    let (server_args, maintenance) = match parse_conversation_maintenance_args(&raw_args) {
+        Ok(parsed) => parsed,
+        Err(message) => {
+            eprintln!("error: {message}");
+            eprintln!();
+            eprintln!("{}", usage());
+            return ExitCode::from(2);
+        }
+    };
+
     // Parse CLI BEFORE any tokio / app setup (AC2).
-    let cfg = match ServerConfig::from_args(raw_args) {
+    let cfg = match ServerConfig::from_args(server_args) {
         Ok(cfg) => cfg,
         Err(ParseCliError::Help) => {
             println!("{}", usage());
@@ -71,6 +84,10 @@ fn main() -> ExitCode {
     };
 
     init_tracing();
+
+    if let Some(maintenance) = maintenance {
+        return schedule_standalone_conversation_maintenance(&cfg, maintenance);
+    }
 
     // Provision standalone remote-access policy before opening any application
     // store, manager, PTY, listener, or router. Non-loopback configuration was
@@ -338,6 +355,248 @@ fn main() -> ExitCode {
 /// Initialize `tracing` + `tracing-subscriber` (EnvFilter, `RUST_LOG`; floor `info`).
 /// Extracted so both the normal server path and the `--check-update` one-shot
 /// share the same setup.
+#[derive(Debug)]
+struct StandaloneConversationMaintenance {
+    action: termul_manager_lib::conversation::MigrationMaintenanceAction,
+    approval_receipt_path: Option<PathBuf>,
+}
+
+fn parse_conversation_maintenance_args(
+    raw_args: &[String],
+) -> Result<(Vec<String>, Option<StandaloneConversationMaintenance>), String> {
+    let mut server_args = Vec::new();
+    let mut action = None;
+    let mut approval_receipt_path = None;
+    let mut index = 0;
+    while index < raw_args.len() {
+        match raw_args[index].as_str() {
+            "--conversation-migration-control" => {
+                if action.is_some() {
+                    return Err(
+                        "--conversation-migration-control may be specified only once".into(),
+                    );
+                }
+                let value = raw_args
+                    .get(index + 1)
+                    .ok_or("missing value for --conversation-migration-control")?;
+                action = Some(match value.as_str() {
+                    "rollback" => {
+                        termul_manager_lib::conversation::MigrationMaintenanceAction::Rollback
+                    }
+                    "reapply" => {
+                        termul_manager_lib::conversation::MigrationMaintenanceAction::Reapply
+                    }
+                    "finalize" => {
+                        termul_manager_lib::conversation::MigrationMaintenanceAction::Finalize
+                    }
+                    _ => {
+                        return Err(format!(
+                            "invalid --conversation-migration-control '{value}': use rollback, reapply, or finalize"
+                        ));
+                    }
+                });
+                index += 2;
+            }
+            "--approval-receipt" => {
+                if approval_receipt_path.is_some() {
+                    return Err("--approval-receipt may be specified only once".into());
+                }
+                let value = raw_args
+                    .get(index + 1)
+                    .ok_or("missing value for --approval-receipt")?;
+                approval_receipt_path = Some(PathBuf::from(value));
+                index += 2;
+            }
+            _ => {
+                server_args.push(raw_args[index].clone());
+                index += 1;
+            }
+        }
+    }
+
+    let Some(action) = action else {
+        if approval_receipt_path.is_some() {
+            return Err(
+                "--approval-receipt requires --conversation-migration-control finalize".into(),
+            );
+        }
+        return Ok((server_args, None));
+    };
+    match (action, approval_receipt_path.as_ref()) {
+        (termul_manager_lib::conversation::MigrationMaintenanceAction::Finalize, None) => {
+            return Err(
+                "--conversation-migration-control finalize requires --approval-receipt <path>"
+                    .into(),
+            );
+        }
+        (
+            termul_manager_lib::conversation::MigrationMaintenanceAction::Rollback
+            | termul_manager_lib::conversation::MigrationMaintenanceAction::Reapply,
+            Some(_),
+        ) => {
+            return Err(
+                "--approval-receipt is accepted only with conversation migration finalize".into(),
+            );
+        }
+        _ => {}
+    }
+    Ok((
+        server_args,
+        Some(StandaloneConversationMaintenance {
+            action,
+            approval_receipt_path,
+        }),
+    ))
+}
+
+fn schedule_standalone_conversation_maintenance(
+    cfg: &ServerConfig,
+    maintenance: StandaloneConversationMaintenance,
+) -> ExitCode {
+    let state_root = cfg.service_account_state_dir();
+    if let Err(error) = std::fs::create_dir_all(&state_root) {
+        error!(
+            code = "MIGRATION_DURABILITY_FAILED",
+            "failed to prepare standalone maintenance state root: {error}"
+        );
+        return ExitCode::from(1);
+    }
+    let approval_receipt = match maintenance.approval_receipt_path {
+        Some(path) => match std::fs::read(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|error| error.to_string()))
+        {
+            Ok(receipt) => Some(receipt),
+            Err(error) => {
+                error!(
+                    code = "MIGRATION_APPROVAL_INVALID",
+                    "failed to read standalone maintenance approval receipt: {error}"
+                );
+                return ExitCode::from(1);
+            }
+        },
+        None => None,
+    };
+    let request_id = approval_receipt
+        .as_ref()
+        .map(
+            |receipt: &termul_manager_lib::conversation::ApprovalReceiptV1| {
+                receipt.request_id.clone()
+            },
+        )
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    let request = termul_manager_lib::conversation::MigrationMaintenanceRequestV1 {
+        action: maintenance.action,
+        request_id,
+        requested_at_utc: Utc::now(),
+        approval_receipt,
+    };
+    let control = match termul_manager_lib::conversation::ConversationMigrationControlService::new(
+        &state_root,
+    ) {
+        Ok(control) => control,
+        Err(error) => {
+            error!(
+                code = error.code.as_str(),
+                "failed to create maintenance control"
+            );
+            return ExitCode::from(1);
+        }
+    };
+    match control.request(request) {
+        Ok(receipt) => {
+            match serde_json::to_string(&receipt) {
+                Ok(json) => println!("{json}"),
+                Err(error) => {
+                    error!("failed to serialize maintenance receipt: {error}");
+                    return ExitCode::from(1);
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            error!(
+                code = error.code.as_str(),
+                operation = error.operation,
+                "failed to schedule standalone maintenance"
+            );
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[cfg(test)]
+mod conversation_maintenance_tests {
+    use super::*;
+    use termul_manager_lib::conversation::MigrationMaintenanceAction;
+
+    #[test]
+    fn standalone_control_mode_accepts_all_actions_and_preserves_server_args() {
+        for (value, expected) in [
+            ("rollback", MigrationMaintenanceAction::Rollback),
+            ("reapply", MigrationMaintenanceAction::Reapply),
+        ] {
+            let args = vec![
+                "--port".to_string(),
+                "9090".to_string(),
+                "--conversation-migration-control".to_string(),
+                value.to_string(),
+            ];
+            let (server_args, maintenance) = parse_conversation_maintenance_args(&args).unwrap();
+            assert_eq!(server_args, ["--port", "9090"]);
+            let maintenance = maintenance.unwrap();
+            assert_eq!(maintenance.action, expected);
+            assert!(maintenance.approval_receipt_path.is_none());
+        }
+    }
+
+    #[test]
+    fn standalone_finalize_requires_approval_and_other_actions_reject_it() {
+        let missing = vec![
+            "--conversation-migration-control".to_string(),
+            "finalize".to_string(),
+        ];
+        assert!(parse_conversation_maintenance_args(&missing)
+            .unwrap_err()
+            .contains("requires --approval-receipt"));
+
+        let wrong_action = vec![
+            "--conversation-migration-control".to_string(),
+            "rollback".to_string(),
+            "--approval-receipt".to_string(),
+            "approval.json".to_string(),
+        ];
+        assert!(parse_conversation_maintenance_args(&wrong_action)
+            .unwrap_err()
+            .contains("accepted only"));
+
+        let finalize = vec![
+            "--conversation-migration-control".to_string(),
+            "finalize".to_string(),
+            "--approval-receipt".to_string(),
+            "approval.json".to_string(),
+        ];
+        let (_, maintenance) = parse_conversation_maintenance_args(&finalize).unwrap();
+        let maintenance = maintenance.unwrap();
+        assert_eq!(maintenance.action, MigrationMaintenanceAction::Finalize);
+        assert_eq!(
+            maintenance.approval_receipt_path,
+            Some(PathBuf::from("approval.json"))
+        );
+    }
+
+    #[test]
+    fn approval_flag_without_control_mode_is_rejected() {
+        let args = vec![
+            "--approval-receipt".to_string(),
+            "approval.json".to_string(),
+        ];
+        assert!(parse_conversation_maintenance_args(&args)
+            .unwrap_err()
+            .contains("requires --conversation-migration-control finalize"));
+    }
+}
+
 fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -546,7 +805,7 @@ fn spawn_periodic_update_loop() {
 }
 
 fn usage() -> &'static str {
-    "Usage: termul-server [--host HOST] [--port PORT] [--event-log-capacity N] [--permission-timeout SECS] [--permission-reconnect-grace SECS] [--project-root PATH] [--projects-file PATH] [--sessions-dir PATH] [--conversation-workspace-root PATH] [--workspace-manifests-dir PATH] [--acp-catalog-dir PATH] [--remote-access-token-file PATH] [--allowed-origin ORIGIN] [--check-update]\n\n\
+    "Usage: termul-server [--host HOST] [--port PORT] [--event-log-capacity N] [--permission-timeout SECS] [--permission-reconnect-grace SECS] [--project-root PATH] [--projects-file PATH] [--sessions-dir PATH] [--conversation-workspace-root PATH] [--workspace-manifests-dir PATH] [--acp-catalog-dir PATH] [--remote-access-token-file PATH] [--allowed-origin ORIGIN] [--check-update] [--conversation-migration-control rollback|reapply|finalize] [--approval-receipt PATH]\n\n\
      Options:\n\
         --host HOST                 Bind host (default: 127.0.0.1; use 0.0.0.0 to expose)\n\
         --port PORT                 Bind port (default: 8080)\n\
@@ -561,6 +820,10 @@ fn usage() -> &'static str {
         --acp-catalog-dir PATH      ACP catalog root (default: <state dir>/acp-catalog)\n\
         --remote-access-token-file PATH  Operator-owned bearer token file (required for --host 0.0.0.0)\n\
         --allowed-origin ORIGIN     Allowed browser Origin; repeatable (required for --host 0.0.0.0)\n\
+        --conversation-migration-control ACTION  Durably schedule rollback, reapply, or finalize\n\
+                                     for the next bootstrap, then exit without opening stores,\n\
+                                     managers, PTYs, listeners, or routes.\n\
+        --approval-receipt PATH     ApprovalReceiptV1 JSON; required only for finalize.\n\
         --check-update              Run one opt-in self-update now: fetch the channel manifest,\n\
                                      verify the downloaded binary signature, atomically swap, and\n\
                                      reexec. Defaults to the stable channel when\n\

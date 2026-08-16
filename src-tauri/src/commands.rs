@@ -117,6 +117,59 @@ impl<T> IpcResult<T> {
     }
 }
 
+/// Durably schedule Conversation migration maintenance for the next process bootstrap. This
+/// command never acquires live mutation authority, opens stores, or touches PTYs/routes.
+#[tauri::command]
+pub fn conversation_migration_control(
+    request: crate::conversation::MigrationMaintenanceRequestV1,
+    control: State<'_, Arc<crate::conversation::ConversationMigrationControlService>>,
+) -> Result<IpcResult<crate::conversation::MigrationMaintenanceScheduleReceiptV1>, String> {
+    Ok(conversation_migration_control_inner(
+        control.inner().as_ref(),
+        request,
+    ))
+}
+
+fn conversation_migration_control_inner(
+    control: &crate::conversation::ConversationMigrationControlService,
+    request: crate::conversation::MigrationMaintenanceRequestV1,
+) -> IpcResult<crate::conversation::MigrationMaintenanceScheduleReceiptV1> {
+    match control.request(request) {
+        Ok(receipt) => IpcResult::success(receipt),
+        Err(error) => IpcResult::error(error.detail, error.code.as_str()),
+    }
+}
+
+#[cfg(test)]
+mod conversation_migration_control_tests {
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::conversation::{
+        ConversationMigrationControlService, MigrationMaintenanceAction,
+        MigrationMaintenanceRequestV1,
+    };
+
+    #[test]
+    fn conversation_migration_control_schedules_restart_without_live_resources() {
+        let temp = tempfile::tempdir().unwrap();
+        let control = ConversationMigrationControlService::new(temp.path()).unwrap();
+        let request = MigrationMaintenanceRequestV1 {
+            action: MigrationMaintenanceAction::Rollback,
+            request_id: Uuid::new_v4().to_string(),
+            requested_at_utc: Utc::now(),
+            approval_receipt: None,
+        };
+        let result = conversation_migration_control_inner(&control, request.clone());
+        assert!(result.success);
+        let receipt = result.data.unwrap();
+        assert!(receipt.restart_required);
+        assert_eq!(receipt.code, "MIGRATION_RESTART_REQUIRED");
+        assert_eq!(control.pending().unwrap(), Some(request));
+    }
+}
+
 /// Terminal visibility state
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]

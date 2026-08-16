@@ -1316,6 +1316,11 @@ pub fn run() {
             app.manage(Arc::clone(&conversation_bootstrap.creation));
             app.manage(Arc::clone(&conversation_bootstrap.persistence_adapter));
             app.manage(Arc::clone(&conversation_bootstrap.application));
+            let conversation_migration_control = Arc::new(
+                crate::conversation::ConversationMigrationControlService::new(&app_data_dir)
+                    .map_err(|error| error.to_string())?,
+            );
+            app.manage(conversation_migration_control);
 
             // Window chrome is configured before show(). macOS overlay settings
             // live in tauri.conf.json — avoid set_decorations(true) there because
@@ -1745,6 +1750,8 @@ pub fn run() {
             export_log_file_command,
             copy_log_contents_command,
             export_log_to_default_command,
+            // Restart-required Conversation migration maintenance
+            commands::conversation_migration_control,
             // Terminal commands
             commands::terminal_spawn,
             commands::terminal_attach,

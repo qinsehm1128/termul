@@ -138,6 +138,10 @@ keyring = "3.6"
 # Logging
 log = "0.4"
 
+# Kernel-backed cross-platform migration lock. The permanent lock file is diagnostic metadata;
+# ownership is released by the OS when the process/handle terminates.
+fs2 = "0.4"
+
 # Remote terminal server (embedded Axum HTTP + WebSocket)
 # Reuses the existing tokio + hyper 1.x + tower stack already in the dep tree.
 axum = { version = "0.8", features = ["ws"] }

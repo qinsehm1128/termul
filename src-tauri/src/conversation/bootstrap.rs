@@ -23,9 +23,10 @@ use crate::conversation::application::ConversationApplicationService;
 use crate::conversation::creation::ConversationCreationService;
 use crate::conversation::locator::{ConversationLocator, SessionWorkspaceLocator};
 use crate::conversation::migration::{
-    load_migration_map, ConversationMigrationService, ConversationReader, HostMigrationLock,
-    LegacyConversationReader, LegacyMigrationCallbacks, LegacyRootConfiguration,
-    MigrationAdmissionState, MigrationContext, MigrationHostMode, MigrationPhase, ReaderPrecedence,
+    load_migration_map, BootstrapObservationReceiptV1, ConversationMigrationControlService,
+    ConversationMigrationService, ConversationReader, HostMigrationLock, LegacyConversationReader,
+    LegacyMigrationCallbacks, LegacyRootConfiguration, MigrationAdmissionState, MigrationContext,
+    MigrationHostMode, MigrationPhase, ReaderPrecedence,
 };
 use crate::conversation::persistence_adapter::ConversationPersistenceAdapter;
 use crate::conversation::repository::ConversationRepository;
@@ -146,7 +147,10 @@ impl ConversationBootstrap {
                 "an app-managed mutable store, resource manager, or route was admitted before bootstrap",
             ));
         }
-        log::info!("[conversation-bootstrap] start host_mode={host_mode:?}");
+        let bootstrap_run_id = uuid::Uuid::new_v4().to_string();
+        log::info!(
+            "[conversation-bootstrap] start host_mode={host_mode:?} bootstrap_run_id={bootstrap_run_id}"
+        );
         roots.state_root = create_absolute_directory(&roots.state_root, "create_state_root")?;
         roots.workspace_base =
             create_absolute_directory(&roots.workspace_base, "create_workspace_base")?;
@@ -186,7 +190,7 @@ impl ConversationBootstrap {
             project_worktrees: Vec::new(),
         };
         let operation_key = migration_operation_key(&legacy_configuration);
-        let report = migration_service
+        let mut report = migration_service
             .recover_and_run(MigrationContext {
                 lock_guard: &lock_guard,
                 host_state_root: &roots.state_root,
@@ -197,6 +201,36 @@ impl ConversationBootstrap {
                 callbacks: &mut callbacks,
             })
             .map_err(|source| bootstrap_error(source.code.as_str(), "recover_and_run", source))?;
+        let control_service = ConversationMigrationControlService::new(&roots.state_root)
+            .map_err(|source| bootstrap_error(source.code.as_str(), "create_control", source))?;
+        let mut control_request_ids = Vec::new();
+        if let Some(request) = control_service
+            .pending()
+            .map_err(|source| bootstrap_error(source.code.as_str(), "load_control", source))?
+        {
+            report = migration_service
+                .apply_maintenance(
+                    &request,
+                    MigrationContext {
+                        lock_guard: &lock_guard,
+                        host_state_root: &roots.state_root,
+                        operation_key: &operation_key,
+                        host_mode,
+                        admission,
+                        now_utc: Utc::now(),
+                        callbacks: &mut callbacks,
+                    },
+                )
+                .map_err(|source| {
+                    bootstrap_error(source.code.as_str(), "apply_maintenance", source)
+                })?;
+            control_service
+                .complete(&request, &report, Utc::now())
+                .map_err(|source| {
+                    bootstrap_error(source.code.as_str(), "complete_maintenance", source)
+                })?;
+            control_request_ids.push(request.request_id);
+        }
 
         if !matches!(
             report.phase,
@@ -307,6 +341,38 @@ impl ConversationBootstrap {
             report.reader_precedence,
             open_report.recovery_items.len(),
         ));
+        if report.phase == MigrationPhase::ObservationWindow {
+            let admitted_at_utc = Utc::now();
+            let validation_sha256 = report.validation_sha256.clone().ok_or_else(|| {
+                error(
+                    "MIGRATION_OBSERVATION_INVALID",
+                    "record_observation",
+                    "observation-window report is missing the current validation digest",
+                )
+            })?;
+            report = migration_service
+                .record_bootstrap_observation(
+                    crate::conversation::migration::MigrationControlContext {
+                        lock_guard: &lock_guard,
+                        host_state_root: &roots.state_root,
+                        now_utc: admitted_at_utc,
+                    },
+                    BootstrapObservationReceiptV1 {
+                        bootstrap_run_id: bootstrap_run_id.clone(),
+                        admitted_at_utc,
+                        validation_sha256,
+                        control_request_ids,
+                    },
+                )
+                .map_err(|source| {
+                    bootstrap_error(source.code.as_str(), "record_observation", source)
+                })?;
+            log::info!(
+                "[conversation-bootstrap] service-ready observation recorded bootstrap_run_id={} generation={}",
+                bootstrap_run_id,
+                report.target_generation
+            );
+        }
         drop(lock_guard);
         log::info!(
             "[conversation-bootstrap] complete host_mode={host_mode:?} phase={:?} precedence={:?} recovery_count={}",
@@ -474,7 +540,7 @@ mod tests {
             "WorkspaceManifestService::open_read_only",
             "AcpCatalogService::open",
             "AcpManager::with_conversation_services",
-            "RemoteServerState::new",
+            "RemoteServerState::with_desktop_authority",
         ] {
             let position = desktop.find(forbidden).unwrap();
             assert!(
@@ -613,14 +679,93 @@ mod tests {
         assert_eq!(outcome.repository.root(), state.join("conversations/v2"));
         assert_eq!(hook.lock_acquire_count.load(Ordering::SeqCst), 1);
         assert_eq!(hook.store_open_count.load(Ordering::SeqCst), 1);
-        assert!(!state
+        let journal: crate::conversation::migration::MigrationJournalV1 = serde_json::from_slice(
+            &fs::read(
+                state
+                    .join("conversation-migrations")
+                    .join(crate::conversation::migration::MIGRATION_JOURNAL_FILE),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            journal
+                .observation_evidence
+                .as_ref()
+                .unwrap()
+                .successful_bootstrap_count,
+            1
+        );
+        assert!(state
             .join("conversation-migrations")
             .join(crate::conversation::migration::MIGRATION_LOCK_FILE)
-            .exists());
+            .is_file());
         BOOTSTRAP_TEST_HOOKS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&state);
+    }
+
+    #[test]
+    fn next_bootstrap_consumes_restart_intents_before_admission_and_pins_request_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state");
+        let visible = temp.path().join("visible");
+        let first = ConversationBootstrap::run(
+            HostConversationRoots::desktop(state.clone(), visible.clone()),
+            MigrationHostMode::Desktop,
+        )
+        .unwrap();
+        assert_eq!(first.migration_phase, MigrationPhase::ObservationWindow);
+        drop(first);
+
+        let control = ConversationMigrationControlService::new(&state).unwrap();
+        let rollback = crate::conversation::migration::MigrationMaintenanceRequestV1 {
+            action: crate::conversation::migration::MigrationMaintenanceAction::Rollback,
+            request_id: uuid::Uuid::new_v4().to_string(),
+            requested_at_utc: Utc::now(),
+            approval_receipt: None,
+        };
+        control.request(rollback).unwrap();
+        let rolled_back = ConversationBootstrap::run(
+            HostConversationRoots::desktop(state.clone(), visible.clone()),
+            MigrationHostMode::Desktop,
+        )
+        .unwrap();
+        assert_eq!(rolled_back.migration_phase, MigrationPhase::RolledBack);
+        drop(rolled_back);
+        assert!(control.pending().unwrap().is_none());
+
+        let reapply = crate::conversation::migration::MigrationMaintenanceRequestV1 {
+            action: crate::conversation::migration::MigrationMaintenanceAction::Reapply,
+            request_id: uuid::Uuid::new_v4().to_string(),
+            requested_at_utc: Utc::now(),
+            approval_receipt: None,
+        };
+        control.request(reapply.clone()).unwrap();
+        let reapplied = ConversationBootstrap::run(
+            HostConversationRoots::desktop(state.clone(), visible),
+            MigrationHostMode::Desktop,
+        )
+        .unwrap();
+        assert_eq!(reapplied.migration_phase, MigrationPhase::ObservationWindow);
+        assert!(control.pending().unwrap().is_none());
+
+        let journal: crate::conversation::migration::MigrationJournalV1 = serde_json::from_slice(
+            &fs::read(
+                state
+                    .join("conversation-migrations")
+                    .join(crate::conversation::migration::MIGRATION_JOURNAL_FILE),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let evidence = journal.observation_evidence.unwrap();
+        assert_eq!(evidence.successful_bootstrap_count, 1);
+        assert_eq!(
+            evidence.bootstrap_receipts[0].control_request_ids,
+            vec![reapply.request_id]
+        );
     }
 
     #[test]
@@ -662,6 +807,25 @@ mod tests {
         });
         entered_rx.recv().unwrap();
         assert_eq!(hook.store_open_count.load(Ordering::SeqCst), 0);
+        let journal_before_ready: crate::conversation::migration::MigrationJournalV1 =
+            serde_json::from_slice(
+                &fs::read(
+                    state
+                        .join("conversation-migrations")
+                        .join(crate::conversation::migration::MIGRATION_JOURNAL_FILE),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            journal_before_ready
+                .observation_evidence
+                .as_ref()
+                .unwrap()
+                .successful_bootstrap_count,
+            0,
+            "bootstrap observation must not be recorded before repository/service readiness"
+        );
 
         let second = ConversationBootstrap::run(
             HostConversationRoots::desktop(state.clone(), visible),
@@ -676,6 +840,24 @@ mod tests {
         release_tx.send(()).unwrap();
         first.join().unwrap().unwrap();
         assert_eq!(hook.store_open_count.load(Ordering::SeqCst), 1);
+        let journal_after_ready: crate::conversation::migration::MigrationJournalV1 =
+            serde_json::from_slice(
+                &fs::read(
+                    state
+                        .join("conversation-migrations")
+                        .join(crate::conversation::migration::MIGRATION_JOURNAL_FILE),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            journal_after_ready
+                .observation_evidence
+                .as_ref()
+                .unwrap()
+                .successful_bootstrap_count,
+            1
+        );
         BOOTSTRAP_TEST_HOOKS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -719,6 +901,9 @@ mod tests {
             b"not-json",
         )
         .unwrap();
+        let journal_path = state
+            .join("conversation-migrations")
+            .join(crate::conversation::migration::MIGRATION_JOURNAL_FILE);
         let failure = ConversationBootstrap::run(
             HostConversationRoots::desktop(state.clone(), visible),
             MigrationHostMode::Desktop,
@@ -726,6 +911,7 @@ mod tests {
         .err()
         .unwrap();
         assert_eq!(failure.code, "MIGRATION_JOURNAL_CORRUPT");
+        assert_eq!(fs::read(journal_path).unwrap(), b"not-json");
         assert!(!state.join("conversations/v2").exists());
     }
 

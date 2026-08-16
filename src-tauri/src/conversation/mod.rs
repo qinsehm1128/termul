@@ -75,12 +75,14 @@ pub use locator::{
 };
 pub use migration::{
     advance_phase, recover_cutover, ActiveLayout, ApprovalReceiptV1, BootstrapObservationReceiptV1,
-    CompatibilityError, ConversationLayoutDescriptorV1, ConversationMigrationService,
-    ConversationReader, CutoverRecovery, HostMigrationLock, HostMigrationLockGuard,
-    LegacyConversationProjection,
-    LegacyConversationReader, MigrationAdmissionState, MigrationCallbacks, MigrationContext,
-    MigrationControlContext, MigrationError, MigrationErrorCode, MigrationHostMode,
-    MigrationJournalV1, MigrationPhase, MigrationReport, MigrationStepOutput,
+    CompatibilityError, ConversationLayoutDescriptorV1, ConversationMigrationControlService,
+    ConversationMigrationService, ConversationReader, CutoverRecovery, HostMigrationLock,
+    HostMigrationLockGuard, LegacyConversationProjection, LegacyConversationReader,
+    MaintenanceReceiptState, MaintenanceRequestReceiptV1, MigrationAdmissionState,
+    MigrationCallbacks, MigrationContext, MigrationControlContext, MigrationError,
+    MigrationErrorCode, MigrationHostMode, MigrationJournalV1, MigrationMaintenanceAction,
+    MigrationMaintenanceCompletionReceiptV1, MigrationMaintenanceRequestV1,
+    MigrationMaintenanceScheduleReceiptV1, MigrationPhase, MigrationReport, MigrationStepOutput,
     ObservationEvidenceV1, ReaderPrecedence, StepReceiptV1,
 };
 pub use ordered_persistence::{
