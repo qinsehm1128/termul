@@ -96,24 +96,28 @@ async fn fixture() -> MatrixFixture {
     std::fs::create_dir_all(&visible).unwrap();
     let (repository, report) = ConversationRepository::open(private.clone()).unwrap();
     assert_eq!(report.valid_conversation_count, 0);
+    let writer = ConversationWriter::for_test(Arc::clone(&repository));
     let id = ConversationId::parse(ID).unwrap();
     let created_at = fixed_time();
-    repository
-        .create_conversation(ConversationRecordV2 {
-            schema_version: CONVERSATION_SCHEMA_VERSION,
-            conversation_id: id,
-            created_at_utc: created_at,
-            creation_partition: CreationPartition::from_created_at(created_at),
-            workspace_cwd: visible.to_string_lossy().into_owned(),
-            execution_target: ExecutionTarget::Workspace,
-            project_attachment: None,
-            lifecycle_state: ConversationLifecycleState::Ready,
-            last_seq: 0,
-            created_by: ConversationCreator::Termul,
-        })
+    writer
+        .create_conversation(
+            ConversationRecordV2 {
+                schema_version: CONVERSATION_SCHEMA_VERSION,
+                conversation_id: id,
+                created_at_utc: created_at,
+                creation_partition: CreationPartition::from_created_at(created_at),
+                workspace_cwd: visible.to_string_lossy().into_owned(),
+                execution_target: ExecutionTarget::Workspace,
+                project_attachment: None,
+                lifecycle_state: ConversationLifecycleState::Ready,
+                last_seq: 0,
+                created_by: ConversationCreator::Termul,
+            },
+            ConversationMutation::CreateConversation,
+        )
         .await
         .unwrap();
-    repository
+    writer
         .bind_agent_session(
             id,
             AgentSessionBinding {
@@ -133,7 +137,7 @@ async fn fixture() -> MatrixFixture {
 
     let creation = Arc::new(
         ConversationCreationService::new(
-            Arc::clone(&repository),
+            Arc::clone(&writer),
             ConversationLocator::new(private).unwrap(),
             SessionWorkspaceLocator::new(base.join("visible")).unwrap(),
         )
@@ -144,9 +148,10 @@ async fn fixture() -> MatrixFixture {
         LegacyConversationReader::default(),
         ReaderPrecedence::ConversationV2Only,
     ));
-    let workspace = Arc::new(SessionWorkspaceService::new(Arc::clone(&repository)));
+    let workspace = Arc::new(SessionWorkspaceService::new(Arc::clone(&writer)));
     let application = Arc::new(ConversationApplicationService::new(
         reader,
+        Arc::clone(&writer),
         Arc::clone(&workspace),
         &MigrationMapV1 {
             schema_version: migration::MIGRATION_MAP_SCHEMA_VERSION,
@@ -156,14 +161,13 @@ async fn fixture() -> MatrixFixture {
         MigrationHostMode::Standalone,
         MigrationPhase::Finalized,
         ReaderPrecedence::ConversationV2Only,
-        0,
     ));
     let provider = Arc::new(MatrixProvider::default());
     *provider.addressable.lock() = true;
     let terminals = Arc::new(MatrixTerminals::default());
     application
         .attach_lifecycle(ConversationLifecycleService::new(
-            Arc::clone(&repository),
+            Arc::clone(&writer),
             creation,
             provider.clone(),
             terminals.clone(),
@@ -394,6 +398,197 @@ async fn repository_catalog_workspace_and_application_recovery_matrix() {
     assert_eq!(std::fs::read(workspace_path).unwrap(), preserved);
 }
 
+#[tokio::test]
+async fn hybrid_legacy_first_full_mutation_matrix() {
+    const NEW_ID: &str = "5f7a1c01-4d1b-4c8a-af01-0123456789ab";
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().canonicalize().unwrap().join("conversations/v2");
+    let (repository, _) = ConversationRepository::open(root).unwrap();
+    let seed_writer = ConversationWriter::for_test(Arc::clone(&repository));
+    let created_at = fixed_time();
+    for (id, cwd) in [(ID, "/legacy"), (NEW_ID, "/new-v2")] {
+        seed_writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id: ConversationId::parse(id).unwrap(),
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: cwd.to_string(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::Ready,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                },
+                ConversationMutation::CreateConversation,
+            )
+            .await
+            .unwrap();
+    }
+
+    let mapped = ConversationId::parse(ID).unwrap();
+    let new_v2 = ConversationId::parse(NEW_ID).unwrap();
+    let authority = Arc::new(ConversationWriteAuthority::new(
+        repository.as_ref(),
+        ReaderPrecedence::HybridLegacyFirst,
+        [mapped],
+    ));
+    let writer = ConversationWriter::new(Arc::clone(&repository), authority).unwrap();
+
+    for mutation in ConversationMutation::RUNTIME {
+        let denied = writer.authorize(mapped, mutation).unwrap_err();
+        assert_eq!(
+            denied.code,
+            ConversationErrorCode::LegacyCompatibilityReadOnly,
+            "mapped legacy mutation {} must be denied",
+            mutation.as_str()
+        );
+        assert!(
+            writer.authorize(new_v2, mutation).is_ok(),
+            "new v2-only mutation {} must remain writable",
+            mutation.as_str()
+        );
+    }
+    for mutation in [
+        ConversationMutation::MigrationStageCreate,
+        ConversationMutation::MigrationStageEvent,
+        ConversationMutation::MigrationStageProvenance,
+        ConversationMutation::MigrationStageSync,
+    ] {
+        assert_eq!(
+            writer.authorize(new_v2, mutation).unwrap_err().code,
+            ConversationErrorCode::ConversationRecoveryRequired
+        );
+    }
+}
+
+#[tokio::test]
+async fn terminal_service_graph_is_host_exact() {
+    const HOST_A_ID: &str = "11111111-1111-4111-8111-111111111111";
+    const HOST_B_ID: &str = "22222222-2222-4222-8222-222222222222";
+
+    async fn add_conversation(
+        bootstrap: &BootstrapOutcome,
+        id: &str,
+        label: &str,
+    ) -> ConversationId {
+        let conversation_id = ConversationId::parse(id).unwrap();
+        let created_at = fixed_time();
+        let workspace_cwd = bootstrap.workspace_base.join(label);
+        std::fs::create_dir_all(&workspace_cwd).unwrap();
+        bootstrap
+            .writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: workspace_cwd.to_string_lossy().into_owned(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::Ready,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                },
+                ConversationMutation::CreateConversation,
+            )
+            .await
+            .unwrap();
+        conversation_id
+    }
+
+    fn terminal_ids(outcome: SessionWorkspaceLoadOutcome) -> HashSet<String> {
+        let SessionWorkspaceLoadOutcome::Loaded { workspace } = outcome else {
+            panic!("terminal workspace must be loaded")
+        };
+        workspace
+            .resources
+            .into_iter()
+            .filter_map(|resource| match resource {
+                SessionWorkspaceResourceDescriptor::Terminal { terminal_id, .. } => {
+                    Some(terminal_id)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let base = temp.path().canonicalize().unwrap();
+    let host_a = ConversationBootstrap::run(
+        HostConversationRoots::desktop(base.join("state-a"), base.join("visible-a")),
+        MigrationHostMode::Desktop,
+    )
+    .unwrap();
+    let host_b = ConversationBootstrap::run(
+        HostConversationRoots::desktop(base.join("state-b"), base.join("visible-b")),
+        MigrationHostMode::Desktop,
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(
+        &host_a.workspace,
+        &host_a.application.session_workspace()
+    ));
+    assert!(Arc::ptr_eq(
+        &host_b.workspace,
+        &host_b.application.session_workspace()
+    ));
+    assert!(!Arc::ptr_eq(&host_a.workspace, &host_b.workspace));
+
+    let id_a = add_conversation(&host_a, HOST_A_ID, "host-a").await;
+    let id_b = add_conversation(&host_b, HOST_B_ID, "host-b").await;
+    let pty_a = crate::web::test_pty_manager();
+    let pty_b = crate::web::test_pty_manager();
+    let spawned_a = crate::commands::terminal_spawn_resource(
+        crate::pty::SpawnOptions {
+            conversation_id: Some(id_a),
+            cwd: Some(host_a.workspace_base.to_string_lossy().into_owned()),
+            ..Default::default()
+        },
+        None,
+        &pty_a,
+        &host_a.workspace,
+    )
+    .await;
+    assert!(spawned_a.success, "host A spawn: {:?}", spawned_a.error);
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    let spawned_b = crate::commands::terminal_spawn_resource(
+        crate::pty::SpawnOptions {
+            conversation_id: Some(id_b),
+            cwd: Some(host_b.workspace_base.to_string_lossy().into_owned()),
+            ..Default::default()
+        },
+        None,
+        &pty_b,
+        &host_b.workspace,
+    )
+    .await;
+    assert!(spawned_b.success, "host B spawn: {:?}", spawned_b.error);
+    let terminal_a = spawned_a.data.unwrap().info.id;
+    let terminal_b = spawned_b.data.unwrap().info.id;
+    assert_ne!(terminal_a, terminal_b);
+
+    let refs_a = terminal_ids(host_a.workspace.load(id_a).await.unwrap());
+    let refs_b = terminal_ids(host_b.workspace.load(id_b).await.unwrap());
+    assert_eq!(refs_a, HashSet::from([terminal_a.clone()]));
+    assert_eq!(refs_b, HashSet::from([terminal_b.clone()]));
+    assert!(!refs_a.contains(&terminal_b));
+    assert!(!refs_b.contains(&terminal_a));
+
+    assert!(
+        crate::commands::terminal_terminate_resource(&terminal_a, &pty_a, &host_a.workspace,)
+            .await
+            .success
+    );
+    assert!(
+        crate::commands::terminal_terminate_resource(&terminal_b, &pty_b, &host_b.workspace,)
+            .await
+            .success
+    );
+}
+
 #[test]
 fn migration_phase_and_shutdown_boundary_matrix() {
     use MigrationPhase::*;
@@ -424,8 +619,26 @@ fn migration_phase_and_shutdown_boundary_matrix() {
             "disconnect contains {forbidden}"
         );
     }
+    let standalone = include_str!("../server_main.rs");
+    let maintenance_gate = standalone
+        .find("if let Some(maintenance) = maintenance {")
+        .expect("standalone maintenance control must gate normal startup");
+    let bootstrap_gate = standalone
+        .find("ConversationBootstrap::run(")
+        .expect("standalone startup must run Conversation bootstrap");
+    let network_admission = standalone
+        .find("match serve(")
+        .expect("standalone startup must enter the network server through serve");
+    assert!(
+        maintenance_gate < bootstrap_gate && bootstrap_gate < network_admission,
+        "maintenance control and Conversation bootstrap must complete before network/router admission"
+    );
+
     let remote = include_str!("../remote/host.rs");
-    let production = remote.split("#[cfg(test)]").next().unwrap();
+    let production = remote
+        .split("#[cfg(test)]\nmod tests")
+        .next()
+        .expect("desktop shared-live production source");
     assert!(production.contains("serve_router("));
     assert!(!production.contains("kill_all_checked"));
 

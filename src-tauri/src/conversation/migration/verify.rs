@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::inventory::{hash_file_streaming, LegacyInventoryV1};
+use super::inventory::{hash_legacy_file_no_follow, LegacyInventoryV1};
 use super::legacy::{
     load_migration_map, load_staged_manifest, stage_digest, stage_output_digest, MigrationMapV1,
     StageReceiptV1, StagedManifestV1,
@@ -57,7 +57,7 @@ pub fn verify_staged_layout(
 
     let repository_root = host_state_root.join("conversations").join("v2");
     let (repository, open_report) =
-        ConversationRepository::open(repository_root.clone()).map_err(repository_error)?;
+        ConversationRepository::open_staging(repository_root.clone()).map_err(repository_error)?;
     if open_report
         .recovery_items
         .iter()
@@ -173,18 +173,19 @@ pub fn verify_source_snapshot(inventory: &LegacyInventoryV1) -> Result<()> {
     for root in &inventory.roots {
         let root_path = PathBuf::from(&root.canonical_path);
         for expected in &root.files {
-            let path = root_path.join(
+            let relative = PathBuf::from(
                 expected
                     .relative_path
                     .replace('/', std::path::MAIN_SEPARATOR_STR),
             );
-            let (size, sha256) = hash_file_streaming(&path).map_err(|error| {
-                MigrationError::new(
-                    MigrationErrorCode::MigrationSourceChanged,
-                    "verify_source_snapshot",
-                    error.to_string(),
-                )
-            })?;
+            let (size, sha256) =
+                hash_legacy_file_no_follow(&root_path, &relative).map_err(|error| {
+                    MigrationError::new(
+                        MigrationErrorCode::MigrationSourceChanged,
+                        "verify_source_snapshot",
+                        error.to_string(),
+                    )
+                })?;
             if size != expected.size || sha256 != expected.sha256 {
                 log::error!(
                     "[conversation-migration] source changed operation_id={} source={} expected_size={} actual_size={}",

@@ -230,11 +230,11 @@ impl RemoteServerState {
         #[cfg(test)]
         {
             let token = "test-remote-access-token".to_string();
-            return Self {
+            Self {
                 inner: std::sync::Mutex::new(None),
                 authority: Arc::new(RemoteAccessAuthority::for_tests(&token)),
                 credential_source: RemoteCredentialSource::Test(token),
-            };
+            }
         }
         #[cfg(not(test))]
         Self {

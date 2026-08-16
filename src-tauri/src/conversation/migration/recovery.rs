@@ -173,6 +173,18 @@ impl RecoveryQueueV1 {
         workspaces: &mut HashMap<ConversationId, u64>,
     ) -> std::result::Result<RecoveryActionResult, RecoveryActionError> {
         request.validate()?;
+        let item_index = self
+            .items
+            .iter()
+            .position(|item| item.recovery_id == request.recovery_id)
+            .ok_or_else(|| {
+                RecoveryActionError::new(
+                    RecoveryActionErrorCode::RecoveryNotFound,
+                    "recovery item was not found",
+                )
+            })?;
+        validate_candidate_scope(&self.items[item_index], &request.action)?;
+
         let request_digest = request.canonical_digest();
         if let Some(key) = request.idempotency_key {
             if let Some(receipt) = self.idempotency_receipts.get(&key) {
@@ -185,17 +197,6 @@ impl RecoveryQueueV1 {
                 ));
             }
         }
-
-        let item_index = self
-            .items
-            .iter()
-            .position(|item| item.recovery_id == request.recovery_id)
-            .ok_or_else(|| {
-                RecoveryActionError::new(
-                    RecoveryActionErrorCode::RecoveryNotFound,
-                    "recovery item was not found",
-                )
-            })?;
         if self.items[item_index].revision != request.expected_revision {
             return Err(RecoveryActionError::new(
                 RecoveryActionErrorCode::ConversationConflict,
@@ -502,6 +503,31 @@ where
     Ok(Some(parsed))
 }
 
+fn validate_candidate_scope(
+    item: &RecoveryItemV1,
+    action: &RecoveryAction,
+) -> std::result::Result<(), RecoveryActionError> {
+    let target = match action {
+        RecoveryAction::AssociateConversation(payload) => Some(payload.conversation_id),
+        RecoveryAction::StartEmptyWorkspace(payload) => Some(payload.conversation_id),
+        RecoveryAction::Inspect(_) | RecoveryAction::DismissPreservedSource(_) => None,
+    };
+    if let Some(target) = target {
+        if !item.conversation_ids.contains(&target) {
+            log::warn!(
+                "[conversation-recovery] candidate rejected recovery_id={} conversation_id={} code=VALIDATION_ERROR",
+                item.recovery_id,
+                target
+            );
+            return Err(RecoveryActionError::new(
+                RecoveryActionErrorCode::ValidationError,
+                "recovery target is outside the RecoveryItem candidate set",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn immutable_source_view(item: &RecoveryItemV1) -> Value {
     serde_json::json!({
         "sourcePaths": item.source_paths,
@@ -683,7 +709,7 @@ mod tests {
 
         let association = request(
             RecoveryAction::AssociateConversation(AssociateConversationPayload {
-                conversation_id: ConversationId::parse(OTHER_ID).unwrap(),
+                conversation_id: ConversationId::parse(ID).unwrap(),
             }),
             1,
         );
@@ -719,6 +745,34 @@ mod tests {
         assert_eq!(dismissed.recovery_revision, 3);
         assert_eq!(immutable_source_view(&queue.items[0]), immutable);
         assert_eq!(std::fs::read(preserved_source).unwrap(), source_bytes);
+    }
+
+    #[test]
+    fn recovery_mutation_rejects_targets_outside_candidates_without_mutation() {
+        let original = item();
+        let mut queue = RecoveryQueueV1::new(Uuid::new_v4(), vec![original.clone()]);
+        let candidate = ConversationId::parse(ID).unwrap();
+        let outside = ConversationId::parse(OTHER_ID).unwrap();
+
+        for action in [
+            RecoveryAction::AssociateConversation(AssociateConversationPayload {
+                conversation_id: outside,
+            }),
+            RecoveryAction::StartEmptyWorkspace(StartEmptyWorkspacePayload {
+                conversation_id: outside,
+                expected_workspace_revision: None,
+            }),
+        ] {
+            let mut workspaces = HashMap::from([(candidate, 7)]);
+            let before_workspaces = workspaces.clone();
+            let before_queue = queue.clone();
+            let error = queue
+                .resolve(request(action, original.revision), &mut workspaces)
+                .unwrap_err();
+            assert_eq!(error.code, RecoveryActionErrorCode::ValidationError);
+            assert_eq!(queue, before_queue);
+            assert_eq!(workspaces, before_workspaces);
+        }
     }
 
     #[test]

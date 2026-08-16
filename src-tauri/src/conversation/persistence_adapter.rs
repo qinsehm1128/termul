@@ -22,6 +22,7 @@ use crate::conversation::contracts::{
 use crate::conversation::event_log::ConversationEventType;
 use crate::conversation::migration::ConversationReader;
 use crate::conversation::repository::ConversationRepository;
+use crate::conversation::write_authority::{ConversationMutation, ConversationWriter};
 
 #[derive(Debug)]
 pub struct ConversationPersistenceError {
@@ -45,6 +46,7 @@ impl std::error::Error for ConversationPersistenceError {}
 pub type Result<T> = std::result::Result<T, ConversationPersistenceError>;
 
 pub struct ConversationPersistenceAdapter {
+    writer: Arc<ConversationWriter>,
     repository: Arc<ConversationRepository>,
     reader: Arc<ConversationReader>,
     bindings: RwLock<HashMap<String, ConversationId>>,
@@ -52,9 +54,10 @@ pub struct ConversationPersistenceAdapter {
 
 impl ConversationPersistenceAdapter {
     #[must_use]
-    pub fn new(repository: Arc<ConversationRepository>, reader: Arc<ConversationReader>) -> Self {
+    pub fn new(writer: Arc<ConversationWriter>, reader: Arc<ConversationReader>) -> Self {
         let adapter = Self {
-            repository,
+            repository: Arc::clone(writer.repository()),
+            writer,
             reader,
             bindings: RwLock::new(HashMap::new()),
         };
@@ -162,15 +165,24 @@ impl ConversationPersistenceAdapter {
             )
         })?;
         let event = self
-            .repository
-            .append_event(conversation_id, Utc::now(), canonical_type, payload)
+            .writer
+            .append_event(
+                conversation_id,
+                Utc::now(),
+                canonical_type,
+                payload,
+                ConversationMutation::AcpEventAppend,
+            )
             .await
             .map_err(|source| {
-                error(
-                    "CONVERSATION_EVENT_APPEND_FAILED",
-                    "append_acp_event",
-                    source.to_string(),
-                )
+                let code = if source.code
+                    == crate::conversation::contracts::ConversationErrorCode::LegacyCompatibilityReadOnly
+                {
+                    "LEGACY_COMPATIBILITY_READ_ONLY"
+                } else {
+                    "CONVERSATION_EVENT_APPEND_FAILED"
+                };
+                error(code, "append_acp_event", source.to_string())
             })?;
         Ok(event.seq)
     }
@@ -439,28 +451,32 @@ mod tests {
         let visible = root.join("visible");
         std::fs::create_dir_all(&visible).unwrap();
         let (repository, _) = ConversationRepository::open(private.clone()).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
         let id = crate::conversation::ConversationId::parse("11111111-1111-4111-8111-111111111111")
             .unwrap();
         let created_at = Utc
             .timestamp_millis_opt(1_766_000_000_000)
             .single()
             .unwrap();
-        repository
-            .create_conversation(ConversationRecordV2 {
-                schema_version: CONVERSATION_SCHEMA_VERSION,
-                conversation_id: id,
-                created_at_utc: created_at,
-                creation_partition: CreationPartition::from_created_at(created_at),
-                workspace_cwd: visible.join("workspace").to_string_lossy().into_owned(),
-                execution_target: ExecutionTarget::Workspace,
-                project_attachment: None,
-                lifecycle_state: ConversationLifecycleState::InitializingAgent,
-                last_seq: 0,
-                created_by: ConversationCreator::Termul,
-            })
+        writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id: id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: visible.join("workspace").to_string_lossy().into_owned(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::InitializingAgent,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                },
+                ConversationMutation::CreateConversation,
+            )
             .await
             .unwrap();
-        repository
+        writer
             .bind_agent_session(
                 id,
                 AgentSessionBinding {
@@ -483,7 +499,7 @@ mod tests {
             crate::conversation::ReaderPrecedence::ConversationV2Only,
         ));
         let adapter = Arc::new(ConversationPersistenceAdapter::new(
-            Arc::clone(&repository),
+            Arc::clone(&writer),
             reader,
         ));
         let seq = adapter
@@ -505,7 +521,7 @@ mod tests {
             assert!(!temp.path().join(legacy_root).exists());
         }
         let _ = ConversationCreationService::new(
-            repository,
+            writer,
             ConversationLocator::new(private).unwrap(),
             SessionWorkspaceLocator::new(visible).unwrap(),
         )
@@ -520,27 +536,31 @@ mod tests {
         let visible = root.join("visible");
         std::fs::create_dir_all(&visible).unwrap();
         let (repository, _) = ConversationRepository::open(private.clone()).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
         let id = ConversationId::parse("22222222-2222-4222-8222-222222222222").unwrap();
         let created_at = Utc
             .timestamp_millis_opt(1_766_000_000_000)
             .single()
             .unwrap();
-        repository
-            .create_conversation(ConversationRecordV2 {
-                schema_version: CONVERSATION_SCHEMA_VERSION,
-                conversation_id: id,
-                created_at_utc: created_at,
-                creation_partition: CreationPartition::from_created_at(created_at),
-                workspace_cwd: visible.join("workspace").to_string_lossy().into_owned(),
-                execution_target: ExecutionTarget::Workspace,
-                project_attachment: None,
-                lifecycle_state: ConversationLifecycleState::InitializingAgent,
-                last_seq: 0,
-                created_by: ConversationCreator::Termul,
-            })
+        writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id: id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: visible.join("workspace").to_string_lossy().into_owned(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::InitializingAgent,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                },
+                ConversationMutation::CreateConversation,
+            )
             .await
             .unwrap();
-        repository
+        writer
             .bind_agent_session(
                 id,
                 AgentSessionBinding {
@@ -583,15 +603,18 @@ mod tests {
                 serde_json::json!({"update":{"id":"one"}}),
             ),
         ] {
-            repository
-                .append_event(id, created_at, type_, payload)
+            writer
+                .append_event(
+                    id,
+                    created_at,
+                    type_,
+                    payload,
+                    ConversationMutation::AcpEventAppend,
+                )
                 .await
                 .unwrap();
         }
-        repository
-            .detach_agent_binding(id, created_at)
-            .await
-            .unwrap();
+        writer.detach_agent_binding(id, created_at).await.unwrap();
 
         let reader = Arc::new(crate::conversation::ConversationReader::new(
             Arc::clone(&repository),
@@ -599,7 +622,7 @@ mod tests {
             crate::conversation::ReaderPrecedence::ConversationV2Only,
         ));
         let adapter = Arc::new(ConversationPersistenceAdapter::new(
-            Arc::clone(&repository),
+            Arc::clone(&writer),
             reader,
         ));
         assert!(adapter
@@ -627,11 +650,11 @@ mod tests {
             .await
             .is_err());
 
-        repository
+        writer
             .rebind_detached_binding(id, created_at)
             .await
             .unwrap();
-        repository
+        writer
             .suspend_agent_binding(id, true, created_at)
             .await
             .unwrap();
@@ -655,12 +678,13 @@ mod tests {
         drop(adapter);
         drop(repository);
         let (repository, _) = ConversationRepository::open(private).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
         let reader = Arc::new(crate::conversation::ConversationReader::new(
             Arc::clone(&repository),
             crate::conversation::LegacyConversationReader::default(),
             crate::conversation::ReaderPrecedence::ConversationV2Only,
         ));
-        let reopened = ConversationPersistenceAdapter::new(repository, reader);
+        let reopened = ConversationPersistenceAdapter::new(writer, reader);
         let sessions = reopened.list_sessions();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].title.as_deref(), Some("Background"));
@@ -674,12 +698,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let private = temp.path().canonicalize().unwrap().join("private");
         let (repository, _) = ConversationRepository::open(private).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
         let reader = Arc::new(crate::conversation::ConversationReader::new(
             Arc::clone(&repository),
             crate::conversation::LegacyConversationReader::default(),
             crate::conversation::ReaderPrecedence::ConversationV2Only,
         ));
-        let adapter = Arc::new(ConversationPersistenceAdapter::new(repository, reader));
+        let adapter = Arc::new(ConversationPersistenceAdapter::new(writer, reader));
         let error = adapter
             .append_acp_event("unknown", "message_chunk", serde_json::json!({}))
             .await

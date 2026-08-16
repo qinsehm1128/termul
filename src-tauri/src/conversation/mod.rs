@@ -15,6 +15,7 @@ pub mod persistence_adapter;
 pub mod repository;
 pub mod session_workspace;
 pub mod workspace_projection;
+pub mod write_authority;
 
 #[cfg(test)]
 mod native_durability_tests;
@@ -98,8 +99,10 @@ pub use session_workspace::{
     SessionWorkspaceLoadOutcome, SessionWorkspacePaneDirection, SessionWorkspacePaneNode,
     SessionWorkspaceProjectionState, SessionWorkspaceResourceDescriptor, SessionWorkspaceService,
     SessionWorkspaceSplitNode, SessionWorkspaceV1, SessionWorkspaceWriteOutcome,
-    TerminalResourceDescriptor, SESSION_WORKSPACE_SCHEMA_VERSION,
+    TerminalResourceDescriptor, TerminalResourceRollbackFailure, SESSION_WORKSPACE_SCHEMA_VERSION,
+    TERMINAL_RESOURCE_ROLLBACK_FAILED, TERMINAL_TERMINATE_FAILED,
 };
 pub use workspace_projection::{
     LegacyWorkspaceProjector, WorkspaceProjectionOutcome, WorkspaceProjectionReceiptV1,
 };
+pub use write_authority::{ConversationMutation, ConversationWriteAuthority, ConversationWriter};

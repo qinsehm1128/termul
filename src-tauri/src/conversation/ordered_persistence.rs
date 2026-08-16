@@ -973,9 +973,12 @@ mod tests {
     const CONVERSATION_A: &str = "11111111-1111-4111-8111-111111111111";
     const CONVERSATION_B: &str = "22222222-2222-4222-8222-222222222222";
 
+    type RecordedEvent = (u64, String, Value);
+    type RecordedSessions = HashMap<String, Vec<RecordedEvent>>;
+
     struct FakeTarget {
         mappings: HashMap<String, ConversationId>,
-        records: Mutex<HashMap<String, Vec<(u64, String, Value)>>>,
+        records: Mutex<RecordedSessions>,
         append_count: AtomicUsize,
         blocked: AtomicBool,
         release: (Mutex<bool>, Condvar),
@@ -1085,16 +1088,17 @@ mod tests {
         }
         persistence.flush_all().await.unwrap();
         assert_eq!(persistence.retained_worker_count(), 2);
-        let records = target.records.lock();
-        for session in ["opaque-a", "opaque-b"] {
-            let durable = &records[session];
-            assert_eq!(durable.len(), 5_000);
-            assert_eq!(
-                durable.iter().map(|record| record.0).collect::<Vec<_>>(),
-                (1..=5_000).collect::<Vec<_>>()
-            );
+        {
+            let records = target.records.lock();
+            for session in ["opaque-a", "opaque-b"] {
+                let durable = &records[session];
+                assert_eq!(durable.len(), 5_000);
+                assert_eq!(
+                    durable.iter().map(|record| record.0).collect::<Vec<_>>(),
+                    (1..=5_000).collect::<Vec<_>>()
+                );
+            }
         }
-        drop(records);
         persistence.shutdown().await.unwrap();
     }
 

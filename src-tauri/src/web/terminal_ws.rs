@@ -185,20 +185,28 @@ async fn handle(
                 options.project_id.as_deref().unwrap_or("<none>")
             );
             // CAP-3: spawn is the only issuance path. The reply carries the
-            // flattened info + claim (same camelCase shape as desktop).
-            let spawned = state
-                .pty
-                .spawn(options, None)
-                .await
-                .map_err(|e| ("SPAWN_FAILED", e))?;
-            let service = terminal_workspace_service()?;
-            if let Err(error) = service
-                .add_terminal_ref(conversation_id, &spawned.info.id)
-                .await
-            {
-                let _ = state.pty.terminate(&spawned.info.id).await;
-                return Err(("SESSION_WORKSPACE_UNAVAILABLE", error.detail));
+            // flattened info + claim (same camelCase shape as desktop). Resource accounting uses
+            // the exact SessionWorkspaceService owned by this host's Conversation application.
+            let workspace = terminal_workspace_service(state)?;
+            let result =
+                crate::commands::terminal_spawn_resource(options, None, &state.pty, &workspace)
+                    .await;
+            if !result.success {
+                return Err((
+                    terminal_resource_code(result.code.as_deref()),
+                    result
+                        .error
+                        .unwrap_or_else(|| "terminal spawn failed".to_string()),
+                ));
             }
+            let spawned = result.data.expect("successful terminal spawn has data");
+            debug_assert_eq!(
+                state
+                    .pty
+                    .get(&spawned.info.id)
+                    .map(|instance| instance.conversation_id),
+                Some(conversation_id)
+            );
             ctx.authorize(&spawned.info.id);
             info!(
                 "[terminal-ws] spawn success terminal_id={}",
@@ -253,17 +261,19 @@ async fn handle(
                 ctx.detach(terminal_id);
                 return Ok(Value::Null);
             }
-            state
-                .pty
-                .terminate(terminal_id)
-                .await
-                .map_err(|e| ("TERMINATE_FAILED", e))?;
-            if let Some(conversation_id) = scope {
-                terminal_workspace_service()?
-                    .remove_terminal_ref(conversation_id, terminal_id)
-                    .await
-                    .map_err(|error| ("SESSION_WORKSPACE_UNAVAILABLE", error.detail))?;
+            let workspace = terminal_workspace_service(state)?;
+            let result =
+                crate::commands::terminal_terminate_resource(terminal_id, &state.pty, &workspace)
+                    .await;
+            if !result.success {
+                return Err((
+                    terminal_resource_code(result.code.as_deref()),
+                    result
+                        .error
+                        .unwrap_or_else(|| "terminal termination failed".to_string()),
+                ));
             }
+            debug_assert!(scope.is_none() || state.pty.get(terminal_id).is_none());
             ctx.detach(terminal_id);
             Ok(Value::Null)
         }
@@ -561,17 +571,40 @@ async fn handle(
 }
 
 fn terminal_workspace_service(
-) -> Result<crate::conversation::SessionWorkspaceService, (&'static str, String)> {
-    let repository =
-        crate::conversation::ConversationRepository::lookup_single_open().ok_or_else(|| {
+    state: &AppState,
+) -> Result<Arc<crate::conversation::SessionWorkspaceService>, (&'static str, String)> {
+    state
+        .conversation
+        .as_ref()
+        .map(|conversation| conversation.session_workspace())
+        .ok_or_else(|| {
             (
-                "SESSION_WORKSPACE_UNAVAILABLE",
-                "ConversationRepository is unavailable".to_string(),
+                "CONVERSATION_SERVICE_UNAVAILABLE",
+                "Conversation application service is unavailable".to_string(),
             )
-        })?;
-    Ok(crate::conversation::SessionWorkspaceService::new(
-        repository,
-    ))
+        })
+}
+
+fn terminal_resource_code(code: Option<&str>) -> &'static str {
+    match code {
+        Some(crate::conversation::TERMINAL_RESOURCE_ROLLBACK_FAILED) => {
+            crate::conversation::TERMINAL_RESOURCE_ROLLBACK_FAILED
+        }
+        Some(crate::conversation::TERMINAL_TERMINATE_FAILED) => {
+            crate::conversation::TERMINAL_TERMINATE_FAILED
+        }
+        Some("CONVERSATION_INVALID_ID") => "CONVERSATION_INVALID_ID",
+        Some("CONVERSATION_NOT_FOUND") => "CONVERSATION_NOT_FOUND",
+        Some("CONVERSATION_CONFLICT") => "CONVERSATION_CONFLICT",
+        Some("CONVERSATION_RECOVERY_REQUIRED") => "CONVERSATION_RECOVERY_REQUIRED",
+        Some("CONVERSATION_DURABILITY_FAILED") => "CONVERSATION_DURABILITY_FAILED",
+        Some("LEGACY_COMPATIBILITY_READ_ONLY") => "LEGACY_COMPATIBILITY_READ_ONLY",
+        Some("SESSION_WORKSPACE_RECOVERY_REQUIRED") => "SESSION_WORKSPACE_RECOVERY_REQUIRED",
+        Some("SESSION_WORKSPACE_UNAVAILABLE") => "SESSION_WORKSPACE_UNAVAILABLE",
+        Some("VALIDATION_ERROR") => "VALIDATION_ERROR",
+        Some("SPAWN_FAILED") => "SPAWN_FAILED",
+        _ => "SESSION_WORKSPACE_UNAVAILABLE",
+    }
 }
 
 fn string_field<'a>(value: &'a Value, key: &str) -> Result<&'a str, (&'static str, String)> {
@@ -626,6 +659,76 @@ mod tests {
     fn validates_numeric_dimensions() {
         assert_eq!(u16_field(&json!({ "cols": 80 }), "cols"), Ok(80));
         assert!(u16_field(&json!({ "cols": 0 }), "cols").is_err());
+    }
+
+    #[tokio::test]
+    async fn spawn_compound_rollback() {
+        use crate::conversation::{
+            parse_created_at_utc, ConversationCreator, ConversationLifecycleState,
+            ConversationMutation, ConversationRecordV2, ConversationWriter, CreationPartition,
+            ExecutionTarget, SessionWorkspaceLoadOutcome, SessionWorkspaceService,
+            TerminalResourceRollbackFailure, CONVERSATION_SCHEMA_VERSION,
+            TERMINAL_RESOURCE_ROLLBACK_FAILED,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let (repository, _) =
+            crate::conversation::ConversationRepository::open(base.join("conversations/v2"))
+                .unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
+        let conversation_id =
+            crate::conversation::ConversationId::parse("018f7a1c-1b4d-7c8a-9f01-0123456789ab")
+                .unwrap();
+        let created_at = parse_created_at_utc("2026-08-15T09:45:15.123Z").unwrap();
+        writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: base.to_string_lossy().into_owned(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::Ready,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                },
+                ConversationMutation::CreateConversation,
+            )
+            .await
+            .unwrap();
+        let workspace = Arc::new(SessionWorkspaceService::new(writer));
+        repository.fail_next_workspace_replace();
+        let pty = crate::web::test_pty_manager();
+        let result = crate::commands::terminal_spawn_resource_with_rollback_result(
+            SpawnOptions {
+                conversation_id: Some(conversation_id),
+                cwd: Some(base.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            &pty,
+            &workspace,
+            Err("injected termination failure".to_string()),
+        )
+        .await;
+
+        assert_eq!(
+            terminal_resource_code(result.code.as_deref()),
+            TERMINAL_RESOURCE_ROLLBACK_FAILED
+        );
+        let failure: TerminalResourceRollbackFailure =
+            serde_json::from_str(result.error.as_deref().unwrap()).unwrap();
+        assert_eq!(failure.conversation_id, conversation_id);
+        assert_eq!(failure.primary_code, "CONVERSATION_DURABILITY_FAILED");
+        assert_eq!(failure.rollback_code, "TERMINATE_FAILED");
+        assert!(pty.get(&failure.terminal_id).is_some());
+        assert!(matches!(
+            workspace.load(conversation_id).await.unwrap(),
+            SessionWorkspaceLoadOutcome::Missing { .. }
+        ));
+        pty.terminate(&failure.terminal_id).await.unwrap();
     }
 
     #[test]

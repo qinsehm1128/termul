@@ -112,6 +112,11 @@ impl ConversationCatalog {
     pub fn len(&self) -> usize {
         self.file.conversations.len()
     }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.file.conversations.is_empty()
+    }
 }
 
 #[cfg(test)]

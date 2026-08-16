@@ -266,8 +266,8 @@ mod tests {
         MIGRATION_MAP_SCHEMA_VERSION,
     };
     use crate::conversation::{
-        ConversationReader, ConversationRepository, LegacyConversationReader,
-        SessionWorkspaceProjectionState, SessionWorkspaceService,
+        ConversationMutation, ConversationReader, ConversationRepository, ConversationWriter,
+        LegacyConversationReader, SessionWorkspaceProjectionState, SessionWorkspaceService,
     };
     use crate::web::ws::HistoryMode;
     use axum::body::Body;
@@ -285,20 +285,24 @@ mod tests {
         let state_root = temp.path().canonicalize().unwrap().join("state");
         let (repository, _) =
             ConversationRepository::open(state_root.join("conversations/v2")).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
         let created_at_utc = parse_created_at_utc("2026-08-15T09:45:15.123Z").unwrap();
-        repository
-            .create_conversation(ConversationRecordV2 {
-                schema_version: CONVERSATION_SCHEMA_VERSION,
-                conversation_id: ConversationId::parse(ID).unwrap(),
-                created_at_utc,
-                creation_partition: CreationPartition::from_created_at(created_at_utc),
-                workspace_cwd: "/visible/session".to_string(),
-                execution_target: ExecutionTarget::Workspace,
-                project_attachment: None,
-                lifecycle_state: ConversationLifecycleState::Ready,
-                last_seq: 0,
-                created_by: ConversationCreator::Termul,
-            })
+        writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id: ConversationId::parse(ID).unwrap(),
+                    created_at_utc,
+                    creation_partition: CreationPartition::from_created_at(created_at_utc),
+                    workspace_cwd: "/visible/session".to_string(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::Ready,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                },
+                ConversationMutation::CreateConversation,
+            )
             .await
             .unwrap();
         let legacy =
@@ -315,14 +319,15 @@ mod tests {
             operation_id: uuid::Uuid::new_v4(),
             entries: Vec::new(),
         };
+        let workspace = Arc::new(SessionWorkspaceService::new(Arc::clone(&writer)));
         let conversation = Arc::new(ConversationApplicationService::new(
             reader,
-            Arc::new(SessionWorkspaceService::new(Arc::clone(&repository))),
+            writer,
+            workspace,
             &migration_map,
             MigrationHostMode::Standalone,
             MigrationPhase::Finalized,
             ReaderPrecedence::ConversationV2Only,
-            0,
         ));
         let pty = crate::web::test_pty_manager();
         (

@@ -31,6 +31,7 @@ use crate::conversation::migration::{
 use crate::conversation::persistence_adapter::ConversationPersistenceAdapter;
 use crate::conversation::repository::ConversationRepository;
 use crate::conversation::session_workspace::SessionWorkspaceService;
+use crate::conversation::write_authority::{ConversationWriteAuthority, ConversationWriter};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostConversationRoots {
@@ -74,9 +75,12 @@ impl HostConversationRoots {
 
 pub struct BootstrapOutcome {
     pub repository: Arc<ConversationRepository>,
+    pub authority: Arc<ConversationWriteAuthority>,
+    pub writer: Arc<ConversationWriter>,
     pub reader: Arc<ConversationReader>,
     pub creation: Arc<ConversationCreationService>,
     pub persistence_adapter: Arc<ConversationPersistenceAdapter>,
+    pub workspace: Arc<SessionWorkspaceService>,
     pub application: Arc<ConversationApplicationService>,
     pub layout_generation: uuid::Uuid,
     pub reader_precedence: ReaderPrecedence,
@@ -154,16 +158,9 @@ impl ConversationBootstrap {
         roots.state_root = create_absolute_directory(&roots.state_root, "create_state_root")?;
         roots.workspace_base =
             create_absolute_directory(&roots.workspace_base, "create_workspace_base")?;
-        roots.legacy_session_roots = roots
-            .legacy_session_roots
-            .into_iter()
-            .filter_map(|path| path.canonicalize().ok())
-            .collect();
-        roots.legacy_workspace_manifest_roots = roots
-            .legacy_workspace_manifest_roots
-            .into_iter()
-            .filter_map(|path| path.canonicalize().ok())
-            .collect();
+        // Preserve configured legacy paths verbatim until the no-follow inventory validates every
+        // root/component. Canonicalizing here would follow a symlink or junction before the
+        // migration security boundary can reject it.
 
         // Bootstrap is the sole lock owner. The migration service receives this exact guard and
         // validates it; it never reacquires the lock.
@@ -255,7 +252,7 @@ impl ConversationBootstrap {
         }
 
         let repository_root = roots.private_conversation_root();
-        let (repository, open_report) = ConversationRepository::open(repository_root.clone())
+        let (repository, _open_report) = ConversationRepository::open(repository_root.clone())
             .map_err(|source| {
                 bootstrap_error(
                     "CONVERSATION_REPOSITORY_OPEN_FAILED",
@@ -293,6 +290,25 @@ impl ConversationBootstrap {
                     source,
                 )
             })?;
+        let authority = Arc::new(ConversationWriteAuthority::new(
+            repository.as_ref(),
+            report.reader_precedence,
+            migration_map
+                .entries
+                .iter()
+                .map(|entry| entry.conversation_id),
+        ));
+        let writer = Arc::new(
+            ConversationWriter::new(Arc::clone(&repository), Arc::clone(&authority)).map_err(
+                |source| {
+                    bootstrap_error(
+                        "CONVERSATION_WRITE_AUTHORITY_FAILED",
+                        "create_writer",
+                        source,
+                    )
+                },
+            )?,
+        );
         let reader = Arc::new(ConversationReader::new(
             Arc::clone(&repository),
             legacy,
@@ -308,7 +324,7 @@ impl ConversationBootstrap {
             })?;
         let creation = Arc::new(
             ConversationCreationService::new(
-                Arc::clone(&repository),
+                Arc::clone(&writer),
                 private_locator,
                 workspace_locator,
             )
@@ -328,19 +344,33 @@ impl ConversationBootstrap {
             log::warn!("[conversation-bootstrap] incomplete creations recovered count={recovered}");
         }
         let persistence_adapter = Arc::new(ConversationPersistenceAdapter::new(
-            Arc::clone(&repository),
+            Arc::clone(&writer),
             Arc::clone(&reader),
         ));
-        let workspace = Arc::new(SessionWorkspaceService::new(Arc::clone(&repository)));
+        let workspace = Arc::new(SessionWorkspaceService::new(Arc::clone(&writer)));
         let application = Arc::new(ConversationApplicationService::new(
             Arc::clone(&reader),
-            workspace,
+            Arc::clone(&writer),
+            Arc::clone(&workspace),
             &migration_map,
             host_mode,
             report.phase,
             report.reader_precedence,
-            open_report.recovery_items.len(),
         ));
+        let recovery_item_count = workspace
+            .list_recovery_items()
+            .map_err(|source| {
+                bootstrap_error(
+                    "CONVERSATION_RECOVERY_FAILED",
+                    "load_actionable_recovery",
+                    source,
+                )
+            })?
+            .into_iter()
+            .filter(|item| {
+                item.status == crate::conversation::migration::RecoveryStatus::Unresolved
+            })
+            .count();
         if report.phase == MigrationPhase::ObservationWindow {
             let admitted_at_utc = Utc::now();
             let validation_sha256 = report.validation_sha256.clone().ok_or_else(|| {
@@ -378,18 +408,21 @@ impl ConversationBootstrap {
             "[conversation-bootstrap] complete host_mode={host_mode:?} phase={:?} precedence={:?} recovery_count={}",
             report.phase,
             report.reader_precedence,
-            open_report.recovery_items.len()
+            recovery_item_count
         );
         Ok(BootstrapOutcome {
             repository,
+            authority,
+            writer,
             reader,
             creation,
             persistence_adapter,
+            workspace,
             application,
             layout_generation: report.target_generation,
             reader_precedence: report.reader_precedence,
             migration_phase: report.phase,
-            recovery_item_count: open_report.recovery_items.len(),
+            recovery_item_count,
             repository_root,
             workspace_base: roots.workspace_base,
         })

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
+use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -23,10 +24,13 @@ use crate::conversation::migration::{
     ResolveRecoveryItemRequest, INVENTORY_FILE, MIGRATION_JOURNAL_FILE, MIGRATION_MAP_FILE,
     RECOVERY_ITEMS_FILE,
 };
-use crate::conversation::repository::{ConversationRepository, RepositoryError};
+use crate::conversation::repository::{
+    ConversationRepository, RepositoryError, RepositoryOpenReport,
+};
 use crate::conversation::workspace_projection::{
     LegacyWorkspaceProjector, WorkspaceProjectionOutcome,
 };
+use crate::conversation::write_authority::{ConversationMutation, ConversationWriter};
 
 pub const SESSION_WORKSPACE_SCHEMA_VERSION: u32 = 1;
 const FALLBACK_RECOVERY_OPERATION: &str = "workspace-recovery-v1";
@@ -166,6 +170,8 @@ pub enum SessionWorkspaceErrorCode {
     RecoveryNotFound,
     MigrationIdempotencyConflict,
     SessionWorkspaceUnavailable,
+    SessionWorkspaceRecoveryRequired,
+    LegacyCompatibilityReadOnly,
 }
 
 impl SessionWorkspaceErrorCode {
@@ -196,45 +202,77 @@ impl std::error::Error for SessionWorkspaceError {}
 
 pub type Result<T> = std::result::Result<T, SessionWorkspaceError>;
 
+pub const TERMINAL_RESOURCE_ROLLBACK_FAILED: &str = "TERMINAL_RESOURCE_ROLLBACK_FAILED";
+pub const TERMINAL_TERMINATE_FAILED: &str = "TERMINATE_FAILED";
+
+/// Safe compound identity returned when passive-ref admission fails and PTY rollback also fails.
+/// It deliberately contains no claim, environment, argv, cwd contents, or terminal output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TerminalResourceRollbackFailure {
+    pub terminal_id: String,
+    pub conversation_id: ConversationId,
+    pub primary_code: String,
+    pub rollback_code: String,
+}
+
+impl TerminalResourceRollbackFailure {
+    #[must_use]
+    pub fn wire_detail(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| {
+            format!(
+                "{{\"terminalId\":\"{}\",\"conversationId\":\"{}\",\"primaryCode\":\"{}\",\"rollbackCode\":\"{}\"}}",
+                self.terminal_id, self.conversation_id, self.primary_code, self.rollback_code
+            )
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct SessionWorkspaceService {
+    writer: Arc<ConversationWriter>,
     repository: Arc<ConversationRepository>,
+    repository_recovery_items: Arc<ParkingMutex<Vec<RecoveryItemV1>>>,
 }
 
 impl SessionWorkspaceService {
     #[must_use]
-    pub fn new(repository: Arc<ConversationRepository>) -> Self {
-        Self { repository }
-    }
-
-    /// Resolve the bootstrap-opened repository associated with the preserved legacy manifest root.
-    /// This is used only by the existing shared web composition, avoiding a second repository open.
-    pub fn from_legacy_manifest_root(root: &Path) -> Result<Self> {
-        let state_root = root.parent().ok_or_else(|| {
-            error(
-                SessionWorkspaceErrorCode::SessionWorkspaceUnavailable,
-                "resolve_service",
-                None,
-                "legacy workspace-manifest root has no host-state parent",
-            )
-        })?;
-        let private_root = state_root.join("conversations").join("v2");
-        let repository = ConversationRepository::lookup_open(&private_root)
-            .or_else(ConversationRepository::lookup_single_open)
-            .ok_or_else(|| {
-                error(
-                    SessionWorkspaceErrorCode::SessionWorkspaceUnavailable,
-                    "resolve_service",
-                    None,
-                    "bootstrap-published ConversationRepository is unavailable or ambiguous",
-                )
-            })?;
-        Ok(Self::new(repository))
+    pub fn new(writer: Arc<ConversationWriter>) -> Self {
+        let repository = Arc::clone(writer.repository());
+        let repository_recovery_items = repository_recovery_items(&repository.recovery_report());
+        Self {
+            writer,
+            repository,
+            repository_recovery_items: Arc::new(ParkingMutex::new(repository_recovery_items)),
+        }
     }
 
     #[must_use]
     pub fn repository(&self) -> &Arc<ConversationRepository> {
         &self.repository
+    }
+
+    #[must_use]
+    pub fn writer(&self) -> &Arc<ConversationWriter> {
+        &self.writer
+    }
+
+    pub fn ensure_terminal_ref_writable(
+        &self,
+        conversation_id: ConversationId,
+        add: bool,
+    ) -> Result<()> {
+        self.writer
+            .authorize(
+                conversation_id,
+                if add {
+                    ConversationMutation::TerminalRefAdd
+                } else {
+                    ConversationMutation::TerminalRefRemove
+                },
+            )
+            .map(|_| ())
+            .map_err(|source| repository_error("terminal_ref", conversation_id, source))
     }
 
     /// Add a passive reference after a PTY spawn succeeds. This never owns,
@@ -259,12 +297,112 @@ impl SessionWorkspaceService {
             .await
     }
 
+    /// Remove a passive ref after the PTY is already dead. Failure is converted into an explicit
+    /// recovery-required outcome and a best-effort safe recovery record; the process is never
+    /// recreated.
+    pub async fn remove_terminal_ref_after_termination(
+        &self,
+        conversation_id: ConversationId,
+        terminal_id: &str,
+    ) -> Result<SessionWorkspaceWriteOutcome> {
+        match self.remove_terminal_ref(conversation_id, terminal_id).await {
+            Ok(outcome) => Ok(outcome),
+            Err(primary) => {
+                let primary_code = primary.code.as_str();
+                let recovery = self.record_terminal_ref_cleanup_failure(
+                    conversation_id,
+                    terminal_id,
+                    &primary_code,
+                );
+                let (recovery_id, recovery_record_code) = match recovery {
+                    Ok(recovery_id) => (Some(recovery_id), None),
+                    Err(recovery_error) => {
+                        let recovery_code = recovery_error.code.as_str();
+                        log::error!(
+                            "[session-workspace] terminal-ref cleanup recovery record failed conversation_id={} terminal_id={} primary_code={} recovery_code={}",
+                            conversation_id,
+                            terminal_id,
+                            primary_code,
+                            recovery_code
+                        );
+                        (None, Some(recovery_code))
+                    }
+                };
+                let detail = serde_json::to_string(&json!({
+                    "terminalId": terminal_id,
+                    "conversationId": conversation_id,
+                    "primaryCode": primary_code,
+                    "recoveryId": recovery_id,
+                    "recoveryRecordCode": recovery_record_code,
+                }))
+                .unwrap_or_else(|_| "terminal ref cleanup requires recovery".to_string());
+                log::warn!(
+                    "[session-workspace] terminal-ref cleanup requires recovery conversation_id={} terminal_id={} primary_code={}",
+                    conversation_id,
+                    terminal_id,
+                    primary_code
+                );
+                Err(error(
+                    SessionWorkspaceErrorCode::SessionWorkspaceRecoveryRequired,
+                    "terminal_ref_cleanup",
+                    Some(conversation_id),
+                    detail,
+                ))
+            }
+        }
+    }
+
+    /// Persist a safe recovery identity when PTY termination succeeded but passive-ref cleanup did
+    /// not. The dead process is never recreated and no claim, argv, environment, or output is
+    /// recorded.
+    pub fn record_terminal_ref_cleanup_failure(
+        &self,
+        conversation_id: ConversationId,
+        terminal_id: &str,
+        primary_code: &str,
+    ) -> Result<String> {
+        self.writer
+            .authorize(conversation_id, ConversationMutation::CompensationRecord)
+            .map_err(|source| repository_error("terminal_ref_recovery", conversation_id, source))?;
+        let relative_path = self
+            .repository
+            .workspace_path(conversation_id)
+            .map_err(|source| repository_error("terminal_ref_recovery", conversation_id, source))?
+            .strip_prefix(self.repository.root())
+            .unwrap_or_else(|_| Path::new("workspace.json"))
+            .to_string_lossy()
+            .replace('\\', "/");
+        let digest = sha256_bytes(format!("{terminal_id}\0{primary_code}").as_bytes());
+        let item = RecoveryItemV1::new(
+            RecoveryKind::CorruptSource,
+            RecoverySeverity::Warning,
+            vec![relative_path.clone()],
+            vec![conversation_id],
+            vec![digest.clone()],
+            vec![json!({
+                "reasonCode":"terminalRefCleanupFailed",
+                "terminalId":terminal_id,
+                "primaryCode":primary_code
+            })],
+            vec![RecoveryProvenanceV1 {
+                source_kind: "canonical_terminal_ref".to_string(),
+                relative_path,
+                sha256: digest,
+                preserved_read_only: true,
+            }],
+        );
+        let recovery_id = item.recovery_id.clone();
+        self.persist_recovery_item(item)?;
+        Ok(recovery_id)
+    }
+
     async fn mutate_terminal_ref(
         &self,
         conversation_id: ConversationId,
         terminal_id: &str,
         add: bool,
     ) -> Result<SessionWorkspaceWriteOutcome> {
+        self.ensure_terminal_ref_writable(conversation_id, add)?;
         let lock = self.repository.workspace_lock(conversation_id);
         let _guard = lock.lock().await;
         let current_bytes = self
@@ -337,8 +475,16 @@ impl SessionWorkspaceService {
             )
         })?;
         bytes.push(b'\n');
-        self.repository
-            .replace_workspace_bytes(conversation_id, &bytes)
+        self.writer
+            .replace_workspace_bytes(
+                conversation_id,
+                &bytes,
+                if add {
+                    ConversationMutation::TerminalRefAdd
+                } else {
+                    ConversationMutation::TerminalRefRemove
+                },
+            )
             .map_err(|source| repository_error("terminal_ref", conversation_id, source))?;
         log::info!(
             "[session-workspace] terminal-ref action={} conversation_id={} terminal_id={} revision={}",
@@ -427,6 +573,9 @@ impl SessionWorkspaceService {
         mut workspace: SessionWorkspaceV1,
     ) -> Result<SessionWorkspaceWriteOutcome> {
         validate_workspace_payload(conversation_id, &workspace)?;
+        self.writer
+            .authorize(conversation_id, ConversationMutation::WorkspaceWrite)
+            .map_err(|source| repository_error("write", conversation_id, source))?;
         let lock = self.repository.workspace_lock(conversation_id);
         let _guard = lock.lock().await;
         let current_bytes = self
@@ -487,8 +636,12 @@ impl SessionWorkspaceService {
             )
         })?;
         bytes.push(b'\n');
-        self.repository
-            .replace_workspace_bytes(conversation_id, &bytes)
+        self.writer
+            .replace_workspace_bytes(
+                conversation_id,
+                &bytes,
+                ConversationMutation::WorkspaceWrite,
+            )
             .map_err(|source| repository_error("write", conversation_id, source))?;
         log::info!(
             "[session-workspace] write updated conversation_id={} revision={}",
@@ -526,6 +679,17 @@ impl SessionWorkspaceService {
             })?;
             items.extend(queue.items);
         }
+        let durable_ids = items
+            .iter()
+            .map(|item| item.recovery_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        items.extend(
+            self.repository_recovery_items
+                .lock()
+                .iter()
+                .filter(|item| !durable_ids.contains(&item.recovery_id))
+                .cloned(),
+        );
         items.sort_by(|left, right| left.recovery_id.cmp(&right.recovery_id));
         items.dedup_by(|left, right| left.recovery_id == right.recovery_id);
         Ok(items)
@@ -536,6 +700,31 @@ impl SessionWorkspaceService {
         request: ResolveRecoveryItemRequest,
     ) -> Result<RecoveryActionResult> {
         let (path, mut queue) = self.find_recovery_queue(&request.recovery_id)?;
+        let item = queue
+            .items
+            .iter()
+            .find(|item| item.recovery_id == request.recovery_id)
+            .cloned()
+            .ok_or_else(|| {
+                error(
+                    SessionWorkspaceErrorCode::RecoveryNotFound,
+                    "resolve_recovery",
+                    None,
+                    "recovery item was not found",
+                )
+            })?;
+        let authorization = request.action.authorization();
+        if authorization == crate::conversation::migration::RecoveryAuthorizationClass::Mutation {
+            let targets = recovery_mutation_targets(&item, &request.action)?;
+            for conversation_id in &targets {
+                self.writer
+                    .authorize(*conversation_id, ConversationMutation::RecoveryAction)
+                    .map_err(|source| {
+                        repository_error("resolve_recovery", *conversation_id, source)
+                    })?;
+            }
+        }
+
         let mut workspaces = HashMap::new();
         for item in &queue.items {
             for conversation_id in &item.conversation_ids {
@@ -552,7 +741,6 @@ impl SessionWorkspaceService {
                 }
             }
         }
-        let authorization = request.action.authorization();
         let result = queue
             .resolve(request.clone(), &mut workspaces)
             .map_err(|source| recovery_action_error(source.code, source.detail))?;
@@ -600,6 +788,10 @@ impl SessionWorkspaceService {
             queue
                 .persist(path.parent().expect("queue path has operation directory"))
                 .map_err(|source| {
+                    log::error!(
+                        "[session-workspace] recovery queue persistence failed recovery_id={} code=CONVERSATION_DURABILITY_FAILED",
+                        request.recovery_id
+                    );
                     error(
                         SessionWorkspaceErrorCode::ConversationDurabilityFailed,
                         "persist_recovery",
@@ -607,6 +799,16 @@ impl SessionWorkspaceService {
                         source.to_string(),
                     )
                 })?;
+            self.repository_recovery_items
+                .lock()
+                .retain(|item| item.recovery_id != result.recovery_id);
+            for conversation_id in &item.conversation_ids {
+                self.writer
+                    .clear_recovery_item(*conversation_id, ConversationMutation::RecoveryAction)
+                    .map_err(|source| {
+                        repository_error("resolve_recovery", *conversation_id, source)
+                    })?;
+            }
         }
         log::info!(
             "[session-workspace] recovery action={} recovery_id={} recovery_revision={} workspace_revision={:?}",
@@ -625,6 +827,7 @@ impl SessionWorkspaceService {
         &self,
         conversation_id: ConversationId,
     ) -> Result<Option<SessionWorkspaceV1>> {
+        let projection_writable = self.writer.is_writable(conversation_id);
         let Some(operation_dir) = self.migration_operation_dir()? else {
             return Ok(None);
         };
@@ -722,7 +925,9 @@ impl SessionWorkspaceService {
                             preserved_read_only: true,
                         }],
                     );
-                    self.persist_recovery_item(item)?;
+                    if projection_writable {
+                        self.persist_recovery_item(item)?;
+                    }
                     continue;
                 }
                 let value: Value = match serde_json::from_slice(&bytes) {
@@ -742,7 +947,9 @@ impl SessionWorkspaceService {
                                 preserved_read_only: true,
                             }],
                         );
-                        self.persist_recovery_item(item)?;
+                        if projection_writable {
+                            self.persist_recovery_item(item)?;
+                        }
                         continue;
                     }
                 };
@@ -788,7 +995,9 @@ impl SessionWorkspaceService {
                     })
                     .collect(),
             );
-            self.persist_recovery_item(item)?;
+            if projection_writable {
+                self.persist_recovery_item(item)?;
+            }
             return Ok(None);
         }
         let source = sources.pop().expect("one projection source remains");
@@ -803,10 +1012,19 @@ impl SessionWorkspaceService {
             format_created_at_utc(&Utc::now()),
         ) {
             WorkspaceProjectionOutcome::RecoveryRequired { item } => {
-                self.persist_recovery_item(item)?;
+                if projection_writable {
+                    self.persist_recovery_item(item)?;
+                }
                 Ok(None)
             }
             WorkspaceProjectionOutcome::Projected { workspace, .. } => {
+                if !projection_writable {
+                    log::info!(
+                        "[session-workspace] read-only legacy projection returned without canonical mutation conversation_id={}",
+                        conversation_id
+                    );
+                    return Ok(Some(workspace));
+                }
                 match self.write(conversation_id, None, workspace).await? {
                     SessionWorkspaceWriteOutcome::Updated { revision: 1, .. }
                     | SessionWorkspaceWriteOutcome::Conflict {
@@ -942,6 +1160,12 @@ impl SessionWorkspaceService {
                 preserved_read_only: true,
             }],
         );
+        if !self.writer.is_writable(conversation_id) {
+            return Ok(item);
+        }
+        self.writer
+            .authorize(conversation_id, ConversationMutation::RecoveryQueueWrite)
+            .map_err(|source| repository_error("workspace_recovery", conversation_id, source))?;
         let path = self.primary_recovery_queue_path()?;
         let operation_dir = path.parent().expect("queue path has operation directory");
         let mut queue = match fs::read(&path) {
@@ -990,6 +1214,19 @@ impl SessionWorkspaceService {
 
     fn persist_recovery_item(&self, item: RecoveryItemV1) -> Result<()> {
         let conversation_id = item.conversation_ids.first().copied();
+        if item.conversation_ids.is_empty() {
+            return Err(error(
+                SessionWorkspaceErrorCode::ValidationError,
+                "persist_recovery",
+                None,
+                "runtime recovery records require at least one candidate ConversationId",
+            ));
+        }
+        for candidate in &item.conversation_ids {
+            self.writer
+                .authorize(*candidate, ConversationMutation::RecoveryQueueWrite)
+                .map_err(|source| repository_error("persist_recovery", *candidate, source))?;
+        }
         let path = self.primary_recovery_queue_path()?;
         let operation_dir = path.parent().expect("queue path has operation directory");
         let mut queue = match fs::read(&path) {
@@ -1065,6 +1302,18 @@ impl SessionWorkspaceService {
                 return Ok((path, queue));
             }
         }
+        if let Some(item) = self
+            .repository_recovery_items
+            .lock()
+            .iter()
+            .find(|item| item.recovery_id == recovery_id)
+            .cloned()
+        {
+            return Ok((
+                self.fallback_recovery_queue_path()?,
+                RecoveryQueueV1::new(Uuid::new_v4(), vec![item]),
+            ));
+        }
         Err(error(
             SessionWorkspaceErrorCode::RecoveryNotFound,
             "resolve_recovery",
@@ -1133,6 +1382,82 @@ impl SessionWorkspaceService {
                 )
             })
     }
+}
+
+fn repository_recovery_items(report: &RepositoryOpenReport) -> Vec<RecoveryItemV1> {
+    report
+        .recovery_items
+        .iter()
+        .filter(|item| item.requires_action && !item.repaired)
+        .map(|item| {
+            let code = serde_json::to_value(item.code)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "CONVERSATION_RECOVERY_REQUIRED".to_string());
+            let digest = sha256_bytes(
+                format!(
+                    "{code}\0{:?}\0{}\0{}",
+                    item.kind, item.relative_path, item.detail
+                )
+                .as_bytes(),
+            );
+            RecoveryItemV1::new(
+                RecoveryKind::CorruptSource,
+                RecoverySeverity::Blocking,
+                vec![item.relative_path.clone()],
+                item.conversation_id.into_iter().collect(),
+                vec![digest.clone()],
+                vec![json!({
+                    "reasonCode":"repositoryRecoveryRequired",
+                    "repositoryKind": serde_json::to_value(item.kind)
+                        .unwrap_or_else(|_| json!("unknown")),
+                    "code":code
+                })],
+                vec![RecoveryProvenanceV1 {
+                    source_kind: "canonical_repository".to_string(),
+                    relative_path: item.relative_path.clone(),
+                    sha256: digest,
+                    preserved_read_only: true,
+                }],
+            )
+        })
+        .collect()
+}
+
+fn recovery_mutation_targets(
+    item: &RecoveryItemV1,
+    action: &RecoveryAction,
+) -> Result<Vec<ConversationId>> {
+    let targets = match action {
+        RecoveryAction::Inspect(_) => Vec::new(),
+        RecoveryAction::AssociateConversation(payload) => vec![payload.conversation_id],
+        RecoveryAction::StartEmptyWorkspace(payload) => vec![payload.conversation_id],
+        RecoveryAction::DismissPreservedSource(_) => item.conversation_ids.clone(),
+    };
+    if targets.is_empty() {
+        return Err(error(
+            SessionWorkspaceErrorCode::ValidationError,
+            "resolve_recovery",
+            None,
+            "mutation recovery action has no candidate ConversationId scope",
+        ));
+    }
+    for target in &targets {
+        if !item.conversation_ids.contains(target) {
+            log::warn!(
+                "[session-workspace] recovery candidate rejected recovery_id={} conversation_id={} code=VALIDATION_ERROR",
+                item.recovery_id,
+                target
+            );
+            return Err(error(
+                SessionWorkspaceErrorCode::ValidationError,
+                "resolve_recovery",
+                Some(*target),
+                "recovery target is outside the RecoveryItem candidate set",
+            ));
+        }
+    }
+    Ok(targets)
 }
 
 fn collect_legacy_session_references(value: &Value, key: Option<&str>, output: &mut Vec<String>) {
@@ -1249,6 +1574,9 @@ fn repository_error(
         | crate::conversation::contracts::ConversationErrorCode::ConversationDurabilityUnsupported => {
             SessionWorkspaceErrorCode::ConversationDurabilityFailed
         }
+        crate::conversation::contracts::ConversationErrorCode::LegacyCompatibilityReadOnly => {
+            SessionWorkspaceErrorCode::LegacyCompatibilityReadOnly
+        }
         _ => SessionWorkspaceErrorCode::ConversationRecoveryRequired,
     };
     error(code, operation, Some(conversation_id), source.to_string())
@@ -1316,25 +1644,29 @@ mod tests {
             .unwrap()
             .join("state/conversations/v2");
         let (repository, _) = ConversationRepository::open(root).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
         for id in [ID, OTHER_ID] {
             let created_at_utc = parse_created_at_utc("2026-08-15T09:45:15.123Z").unwrap();
-            repository
-                .create_conversation(ConversationRecordV2 {
-                    schema_version: CONVERSATION_SCHEMA_VERSION,
-                    conversation_id: ConversationId::parse(id).unwrap(),
-                    created_at_utc,
-                    creation_partition: CreationPartition::from_created_at(created_at_utc),
-                    workspace_cwd: format!("/visible/{id}"),
-                    execution_target: ExecutionTarget::Workspace,
-                    project_attachment: None,
-                    lifecycle_state: ConversationLifecycleState::Ready,
-                    last_seq: 0,
-                    created_by: ConversationCreator::Termul,
-                })
+            writer
+                .create_conversation(
+                    ConversationRecordV2 {
+                        schema_version: CONVERSATION_SCHEMA_VERSION,
+                        conversation_id: ConversationId::parse(id).unwrap(),
+                        created_at_utc,
+                        creation_partition: CreationPartition::from_created_at(created_at_utc),
+                        workspace_cwd: format!("/visible/{id}"),
+                        execution_target: ExecutionTarget::Workspace,
+                        project_attachment: None,
+                        lifecycle_state: ConversationLifecycleState::Ready,
+                        last_seq: 0,
+                        created_by: ConversationCreator::Termul,
+                    },
+                    ConversationMutation::CreateConversation,
+                )
                 .await
                 .unwrap();
         }
-        let service = SessionWorkspaceService::new(Arc::clone(&repository));
+        let service = SessionWorkspaceService::new(writer);
         (temp, repository, service)
     }
 
@@ -1396,7 +1728,8 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), before);
 
         let (reopened, _) = ConversationRepository::open(repository.root().to_path_buf()).unwrap();
-        let reopened_service = SessionWorkspaceService::new(reopened);
+        let reopened_writer = ConversationWriter::for_test(reopened);
+        let reopened_service = SessionWorkspaceService::new(reopened_writer);
         let SessionWorkspaceLoadOutcome::Loaded {
             workspace: loaded_workspace,
         } = reopened_service.load(id).await.unwrap()
@@ -1516,7 +1849,8 @@ mod tests {
             item.kind
                 == crate::conversation::repository::RepositoryRecoveryKind::WorkspaceRecoveryRequired
         }));
-        let reopened_service = SessionWorkspaceService::new(reopened_repository);
+        let reopened_writer = ConversationWriter::for_test(reopened_repository);
+        let reopened_service = SessionWorkspaceService::new(reopened_writer);
         assert!(matches!(
             reopened_service.load(id).await.unwrap(),
             SessionWorkspaceLoadOutcome::RecoveryRequired { .. }
@@ -1686,6 +2020,42 @@ mod tests {
             resource,
             SessionWorkspaceResourceDescriptor::Terminal { terminal_id, .. }
                 if terminal_id == "pty-one"
+        )));
+    }
+
+    #[tokio::test]
+    async fn dead_terminal_ref_cleanup_failure_records_recovery_without_process_recreation() {
+        let (_temp, repository, service) = fixture().await;
+        let id = ConversationId::parse(ID).unwrap();
+        service.add_terminal_ref(id, "pty-dead").await.unwrap();
+        repository.fail_next_workspace_replace();
+
+        let error = service
+            .remove_terminal_ref_after_termination(id, "pty-dead")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            SessionWorkspaceErrorCode::SessionWorkspaceRecoveryRequired
+        );
+        let detail: Value = serde_json::from_str(&error.detail).unwrap();
+        assert_eq!(detail["terminalId"], "pty-dead");
+        assert_eq!(detail["conversationId"], ID);
+        assert_eq!(detail["primaryCode"], "CONVERSATION_DURABILITY_FAILED");
+        assert!(detail["recoveryId"].as_str().is_some());
+        assert!(service
+            .list_recovery_items()
+            .unwrap()
+            .iter()
+            .any(|item| item.status == RecoveryStatus::Unresolved));
+        let SessionWorkspaceLoadOutcome::Loaded { workspace } = service.load(id).await.unwrap()
+        else {
+            panic!("workspace remains available for recovery")
+        };
+        assert!(workspace.resources.iter().any(|resource| matches!(
+            resource,
+            SessionWorkspaceResourceDescriptor::Terminal { terminal_id, .. }
+                if terminal_id == "pty-dead"
         )));
     }
 

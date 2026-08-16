@@ -114,7 +114,7 @@ pub async fn replace(
     Path(conversation_id): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
-    if let Err(response) = require_mutation(&authority, &principal) {
+    if let Some(response) = mutation_denial(&authority, &principal) {
         return response;
     }
     let conversation_id = match parse_id(&conversation_id) {
@@ -154,7 +154,7 @@ async fn mutate_revision(
     body: Bytes,
     mutation: Mutation,
 ) -> (StatusCode, Json<IpcBody<ConversationLifecycleOutcome>>) {
-    if let Err(response) = require_mutation(&authority, &principal) {
+    if let Some(response) = mutation_denial(&authority, &principal) {
         return response;
     }
     let conversation_id = match parse_id(&conversation_id) {
@@ -245,13 +245,14 @@ fn validation(detail: String) -> (StatusCode, Json<IpcBody<ConversationLifecycle
     )
 }
 
-fn require_mutation(
+fn mutation_denial(
     authority: &RemoteAccessAuthority,
     principal: &RemotePrincipal,
-) -> Result<(), (StatusCode, Json<IpcBody<ConversationLifecycleOutcome>>)> {
+) -> Option<(StatusCode, Json<IpcBody<ConversationLifecycleOutcome>>)> {
     authority
         .authorize(principal, RemoteCapability::Mutate)
-        .map_err(|error| failure(error.code().to_string(), error.to_string()))
+        .err()
+        .map(|error| failure(error.code().to_string(), error.to_string()))
 }
 
 fn failure(
@@ -279,8 +280,9 @@ mod tests {
     };
     use crate::conversation::{
         ConversationApplicationService, ConversationCreationService, ConversationLifecycleService,
-        ConversationLocator, ConversationPersistenceAdapter, ConversationReader,
-        ConversationRepository, SessionWorkspaceLocator, SessionWorkspaceService,
+        ConversationLocator, ConversationMutation, ConversationPersistenceAdapter,
+        ConversationReader, ConversationRepository, ConversationWriter, SessionWorkspaceLocator,
+        SessionWorkspaceService,
     };
     use crate::web::ws::HistoryMode;
     use axum::body::Body;
@@ -301,26 +303,30 @@ mod tests {
         let visible = base.join("visible");
         std::fs::create_dir_all(&visible).unwrap();
         let (repository, _) = ConversationRepository::open(private.clone()).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
         let id = ConversationId::parse(ID).unwrap();
         let created_at = parse_created_at_utc("2026-08-15T09:45:15.123Z").unwrap();
         let workspace = visible.join("sessions/2026/08/15").join(ID);
         std::fs::create_dir_all(&workspace).unwrap();
-        repository
-            .create_conversation(ConversationRecordV2 {
-                schema_version: CONVERSATION_SCHEMA_VERSION,
-                conversation_id: id,
-                created_at_utc: created_at,
-                creation_partition: CreationPartition::from_created_at(created_at),
-                workspace_cwd: workspace.to_string_lossy().into_owned(),
-                execution_target: ExecutionTarget::Workspace,
-                project_attachment: None,
-                lifecycle_state: ConversationLifecycleState::Ready,
-                last_seq: 0,
-                created_by: ConversationCreator::Termul,
-            })
+        writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id: id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: workspace.to_string_lossy().into_owned(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::Ready,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                },
+                ConversationMutation::CreateConversation,
+            )
             .await
             .unwrap();
-        repository
+        writer
             .bind_agent_session(
                 id,
                 AgentSessionBinding {
@@ -339,7 +345,7 @@ mod tests {
             .unwrap();
         let creation = Arc::new(
             ConversationCreationService::new(
-                Arc::clone(&repository),
+                Arc::clone(&writer),
                 ConversationLocator::new(private).unwrap(),
                 SessionWorkspaceLocator::new(visible).unwrap(),
             )
@@ -351,7 +357,7 @@ mod tests {
             ReaderPrecedence::ConversationV2Only,
         ));
         let persistence = Arc::new(ConversationPersistenceAdapter::new(
-            Arc::clone(&repository),
+            Arc::clone(&writer),
             Arc::clone(&reader),
         ));
         let acp = Arc::new(AcpManager::with_conversation_services(
@@ -366,14 +372,15 @@ mod tests {
             operation_id: Uuid::new_v4(),
             entries: Vec::new(),
         };
+        let workspace_service = Arc::new(SessionWorkspaceService::new(Arc::clone(&writer)));
         let conversation = Arc::new(ConversationApplicationService::new(
             reader,
-            Arc::new(SessionWorkspaceService::new(Arc::clone(&repository))),
+            writer,
+            workspace_service,
             &migration_map,
             MigrationHostMode::Standalone,
             MigrationPhase::Finalized,
             ReaderPrecedence::ConversationV2Only,
-            0,
         ));
         conversation
             .attach_lifecycle(

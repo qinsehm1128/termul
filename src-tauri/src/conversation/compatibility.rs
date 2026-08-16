@@ -275,25 +275,6 @@ impl ConversationReader {
         records.sort_by_key(|record| record.conversation_id.to_string());
         records
     }
-
-    /// The sole mutation admission seam. It returns only the v2 repository and disables writes to
-    /// mapped legacy Conversations during hybrid rollback.
-    pub fn repository_for_write(
-        &self,
-        conversation_id: ConversationId,
-    ) -> Result<Arc<ConversationRepository>, CompatibilityError> {
-        if self.precedence == ReaderPrecedence::LegacyOnly
-            || (self.precedence == ReaderPrecedence::HybridLegacyFirst
-                && self.legacy.is_mapped(conversation_id))
-        {
-            return Err(CompatibilityError {
-                code: "LEGACY_COMPATIBILITY_READ_ONLY",
-                detail: "mapped legacy Conversations are read-only under the active reader policy"
-                    .to_string(),
-            });
-        }
-        Ok(Arc::clone(&self.repository))
-    }
 }
 
 fn source_metadata_path(source_key: &str, roots: &[PathBuf]) -> Option<PathBuf> {
@@ -393,14 +374,22 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap().join("v2");
         let (repository, _) = ConversationRepository::open(root).unwrap();
+        let seed_writer =
+            crate::conversation::ConversationWriter::for_test(Arc::clone(&repository));
         let legacy_record = record(LEGACY_ID, "/legacy");
-        repository
-            .create_conversation(legacy_record.clone())
+        seed_writer
+            .create_conversation(
+                legacy_record.clone(),
+                crate::conversation::ConversationMutation::CreateConversation,
+            )
             .await
             .unwrap();
         let new_record = record(NEW_ID, "/new-project-less");
-        repository
-            .create_conversation(new_record.clone())
+        seed_writer
+            .create_conversation(
+                new_record.clone(),
+                crate::conversation::ConversationMutation::CreateConversation,
+            )
             .await
             .unwrap();
         let legacy =
@@ -422,13 +411,29 @@ mod tests {
             legacy_record
         );
         assert_eq!(reader.get(new_record.conversation_id).unwrap(), new_record);
-        let error = match reader.repository_for_write(ConversationId::parse(LEGACY_ID).unwrap()) {
-            Ok(_) => panic!("mapped legacy write must be rejected"),
-            Err(error) => error,
-        };
-        assert_eq!(error.code, "LEGACY_COMPATIBILITY_READ_ONLY");
-        assert!(reader
-            .repository_for_write(ConversationId::parse(NEW_ID).unwrap())
+        let authority = Arc::new(crate::conversation::ConversationWriteAuthority::new(
+            repository.as_ref(),
+            ReaderPrecedence::HybridLegacyFirst,
+            [ConversationId::parse(LEGACY_ID).unwrap()],
+        ));
+        let writer =
+            crate::conversation::ConversationWriter::new(Arc::clone(&repository), authority)
+                .unwrap();
+        let error = writer
+            .authorize(
+                ConversationId::parse(LEGACY_ID).unwrap(),
+                crate::conversation::ConversationMutation::MetadataUpdate,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            crate::conversation::ConversationErrorCode::LegacyCompatibilityReadOnly
+        );
+        assert!(writer
+            .authorize(
+                ConversationId::parse(NEW_ID).unwrap(),
+                crate::conversation::ConversationMutation::MetadataUpdate,
+            )
             .is_ok());
         assert_eq!(repository.list_conversations().len(), 2);
     }

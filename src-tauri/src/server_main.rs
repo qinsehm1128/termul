@@ -526,6 +526,7 @@ fn schedule_standalone_conversation_maintenance(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod conversation_maintenance_tests {
     use super::*;
     use termul_manager_lib::conversation::MigrationMaintenanceAction;

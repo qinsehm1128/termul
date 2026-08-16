@@ -27,6 +27,7 @@ use crate::conversation::repository::{ConversationRepository, RepositoryError};
 use crate::conversation::session_workspace::{
     SessionWorkspaceResourceDescriptor, SessionWorkspaceV1, SESSION_WORKSPACE_SCHEMA_VERSION,
 };
+use crate::conversation::write_authority::{ConversationMutation, ConversationWriter};
 use crate::pty::PtyManager;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +86,7 @@ pub enum ConversationLifecycleErrorCode {
     ConversationLiveResources,
     ConversationRecoveryRequired,
     ConversationDurabilityFailed,
+    LegacyCompatibilityReadOnly,
     AcpCloseUnsupported,
     AcpCloseFailed,
     AcpReplaceFailed,
@@ -218,6 +220,7 @@ impl TerminalResourceInspector for PtyManager {
 
 #[derive(Clone)]
 pub struct ConversationLifecycleService {
+    writer: Arc<ConversationWriter>,
     repository: Arc<ConversationRepository>,
     creation: Arc<ConversationCreationService>,
     provider: Arc<dyn ConversationAgentLifecycle>,
@@ -227,12 +230,14 @@ pub struct ConversationLifecycleService {
 impl ConversationLifecycleService {
     #[must_use]
     pub fn new(
-        repository: Arc<ConversationRepository>,
+        writer: Arc<ConversationWriter>,
         creation: Arc<ConversationCreationService>,
         provider: Arc<dyn ConversationAgentLifecycle>,
         terminals: Arc<dyn TerminalResourceInspector>,
     ) -> Self {
+        let repository = Arc::clone(writer.repository());
         Self {
+            writer,
             repository,
             creation,
             provider,
@@ -249,12 +254,7 @@ impl ConversationLifecycleService {
                 "bootstrap-published ConversationCreationService is unavailable",
             )
         })?;
-        Ok(Self::new(
-            Arc::clone(creation.repository()),
-            creation,
-            acp,
-            pty,
-        ))
+        Ok(Self::new(Arc::clone(creation.writer()), creation, acp, pty))
     }
 
     pub async fn detach_agent_binding(
@@ -262,12 +262,19 @@ impl ConversationLifecycleService {
         conversation_id: ConversationId,
         expected_revision: u64,
     ) -> Result<ConversationLifecycleOutcome> {
+        let permit = self
+            .writer
+            .authorize(conversation_id, ConversationMutation::BindingDetach)
+            .map_err(map_repository_error)?;
         let _guard = self.repository.lifecycle_lock(conversation_id).await;
         let record = self.expected(conversation_id, expected_revision, "detach_binding")?;
         self.repository
-            .detach_agent_binding_locked(conversation_id, Utc::now())
+            .detach_agent_binding_locked(&permit, conversation_id, Utc::now())
             .map_err(map_repository_error)?;
-        self.repository.refresh_lifecycle_catalog().await;
+        self.repository
+            .refresh_lifecycle_catalog(&permit, conversation_id)
+            .await
+            .map_err(map_repository_error)?;
         self.updated(ConversationLifecycleAction::DetachBinding, &record, None)
     }
 
@@ -276,6 +283,10 @@ impl ConversationLifecycleService {
         conversation_id: ConversationId,
         expected_revision: u64,
     ) -> Result<ConversationLifecycleOutcome> {
+        let permit = self
+            .writer
+            .authorize(conversation_id, ConversationMutation::BindingRebind)
+            .map_err(map_repository_error)?;
         let _guard = self.repository.lifecycle_lock(conversation_id).await;
         let record = self.expected(conversation_id, expected_revision, "rebind_binding")?;
         let binding = self.current_binding(conversation_id, "rebind_binding")?;
@@ -296,9 +307,12 @@ impl ConversationLifecycleService {
             ));
         }
         self.repository
-            .rebind_detached_binding_locked(conversation_id, Utc::now())
+            .rebind_detached_binding_locked(&permit, conversation_id, Utc::now())
             .map_err(map_repository_error)?;
-        self.repository.refresh_lifecycle_catalog().await;
+        self.repository
+            .refresh_lifecycle_catalog(&permit, conversation_id)
+            .await
+            .map_err(map_repository_error)?;
         self.updated(
             ConversationLifecycleAction::RebindDetachedBinding,
             &record,
@@ -311,6 +325,10 @@ impl ConversationLifecycleService {
         conversation_id: ConversationId,
         expected_revision: u64,
     ) -> Result<ConversationLifecycleOutcome> {
+        let permit = self
+            .writer
+            .authorize(conversation_id, ConversationMutation::BindingSuspend)
+            .map_err(map_repository_error)?;
         let _guard = self.repository.lifecycle_lock(conversation_id).await;
         let record = self.expected(conversation_id, expected_revision, "suspend_binding")?;
         let binding = self.current_binding(conversation_id, "suspend_binding")?;
@@ -343,12 +361,17 @@ impl ConversationLifecycleService {
                 source.detail,
             ));
         }
-        if let Err(error) = self
-            .repository
-            .suspend_agent_binding_locked(conversation_id, Utc::now())
-        {
+        if let Err(error) =
             self.repository
-                .mark_lifecycle_recovery_required_locked(conversation_id);
+                .suspend_agent_binding_locked(&permit, conversation_id, Utc::now())
+        {
+            if let Ok(compensation) = self
+                .writer
+                .authorize(conversation_id, ConversationMutation::CompensationRecord)
+            {
+                self.repository
+                    .mark_lifecycle_recovery_required_locked(&compensation, conversation_id);
+            }
             return Err(lifecycle_error(
                 ConversationLifecycleErrorCode::ConversationRecoveryRequired,
                 "suspend_binding",
@@ -356,7 +379,10 @@ impl ConversationLifecycleService {
                 format!("provider closed the session but canonical append failed: {error}"),
             ));
         }
-        self.repository.refresh_lifecycle_catalog().await;
+        self.repository
+            .refresh_lifecycle_catalog(&permit, conversation_id)
+            .await
+            .map_err(map_repository_error)?;
         self.updated(ConversationLifecycleAction::SuspendBinding, &record, None)
     }
 
@@ -366,6 +392,10 @@ impl ConversationLifecycleService {
         mut request: PrepareConversationRequest,
         expected_revision: u64,
     ) -> Result<ConversationLifecycleOutcome> {
+        let permit = self
+            .writer
+            .authorize(conversation_id, ConversationMutation::BindingReplace)
+            .map_err(map_repository_error)?;
         let _guard = self.repository.lifecycle_lock(conversation_id).await;
         let record = self.expected(conversation_id, expected_revision, "replace_binding")?;
         request.conversation_id = Some(conversation_id);
@@ -404,12 +434,18 @@ impl ConversationLifecycleService {
             state: AgentSessionBindingState::Active,
         };
         if let Err(error) = self.repository.replace_agent_binding_locked(
+            &permit,
             conversation_id,
             replacement.clone(),
             replacement.bound_at_utc,
         ) {
-            self.repository
-                .mark_lifecycle_recovery_required_locked(conversation_id);
+            if let Ok(compensation) = self
+                .writer
+                .authorize(conversation_id, ConversationMutation::CompensationRecord)
+            {
+                self.repository
+                    .mark_lifecycle_recovery_required_locked(&compensation, conversation_id);
+            }
             self.provider.abort_replacement(&replacement).await;
             return Err(lifecycle_error(
                 ConversationLifecycleErrorCode::ConversationRecoveryRequired,
@@ -420,7 +456,10 @@ impl ConversationLifecycleService {
         }
         self.provider
             .register_binding(&replacement.agent_session_id, conversation_id);
-        self.repository.refresh_lifecycle_catalog().await;
+        self.repository
+            .refresh_lifecycle_catalog(&permit, conversation_id)
+            .await
+            .map_err(map_repository_error)?;
         self.updated(
             ConversationLifecycleAction::ReplaceBinding,
             &record,
@@ -433,6 +472,10 @@ impl ConversationLifecycleService {
         conversation_id: ConversationId,
         expected_revision: u64,
     ) -> Result<ConversationLifecycleOutcome> {
+        let permit = self
+            .writer
+            .authorize(conversation_id, ConversationMutation::ConversationTombstone)
+            .map_err(map_repository_error)?;
         let _guard = self.repository.lifecycle_lock(conversation_id).await;
         let record = self.expected(conversation_id, expected_revision, "delete_conversation")?;
         let mut blockers = Vec::new();
@@ -475,9 +518,12 @@ impl ConversationLifecycleService {
         }
         let deleted = self
             .repository
-            .tombstone_conversation_locked(conversation_id)
+            .tombstone_conversation_locked(&permit, conversation_id)
             .map_err(map_repository_error)?;
-        self.repository.refresh_lifecycle_catalog().await;
+        self.repository
+            .refresh_lifecycle_catalog(&permit, conversation_id)
+            .await
+            .map_err(map_repository_error)?;
         Ok(ConversationLifecycleOutcome::Updated {
             action: ConversationLifecycleAction::DeleteConversation,
             conversation_id,
@@ -627,6 +673,9 @@ fn map_repository_error(source: RepositoryError) -> ConversationLifecycleError {
         | ConversationErrorCode::ConversationDurabilityUnsupported => {
             ConversationLifecycleErrorCode::ConversationDurabilityFailed
         }
+        ConversationErrorCode::LegacyCompatibilityReadOnly => {
+            ConversationLifecycleErrorCode::LegacyCompatibilityReadOnly
+        }
         _ => ConversationLifecycleErrorCode::ConversationRecoveryRequired,
     };
     lifecycle_error(
@@ -754,26 +803,30 @@ mod tests {
         let visible = base.join("visible");
         std::fs::create_dir_all(&visible).unwrap();
         let (repository, _) = ConversationRepository::open(private.clone()).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
         let id = ConversationId::parse(ID).unwrap();
         let created_at = parse_created_at_utc("2026-08-15T09:45:15.123Z").unwrap();
         let workspace = visible.join("sessions/2026/08/15").join(ID);
         std::fs::create_dir_all(&workspace).unwrap();
-        repository
-            .create_conversation(ConversationRecordV2 {
-                schema_version: CONVERSATION_SCHEMA_VERSION,
-                conversation_id: id,
-                created_at_utc: created_at,
-                creation_partition: CreationPartition::from_created_at(created_at),
-                workspace_cwd: workspace.to_string_lossy().into_owned(),
-                execution_target: ExecutionTarget::Workspace,
-                project_attachment: None,
-                lifecycle_state: ConversationLifecycleState::Ready,
-                last_seq: 0,
-                created_by: ConversationCreator::Termul,
-            })
+        writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id: id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: workspace.to_string_lossy().into_owned(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::Ready,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                },
+                ConversationMutation::CreateConversation,
+            )
             .await
             .unwrap();
-        repository
+        writer
             .bind_agent_session(
                 id,
                 AgentSessionBinding {
@@ -792,7 +845,7 @@ mod tests {
             .unwrap();
         let creation = Arc::new(
             ConversationCreationService::new(
-                Arc::clone(&repository),
+                Arc::clone(&writer),
                 ConversationLocator::new(private).unwrap(),
                 SessionWorkspaceLocator::new(visible).unwrap(),
             )
@@ -802,7 +855,7 @@ mod tests {
         *provider.owns.lock() = true;
         let terminals = Arc::new(FakeTerminals::default());
         let service = ConversationLifecycleService::new(
-            Arc::clone(&repository),
+            writer,
             Arc::clone(&creation),
             provider.clone(),
             terminals.clone(),
@@ -1050,7 +1103,7 @@ mod tests {
             .0
             .lock()
             .insert("terminal-live".to_string());
-        let workspace_service = SessionWorkspaceService::new(Arc::clone(&fixture.repository));
+        let workspace_service = SessionWorkspaceService::new(Arc::clone(fixture.creation.writer()));
         workspace_service
             .write(
                 fixture.id,

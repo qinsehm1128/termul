@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Weak};
+use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
@@ -17,6 +17,7 @@ use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
+use uuid::Uuid;
 
 use crate::conversation::catalog::{
     rebuild_catalog, AcceptedCanonicalConversation, CatalogRecoveryIssue, ConversationCatalog,
@@ -35,6 +36,7 @@ use crate::conversation::event_log::{
     ProjectAttachmentEventPayloadV1, CONVERSATION_EVENT_SCHEMA_VERSION, EVENT_LOG_FILES,
 };
 use crate::conversation::locator::ConversationLocator;
+use crate::conversation::write_authority::RepositoryWritePermit;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -110,10 +112,15 @@ impl std::error::Error for RepositoryError {}
 
 pub type Result<T> = std::result::Result<T, RepositoryError>;
 
-static OPEN_REPOSITORIES: LazyLock<ParkingMutex<HashMap<PathBuf, Weak<ConversationRepository>>>> =
-    LazyLock::new(|| ParkingMutex::new(HashMap::new()));
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepositoryMode {
+    Runtime,
+    MigrationStaging,
+}
 
 pub struct ConversationRepository {
+    instance_id: Uuid,
+    mode: RepositoryMode,
     locator: ConversationLocator,
     durable_fs: DurableFileSystem,
     states: ParkingMutex<HashMap<ConversationId, ConversationState>>,
@@ -122,12 +129,26 @@ pub struct ConversationRepository {
     conversation_locks: ParkingMutex<HashMap<ConversationId, Arc<TokioMutex<()>>>>,
     catalog: ParkingMutex<CatalogCacheState>,
     catalog_lock: TokioMutex<()>,
+    #[cfg(test)]
+    fail_next_workspace_replace: std::sync::atomic::AtomicBool,
 }
 
 impl ConversationRepository {
     /// Open the canonical root, repair only torn final JSONL tails, recover stale creation state,
     /// and rewrite the disposable catalog from validated authoritative files.
     pub fn open(private_root: PathBuf) -> Result<(Arc<Self>, RepositoryOpenReport)> {
+        Self::open_with_mode(private_root, RepositoryMode::Runtime)
+    }
+
+    /// Open the pre-admission migration target. Only MigrationWriter permits are accepted.
+    pub(crate) fn open_staging(private_root: PathBuf) -> Result<(Arc<Self>, RepositoryOpenReport)> {
+        Self::open_with_mode(private_root, RepositoryMode::MigrationStaging)
+    }
+
+    fn open_with_mode(
+        private_root: PathBuf,
+        mode: RepositoryMode,
+    ) -> Result<(Arc<Self>, RepositoryOpenReport)> {
         let started_at = Instant::now();
         let durable_fs = DurableFileSystem::new();
         durable_fs
@@ -268,6 +289,8 @@ impl ConversationRepository {
             recovery_items: recovery_items.clone(),
         };
         let repository = Arc::new(Self {
+            instance_id: Uuid::new_v4(),
+            mode,
             locator,
             durable_fs,
             states: ParkingMutex::new(states),
@@ -282,10 +305,9 @@ impl ConversationRepository {
                 last_conversation_id: None,
             }),
             catalog_lock: TokioMutex::new(()),
+            #[cfg(test)]
+            fail_next_workspace_replace: std::sync::atomic::AtomicBool::new(false),
         });
-        OPEN_REPOSITORIES
-            .lock()
-            .insert(private_root.clone(), Arc::downgrade(&repository));
         log::info!(
             "[conversation-repository] open complete root={} valid_count={} recovery_item_count={} duration_ms={}",
             private_root.display(),
@@ -301,32 +323,14 @@ impl ConversationRepository {
         self.locator.root()
     }
 
-    /// Resolve the already-open canonical writer for a host root without opening a second writer.
     #[must_use]
-    pub fn lookup_open(private_root: &Path) -> Option<Arc<Self>> {
-        let mut repositories = OPEN_REPOSITORIES.lock();
-        let repository = repositories.get(private_root).and_then(Weak::upgrade);
-        if repository.is_none() {
-            repositories.remove(private_root);
-        }
-        repository
+    pub(crate) const fn instance_id(&self) -> Uuid {
+        self.instance_id
     }
 
-    /// Resolve the sole bootstrap-opened repository when a compatibility root is configured
-    /// outside the host-state directory. Ambiguous multi-repository processes fail closed.
     #[must_use]
-    pub fn lookup_single_open() -> Option<Arc<Self>> {
-        let mut repositories = OPEN_REPOSITORIES.lock();
-        let mut open = Vec::new();
-        repositories.retain(|_, repository| {
-            if let Some(repository) = repository.upgrade() {
-                open.push(repository);
-                true
-            } else {
-                false
-            }
-        });
-        (open.len() == 1).then(|| open.pop().expect("one open repository"))
+    pub(crate) const fn is_staging(&self) -> bool {
+        matches!(self.mode, RepositoryMode::MigrationStaging)
     }
 
     pub(crate) fn workspace_path(&self, conversation_id: ConversationId) -> Result<PathBuf> {
@@ -369,14 +373,34 @@ impl ConversationRepository {
 
     pub(crate) fn replace_workspace_bytes(
         &self,
+        permit: &RepositoryWritePermit,
         conversation_id: ConversationId,
         bytes: &[u8],
     ) -> Result<()> {
+        self.validate_write_permit(permit, conversation_id, "replace_workspace")?;
+        #[cfg(test)]
+        if self
+            .fail_next_workspace_replace
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(repository_error(
+                ConversationErrorCode::ConversationDurabilityFailed,
+                "replace_workspace",
+                Some(conversation_id),
+                "injected workspace replacement failure".to_string(),
+            ));
+        }
         let path = self.workspace_path(conversation_id)?;
         self.durable_fs
             .replace_bytes(&path, bytes)
             .map_err(|error| durability_error("replace_workspace", conversation_id, error))?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_workspace_replace(&self) {
+        self.fail_next_workspace_replace
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub(crate) fn workspace_lock(&self, conversation_id: ConversationId) -> Arc<TokioMutex<()>> {
@@ -391,10 +415,12 @@ impl ConversationRepository {
         }
     }
 
-    pub async fn create_conversation(
+    pub(crate) async fn create_conversation(
         self: &Arc<Self>,
+        permit: &RepositoryWritePermit,
         record: ConversationRecordV2,
     ) -> Result<ConversationRecordV2> {
+        self.validate_write_permit(permit, record.conversation_id, "create_conversation")?;
         validate_new_record(&record)?;
         let lock = self.conversation_lock(record.conversation_id);
         let _guard = lock.lock().await;
@@ -501,11 +527,13 @@ impl ConversationRepository {
         records
     }
 
-    pub async fn update_metadata(
+    pub(crate) async fn update_metadata(
         self: &Arc<Self>,
+        permit: &RepositoryWritePermit,
         conversation_id: ConversationId,
         update: ConversationMetadataUpdate,
     ) -> Result<ConversationRecordV2> {
+        self.validate_write_permit(permit, conversation_id, "update_metadata")?;
         let lock = self.conversation_lock(conversation_id);
         let _guard = lock.lock().await;
         self.check_recovery(conversation_id, "update_metadata")?;
@@ -532,13 +560,15 @@ impl ConversationRepository {
         Ok(record)
     }
 
-    pub async fn append_event(
+    pub(crate) async fn append_event(
         self: &Arc<Self>,
+        permit: &RepositoryWritePermit,
         conversation_id: ConversationId,
         recorded_at_utc: DateTime<Utc>,
         type_: ConversationEventType,
         payload: Value,
     ) -> Result<ConversationEventRecordV2> {
+        self.validate_write_permit(permit, conversation_id, "append_event")?;
         let lock = self.conversation_lock(conversation_id);
         let _guard = lock.lock().await;
         let event = self.append_event_locked(conversation_id, recorded_at_utc, type_, payload)?;
@@ -638,15 +668,18 @@ impl ConversationRepository {
             .ok_or_else(|| not_found("conversation_frontier", conversation_id))
     }
 
-    pub async fn bind_agent_session(
+    pub(crate) async fn bind_agent_session(
         self: &Arc<Self>,
+        permit: &RepositoryWritePermit,
         conversation_id: ConversationId,
         mut binding: AgentSessionBinding,
         recorded_at_utc: DateTime<Utc>,
     ) -> Result<ConversationEventRecordV2> {
+        self.validate_write_permit(permit, conversation_id, "bind_agent_session")?;
         binding.state = AgentSessionBindingState::Active;
         validate_binding_input(&binding, conversation_id, "bind_agent_session")?;
         self.append_event(
+            permit,
             conversation_id,
             recorded_at_utc,
             ConversationEventType::BindingBound,
@@ -662,53 +695,68 @@ impl ConversationRepository {
         .await
     }
 
-    pub async fn detach_agent_binding(
+    // Retained for the authority facade and focused repository tests; lifecycle production flows
+    // use the locked compound operation so revision checks and provider effects stay atomic.
+    #[allow(dead_code)]
+    pub(crate) async fn detach_agent_binding(
         self: &Arc<Self>,
+        permit: &RepositoryWritePermit,
         conversation_id: ConversationId,
         recorded_at_utc: DateTime<Utc>,
     ) -> Result<ConversationEventRecordV2> {
+        self.validate_write_permit(permit, conversation_id, "detach_agent_binding")?;
         let _guard = self.lifecycle_lock(conversation_id).await;
-        let event = self.detach_agent_binding_locked(conversation_id, recorded_at_utc)?;
+        let event = self.detach_agent_binding_locked(permit, conversation_id, recorded_at_utc)?;
         self.flush_catalog_best_effort().await;
         Ok(event)
     }
 
-    pub async fn rebind_detached_binding(
+    #[allow(dead_code)]
+    pub(crate) async fn rebind_detached_binding(
         self: &Arc<Self>,
+        permit: &RepositoryWritePermit,
         conversation_id: ConversationId,
         recorded_at_utc: DateTime<Utc>,
     ) -> Result<ConversationEventRecordV2> {
+        self.validate_write_permit(permit, conversation_id, "rebind_detached_binding")?;
         let _guard = self.lifecycle_lock(conversation_id).await;
-        let event = self.rebind_detached_binding_locked(conversation_id, recorded_at_utc)?;
+        let event =
+            self.rebind_detached_binding_locked(permit, conversation_id, recorded_at_utc)?;
         self.flush_catalog_best_effort().await;
         Ok(event)
     }
 
     /// Record suspension only after the provider confirms close/suspend success.
     /// A false confirmation performs no append and leaves materialized state unchanged.
-    pub async fn suspend_agent_binding(
+    #[allow(dead_code)]
+    pub(crate) async fn suspend_agent_binding(
         self: &Arc<Self>,
+        permit: &RepositoryWritePermit,
         conversation_id: ConversationId,
         provider_confirmed: bool,
         recorded_at_utc: DateTime<Utc>,
     ) -> Result<Option<ConversationEventRecordV2>> {
+        self.validate_write_permit(permit, conversation_id, "suspend_agent_binding")?;
         if !provider_confirmed {
             return Ok(None);
         }
         let _guard = self.lifecycle_lock(conversation_id).await;
-        let event = self.suspend_agent_binding_locked(conversation_id, recorded_at_utc)?;
+        let event = self.suspend_agent_binding_locked(permit, conversation_id, recorded_at_utc)?;
         self.flush_catalog_best_effort().await;
         Ok(Some(event))
     }
 
-    pub async fn replace_agent_binding(
+    pub(crate) async fn replace_agent_binding(
         self: &Arc<Self>,
+        permit: &RepositoryWritePermit,
         conversation_id: ConversationId,
         binding: AgentSessionBinding,
         recorded_at_utc: DateTime<Utc>,
     ) -> Result<ConversationEventRecordV2> {
+        self.validate_write_permit(permit, conversation_id, "replace_agent_binding")?;
         let _guard = self.lifecycle_lock(conversation_id).await;
-        let event = self.replace_agent_binding_locked(conversation_id, binding, recorded_at_utc)?;
+        let event =
+            self.replace_agent_binding_locked(permit, conversation_id, binding, recorded_at_utc)?;
         self.flush_catalog_best_effort().await;
         Ok(event)
     }
@@ -755,9 +803,11 @@ impl ConversationRepository {
 
     pub(crate) fn detach_agent_binding_locked(
         &self,
+        permit: &RepositoryWritePermit,
         conversation_id: ConversationId,
         recorded_at_utc: DateTime<Utc>,
     ) -> Result<ConversationEventRecordV2> {
+        self.validate_write_permit(permit, conversation_id, "detach_agent_binding")?;
         let mut binding = self.current_binding(conversation_id)?.ok_or_else(|| {
             repository_error(
                 ConversationErrorCode::ConversationBindingNotFound,
@@ -785,9 +835,11 @@ impl ConversationRepository {
 
     pub(crate) fn rebind_detached_binding_locked(
         &self,
+        permit: &RepositoryWritePermit,
         conversation_id: ConversationId,
         recorded_at_utc: DateTime<Utc>,
     ) -> Result<ConversationEventRecordV2> {
+        self.validate_write_permit(permit, conversation_id, "rebind_detached_binding")?;
         let mut binding = self.current_binding(conversation_id)?.ok_or_else(|| {
             repository_error(
                 ConversationErrorCode::ConversationBindingNotFound,
@@ -815,9 +867,11 @@ impl ConversationRepository {
 
     pub(crate) fn suspend_agent_binding_locked(
         &self,
+        permit: &RepositoryWritePermit,
         conversation_id: ConversationId,
         recorded_at_utc: DateTime<Utc>,
     ) -> Result<ConversationEventRecordV2> {
+        self.validate_write_permit(permit, conversation_id, "suspend_agent_binding")?;
         let mut binding = self.current_binding(conversation_id)?.ok_or_else(|| {
             repository_error(
                 ConversationErrorCode::ConversationBindingNotFound,
@@ -845,10 +899,12 @@ impl ConversationRepository {
 
     pub(crate) fn replace_agent_binding_locked(
         &self,
+        permit: &RepositoryWritePermit,
         conversation_id: ConversationId,
         mut binding: AgentSessionBinding,
         recorded_at_utc: DateTime<Utc>,
     ) -> Result<ConversationEventRecordV2> {
+        self.validate_write_permit(permit, conversation_id, "replace_agent_binding")?;
         validate_binding_input(&binding, conversation_id, "replace_agent_binding")?;
         let mut previous_binding = self.current_binding(conversation_id)?.ok_or_else(|| {
             repository_error(
@@ -877,16 +933,24 @@ impl ConversationRepository {
         Ok(event)
     }
 
-    pub(crate) async fn refresh_lifecycle_catalog(&self) {
+    pub(crate) async fn refresh_lifecycle_catalog(
+        &self,
+        permit: &RepositoryWritePermit,
+        conversation_id: ConversationId,
+    ) -> Result<()> {
+        self.validate_write_permit(permit, conversation_id, "refresh_lifecycle_catalog")?;
         self.flush_catalog_best_effort().await;
+        Ok(())
     }
 
-    pub async fn append_project_attachment(
+    pub(crate) async fn append_project_attachment(
         self: &Arc<Self>,
+        permit: &RepositoryWritePermit,
         conversation_id: ConversationId,
         attachment: ProjectAttachment,
         recorded_at_utc: DateTime<Utc>,
     ) -> Result<ConversationEventRecordV2> {
+        self.validate_write_permit(permit, conversation_id, "append_project_attachment")?;
         if attachment.schema_version != PROJECT_ATTACHMENT_SCHEMA_VERSION {
             return Err(repository_error(
                 ConversationErrorCode::ConversationUnsupportedSchema,
@@ -909,6 +973,7 @@ impl ConversationRepository {
         }
         let event = self
             .append_event(
+                permit,
                 conversation_id,
                 recorded_at_utc,
                 ConversationEventType::ProjectAttached,
@@ -922,11 +987,16 @@ impl ConversationRepository {
         Ok(event)
     }
 
-    pub async fn detach_project_attachment(
+    // Published through ConversationWriter as part of the exhaustive mutation authority even
+    // though no current production transport exposes detach yet.
+    #[allow(dead_code)]
+    pub(crate) async fn detach_project_attachment(
         self: &Arc<Self>,
+        permit: &RepositoryWritePermit,
         conversation_id: ConversationId,
         recorded_at_utc: DateTime<Utc>,
     ) -> Result<ConversationEventRecordV2> {
+        self.validate_write_permit(permit, conversation_id, "detach_project_attachment")?;
         let attachment = self
             .get_conversation(conversation_id)?
             .project_attachment
@@ -940,6 +1010,7 @@ impl ConversationRepository {
             })?;
         let event = self
             .append_event(
+                permit,
                 conversation_id,
                 recorded_at_utc,
                 ConversationEventType::ProjectDetached,
@@ -953,11 +1024,13 @@ impl ConversationRepository {
         Ok(event)
     }
 
-    pub async fn write_provenance(
+    pub(crate) async fn write_provenance(
         self: &Arc<Self>,
+        permit: &RepositoryWritePermit,
         conversation_id: ConversationId,
         provenance: ConversationProvenanceFileV1,
     ) -> Result<()> {
+        self.validate_write_permit(permit, conversation_id, "write_provenance")?;
         provenance.validate().map_err(|detail| {
             repository_error(
                 ConversationErrorCode::ConversationRecoveryRequired,
@@ -1020,10 +1093,12 @@ impl ConversationRepository {
             .ok_or_else(|| not_found("read_provenance", conversation_id))
     }
 
-    pub async fn sync_conversation(
+    pub(crate) async fn sync_conversation(
         self: &Arc<Self>,
+        permit: &RepositoryWritePermit,
         conversation_id: ConversationId,
     ) -> Result<()> {
+        self.validate_write_permit(permit, conversation_id, "sync_conversation")?;
         let lock = self.conversation_lock(conversation_id);
         let _guard = lock.lock().await;
         self.check_recovery(conversation_id, "sync_conversation")?;
@@ -1051,54 +1126,29 @@ impl ConversationRepository {
         Ok(())
     }
 
-    /// Explicit startup policy for callers that want both allocation phases closed after their
-    /// visible-workspace reconciliation. It never deletes either root or fabricates a binding.
-    pub async fn recover_incomplete_conversations(self: &Arc<Self>) -> Result<usize> {
-        let ids = self
-            .list_conversations()
-            .into_iter()
-            .filter(|record| {
-                matches!(
-                    record.lifecycle_state,
-                    ConversationLifecycleState::AllocatingWorkspace
-                        | ConversationLifecycleState::InitializingAgent
-                )
-            })
-            .map(|record| record.conversation_id)
-            .collect::<Vec<_>>();
-        for conversation_id in &ids {
-            self.update_metadata(
-                *conversation_id,
-                ConversationMetadataUpdate {
-                    lifecycle_state: Some(ConversationLifecycleState::AgentFailed),
-                    execution_target: None,
-                },
-            )
-            .await?;
-            log::warn!(
-                "[conversation-repository] incomplete creation recovered conversation_id={}",
-                conversation_id
-            );
-        }
-        Ok(ids.len())
-    }
-
     /// Stage-2 deletion is a durable tombstone only. Physical removal and blocker policy belong to
     /// the explicit lifecycle service.
-    pub async fn mark_deleted(
+    // Retained as the single-operation authority API; lifecycle deletion uses the locked variant
+    // to combine blocker checks, terminal cleanup, and the tombstone under one revision gate.
+    #[allow(dead_code)]
+    pub(crate) async fn mark_deleted(
         self: &Arc<Self>,
+        permit: &RepositoryWritePermit,
         conversation_id: ConversationId,
     ) -> Result<ConversationRecordV2> {
+        self.validate_write_permit(permit, conversation_id, "mark_deleted")?;
         let _guard = self.lifecycle_lock(conversation_id).await;
-        let record = self.tombstone_conversation_locked(conversation_id)?;
+        let record = self.tombstone_conversation_locked(permit, conversation_id)?;
         self.flush_catalog_best_effort().await;
         Ok(record)
     }
 
     pub(crate) fn tombstone_conversation_locked(
         &self,
+        permit: &RepositoryWritePermit,
         conversation_id: ConversationId,
     ) -> Result<ConversationRecordV2> {
+        self.validate_write_permit(permit, conversation_id, "tombstone_conversation")?;
         self.check_recovery(conversation_id, "tombstone_conversation")?;
         let mut record = self
             .states
@@ -1127,7 +1177,21 @@ impl ConversationRepository {
     /// Provider success followed by a canonical append failure must never leave the in-process
     /// materialization falsely advertising an active binding. This fail-closed marker is best
     /// effort durable and always updates the in-memory frontier before returning recovery-required.
-    pub(crate) fn mark_lifecycle_recovery_required_locked(&self, conversation_id: ConversationId) {
+    pub(crate) fn mark_lifecycle_recovery_required_locked(
+        &self,
+        permit: &RepositoryWritePermit,
+        conversation_id: ConversationId,
+    ) {
+        if let Err(error) =
+            self.validate_write_permit(permit, conversation_id, "lifecycle_recovery")
+        {
+            log::error!(
+                "[conversation-repository] lifecycle recovery bypass rejected conversation_id={} code={}",
+                conversation_id,
+                stable_code(error.code)
+            );
+            return;
+        }
         if self
             .check_recovery(conversation_id, "lifecycle_recovery")
             .is_err()
@@ -1285,6 +1349,47 @@ impl ConversationRepository {
                     error.to_string(),
                 )
             })
+    }
+
+    pub(crate) fn clear_recovery_item(
+        &self,
+        permit: &RepositoryWritePermit,
+        conversation_id: ConversationId,
+    ) -> Result<()> {
+        self.validate_write_permit(permit, conversation_id, "clear_recovery_item")?;
+        self.recovery_by_id.lock().remove(&conversation_id);
+        self.recovery_items
+            .lock()
+            .retain(|item| item.conversation_id != Some(conversation_id));
+        log::info!(
+            "[conversation-repository] actionable recovery cleared conversation_id={}",
+            conversation_id
+        );
+        Ok(())
+    }
+
+    fn validate_write_permit(
+        &self,
+        permit: &RepositoryWritePermit,
+        conversation_id: ConversationId,
+        operation: &'static str,
+    ) -> Result<()> {
+        if permit.admits(self.instance_id, conversation_id, self.is_staging()) {
+            return Ok(());
+        }
+        log::error!(
+            "[conversation-repository] write capability bypass rejected operation={} conversation_id={} mutation={}",
+            operation,
+            conversation_id,
+            permit.mutation().as_str()
+        );
+        Err(repository_error(
+            ConversationErrorCode::ConversationRecoveryRequired,
+            operation,
+            Some(conversation_id),
+            "repository write permit does not match this repository, scope, or ConversationId"
+                .to_string(),
+        ))
     }
 
     fn check_recovery(
@@ -1650,18 +1755,24 @@ mod tests {
         parse_created_at_utc, ConversationCreator, CreationPartition,
         PROJECT_ATTACHMENT_SCHEMA_VERSION,
     };
+    use crate::conversation::write_authority::{ConversationMutation, ConversationWriter};
     use serde_json::json;
     use tempfile::TempDir;
     use uuid::Uuid;
 
     const ID: &str = "018f7a1c-1b4d-7c8a-9f01-0123456789ab";
 
-    fn fixture() -> (TempDir, Arc<ConversationRepository>) {
+    fn fixture() -> (
+        TempDir,
+        Arc<ConversationRepository>,
+        Arc<ConversationWriter>,
+    ) {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap().join("private");
         let (repository, report) = ConversationRepository::open(root).unwrap();
         assert_eq!(report.valid_conversation_count, 0);
-        (temp, repository)
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
+        (temp, repository, writer)
     }
 
     fn record() -> ConversationRecordV2 {
@@ -1699,13 +1810,16 @@ mod tests {
 
     #[tokio::test]
     async fn create_writes_exact_canonical_files_only_under_private_root() {
-        let (temp, repository) = fixture();
+        let (temp, repository, writer) = fixture();
         let workspace = temp.path().join("visible-workspace");
         fs::create_dir_all(&workspace).unwrap();
         fs::write(workspace.join("user-file.txt"), b"keep").unwrap();
         let mut value = record();
         value.workspace_cwd = workspace.to_string_lossy().into_owned();
-        repository.create_conversation(value.clone()).await.unwrap();
+        writer
+            .create_conversation(value.clone(), ConversationMutation::CreateConversation)
+            .await
+            .unwrap();
         let directory = repository
             .locator
             .private_dir(value.conversation_id, &value.creation_partition)
@@ -1732,10 +1846,13 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_or_corrupting_catalog_rebuilds_byte_identically_and_cannot_hide_or_invent() {
-        let (_temp, repository) = fixture();
+        let (_temp, repository, writer) = fixture();
         let mut ready = record();
         ready.lifecycle_state = ConversationLifecycleState::Ready;
-        repository.create_conversation(ready).await.unwrap();
+        writer
+            .create_conversation(ready, ConversationMutation::CreateConversation)
+            .await
+            .unwrap();
         let catalog_path = repository.root().join(CATALOG_FILE);
         let expected = fs::read(&catalog_path).unwrap();
         fs::remove_file(&catalog_path).unwrap();
@@ -1765,23 +1882,27 @@ mod tests {
 
     #[tokio::test]
     async fn global_sequence_is_serialized_across_message_and_tool_streams() {
-        let (_temp, repository) = fixture();
-        repository.create_conversation(record()).await.unwrap();
+        let (_temp, repository, writer) = fixture();
+        writer
+            .create_conversation(record(), ConversationMutation::CreateConversation)
+            .await
+            .unwrap();
         let mut tasks = Vec::new();
         for index in 0..20u32 {
-            let repository = Arc::clone(&repository);
+            let writer = Arc::clone(&writer);
             tasks.push(tokio::spawn(async move {
                 let type_ = if index % 2 == 0 {
                     ConversationEventType::MessageChunk
                 } else {
                     ConversationEventType::ToolCall
                 };
-                repository
+                writer
                     .append_event(
                         ConversationId::parse(ID).unwrap(),
                         time(20),
                         type_,
                         json!({"structural":"only"}),
+                        ConversationMutation::AcpEventAppend,
                     )
                     .await
                     .unwrap()
@@ -1805,18 +1926,22 @@ mod tests {
 
     #[tokio::test]
     async fn append_work_is_constant_and_mutations_do_not_scan_the_catalog() {
-        let (_temp, repository) = fixture();
-        repository.create_conversation(record()).await.unwrap();
+        let (_temp, repository, writer) = fixture();
+        writer
+            .create_conversation(record(), ConversationMutation::CreateConversation)
+            .await
+            .unwrap();
         crate::conversation::event_log::reset_operation_counters();
         crate::conversation::catalog::reset_catalog_scan_counter();
 
         for seq in 1..=3_u32 {
-            repository
+            writer
                 .append_event(
                     ConversationId::parse(ID).unwrap(),
                     time(20 + seq),
                     ConversationEventType::MessageChunk,
                     json!({"role":"agent"}),
+                    ConversationMutation::AcpEventAppend,
                 )
                 .await
                 .unwrap();
@@ -1835,20 +1960,23 @@ mod tests {
 
     #[tokio::test]
     async fn binding_history_distinguishes_detach_rebound_suspend_and_replacement() {
-        let (_temp, repository) = fixture();
+        let (_temp, repository, writer) = fixture();
         let original_record = record();
         let workspace_cwd = original_record.workspace_cwd.clone();
-        repository
-            .create_conversation(original_record.clone())
+        writer
+            .create_conversation(
+                original_record.clone(),
+                ConversationMutation::CreateConversation,
+            )
             .await
             .unwrap();
         let conversation_id = original_record.conversation_id;
         let first = binding("b2832b54-2ca4-4db4-93fd-f93bf6793114", "agent/opaque:first");
-        repository
+        writer
             .bind_agent_session(conversation_id, first.clone(), time(16))
             .await
             .unwrap();
-        repository
+        writer
             .detach_agent_binding(conversation_id, time(17))
             .await
             .unwrap();
@@ -1860,7 +1988,7 @@ mod tests {
                 .state,
             AgentSessionBindingState::Detached
         );
-        repository
+        writer
             .rebind_detached_binding(conversation_id, time(18))
             .await
             .unwrap();
@@ -1873,7 +2001,7 @@ mod tests {
             AgentSessionBindingState::Active
         );
         let before_failed_suspend = repository.read_events(conversation_id, 0).unwrap();
-        assert!(repository
+        assert!(writer
             .suspend_agent_binding(conversation_id, false, time(19))
             .await
             .unwrap()
@@ -1890,7 +2018,7 @@ mod tests {
                 .state,
             AgentSessionBindingState::Active
         );
-        repository
+        writer
             .suspend_agent_binding(conversation_id, true, time(20))
             .await
             .unwrap();
@@ -1906,7 +2034,7 @@ mod tests {
             "c3943c65-3db5-4ec5-a4e0-0a4cf78a4225",
             "agent/opaque:second",
         );
-        repository
+        writer
             .replace_agent_binding(conversation_id, second.clone(), time(21))
             .await
             .unwrap();
@@ -1933,7 +2061,7 @@ mod tests {
 
     #[tokio::test]
     async fn project_attach_and_detach_change_only_attachment_materialization() {
-        let (_temp, repository) = fixture();
+        let (_temp, repository, writer) = fixture();
         let value = record();
         let conversation_id = value.conversation_id;
         let workspace_cwd = value.workspace_cwd.clone();
@@ -1942,7 +2070,10 @@ mod tests {
             value.created_at_utc,
             value.creation_partition.clone(),
         );
-        repository.create_conversation(value).await.unwrap();
+        writer
+            .create_conversation(value, ConversationMutation::CreateConversation)
+            .await
+            .unwrap();
         let attachment = ProjectAttachment {
             schema_version: PROJECT_ATTACHMENT_SCHEMA_VERSION,
             project_id: "project-opaque".to_string(),
@@ -1951,7 +2082,7 @@ mod tests {
             worktree_path: None,
             worktree_branch: None,
         };
-        repository
+        writer
             .append_project_attachment(conversation_id, attachment.clone(), time(22))
             .await
             .unwrap();
@@ -1966,7 +2097,7 @@ mod tests {
             ),
             identity
         );
-        repository
+        writer
             .detach_project_attachment(conversation_id, time(23))
             .await
             .unwrap();
@@ -1987,14 +2118,18 @@ mod tests {
     async fn torn_tail_is_repaired_but_middle_corruption_surfaces_recovery_required() {
         use std::io::Write;
 
-        let (_temp, repository) = fixture();
-        repository.create_conversation(record()).await.unwrap();
-        repository
+        let (_temp, repository, writer) = fixture();
+        writer
+            .create_conversation(record(), ConversationMutation::CreateConversation)
+            .await
+            .unwrap();
+        writer
             .append_event(
                 ConversationId::parse(ID).unwrap(),
                 time(16),
                 ConversationEventType::MessageChunk,
                 json!({"role":"agent"}),
+                ConversationMutation::AcpEventAppend,
             )
             .await
             .unwrap();

@@ -313,6 +313,7 @@ pub enum ConversationErrorCode {
     ConversationLiveResources,
     ConversationRecoveryRequired,
     ConversationDurabilityUnsupported,
+    LegacyCompatibilityReadOnly,
 }
 
 impl ConversationErrorCode {

@@ -291,43 +291,117 @@ pub async fn terminal_spawn(
     options: SpawnOptions,
     on_data: Channel<Response>,
     pty_manager: State<'_, Arc<PtyManager>>,
-    repository: State<'_, Arc<crate::conversation::ConversationRepository>>,
+    workspace: State<'_, Arc<crate::conversation::SessionWorkspaceService>>,
 ) -> Result<IpcResult<SpawnedTerminal>, String> {
+    Ok(terminal_spawn_resource(
+        options,
+        Some(on_data),
+        pty_manager.inner(),
+        workspace.inner(),
+    )
+    .await)
+}
+
+pub(crate) async fn terminal_spawn_resource(
+    options: SpawnOptions,
+    on_data: Option<Channel<Response>>,
+    pty_manager: &Arc<PtyManager>,
+    workspace: &Arc<crate::conversation::SessionWorkspaceService>,
+) -> IpcResult<SpawnedTerminal> {
+    terminal_spawn_resource_impl(options, on_data, pty_manager, workspace, None).await
+}
+
+#[cfg(test)]
+pub(crate) async fn terminal_spawn_resource_with_rollback_result(
+    options: SpawnOptions,
+    pty_manager: &Arc<PtyManager>,
+    workspace: &Arc<crate::conversation::SessionWorkspaceService>,
+    rollback_result: Result<(), String>,
+) -> IpcResult<SpawnedTerminal> {
+    terminal_spawn_resource_impl(options, None, pty_manager, workspace, Some(rollback_result)).await
+}
+
+async fn terminal_spawn_resource_impl(
+    options: SpawnOptions,
+    on_data: Option<Channel<Response>>,
+    pty_manager: &Arc<PtyManager>,
+    workspace: &Arc<crate::conversation::SessionWorkspaceService>,
+    rollback_result_override: Option<Result<(), String>>,
+) -> IpcResult<SpawnedTerminal> {
     let is_ephemeral_ssh = options.kind.as_deref() == Some("ssh");
-    if !is_ephemeral_ssh && options.conversation_id.is_none() {
-        log::warn!("[terminal-command] durable spawn rejected: missing ConversationId");
-        return Ok(IpcResult::error(
-            "Durable terminal spawn requires conversationId",
-            "CONVERSATION_INVALID_ID",
-        ));
-    }
-    let track_workspace_ref = !is_ephemeral_ssh;
-    match pty_manager.spawn(options, Some(on_data)).await {
-        Ok(spawned) => {
-            if track_workspace_ref {
-                let instance = pty_manager
-                    .get(&spawned.info.id)
-                    .expect("spawned terminal remains registered");
-                let service =
-                    crate::conversation::SessionWorkspaceService::new(repository.inner().clone());
-                if let Err(error) = service
-                    .add_terminal_ref(instance.conversation_id, &spawned.info.id)
-                    .await
-                {
-                    let _ = pty_manager.terminate(&spawned.info.id).await;
-                    log::warn!(
-                        "[terminal-command] spawn ref failed conversation_id={} terminal_id={} code={}",
-                        instance.conversation_id,
-                        spawned.info.id,
-                        error.code.as_str()
-                    );
-                    return Ok(IpcResult::error(error.detail, error.code.as_str()));
-                }
-            }
-            Ok(IpcResult::success(spawned))
+    let conversation_id = if is_ephemeral_ssh {
+        None
+    } else {
+        let Some(conversation_id) = options.conversation_id else {
+            log::warn!("[terminal-command] durable spawn rejected: missing ConversationId");
+            return IpcResult::error(
+                "Durable terminal spawn requires conversationId",
+                "CONVERSATION_INVALID_ID",
+            );
+        };
+        if let Err(error) = workspace.ensure_terminal_ref_writable(conversation_id, true) {
+            log::warn!(
+                "[terminal-command] durable spawn admission rejected conversation_id={} code={}",
+                conversation_id,
+                error.code.as_str()
+            );
+            return IpcResult::error(error.detail, error.code.as_str());
         }
-        Err(e) => Ok(IpcResult::error(e, "SPAWN_FAILED")),
+        Some(conversation_id)
+    };
+
+    let spawned = match pty_manager.spawn(options, on_data).await {
+        Ok(spawned) => spawned,
+        Err(error) => return IpcResult::error(error, "SPAWN_FAILED"),
+    };
+    let Some(conversation_id) = conversation_id else {
+        return IpcResult::success(spawned);
+    };
+
+    if let Err(primary) = workspace
+        .add_terminal_ref(conversation_id, &spawned.info.id)
+        .await
+    {
+        let primary_code = primary.code.as_str();
+        let rollback_result = match rollback_result_override {
+            Some(result) => result,
+            None => pty_manager.terminate(&spawned.info.id).await,
+        };
+        if rollback_result.is_ok() {
+            log::warn!(
+                "[terminal-command] spawn ref failed and PTY rollback completed conversation_id={} terminal_id={} primary_code={}",
+                conversation_id,
+                spawned.info.id,
+                primary_code
+            );
+            return IpcResult::error(primary.detail, primary_code);
+        }
+
+        let failure = crate::conversation::TerminalResourceRollbackFailure {
+            terminal_id: spawned.info.id.clone(),
+            conversation_id,
+            primary_code,
+            rollback_code: crate::conversation::TERMINAL_TERMINATE_FAILED.to_string(),
+        };
+        log::error!(
+            "[terminal-command] compound spawn rollback failed conversation_id={} terminal_id={} primary_code={} rollback_code={}",
+            failure.conversation_id,
+            failure.terminal_id,
+            failure.primary_code,
+            failure.rollback_code
+        );
+        return IpcResult::error(
+            failure.wire_detail(),
+            crate::conversation::TERMINAL_RESOURCE_ROLLBACK_FAILED,
+        );
     }
+
+    log::info!(
+        "[terminal-command] spawn resource committed conversation_id={} terminal_id={} code=OK",
+        conversation_id,
+        spawned.info.id
+    );
+    IpcResult::success(spawned)
 }
 
 /// Milliseconds between claim-generation checks in a desktop attach forwarder.
@@ -619,41 +693,57 @@ pub async fn terminal_close_view(terminal_id: String) -> Result<IpcResult<()>, S
 pub async fn terminal_terminate(
     terminal_id: String,
     pty_manager: State<'_, Arc<PtyManager>>,
-    repository: State<'_, Arc<crate::conversation::ConversationRepository>>,
+    workspace: State<'_, Arc<crate::conversation::SessionWorkspaceService>>,
 ) -> Result<IpcResult<()>, String> {
+    Ok(terminal_terminate_resource(&terminal_id, pty_manager.inner(), workspace.inner()).await)
+}
+
+pub(crate) async fn terminal_terminate_resource(
+    terminal_id: &str,
+    pty_manager: &Arc<PtyManager>,
+    workspace: &Arc<crate::conversation::SessionWorkspaceService>,
+) -> IpcResult<()> {
     let scope = pty_manager
-        .get(&terminal_id)
+        .get(terminal_id)
         .filter(|instance| instance.workspace_ref_tracked)
         .map(|instance| instance.conversation_id);
-    if pty_manager.get(&terminal_id).is_none() {
-        return Ok(IpcResult::success(()));
+    if pty_manager.get(terminal_id).is_none() {
+        return IpcResult::success(());
     }
-    match pty_manager.terminate(&terminal_id).await {
-        Ok(()) => {
-            if let Some((_, forwarder)) = lock_forwarders().remove(&terminal_id) {
-                forwarder.abort();
-            }
-            if let Some(conversation_id) = scope {
-                let service =
-                    crate::conversation::SessionWorkspaceService::new(repository.inner().clone());
-                if let Err(error) = service
-                    .remove_terminal_ref(conversation_id, &terminal_id)
-                    .await
-                {
-                    log::warn!(
-                        "[terminal-command] terminate ref cleanup failed conversation_id={} terminal_id={} code={}",
-                        conversation_id,
-                        terminal_id,
-                        error.code.as_str()
-                    );
-                    return Ok(IpcResult::error(error.detail, error.code.as_str()));
-                }
-            }
-            log::info!("[terminal-command] terminated terminal_id={terminal_id}");
-            Ok(IpcResult::success(()))
+    if let Some(conversation_id) = scope {
+        if let Err(error) = workspace.ensure_terminal_ref_writable(conversation_id, false) {
+            log::warn!(
+                "[terminal-command] terminate admission rejected conversation_id={} terminal_id={} code={}",
+                conversation_id,
+                terminal_id,
+                error.code.as_str()
+            );
+            return IpcResult::error(error.detail, error.code.as_str());
         }
-        Err(e) => Ok(IpcResult::error(e, "TERMINATE_FAILED")),
     }
+
+    if let Err(error) = pty_manager.terminate(terminal_id).await {
+        return IpcResult::error(error, crate::conversation::TERMINAL_TERMINATE_FAILED);
+    }
+    if let Some((_, forwarder)) = lock_forwarders().remove(terminal_id) {
+        forwarder.abort();
+    }
+    if let Some(conversation_id) = scope {
+        if let Err(error) = workspace
+            .remove_terminal_ref_after_termination(conversation_id, terminal_id)
+            .await
+        {
+            log::warn!(
+                "[terminal-command] terminate ref cleanup failed conversation_id={} terminal_id={} code={}",
+                conversation_id,
+                terminal_id,
+                error.code.as_str()
+            );
+            return IpcResult::error(error.detail, error.code.as_str());
+        }
+    }
+    log::info!("[terminal-command] terminated terminal_id={terminal_id}");
+    IpcResult::success(())
 }
 
 /// Deprecated compatibility alias; identical to `terminal_terminate`.
@@ -661,9 +751,9 @@ pub async fn terminal_terminate(
 pub async fn terminal_kill(
     terminal_id: String,
     pty_manager: State<'_, Arc<PtyManager>>,
-    repository: State<'_, Arc<crate::conversation::ConversationRepository>>,
+    workspace: State<'_, Arc<crate::conversation::SessionWorkspaceService>>,
 ) -> Result<IpcResult<()>, String> {
-    terminal_terminate(terminal_id, pty_manager, repository).await
+    terminal_terminate(terminal_id, pty_manager, workspace).await
 }
 
 /// Get the current working directory for a terminal
@@ -5099,6 +5189,85 @@ mod tests {
         assert!(result.data.is_none());
         assert_eq!(result.error, Some("test error".to_string()));
         assert_eq!(result.code, Some("TEST_ERROR".to_string()));
+    }
+
+    #[tokio::test]
+    async fn terminal_spawn_compound_rollback() {
+        use crate::conversation::{
+            parse_created_at_utc, ConversationCreator, ConversationLifecycleState,
+            ConversationMutation, ConversationRecordV2, ConversationWriter, CreationPartition,
+            ExecutionTarget, SessionWorkspaceLoadOutcome, SessionWorkspaceService,
+            TerminalResourceRollbackFailure, CONVERSATION_SCHEMA_VERSION,
+            TERMINAL_RESOURCE_ROLLBACK_FAILED,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let (repository, _) =
+            crate::conversation::ConversationRepository::open(base.join("conversations/v2"))
+                .unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
+        let conversation_id =
+            crate::conversation::ConversationId::parse("018f7a1c-1b4d-7c8a-9f01-0123456789ab")
+                .unwrap();
+        let created_at = parse_created_at_utc("2026-08-15T09:45:15.123Z").unwrap();
+        writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: base.to_string_lossy().into_owned(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::Ready,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                },
+                ConversationMutation::CreateConversation,
+            )
+            .await
+            .unwrap();
+        let workspace = Arc::new(SessionWorkspaceService::new(writer));
+        repository.fail_next_workspace_replace();
+        let pty = crate::web::test_pty_manager();
+        let result = terminal_spawn_resource_with_rollback_result(
+            SpawnOptions {
+                conversation_id: Some(conversation_id),
+                cwd: Some(base.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            &pty,
+            &workspace,
+            Err("injected termination failure".to_string()),
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.code.as_deref(),
+            Some(TERMINAL_RESOURCE_ROLLBACK_FAILED)
+        );
+        let failure: TerminalResourceRollbackFailure =
+            serde_json::from_str(result.error.as_deref().unwrap()).unwrap();
+        assert_eq!(failure.conversation_id, conversation_id);
+        assert_eq!(failure.primary_code, "CONVERSATION_DURABILITY_FAILED");
+        assert_eq!(failure.rollback_code, "TERMINATE_FAILED");
+        assert!(pty.get(&failure.terminal_id).is_some());
+        assert!(matches!(
+            workspace.load(conversation_id).await.unwrap(),
+            SessionWorkspaceLoadOutcome::Missing { .. }
+        ));
+        pty.terminate(&failure.terminal_id).await.unwrap();
+
+        let production = include_str!("commands.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for forbidden in ["claim=", "env=", "argv=", "terminal_output="] {
+            assert!(!production.contains(forbidden));
+        }
     }
 
     /// The host-owned list maps `SessionIndexEntry` (camelCase wire) into the

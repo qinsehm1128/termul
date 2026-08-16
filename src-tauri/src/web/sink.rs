@@ -2041,8 +2041,9 @@ mod tests {
     ) {
         use crate::conversation::{
             AgentSessionBinding, AgentSessionBindingState, ConversationCreator,
-            ConversationLifecycleState, ConversationRecordV2, CreationPartition, ExecutionTarget,
-            ReaderPrecedence, AGENT_SESSION_BINDING_SCHEMA_VERSION, CONVERSATION_SCHEMA_VERSION,
+            ConversationLifecycleState, ConversationMutation, ConversationRecordV2,
+            ConversationWriter, CreationPartition, ExecutionTarget, ReaderPrecedence,
+            AGENT_SESSION_BINDING_SCHEMA_VERSION, CONVERSATION_SCHEMA_VERSION,
         };
 
         let root = temp_dir(label).canonicalize().unwrap();
@@ -2050,24 +2051,28 @@ mod tests {
         let workspace = root.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         let (repository, _) = crate::conversation::ConversationRepository::open(private).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
         let conversation_id = crate::conversation::ConversationId::new_v4();
         let created_at = Utc::now();
-        repository
-            .create_conversation(ConversationRecordV2 {
-                schema_version: CONVERSATION_SCHEMA_VERSION,
-                conversation_id,
-                created_at_utc: created_at,
-                creation_partition: CreationPartition::from_created_at(created_at),
-                workspace_cwd: workspace.to_string_lossy().into_owned(),
-                execution_target: ExecutionTarget::Workspace,
-                project_attachment: None,
-                lifecycle_state: ConversationLifecycleState::InitializingAgent,
-                last_seq: 0,
-                created_by: ConversationCreator::Termul,
-            })
+        writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: workspace.to_string_lossy().into_owned(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::InitializingAgent,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                },
+                ConversationMutation::CreateConversation,
+            )
             .await
             .unwrap();
-        repository
+        writer
             .bind_agent_session(
                 conversation_id,
                 AgentSessionBinding {
@@ -2090,8 +2095,7 @@ mod tests {
             ReaderPrecedence::ConversationV2Only,
         ));
         let adapter = Arc::new(crate::conversation::ConversationPersistenceAdapter::new(
-            Arc::clone(&repository),
-            reader,
+            writer, reader,
         ));
         (root, repository, adapter, conversation_id)
     }

@@ -5,7 +5,7 @@
 //! and authenticated WebSocket adapters share this `Arc`; adapters only decode, authorize, and map
 //! the stable application envelope.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -22,6 +22,7 @@ use crate::conversation::session_workspace::{
     SessionWorkspaceError, SessionWorkspaceLoadOutcome, SessionWorkspaceService,
     SessionWorkspaceV1, SessionWorkspaceWriteOutcome,
 };
+use crate::conversation::write_authority::{ConversationMutation, ConversationWriter};
 use crate::conversation::{
     CompatibilityError, ConversationId, ConversationReader, ConversationRecordV2,
     PrepareConversationRequest,
@@ -114,32 +115,29 @@ pub type Result<T> = std::result::Result<T, ConversationApplicationError>;
 
 pub struct ConversationApplicationService {
     reader: Arc<ConversationReader>,
+    writer: Arc<ConversationWriter>,
     workspace: Arc<SessionWorkspaceService>,
     legacy_index: HashMap<(LegacyConversationSourceKind, String), Vec<ConversationId>>,
-    mapped_legacy_ids: HashSet<ConversationId>,
     lifecycle: OnceLock<ConversationLifecycleService>,
     host_kind: ConversationHostKind,
     migration_phase: MigrationPhase,
     reader_precedence: ReaderPrecedence,
-    bootstrap_recovery_item_count: usize,
 }
 
 impl ConversationApplicationService {
     #[must_use]
     pub fn new(
         reader: Arc<ConversationReader>,
+        writer: Arc<ConversationWriter>,
         workspace: Arc<SessionWorkspaceService>,
         migration_map: &MigrationMapV1,
         host_mode: MigrationHostMode,
         migration_phase: MigrationPhase,
         reader_precedence: ReaderPrecedence,
-        bootstrap_recovery_item_count: usize,
     ) -> Self {
         let mut legacy_index =
             HashMap::<(LegacyConversationSourceKind, String), Vec<ConversationId>>::new();
-        let mut mapped_legacy_ids = HashSet::new();
         for entry in &migration_map.entries {
-            mapped_legacy_ids.insert(entry.conversation_id);
             if let Some(value) = &entry.legacy_storage_key {
                 push_legacy(
                     &mut legacy_index,
@@ -179,15 +177,24 @@ impl ConversationApplicationService {
         }
         Self {
             reader,
+            writer,
             workspace,
             legacy_index,
-            mapped_legacy_ids,
             lifecycle: OnceLock::new(),
             host_kind: host_mode.into(),
             migration_phase,
             reader_precedence,
-            bootstrap_recovery_item_count,
         }
+    }
+
+    #[must_use]
+    pub fn session_workspace(&self) -> Arc<SessionWorkspaceService> {
+        Arc::clone(&self.workspace)
+    }
+
+    #[must_use]
+    pub fn writer(&self) -> Arc<ConversationWriter> {
+        Arc::clone(&self.writer)
     }
 
     pub fn attach_lifecycle(&self, lifecycle: ConversationLifecycleService) -> Result<()> {
@@ -210,7 +217,7 @@ impl ConversationApplicationService {
             .into_iter()
             .filter(|item| item.status == RecoveryStatus::Unresolved)
             .collect::<Vec<_>>();
-        let recovery_item_count = self.bootstrap_recovery_item_count.max(recovery_items.len());
+        let recovery_item_count = recovery_items.len();
         let state = if recovery_item_count > 0 {
             ConversationHostState::Recovery
         } else if self.reader_precedence == ReaderPrecedence::HybridLegacyFirst
@@ -393,7 +400,7 @@ impl ConversationApplicationService {
     ) -> Result<SessionWorkspaceWriteOutcome> {
         let started = Instant::now();
         let result = async {
-            self.ensure_writable(conversation_id)?;
+            self.ensure_writable(conversation_id, ConversationMutation::WorkspaceWrite)?;
             self.workspace
                 .write(conversation_id, based_revision, workspace)
                 .await
@@ -444,7 +451,7 @@ impl ConversationApplicationService {
     ) -> Result<ConversationLifecycleOutcome> {
         let started = Instant::now();
         let result = async {
-            self.ensure_writable(conversation_id)?;
+            self.ensure_writable(conversation_id, ConversationMutation::BindingDetach)?;
             self.lifecycle()?
                 .detach_agent_binding(conversation_id, expected_revision)
                 .await
@@ -469,7 +476,7 @@ impl ConversationApplicationService {
     ) -> Result<ConversationLifecycleOutcome> {
         let started = Instant::now();
         let result = async {
-            self.ensure_writable(conversation_id)?;
+            self.ensure_writable(conversation_id, ConversationMutation::BindingRebind)?;
             self.lifecycle()?
                 .rebind_detached_binding(conversation_id, expected_revision)
                 .await
@@ -494,7 +501,7 @@ impl ConversationApplicationService {
     ) -> Result<ConversationLifecycleOutcome> {
         let started = Instant::now();
         let result = async {
-            self.ensure_writable(conversation_id)?;
+            self.ensure_writable(conversation_id, ConversationMutation::BindingSuspend)?;
             self.lifecycle()?
                 .suspend_agent_binding(conversation_id, expected_revision)
                 .await
@@ -520,7 +527,7 @@ impl ConversationApplicationService {
     ) -> Result<ConversationLifecycleOutcome> {
         let started = Instant::now();
         let result = async {
-            self.ensure_writable(conversation_id)?;
+            self.ensure_writable(conversation_id, ConversationMutation::BindingReplace)?;
             self.lifecycle()?
                 .replace_agent_binding(conversation_id, request, expected_revision)
                 .await
@@ -545,7 +552,7 @@ impl ConversationApplicationService {
     ) -> Result<ConversationLifecycleOutcome> {
         let started = Instant::now();
         let result = async {
-            self.ensure_writable(conversation_id)?;
+            self.ensure_writable(conversation_id, ConversationMutation::ConversationTombstone)?;
             self.lifecycle()?
                 .delete_conversation(conversation_id, expected_revision)
                 .await
@@ -574,19 +581,15 @@ impl ConversationApplicationService {
         })
     }
 
-    fn ensure_writable(&self, conversation_id: ConversationId) -> Result<()> {
-        if self.reader_precedence == ReaderPrecedence::LegacyOnly
-            || (self.reader_precedence == ReaderPrecedence::HybridLegacyFirst
-                && self.mapped_legacy_ids.contains(&conversation_id))
-        {
-            return Err(application_error(
-                "LEGACY_COMPATIBILITY_READ_ONLY",
-                "ensure_writable",
-                Some(conversation_id),
-                "mapped legacy Conversations are read-only under the active reader policy",
-            ));
-        }
-        Ok(())
+    fn ensure_writable(
+        &self,
+        conversation_id: ConversationId,
+        mutation: ConversationMutation,
+    ) -> Result<()> {
+        self.writer
+            .authorize(conversation_id, mutation)
+            .map(|_| ())
+            .map_err(map_repository_error)
     }
 }
 
@@ -636,6 +639,21 @@ fn map_compatibility_error(source: CompatibilityError) -> ConversationApplicatio
         _ => "CONVERSATION_RECOVERY_REQUIRED",
     };
     application_error(code, "read_conversation", None, source.detail)
+}
+
+fn map_repository_error(
+    source: crate::conversation::repository::RepositoryError,
+) -> ConversationApplicationError {
+    let code = serde_json::to_value(source.code)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "CONVERSATION_RECOVERY_REQUIRED".to_string());
+    application_error(
+        code,
+        source.operation,
+        source.conversation_id,
+        source.detail,
+    )
 }
 
 fn map_workspace_error(source: SessionWorkspaceError) -> ConversationApplicationError {
@@ -725,21 +743,25 @@ mod tests {
             .unwrap()
             .join("state/conversations/v2");
         let (repository, _) = ConversationRepository::open(root).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
         let id = ConversationId::parse(ID).unwrap();
         let created_at = parse_created_at_utc("2026-08-15T09:45:15.123Z").unwrap();
-        repository
-            .create_conversation(ConversationRecordV2 {
-                schema_version: CONVERSATION_SCHEMA_VERSION,
-                conversation_id: id,
-                created_at_utc: created_at,
-                creation_partition: CreationPartition::from_created_at(created_at),
-                workspace_cwd: "/visible/conversation".to_string(),
-                execution_target: ExecutionTarget::Workspace,
-                project_attachment: None,
-                lifecycle_state: ConversationLifecycleState::Ready,
-                last_seq: 0,
-                created_by: ConversationCreator::Termul,
-            })
+        writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id: id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: "/visible/conversation".to_string(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::Ready,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                },
+                ConversationMutation::CreateConversation,
+            )
             .await
             .unwrap();
         let reader = Arc::new(ConversationReader::new(
@@ -747,7 +769,7 @@ mod tests {
             LegacyConversationReader::default(),
             ReaderPrecedence::ConversationV2Only,
         ));
-        let workspace = Arc::new(SessionWorkspaceService::new(Arc::clone(&repository)));
+        let workspace = Arc::new(SessionWorkspaceService::new(Arc::clone(&writer)));
         let map = MigrationMapV1 {
             schema_version: MIGRATION_MAP_SCHEMA_VERSION,
             operation_id: Uuid::new_v4(),
@@ -766,12 +788,12 @@ mod tests {
             repository,
             ConversationApplicationService::new(
                 reader,
+                writer,
                 workspace,
                 &map,
                 MigrationHostMode::Desktop,
                 MigrationPhase::Finalized,
                 ReaderPrecedence::ConversationV2Only,
-                0,
             ),
         )
     }
@@ -955,14 +977,20 @@ mod tests {
             operation_id: Uuid::new_v4(),
             entries,
         };
+        let authority = Arc::new(crate::conversation::ConversationWriteAuthority::new(
+            repository.as_ref(),
+            ReaderPrecedence::HybridLegacyFirst,
+            map.entries.iter().map(|entry| entry.conversation_id),
+        ));
+        let writer = Arc::new(ConversationWriter::new(Arc::clone(&repository), authority).unwrap());
         let service = ConversationApplicationService::new(
             reader,
-            Arc::new(SessionWorkspaceService::new(repository)),
+            Arc::clone(&writer),
+            Arc::new(SessionWorkspaceService::new(writer)),
             &map,
             MigrationHostMode::Standalone,
             MigrationPhase::RolledBack,
             ReaderPrecedence::HybridLegacyFirst,
-            0,
         );
         assert_eq!(
             service
@@ -975,7 +1003,10 @@ mod tests {
             "LEGACY_ID_AMBIGUOUS"
         );
         assert_eq!(
-            service.ensure_writable(id).unwrap_err().code,
+            service
+                .ensure_writable(id, ConversationMutation::MetadataUpdate)
+                .unwrap_err()
+                .code,
             "LEGACY_COMPATIBILITY_READ_ONLY"
         );
     }

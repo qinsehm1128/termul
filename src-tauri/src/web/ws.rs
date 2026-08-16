@@ -7487,8 +7487,9 @@ mod tests {
             RecoveryProvenanceV1, RecoveryQueueV1, RecoverySeverity, MIGRATION_MAP_SCHEMA_VERSION,
         };
         use crate::conversation::{
-            ConversationApplicationService, ConversationId, ConversationReader,
-            ConversationRepository, LegacyConversationReader, SessionWorkspaceService,
+            ConversationApplicationService, ConversationId, ConversationMutation,
+            ConversationReader, ConversationRepository, ConversationWriteAuthority,
+            ConversationWriter, LegacyConversationReader, SessionWorkspaceService,
         };
 
         const ID: &str = "018f7a1c-1b4d-7c8a-9f01-0123456789ab";
@@ -7507,21 +7508,25 @@ mod tests {
                 .unwrap()
                 .join("state/conversations/v2");
             let (repository, _) = ConversationRepository::open(root).unwrap();
+            let seed_writer = ConversationWriter::for_test(Arc::clone(&repository));
             let conversation_id = ConversationId::parse(ID).unwrap();
             let created_at = parse_created_at_utc("2026-08-15T09:45:15.123Z").unwrap();
-            repository
-                .create_conversation(ConversationRecordV2 {
-                    schema_version: CONVERSATION_SCHEMA_VERSION,
-                    conversation_id,
-                    created_at_utc: created_at,
-                    creation_partition: CreationPartition::from_created_at(created_at),
-                    workspace_cwd: "/visible/conversation".to_string(),
-                    execution_target: ExecutionTarget::Workspace,
-                    project_attachment: None,
-                    lifecycle_state: ConversationLifecycleState::Ready,
-                    last_seq: 0,
-                    created_by: ConversationCreator::Termul,
-                })
+            seed_writer
+                .create_conversation(
+                    ConversationRecordV2 {
+                        schema_version: CONVERSATION_SCHEMA_VERSION,
+                        conversation_id,
+                        created_at_utc: created_at,
+                        creation_partition: CreationPartition::from_created_at(created_at),
+                        workspace_cwd: "/visible/conversation".to_string(),
+                        execution_target: ExecutionTarget::Workspace,
+                        project_attachment: None,
+                        lifecycle_state: ConversationLifecycleState::Ready,
+                        last_seq: 0,
+                        created_by: ConversationCreator::Termul,
+                    },
+                    ConversationMutation::CreateConversation,
+                )
                 .await
                 .unwrap();
             let migration_map = MigrationMapV1 {
@@ -7542,9 +7547,21 @@ mod tests {
                 LegacyConversationReader::default(),
                 precedence,
             ));
+            let authority = Arc::new(ConversationWriteAuthority::new(
+                repository.as_ref(),
+                precedence,
+                migration_map
+                    .entries
+                    .iter()
+                    .map(|entry| entry.conversation_id),
+            ));
+            let writer =
+                Arc::new(ConversationWriter::new(Arc::clone(&repository), authority).unwrap());
+            let workspace = Arc::new(SessionWorkspaceService::new(Arc::clone(&writer)));
             let service = Arc::new(ConversationApplicationService::new(
                 reader,
-                Arc::new(SessionWorkspaceService::new(Arc::clone(&repository))),
+                writer,
+                workspace,
                 &migration_map,
                 MigrationHostMode::Standalone,
                 if precedence == ReaderPrecedence::HybridLegacyFirst {
@@ -7553,7 +7570,6 @@ mod tests {
                     MigrationPhase::Finalized
                 },
                 precedence,
-                0,
             ));
             (temp, repository, service)
         }
@@ -7762,8 +7778,9 @@ mod tests {
             CONVERSATION_SCHEMA_VERSION,
         };
         use crate::conversation::{
-            ConversationCreationService, ConversationLocator, ConversationPersistenceAdapter,
-            ConversationReader, ConversationRepository, LegacyConversationReader, ReaderPrecedence,
+            ConversationCreationService, ConversationLocator, ConversationMutation,
+            ConversationPersistenceAdapter, ConversationReader, ConversationRepository,
+            ConversationWriter, LegacyConversationReader, ReaderPrecedence,
             SessionWorkspaceLocator,
         };
 
@@ -7782,26 +7799,30 @@ mod tests {
             let visible = base.join("visible");
             std::fs::create_dir_all(&visible).unwrap();
             let (repository, _) = ConversationRepository::open(private.clone()).unwrap();
+            let writer = ConversationWriter::for_test(Arc::clone(&repository));
             let conversation_id = crate::conversation::ConversationId::parse(ID).unwrap();
             let created_at = parse_created_at_utc("2026-08-15T09:45:15.123Z").unwrap();
             let workspace = visible.join("sessions/2026/08/15").join(ID);
             std::fs::create_dir_all(&workspace).unwrap();
-            repository
-                .create_conversation(ConversationRecordV2 {
-                    schema_version: CONVERSATION_SCHEMA_VERSION,
-                    conversation_id,
-                    created_at_utc: created_at,
-                    creation_partition: CreationPartition::from_created_at(created_at),
-                    workspace_cwd: workspace.to_string_lossy().into_owned(),
-                    execution_target: ExecutionTarget::Workspace,
-                    project_attachment: None,
-                    lifecycle_state: ConversationLifecycleState::Ready,
-                    last_seq: 0,
-                    created_by: ConversationCreator::Termul,
-                })
+            writer
+                .create_conversation(
+                    ConversationRecordV2 {
+                        schema_version: CONVERSATION_SCHEMA_VERSION,
+                        conversation_id,
+                        created_at_utc: created_at,
+                        creation_partition: CreationPartition::from_created_at(created_at),
+                        workspace_cwd: workspace.to_string_lossy().into_owned(),
+                        execution_target: ExecutionTarget::Workspace,
+                        project_attachment: None,
+                        lifecycle_state: ConversationLifecycleState::Ready,
+                        last_seq: 0,
+                        created_by: ConversationCreator::Termul,
+                    },
+                    ConversationMutation::CreateConversation,
+                )
                 .await
                 .unwrap();
-            repository
+            writer
                 .bind_agent_session(
                     conversation_id,
                     AgentSessionBinding {
@@ -7820,7 +7841,7 @@ mod tests {
                 .unwrap();
             let creation = Arc::new(
                 ConversationCreationService::new(
-                    Arc::clone(&repository),
+                    Arc::clone(&writer),
                     ConversationLocator::new(private).unwrap(),
                     SessionWorkspaceLocator::new(visible).unwrap(),
                 )
@@ -7831,10 +7852,7 @@ mod tests {
                 LegacyConversationReader::default(),
                 ReaderPrecedence::ConversationV2Only,
             ));
-            let persistence = Arc::new(ConversationPersistenceAdapter::new(
-                Arc::clone(&repository),
-                reader,
-            ));
+            let persistence = Arc::new(ConversationPersistenceAdapter::new(writer, reader));
             let relay = Arc::new(WsRelaySink::new());
             let acp = Arc::new(AcpManager::with_conversation_services(
                 vec![relay.clone()],

@@ -209,8 +209,8 @@ mod tests {
         MigrationPhase, ReaderPrecedence, RecoveryItemV1, MIGRATION_MAP_SCHEMA_VERSION,
     };
     use crate::conversation::{
-        ConversationReader, ConversationRepository, LegacyConversationReader,
-        SessionWorkspaceService,
+        ConversationMutation, ConversationReader, ConversationRepository, ConversationWriter,
+        LegacyConversationReader, SessionWorkspaceService,
     };
     use crate::web::ws::HistoryMode;
     use axum::body::Body;
@@ -231,21 +231,25 @@ mod tests {
             .unwrap()
             .join("state/conversations/v2");
         let (repository, _) = ConversationRepository::open(root).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
         let id = ConversationId::parse(ID).unwrap();
         let created_at = parse_created_at_utc("2026-08-15T09:45:15.123Z").unwrap();
-        repository
-            .create_conversation(ConversationRecordV2 {
-                schema_version: CONVERSATION_SCHEMA_VERSION,
-                conversation_id: id,
-                created_at_utc: created_at,
-                creation_partition: CreationPartition::from_created_at(created_at),
-                workspace_cwd: "/visible/conversation".to_string(),
-                execution_target: ExecutionTarget::Workspace,
-                project_attachment: None,
-                lifecycle_state: ConversationLifecycleState::Ready,
-                last_seq: 0,
-                created_by: ConversationCreator::Termul,
-            })
+        writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id: id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: "/visible/conversation".to_string(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::Ready,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                },
+                ConversationMutation::CreateConversation,
+            )
             .await
             .unwrap();
         let reader = Arc::new(ConversationReader::new(
@@ -266,14 +270,15 @@ mod tests {
                 source_record_sha256: "a".repeat(64),
             }],
         };
+        let workspace = Arc::new(SessionWorkspaceService::new(Arc::clone(&writer)));
         let conversation = Arc::new(ConversationApplicationService::new(
             reader,
-            Arc::new(SessionWorkspaceService::new(Arc::clone(&repository))),
+            writer,
+            workspace,
             &map,
             MigrationHostMode::Standalone,
             MigrationPhase::Finalized,
             ReaderPrecedence::ConversationV2Only,
-            0,
         ));
         let pty = crate::web::test_pty_manager();
         (

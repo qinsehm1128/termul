@@ -30,6 +30,7 @@ use crate::conversation::locator::{ConversationLocator, LocatorError, SessionWor
 use crate::conversation::repository::{
     ConversationMetadataUpdate, ConversationRepository, RepositoryError,
 };
+use crate::conversation::write_authority::{ConversationMutation, ConversationWriter};
 
 pub const PREPARE_CONVERSATION_SCHEMA_VERSION: u32 = 1;
 pub const PREPARED_CONVERSATION_SCHEMA_VERSION: u32 = 1;
@@ -151,6 +152,7 @@ pub type Result<T> = std::result::Result<T, ConversationCreationError>;
 
 /// Reusable durable creation transaction shared by future desktop and standalone bootstrap paths.
 pub struct ConversationCreationService {
+    writer: Arc<ConversationWriter>,
     repository: Arc<ConversationRepository>,
     private_locator: ConversationLocator,
     workspace_locator: SessionWorkspaceLocator,
@@ -162,12 +164,12 @@ pub struct ConversationCreationService {
 
 impl ConversationCreationService {
     pub fn new(
-        repository: Arc<ConversationRepository>,
+        writer: Arc<ConversationWriter>,
         private_locator: ConversationLocator,
         workspace_locator: SessionWorkspaceLocator,
     ) -> Result<Self> {
         Self::with_sources(
-            repository,
+            writer,
             private_locator,
             workspace_locator,
             DurableFileSystem::new(),
@@ -177,13 +179,14 @@ impl ConversationCreationService {
     }
 
     pub fn with_sources(
-        repository: Arc<ConversationRepository>,
+        writer: Arc<ConversationWriter>,
         private_locator: ConversationLocator,
         workspace_locator: SessionWorkspaceLocator,
         durable_fs: DurableFileSystem,
         clock: Arc<dyn Clock>,
         id_generator: Arc<dyn ConversationIdGenerator>,
     ) -> Result<Self> {
+        let repository = Arc::clone(writer.repository());
         if repository.root() != private_locator.root() {
             return Err(creation_error(
                 ConversationErrorCode::ConversationPathEscape,
@@ -193,6 +196,7 @@ impl ConversationCreationService {
             ));
         }
         Ok(Self {
+            writer,
             repository,
             private_locator,
             workspace_locator,
@@ -206,6 +210,11 @@ impl ConversationCreationService {
     #[must_use]
     pub fn repository(&self) -> &Arc<ConversationRepository> {
         &self.repository
+    }
+
+    #[must_use]
+    pub fn writer(&self) -> &Arc<ConversationWriter> {
+        &self.writer
     }
 
     /// Resolve a replacement execution target against an existing Conversation without mutating
@@ -428,6 +437,19 @@ impl ConversationCreationService {
 
             let lock = self.creation_lock(record.conversation_id);
             let _guard = lock.lock().await;
+            if let Err(error) = self.writer.authorize(
+                record.conversation_id,
+                ConversationMutation::CreationRecovery,
+            ) {
+                if error.code == ConversationErrorCode::LegacyCompatibilityReadOnly {
+                    log::warn!(
+                        "[conversation-creation] recovery skipped read-only conversation_id={} code=LEGACY_COMPATIBILITY_READ_ONLY",
+                        record.conversation_id
+                    );
+                    continue;
+                }
+                return Err(map_repository_error(error));
+            }
             if workspace_missing {
                 self.durable_fs
                     .create_dir_durable(&workspace, DirectoryPermissions::Inherit)
@@ -444,19 +466,23 @@ impl ConversationCreationService {
                 );
             }
             if record.lifecycle_state != ConversationLifecycleState::AgentFailed {
-                self.repository
+                self.writer
                     .update_metadata(
                         record.conversation_id,
                         ConversationMetadataUpdate {
                             lifecycle_state: Some(ConversationLifecycleState::AgentFailed),
                             execution_target: None,
                         },
+                        ConversationMutation::CreationRecovery,
                     )
                     .await
                     .map_err(map_repository_error)?;
             }
-            self.repository
-                .sync_conversation(record.conversation_id)
+            self.writer
+                .sync_conversation(
+                    record.conversation_id,
+                    ConversationMutation::CreationRecovery,
+                )
                 .await
                 .map_err(map_repository_error)?;
             log::warn!(
@@ -520,13 +546,13 @@ impl ConversationCreationService {
             last_seq: 0,
             created_by: ConversationCreator::Termul,
         };
-        self.repository
-            .create_conversation(record)
+        self.writer
+            .create_conversation(record, ConversationMutation::CreateConversation)
             .await
             .map_err(map_repository_error)?;
 
         if let Some(attachment) = request.project_attachment {
-            self.repository
+            self.writer
                 .append_project_attachment(
                     conversation_id,
                     attachment.clone(),
@@ -548,18 +574,19 @@ impl ConversationCreationService {
         );
 
         let record = self
-            .repository
+            .writer
             .update_metadata(
                 conversation_id,
                 ConversationMetadataUpdate {
                     lifecycle_state: Some(ConversationLifecycleState::InitializingAgent),
                     execution_target: None,
                 },
+                ConversationMutation::MetadataUpdate,
             )
             .await
             .map_err(map_repository_error)?;
-        self.repository
-            .sync_conversation(conversation_id)
+        self.writer
+            .sync_conversation(conversation_id, ConversationMutation::ConversationSync)
             .await
             .map_err(map_repository_error)?;
         log::info!(
@@ -613,9 +640,13 @@ impl ConversationCreationService {
             effective_attachment,
         )?;
 
+        self.writer
+            .authorize(conversation_id, ConversationMutation::CreationRetry)
+            .map_err(map_repository_error)?;
+
         match (&existing.project_attachment, request.project_attachment) {
             (None, Some(attachment)) => {
-                self.repository
+                self.writer
                     .append_project_attachment(
                         conversation_id,
                         attachment.clone(),
@@ -645,18 +676,19 @@ impl ConversationCreationService {
             conversation_id
         );
         let record = self
-            .repository
+            .writer
             .update_metadata(
                 conversation_id,
                 ConversationMetadataUpdate {
                     lifecycle_state: Some(ConversationLifecycleState::InitializingAgent),
                     execution_target: Some(request.execution_target),
                 },
+                ConversationMutation::CreationRetry,
             )
             .await
             .map_err(map_repository_error)?;
-        self.repository
-            .sync_conversation(conversation_id)
+        self.writer
+            .sync_conversation(conversation_id, ConversationMutation::CreationRetry)
             .await
             .map_err(map_repository_error)?;
         log::info!(
@@ -713,18 +745,18 @@ impl ConversationCreationService {
             .map_err(map_repository_error)?
             .is_some()
         {
-            self.repository
+            self.writer
                 .replace_agent_binding(conversation_id, value, bound_at_utc)
                 .await
                 .map_err(map_repository_error)?;
         } else {
-            self.repository
+            self.writer
                 .bind_agent_session(conversation_id, value, bound_at_utc)
                 .await
                 .map_err(map_repository_error)?;
         }
-        self.repository
-            .sync_conversation(conversation_id)
+        self.writer
+            .sync_conversation(conversation_id, ConversationMutation::ConversationSync)
             .await
             .map_err(map_repository_error)?;
         let ready = self
@@ -764,7 +796,7 @@ impl ConversationCreationService {
             ));
         }
         let event = self
-            .repository
+            .writer
             .append_event(
                 conversation_id,
                 self.clock.now_utc(),
@@ -774,11 +806,12 @@ impl ConversationCreationService {
                     "retryable": true,
                     "message": message,
                 }),
+                ConversationMutation::CreationFailureRecord,
             )
             .await
             .map_err(map_repository_error)?;
-        self.repository
-            .sync_conversation(conversation_id)
+        self.writer
+            .sync_conversation(conversation_id, ConversationMutation::CreationFailureRecord)
             .await
             .map_err(map_repository_error)?;
         log::warn!(
@@ -1149,11 +1182,12 @@ mod tests {
         fs::create_dir_all(&visible_root).unwrap();
         let (repository, report) = ConversationRepository::open(private_root.clone()).unwrap();
         assert_eq!(report.valid_conversation_count, 0);
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
         let clock = FixedClock::new(clock_values);
         let ids = FixedIds::new(id_values);
         let service = Arc::new(
             ConversationCreationService::with_sources(
-                Arc::clone(&repository),
+                writer,
                 ConversationLocator::new(private_root.clone()).unwrap(),
                 SessionWorkspaceLocator::new(visible_root.clone()).unwrap(),
                 DurableFileSystem::new(),
@@ -1507,13 +1541,15 @@ mod tests {
         let workspace = PathBuf::from(&prepared.workspace_cwd);
         fs::write(workspace.join("user-data.txt"), b"never delete").unwrap();
         fixture
-            .repository
+            .service
+            .writer()
             .update_metadata(
                 prepared.conversation_id,
                 ConversationMetadataUpdate {
                     lifecycle_state: Some(ConversationLifecycleState::AllocatingWorkspace),
                     execution_target: None,
                 },
+                ConversationMutation::MetadataUpdate,
             )
             .await
             .unwrap();
@@ -1570,9 +1606,10 @@ mod tests {
                 .lifecycle_state,
             ConversationLifecycleState::AgentFailed
         );
+        let reopened_writer = ConversationWriter::for_test(Arc::clone(&reopened));
         let service = Arc::new(
             ConversationCreationService::with_sources(
-                Arc::clone(&reopened),
+                reopened_writer,
                 ConversationLocator::new(fixture.private_root.clone()).unwrap(),
                 SessionWorkspaceLocator::new(fixture.visible_root.clone()).unwrap(),
                 DurableFileSystem::new(),

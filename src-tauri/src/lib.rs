@@ -1315,6 +1315,7 @@ pub fn run() {
             app.manage(Arc::clone(&conversation_bootstrap.reader));
             app.manage(Arc::clone(&conversation_bootstrap.creation));
             app.manage(Arc::clone(&conversation_bootstrap.persistence_adapter));
+            app.manage(Arc::clone(&conversation_bootstrap.workspace));
             app.manage(Arc::clone(&conversation_bootstrap.application));
             let conversation_migration_control = Arc::new(
                 crate::conversation::ConversationMigrationControlService::new(&app_data_dir)

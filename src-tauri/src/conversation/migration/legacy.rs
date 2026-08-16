@@ -7,7 +7,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use chrono::{DateTime, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -34,6 +33,7 @@ use crate::conversation::contracts::{
 use crate::conversation::durable_fs::{DirectoryPermissions, DurableFileSystem};
 use crate::conversation::event_log::{ConversationEventRecordV2, ConversationEventType};
 use crate::conversation::repository::ConversationRepository;
+use crate::conversation::write_authority::MigrationWriter;
 
 pub const MIGRATION_MAP_SCHEMA_VERSION: u32 = 1;
 pub const MIGRATION_MAP_FILE: &str = "migration-map-v1.json";
@@ -295,8 +295,10 @@ pub async fn stage_legacy_conversations(
         .join("conversations")
         .join("v2");
     let (repository, _) =
-        ConversationRepository::open(repository_root).map_err(repository_error)?;
-    let reserved_conversation_ids = repository
+        ConversationRepository::open_staging(repository_root).map_err(repository_error)?;
+    let writer = MigrationWriter::new(repository).map_err(repository_error)?;
+    let reserved_conversation_ids = writer
+        .repository()
         .list_conversations()
         .into_iter()
         .map(|record| record.conversation_id)
@@ -323,7 +325,7 @@ pub async fn stage_legacy_conversations(
             continue;
         };
         let receipt = stage_one(
-            &repository,
+            &writer,
             &configuration.operation_dir,
             inventory.operation_id,
             plan,
@@ -422,7 +424,7 @@ pub fn load_staged_manifest(operation_dir: &Path) -> Result<StagedManifestV1> {
 }
 
 async fn stage_one(
-    repository: &Arc<ConversationRepository>,
+    writer: &MigrationWriter,
     operation_dir: &Path,
     operation_id: Uuid,
     plan: &PlannedConversation,
@@ -437,7 +439,7 @@ async fn stage_one(
                 error.to_string(),
             )
         })?;
-        verify_receipt_matches_plan(repository, plan, &receipt)?;
+        verify_receipt_matches_plan(writer.repository(), plan, &receipt)?;
         return Ok(receipt);
     }
 
@@ -480,7 +482,10 @@ async fn stage_one(
         last_seq: 0,
         created_by: ConversationCreator::Termul,
     };
-    match repository.get_conversation(plan.map.conversation_id) {
+    match writer
+        .repository()
+        .get_conversation(plan.map.conversation_id)
+    {
         Ok(existing) => {
             if existing.created_at_utc != record.created_at_utc
                 || existing.workspace_cwd != record.workspace_cwd
@@ -497,7 +502,7 @@ async fn stage_one(
             if error.code
                 == crate::conversation::contracts::ConversationErrorCode::ConversationNotFound =>
         {
-            repository
+            writer
                 .create_conversation(record)
                 .await
                 .map_err(repository_error)?;
@@ -537,7 +542,8 @@ async fn stage_one(
         }
     }
     all_events.extend(plan.events.clone());
-    let existing_events = repository
+    let existing_events = writer
+        .repository()
         .read_events(plan.map.conversation_id, 0)
         .map_err(repository_error)?;
     if existing_events.len() > all_events.len()
@@ -557,7 +563,7 @@ async fn stage_one(
         ));
     }
     for event in all_events.iter().skip(existing_events.len()) {
-        repository
+        writer
             .append_event(
                 plan.map.conversation_id,
                 event.recorded_at_utc,
@@ -576,22 +582,25 @@ async fn stage_one(
         migration_id: operation_id.to_string(),
         source_records: provenance,
     };
-    repository
+    writer
         .write_provenance(plan.map.conversation_id, provenance_file.clone())
         .await
         .map_err(repository_error)?;
-    repository
+    writer
         .sync_conversation(plan.map.conversation_id)
         .await
         .map_err(repository_error)?;
 
-    let staged_record = repository
+    let staged_record = writer
+        .repository()
         .get_conversation(plan.map.conversation_id)
         .map_err(repository_error)?;
-    let staged_events = repository
+    let staged_events = writer
+        .repository()
         .read_events(plan.map.conversation_id, 0)
         .map_err(repository_error)?;
-    let summary = repository
+    let summary = writer
+        .repository()
         .history_summary(plan.map.conversation_id)
         .map_err(repository_error)?;
     let message_count = summary.message_count;

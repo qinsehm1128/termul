@@ -237,7 +237,7 @@ fn scan_with_limits(locator: &ConversationLocator, limits: ScanLimits) -> Result
     log::debug!("[conversation-locator] scan start root={}", root.display());
 
     match fs::symlink_metadata(root) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
+        Ok(metadata) if metadata_is_link_or_reparse(&metadata) => {
             warn_rejected(root, root, "CONVERSATION_SYMLINK_COMPONENT");
             return Err(LocatorError::SymlinkComponent {
                 path: root.to_path_buf(),
@@ -269,7 +269,7 @@ fn scan_with_limits(locator: &ConversationLocator, limits: ScanLimits) -> Result
         }
     }
 
-    reject_existing_symlink_components(root)?;
+    reject_link_or_reparse_components(root)?;
 
     let mut rejected_count = 0usize;
     let mut seen_conversations = 0usize;
@@ -423,10 +423,10 @@ fn validate_root(root: &Path) -> Result<()> {
             reason: "root contains traversal or current-directory components",
         });
     }
-    reject_existing_symlink_components(root)
+    reject_link_or_reparse_components(root)
 }
 
-fn reject_existing_symlink_components(path: &Path) -> Result<()> {
+pub(crate) fn reject_link_or_reparse_components(path: &Path) -> Result<()> {
     let mut current = PathBuf::new();
     for component in path.components() {
         match component {
@@ -442,7 +442,7 @@ fn reject_existing_symlink_components(path: &Path) -> Result<()> {
             }
         }
         match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
+            Ok(metadata) if metadata_is_link_or_reparse(&metadata) => {
                 return Err(LocatorError::SymlinkComponent {
                     path: current.clone(),
                 });
@@ -458,6 +458,22 @@ fn reject_existing_symlink_components(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn metadata_is_link_or_reparse(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 fn validate_partition(partition: &CreationPartition) -> Result<()> {
@@ -643,7 +659,7 @@ fn safe_directory_entry(
         path: path.clone(),
         source,
     })?;
-    if metadata.file_type().is_symlink() {
+    if metadata_is_link_or_reparse(&metadata) {
         *rejected_count += 1;
         warn_rejected(root, &path, "CONVERSATION_SYMLINK_COMPONENT");
         return Ok(false);
@@ -667,7 +683,7 @@ fn load_validated_record(
         path: metadata_path.clone(),
         source,
     })?;
-    if metadata.file_type().is_symlink() {
+    if metadata_is_link_or_reparse(&metadata) {
         warn_rejected(root, &metadata_path, "CONVERSATION_SYMLINK_COMPONENT");
         return Err(LocatorError::SymlinkComponent {
             path: metadata_path,
