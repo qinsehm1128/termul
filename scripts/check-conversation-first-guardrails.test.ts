@@ -5,22 +5,70 @@ import {
   stripComments
 } from './check-conversation-first-guardrails'
 
-function roots(): string {
+function root(): string {
   return `
-function AppEffects() {
+import { PortableAppEffects } from '@/app/PortableAppEffects'
+import { createPortableRouter } from '@/app/portable-router'
+const router = createPortableRouter()
+const effects = <PortableAppEffects />
+const status = <ConversationHostStatus />
+const recovery = <ConversationRecoveryPanel />
+`
+}
+
+function portableEffects(): string {
+  return `
+export function PortableAppEffects() {
+  useTerminalAutoSave()
   useSessionWorkspaceBootstrap()
   useConversationHostBootstrap()
   useConversationLifecycle()
   useTerminalResourceLifecycle()
+  useTerminalRestore()
+  useCrashRecovery()
+  useTerminalDetachedOutput()
+  useCwd()
+  useGitBranch()
+  useGitStatus()
+  useExitCode()
+  useContextBarSettings()
+  useAppSettingsLoader()
+  useAppliedLanguageSync()
+  useAppliedColorThemeSync()
+  useAppliedUiZoomSync()
+  useKeyboardShortcutsLoader()
+  useProjectsLoader()
+  useProjectsAutoSave()
+  useMenuUpdaterListener()
+  useUpdateCheck()
+  useUpdateToast()
+  useVisibilityState()
+  useTerminalExitNotification()
+  useRemoteProjects()
+  useAcpListeners()
+  useAcpAgents()
+  useAcpHistory()
+  useAcpSessionResume()
+  useAcpMcp()
+  usePreventFileDropNavigation()
+  usePreventNativeContextMenu()
+  initNotificationPermissions()
 }
-const routes = [
+`
+}
+
+function portableRouter(): string {
+  return `
+export const portableRouteObjects = [
   { path: 'c/:conversationId' },
   { path: 'legacy/session/:legacyValue' },
   { path: 'legacy/storage/:legacyValue' },
-  { path: 'legacy/history/:legacyValue' }
+  { path: 'legacy/history/:legacyValue' },
+  { path: 'snapshots' },
+  { path: 'settings' },
+  { path: 'preferences' }
 ]
-const status = <ConversationHostStatus />
-const recovery = <ConversationRecoveryPanel />
+export function createPortableRouter() {}
 `
 }
 
@@ -38,8 +86,14 @@ pub struct SessionWorkspaceV1 {
 pub enum SessionWorkspaceLoadOutcome { Missing }
 `,
     'src-tauri/src/remote/host.rs': `
+enum CredentialSource {
+  Desktop,
+  #[cfg(test)]
+  Test(String),
+}
 async fn start() { serve_router().await; }
-#[cfg(test)] mod tests { const TEXT: &str = "kill_all is forbidden"; }
+#[cfg(test)]
+mod tests { const TEXT: &str = "kill_all is forbidden"; }
 `,
     'src-tauri/src/web/mod.rs': `
 pub async fn serve() {
@@ -49,8 +103,10 @@ pub async fn serve() {
 pub async fn serve_router() { build_router(); }
 async fn shutdown_signal_future() {}
 `,
-    'src/renderer/App.tsx': roots(),
-    'src/renderer/TauriApp.tsx': roots(),
+    'src/renderer/App.tsx': root(),
+    'src/renderer/TauriApp.tsx': root(),
+    'src/renderer/app/PortableAppEffects.tsx': portableEffects(),
+    'src/renderer/app/portable-router.tsx': portableRouter(),
     'src/renderer/lib/router-navigate.ts': 'export function navigate() {}',
     'src/renderer/stores/project-store.ts': 'export function selectProject() {}',
     'src/renderer/layouts/WorkspaceLayout.tsx': `
@@ -112,7 +168,16 @@ describe('Conversation-first structural guardrails', () => {
       'src/renderer/stores/project-store.ts',
       `terminalApi.terminate('terminal-one')`
     ],
-    ['root-parity', 'src/renderer/App.tsx', roots().replace("{ path: 'c/:conversationId' },", '')],
+    [
+      'root-parity',
+      'src/renderer/App.tsx',
+      root().replace("import { PortableAppEffects } from '@/app/PortableAppEffects'\n", '')
+    ],
+    [
+      'root-parity',
+      'src/renderer/app/PortableAppEffects.tsx',
+      portableEffects().replace('  useAcpMcp()\n', '')
+    ],
     [
       'desktop-shared-live-ownership',
       'src-tauri/src/remote/host.rs',
@@ -131,6 +196,46 @@ describe('Conversation-first structural guardrails', () => {
     expect(findings[0]).toMatchObject({ rule, file })
     expect(findings[0].line).toBeGreaterThan(0)
     expect(`${findings[0].file}:${findings[0].line}`).toMatch(/:\d+$/)
+  })
+
+  it('reports a root that duplicates portable effects with exact file:line evidence', () => {
+    const sources = validSources()
+    sources['src/renderer/TauriApp.tsx'] += `
+function AppEffects() {
+  useGitStatus()
+}
+`
+
+    const findings = checkConversationFirstGuardrails(sources).filter(
+      (item) => item.rule === 'root-parity' && item.file === 'src/renderer/TauriApp.tsx'
+    )
+
+    expect(
+      findings.some((item) => item.message.includes('redeclare portable application effects'))
+    ).toBe(true)
+    expect(findings.some((item) => item.message.includes('duplicate portable effect hooks'))).toBe(
+      true
+    )
+    expect(findings.every((item) => item.line > 0)).toBe(true)
+  })
+
+  it('reports a root that duplicates portable routes with exact file:line evidence', () => {
+    const sources = validSources()
+    sources['src/renderer/App.tsx'] += `
+const duplicateRouter = createHashRouter([
+  { path: 'settings' }
+])
+`
+
+    const findings = checkConversationFirstGuardrails(sources).filter(
+      (item) => item.rule === 'root-parity' && item.file === 'src/renderer/App.tsx'
+    )
+
+    expect(
+      findings.some((item) => item.message.includes('redeclare the portable route table'))
+    ).toBe(true)
+    expect(findings.some((item) => item.message.includes('duplicate a portable route'))).toBe(true)
+    expect(findings.every((item) => item.line > 0)).toBe(true)
   })
 
   it('does not treat forbidden words in comments as live code', () => {

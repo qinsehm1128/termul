@@ -17,6 +17,8 @@ const REQUIRED_SOURCES = [
   'src-tauri/src/web/mod.rs',
   'src/renderer/App.tsx',
   'src/renderer/TauriApp.tsx',
+  'src/renderer/app/PortableAppEffects.tsx',
+  'src/renderer/app/portable-router.tsx',
   'src/renderer/lib/router-navigate.ts',
   'src/renderer/stores/project-store.ts',
   'src/renderer/layouts/WorkspaceLayout.tsx',
@@ -29,8 +31,46 @@ const REQUIRED_SOURCES = [
 const NAVIGATION_FILES = [
   'src/renderer/App.tsx',
   'src/renderer/TauriApp.tsx',
+  'src/renderer/app/PortableAppEffects.tsx',
+  'src/renderer/app/portable-router.tsx',
   'src/renderer/lib/router-navigate.ts',
   'src/renderer/stores/project-store.ts'
+] as const
+
+const PORTABLE_EFFECT_HOOKS = [
+  'useTerminalAutoSave',
+  'useSessionWorkspaceBootstrap',
+  'useConversationHostBootstrap',
+  'useConversationLifecycle',
+  'useTerminalResourceLifecycle',
+  'useTerminalRestore',
+  'useCrashRecovery',
+  'useTerminalDetachedOutput',
+  'useCwd',
+  'useGitBranch',
+  'useGitStatus',
+  'useExitCode',
+  'useContextBarSettings',
+  'useAppSettingsLoader',
+  'useAppliedLanguageSync',
+  'useAppliedColorThemeSync',
+  'useAppliedUiZoomSync',
+  'useKeyboardShortcutsLoader',
+  'useProjectsLoader',
+  'useProjectsAutoSave',
+  'useMenuUpdaterListener',
+  'useUpdateCheck',
+  'useUpdateToast',
+  'useVisibilityState',
+  'useTerminalExitNotification',
+  'useRemoteProjects',
+  'useAcpListeners',
+  'useAcpAgents',
+  'useAcpHistory',
+  'useAcpSessionResume',
+  'useAcpMcp',
+  'usePreventFileDropNavigation',
+  'usePreventNativeContextMenu'
 ] as const
 
 function lineNumber(source: string, index: number): number {
@@ -286,17 +326,71 @@ export function checkConversationFirstGuardrails(sources: GuardSources): GuardFi
     )
   }
 
-  const rootRequirements = [
+  const portableEffectsFile = 'src/renderer/app/PortableAppEffects.tsx'
+  const portableEffects = stripped[portableEffectsFile] ?? ''
+  for (const token of [
+    ...PORTABLE_EFFECT_HOOKS.map((hook) => `${hook}()`),
+    'initNotificationPermissions()'
+  ]) {
+    requireToken(
+      findings,
+      'root-parity',
+      portableEffectsFile,
+      portableEffects,
+      token,
+      `shared portable effects are missing Conversation wiring: ${token}`
+    )
+  }
+
+  const portableRouterFile = 'src/renderer/app/portable-router.tsx'
+  const portableRouter = stripped[portableRouterFile] ?? ''
+  for (const token of [
     "path: 'c/:conversationId'",
     "path: 'legacy/session/:legacyValue'",
     "path: 'legacy/storage/:legacyValue'",
     "path: 'legacy/history/:legacyValue'",
-    'useSessionWorkspaceBootstrap()',
-    'useConversationHostBootstrap()',
-    'useConversationLifecycle()',
-    'useTerminalResourceLifecycle()',
+    "path: 'snapshots'",
+    "path: 'settings'",
+    "path: 'preferences'"
+  ]) {
+    requireToken(
+      findings,
+      'root-parity',
+      portableRouterFile,
+      portableRouter,
+      token,
+      `shared portable router is missing route: ${token}`
+    )
+  }
+
+  const rootRequirements = [
+    "import { PortableAppEffects } from '@/app/PortableAppEffects'",
+    "import { createPortableRouter } from '@/app/portable-router'",
+    'createPortableRouter()',
+    '<PortableAppEffects />',
     '<ConversationHostStatus />',
     '<ConversationRecoveryPanel />'
+  ]
+  const duplicatedRootPatterns = [
+    {
+      pattern: /function\s+(?:AppEffects|PortableAppEffects)\s*\(/,
+      message: 'renderer root must not redeclare portable application effects'
+    },
+    {
+      pattern: /createHashRouter\s*\(/,
+      message: 'renderer root must not redeclare the portable route table'
+    },
+    {
+      pattern:
+        /path:\s*['"](?:c\/:conversationId|legacy\/(?:session|storage|history)\/:legacyValue|snapshots|settings|preferences)['"]/,
+      message: 'renderer root must not duplicate a portable route declaration'
+    },
+    {
+      pattern: new RegExp(
+        `(?:${PORTABLE_EFFECT_HOOKS.join('|')}|initNotificationPermissions)\\s*\\(`
+      ),
+      message: 'renderer root must not duplicate portable effect hooks'
+    }
   ]
   for (const file of ['src/renderer/App.tsx', 'src/renderer/TauriApp.tsx']) {
     const source = stripped[file] ?? ''
@@ -307,14 +401,19 @@ export function checkConversationFirstGuardrails(sources: GuardSources): GuardFi
         file,
         source,
         token,
-        `renderer root is missing portable Conversation wiring: ${token}`
+        `renderer root is missing shared portable wiring: ${token}`
       )
+    }
+    for (const duplicate of duplicatedRootPatterns) {
+      scanPattern(findings, 'root-parity', file, source, duplicate.pattern, duplicate.message)
     }
   }
 
   const remoteFile = 'src-tauri/src/remote/host.rs'
   const remote = stripped[remoteFile] ?? ''
-  const remoteProduction = remote.split('#[cfg(test)]')[0] ?? remote
+  // Inline cfg(test) enum variants and constructor branches are valid production-file
+  // structure. Only exclude the terminal test module from ownership scans.
+  const remoteProduction = remote.split(/\n#\[cfg\(test\)\]\s*\nmod tests\b/)[0] ?? remote
   scanPattern(
     findings,
     'desktop-shared-live-ownership',

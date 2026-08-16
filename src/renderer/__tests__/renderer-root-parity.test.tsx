@@ -1,75 +1,155 @@
-import { readFileSync } from 'node:fs'
-import { join } from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import type { ComponentType, ReactNode } from 'react'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import App from '../App'
+import TauriApp from '../TauriApp'
 
-const rendererRoot = join(__dirname, '..')
-const appSource = readFileSync(join(rendererRoot, 'App.tsx'), 'utf8')
-const tauriSource = readFileSync(join(rendererRoot, 'TauriApp.tsx'), 'utf8')
+const { mockPreventDevToolsShortcuts } = vi.hoisted(() => ({
+  mockPreventDevToolsShortcuts: vi.fn()
+}))
 
-const portableRoutes = [
-  'c/:conversationId',
-  'legacy/session/:legacyValue',
-  'legacy/storage/:legacyValue',
-  'legacy/history/:legacyValue',
-  'snapshots',
-  'settings',
-  'preferences'
+vi.mock('@/app/PortableAppEffects', () => ({
+  PortableAppEffects: () => <div data-testid="portable-app-effects" />
+}))
+
+vi.mock('@/layouts/WorkspaceLayout', async () => {
+  const { Outlet } = await import('react-router-dom')
+  return { default: () => <Outlet /> }
+})
+
+vi.mock('@/components/conversation/ConversationRoute', () => ({
+  ConversationRoute: () => <div data-testid="portable-route" data-component="conversation" />
+}))
+
+vi.mock('@/components/ChatRoute', () => ({
+  ChatRoute: ({ sourceKind }: { sourceKind: string }) => (
+    <div data-testid="portable-route" data-component={`legacy:${sourceKind}`} />
+  )
+}))
+
+vi.mock('@/pages/WorkspaceDashboard', () => ({
+  default: () => <div data-testid="portable-route" data-component="dashboard" />
+}))
+
+vi.mock('@/pages/WorkspaceSnapshots', () => ({
+  default: () => <div data-testid="portable-route" data-component="snapshots" />
+}))
+
+vi.mock('@/pages/ProjectSettings', () => ({
+  default: () => <div data-testid="portable-route" data-component="settings" />
+}))
+
+vi.mock('@/pages/AppPreferences', () => ({
+  default: () => <div data-testid="portable-route" data-component="preferences" />
+}))
+
+vi.mock('@/pages/NotFound', () => ({
+  default: () => <div data-testid="portable-route" data-component="not-found" />
+}))
+
+vi.mock('@/components/conversation/ConversationHostStatus', () => ({
+  ConversationHostStatus: () => null
+}))
+
+vi.mock('@/components/conversation/ConversationRecoveryPanel', () => ({
+  ConversationRecoveryPanel: () => null
+}))
+
+vi.mock('@/components/ErrorBoundary', () => ({
+  ErrorBoundary: ({ children }: { children: ReactNode }) => <>{children}</>
+}))
+
+vi.mock('@/components/GlobalContextMenu', () => ({
+  GlobalContextMenu: ({ children }: { children: ReactNode }) => <>{children}</>
+}))
+
+vi.mock('@/components/ui/tooltip', () => ({
+  TooltipProvider: ({ children }: { children: ReactNode }) => <>{children}</>
+}))
+
+vi.mock('@/components/ui/toaster', () => ({ Toaster: () => null }))
+vi.mock('@/components/ui/sonner', () => ({ Toaster: () => null }))
+vi.mock('@/components/WhatsNewModal', () => ({ WhatsNewModal: () => null }))
+vi.mock('@/components/DirectoryPicker', () => ({
+  DirectoryPicker: () => <div data-testid="web-directory-picker" />
+}))
+
+vi.mock('@/hooks/use-whats-new', () => ({
+  useWhatsNew: () => ({
+    isOpen: false,
+    version: '',
+    notes: null,
+    htmlUrl: null,
+    close: vi.fn()
+  })
+}))
+
+vi.mock('@/hooks/use-prevent-devtools-shortcuts', () => ({
+  usePreventDevToolsShortcuts: mockPreventDevToolsShortcuts
+}))
+
+vi.mock('@/hooks/use-window-state', () => ({ useWindowState: () => false }))
+vi.mock('@/lib/platform', () => ({ isWindows: false }))
+vi.mock('@/lib/tauri-runtime', () => ({ isTauriContext: () => false }))
+
+const routeCases = [
+  ['/', 'dashboard'],
+  ['/c/018f7a1c-1b4d-7c8a-9f01-0123456789ab', 'conversation'],
+  ['/legacy/session/opaque-value', 'legacy:legacyAgentSessionId'],
+  ['/legacy/storage/opaque-value', 'legacy:legacyStorageKey'],
+  ['/legacy/history/opaque-value', 'legacy:legacyChatHistoryId'],
+  ['/snapshots', 'snapshots'],
+  ['/settings', 'settings'],
+  ['/preferences', 'preferences'],
+  ['/missing-route', 'not-found']
 ] as const
 
-const portableWiring = [
-  'useSessionWorkspaceBootstrap()',
-  'useConversationHostBootstrap()',
-  'useConversationLifecycle()',
-  'useTerminalResourceLifecycle()',
-  '<ConversationHostStatus />',
-  '<ConversationRecoveryPanel />',
-  '<GlobalContextMenu>',
-  '<ErrorBoundary context="appRoot">'
-] as const
-
-function routeSet(source: string): string[] {
-  return portableRoutes.filter((route) => source.includes(`path: '${route}'`)).sort()
+async function navigateRoot(
+  Root: ComponentType,
+  path: string,
+  expected: string
+): Promise<{ route: string; hasPortableEffects: boolean }> {
+  window.location.hash = `#${path}`
+  window.dispatchEvent(new HashChangeEvent('hashchange'))
+  const view = render(<Root />)
+  await waitFor(() => {
+    expect(screen.getByTestId('portable-route')).toHaveAttribute('data-component', expected)
+  })
+  const result = {
+    route: screen.getByTestId('portable-route').getAttribute('data-component') ?? '',
+    hasPortableEffects: screen.queryByTestId('portable-app-effects') !== null
+  }
+  view.unmount()
+  cleanup()
+  return result
 }
 
-function wiringSet(source: string): string[] {
-  return portableWiring.filter((token) => source.includes(token)).sort()
-}
+afterEach(() => {
+  cleanup()
+  vi.clearAllMocks()
+})
 
-describe('renderer root Conversation parity', () => {
-  it('loads both root modules as executable React components', async () => {
-    const [app, tauri] = await Promise.all([import('../App'), import('../TauriApp')])
-    expect(typeof app.default).toBe('function')
-    expect(typeof tauri.default).toBe('function')
-  }, 15_000)
+describe('renderer root runtime parity', () => {
+  it.each(routeCases)('navigates %s to the same portable %s component', async (path, expected) => {
+    const web = await navigateRoot(App, path, expected)
+    const native = await navigateRoot(TauriApp, path, expected)
 
-  it('registers identical portable canonical and legacy routes', () => {
-    expect(routeSet(appSource)).toEqual([...portableRoutes].sort())
-    expect(routeSet(tauriSource)).toEqual([...portableRoutes].sort())
-    expect(routeSet(appSource)).toEqual(routeSet(tauriSource))
+    expect(web).toEqual({ route: expected, hasPortableEffects: true })
+    expect(native).toEqual(web)
   })
 
-  it('mounts identical Conversation providers, hooks, host status, and recovery UI', () => {
-    expect(wiringSet(appSource)).toEqual([...portableWiring].sort())
-    expect(wiringSet(tauriSource)).toEqual([...portableWiring].sort())
-    expect(wiringSet(appSource)).toEqual(wiringSet(tauriSource))
-  })
+  it('keeps browser and native wrappers platform-specific around the portable shell', async () => {
+    window.location.hash = '#/'
+    const web = render(<App />)
+    await waitFor(() => expect(screen.queryByTestId('portable-app-effects')).not.toBeNull())
+    expect(screen.queryByTestId('web-directory-picker')).not.toBeNull()
+    expect(mockPreventDevToolsShortcuts).not.toHaveBeenCalled()
+    web.unmount()
+    cleanup()
 
-  it('keeps platform-only differences explicit without changing Conversation behavior', () => {
-    expect(appSource).toContain('!isTauriContext() && <DirectoryPicker />')
-    expect(tauriSource).not.toContain('<DirectoryPicker />')
-    for (const token of ['ConversationRoute', 'ChatRoute', 'ConversationHostStatus']) {
-      expect(appSource).toContain(token)
-      expect(tauriSource).toContain(token)
-    }
-  })
-
-  it('does not terminate PTYs from either renderer root', () => {
-    for (const [file, source] of [
-      ['App.tsx', appSource],
-      ['TauriApp.tsx', tauriSource]
-    ] as const) {
-      expect(source, file).not.toMatch(/terminalApi\.(?:terminate|kill)\s*\(/)
-      expect(source, file).not.toMatch(/terminateTerminalResource\s*\(/)
-    }
+    render(<TauriApp />)
+    await waitFor(() => expect(screen.queryByTestId('portable-app-effects')).not.toBeNull())
+    expect(screen.queryByTestId('web-directory-picker')).toBeNull()
+    expect(mockPreventDevToolsShortcuts).toHaveBeenCalledTimes(1)
   })
 })

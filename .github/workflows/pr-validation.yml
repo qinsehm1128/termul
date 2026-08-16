@@ -208,6 +208,10 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
+      - name: Validate locked Rust metadata
+        working-directory: src-tauri
+        run: cargo metadata --locked --format-version 1
+
       - name: Cache Rust
         uses: swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
@@ -216,23 +220,23 @@ jobs:
 
       - name: Durable filesystem replacement matrix
         working-directory: src-tauri
-        run: cargo test conversation::durable_fs
+        run: cargo test --locked conversation::durable_fs
 
       - name: Migration recovery matrix
         working-directory: src-tauri
-        run: cargo test conversation::migration
+        run: cargo test --locked conversation::migration
 
       - name: Repository recovery matrix
         working-directory: src-tauri
-        run: cargo test conversation::repository
+        run: cargo test --locked conversation::repository
 
       - name: SessionWorkspace recovery matrix
         working-directory: src-tauri
-        run: cargo test conversation::session_workspace
+        run: cargo test --locked conversation::session_workspace
 
       - name: Native replacement and restart matrix
         working-directory: src-tauri
-        run: cargo test conversation::native_durability_tests
+        run: cargo test --locked conversation::native_durability_tests
 
   rust-checks:
     name: Rust Checks
@@ -259,6 +263,10 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
+
+      - name: Validate locked Rust metadata
+        working-directory: src-tauri
+        run: cargo metadata --locked --format-version 1
 
       - name: Cache Rust
         uses: swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
@@ -287,15 +295,15 @@ jobs:
 
       - name: Cargo check
         working-directory: src-tauri
-        run: cargo check --all-targets
+        run: cargo check --locked --all-targets
 
       - name: Cargo test
         working-directory: src-tauri
-        run: cargo test
+        run: cargo test --locked
 
       - name: Cargo clippy
         working-directory: src-tauri
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
   web-build:
     name: Web Client Build
@@ -348,6 +356,10 @@ jobs:
         with:
           components: clippy
 
+      - name: Validate locked Rust metadata
+        working-directory: src-tauri
+        run: cargo metadata --locked --format-version 1
+
       - name: Cache Rust
         uses: swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
@@ -375,11 +387,11 @@ jobs:
 
       - name: Build termul-server (native host)
         working-directory: src-tauri
-        run: cargo build --bin termul-server --features standalone-server
+        run: cargo build --locked --bin termul-server --features standalone-server
 
       - name: Clippy termul-server (feature on)
         working-directory: src-tauri
-        run: cargo clippy --bin termul-server --features standalone-server -- -D warnings
+        run: cargo clippy --locked --bin termul-server --features standalone-server -- -D warnings
 
   rust-windows-check:
     name: Rust Windows Smoke Check
@@ -396,6 +408,10 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
+
+      - name: Validate locked Rust metadata
+        working-directory: src-tauri
+        run: cargo metadata --locked --format-version 1
 
       - name: Cache Rust
         uses: swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
@@ -420,11 +436,11 @@ jobs:
 
       - name: Cargo check
         working-directory: src-tauri
-        run: cargo check --all-targets
+        run: cargo check --locked --all-targets
 
       - name: Build termul-server (Windows host)
         working-directory: src-tauri
-        run: cargo build --bin termul-server --features standalone-server
+        run: cargo build --locked --bin termul-server --features standalone-server
 
   build-check:
     name: Verify Tauri Frontend Build

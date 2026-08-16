@@ -33,6 +33,15 @@ vi.mock('@/components/ChatRoute', () => ({
   )
 }))
 
+vi.mock('@/components/DirectoryPicker', () => ({
+  DirectoryPicker: () => <div data-testid="web-directory-picker" />
+}))
+
+vi.mock('@/lib/tauri-runtime', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/tauri-runtime')>()),
+  isTauriContext: () => false
+}))
+
 vi.mock('./hooks/use-session-workspace-sync', () => ({
   useSessionWorkspaceBootstrap: mockSessionWorkspaceBootstrap,
   useSessionWorkspaceSync: vi.fn(),
@@ -110,6 +119,12 @@ vi.mock('./hooks/use-terminal-exit-notification', () => ({
 vi.mock('./hooks/use-remote-projects', () => ({
   useRemoteProjects: mockUseRemoteProjects
 }))
+
+vi.mock('./hooks/use-acp-listeners', () => ({ useAcpListeners: () => undefined }))
+vi.mock('./hooks/use-acp-agents', () => ({ useAcpAgents: () => undefined }))
+vi.mock('./hooks/use-acp-history', () => ({ useAcpHistory: () => undefined }))
+vi.mock('./hooks/use-acp-session-resume', () => ({ useAcpSessionResume: () => undefined }))
+vi.mock('./hooks/use-acp-mcp', () => ({ useAcpMcp: () => undefined }))
 
 vi.mock('./hooks/use-whats-new', () => ({
   useWhatsNew: mockUseWhatsNew
@@ -238,6 +253,13 @@ describe('App Component', () => {
     render(<App />)
     // App renders and providers work - verify by checking rendered content exists
     expect(document.body.innerHTML.length).toBeGreaterThan(0)
+  })
+
+  it('keeps the browser-only directory picker around the shared portable shell', () => {
+    render(<App />)
+
+    expect(document.querySelector('[data-testid="web-directory-picker"]')).not.toBeNull()
+    expect(mockSessionWorkspaceBootstrap).toHaveBeenCalledTimes(1)
   })
 })
 
@@ -396,19 +418,19 @@ describe('App CAP-3 resilience wiring (web entry)', () => {
     expect(mockUseWhatsNew).toHaveBeenCalledTimes(1)
   })
 
-  it('mounts useCrashRecovery in AppEffects', () => {
+  it('mounts useCrashRecovery in PortableAppEffects', () => {
     render(<App />)
 
     expect(mockUseCrashRecovery).toHaveBeenCalledTimes(1)
   })
 
-  it('mounts useTerminalExitNotification in AppEffects', () => {
+  it('mounts useTerminalExitNotification in PortableAppEffects', () => {
     render(<App />)
 
     expect(mockUseTerminalExitNotification).toHaveBeenCalledTimes(1)
   })
 
-  it('mounts useRemoteProjects in AppEffects', () => {
+  it('mounts useRemoteProjects in PortableAppEffects', () => {
     render(<App />)
 
     expect(mockUseRemoteProjects).toHaveBeenCalledTimes(1)

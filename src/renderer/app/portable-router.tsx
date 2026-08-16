@@ -1,0 +1,56 @@
+import { lazy, Suspense } from 'react'
+import { createHashRouter, type RouteObject } from 'react-router-dom'
+import { ChatRoute } from '@/components/ChatRoute'
+import { ConversationRoute } from '@/components/conversation/ConversationRoute'
+import { Skeleton } from '@/components/ui/skeleton'
+import WorkspaceLayout from '@/layouts/WorkspaceLayout'
+
+const WorkspaceDashboard = lazy(() => import('@/pages/WorkspaceDashboard'))
+const ProjectSettings = lazy(() => import('@/pages/ProjectSettings'))
+const AppPreferences = lazy(() => import('@/pages/AppPreferences'))
+const WorkspaceSnapshots = lazy(() => import('@/pages/WorkspaceSnapshots'))
+const NotFound = lazy(() => import('@/pages/NotFound'))
+
+function RouteFallback(): React.JSX.Element {
+  return <Skeleton className="h-full w-full" />
+}
+
+function deferred(element: React.JSX.Element): React.JSX.Element {
+  return <Suspense fallback={<RouteFallback />}>{element}</Suspense>
+}
+
+/** The portable route table used by the browser and native renderer roots. */
+export const portableRouteObjects: RouteObject[] = [
+  {
+    path: '/',
+    element: <WorkspaceLayout />,
+    children: [
+      { index: true, element: deferred(<WorkspaceDashboard />) },
+      { path: 'c/:conversationId', element: <ConversationRoute /> },
+      {
+        path: 'legacy/session/:legacyValue',
+        element: <ChatRoute sourceKind="legacyAgentSessionId" />
+      },
+      {
+        path: 'legacy/storage/:legacyValue',
+        element: <ChatRoute sourceKind="legacyStorageKey" />
+      },
+      {
+        path: 'legacy/history/:legacyValue',
+        element: <ChatRoute sourceKind="legacyChatHistoryId" />
+      },
+      { path: 'snapshots', element: deferred(<WorkspaceSnapshots />) },
+      { path: 'settings', element: deferred(<ProjectSettings />) },
+      { path: 'preferences', element: deferred(<AppPreferences />) }
+    ]
+  },
+  { path: '*', element: deferred(<NotFound />) }
+]
+
+export function createPortableRouter(): ReturnType<typeof createHashRouter> {
+  return createHashRouter(portableRouteObjects, {
+    future: {
+      v7_relativeSplatPath: true
+    }
+  })
+}

@@ -8,13 +8,19 @@ const {
   mockSessionWorkspaceBootstrap,
   mockConversationHostBootstrap,
   mockConversationLifecycle,
-  mockTerminalResourceLifecycle
+  mockTerminalResourceLifecycle,
+  mockPreventDevToolsShortcuts,
+  mockIsWindowStateReady,
+  mockShowWindow
 } = vi.hoisted(() => ({
   mockPersistenceRead: vi.fn(),
   mockSessionWorkspaceBootstrap: vi.fn(),
   mockConversationHostBootstrap: vi.fn(),
   mockConversationLifecycle: vi.fn(),
-  mockTerminalResourceLifecycle: vi.fn()
+  mockTerminalResourceLifecycle: vi.fn(),
+  mockPreventDevToolsShortcuts: vi.fn(),
+  mockIsWindowStateReady: vi.fn(() => false),
+  mockShowWindow: vi.fn(() => Promise.resolve())
 }))
 
 vi.mock('@/lib/api', () => ({
@@ -61,8 +67,16 @@ vi.mock('./hooks/use-terminal-resource-lifecycle', () => ({
   useTerminalResourceLifecycle: mockTerminalResourceLifecycle
 }))
 
+vi.mock('@/hooks/use-prevent-devtools-shortcuts', () => ({
+  usePreventDevToolsShortcuts: mockPreventDevToolsShortcuts
+}))
+
 vi.mock('@/hooks/use-window-state', () => ({
-  useWindowState: () => false
+  useWindowState: mockIsWindowStateReady
+}))
+
+vi.mock('@/lib/tauri-window', () => ({
+  getCurrentWindow: () => ({ show: mockShowWindow })
 }))
 
 vi.mock('./layouts/WorkspaceLayout', async () => {
@@ -165,6 +179,16 @@ vi.mock('./hooks/use-terminal-exit-notification', () => ({
   useTerminalExitNotification: () => undefined
 }))
 
+vi.mock('./hooks/use-remote-projects', () => ({
+  useRemoteProjects: () => undefined
+}))
+
+vi.mock('./hooks/use-acp-listeners', () => ({ useAcpListeners: () => undefined }))
+vi.mock('./hooks/use-acp-agents', () => ({ useAcpAgents: () => undefined }))
+vi.mock('./hooks/use-acp-history', () => ({ useAcpHistory: () => undefined }))
+vi.mock('./hooks/use-acp-session-resume', () => ({ useAcpSessionResume: () => undefined }))
+vi.mock('./hooks/use-acp-mcp', () => ({ useAcpMcp: () => undefined }))
+
 vi.mock('@/lib/tauri-notification-api', () => ({
   initNotificationPermissions: () => Promise.resolve(),
   sendDesktopNotification: () => Promise.resolve()
@@ -172,7 +196,9 @@ vi.mock('@/lib/tauri-notification-api', () => ({
 
 beforeEach(() => {
   vi.clearAllMocks()
+  mockIsWindowStateReady.mockReturnValue(false)
   window.location.hash = '#/'
+  delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__
   mockPersistenceRead.mockResolvedValue({
     success: false,
     error: 'Key not found',
@@ -196,6 +222,24 @@ describe('TauriApp', () => {
   it('wires app visibility tracking at app scope', () => {
     render(<TauriApp />)
     expect(mockUseVisibilityState).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps native-only devtools protection around the shared portable shell', () => {
+    render(<TauriApp />)
+
+    expect(mockPreventDevToolsShortcuts).toHaveBeenCalledTimes(1)
+    expect(mockSessionWorkspaceBootstrap).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows the native window after window state restoration', async () => {
+    mockIsWindowStateReady.mockReturnValue(true)
+    ;(window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {}
+
+    render(<TauriApp />)
+
+    await waitFor(() => {
+      expect(mockShowWindow).toHaveBeenCalledTimes(1)
+    })
   })
 
   it('mounts the portable SessionWorkspace bootstrap at the desktop root', () => {
