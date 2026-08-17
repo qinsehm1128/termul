@@ -7,6 +7,8 @@
 //! and recovery provenance must never be logged here.
 
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::io::Read;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
@@ -24,7 +26,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use tracing::{error, info, warn};
+use tokio::sync::watch;
 use url::Url;
 
 const TOKEN_BYTES: usize = 32;
@@ -53,6 +55,52 @@ impl RemoteAuthoritySource {
             Self::Test => "test",
             Self::Unconfigured => "unconfigured",
         }
+    }
+}
+
+/// Host-controlled request provenance. It is injected by the host/router and
+/// is never derived from the reverse-proxy TCP peer or client headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IngressProvenance {
+    LocalOperator,
+    PublicTunnel,
+}
+
+impl IngressProvenance {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LocalOperator => "local_operator",
+            Self::PublicTunnel => "public_tunnel",
+        }
+    }
+
+    #[must_use]
+    pub const fn allows_local_operator_mutation(self) -> bool {
+        matches!(self, Self::LocalOperator)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteGenerationState {
+    pub generation: u64,
+    pub active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenerationRetirementReceipt {
+    pub generation: u64,
+    pub credential_invalidated: bool,
+    pub origins_cleared: bool,
+    pub failure_state_cleared: bool,
+    pub keyring_deleted: bool,
+    pub stable_codes: Vec<&'static str>,
+}
+
+impl GenerationRetirementReceipt {
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.stable_codes.is_empty()
     }
 }
 
@@ -361,6 +409,8 @@ pub struct RemoteAccessAuthority {
     credential: RwLock<CredentialState>,
     allowed_origins: RwLock<HashSet<String>>,
     failures: Mutex<FailureLimiter>,
+    ingress: RwLock<IngressProvenance>,
+    generation_tx: watch::Sender<RemoteGenerationState>,
 }
 
 impl std::fmt::Debug for RemoteAccessAuthority {
@@ -372,6 +422,7 @@ impl std::fmt::Debug for RemoteAccessAuthority {
             .field("generation", &credential.generation)
             .field("configured", &credential.digest.is_some())
             .field("allowed_origin_count", &self.allowed_origins.read().len())
+            .field("ingress", &*self.ingress.read())
             .finish_non_exhaustive()
     }
 }
@@ -379,6 +430,10 @@ impl std::fmt::Debug for RemoteAccessAuthority {
 impl RemoteAccessAuthority {
     #[must_use]
     pub fn unconfigured() -> Self {
+        let (generation_tx, _generation_rx) = watch::channel(RemoteGenerationState {
+            generation: 0,
+            active: false,
+        });
         Self {
             credential: RwLock::new(CredentialState {
                 generation: 0,
@@ -388,6 +443,8 @@ impl RemoteAccessAuthority {
             }),
             allowed_origins: RwLock::new(HashSet::new()),
             failures: Mutex::new(FailureLimiter::default()),
+            ingress: RwLock::new(IngressProvenance::LocalOperator),
+            generation_tx,
         }
     }
 
@@ -402,44 +459,40 @@ impl RemoteAccessAuthority {
             Ok(Some(token)) => (token, false),
             Ok(None) => {
                 let token = generate_token().inspect_err(|error| {
-                    error!(
+                    log::error!(
                         target: "termul::web::auth",
-                        authority_source = RemoteAuthoritySource::DesktopKeyring.as_str(),
-                        operation = "generate_credential",
-                        stable_code = error.code(),
-                        "remote access authority provisioning failed"
+                        "operation=generate_credential authority_source={} stable_code={}",
+                        RemoteAuthoritySource::DesktopKeyring.as_str(),
+                        error.code()
                     );
                 })?;
                 crate::secure_storage::keyring_set(keyring_account, &token).map_err(|_| {
-                    error!(
+                    log::error!(
                         target: "termul::web::auth",
-                        authority_source = RemoteAuthoritySource::DesktopKeyring.as_str(),
-                        operation = "keyring_set",
-                        stable_code = RemoteAuthError::Provisioning.code(),
-                        "remote access authority provisioning failed"
+                        "operation=keyring_set authority_source={} stable_code={}",
+                        RemoteAuthoritySource::DesktopKeyring.as_str(),
+                        RemoteAuthError::Provisioning.code()
                     );
                     RemoteAuthError::Provisioning
                 })?;
                 (token, true)
             }
             Err(_) => {
-                error!(
+                log::error!(
                     target: "termul::web::auth",
-                    authority_source = RemoteAuthoritySource::DesktopKeyring.as_str(),
-                    operation = "keyring_get",
-                    stable_code = RemoteAuthError::Provisioning.code(),
-                    "remote access authority provisioning failed"
+                    "operation=keyring_get authority_source={} stable_code={}",
+                    RemoteAuthoritySource::DesktopKeyring.as_str(),
+                    RemoteAuthError::Provisioning.code()
                 );
                 return Err(RemoteAuthError::Provisioning);
             }
         };
         validate_token(&token).inspect_err(|error| {
-            error!(
+            log::error!(
                 target: "termul::web::auth",
-                authority_source = RemoteAuthoritySource::DesktopKeyring.as_str(),
-                operation = "validate_credential",
-                stable_code = error.code(),
-                "remote access authority provisioning failed"
+                "operation=validate_credential authority_source={} stable_code={}",
+                RemoteAuthoritySource::DesktopKeyring.as_str(),
+                error.code()
             );
         })?;
         let authority = Self::from_token(
@@ -447,53 +500,40 @@ impl RemoteAccessAuthority {
             RemoteAuthoritySource::DesktopKeyring,
             Some(keyring_account.to_string()),
         );
-        info!(
+        log::info!(
             target: "termul::web::auth",
-            authority_source = RemoteAuthoritySource::DesktopKeyring.as_str(),
-            generation = 1_u64,
-            provisioned = issued,
-            "remote access authority ready"
+            "operation=authority_ready authority_source={} generation=1 provisioned={} stable_code=OK",
+            RemoteAuthoritySource::DesktopKeyring.as_str(),
+            issued
         );
         Ok((authority, token))
     }
 
-    /// Load a standalone credential from an explicit operator-owned file.
-    /// On Unix, group/world permission bits are rejected before reading.
+    /// Load a standalone credential from one securely opened operator-owned
+    /// handle. Metadata/owner/DACL checks and bounded reads are performed on
+    /// that exact handle; the pathname is never reopened after validation.
     pub fn from_token_file(path: &Path) -> Result<Self, RemoteAuthError> {
-        validate_token_file_permissions(path).inspect_err(|error| {
-            error!(
+        let mut file = open_validated_token_file(path).inspect_err(|error| {
+            log::error!(
                 target: "termul::web::auth",
-                authority_source = RemoteAuthoritySource::OperatorTokenFile.as_str(),
-                operation = "validate_token_file",
-                stable_code = error.code(),
-                "remote access authority provisioning failed"
+                "operation=token_file_open authority_source={} stable_code={}",
+                RemoteAuthoritySource::OperatorTokenFile.as_str(),
+                error.code()
             );
         })?;
-        let token = std::fs::read_to_string(path).map_err(|_| {
-            error!(
+        let token = read_token_from_validated_handle(&mut file).inspect_err(|error| {
+            log::error!(
                 target: "termul::web::auth",
-                authority_source = RemoteAuthoritySource::OperatorTokenFile.as_str(),
-                operation = "read_token_file",
-                stable_code = RemoteAuthError::Provisioning.code(),
-                "remote access authority provisioning failed"
-            );
-            RemoteAuthError::Provisioning
-        })?;
-        let token = token.trim_end_matches(['\r', '\n']);
-        validate_token(token).inspect_err(|error| {
-            error!(
-                target: "termul::web::auth",
-                authority_source = RemoteAuthoritySource::OperatorTokenFile.as_str(),
-                operation = "validate_credential",
-                stable_code = error.code(),
-                "remote access authority provisioning failed"
+                "operation=token_file_read authority_source={} stable_code={}",
+                RemoteAuthoritySource::OperatorTokenFile.as_str(),
+                error.code()
             );
         })?;
-        let authority = Self::from_token(token, RemoteAuthoritySource::OperatorTokenFile, None);
-        info!(
+        let authority = Self::from_token(&token, RemoteAuthoritySource::OperatorTokenFile, None);
+        log::info!(
             target: "termul::web::auth",
-            authority_source = RemoteAuthoritySource::OperatorTokenFile.as_str(),
-            "remote access authority ready"
+            "operation=authority_ready authority_source={} stable_code=OK",
+            RemoteAuthoritySource::OperatorTokenFile.as_str()
         );
         Ok(authority)
     }
@@ -503,6 +543,10 @@ impl RemoteAccessAuthority {
         source: RemoteAuthoritySource,
         desktop_keyring_account: Option<String>,
     ) -> Self {
+        let (generation_tx, _generation_rx) = watch::channel(RemoteGenerationState {
+            generation: 1,
+            active: true,
+        });
         Self {
             credential: RwLock::new(CredentialState {
                 generation: 1,
@@ -512,6 +556,8 @@ impl RemoteAccessAuthority {
             }),
             allowed_origins: RwLock::new(HashSet::new()),
             failures: Mutex::new(FailureLimiter::default()),
+            ingress: RwLock::new(IngressProvenance::LocalOperator),
+            generation_tx,
         }
     }
 
@@ -520,16 +566,29 @@ impl RemoteAccessAuthority {
         Self::from_token(token, RemoteAuthoritySource::Test, None)
     }
 
+    pub fn set_ingress_provenance(&self, provenance: IngressProvenance) {
+        *self.ingress.write() = provenance;
+    }
+
+    #[must_use]
+    pub fn ingress_provenance(&self) -> IngressProvenance {
+        *self.ingress.read()
+    }
+
+    #[must_use]
+    pub fn subscribe_generation(&self) -> watch::Receiver<RemoteGenerationState> {
+        self.generation_tx.subscribe()
+    }
+
     /// Generate and install a fresh desktop bearer generation. The raw bearer
     /// is returned exactly once in the host-owned lease; only its digest and
     /// monotonically increasing generation remain in the authority.
     pub fn rotate_desktop_credential(&self) -> Result<DesktopCredentialLease, RemoteAuthError> {
         let bearer = generate_token().inspect_err(|error| {
-            error!(
+            log::error!(
                 target: "termul::web::auth",
-                operation = "rotate_credential",
-                stable_code = error.code(),
-                "remote access credential rotation failed"
+                "operation=rotate_credential stable_code={}",
+                error.code()
             );
         })?;
         let mut credential = self.credential.write();
@@ -544,12 +603,11 @@ impl RemoteAccessAuthority {
                     .as_deref()
                     .ok_or(RemoteAuthError::Provisioning)?;
                 crate::secure_storage::keyring_set(account, &bearer).map_err(|_| {
-                    error!(
+                    log::error!(
                         target: "termul::web::auth",
-                        authority_source = RemoteAuthoritySource::DesktopKeyring.as_str(),
-                        operation = "rotate_keyring_set",
-                        stable_code = RemoteAuthError::Provisioning.code(),
-                        "remote access credential rotation failed"
+                        "operation=rotate_keyring_set authority_source={} stable_code={}",
+                        RemoteAuthoritySource::DesktopKeyring.as_str(),
+                        RemoteAuthError::Provisioning.code()
                     );
                     RemoteAuthError::Provisioning
                 })?;
@@ -565,13 +623,15 @@ impl RemoteAccessAuthority {
         drop(credential);
         self.allowed_origins.write().clear();
         *self.failures.lock() = FailureLimiter::default();
-        info!(
-            target: "termul::web::auth",
-            authority_source = source.as_str(),
+        let _ = self.generation_tx.send(RemoteGenerationState {
             generation,
-            lifecycle_phase = "rotate",
-            stable_code = "OK",
-            "remote access credential generation rotated"
+            active: true,
+        });
+        log::info!(
+            target: "termul::web::auth",
+            "operation=credential_rotate authority_source={} generation={} lifecycle_phase=rotate stable_code=OK",
+            source.as_str(),
+            generation
         );
         Ok(DesktopCredentialLease { generation, bearer })
     }
@@ -591,13 +651,86 @@ impl RemoteAccessAuthority {
         if invalidated {
             self.allowed_origins.write().clear();
             *self.failures.lock() = FailureLimiter::default();
-            warn!(
-                target: "termul::web::auth",
+            let _ = self.generation_tx.send(RemoteGenerationState {
                 generation,
-                lifecycle_phase = "invalidate",
-                stable_code = "GENERATION_INVALIDATED",
-                "remote access credential generation invalidated"
+                active: false,
+            });
+            log::warn!(
+                target: "termul::web::auth",
+                "operation=credential_invalidate generation={} lifecycle_phase=invalidate stable_code=GENERATION_INVALIDATED",
+                generation
             );
+        }
+    }
+
+    /// Retire a desktop generation completely. Digest, Origins, failure state,
+    /// and generation observers are always retired first; keyring deletion is
+    /// attempted afterwards and reported with one stable account-free code.
+    #[must_use]
+    pub fn retire_generation(&self, generation: u64) -> GenerationRetirementReceipt {
+        let (generation_matched, credential_invalidated, keyring_account) = {
+            let mut credential = self.credential.write();
+            if credential.generation == generation {
+                let invalidated = credential.digest.take().is_some();
+                (
+                    true,
+                    invalidated,
+                    credential.desktop_keyring_account.clone(),
+                )
+            } else {
+                (false, false, None)
+            }
+        };
+        let origins_cleared = {
+            let mut origins = self.allowed_origins.write();
+            origins.clear();
+            generation_matched
+        };
+        *self.failures.lock() = FailureLimiter::default();
+        let failure_state_cleared = generation_matched;
+        if credential_invalidated {
+            let _ = self.generation_tx.send(RemoteGenerationState {
+                generation,
+                active: false,
+            });
+        }
+
+        let mut stable_codes = Vec::new();
+        let keyring_deleted = match keyring_account {
+            Some(account) => match crate::secure_storage::keyring_delete_checked(&account) {
+                Ok(()) => true,
+                Err(error) => {
+                    stable_codes.push(error.code());
+                    false
+                }
+            },
+            None => true,
+        };
+        let stable_code = stable_codes.first().copied().unwrap_or("OK");
+        if stable_codes.is_empty() {
+            log::info!(
+                target: "termul::web::auth",
+                "operation=generation_retire generation={} lifecycle_phase=retire stable_code={} keyring_deleted={}",
+                generation,
+                stable_code,
+                keyring_deleted
+            );
+        } else {
+            log::error!(
+                target: "termul::web::auth",
+                "operation=generation_retire generation={} lifecycle_phase=retire stable_code={} keyring_deleted={}",
+                generation,
+                stable_code,
+                keyring_deleted
+            );
+        }
+        GenerationRetirementReceipt {
+            generation,
+            credential_invalidated,
+            origins_cleared,
+            failure_state_cleared,
+            keyring_deleted,
+            stable_codes,
         }
     }
 
@@ -618,8 +751,13 @@ impl RemoteAccessAuthority {
         if source != RemoteAuthoritySource::DesktopKeyring {
             credential.desktop_keyring_account = None;
         }
+        let generation = credential.generation;
         drop(credential);
         *self.failures.lock() = FailureLimiter::default();
+        let _ = self.generation_tx.send(RemoteGenerationState {
+            generation,
+            active: true,
+        });
         Ok(())
     }
 
@@ -627,12 +765,10 @@ impl RemoteAccessAuthority {
         let normalized = normalize_origin(&origin)?;
         self.allowed_origins.write().insert(normalized);
         let generation = self.credential.read().generation;
-        info!(
+        log::info!(
             target: "termul::web::auth",
-            generation,
-            lifecycle_phase = "register_origin",
-            stable_code = "OK",
-            "remote access Origin policy updated"
+            "operation=origin_register generation={} lifecycle_phase=register_origin stable_code=OK",
+            generation
         );
         Ok(())
     }
@@ -695,12 +831,12 @@ impl RemoteAccessAuthority {
             || principal.authority_source != credential.source
             || principal.authority_source == RemoteAuthoritySource::Unconfigured
         {
-            warn!(
+            log::warn!(
                 target: "termul::web::auth",
-                generation = principal.generation,
-                capability = capability.as_str(),
-                stable_code = RemoteAuthError::Forbidden.code(),
-                "remote capability rejected"
+                "operation=capability_authorize generation={} capability={} stable_code={}",
+                principal.generation,
+                capability.as_str(),
+                RemoteAuthError::Forbidden.code()
             );
             return Err(RemoteAuthError::Forbidden);
         }
@@ -753,12 +889,11 @@ impl RemoteAccessAuthority {
                     .failures
                     .lock()
                     .record_failure(FailureKey { peer, generation }, now);
-                warn!(
+                log::warn!(
                     target: "termul::web::auth",
+                    "operation=bearer_verify generation={} auth_class=bearer stable_code={}",
                     generation,
-                    auth_class = "bearer",
-                    stable_code = reported.code(),
-                    "remote authentication failed"
+                    reported.code()
                 );
                 Err(reported)
             }
@@ -810,29 +945,389 @@ fn normalize_origin(origin: &Url) -> Result<String, RemoteAuthError> {
     Ok(normalized)
 }
 
+fn read_token_from_validated_handle(file: &mut File) -> Result<String, RemoteAuthError> {
+    let mut bytes = Vec::with_capacity(MAX_TOKEN_BYTES + 1);
+    file.take((MAX_TOKEN_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| RemoteAuthError::Provisioning)?;
+    if bytes.len() > MAX_TOKEN_BYTES {
+        return Err(RemoteAuthError::Provisioning);
+    }
+    let token = String::from_utf8(bytes).map_err(|_| RemoteAuthError::Provisioning)?;
+    let token = token.trim_end_matches(['\r', '\n']).to_string();
+    validate_token(&token)?;
+    Ok(token)
+}
+
 #[cfg(unix)]
-fn validate_token_file_permissions(path: &Path) -> Result<(), RemoteAuthError> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = std::fs::symlink_metadata(path).map_err(|_| RemoteAuthError::Provisioning)?;
+fn open_validated_token_file(path: &Path) -> Result<File, RemoteAuthError> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| RemoteAuthError::Provisioning)?;
+    let metadata = file.metadata().map_err(|_| RemoteAuthError::Provisioning)?;
     // SAFETY: `geteuid` has no preconditions and only reads the process's
-    // effective user id. Reject files owned by any other account.
+    // effective user id. All checks are handle-derived (`fstat` semantics).
     let effective_uid = unsafe { libc::geteuid() };
-    if !metadata.file_type().is_file()
-        || metadata.uid() != effective_uid
-        || metadata.mode() & 0o077 != 0
+    validate_unix_token_metadata(
+        metadata.file_type().is_file(),
+        metadata.uid(),
+        metadata.mode(),
+        metadata.len(),
+        effective_uid,
+    )?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn validate_unix_token_metadata(
+    regular: bool,
+    owner_uid: u32,
+    mode: u32,
+    length: u64,
+    effective_uid: u32,
+) -> Result<(), RemoteAuthError> {
+    if !regular
+        || owner_uid != effective_uid
+        || mode & 0o077 != 0
+        || length > MAX_TOKEN_BYTES as u64
     {
         return Err(RemoteAuthError::Provisioning);
     }
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn validate_token_file_permissions(path: &Path) -> Result<(), RemoteAuthError> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|_| RemoteAuthError::Provisioning)?;
-    if !metadata.file_type().is_file() {
-        return Err(RemoteAuthError::Provisioning);
+#[cfg(windows)]
+fn open_validated_token_file(path: &Path) -> Result<File, RemoteAuthError> {
+    windows_token_file::open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_validated_token_file(_path: &Path) -> Result<File, RemoteAuthError> {
+    Err(RemoteAuthError::Provisioning)
+}
+
+#[cfg(windows)]
+mod windows_token_file {
+    use super::{File, Path, RemoteAuthError, MAX_TOKEN_BYTES};
+    use std::ffi::c_void;
+    use std::mem::{size_of, zeroed};
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use std::ptr::{null_mut, NonNull};
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, LocalFree, ERROR_SUCCESS, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        AclSizeInformation, CreateWellKnownSid, EqualSid, GetAce, GetAclInformation,
+        GetTokenInformation, IsValidSid, TokenUser, WinAuthenticatedUserSid, WinBuiltinUsersSid,
+        WinWorldSid, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL_SIZE_INFORMATION,
+        DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE, OWNER_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FileAttributeTagInfo, GetFileInformationByHandleEx, GetFileSizeEx,
+        GetFileType, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_TYPE_DISK,
+        OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+    const ACCESS_ALLOWED_OBJECT_ACE_TYPE: u8 = 5;
+    const ACCESS_ALLOWED_CALLBACK_ACE_TYPE: u8 = 9;
+    const ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE: u8 = 11;
+    const SECURITY_MAX_SID_SIZE: usize = 68;
+
+    struct Handle(HANDLE);
+
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            // SAFETY: this guard owns one valid Win32 handle.
+            unsafe {
+                CloseHandle(self.0);
+            }
+        }
     }
-    Ok(())
+
+    struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+    impl Drop for SecurityDescriptor {
+        fn drop(&mut self) {
+            // SAFETY: GetSecurityInfo allocates this descriptor with LocalAlloc.
+            unsafe {
+                let _ = LocalFree(self.0.cast());
+            }
+        }
+    }
+
+    pub(super) fn open(path: &Path) -> Result<File, RemoteAuthError> {
+        let mut wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        wide.push(0);
+        // SAFETY: the UTF-16 path is NUL-terminated; returned ownership is
+        // transferred exactly once into `File` below.
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ,
+                null_mut(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                null_mut(),
+            )
+        };
+        if raw == INVALID_HANDLE_VALUE {
+            return Err(RemoteAuthError::Provisioning);
+        }
+        let handle = Handle(raw);
+        validate_file_identity(handle.0)?;
+        validate_security(handle.0)?;
+        // SAFETY: `handle` uniquely owns `raw`; forget the guard after moving
+        // ownership into `File` so the handle is closed exactly once.
+        let file = unsafe { File::from_raw_handle(handle.0) };
+        std::mem::forget(handle);
+        Ok(file)
+    }
+
+    fn validate_file_identity(handle: HANDLE) -> Result<(), RemoteAuthError> {
+        // SAFETY: `handle` is valid and all output buffers have exact sizes.
+        unsafe {
+            if GetFileType(handle) != FILE_TYPE_DISK {
+                return Err(RemoteAuthError::Provisioning);
+            }
+            let mut tag: FILE_ATTRIBUTE_TAG_INFO = zeroed();
+            if GetFileInformationByHandleEx(
+                handle,
+                FileAttributeTagInfo,
+                (&mut tag as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+                size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+            ) == 0
+            {
+                return Err(RemoteAuthError::Provisioning);
+            }
+            if tag.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+                return Err(RemoteAuthError::Provisioning);
+            }
+            let mut length = 0_i64;
+            if GetFileSizeEx(handle, &mut length) == 0
+                || length < 0
+                || length as u64 > MAX_TOKEN_BYTES as u64
+            {
+                return Err(RemoteAuthError::Provisioning);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_security(handle: HANDLE) -> Result<(), RemoteAuthError> {
+        let mut owner: PSID = null_mut();
+        let mut dacl = null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
+        // SAFETY: all pointers are valid out-parameters; descriptor ownership
+        // is released by `SecurityDescriptor` on every return path.
+        let status = unsafe {
+            GetSecurityInfo(
+                handle,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                &mut owner,
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS || descriptor.is_null() {
+            return Err(RemoteAuthError::Provisioning);
+        }
+        let _descriptor = SecurityDescriptor(descriptor);
+        let current_user = current_user_sid()?;
+        // SAFETY: owner and current-user SIDs are backed by live descriptors.
+        if owner.is_null()
+            || unsafe { IsValidSid(owner) } == 0
+            || unsafe { EqualSid(owner, current_user.as_ptr()) } == 0
+        {
+            return Err(RemoteAuthError::Provisioning);
+        }
+        validate_dacl(dacl)
+    }
+
+    struct SidBuffer {
+        words: Vec<usize>,
+    }
+
+    impl SidBuffer {
+        fn with_byte_capacity(bytes: usize) -> Self {
+            let words = bytes.div_ceil(size_of::<usize>());
+            Self {
+                words: vec![0; words.max(1)],
+            }
+        }
+
+        fn as_ptr(&self) -> PSID {
+            self.words.as_ptr().cast_mut().cast()
+        }
+
+        fn as_mut_ptr(&mut self) -> *mut c_void {
+            self.words.as_mut_ptr().cast()
+        }
+
+        fn byte_capacity(&self) -> u32 {
+            (self.words.len() * size_of::<usize>()) as u32
+        }
+    }
+
+    fn current_user_sid() -> Result<SidBuffer, RemoteAuthError> {
+        let mut token: HANDLE = null_mut();
+        // SAFETY: current process pseudo-handle is valid; `token` is an out-param.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(RemoteAuthError::Provisioning);
+        }
+        let token = Handle(token);
+        let mut required = 0_u32;
+        // The first call intentionally obtains the required size.
+        unsafe {
+            GetTokenInformation(token.0, TokenUser, null_mut(), 0, &mut required);
+        }
+        if required < size_of::<TOKEN_USER>() as u32 {
+            return Err(RemoteAuthError::Provisioning);
+        }
+        let mut raw = SidBuffer::with_byte_capacity(required as usize);
+        if unsafe {
+            GetTokenInformation(
+                token.0,
+                TokenUser,
+                raw.as_mut_ptr(),
+                raw.byte_capacity(),
+                &mut required,
+            )
+        } == 0
+        {
+            return Err(RemoteAuthError::Provisioning);
+        }
+        // Copy the SID out of the TOKEN_USER buffer so its address remains
+        // stable independently of the token-information layout.
+        let token_user = unsafe { &*(raw.words.as_ptr().cast::<TOKEN_USER>()) };
+        if token_user.User.Sid.is_null() || unsafe { IsValidSid(token_user.User.Sid) } == 0 {
+            return Err(RemoteAuthError::Provisioning);
+        }
+        copy_sid(token_user.User.Sid)
+    }
+
+    fn copy_sid(sid: PSID) -> Result<SidBuffer, RemoteAuthError> {
+        use windows_sys::Win32::Security::{CopySid, GetLengthSid};
+        // SAFETY: caller supplies a validated SID.
+        let length = unsafe { GetLengthSid(sid) };
+        if length == 0 {
+            return Err(RemoteAuthError::Provisioning);
+        }
+        let mut copy = SidBuffer::with_byte_capacity(length as usize);
+        if unsafe { CopySid(copy.byte_capacity(), copy.as_ptr(), sid) } == 0 {
+            return Err(RemoteAuthError::Provisioning);
+        }
+        Ok(copy)
+    }
+
+    fn broad_sids() -> Result<[SidBuffer; 3], RemoteAuthError> {
+        Ok([
+            well_known_sid(WinWorldSid)?,
+            well_known_sid(WinAuthenticatedUserSid)?,
+            well_known_sid(WinBuiltinUsersSid)?,
+        ])
+    }
+
+    fn well_known_sid(kind: i32) -> Result<SidBuffer, RemoteAuthError> {
+        let mut sid = SidBuffer::with_byte_capacity(SECURITY_MAX_SID_SIZE);
+        let mut length = sid.byte_capacity();
+        // SAFETY: the aligned buffer is writable for `length` bytes.
+        if unsafe { CreateWellKnownSid(kind, null_mut(), sid.as_ptr(), &mut length) } == 0 {
+            return Err(RemoteAuthError::Provisioning);
+        }
+        Ok(sid)
+    }
+
+    fn validate_dacl(dacl: *mut windows_sys::Win32::Security::ACL) -> Result<(), RemoteAuthError> {
+        let Some(dacl) = NonNull::new(dacl) else {
+            return Err(RemoteAuthError::Provisioning);
+        };
+        let mut info: ACL_SIZE_INFORMATION = unsafe { zeroed() };
+        // SAFETY: DACL is descriptor-owned and `info` has the requested layout.
+        if unsafe {
+            GetAclInformation(
+                dacl.as_ptr(),
+                (&mut info as *mut ACL_SIZE_INFORMATION).cast(),
+                size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } == 0
+        {
+            return Err(RemoteAuthError::Provisioning);
+        }
+        let broad = broad_sids()?;
+        for index in 0..info.AceCount {
+            let mut ace: *mut c_void = null_mut();
+            if unsafe { GetAce(dacl.as_ptr(), index, &mut ace) } == 0 || ace.is_null() {
+                return Err(RemoteAuthError::Provisioning);
+            }
+            let header = unsafe { &*(ace.cast::<ACE_HEADER>()) };
+            if header.AceFlags & INHERIT_ONLY_ACE as u8 != 0 {
+                continue;
+            }
+            if matches!(
+                header.AceType,
+                ACCESS_ALLOWED_OBJECT_ACE_TYPE
+                    | ACCESS_ALLOWED_CALLBACK_ACE_TYPE
+                    | ACCESS_ALLOWED_CALLBACK_OBJECT_ACE_TYPE
+            ) {
+                // Object/callback allow ACE layouts are variable. Fail closed
+                // rather than guess where their SID begins.
+                return Err(RemoteAuthError::Provisioning);
+            }
+            if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
+                continue;
+            }
+            if usize::from(header.AceSize) < size_of::<ACCESS_ALLOWED_ACE>() {
+                return Err(RemoteAuthError::Provisioning);
+            }
+            let allowed = unsafe { &*(ace.cast::<ACCESS_ALLOWED_ACE>()) };
+            let sid = (&allowed.SidStart as *const u32).cast_mut().cast();
+            if unsafe { IsValidSid(sid) } == 0 {
+                return Err(RemoteAuthError::Provisioning);
+            }
+            if allowed.Mask != 0
+                && broad
+                    .iter()
+                    .any(|candidate| unsafe { EqualSid(sid, candidate.as_ptr()) } != 0)
+            {
+                return Err(RemoteAuthError::Provisioning);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn validate_descriptor_for_tests(
+        owner: PSID,
+        dacl: *mut windows_sys::Win32::Security::ACL,
+        current_user: PSID,
+    ) -> Result<(), RemoteAuthError> {
+        if owner.is_null()
+            || current_user.is_null()
+            || unsafe { IsValidSid(owner) } == 0
+            || unsafe { IsValidSid(current_user) } == 0
+            || unsafe { EqualSid(owner, current_user) } == 0
+        {
+            return Err(RemoteAuthError::Provisioning);
+        }
+        validate_dacl(dacl)
+    }
 }
 
 #[derive(Serialize)]
@@ -872,6 +1367,11 @@ pub async fn capability_middleware(
     let Some(capability) = route_class.capability(&method) else {
         return next.run(request).await;
     };
+    let provenance = request
+        .extensions()
+        .get::<IngressProvenance>()
+        .copied()
+        .unwrap_or_else(|| authority.ingress_provenance());
     let started = Instant::now();
 
     // ACP WebSocket bearer authentication occurs in its first protocol frame;
@@ -889,6 +1389,7 @@ pub async fn capability_middleware(
             &method,
             route_class,
             capability,
+            provenance,
             stable_code,
             response.status(),
             started.elapsed(),
@@ -914,6 +1415,7 @@ pub async fn capability_middleware(
             &method,
             route_class,
             capability,
+            provenance,
             error.code(),
             error.status(),
             started.elapsed(),
@@ -927,6 +1429,7 @@ pub async fn capability_middleware(
                 &method,
                 route_class,
                 capability,
+                provenance,
                 error.code(),
                 error.status(),
                 started.elapsed(),
@@ -939,6 +1442,7 @@ pub async fn capability_middleware(
             &method,
             route_class,
             capability,
+            provenance,
             error.code(),
             error.status(),
             started.elapsed(),
@@ -956,6 +1460,7 @@ pub async fn capability_middleware(
         &method,
         route_class,
         capability,
+        provenance,
         stable_code,
         response.status(),
         started.elapsed(),
@@ -967,31 +1472,34 @@ fn log_boundary_outcome(
     method: &Method,
     route_class: RemoteRouteClass,
     capability: RemoteCapability,
+    provenance: IngressProvenance,
     stable_code: &str,
     status: StatusCode,
     duration: Duration,
 ) {
     if status.is_client_error() || status.is_server_error() {
-        warn!(
+        log::warn!(
             target: "termul::web::auth",
-            method = method.as_str(),
-            route_class = route_class.as_str(),
-            capability = capability.as_str(),
+            "operation=remote_boundary method={} route_class={} capability={} provenance={} stable_code={} http_status={} duration_ms={}",
+            method.as_str(),
+            route_class.as_str(),
+            capability.as_str(),
+            provenance.as_str(),
             stable_code,
-            http_status = status.as_u16(),
-            duration_ms = duration.as_millis(),
-            "remote boundary request rejected"
+            status.as_u16(),
+            duration.as_millis()
         );
     } else {
-        info!(
+        log::info!(
             target: "termul::web::auth",
-            method = method.as_str(),
-            route_class = route_class.as_str(),
-            capability = capability.as_str(),
+            "operation=remote_boundary method={} route_class={} capability={} provenance={} stable_code={} http_status={} duration_ms={}",
+            method.as_str(),
+            route_class.as_str(),
+            capability.as_str(),
+            provenance.as_str(),
             stable_code,
-            http_status = status.as_u16(),
-            duration_ms = duration.as_millis(),
-            "remote boundary request completed"
+            status.as_u16(),
+            duration.as_millis()
         );
     }
 }
@@ -1020,51 +1528,95 @@ pub fn status_for_code(code: &str) -> StatusCode {
 }
 
 #[cfg(test)]
+pub mod test_tracing {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex as StdMutex, Once};
+
+    #[derive(Clone)]
+    struct CapturedRecord {
+        target: String,
+        message: String,
+    }
+
+    struct CaptureLogger {
+        active: AtomicBool,
+        records: StdMutex<Vec<CapturedRecord>>,
+    }
+
+    impl log::Log for CaptureLogger {
+        fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+            self.active.load(Ordering::Acquire)
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+            self.records.lock().unwrap().push(CapturedRecord {
+                target: record.target().to_string(),
+                message: record.args().to_string(),
+            });
+        }
+
+        fn flush(&self) {}
+    }
+
+    static LOGGER: CaptureLogger = CaptureLogger {
+        active: AtomicBool::new(false),
+        records: StdMutex::new(Vec::new()),
+    };
+    static INSTALL: Once = Once::new();
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    static HARNESS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    pub struct Guard {
+        _guard: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            LOGGER.active.store(false, Ordering::Release);
+        }
+    }
+
+    pub async fn lock() -> Guard {
+        let guard = HARNESS.lock().await;
+        INSTALL.call_once(|| {
+            if log::set_logger(&LOGGER).is_ok() {
+                log::set_max_level(log::LevelFilter::Trace);
+                INSTALLED.store(true, Ordering::Release);
+            }
+        });
+        assert!(
+            INSTALLED.load(Ordering::Acquire),
+            "shared test logger must install before boundary capture"
+        );
+        LOGGER.records.lock().unwrap().clear();
+        LOGGER.active.store(true, Ordering::Release);
+        Guard { _guard: guard }
+    }
+
+    pub fn messages(target: &str) -> Vec<String> {
+        LOGGER
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|record| record.target == target)
+            .map(|record| record.message.clone())
+            .collect()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use axum::routing::{get, post};
-    use std::io::Write;
     use std::net::Ipv6Addr;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex as StdMutex;
     use tower::ServiceExt;
 
     const TOKEN: &str = "test-remote-access-token";
-
-    // tracing callsite registration is process-global; prevent shared middleware
-    // callsites from racing the scoped capture during first registration.
-    static BOUNDARY_LOG_TEST_LOCK: tokio::sync::Mutex<()> =
-        tokio::sync::Mutex::const_new(());
-
-    #[derive(Clone, Default)]
-    struct LogBuffer(Arc<StdMutex<Vec<u8>>>);
-
-    struct LogWriter(Arc<StdMutex<Vec<u8>>>);
-
-    impl Write for LogWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for LogBuffer {
-        type Writer = LogWriter;
-
-        fn make_writer(&'writer self) -> Self::Writer {
-            LogWriter(Arc::clone(&self.0))
-        }
-    }
-
-    impl LogBuffer {
-        fn text(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-        }
-    }
 
     fn authority() -> RemoteAccessAuthority {
         let authority = RemoteAccessAuthority::for_tests(TOKEN);
@@ -1184,6 +1736,136 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn token_file_same_handle_rejects_swaps_nonregular_foreign_owner_and_oversize() {
+        use std::io::Write;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let original = dir.path().join("token");
+        std::fs::write(&original, TOKEN).unwrap();
+        std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let mut validated = open_validated_token_file(&original).unwrap();
+        let retained = dir.path().join("validated-token");
+        std::fs::rename(&original, &retained).unwrap();
+        std::fs::write(&original, "attacker-replacement-token").unwrap();
+        std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            read_token_from_validated_handle(&mut validated).unwrap(),
+            TOKEN
+        );
+
+        let metadata = std::fs::metadata(&retained).unwrap();
+        assert_eq!(
+            validate_unix_token_metadata(
+                true,
+                metadata.uid().saturating_add(1),
+                metadata.mode(),
+                metadata.len(),
+                metadata.uid(),
+            ),
+            Err(RemoteAuthError::Provisioning)
+        );
+        assert_eq!(
+            open_validated_token_file(dir.path()).unwrap_err(),
+            RemoteAuthError::Provisioning
+        );
+
+        let oversized = dir.path().join("oversized");
+        let mut oversized_file = std::fs::File::create(&oversized).unwrap();
+        oversized_file
+            .write_all(&vec![b'x'; MAX_TOKEN_BYTES + 1])
+            .unwrap();
+        drop(oversized_file);
+        std::fs::set_permissions(&oversized, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(
+            RemoteAccessAuthority::from_token_file(&oversized).unwrap_err(),
+            RemoteAuthError::Provisioning
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_token_descriptor_rejects_foreign_owner_null_dacl_and_broad_allow_ace() {
+        use std::ffi::c_void;
+        use std::mem::size_of;
+        use std::ptr::null_mut;
+        use windows_sys::Win32::Foundation::GENERIC_READ;
+        use windows_sys::Win32::Security::{
+            AddAccessAllowedAce, CreateWellKnownSid, InitializeAcl, ACL, ACL_REVISION,
+            WinAuthenticatedUserSid, WinBuiltinAdministratorsSid, WinWorldSid,
+        };
+
+        fn sid(kind: i32) -> Vec<usize> {
+            let mut storage = vec![0_usize; 16];
+            let mut bytes = (storage.len() * size_of::<usize>()) as u32;
+            assert_ne!(
+                unsafe {
+                    CreateWellKnownSid(
+                        kind,
+                        null_mut(),
+                        storage.as_mut_ptr().cast::<c_void>(),
+                        &mut bytes,
+                    )
+                },
+                0
+            );
+            storage
+        }
+
+        let owner = sid(WinBuiltinAdministratorsSid);
+        let foreign = sid(WinAuthenticatedUserSid);
+        let owner_ptr = owner.as_ptr().cast_mut().cast();
+        let foreign_ptr = foreign.as_ptr().cast_mut().cast();
+        assert_eq!(
+            windows_token_file::validate_descriptor_for_tests(
+                foreign_ptr,
+                null_mut(),
+                owner_ptr,
+            ),
+            Err(RemoteAuthError::Provisioning)
+        );
+        assert_eq!(
+            windows_token_file::validate_descriptor_for_tests(owner_ptr, null_mut(), owner_ptr),
+            Err(RemoteAuthError::Provisioning)
+        );
+
+        let world = sid(WinWorldSid);
+        let mut acl_storage = vec![0_usize; 128];
+        let acl = acl_storage.as_mut_ptr().cast::<ACL>();
+        assert_ne!(
+            unsafe {
+                InitializeAcl(
+                    acl,
+                    (acl_storage.len() * size_of::<usize>()) as u32,
+                    ACL_REVISION,
+                )
+            },
+            0
+        );
+        assert_ne!(
+            unsafe {
+                AddAccessAllowedAce(
+                    acl,
+                    ACL_REVISION,
+                    GENERIC_READ,
+                    world.as_ptr().cast_mut().cast(),
+                )
+            },
+            0
+        );
+        assert_eq!(
+            windows_token_file::validate_descriptor_for_tests(owner_ptr, acl, owner_ptr),
+            Err(RemoteAuthError::Provisioning)
+        );
+
+        let source = include_str!("auth.rs");
+        assert!(source.contains("FILE_FLAG_OPEN_REPARSE_POINT"));
+        assert!(source.contains("FILE_ATTRIBUTE_REPARSE_POINT"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn token_file_rejects_group_or_world_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -1205,6 +1887,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn generation_retirement_reports_sanitized_keyring_failure_and_revokes_state() {
+        let authority = RemoteAccessAuthority::from_token(
+            TOKEN,
+            RemoteAuthoritySource::DesktopKeyring,
+            Some("opaque-test-account".to_string()),
+        );
+        authority
+            .set_public_origin(Url::parse("https://retire.example.test").unwrap())
+            .unwrap();
+        crate::secure_storage::fail_next_keyring_deletes_for_tests(1);
+        let receipt = authority.retire_generation(1);
+        assert!(receipt.credential_invalidated);
+        assert!(receipt.origins_cleared);
+        assert!(receipt.failure_state_cleared);
+        assert!(!receipt.keyring_deleted);
+        assert_eq!(
+            receipt.stable_codes,
+            [crate::secure_storage::KEYRING_DELETE_FAILED]
+        );
+        assert_eq!(
+            authority.verify_bearer(TOKEN).unwrap_err(),
+            RemoteAuthError::InvalidCredential
+        );
+    }
+
     fn protected_test_router(authority: Arc<RemoteAccessAuthority>) -> axum::Router {
         axum::Router::new()
             .route(
@@ -1213,6 +1921,7 @@ mod tests {
             )
             .layer(axum::middleware::from_fn(capability_middleware))
             .layer(Extension(RemoteRouteClass::Conversation))
+            .layer(Extension(IngressProvenance::LocalOperator))
             .layer(Extension(authority))
     }
 
@@ -1228,7 +1937,7 @@ mod tests {
 
     #[tokio::test]
     async fn protected_http_rejects_missing_wrong_and_oversized_credentials_without_body_leak() {
-        let _boundary_log_test_guard = BOUNDARY_LOG_TEST_LOCK.lock().await;
+        let _boundary_log_test_guard = test_tracing::lock().await;
         let oversized = format!("Bearer {}", "x".repeat(MAX_TOKEN_BYTES + 1));
         for authorization in [None, Some("Bearer wrong"), Some(oversized.as_str())] {
             let app = protected_test_router(Arc::new(authority()));
@@ -1245,7 +1954,7 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_proxy_without_credential_cannot_reach_lifecycle_or_workspace_mutations() {
-        let _boundary_log_test_guard = BOUNDARY_LOG_TEST_LOCK.lock().await;
+        let _boundary_log_test_guard = test_tracing::lock().await;
         let reached = Arc::new(AtomicUsize::new(0));
         let handler_reached = Arc::clone(&reached);
         let authority = Arc::new(authority());
@@ -1300,7 +2009,7 @@ mod tests {
 
     #[tokio::test]
     async fn protected_http_accepts_bearer_and_rate_limits_sixth_failure() {
-        let _boundary_log_test_guard = BOUNDARY_LOG_TEST_LOCK.lock().await;
+        let _boundary_log_test_guard = test_tracing::lock().await;
         let authority = Arc::new(authority());
         let app = protected_test_router(Arc::clone(&authority));
         let accepted = app
@@ -1327,14 +2036,7 @@ mod tests {
 
     #[tokio::test]
     async fn captured_boundary_log_uses_static_class_without_path_identifier_or_credential() {
-        let _boundary_log_test_guard = BOUNDARY_LOG_TEST_LOCK.lock().await;
-        let logs = LogBuffer::default();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(logs.clone())
-            .finish();
-        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let _boundary_log_test_guard = test_tracing::lock().await;
         let authority = Arc::new(authority());
         let app = axum::Router::new()
             .route(
@@ -1343,6 +2045,7 @@ mod tests {
             )
             .layer(axum::middleware::from_fn(capability_middleware))
             .layer(Extension(RemoteRouteClass::Conversation))
+            .layer(Extension(IngressProvenance::PublicTunnel))
             .layer(Extension(authority));
         let supplied_path = "/conversations/supplied-conversation-id/lifecycle/detach";
         let response = app
@@ -1358,14 +2061,81 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        let output = logs.text();
-        assert!(output.contains("route_class"));
-        assert!(output.contains("conversation"));
-        assert!(output.contains("capability"));
+        let output = test_tracing::messages("termul::web::auth").join("\n");
+        for required in [
+            "operation=remote_boundary",
+            "route_class=conversation",
+            "capability=mutate",
+            "provenance=public_tunnel",
+            "stable_code=OK",
+            "http_status=204",
+            "duration_ms=",
+        ] {
+            assert!(output.contains(required), "missing {required}: {output}");
+        }
         assert!(!output.contains(supplied_path));
         assert!(!output.contains("supplied-conversation-id"));
         assert!(!output.contains(TOKEN));
         assert!(!output.contains("supplied-sensitive-payload"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn boundary_log_global_harness_captures_500_parallel_calls_without_missing_fields() {
+        let _boundary_log_test_guard = test_tracing::lock().await;
+        let authority = Arc::new(authority());
+        let app = axum::Router::new()
+            .route("/conversations", get(|| async { StatusCode::OK }))
+            .layer(axum::middleware::from_fn(capability_middleware))
+            .layer(Extension(RemoteRouteClass::Conversation))
+            .layer(Extension(IngressProvenance::LocalOperator))
+            .layer(Extension(authority));
+
+        let mut tasks = Vec::with_capacity(500);
+        for ordinal in 0..500_u16 {
+            let app = app.clone();
+            tasks.push(tokio::spawn(async move {
+                app.oneshot(
+                    Request::builder()
+                        .uri("/conversations")
+                        .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                        .extension(ConnectInfo(SocketAddr::from((
+                            [127, 0, 0, 1],
+                            10_000_u16.saturating_add(ordinal),
+                        ))))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }));
+        }
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), StatusCode::OK);
+        }
+
+        let boundary = test_tracing::messages("termul::web::auth")
+            .into_iter()
+            .filter(|message| message.contains("operation=remote_boundary"))
+            .collect::<Vec<_>>();
+        assert!(
+            boundary.len() >= 500,
+            "captured {} boundary records",
+            boundary.len()
+        );
+        for message in boundary {
+            for required in [
+                "method=GET",
+                "route_class=conversation",
+                "capability=read",
+                "provenance=local_operator",
+                "stable_code=OK",
+                "http_status=200",
+                "duration_ms=",
+            ] {
+                assert!(message.contains(required), "missing {required}: {message}");
+            }
+        }
     }
 
     #[test]

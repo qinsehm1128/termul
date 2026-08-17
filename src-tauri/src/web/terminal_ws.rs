@@ -1089,6 +1089,10 @@ mod tests {
             .layer(axum::middleware::from_fn(
                 crate::web::auth::capability_middleware,
             ))
+            .layer(Extension(
+                crate::web::auth::RemoteRouteClass::TerminalWebSocket,
+            ))
+            .layer(Extension(crate::web::auth::IngressProvenance::PublicTunnel))
             .layer(Extension(authority))
     }
 
@@ -1117,6 +1121,8 @@ mod tests {
     #[tokio::test]
     async fn resume_requires_authenticated_scope() {
         use tower::ServiceExt;
+
+        let _boundary_log_test_guard = crate::web::auth::test_tracing::lock().await;
 
         let peer = std::net::SocketAddr::from(([192, 0, 2, 10], 43123));
         let allowed_origin = "https://terminal.example.test";

@@ -29,11 +29,9 @@
 //! uses 200 for both success and app-level failure so the renderer maps the
 //! `VALIDATION_ERROR` code, not a transport `NETWORK_ERROR`).
 
-use std::net::SocketAddr;
-
 use axum::{
     body::Bytes,
-    extract::{ConnectInfo, Path, State},
+    extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -42,7 +40,8 @@ use serde::Deserialize;
 use tracing::{debug, warn};
 
 use crate::acp::{WorkspaceManifest, WriteOutcome};
-use crate::web::fs_api::IpcBody;
+use crate::web::auth::IngressProvenance;
+use crate::web::fs_api::{check_local_only, IpcBody};
 use crate::web::ws::AppState;
 
 /// `POST /workspace/:projectId/write` body. The `manifest` field carries the
@@ -77,7 +76,10 @@ pub async fn get(
 ) -> impl IntoResponse {
     let Some(service) = state.workspace_manifest.as_ref() else {
         // Degraded fresh-only mode — no host store attached.
-        return (StatusCode::OK, Json(IpcBody::<Option<WorkspaceManifest>>::ok(None)));
+        return (
+            StatusCode::OK,
+            Json(IpcBody::<Option<WorkspaceManifest>>::ok(None)),
+        );
     };
     match service.load(&project_id).await {
         Ok(manifest) => {
@@ -126,11 +128,11 @@ pub async fn get(
 /// `NETWORK_ERROR`).
 pub async fn write(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Path(project_id): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
-    if let Some(forbidden) = check_local_only::<WriteOutcome>(peer) {
+    if let Some(forbidden) = check_local_only::<WriteOutcome>(provenance) {
         return (StatusCode::OK, Json(forbidden));
     }
     // Patch 1: manual deserialization so a `deny_unknown_fields` rejection
@@ -198,10 +200,10 @@ pub async fn write(
 /// layer is unaffected by stale revisions). Loopback-only.
 pub async fn delete(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Path(project_id): Path<String>,
 ) -> impl IntoResponse {
-    if let Some(forbidden) = check_local_only::<()>(peer) {
+    if let Some(forbidden) = check_local_only::<()>(provenance) {
         return (StatusCode::OK, Json(forbidden));
     }
     let Some(service) = state.workspace_manifest.as_ref() else {
@@ -228,34 +230,19 @@ pub async fn delete(
     }
 }
 
-/// Localhost-only guard for write/delete routes (mirrors
-/// `log_api::frontend_error` / `fs_api::check_local_only`). Returns `None`
-/// when the peer is loopback, or `Some(IpcBody::err(...))` with `code:
-/// "FORBIDDEN"` when remote. 200+IpcResult convention (200 with the error body)
-/// so the renderer maps it to a uniform failure body.
-fn check_local_only<T>(peer: SocketAddr) -> Option<IpcBody<T>> {
-    if peer.ip().is_loopback() {
-        None
-    } else {
-        Some(IpcBody::<T>::err(
-            format!("workspace manifest write/delete routes are localhost-only (peer {peer} is not loopback)"),
-            "FORBIDDEN",
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::{
-        LeafNode, PaneNode, TerminalDescriptor, WorkspaceManifest,
-        WorkspaceManifestService,
-    };
     use crate::acp::workspace_manifest::WORKSPACE_MANIFEST_SCHEMA_VERSION;
+    use crate::acp::{
+        LeafNode, PaneNode, TerminalDescriptor, WorkspaceManifest, WorkspaceManifestService,
+    };
     use crate::web::ws::HistoryMode;
     use axum::body::Body;
+    use axum::extract::ConnectInfo;
     use axum::http::{Request, StatusCode};
     use axum::routing::{get, post};
+    use std::net::SocketAddr;
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -311,9 +298,7 @@ mod tests {
         }
     }
 
-    async fn state_with_store(
-        root: &std::path::Path,
-    ) -> AppState {
+    async fn state_with_store(root: &std::path::Path) -> AppState {
         let store = WorkspaceManifestService::open_writable_for_tests(root.join("manifests"))
             .await
             .expect("open store");
@@ -411,10 +396,7 @@ mod tests {
             .with_state(state)
     }
 
-    async fn get_manifest(
-        state: AppState,
-        project_id: &str,
-    ) -> axum::http::Response<Body> {
+    async fn get_manifest(state: AppState, project_id: &str) -> axum::http::Response<Body> {
         test_router(state)
             .oneshot(
                 Request::builder()
@@ -441,6 +423,11 @@ mod tests {
                     .uri(format!("/workspace/{project_id}/write"))
                     .header("content-type", "application/json")
                     .extension(ConnectInfo(peer))
+                    .extension(if peer.ip().is_loopback() {
+                        IngressProvenance::LocalOperator
+                    } else {
+                        IngressProvenance::PublicTunnel
+                    })
                     .body(Body::from(bytes))
                     .expect("build request"),
             )
@@ -459,6 +446,11 @@ mod tests {
                     .method("POST")
                     .uri(format!("/workspace/{project_id}/delete"))
                     .extension(ConnectInfo(peer))
+                    .extension(if peer.ip().is_loopback() {
+                        IngressProvenance::LocalOperator
+                    } else {
+                        IngressProvenance::PublicTunnel
+                    })
                     .body(Body::empty())
                     .expect("build request"),
             )
@@ -738,6 +730,7 @@ mod tests {
                     .uri("/workspace/project-1/write")
                     .header("content-type", "application/json")
                     .extension(ConnectInfo(loopback_peer()))
+                    .extension(IngressProvenance::LocalOperator)
                     .body(Body::from(bytes.to_vec()))
                     .expect("build request"),
             )
@@ -853,7 +846,15 @@ mod tests {
             .count();
         let conflicted = outcomes
             .iter()
-            .filter(|o| matches!(o, WriteOutcome::Conflict { current_revision: 2, .. }))
+            .filter(|o| {
+                matches!(
+                    o,
+                    WriteOutcome::Conflict {
+                        current_revision: 2,
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(updated, 1, "exactly one Updated");
         assert_eq!(conflicted, 1, "exactly one Conflict");
@@ -871,10 +872,7 @@ mod tests {
         let value = serde_json::to_value(&updated).unwrap();
         assert_eq!(value["status"], "updated");
         assert_eq!(value["revision"], 5);
-        assert_eq!(
-            value["updatedAt"].as_u64().unwrap(),
-            1_700_000_000_000u64
-        );
+        assert_eq!(value["updatedAt"].as_u64().unwrap(), 1_700_000_000_000u64);
 
         let conflict = WriteOutcome::Conflict {
             current_revision: 7,
@@ -918,7 +916,10 @@ mod tests {
             "fullscreenPaneId",
             "agentLauncherPaneId",
         ] {
-            assert!(value.get(excluded).is_none(), "{excluded} must not be serialized");
+            assert!(
+                value.get(excluded).is_none(),
+                "{excluded} must not be serialized"
+            );
         }
     }
 
@@ -929,4 +930,3 @@ mod tests {
         assert_eq!(WORKSPACE_MANIFEST_SCHEMA_VERSION, 1);
     }
 }
-

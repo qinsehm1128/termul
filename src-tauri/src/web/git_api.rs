@@ -19,11 +19,10 @@
 //! - logs at route boundaries via `tracing` (the standalone server's logger;
 //!   a no-op when no subscriber is installed on the desktop shared-live path).
 
-use std::net::SocketAddr;
 use std::path::Path;
 
 use axum::{
-    extract::{ConnectInfo, Query, State},
+    extract::{Query, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -33,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use crate::trackers::git_tracker::{
     self, GitCommit, GitCommitContext, GitStatusDetail, GitTracker,
 };
+use crate::web::auth::IngressProvenance;
 use crate::web::fs_api::{check_local_only, resolve_request_path, IpcBody};
 use crate::web::ws::AppState;
 
@@ -195,7 +195,7 @@ type RouteErr<T> = (StatusCode, Json<IpcBody<T>>);
 fn resolve_cwd<T>(
     req_cwd: &str,
     state: &AppState,
-    peer: Option<SocketAddr>,
+    provenance: Option<IngressProvenance>,
     is_write: bool,
 ) -> Result<std::path::PathBuf, RouteErr<T>> {
     // 1) Loopback guard for write routes FIRST — fail fast on non-local peers
@@ -203,8 +203,8 @@ fn resolve_cwd<T>(
     //    (follows symlinks / reads FS metadata); a LAN peer must not trigger
     //    that on a write (mutation safety on a 0.0.0.0 bind).
     if is_write {
-        if let Some(peer) = peer {
-            if let Some(forbidden) = check_local_only::<T>(peer) {
+        if let Some(provenance) = provenance {
+            if let Some(forbidden) = check_local_only::<T>(provenance) {
                 return Err((StatusCode::OK, Json(forbidden)));
             }
         }
@@ -269,21 +269,20 @@ pub async fn get_status(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let cwd_for_log = cwd.clone();
     let result = tokio::task::spawn_blocking(move || git_tracker::git_get_status_detail(&cwd))
         .await
         .map_err(|e| format!("git status task failed: {e}"));
     let body = match result {
         Ok(Ok(rows)) => {
-            tracing::info!(path = %cwd_for_log, entries = rows.len(), "git status ok");
+            log::info!(target: "termul::web::git_api", "operation=git_api stable_code=OK");
             IpcBody::ok(rows)
         }
         Ok(Err(e)) => {
-            tracing::warn!(path = %cwd_for_log, error = %e, "git status failed");
+            log::warn!(target: "termul::web::git_api", "operation=git_api stable_code=REJECTED");
             IpcBody::<Vec<GitStatusDetail>>::err(e, "GIT_STATUS_ERROR")
         }
         Err(e) => {
-            tracing::error!(path = %cwd_for_log, error = %e, "git status task panicked");
+            log::error!(target: "termul::web::git_api", "operation=git_api stable_code=FAILED");
             IpcBody::<Vec<GitStatusDetail>>::err(
                 format!("git status task failed: {e}"),
                 "GIT_STATUS_ERROR",
@@ -307,7 +306,6 @@ pub async fn get_diff(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let cwd_for_log = cwd.clone();
     let path = req.path;
     let staged = req.staged;
     let result =
@@ -316,15 +314,15 @@ pub async fn get_diff(
             .map_err(|e| format!("git diff task failed: {e}"));
     let body = match result {
         Ok(Ok(diff)) => {
-            tracing::info!(path = %cwd_for_log, bytes = diff.len(), "git diff ok");
+            log::info!(target: "termul::web::git_api", "operation=git_api stable_code=OK");
             IpcBody::ok(diff)
         }
         Ok(Err(e)) => {
-            tracing::warn!(path = %cwd_for_log, error = %e, "git diff failed");
+            log::warn!(target: "termul::web::git_api", "operation=git_api stable_code=REJECTED");
             IpcBody::<String>::err(e, "GIT_DIFF_ERROR")
         }
         Err(e) => {
-            tracing::error!(path = %cwd_for_log, error = %e, "git diff task panicked");
+            log::error!(target: "termul::web::git_api", "operation=git_api stable_code=FAILED");
             IpcBody::<String>::err(format!("git diff task failed: {e}"), "GIT_DIFF_ERROR")
         }
     };
@@ -334,12 +332,17 @@ pub async fn get_diff(
 /// `POST /git/stage` — `git add -- <path>` (write, loopback-guarded).
 pub async fn stage(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<GitPathRequest>,
 ) -> impl IntoResponse {
-    run_git_path_write(&state, peer, req, |cwd, path| {
-        git_tracker::git_stage_file(cwd, path)
-    }, "stage", "GIT_STAGE_ERROR")
+    run_git_path_write(
+        &state,
+        provenance,
+        req,
+        |cwd, path| git_tracker::git_stage_file(cwd, path),
+        "stage",
+        "GIT_STAGE_ERROR",
+    )
     .await
 }
 
@@ -347,12 +350,17 @@ pub async fn stage(
 /// in a no-HEAD repo). Write, loopback-guarded.
 pub async fn unstage(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<GitPathRequest>,
 ) -> impl IntoResponse {
-    run_git_path_write(&state, peer, req, |cwd, path| {
-        git_tracker::git_unstage_file(cwd, path)
-    }, "unstage", "GIT_UNSTAGE_ERROR")
+    run_git_path_write(
+        &state,
+        provenance,
+        req,
+        |cwd, path| git_tracker::git_unstage_file(cwd, path),
+        "unstage",
+        "GIT_UNSTAGE_ERROR",
+    )
     .await
 }
 
@@ -360,12 +368,17 @@ pub async fn unstage(
 /// loopback-guarded.
 pub async fn discard(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<GitPathRequest>,
 ) -> impl IntoResponse {
-    run_git_path_write(&state, peer, req, |cwd, path| {
-        git_tracker::git_discard_file(cwd, path)
-    }, "discard", "GIT_DISCARD_ERROR")
+    run_git_path_write(
+        &state,
+        provenance,
+        req,
+        |cwd, path| git_tracker::git_discard_file(cwd, path),
+        "discard",
+        "GIT_DISCARD_ERROR",
+    )
     .await
 }
 
@@ -382,23 +395,21 @@ pub async fn get_log(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let cwd_for_log = cwd.clone();
     let limit = req.limit;
-    let result =
-        tokio::task::spawn_blocking(move || git_tracker::git_get_log(&cwd, limit))
-            .await
-            .map_err(|e| format!("git log task failed: {e}"));
+    let result = tokio::task::spawn_blocking(move || git_tracker::git_get_log(&cwd, limit))
+        .await
+        .map_err(|e| format!("git log task failed: {e}"));
     let body = match result {
         Ok(Ok(commits)) => {
-            tracing::info!(path = %cwd_for_log, commits = commits.len(), "git log ok");
+            log::info!(target: "termul::web::git_api", "operation=git_api stable_code=OK");
             IpcBody::ok(commits)
         }
         Ok(Err(e)) => {
-            tracing::warn!(path = %cwd_for_log, error = %e, "git log failed");
+            log::warn!(target: "termul::web::git_api", "operation=git_api stable_code=REJECTED");
             IpcBody::<Vec<GitCommit>>::err(e, "GIT_LOG_ERROR")
         }
         Err(e) => {
-            tracing::error!(path = %cwd_for_log, error = %e, "git log task panicked");
+            log::error!(target: "termul::web::git_api", "operation=git_api stable_code=FAILED");
             IpcBody::<Vec<GitCommit>>::err(format!("git log task failed: {e}"), "GIT_LOG_ERROR")
         }
     };
@@ -408,10 +419,10 @@ pub async fn get_log(
 /// `POST /git/commit` — create/amend a commit from the staged index (write).
 pub async fn commit(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<GitCommitRequest>,
 ) -> impl IntoResponse {
-    let resolved = match resolve_cwd::<()>(&req.cwd, &state, Some(peer), true) {
+    let resolved = match resolve_cwd::<()>(&req.cwd, &state, Some(provenance), true) {
         Ok(p) => p,
         Err(resp) => return resp,
     };
@@ -419,7 +430,6 @@ pub async fn commit(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let cwd_for_log = cwd.clone();
     let summary = req.summary;
     let description = req.description;
     let amend = req.amend;
@@ -430,15 +440,15 @@ pub async fn commit(
     .map_err(|e| format!("git commit task failed: {e}"));
     let body = match result {
         Ok(Ok(())) => {
-            tracing::info!(path = %cwd_for_log, amend, "git commit ok");
+            log::info!(target: "termul::web::git_api", "operation=git_api stable_code=OK");
             IpcBody::<()>::ok(())
         }
         Ok(Err(e)) => {
-            tracing::warn!(path = %cwd_for_log, error = %e, "git commit failed");
+            log::warn!(target: "termul::web::git_api", "operation=git_api stable_code=REJECTED");
             IpcBody::<()>::err(e, "GIT_COMMIT_ERROR")
         }
         Err(e) => {
-            tracing::error!(path = %cwd_for_log, error = %e, "git commit task panicked");
+            log::error!(target: "termul::web::git_api", "operation=git_api stable_code=FAILED");
             IpcBody::<()>::err(format!("git commit task failed: {e}"), "GIT_COMMIT_ERROR")
         }
     };
@@ -450,10 +460,10 @@ pub async fn commit(
 /// fails fast instead of blocking until the network timeout.
 pub async fn push(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<GitCwdRequest>,
 ) -> impl IntoResponse {
-    let resolved = match resolve_cwd::<()>(&req.cwd, &state, Some(peer), true) {
+    let resolved = match resolve_cwd::<()>(&req.cwd, &state, Some(provenance), true) {
         Ok(p) => p,
         Err(resp) => return resp,
     };
@@ -461,22 +471,20 @@ pub async fn push(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let cwd_for_log = cwd.clone();
-    let result =
-        tokio::task::spawn_blocking(move || git_tracker::git_push_current(&cwd))
-            .await
-            .map_err(|e| format!("git push task failed: {e}"));
+    let result = tokio::task::spawn_blocking(move || git_tracker::git_push_current(&cwd))
+        .await
+        .map_err(|e| format!("git push task failed: {e}"));
     let body = match result {
         Ok(Ok(())) => {
-            tracing::info!(path = %cwd_for_log, "git push ok");
+            log::info!(target: "termul::web::git_api", "operation=git_api stable_code=OK");
             IpcBody::<()>::ok(())
         }
         Ok(Err(e)) => {
-            tracing::warn!(path = %cwd_for_log, error = %e, "git push failed");
+            log::warn!(target: "termul::web::git_api", "operation=git_api stable_code=REJECTED");
             IpcBody::<()>::err(e, "GIT_PUSH_ERROR")
         }
         Err(e) => {
-            tracing::error!(path = %cwd_for_log, error = %e, "git push task panicked");
+            log::error!(target: "termul::web::git_api", "operation=git_api stable_code=FAILED");
             IpcBody::<()>::err(format!("git push task failed: {e}"), "GIT_PUSH_ERROR")
         }
     };
@@ -497,27 +505,20 @@ pub async fn get_commit_context(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let cwd_for_log = cwd.clone();
-    let result =
-        tokio::task::spawn_blocking(move || git_tracker::git_get_commit_context(&cwd))
-            .await
-            .map_err(|e| format!("git commit-context task failed: {e}"));
+    let result = tokio::task::spawn_blocking(move || git_tracker::git_get_commit_context(&cwd))
+        .await
+        .map_err(|e| format!("git commit-context task failed: {e}"));
     let body = match result {
         Ok(Ok(ctx)) => {
-            tracing::info!(
-                path = %cwd_for_log,
-                branch = ?ctx.branch,
-                has_upstream = ctx.has_upstream,
-                "git commit-context ok"
-            );
+            log::info!(target: "termul::web::git_api", "operation=git_api stable_code=OK");
             IpcBody::ok(ctx)
         }
         Ok(Err(e)) => {
-            tracing::warn!(path = %cwd_for_log, error = %e, "git commit-context failed");
+            log::warn!(target: "termul::web::git_api", "operation=git_api stable_code=REJECTED");
             IpcBody::<GitCommitContext>::err(e, "GIT_COMMIT_CONTEXT_ERROR")
         }
         Err(e) => {
-            tracing::error!(path = %cwd_for_log, error = %e, "git commit-context task panicked");
+            log::error!(target: "termul::web::git_api", "operation=git_api stable_code=FAILED");
             IpcBody::<GitCommitContext>::err(
                 format!("git commit-context task failed: {e}"),
                 "GIT_COMMIT_CONTEXT_ERROR",
@@ -530,10 +531,10 @@ pub async fn get_commit_context(
 /// `POST /git/checkout-branch` — checkout existing local/remote branch (write).
 pub async fn checkout_branch(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<GitCheckoutBranchRequest>,
 ) -> impl IntoResponse {
-    let resolved = match resolve_cwd::<()>(&req.cwd, &state, Some(peer), true) {
+    let resolved = match resolve_cwd::<()>(&req.cwd, &state, Some(provenance), true) {
         Ok(p) => p,
         Err(resp) => return resp,
     };
@@ -541,9 +542,7 @@ pub async fn checkout_branch(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let cwd_for_log = cwd.clone();
     let branch = req.branch;
-    let branch_for_log = branch.clone();
     let is_remote = req.is_remote;
     let result = tokio::task::spawn_blocking(move || {
         git_tracker::git_checkout_branch(&cwd, &branch, is_remote)
@@ -552,16 +551,19 @@ pub async fn checkout_branch(
     .map_err(|e| format!("git checkout task failed: {e}"));
     let body = match result {
         Ok(Ok(())) => {
-            tracing::info!(path = %cwd_for_log, branch = %branch_for_log, "git checkout ok");
+            log::info!(target: "termul::web::git_api", "operation=git_api stable_code=OK");
             IpcBody::<()>::ok(())
         }
         Ok(Err(e)) => {
-            tracing::warn!(path = %cwd_for_log, branch = %branch_for_log, error = %e, "git checkout failed");
+            log::warn!(target: "termul::web::git_api", "operation=git_api stable_code=REJECTED");
             IpcBody::<()>::err(e, "GIT_CHECKOUT_ERROR")
         }
         Err(e) => {
-            tracing::error!(path = %cwd_for_log, error = %e, "git checkout task panicked");
-            IpcBody::<()>::err(format!("git checkout task failed: {e}"), "GIT_CHECKOUT_ERROR")
+            log::error!(target: "termul::web::git_api", "operation=git_api stable_code=FAILED");
+            IpcBody::<()>::err(
+                format!("git checkout task failed: {e}"),
+                "GIT_CHECKOUT_ERROR",
+            )
         }
     };
     (StatusCode::OK, Json(body))
@@ -571,10 +573,10 @@ pub async fn checkout_branch(
 /// (defaults to HEAD). Write.
 pub async fn create_branch(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<GitCreateBranchRequest>,
 ) -> impl IntoResponse {
-    let resolved = match resolve_cwd::<()>(&req.cwd, &state, Some(peer), true) {
+    let resolved = match resolve_cwd::<()>(&req.cwd, &state, Some(provenance), true) {
         Ok(p) => p,
         Err(resp) => return resp,
     };
@@ -582,9 +584,7 @@ pub async fn create_branch(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let cwd_for_log = cwd.clone();
     let branch = req.branch;
-    let branch_for_log = branch.clone();
     let start_ref = req.start_ref;
     let result = tokio::task::spawn_blocking(move || {
         git_tracker::git_create_branch(&cwd, &branch, start_ref.as_deref())
@@ -593,15 +593,15 @@ pub async fn create_branch(
     .map_err(|e| format!("git create-branch task failed: {e}"));
     let body = match result {
         Ok(Ok(())) => {
-            tracing::info!(path = %cwd_for_log, branch = %branch_for_log, "git create-branch ok");
+            log::info!(target: "termul::web::git_api", "operation=git_api stable_code=OK");
             IpcBody::<()>::ok(())
         }
         Ok(Err(e)) => {
-            tracing::warn!(path = %cwd_for_log, branch = %branch_for_log, error = %e, "git create-branch failed");
+            log::warn!(target: "termul::web::git_api", "operation=git_api stable_code=REJECTED");
             IpcBody::<()>::err(e, "GIT_CREATE_BRANCH_ERROR")
         }
         Err(e) => {
-            tracing::error!(path = %cwd_for_log, error = %e, "git create-branch task panicked");
+            log::error!(target: "termul::web::git_api", "operation=git_api stable_code=FAILED");
             IpcBody::<()>::err(
                 format!("git create-branch task failed: {e}"),
                 "GIT_CREATE_BRANCH_ERROR",
@@ -614,10 +614,10 @@ pub async fn create_branch(
 /// `POST /git/stash-save` — `git stash push [-u] [-m <msg>]` (write).
 pub async fn stash_save(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<GitStashSaveRequest>,
 ) -> impl IntoResponse {
-    let resolved = match resolve_cwd::<()>(&req.cwd, &state, Some(peer), true) {
+    let resolved = match resolve_cwd::<()>(&req.cwd, &state, Some(provenance), true) {
         Ok(p) => p,
         Err(resp) => return resp,
     };
@@ -625,7 +625,6 @@ pub async fn stash_save(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let cwd_for_log = cwd.clone();
     let message = req.message;
     let include_untracked = req.include_untracked.unwrap_or(false);
     let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
@@ -652,15 +651,15 @@ pub async fn stash_save(
     .map_err(|e| format!("git stash-save task failed: {e}"));
     let body = match result {
         Ok(Ok(())) => {
-            tracing::info!(path = %cwd_for_log, "git stash-save ok");
+            log::info!(target: "termul::web::git_api", "operation=git_api stable_code=OK");
             IpcBody::<()>::ok(())
         }
         Ok(Err(e)) => {
-            tracing::warn!(path = %cwd_for_log, error = %e, "git stash-save failed");
+            log::warn!(target: "termul::web::git_api", "operation=git_api stable_code=REJECTED");
             IpcBody::<()>::err(e, "GIT_STASH_SAVE_ERROR")
         }
         Err(e) => {
-            tracing::error!(path = %cwd_for_log, error = %e, "git stash-save task panicked");
+            log::error!(target: "termul::web::git_api", "operation=git_api stable_code=FAILED");
             IpcBody::<()>::err(
                 format!("git stash-save task failed: {e}"),
                 "GIT_STASH_SAVE_ERROR",
@@ -683,7 +682,6 @@ pub async fn stash_list(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let cwd_for_log = cwd.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<Vec<GitStashInfoDto>, String> {
         let output = GitTracker::run_git_command(&cwd, &["stash", "list"])
             .ok_or_else(|| "Failed to run git stash list".to_string())?;
@@ -714,15 +712,15 @@ pub async fn stash_list(
     .map_err(|e| format!("git stash-list task failed: {e}"));
     let body = match result {
         Ok(Ok(rows)) => {
-            tracing::info!(path = %cwd_for_log, stashes = rows.len(), "git stash-list ok");
+            log::info!(target: "termul::web::git_api", "operation=git_api stable_code=OK");
             IpcBody::ok(rows)
         }
         Ok(Err(e)) => {
-            tracing::warn!(path = %cwd_for_log, error = %e, "git stash-list failed");
+            log::warn!(target: "termul::web::git_api", "operation=git_api stable_code=REJECTED");
             IpcBody::<Vec<GitStashInfoDto>>::err(e, "GIT_STASH_LIST_ERROR")
         }
         Err(e) => {
-            tracing::error!(path = %cwd_for_log, error = %e, "git stash-list task panicked");
+            log::error!(target: "termul::web::git_api", "operation=git_api stable_code=FAILED");
             IpcBody::<Vec<GitStashInfoDto>>::err(
                 format!("git stash-list task failed: {e}"),
                 "GIT_STASH_LIST_ERROR",
@@ -735,28 +733,28 @@ pub async fn stash_list(
 /// `POST /git/stash-apply` — apply without removing (write).
 pub async fn stash_apply(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<GitStashIndexRequest>,
 ) -> impl IntoResponse {
-    run_stash_index_write(&state, peer, req, "apply", "GIT_STASH_APPLY_ERROR").await
+    run_stash_index_write(&state, provenance, req, "apply", "GIT_STASH_APPLY_ERROR").await
 }
 
 /// `POST /git/stash-pop` — apply + drop (write).
 pub async fn stash_pop(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<GitStashIndexRequest>,
 ) -> impl IntoResponse {
-    run_stash_index_write(&state, peer, req, "pop", "GIT_STASH_POP_ERROR").await
+    run_stash_index_write(&state, provenance, req, "pop", "GIT_STASH_POP_ERROR").await
 }
 
 /// `POST /git/stash-drop` — delete a stash (write, destructive).
 pub async fn stash_drop(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<GitStashIndexRequest>,
 ) -> impl IntoResponse {
-    run_stash_index_write(&state, peer, req, "drop", "GIT_STASH_DROP_ERROR").await
+    run_stash_index_write(&state, provenance, req, "drop", "GIT_STASH_DROP_ERROR").await
 }
 
 /// `GET /git/branch-list?cwd=...` — `git branch -a` (read).
@@ -772,7 +770,6 @@ pub async fn branch_list(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let cwd_for_log = cwd.clone();
     let result = tokio::task::spawn_blocking(move || -> Result<Vec<String>, String> {
         let output =
             GitTracker::run_git_command(&cwd, &["branch", "-a", "--format=%(refname:short)"])
@@ -792,15 +789,15 @@ pub async fn branch_list(
     .map_err(|e| format!("git branch-list task failed: {e}"));
     let body = match result {
         Ok(Ok(branches)) => {
-            tracing::info!(path = %cwd_for_log, branches = branches.len(), "git branch-list ok");
+            log::info!(target: "termul::web::git_api", "operation=git_api stable_code=OK");
             IpcBody::ok(branches)
         }
         Ok(Err(e)) => {
-            tracing::warn!(path = %cwd_for_log, error = %e, "git branch-list failed");
+            log::warn!(target: "termul::web::git_api", "operation=git_api stable_code=REJECTED");
             IpcBody::<Vec<String>>::err(e, "GIT_BRANCH_LIST_ERROR")
         }
         Err(e) => {
-            tracing::error!(path = %cwd_for_log, error = %e, "git branch-list task panicked");
+            log::error!(target: "termul::web::git_api", "operation=git_api stable_code=FAILED");
             IpcBody::<Vec<String>>::err(
                 format!("git branch-list task failed: {e}"),
                 "GIT_BRANCH_LIST_ERROR",
@@ -813,12 +810,12 @@ pub async fn branch_list(
 /// `POST /git/branch-switch` — `git checkout <name>` (write).
 pub async fn branch_switch(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<GitBranchNameRequest>,
 ) -> impl IntoResponse {
     run_branch_name_write(
         &state,
-        peer,
+        provenance,
         req,
         "checkout",
         "GIT_BRANCH_SWITCH_ERROR",
@@ -830,12 +827,12 @@ pub async fn branch_switch(
 /// `POST /git/branch-create` — `git checkout -b <name>` (write).
 pub async fn branch_create(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<GitBranchNameRequest>,
 ) -> impl IntoResponse {
     run_branch_name_write(
         &state,
-        peer,
+        provenance,
         req,
         "checkout -b",
         "GIT_BRANCH_CREATE_ERROR",
@@ -850,13 +847,13 @@ pub async fn branch_create(
 /// boundary/loopback/log/IpcBody wrap. Used by `stage`/`unstage`/`discard`.
 async fn run_git_path_write(
     state: &AppState,
-    peer: SocketAddr,
+    provenance: IngressProvenance,
     req: GitPathRequest,
     op: impl FnOnce(&str, &str) -> Result<(), String> + Send + 'static,
     label: &'static str,
     code: &'static str,
 ) -> (StatusCode, Json<IpcBody<()>>) {
-    let resolved = match resolve_cwd::<()>(&req.cwd, state, Some(peer), true) {
+    let resolved = match resolve_cwd::<()>(&req.cwd, state, Some(provenance), true) {
         Ok(p) => p,
         Err((st, body)) => return (st, body),
     };
@@ -864,22 +861,21 @@ async fn run_git_path_write(
         Ok(s) => s,
         Err((st, body)) => return (st, body),
     };
-    let cwd_for_log = cwd.clone();
     let path = req.path;
     let result = tokio::task::spawn_blocking(move || op(&cwd, &path))
         .await
         .map_err(|e| format!("git {label} task failed: {e}"));
     let body = match result {
         Ok(Ok(())) => {
-            tracing::info!(path = %cwd_for_log, op = label, "git {label} ok");
+            log::info!(target: "termul::web::git_api", "operation=git_api stable_code=OK");
             IpcBody::<()>::ok(())
         }
         Ok(Err(e)) => {
-            tracing::warn!(path = %cwd_for_log, op = label, error = %e, "git {label} failed");
+            log::warn!(target: "termul::web::git_api", "operation=git_api stable_code=REJECTED");
             IpcBody::<()>::err(e, code)
         }
         Err(e) => {
-            tracing::error!(path = %cwd_for_log, op = label, error = %e, "git {label} task panicked");
+            log::error!(target: "termul::web::git_api", "operation=git_api stable_code=FAILED");
             IpcBody::<()>::err(format!("git {label} task failed: {e}"), code)
         }
     };
@@ -889,12 +885,12 @@ async fn run_git_path_write(
 /// Run a stash-by-index op (`apply`/`pop`/`drop`): `git stash <op> stash@{<i>}`.
 async fn run_stash_index_write(
     state: &AppState,
-    peer: SocketAddr,
+    provenance: IngressProvenance,
     req: GitStashIndexRequest,
     op: &'static str,
     code: &'static str,
 ) -> (StatusCode, Json<IpcBody<()>>) {
-    let resolved = match resolve_cwd::<()>(&req.cwd, state, Some(peer), true) {
+    let resolved = match resolve_cwd::<()>(&req.cwd, state, Some(provenance), true) {
         Ok(p) => p,
         Err((st, body)) => return (st, body),
     };
@@ -902,7 +898,6 @@ async fn run_stash_index_write(
         Ok(s) => s,
         Err((st, body)) => return (st, body),
     };
-    let cwd_for_log = cwd.clone();
     let index = req.index;
     let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
         let stash_ref = format!("stash@{{{}}}", index);
@@ -919,15 +914,15 @@ async fn run_stash_index_write(
     .map_err(|e| format!("git stash {op} task failed: {e}"));
     let body = match result {
         Ok(Ok(())) => {
-            tracing::info!(path = %cwd_for_log, op, index, "git stash {op} ok");
+            log::info!(target: "termul::web::git_api", "operation=git_api stable_code=OK");
             IpcBody::<()>::ok(())
         }
         Ok(Err(e)) => {
-            tracing::warn!(path = %cwd_for_log, op, index, error = %e, "git stash {op} failed");
+            log::warn!(target: "termul::web::git_api", "operation=git_api stable_code=REJECTED");
             IpcBody::<()>::err(e, code)
         }
         Err(e) => {
-            tracing::error!(path = %cwd_for_log, op, index, error = %e, "git stash {op} task panicked");
+            log::error!(target: "termul::web::git_api", "operation=git_api stable_code=FAILED");
             IpcBody::<()>::err(format!("git stash {op} task failed: {e}"), code)
         }
     };
@@ -938,13 +933,13 @@ async fn run_stash_index_write(
 /// git command for the op (e.g. `checkout` vs `checkout -b`).
 async fn run_branch_name_write(
     state: &AppState,
-    peer: SocketAddr,
+    provenance: IngressProvenance,
     req: GitBranchNameRequest,
     label: &'static str,
     code: &'static str,
     runner: fn(&str, &str) -> Result<(), String>,
 ) -> (StatusCode, Json<IpcBody<()>>) {
-    let resolved = match resolve_cwd::<()>(&req.cwd, state, Some(peer), true) {
+    let resolved = match resolve_cwd::<()>(&req.cwd, state, Some(provenance), true) {
         Ok(p) => p,
         Err((st, body)) => return (st, body),
     };
@@ -952,23 +947,21 @@ async fn run_branch_name_write(
         Ok(s) => s,
         Err((st, body)) => return (st, body),
     };
-    let cwd_for_log = cwd.clone();
     let name = req.name;
-    let name_for_log = name.clone();
     let result = tokio::task::spawn_blocking(move || runner(&cwd, &name))
         .await
         .map_err(|e| format!("git {label} task failed: {e}"));
     let body = match result {
         Ok(Ok(())) => {
-            tracing::info!(path = %cwd_for_log, op = label, name = %name_for_log, "git {label} ok");
+            log::info!(target: "termul::web::git_api", "operation=git_api stable_code=OK");
             IpcBody::<()>::ok(())
         }
         Ok(Err(e)) => {
-            tracing::warn!(path = %cwd_for_log, op = label, name = %name_for_log, error = %e, "git {label} failed");
+            log::warn!(target: "termul::web::git_api", "operation=git_api stable_code=REJECTED");
             IpcBody::<()>::err(e, code)
         }
         Err(e) => {
-            tracing::error!(path = %cwd_for_log, op = label, error = %e, "git {label} task panicked");
+            log::error!(target: "termul::web::git_api", "operation=git_api stable_code=FAILED");
             IpcBody::<()>::err(format!("git {label} task failed: {e}"), code)
         }
     };
@@ -1008,6 +1001,7 @@ mod tests {
     use crate::web::test_pty_manager;
     use crate::web::ws::HistoryMode;
     use axum::body::Body;
+    use axum::extract::ConnectInfo;
     use axum::http::{Request, StatusCode};
     use axum::routing::{get, post};
     use std::net::SocketAddr;
@@ -1055,7 +1049,9 @@ mod tests {
             projects_file: None,
             history_mode: HistoryMode::LiveOnly,
             conversation: None,
-            project_root: Arc::new(parking_lot::RwLock::new(root.canonicalize().unwrap_or_else(|_| root.to_path_buf()))),
+            project_root: Arc::new(parking_lot::RwLock::new(
+                root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
+            )),
             workspace_manifest: None,
             acp_catalog: None,
             acp_install: None,
@@ -1111,6 +1107,11 @@ mod tests {
         body: &serde_json::Value,
         peer: SocketAddr,
     ) -> axum::http::Response<Body> {
+        let provenance = if peer.ip().is_loopback() {
+            IngressProvenance::LocalOperator
+        } else {
+            IngressProvenance::PublicTunnel
+        };
         let bytes = serde_json::to_vec(body).expect("serialize body");
         test_router(state)
             .oneshot(
@@ -1119,6 +1120,7 @@ mod tests {
                     .uri(uri)
                     .header("content-type", "application/json")
                     .extension(ConnectInfo(peer))
+                    .extension(provenance)
                     .body(Body::from(bytes))
                     .expect("build request"),
             )

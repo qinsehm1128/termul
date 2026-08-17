@@ -77,10 +77,7 @@ pub async fn list(
                 )
             };
             if let Some(err) = outside_err {
-                tracing::warn!(
-                    "[Security] /skills rejected: projectRoot '{}' outside project_root",
-                    canonical.display()
-                );
+                log::warn!(target: "termul::web::skills_api", "operation=skills_api stable_code=REJECTED");
                 return (StatusCode::OK, Json(err));
             }
         }
@@ -94,14 +91,14 @@ pub async fn list(
 
     let body = match result {
         Ok(Ok(skills)) => IpcBody::ok(skills),
-        Ok(Err(e)) => {
-            tracing::warn!("skills list failed (degrading to empty list): {e}");
+        Ok(Err(_e)) => {
+            log::warn!(target: "termul::web::skills_api", "operation=skills_api stable_code=REJECTED");
             // Degrade: return an empty list so the slash menu stays usable,
             // matching the desktop's `Promise.resolve([])` fallback contract.
             IpcBody::ok(Vec::<AgentSkillSummary>::new())
         }
-        Err(e) => {
-            tracing::error!("skills list task panicked: {e}");
+        Err(_e) => {
+            log::error!(target: "termul::web::skills_api", "operation=skills_api stable_code=FAILED");
             IpcBody::ok(Vec::<AgentSkillSummary>::new())
         }
     };
@@ -134,16 +131,12 @@ pub async fn read(
                 )
             };
             if let Some(err) = outside_err {
-                tracing::warn!(
-                    "[Security] /skills/:name rejected: projectRoot '{}' outside project_root",
-                    canonical.display()
-                );
+                log::warn!(target: "termul::web::skills_api", "operation=skills_api stable_code=REJECTED");
                 return (StatusCode::OK, Json(err));
             }
         }
     }
     let project_root = q.project_root;
-    let name_for_log = name.clone();
     let result = tokio::task::spawn_blocking(move || {
         crate::skills::read_agent_skill(&name, project_root.as_deref())
     })
@@ -153,11 +146,11 @@ pub async fn read(
     let body = match result {
         Ok(Ok(content)) => IpcBody::ok(content),
         Ok(Err(e)) => {
-            tracing::warn!("skills read failed for '{name_for_log}': {e}");
+            log::warn!(target: "termul::web::skills_api", "operation=skills_api stable_code=REJECTED");
             IpcBody::<AgentSkillContent>::err(e, "SKILL_NOT_FOUND")
         }
         Err(e) => {
-            tracing::error!("skills read task panicked for '{name_for_log}': {e}");
+            log::error!(target: "termul::web::skills_api", "operation=skills_api stable_code=FAILED");
             IpcBody::<AgentSkillContent>::err(
                 format!("skills read task failed: {e}"),
                 "SKILL_READ_ERROR",
@@ -276,7 +269,10 @@ mod tests {
         let resp = get_request(state, &uri).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body: IpcBody<Vec<AgentSkillSummary>> = body_as_json(resp.into_body()).await;
-        assert!(!body.success, "outside-project-root projectRoot must be rejected");
+        assert!(
+            !body.success,
+            "outside-project-root projectRoot must be rejected"
+        );
         assert_eq!(body.code.as_deref(), Some("OUTSIDE_PROJECT_ROOT"));
     }
 
@@ -286,7 +282,11 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body: IpcBody<AgentSkillContent> = body_as_json(resp.into_body()).await;
         // A nonexistent skill must return a failure body (never throw).
-        assert!(!body.success, "nonexistent skill should not be found: {:?}", body.data);
+        assert!(
+            !body.success,
+            "nonexistent skill should not be found: {:?}",
+            body.data
+        );
         assert_eq!(body.code.as_deref(), Some("SKILL_NOT_FOUND"));
     }
 }

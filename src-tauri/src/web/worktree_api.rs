@@ -26,24 +26,23 @@
 //! `parseGitignore`, `mergePreview/Execute`, `archive`/`restore`,
 //! `removeAllManaged`) are deferred — see `deferred-work.md`.
 
-use std::net::SocketAddr;
 use std::path::Path;
 
 use axum::{
-    extract::{ConnectInfo, Query, State},
+    extract::{Query, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
 };
 use serde::Deserialize;
-use tracing::{error, info, warn};
 
+use crate::web::auth::IngressProvenance;
 use crate::web::fs_api::{check_local_only, resolve_request_path, IpcBody};
 use crate::web::git_api::ensure_within_project_boundary;
 use crate::web::ws::AppState;
 use crate::worktree::{
-    BaseBranchInfo, BranchEntry, DirtyStatus, GitWorktreeEntry, IncludeCopyResult,
-    WorktreeError, WorktreeManager,
+    BaseBranchInfo, BranchEntry, DirtyStatus, GitWorktreeEntry, IncludeCopyResult, WorktreeError,
+    WorktreeManager,
 };
 
 /// `POST /worktree/list { projectPath }` body.
@@ -108,7 +107,7 @@ type RouteErr<T> = (StatusCode, Json<IpcBody<T>>);
 fn resolve_project_path<T>(
     req_path: &str,
     state: &AppState,
-    peer: Option<SocketAddr>,
+    provenance: Option<IngressProvenance>,
     is_write: bool,
 ) -> Result<std::path::PathBuf, RouteErr<T>> {
     // 1) Loopback guard for write routes FIRST — fail fast on non-local peers
@@ -116,8 +115,8 @@ fn resolve_project_path<T>(
     //    (follows symlinks / reads FS metadata); a LAN peer must not trigger
     //    that on a write (mutation safety on a 0.0.0.0 bind).
     if is_write {
-        if let Some(peer) = peer {
-            if let Some(forbidden) = check_local_only::<T>(peer) {
+        if let Some(provenance) = provenance {
+            if let Some(forbidden) = check_local_only::<T>(provenance) {
                 return Err((StatusCode::OK, Json(forbidden)));
             }
         }
@@ -176,15 +175,16 @@ pub async fn list(
     State(state): State<AppState>,
     Json(req): Json<WorktreeProjectPathRequest>,
 ) -> impl IntoResponse {
-    let resolved = match resolve_project_path::<Vec<GitWorktreeEntry>>(&req.project_path, &state, None, false) {
-        Ok(p) => p,
-        Err(resp) => return resp,
-    };
+    let resolved =
+        match resolve_project_path::<Vec<GitWorktreeEntry>>(&req.project_path, &state, None, false)
+        {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
     let project_path = match path_string::<Vec<GitWorktreeEntry>>(&resolved) {
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let path_for_log = project_path.clone();
     // Normalize the project root for the info-leak filter: strip the Windows
     // verbatim (`\\?\`) prefix so `starts_with` matches git's output (which
     // carries no verbatim prefix). Both sides must share the same non-verbatim
@@ -210,16 +210,15 @@ pub async fn list(
                     std::path::Path::new(entry.as_ref()).starts_with(&project_root_for_filter)
                 })
                 .collect();
-            let kept = filtered.len();
-            info!(path = %path_for_log, count = kept, "worktree list ok");
+            log::info!(target: "termul::web::worktree_api", "operation=worktree_api stable_code=OK");
             IpcBody::ok(filtered)
         }
         Ok(Err(e)) => {
-            warn!(path = %path_for_log, error = %e, "worktree list failed");
+            log::warn!(target: "termul::web::worktree_api", "operation=worktree_api stable_code=REJECTED");
             worktree_err::<Vec<GitWorktreeEntry>>(e)
         }
         Err(e) => {
-            error!(path = %path_for_log, error = %e, "worktree list task panicked");
+            log::error!(target: "termul::web::worktree_api", "operation=worktree_api stable_code=FAILED");
             IpcBody::<Vec<GitWorktreeEntry>>::err(
                 format!("worktree list task failed: {e}"),
                 "WORKTREE_LIST_ERROR",
@@ -233,10 +232,15 @@ pub async fn list(
 /// Mirrors `worktree_create` → `WorktreeManager::create`.
 pub async fn create(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<WorktreeCreateRequest>,
 ) -> impl IntoResponse {
-    let resolved = match resolve_project_path::<GitWorktreeEntry>(&req.project_path, &state, Some(peer), true) {
+    let resolved = match resolve_project_path::<GitWorktreeEntry>(
+        &req.project_path,
+        &state,
+        Some(provenance),
+        true,
+    ) {
         Ok(p) => p,
         Err(resp) => return resp,
     };
@@ -247,16 +251,17 @@ pub async fn create(
     // If a custom target_path was provided, boundary-check it too (the default
     // is `<project>/.termul/worktrees/<name>/` which is inside the boundary).
     let target_path = match req.target_path.as_deref() {
-        Some(tp) => match resolve_project_path::<GitWorktreeEntry>(tp, &state, Some(peer), true) {
-            Ok(p) => match path_string::<GitWorktreeEntry>(&p) {
-                Ok(s) => Some(s),
+        Some(tp) => {
+            match resolve_project_path::<GitWorktreeEntry>(tp, &state, Some(provenance), true) {
+                Ok(p) => match path_string::<GitWorktreeEntry>(&p) {
+                    Ok(s) => Some(s),
+                    Err(resp) => return resp,
+                },
                 Err(resp) => return resp,
-            },
-            Err(resp) => return resp,
-        },
+            }
+        }
         None => None,
     };
-    let path_for_log = project_path.clone();
     let name = req.name;
     let branch = req.branch;
     let is_new_branch = req.is_new_branch;
@@ -275,15 +280,15 @@ pub async fn create(
     .map_err(|e| format!("worktree create task failed: {e}"));
     let body = match result {
         Ok(Ok(entry)) => {
-            info!(path = %path_for_log, branch = %entry.branch, "worktree create ok");
+            log::info!(target: "termul::web::worktree_api", "operation=worktree_api stable_code=OK");
             IpcBody::ok(entry)
         }
         Ok(Err(e)) => {
-            warn!(path = %path_for_log, error = %e, "worktree create failed");
+            log::warn!(target: "termul::web::worktree_api", "operation=worktree_api stable_code=REJECTED");
             worktree_err::<GitWorktreeEntry>(e)
         }
         Err(e) => {
-            error!(path = %path_for_log, error = %e, "worktree create task panicked");
+            log::error!(target: "termul::web::worktree_api", "operation=worktree_api stable_code=FAILED");
             IpcBody::<GitWorktreeEntry>::err(
                 format!("worktree create task failed: {e}"),
                 "WORKTREE_CREATE_ERROR",
@@ -297,26 +302,27 @@ pub async fn create(
 /// Mirrors `worktree_remove` → `WorktreeManager::remove`.
 pub async fn remove(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<WorktreeRemoveRequest>,
 ) -> impl IntoResponse {
-    let project_resolved = match resolve_project_path::<()>(&req.project_path, &state, Some(peer), true) {
-        Ok(p) => p,
-        Err(resp) => return resp,
-    };
+    let project_resolved =
+        match resolve_project_path::<()>(&req.project_path, &state, Some(provenance), true) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
     let project_path = match path_string::<()>(&project_resolved) {
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let worktree_resolved = match resolve_project_path::<()>(&req.worktree_path, &state, Some(peer), true) {
-        Ok(p) => p,
-        Err(resp) => return resp,
-    };
+    let worktree_resolved =
+        match resolve_project_path::<()>(&req.worktree_path, &state, Some(provenance), true) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
     let worktree_path = match path_string::<()>(&worktree_resolved) {
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let path_for_log = worktree_path.clone();
     let force = req.force;
     let result = tokio::task::spawn_blocking(move || {
         WorktreeManager::remove(&project_path, &worktree_path, force)
@@ -325,15 +331,15 @@ pub async fn remove(
     .map_err(|e| format!("worktree remove task failed: {e}"));
     let body = match result {
         Ok(Ok(())) => {
-            info!(path = %path_for_log, force, "worktree remove ok");
+            log::info!(target: "termul::web::worktree_api", "operation=worktree_api stable_code=OK");
             IpcBody::<()>::ok(())
         }
         Ok(Err(e)) => {
-            warn!(path = %path_for_log, error = %e, "worktree remove failed");
+            log::warn!(target: "termul::web::worktree_api", "operation=worktree_api stable_code=REJECTED");
             worktree_err::<()>(e)
         }
         Err(e) => {
-            error!(path = %path_for_log, error = %e, "worktree remove task panicked");
+            log::error!(target: "termul::web::worktree_api", "operation=worktree_api stable_code=FAILED");
             IpcBody::<()>::err(
                 format!("worktree remove task failed: {e}"),
                 "WORKTREE_REMOVE_ERROR",
@@ -349,29 +355,29 @@ pub async fn branches(
     State(state): State<AppState>,
     Query(q): Query<WorktreeProjectPathQuery>,
 ) -> impl IntoResponse {
-    let resolved = match resolve_project_path::<Vec<BranchEntry>>(&q.project_path, &state, None, false) {
-        Ok(p) => p,
-        Err(resp) => return resp,
-    };
+    let resolved =
+        match resolve_project_path::<Vec<BranchEntry>>(&q.project_path, &state, None, false) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
     let project_path = match path_string::<Vec<BranchEntry>>(&resolved) {
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let path_for_log = project_path.clone();
     let result = tokio::task::spawn_blocking(move || WorktreeManager::branches(&project_path))
         .await
         .map_err(|e| format!("worktree branches task failed: {e}"));
     let body = match result {
         Ok(Ok(entries)) => {
-            info!(path = %path_for_log, count = entries.len(), "worktree branches ok");
+            log::info!(target: "termul::web::worktree_api", "operation=worktree_api stable_code=OK");
             IpcBody::ok(entries)
         }
         Ok(Err(e)) => {
-            warn!(path = %path_for_log, error = %e, "worktree branches failed");
+            log::warn!(target: "termul::web::worktree_api", "operation=worktree_api stable_code=REJECTED");
             worktree_err::<Vec<BranchEntry>>(e)
         }
         Err(e) => {
-            error!(path = %path_for_log, error = %e, "worktree branches task panicked");
+            log::error!(target: "termul::web::worktree_api", "operation=worktree_api stable_code=FAILED");
             IpcBody::<Vec<BranchEntry>>::err(
                 format!("worktree branches task failed: {e}"),
                 "WORKTREE_BRANCHES_ERROR",
@@ -387,7 +393,8 @@ pub async fn check_dirty(
     State(state): State<AppState>,
     Query(q): Query<WorktreePathQuery>,
 ) -> impl IntoResponse {
-    let resolved = match resolve_project_path::<DirtyStatus>(&q.worktree_path, &state, None, false) {
+    let resolved = match resolve_project_path::<DirtyStatus>(&q.worktree_path, &state, None, false)
+    {
         Ok(p) => p,
         Err(resp) => return resp,
     };
@@ -395,21 +402,20 @@ pub async fn check_dirty(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let path_for_log = worktree_path.clone();
     let result = tokio::task::spawn_blocking(move || WorktreeManager::check_dirty(&worktree_path))
         .await
         .map_err(|e| format!("worktree check-dirty task failed: {e}"));
     let body = match result {
         Ok(Ok(status)) => {
-            info!(path = %path_for_log, has_changes = status.has_changes, "worktree check-dirty ok");
+            log::info!(target: "termul::web::worktree_api", "operation=worktree_api stable_code=OK");
             IpcBody::ok(status)
         }
         Ok(Err(e)) => {
-            warn!(path = %path_for_log, error = %e, "worktree check-dirty failed");
+            log::warn!(target: "termul::web::worktree_api", "operation=worktree_api stable_code=REJECTED");
             worktree_err::<DirtyStatus>(e)
         }
         Err(e) => {
-            error!(path = %path_for_log, error = %e, "worktree check-dirty task panicked");
+            log::error!(target: "termul::web::worktree_api", "operation=worktree_api stable_code=FAILED");
             IpcBody::<DirtyStatus>::err(
                 format!("worktree check-dirty task failed: {e}"),
                 "WORKTREE_CHECK_DIRTY_ERROR",
@@ -425,35 +431,31 @@ pub async fn resolve_base_branch(
     State(state): State<AppState>,
     Json(req): Json<WorktreeProjectPathRequest>,
 ) -> impl IntoResponse {
-    let resolved = match resolve_project_path::<BaseBranchInfo>(&req.project_path, &state, None, false) {
-        Ok(p) => p,
-        Err(resp) => return resp,
-    };
+    let resolved =
+        match resolve_project_path::<BaseBranchInfo>(&req.project_path, &state, None, false) {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        };
     let project_path = match path_string::<BaseBranchInfo>(&resolved) {
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let path_for_log = project_path.clone();
-    let result =
-        tokio::task::spawn_blocking(move || WorktreeManager::resolve_default_base_branch(&project_path))
-            .await
-            .map_err(|e| format!("worktree resolve-base-branch task failed: {e}"));
+    let result = tokio::task::spawn_blocking(move || {
+        WorktreeManager::resolve_default_base_branch(&project_path)
+    })
+    .await
+    .map_err(|e| format!("worktree resolve-base-branch task failed: {e}"));
     let body = match result {
         Ok(Ok(info)) => {
-            info!(
-                path = %path_for_log,
-                default_base = %info.default_base,
-                is_detached = info.is_detached,
-                "worktree resolve-base-branch ok"
-            );
+            log::info!(target: "termul::web::worktree_api", "operation=worktree_api stable_code=OK");
             IpcBody::ok(info)
         }
         Ok(Err(e)) => {
-            warn!(path = %path_for_log, error = %e, "worktree resolve-base-branch failed");
+            log::warn!(target: "termul::web::worktree_api", "operation=worktree_api stable_code=REJECTED");
             worktree_err::<BaseBranchInfo>(e)
         }
         Err(e) => {
-            error!(path = %path_for_log, error = %e, "worktree resolve-base-branch task panicked");
+            log::error!(target: "termul::web::worktree_api", "operation=worktree_api stable_code=FAILED");
             IpcBody::<BaseBranchInfo>::err(
                 format!("worktree resolve-base-branch task failed: {e}"),
                 "WORKTREE_RESOLVE_BASE_BRANCH_ERROR",
@@ -467,10 +469,15 @@ pub async fn resolve_base_branch(
 /// Mirrors `worktree_copy_include_files` → `WorktreeManager::copy_worktree_include_files`.
 pub async fn copy_include_files(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<WorktreeCopyIncludeRequest>,
 ) -> impl IntoResponse {
-    let project_resolved = match resolve_project_path::<IncludeCopyResult>(&req.project_path, &state, Some(peer), true) {
+    let project_resolved = match resolve_project_path::<IncludeCopyResult>(
+        &req.project_path,
+        &state,
+        Some(provenance),
+        true,
+    ) {
         Ok(p) => p,
         Err(resp) => return resp,
     };
@@ -478,7 +485,12 @@ pub async fn copy_include_files(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let worktree_resolved = match resolve_project_path::<IncludeCopyResult>(&req.worktree_path, &state, Some(peer), true) {
+    let worktree_resolved = match resolve_project_path::<IncludeCopyResult>(
+        &req.worktree_path,
+        &state,
+        Some(provenance),
+        true,
+    ) {
         Ok(p) => p,
         Err(resp) => return resp,
     };
@@ -486,7 +498,6 @@ pub async fn copy_include_files(
         Ok(s) => s,
         Err(resp) => return resp,
     };
-    let path_for_log = worktree_path.clone();
     let result = tokio::task::spawn_blocking(move || {
         WorktreeManager::copy_worktree_include_files(&project_path, &worktree_path)
     })
@@ -494,21 +505,15 @@ pub async fn copy_include_files(
     .map_err(|e| format!("worktree copy-include-files task failed: {e}"));
     let body = match result {
         Ok(Ok(outcome)) => {
-            info!(
-                path = %path_for_log,
-                ran = outcome.ran,
-                copied = outcome.copied,
-                skipped = outcome.skipped.len(),
-                "worktree copy-include-files ok"
-            );
+            log::info!(target: "termul::web::worktree_api", "operation=worktree_api stable_code=OK");
             IpcBody::ok(outcome)
         }
         Ok(Err(e)) => {
-            warn!(path = %path_for_log, error = %e, "worktree copy-include-files failed");
+            log::warn!(target: "termul::web::worktree_api", "operation=worktree_api stable_code=REJECTED");
             worktree_err::<IncludeCopyResult>(e)
         }
         Err(e) => {
-            error!(path = %path_for_log, error = %e, "worktree copy-include-files task panicked");
+            log::error!(target: "termul::web::worktree_api", "operation=worktree_api stable_code=FAILED");
             IpcBody::<IncludeCopyResult>::err(
                 format!("worktree copy-include-files task failed: {e}"),
                 "WORKTREE_COPY_INCLUDE_FILES_ERROR",
@@ -528,8 +533,10 @@ mod tests {
     use crate::web::test_pty_manager;
     use crate::web::ws::HistoryMode;
     use axum::body::Body;
+    use axum::extract::ConnectInfo;
     use axum::http::Request;
     use axum::routing::{get, post};
+    use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tower::ServiceExt;
@@ -627,6 +634,11 @@ mod tests {
                     .uri(uri)
                     .header("content-type", "application/json")
                     .extension(ConnectInfo(peer))
+                    .extension(if peer.ip().is_loopback() {
+                        IngressProvenance::LocalOperator
+                    } else {
+                        IngressProvenance::PublicTunnel
+                    })
                     .body(Body::from(bytes))
                     .expect("build request"),
             )
@@ -699,9 +711,16 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
-        let out = GitTracker::run_git_command(path.to_str().unwrap(), &["commit", "--allow-empty", "-m", "init"])
-            .expect("git commit");
-        assert!(out.status.success(), "initial commit failed: {}", String::from_utf8_lossy(&out.stderr));
+        let out = GitTracker::run_git_command(
+            path.to_str().unwrap(),
+            &["commit", "--allow-empty", "-m", "init"],
+        )
+        .expect("git commit");
+        assert!(
+            out.status.success(),
+            "initial commit failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         RepoFixture { _dir: dir, path }
     }
 
@@ -745,7 +764,11 @@ mod tests {
             return;
         }
         let repo = init_repo("create-guard");
-        let state = test_state(repo.path().parent().unwrap_or_else(|| std::path::Path::new(".")));
+        let state = test_state(
+            repo.path()
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+        );
         let remote = SocketAddr::from(([192, 168, 1, 50], 40000));
         let resp = post_json_from(
             state,
@@ -814,7 +837,11 @@ mod tests {
             return;
         }
         let repo = init_repo("list-ok");
-        let state = test_state(repo.path().parent().unwrap_or_else(|| std::path::Path::new(".")));
+        let state = test_state(
+            repo.path()
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+        );
         let resp = post_json(
             state,
             "/worktree/list",
@@ -835,7 +862,11 @@ mod tests {
             return;
         }
         let repo = init_repo("branches-ok");
-        let state = test_state(repo.path().parent().unwrap_or_else(|| std::path::Path::new(".")));
+        let state = test_state(
+            repo.path()
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+        );
         let uri = format!(
             "/worktree/branches?projectPath={}",
             urlencoding(&repo.path().to_string_lossy())
@@ -854,7 +885,11 @@ mod tests {
             return;
         }
         let repo = init_repo("base-ok");
-        let state = test_state(repo.path().parent().unwrap_or_else(|| std::path::Path::new(".")));
+        let state = test_state(
+            repo.path()
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+        );
         let resp = post_json(
             state,
             "/worktree/resolve-base-branch",
@@ -865,7 +900,10 @@ mod tests {
         let body: IpcBody<BaseBranchInfo> = body_as(resp.into_body()).await;
         assert!(body.success, "{:?}", body.error);
         let info = body.data.expect("base branch info");
-        assert!(!info.default_base.is_empty(), "default base must be non-empty");
+        assert!(
+            !info.default_base.is_empty(),
+            "default base must be non-empty"
+        );
     }
 
     // ----- Write routes (loopback-guarded) -----
@@ -876,7 +914,11 @@ mod tests {
             return;
         }
         let repo = init_repo("cud");
-        let state = test_state(repo.path().parent().unwrap_or_else(|| std::path::Path::new(".")));
+        let state = test_state(
+            repo.path()
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+        );
 
         // Create a worktree
         let resp = post_json(
@@ -931,7 +973,11 @@ mod tests {
             return;
         }
         let repo = init_repo("dirty-ok");
-        let state = test_state(repo.path().parent().unwrap_or_else(|| std::path::Path::new(".")));
+        let state = test_state(
+            repo.path()
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+        );
 
         // Create a worktree so check-dirty has a valid path to probe
         let resp = post_json(
@@ -966,7 +1012,11 @@ mod tests {
             return;
         }
         let repo = init_repo("copy-ok");
-        let state = test_state(repo.path().parent().unwrap_or_else(|| std::path::Path::new(".")));
+        let state = test_state(
+            repo.path()
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+        );
 
         let resp = post_json(
             state.clone(),
@@ -1013,9 +1063,7 @@ mod tests {
     /// Build the production `router()` with a test AppState rooted at `root`.
     fn production_router(root: &std::path::Path) -> axum::Router {
         let pty = crate::web::test_pty_manager();
-        let project_root = root
-            .canonicalize()
-            .unwrap_or_else(|_| root.to_path_buf());
+        let project_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
         crate::web::router::router(
             Arc::new(AcpManager::new(vec![])),
             pty.clone(),
@@ -1046,7 +1094,9 @@ mod tests {
         }
         let repo = init_repo("prod-router-list");
         let app = production_router(
-            repo.path().parent().unwrap_or_else(|| std::path::Path::new(".")),
+            repo.path()
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
         );
         let bytes = serde_json::to_vec(
             &serde_json::json!({ "projectPath": repo.path().to_string_lossy() }),
@@ -1060,6 +1110,7 @@ mod tests {
                     .header("authorization", "Bearer test-remote-access-token")
                     .header("content-type", "application/json")
                     .extension(ConnectInfo(loopback()))
+                    .extension(IngressProvenance::LocalOperator)
                     .body(Body::from(bytes))
                     .expect("build request"),
             )
@@ -1085,7 +1136,9 @@ mod tests {
         }
         let repo = init_repo("prod-router-branches");
         let app = production_router(
-            repo.path().parent().unwrap_or_else(|| std::path::Path::new(".")),
+            repo.path()
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
         );
         let uri = format!(
             "/worktree/branches?projectPath={}",
@@ -1122,7 +1175,9 @@ mod tests {
         }
         let repo = init_repo("prod-router-base");
         let app = production_router(
-            repo.path().parent().unwrap_or_else(|| std::path::Path::new(".")),
+            repo.path()
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
         );
         let bytes = serde_json::to_vec(
             &serde_json::json!({ "projectPath": repo.path().to_string_lossy() }),
@@ -1136,6 +1191,7 @@ mod tests {
                     .header("authorization", "Bearer test-remote-access-token")
                     .header("content-type", "application/json")
                     .extension(ConnectInfo(loopback()))
+                    .extension(IngressProvenance::LocalOperator)
                     .body(Body::from(bytes))
                     .expect("build request"),
             )
@@ -1158,7 +1214,9 @@ mod tests {
         // from the fallback.
         let repo = init_repo("prod-router-404");
         let app = production_router(
-            repo.path().parent().unwrap_or_else(|| std::path::Path::new(".")),
+            repo.path()
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
         );
         let resp = app
             .oneshot(
@@ -1168,6 +1226,7 @@ mod tests {
                     .header("authorization", "Bearer test-remote-access-token")
                     .header("content-type", "application/json")
                     .extension(ConnectInfo(loopback()))
+                    .extension(IngressProvenance::LocalOperator)
                     .body(Body::from(
                         serde_json::to_vec(&serde_json::json!({})).expect("serialize"),
                     ))

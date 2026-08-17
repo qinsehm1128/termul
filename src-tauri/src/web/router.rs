@@ -22,7 +22,9 @@ use crate::acp::{
 };
 use crate::pty::PtyManager;
 use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub};
-use crate::web::auth::{capability_middleware, RemoteAccessAuthority, RemoteRouteClass};
+use crate::web::auth::{
+    capability_middleware, IngressProvenance, RemoteAccessAuthority, RemoteRouteClass,
+};
 use crate::web::catalog_api;
 use crate::web::conversation_api;
 use crate::web::conversation_lifecycle_api;
@@ -53,7 +55,18 @@ fn classified_routes(routes: Router<AppState>, route_class: RemoteRouteClass) ->
 
 /// Canonical API route registry. Each boundary is assigned an identifier-free
 /// static class before authentication/logging middleware runs.
-fn api_routes() -> Router<AppState> {
+fn api_routes(provenance: IngressProvenance) -> Router<AppState> {
+    let mcp_routes = if provenance.allows_local_operator_mutation() {
+        Router::<AppState>::new()
+            .route(
+                "/mcp-servers",
+                get(mcp_servers_api::get).put(mcp_servers_api::put),
+            )
+            .route("/mcp-servers/probe", post(mcp_probe_api::probe))
+    } else {
+        Router::<AppState>::new().route("/mcp-servers", get(mcp_servers_api::get))
+    };
+
     classified_routes(
         Router::<AppState>::new().route("/health", get(health_check)),
         RemoteRouteClass::Health,
@@ -72,15 +85,7 @@ fn api_routes() -> Router<AppState> {
             .route("/projects/default", post(projects_api::set_default_project)),
         RemoteRouteClass::Project,
     ))
-    .merge(classified_routes(
-        Router::<AppState>::new()
-            .route(
-                "/mcp-servers",
-                get(mcp_servers_api::get).put(mcp_servers_api::put),
-            )
-            .route("/mcp-servers/probe", post(mcp_probe_api::probe)),
-        RemoteRouteClass::Mcp,
-    ))
+    .merge(classified_routes(mcp_routes, RemoteRouteClass::Mcp))
     .merge(classified_routes(
         Router::<AppState>::new()
             .route("/fs/mkdir", post(fs_api::mkdir))
@@ -277,7 +282,8 @@ pub fn router(
     authority: Arc<RemoteAccessAuthority>,
 ) -> Router {
     acp.set_pty_manager(&pty);
-    let mut r = api_routes();
+    let provenance = authority.ingress_provenance();
+    let mut r = api_routes(provenance);
     // Static fallback: disk ServeDir in dev (dist-web/ on disk) or the embedded
     // bundle in release. `/health` + `/ws` are registered above so the static
     // mount cannot shadow them (Story 1.3 AC1).
@@ -312,6 +318,7 @@ pub fn router(
         acp_install,
         project_root: project_root_handle,
     })
+    .layer(Extension(provenance))
     .layer(Extension(authority))
 }
 
@@ -336,7 +343,7 @@ pub fn router_with_static(
     project_root: PathBuf,
 ) -> Router {
     acp.set_pty_manager(&pty);
-    api_routes()
+    api_routes(IngressProvenance::LocalOperator)
         .fallback_service(assets::static_service_from(static_dir))
         // CAP-1: same RwLock wrap + handle registration as `router`.
         .with_state({
@@ -361,6 +368,7 @@ pub fn router_with_static(
                 project_root: project_root_handle,
             }
         })
+        .layer(Extension(IngressProvenance::LocalOperator))
         .layer(Extension(Arc::new(RemoteAccessAuthority::unconfigured())))
 }
 
@@ -406,6 +414,28 @@ mod tests {
         }
     }
 
+    fn route_test_state(root: &Path) -> AppState {
+        let pty = crate::web::test_pty_manager();
+        AppState {
+            acp: Arc::new(AcpManager::new(vec![])),
+            terminal_events: pty.terminal_events(),
+            cwd_tracker: pty.cwd_tracker(),
+            git_tracker: pty.git_tracker(),
+            exit_code_tracker: pty.exit_code_tracker(),
+            pty,
+            relay: Arc::new(WsRelaySink::new()),
+            registry: Arc::new(ProjectRegistry::new()),
+            registry_persistence: None,
+            projects_file: None,
+            history_mode: HistoryMode::LiveOnly,
+            conversation: None,
+            workspace_manifest: None,
+            acp_catalog: None,
+            acp_install: None,
+            project_root: Arc::new(parking_lot::RwLock::new(root.to_path_buf())),
+        }
+    }
+
     fn test_router_with_fixture(dir: &Path) -> Router {
         // PR-S4: `router_with_static` now requires a project root for the
         // fs_api boundary. The fixture tests under `assets.rs` only exercise
@@ -419,6 +449,113 @@ mod tests {
             dir,
             std::env::temp_dir(),
         )
+    }
+
+    #[tokio::test]
+    async fn public_tunnel_loopback_cannot_reach_any_local_mutation_class() {
+        const TOKEN: &str = "public-router-test-token";
+        let _log_guard = crate::web::auth::test_tracing::lock().await;
+        let authority = Arc::new(RemoteAccessAuthority::for_tests(TOKEN));
+        authority
+            .set_public_origin(url::Url::parse("https://public.example.test").unwrap())
+            .unwrap();
+        authority.set_ingress_provenance(IngressProvenance::PublicTunnel);
+        let app = api_routes(IngressProvenance::PublicTunnel)
+            .with_state(route_test_state(std::env::temp_dir().as_path()))
+            .layer(Extension(IngressProvenance::PublicTunnel))
+            .layer(Extension(authority));
+
+        for (path, method, body, omitted) in [
+            (
+                "/fs/write",
+                "POST",
+                r#"{"path":"/tmp/termul-public-denied","content":"x"}"#,
+                false,
+            ),
+            ("/git/stage", "POST", r#"{"cwd":"/tmp","path":"x"}"#, false),
+            (
+                "/worktree/create",
+                "POST",
+                r#"{"projectPath":"/tmp","name":"n","branch":"b","isNewBranch":true}"#,
+                false,
+            ),
+            ("/workspace/opaque/write", "POST", "{}", false),
+            (
+                "/projects/default",
+                "POST",
+                r#"{"projectId":"opaque"}"#,
+                false,
+            ),
+            ("/acp/install", "POST", r#"{"agentId":"opaque"}"#, false),
+            (
+                "/log/frontend-error",
+                "POST",
+                r#"{"message":"opaque"}"#,
+                false,
+            ),
+            ("/mcp-servers/probe", "POST", "{}", true),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("content-type", "application/json")
+                        .header("authorization", format!("Bearer {TOKEN}"))
+                        .header("origin", "https://public.example.test")
+                        .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                            [127, 0, 0, 1],
+                            40123,
+                        ))))
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let text = String::from_utf8_lossy(&body);
+            if omitted {
+                assert_eq!(status, StatusCode::NOT_FOUND, "path={path} body={text}");
+            } else {
+                assert_eq!(status, StatusCode::OK, "path={path} body={text}");
+                assert!(text.contains("FORBIDDEN"), "path={path} body={text}");
+            }
+        }
+
+        let local_authority = Arc::new(RemoteAccessAuthority::for_tests(TOKEN));
+        local_authority
+            .set_public_origin(url::Url::parse("https://public.example.test").unwrap())
+            .unwrap();
+        let local = api_routes(IngressProvenance::LocalOperator)
+            .with_state(route_test_state(std::env::temp_dir().as_path()))
+            .layer(Extension(IngressProvenance::LocalOperator))
+            .layer(Extension(local_authority));
+        let local_response = local
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/fs/write")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .header("origin", "https://public.example.test")
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        40124,
+                    ))))
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(local_response.status(), StatusCode::NOT_FOUND);
+        let local_body = axum::body::to_bytes(local_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&local_body).contains("FORBIDDEN"));
     }
 
     #[tokio::test]

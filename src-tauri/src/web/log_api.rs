@@ -17,17 +17,10 @@
 //!   the `log` facade the desktop command uses) — the `web` module is the
 //!   standalone boundary.
 
-use std::net::SocketAddr;
-
-use axum::{
-    extract::{ConnectInfo, State},
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::Deserialize;
 
-use crate::commands::sanitize_log_field;
+use crate::web::auth::IngressProvenance;
 use crate::web::fs_api::{check_local_only, IpcBody};
 use crate::web::ws::AppState;
 
@@ -48,30 +41,30 @@ pub struct FrontendErrorRequest {
 /// on success; logging failures are swallowed (best-effort, no loop).
 pub async fn frontend_error(
     State(_state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<FrontendErrorRequest>,
 ) -> impl IntoResponse {
-    if let Some(forbidden) = check_local_only::<()>(peer) {
+    if let Some(forbidden) = check_local_only::<()>(provenance) {
         return (StatusCode::OK, Json(forbidden));
     }
 
-    let context = sanitize_log_field(&req.source.unwrap_or_else(|| "renderer".to_string()));
-    let message = sanitize_log_field(&req.message);
-    let stack_part = req
-        .stack
-        .map(|s| format!(" | stack: {}", sanitize_log_field(&s)))
-        .unwrap_or_default();
-    let component_part = req
-        .component_stack
-        .map(|s| format!(" | component stack: {}", sanitize_log_field(&s)))
-        .unwrap_or_default();
-
-    let line = format!("[frontend] [{context}] {message}{stack_part}{component_part}");
-
-    match req.level.as_deref() {
-        Some("warn") => tracing::warn!("{line}"),
-        _ => tracing::error!("{line}"),
-    }
+    let level = if req.level.as_deref() == Some("warn") {
+        "warn"
+    } else {
+        "error"
+    };
+    let supplied_fields = 1_u8
+        + u8::from(req.source.is_some())
+        + u8::from(req.stack.is_some())
+        + u8::from(req.component_stack.is_some());
+    let message_bytes = req.message.len();
+    log::warn!(
+        target: "termul::web::log_api",
+        "operation=frontend_error level={} supplied_fields={} message_bytes={} stable_code=FRONTEND_ERROR_REPORTED",
+        level,
+        supplied_fields,
+        message_bytes
+    );
 
     (StatusCode::OK, Json(IpcBody::<()>::ok(())))
 }
@@ -84,8 +77,10 @@ mod tests {
     use crate::web::sink::WsRelaySink;
     use crate::web::test_pty_manager;
     use axum::body::Body;
+    use axum::extract::ConnectInfo;
     use axum::http::Request;
     use axum::routing::post;
+    use std::net::SocketAddr;
     use std::sync::Arc;
     use tower::ServiceExt;
 
@@ -134,6 +129,11 @@ mod tests {
                     .uri("/log/frontend-error")
                     .header("content-type", "application/json")
                     .extension(ConnectInfo(peer))
+                    .extension(if peer.ip().is_loopback() {
+                        IngressProvenance::LocalOperator
+                    } else {
+                        IngressProvenance::PublicTunnel
+                    })
                     .body(Body::from(bytes))
                     .expect("build request"),
             )

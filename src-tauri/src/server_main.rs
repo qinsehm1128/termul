@@ -86,8 +86,13 @@ fn main() -> ExitCode {
         }
     };
 
-    // Parse CLI BEFORE any tokio / app setup (AC2).
-    let cfg = match ServerConfig::from_args(server_args) {
+    // Parse CLI BEFORE any tokio / app setup (AC2). Maintenance selects the
+    // minimal state/root parser and therefore never depends on network auth.
+    let cfg = match if maintenance.is_some() {
+        ServerConfig::from_maintenance_args(server_args)
+    } else {
+        ServerConfig::from_args(server_args)
+    } {
         Ok(cfg) => cfg,
         Err(ParseCliError::Help) => {
             println!("{}", usage());
@@ -113,7 +118,10 @@ fn main() -> ExitCode {
     // boundary also refuses a manually constructed incomplete config. Token
     // bytes and digests are never logged.
     let authority = match provision_standalone_authority(&cfg) {
-        Ok(authority) => authority,
+        Ok(authority) => {
+            authority.set_ingress_provenance(cfg.ingress_provenance());
+            authority
+        }
         Err(stable_code) => {
             error!(
                 target: "termul::web::auth",
@@ -620,6 +628,8 @@ mod conversation_maintenance_tests {
 
     #[tokio::test]
     async fn explicit_token_file_and_origin_admit_an_authenticated_request() {
+        // Binary unit tests run in their own process, so the library's
+        // process-global boundary logger cannot race another test module here.
         const TOKEN: &str = "standalone-operator-test-token";
         let dir = tempfile::tempdir().unwrap();
         let token_path = dir.path().join("remote-access-token");
@@ -654,6 +664,9 @@ mod conversation_maintenance_tests {
             .layer(axum::Extension(
                 termul_manager_lib::web::auth::RemoteRouteClass::Project,
             ))
+            .layer(axum::Extension(
+                termul_manager_lib::web::auth::IngressProvenance::LocalOperator,
+            ))
             .layer(axum::Extension(authority));
         let response = app
             .oneshot(
@@ -674,11 +687,13 @@ mod conversation_maintenance_tests {
 }
 
 fn init_tracing() {
-    tracing_subscriber::fmt()
+    // `try_init` installs tracing's LogTracer bridge as well as the subscriber,
+    // so shared `log` facade events are durable in standalone composition.
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
-        .init();
+        .try_init();
 }
 
 /// Resolve the server's own binary path for the self-update swap/reexec.

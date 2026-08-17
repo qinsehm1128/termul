@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 
 use url::Url;
 
+use crate::web::auth::IngressProvenance;
+
 pub const MAX_EVENT_LOG_CAPACITY: usize = 16_384;
 pub const REMOTE_AUTH_CONFIGURATION_REQUIRED: &str = "REMOTE_AUTH_CONFIGURATION_REQUIRED";
 
@@ -233,6 +235,16 @@ impl ServerConfig {
         BindMode::parse(&self.host)
     }
 
+    /// Host-controlled provenance used for route composition. A loopback bind
+    /// is the local-operator composition; an all-interface bind is public.
+    #[must_use]
+    pub fn ingress_provenance(&self) -> IngressProvenance {
+        match self.bind_mode() {
+            Some(BindMode::Localhost) => IngressProvenance::LocalOperator,
+            Some(BindMode::All) | None => IngressProvenance::PublicTunnel,
+        }
+    }
+
     /// Socket address for `TcpListener::bind`.
     ///
     /// Returns `None` when `host` is not a recognized bind mode.
@@ -299,6 +311,28 @@ impl ServerConfig {
     ///
     /// Returns `Err(ParseCliError::Help)` for `-h`/`--help`.
     pub fn from_args<I, S>(args: I) -> Result<Self, ParseCliError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Self::from_args_with_auth_policy(args, true)
+    }
+
+    /// Parse only the state/root settings needed by migration maintenance.
+    /// Token and Origin options remain accepted when supplied, but are not
+    /// required because this mode never opens stores, managers, or listeners.
+    pub fn from_maintenance_args<I, S>(args: I) -> Result<Self, ParseCliError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Self::from_args_with_auth_policy(args, false)
+    }
+
+    fn from_args_with_auth_policy<I, S>(
+        args: I,
+        require_remote_auth: bool,
+    ) -> Result<Self, ParseCliError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
@@ -598,7 +632,8 @@ impl ServerConfig {
             })
             .unwrap_or_else(|| project_root.join("Termul"));
 
-        if remote_access_token_file.is_none() || allowed_origins.is_empty() {
+        if require_remote_auth && (remote_access_token_file.is_none() || allowed_origins.is_empty())
+        {
             return Err(ParseCliError::Message(format!(
                 "{REMOTE_AUTH_CONFIGURATION_REQUIRED}: standalone service requires \
                  --remote-access-token-file and at least one --allowed-origin"
@@ -794,6 +829,29 @@ mod tests {
             .contains(REMOTE_AUTH_CONFIGURATION_REQUIRED));
         assert!(error.to_string().contains("--remote-access-token-file"));
         assert!(error.to_string().contains("--allowed-origin"));
+    }
+
+    #[test]
+    fn maintenance_args_do_not_require_remote_auth_and_remain_local_operator() {
+        let cfg = ServerConfig::from_maintenance_args(Vec::<&str>::new())
+            .expect("maintenance configuration is independent of remote auth");
+        assert!(cfg.remote_access_token_file.is_none());
+        assert!(cfg.allowed_origins.is_empty());
+        assert_eq!(cfg.ingress_provenance(), IngressProvenance::LocalOperator);
+    }
+
+    #[test]
+    fn all_interface_serve_configuration_is_public_tunnel_provenance() {
+        let cfg = ServerConfig::from_args([
+            "--host",
+            "0.0.0.0",
+            "--remote-access-token-file",
+            "operator-token",
+            "--allowed-origin",
+            "https://termul.example.test",
+        ])
+        .unwrap();
+        assert_eq!(cfg.ingress_provenance(), IngressProvenance::PublicTunnel);
     }
 
     #[test]
