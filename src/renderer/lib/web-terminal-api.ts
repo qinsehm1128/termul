@@ -15,11 +15,12 @@ import type {
   TerminalResumeRequest,
   TerminalSpawnOptions
 } from '@shared/types/ipc.types'
-import type {
-  WebTerminalEventPayload,
-  WebTerminalFrame,
-  WebTerminalReply,
-  WebTerminalRequestType
+import {
+  readTerminalResourceFailure,
+  type WebTerminalEventPayload,
+  type WebTerminalFrame,
+  type WebTerminalReply,
+  type WebTerminalRequestType
 } from '@shared/types/web-terminal-protocol.types'
 
 const REQUEST_TIMEOUT_MS = 15_000
@@ -70,6 +71,8 @@ interface TerminalTracker {
    * reconnect scheduling.
    */
   disconnected: boolean
+  /** Cleanup failed after ownership was established; retain only the stable id for retry. */
+  cleanupOnly: boolean
 }
 
 export class WebTerminalClient {
@@ -126,8 +129,11 @@ export class WebTerminalClient {
       this.pending.set(id, {
         timer,
         resolve: (reply) => {
-          if (reply.success) resolve({ success: true, data: reply.data as T })
-          else resolve({ success: false, error: reply.error, code: reply.code })
+          const result: IpcResult<T> = reply.success
+            ? { success: true, data: reply.data as T }
+            : { success: false, error: reply.error, code: reply.code }
+          this.retainTerminalResourceFailure(result)
+          resolve(result)
         }
       })
       socket.send(JSON.stringify({ id, type, payload }))
@@ -152,7 +158,7 @@ export class WebTerminalClient {
         // re-attached — mark them disconnected (no credential is ever
         // presented id-only, and a rejected credential is never re-presented).
         for (const [terminalId, tracker] of this.trackers) {
-          if (tracker.exited || tracker.refCount <= 0) continue
+          if (tracker.exited || tracker.refCount <= 0 || tracker.cleanupOnly) continue
           if (!tracker.claim) {
             tracker.disconnected = true
             continue
@@ -249,6 +255,7 @@ export class WebTerminalClient {
       tracker.lastSeq = Math.max(tracker.lastSeq, result.data.latestSeq)
       tracker.disconnected = false
       tracker.streamAttached = true
+      tracker.cleanupOnly = false
     } else if (result.code !== 'NETWORK_ERROR') {
       // Server rejection (generic UNAUTHORIZED): drop the adopted claim and
       // stop re-presenting it on reconnect only when the rejected credential
@@ -325,6 +332,7 @@ export class WebTerminalClient {
     tracker.exited = false
     tracker.disconnected = false
     tracker.streamAttached = true
+    tracker.cleanupOnly = false
     return result
   }
 
@@ -336,6 +344,7 @@ export class WebTerminalClient {
     const tracker = this.getOrCreate(terminalId)
     tracker.claim = claim
     tracker.disconnected = claim === undefined
+    tracker.cleanupOnly = false
     if (!claim) tracker.streamAttached = false
   }
 
@@ -392,11 +401,29 @@ export class WebTerminalClient {
         exited: false,
         refCount: 0,
         streamAttached: false,
-        disconnected: false
+        disconnected: false,
+        cleanupOnly: false
       }
       this.trackers.set(terminalId, tracker)
     }
     return tracker
+  }
+
+  /**
+   * A failed cleanup revokes normal I/O authority but does not erase ownership.
+   * Retain only the recoverable id so an explicit terminate retry can target the
+   * quarantined resource; it must never drive reconnect, attach, or respawn.
+   */
+  private retainTerminalResourceFailure(result: IpcResult<unknown>): void {
+    const failure = readTerminalResourceFailure(result)
+    if (!failure) return
+
+    const tracker = this.getOrCreate(failure.terminalId)
+    tracker.claim = undefined
+    tracker.refCount = 0
+    tracker.streamAttached = false
+    tracker.disconnected = true
+    tracker.cleanupOnly = true
   }
 
   private markExited(terminalId: string): void {
@@ -548,7 +575,7 @@ export class WebTerminalClient {
     // Stop reconnecting if no terminal is both live AND holds a lease
     // credential — exited/disconnected terminals are never re-presented.
     const activeCount = Array.from(this.trackers.values()).filter(
-      (t) => !t.exited && !t.disconnected && t.refCount > 0
+      (t) => !t.exited && !t.disconnected && !t.cleanupOnly && t.refCount > 0
     ).length
     if (activeCount === 0) return
     if (this.reconnectAttempt >= RECONNECT_MAX_ATTEMPTS) return

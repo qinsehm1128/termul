@@ -1,6 +1,7 @@
 import type { ConversationId } from './conversation.types'
 import type {
   GitStatus,
+  IpcResult,
   RotatedClaim,
   SpawnedTerminal,
   TerminalAttachResult,
@@ -32,6 +33,72 @@ export type WebTerminalRequestType =
   | 'update_orphan_detection'
 
 export type TerminalCwdSource = 'workspace' | 'executionTarget'
+
+/** Exact sanitized PTY cleanup stages emitted by both native transports. */
+export const TERMINAL_CLEANUP_STAGES = ['kill', 'wait', 'flusher_join', 'reader_join'] as const
+
+export type TerminalCleanupStage = (typeof TERMINAL_CLEANUP_STAGES)[number]
+
+export const TERMINAL_RESOURCE_FAILURE_CODES = [
+  'TERMINATE_FAILED',
+  'TERMINAL_RESOURCE_ROLLBACK_FAILED'
+] as const
+
+export type TerminalResourceFailureCode = (typeof TERMINAL_RESOURCE_FAILURE_CODES)[number]
+
+/**
+ * Secret-safe recoverable resource detail. The backend deliberately omits the
+ * claim, process, command, argv, cwd, environment, output, and Conversation id.
+ */
+export interface TerminalResourceFailureV1 {
+  terminalId: string
+  primaryCode: string
+  cleanupStage: TerminalCleanupStage
+}
+
+/**
+ * Decode only the exact cleanup/compound error contract without rewriting the
+ * original IpcResult. Callers can retain the recoverable terminal identity
+ * while forwarding the stable transport envelope byte-for-byte.
+ */
+export function readTerminalResourceFailure(
+  result: IpcResult<unknown>
+): TerminalResourceFailureV1 | null {
+  if (
+    result.success ||
+    !TERMINAL_RESOURCE_FAILURE_CODES.includes(result.code as TerminalResourceFailureCode)
+  ) {
+    return null
+  }
+
+  let value: unknown
+  try {
+    value = JSON.parse(result.error)
+  } catch {
+    return null
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+
+  const record = value as Record<string, unknown>
+  const keys = Object.keys(record).sort()
+  if (keys.join(',') !== 'cleanupStage,primaryCode,terminalId') return null
+  if (
+    typeof record.terminalId !== 'string' ||
+    record.terminalId.length === 0 ||
+    typeof record.primaryCode !== 'string' ||
+    record.primaryCode.length === 0 ||
+    typeof record.cleanupStage !== 'string' ||
+    !TERMINAL_CLEANUP_STAGES.includes(record.cleanupStage as TerminalCleanupStage)
+  ) {
+    return null
+  }
+
+  return {
+    terminalId: record.terminalId,
+    primaryCode: record.primaryCode,
+    cleanupStage: record.cleanupStage as TerminalCleanupStage
+  }
+}
 
 /**
  * Remote spawn authority is intentionally narrow. The host resolves cwd from

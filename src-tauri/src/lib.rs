@@ -1201,6 +1201,101 @@ fn export_log_to_default<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result
     Ok(())
 }
 
+const LEGACY_DESKTOP_REMOTE_ACCOUNT: &str = "remote-access-v1";
+const DESKTOP_REMOTE_GENERATION_ACCOUNT: &str = "remote-access-generation-v2";
+
+/// Build a desktop generation authority without accepting any credential persisted by an earlier
+/// process. TASK-002 still owns per-start rotation; this seed exists only to select the desktop
+/// authority source and is removed from the keyring before setup publishes command state.
+fn provision_desktop_remote_authority() -> Result<RemoteAccessAuthority, String> {
+    if crate::secure_storage::keyring_delete(LEGACY_DESKTOP_REMOTE_ACCOUNT).is_err() {
+        log::warn!(
+            "[remote-auth] legacy desktop credential deletion failed stable_code=STALE_CREDENTIAL_DELETE_FAILED"
+        );
+    }
+    crate::secure_storage::keyring_delete(DESKTOP_REMOTE_GENERATION_ACCOUNT)
+        .map_err(|_| "failed to clear the previous desktop credential generation".to_string())?;
+    let (authority, bootstrap_bearer) =
+        RemoteAccessAuthority::issue_or_load_desktop(DESKTOP_REMOTE_GENERATION_ACCOUNT)
+            .map_err(|error| format!("failed to initialize desktop remote authority: {error}"))?;
+    let bootstrap_generation = authority
+        .verify_bearer(&bootstrap_bearer)
+        .map_err(|error| format!("failed to verify desktop authority bootstrap: {error}"))?
+        .generation();
+    authority.invalidate_generation(bootstrap_generation);
+    drop(bootstrap_bearer);
+    crate::secure_storage::keyring_delete(DESKTOP_REMOTE_GENERATION_ACCOUNT)
+        .map_err(|_| "failed to remove the desktop authority bootstrap credential".to_string())?;
+    Ok(authority)
+}
+
+fn clear_desktop_remote_generation() {
+    if crate::secure_storage::keyring_delete(DESKTOP_REMOTE_GENERATION_ACCOUNT).is_err() {
+        log::warn!(
+            "[remote-auth] desktop generation deletion failed stable_code=STALE_CREDENTIAL_DELETE_FAILED"
+        );
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DesktopExitDurabilityOutcome {
+    pub failures: Vec<&'static str>,
+    pub conversation_drain_attempts: usize,
+}
+
+impl DesktopExitDurabilityOutcome {
+    #[must_use]
+    pub fn clean_success(&self) -> bool {
+        self.failures.is_empty()
+    }
+}
+
+/// Stop all ACP producers before awaiting the retained Conversation coordinator exactly once.
+/// The caller owns later PTY/browser/legacy-store cleanup and converts any failure into a non-zero
+/// bounded Desktop exit rather than reporting false clean success.
+pub(crate) async fn stop_desktop_producers_and_drain(
+    acp_manager: Option<&AcpManager>,
+    ws_relay: Option<&WsRelaySink>,
+    deadline: tokio::time::Instant,
+) -> DesktopExitDurabilityOutcome {
+    let mut outcome = DesktopExitDurabilityOutcome::default();
+    let producer_stop_failed = match acp_manager {
+        Some(acp_manager) => acp_manager.stop_producers().await.is_err(),
+        None => true,
+    };
+    if producer_stop_failed {
+        log::error!(
+            "[desktop-exit] shutdown_phase=stop_acp_producers stable_code={} result=FAILED",
+            crate::web::ACP_PRODUCER_STOP_FAILED
+        );
+        outcome.failures.push(crate::web::ACP_PRODUCER_STOP_FAILED);
+    }
+
+    outcome.conversation_drain_attempts = 1;
+    let drain_result = match ws_relay {
+        Some(ws_relay) => {
+            ws_relay
+                .shutdown_conversation_persistence_until(deadline)
+                .await
+        }
+        None => Err("Conversation relay is unavailable".to_string()),
+    };
+    if drain_result.is_err() {
+        log::error!(
+            "[desktop-exit] shutdown_phase=drain_conversation_persistence stable_code={} result=FAILED",
+            crate::web::CONVERSATION_PERSISTENCE_DRAIN_FAILED
+        );
+        outcome
+            .failures
+            .push(crate::web::CONVERSATION_PERSISTENCE_DRAIN_FAILED);
+    } else {
+        log::info!(
+            "[desktop-exit] shutdown_phase=drain_conversation_persistence stable_code=OK result=PASS"
+        );
+    }
+    outcome
+}
+
 static CLEANUP_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 // Claimed synchronously when we enter the async cleanup path and never reset.
 // Prevents a second ExitRequested (e.g. an OS exit signal, or the exit(0) we
@@ -1613,17 +1708,10 @@ pub fn run() {
             let migration_manager = Arc::new(MigrationManager::new(handle.clone()));
             app.manage(migration_manager.clone());
 
-            // Provision exactly one desktop remote-access authority from the
-            // existing OS keyring. Only the SHA-256 digest remains in memory;
-            // the raw credential is dropped immediately and is read again only
-            // when constructing the one-time QR/copy pairing URL.
-            let (remote_authority, pairing_token) =
-                RemoteAccessAuthority::issue_or_load_desktop("remote-access-v1")
-                    .map_err(|error| {
-                        format!("failed to provision desktop remote access: {error}")
-                    })?;
-            drop(pairing_token);
-            let remote_authority = Arc::new(remote_authority);
+            // TASK-002 owns every shared-live credential generation. Startup rejects/removes
+            // credentials left by previous processes and publishes only the digest authority;
+            // RemoteServerState::start rotates a fresh in-memory lease before admission.
+            let remote_authority = Arc::new(provision_desktop_remote_authority()?);
             app.manage(Arc::clone(&remote_authority));
 
             // The shared-live host receives the exact same authority instance
@@ -1929,6 +2017,7 @@ pub fn run() {
             // Desktop ACP renderer-history storage
             commands::acp_history_list,
             commands::acp_history_get,
+            commands::acp_history_get_page,
             commands::acp_history_save,
             commands::acp_history_delete,
             commands::acp_history_flush,
@@ -1966,18 +2055,10 @@ pub fn run() {
 
     app.run(|app_handle, event| {
         if let RunEvent::ExitRequested { api, .. } = event {
-            // Cleanup already finished — let the app exit immediately.
             if CLEANUP_DONE.load(std::sync::atomic::Ordering::SeqCst) {
                 return;
             }
-            // Prevent every exit request while the single cleanup task runs.
-            // A re-entrant request must not bypass cleanup through Tauri's
-            // default exit behavior while CLEANUP_IN_PROGRESS is already true.
             api.prevent_exit();
-
-            // Atomically claim the cleanup path. If a previous ExitRequested
-            // already started the async cleanup (not yet done), short-circuit
-            // so we don't spawn a second task racing kill_all()/destroy_all().
             if CLEANUP_IN_PROGRESS
                 .compare_exchange(
                     false,
@@ -1999,75 +2080,65 @@ pub fn run() {
             let remote_state = app_handle
                 .try_state::<Arc<RemoteServerState>>()
                 .map(|state| state.inner().clone());
-
             let acp_manager = app_handle
                 .try_state::<Arc<AcpManager>>()
                 .map(|state| state.inner().clone());
+            let ws_relay = app_handle
+                .try_state::<Arc<WsRelaySink>>()
+                .map(|state| state.inner().clone());
+            let pty_manager = app_handle
+                .try_state::<Arc<PtyManager>>()
+                .map(|state| state.inner().clone());
+            let app_handle_clone = app_handle.clone();
 
-            if let Some(pty_manager) = app_handle.try_state::<Arc<PtyManager>>() {
-                let pty_manager_clone = pty_manager.inner().clone();
-                let app_handle_clone = app_handle.clone();
+            // The run callback may execute outside a Tokio reactor; Tauri owns this runtime.
+            tauri::async_runtime::spawn(async move {
+                // Close remote ingress before producer stop. Shared-live remains non-owning and
+                // its stop path never drains Desktop-global Conversation persistence.
+                if let Some(remote_state) = remote_state {
+                    let _ = remote_state.stop().await;
+                }
 
-                // Spawn async cleanup task via tauri::async_runtime
-                // (not tokio::spawn directly — the run callback may fire on
-                // a thread without a Tokio reactor, e.g. macOS WKWebView events)
-                tauri::async_runtime::spawn(async move {
-                    if let Some(ssh_manager) = ssh_manager {
-                        ssh_manager.shutdown().await;
+                let deadline = tokio::time::Instant::now()
+                    + crate::conversation::DEFAULT_DRAIN_TIMEOUT;
+                let durability = stop_desktop_producers_and_drain(
+                    acp_manager.as_deref(),
+                    ws_relay.as_deref(),
+                    deadline,
+                )
+                .await;
+                let mut clean_exit = durability.clean_success();
+
+                if let Some(ssh_manager) = ssh_manager {
+                    ssh_manager.shutdown().await;
+                }
+                if let Some(pty_manager) = pty_manager {
+                    pty_manager.kill_all().await;
+                }
+                if let Some(acp_manager) = acp_manager {
+                    if acp_manager.shutdown_persistence().await.is_err() {
+                        log::error!(
+                            "[desktop-exit] shutdown_phase=shutdown_acp_persistence stable_code={} result=FAILED",
+                            crate::web::ACP_PERSISTENCE_SHUTDOWN_FAILED
+                        );
+                        clean_exit = false;
                     }
-                    if let Some(remote_state) = remote_state {
-                        let _ = remote_state.stop().await;
-                    }
-                    pty_manager_clone.kill_all().await;
-                    if let Some(acp_manager) = acp_manager {
-                        // kill_all -> kill_all_checked flushes durable queues;
-                        // shutdown_persistence then stops the writers so the
-                        // host history index is canonical at exit.
-                        acp_manager.kill_all().await;
-                        if let Err(error) = acp_manager.shutdown_persistence().await {
-                            log::error!(
-                                "[acp-history] persistence shutdown failed at exit: {error}"
-                            );
-                        }
-                    }
-                    if let Some(browser_tab_manager) = browser_tab_manager {
-                        browser_tab_manager.destroy_all();
-                    }
-                    // Mark cleanup as done so the subsequent exit event isn't prevented
-                    CLEANUP_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
-                    // After cleanup completes, allow the app to exit with code 0
-                    app_handle_clone.exit(0);
-                });
-            } else if let Some(acp_manager) = acp_manager {
-                let app_handle_clone = app_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    acp_manager.kill_all().await;
-                    if let Err(error) = acp_manager.shutdown_persistence().await {
-                        log::error!("[acp-history] persistence shutdown failed at exit: {error}");
-                    }
-                    if let Some(browser_tab_manager) = browser_tab_manager {
-                        browser_tab_manager.destroy_all();
-                    }
-                    CLEANUP_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
-                    app_handle_clone.exit(0);
-                });
-            } else {
-                let app_handle_clone = app_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Some(ssh_manager) = ssh_manager {
-                        ssh_manager.shutdown().await;
-                    }
-                    if let Some(remote_state) = remote_state {
-                        let _ = remote_state.stop().await;
-                    }
-                    if let Some(browser_tab_manager) = browser_tab_manager {
-                        browser_tab_manager.destroy_all();
-                    }
-                    CLEANUP_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
-                    // No PTY or ACP manager, just exit
-                    app_handle_clone.exit(0);
-                });
-            }
+                }
+                if let Some(browser_tab_manager) = browser_tab_manager {
+                    browser_tab_manager.destroy_all();
+                }
+                clear_desktop_remote_generation();
+
+                CLEANUP_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
+                let exit_code = if clean_exit { 0 } else { 1 };
+                log::info!(
+                    "[desktop-exit] shutdown_phase=complete stable_code={} result={} exit_code={}",
+                    if clean_exit { "OK" } else { "DESKTOP_EXIT_DEGRADED" },
+                    if clean_exit { "PASS" } else { "FAILED" },
+                    exit_code
+                );
+                app_handle_clone.exit(exit_code);
+            });
         }
     });
 }
@@ -2075,6 +2146,54 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_remote_bootstrap_rejects_reusable_legacy_credentials() {
+        let source = include_str!("lib.rs");
+        assert!(!source.contains("issue_or_load_desktop(\"remote-access-v1\")"));
+        let helper_start = source
+            .find("fn provision_desktop_remote_authority()")
+            .expect("desktop authority helper");
+        let helper_end = source[helper_start..]
+            .find("fn clear_desktop_remote_generation()")
+            .map(|offset| helper_start + offset)
+            .expect("desktop authority helper boundary");
+        let helper = &source[helper_start..helper_end];
+        let delete_position = helper
+            .find("keyring_delete(DESKTOP_REMOTE_GENERATION_ACCOUNT)")
+            .expect("previous generation is deleted before bootstrap");
+        let issue_position = helper
+            .find("issue_or_load_desktop(DESKTOP_REMOTE_GENERATION_ACCOUNT)")
+            .expect("generation authority seed");
+        assert!(delete_position < issue_position);
+        let invalidate_position = helper[issue_position..]
+            .find("authority.invalidate_generation(bootstrap_generation)")
+            .map(|offset| issue_position + offset)
+            .expect("bootstrap digest is invalidated before authority publication");
+        let final_delete_position = helper[issue_position..]
+            .rfind("keyring_delete(DESKTOP_REMOTE_GENERATION_ACCOUNT)")
+            .map(|offset| issue_position + offset)
+            .expect("bootstrap keyring material is removed");
+        assert!(issue_position < invalidate_position);
+        assert!(invalidate_position < final_delete_position);
+    }
+
+    #[test]
+    fn desktop_history_page_command_is_registered() {
+        let source = include_str!("lib.rs");
+        let handler_start = source
+            .find(".invoke_handler(tauri::generate_handler![")
+            .expect("production invoke handler start");
+        let handler_tail = &source[handler_start..];
+        let handler_end = handler_tail
+            .find("])\n        .build")
+            .expect("production invoke handler end");
+        let handler = &handler_tail[..handler_end];
+        assert_eq!(
+            handler.matches("commands::acp_history_get_page,").count(),
+            1
+        );
+    }
 
     #[test]
     fn native_ui_labels_cover_supported_languages() {

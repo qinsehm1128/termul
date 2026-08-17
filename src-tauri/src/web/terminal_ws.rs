@@ -44,7 +44,8 @@ struct Request {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AuthorizedTerminalScope {
     conversation_id: crate::conversation::ConversationId,
-    claim_generation: u64,
+    claim_generation: Option<u64>,
+    cleanup_only: bool,
 }
 
 type AuthorizedTerminals = Arc<RwLock<HashMap<String, AuthorizedTerminalScope>>>;
@@ -210,7 +211,23 @@ impl ConnectionContext {
             terminal_id.to_string(),
             AuthorizedTerminalScope {
                 conversation_id,
-                claim_generation,
+                claim_generation: Some(claim_generation),
+                cleanup_only: false,
+            },
+        );
+    }
+
+    fn authorize_cleanup(
+        &mut self,
+        terminal_id: &str,
+        conversation_id: crate::conversation::ConversationId,
+    ) {
+        self.authorized.write().insert(
+            terminal_id.to_string(),
+            AuthorizedTerminalScope {
+                conversation_id,
+                claim_generation: None,
+                cleanup_only: true,
             },
         );
     }
@@ -291,12 +308,12 @@ async fn handle(
             )
             .await;
             if !result.success {
-                return Err((
-                    terminal_resource_code(result.code.as_deref()),
-                    result
-                        .error
-                        .unwrap_or_else(|| "terminal spawn failed".to_string()),
-                ));
+                let code = terminal_resource_code(result.code.as_deref());
+                let error = result
+                    .error
+                    .unwrap_or_else(|| "terminal spawn failed".to_string());
+                retain_compound_cleanup_authorization(state, ctx, code, &error);
+                return Err((code, error));
             }
             let spawned = result.data.expect("successful terminal spawn has data");
             debug_assert_eq!(
@@ -368,7 +385,7 @@ async fn handle(
         }
         "terminate" | "kill" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
-            let scope = authorized_terminal_scope(state, ctx, terminal_id)?;
+            let scope = authorized_terminal_cleanup_scope(state, ctx, terminal_id)?;
             let workspace = terminal_workspace_service(state)?;
             let result =
                 crate::commands::terminal_terminate_resource(terminal_id, &state.pty, &workspace)
@@ -566,12 +583,35 @@ fn terminal_authorization_is_live(
     terminal_id: &str,
     expected: AuthorizedTerminalScope,
 ) -> Option<crate::conversation::ConversationId> {
+    if expected.cleanup_only {
+        return None;
+    }
+    let instance = state.pty.get(terminal_id).filter(|instance| {
+        instance.is_active() && instance.conversation_matches(expected.conversation_id)
+    })?;
+    (state.pty.claim_generation(terminal_id) == expected.claim_generation)
+        .then_some(instance.conversation_id)
+}
+
+fn terminal_cleanup_authorization_is_live(
+    state: &AppState,
+    terminal_id: &str,
+    expected: AuthorizedTerminalScope,
+) -> Option<crate::conversation::ConversationId> {
     let instance = state
         .pty
         .get(terminal_id)
         .filter(|instance| instance.conversation_matches(expected.conversation_id))?;
-    (state.pty.claim_generation(terminal_id) == Some(expected.claim_generation))
-        .then_some(instance.conversation_id)
+    match instance.lifecycle_state() {
+        crate::pty::manager::TerminalLifecycleState::Active => (!expected.cleanup_only
+            && state.pty.claim_generation(terminal_id) == expected.claim_generation)
+            .then_some(instance.conversation_id),
+        crate::pty::manager::TerminalLifecycleState::Terminating
+        | crate::pty::manager::TerminalLifecycleState::Quarantined => {
+            Some(instance.conversation_id)
+        }
+        crate::pty::manager::TerminalLifecycleState::Removed => None,
+    }
 }
 
 fn live_authorized_terminal_scope(
@@ -593,6 +633,43 @@ fn authorized_terminal_scope(
         .ok_or_else(|| unauthorized_error(terminal_id))?;
     terminal_authorization_is_live(state, terminal_id, expected)
         .ok_or_else(|| unauthorized_error(terminal_id))
+}
+
+fn authorized_terminal_cleanup_scope(
+    state: &AppState,
+    ctx: &ConnectionContext,
+    terminal_id: &str,
+) -> Result<crate::conversation::ConversationId, (&'static str, String)> {
+    let expected = ctx
+        .scope(terminal_id)
+        .ok_or_else(|| unauthorized_error(terminal_id))?;
+    terminal_cleanup_authorization_is_live(state, terminal_id, expected)
+        .ok_or_else(|| unauthorized_error(terminal_id))
+}
+
+fn retain_compound_cleanup_authorization(
+    state: &AppState,
+    ctx: &mut ConnectionContext,
+    code: &'static str,
+    error: &str,
+) {
+    if code != crate::conversation::TERMINAL_RESOURCE_ROLLBACK_FAILED {
+        return;
+    }
+    let Ok(failure) = serde_json::from_str::<crate::commands::TerminalResourceFailureV1>(error)
+    else {
+        return;
+    };
+    let Some(instance) = state.pty.get(&failure.terminal_id).filter(|instance| {
+        instance.lifecycle_state() == crate::pty::manager::TerminalLifecycleState::Quarantined
+    }) else {
+        return;
+    };
+    ctx.authorize_cleanup(&failure.terminal_id, instance.conversation_id);
+    info!(
+        "[terminal-ws] cleanup recovery retained terminal_id={} primary_code={} cleanup_stage={}",
+        failure.terminal_id, failure.primary_code, failure.cleanup_stage
+    );
 }
 
 async fn install_replay_forwarder(
@@ -826,8 +903,10 @@ mod tests {
             parse_created_at_utc, ConversationCreator, ConversationLifecycleState,
             ConversationMutation, ConversationRecordV2, ConversationWriter, CreationPartition,
             ExecutionTarget, SessionWorkspaceLoadOutcome, SessionWorkspaceService,
-            TerminalResourceRollbackFailure, CONVERSATION_SCHEMA_VERSION,
-            TERMINAL_RESOURCE_ROLLBACK_FAILED,
+            CONVERSATION_SCHEMA_VERSION, TERMINAL_RESOURCE_ROLLBACK_FAILED,
+        };
+        use crate::pty::manager::{
+            ScriptedCleanupDriver, TerminalCleanupStage, TerminalLifecycleState,
         };
 
         let temp = tempfile::tempdir().unwrap();
@@ -861,15 +940,18 @@ mod tests {
         let workspace = Arc::new(SessionWorkspaceService::new(writer));
         repository.fail_next_workspace_replace();
         let pty = crate::web::test_pty_manager();
-        let result = crate::commands::terminal_spawn_resource_with_rollback_result(
+        let cleanup_driver = Arc::new(ScriptedCleanupDriver::default());
+        cleanup_driver.fail_once(TerminalCleanupStage::Kill);
+        pty.install_cleanup_driver(cleanup_driver);
+        let result = crate::commands::terminal_spawn_resource(
             SpawnOptions {
                 conversation_id: Some(conversation_id),
                 cwd: Some(base.to_string_lossy().into_owned()),
                 ..Default::default()
             },
+            None,
             &pty,
             &workspace,
-            Err("injected termination failure".to_string()),
         )
         .await;
 
@@ -877,16 +959,40 @@ mod tests {
             terminal_resource_code(result.code.as_deref()),
             TERMINAL_RESOURCE_ROLLBACK_FAILED
         );
-        let failure: TerminalResourceRollbackFailure =
+        let failure: crate::commands::TerminalResourceFailureV1 =
             serde_json::from_str(result.error.as_deref().unwrap()).unwrap();
-        assert_eq!(failure.conversation_id, conversation_id);
         assert_eq!(failure.primary_code, "CONVERSATION_DURABILITY_FAILED");
-        assert_eq!(failure.rollback_code, "TERMINATE_FAILED");
-        assert!(pty.get(&failure.terminal_id).is_some());
+        assert_eq!(failure.cleanup_stage, TerminalCleanupStage::Kill);
+        assert_eq!(
+            pty.terminal_lifecycle_state(&failure.terminal_id),
+            Some(TerminalLifecycleState::Quarantined)
+        );
         assert!(matches!(
             workspace.load(conversation_id).await.unwrap(),
             SessionWorkspaceLoadOutcome::Missing { .. }
         ));
+
+        let mut state = terminal_test_state();
+        state.pty = Arc::clone(&pty);
+        let mut ctx = ConnectionContext {
+            authorized: Arc::new(RwLock::new(HashMap::new())),
+            attachments: HashMap::new(),
+        };
+        retain_compound_cleanup_authorization(
+            &state,
+            &mut ctx,
+            TERMINAL_RESOURCE_ROLLBACK_FAILED,
+            result.error.as_deref().unwrap(),
+        );
+        assert_eq!(
+            authorized_terminal_cleanup_scope(&state, &ctx, &failure.terminal_id),
+            Ok(conversation_id)
+        );
+        assert_eq!(
+            authorized_terminal_scope(&state, &ctx, &failure.terminal_id),
+            Err(unauthorized_error(&failure.terminal_id))
+        );
+
         pty.terminate(&failure.terminal_id).await.unwrap();
     }
 

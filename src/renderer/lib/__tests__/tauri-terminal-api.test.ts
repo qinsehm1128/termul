@@ -375,6 +375,64 @@ describe('tauri-terminal-api', () => {
       })
     })
 
+    it('preserves an ordinary cleanup failure against the existing terminal identity', async () => {
+      const { api } = await loadApi()
+      const cleanupFailure = {
+        success: false as const,
+        code: 'TERMINATE_FAILED',
+        error: JSON.stringify({
+          terminalId: 'terminal-1752-1',
+          primaryCode: 'TERMINATE_FAILED',
+          cleanupStage: 'reader_join'
+        })
+      }
+      mockInvoke
+        .mockResolvedValueOnce({ success: true, data: SPAWNED })
+        .mockResolvedValueOnce(cleanupFailure)
+
+      const spawned = await api.spawn()
+      const terminated = await api.terminate('terminal-1752-1')
+
+      expect(spawned.success).toBe(true)
+      expect(terminated).toBe(cleanupFailure)
+      expect(JSON.parse(terminated.success ? '{}' : terminated.error)).toEqual({
+        terminalId: 'terminal-1752-1',
+        primaryCode: 'TERMINATE_FAILED',
+        cleanupStage: 'reader_join'
+      })
+      expect(mockInvoke.mock.calls.map(([command]) => command)).toEqual([
+        'terminal_spawn',
+        'terminal_terminate'
+      ])
+    })
+
+    it('preserves compound rollback detail without spawning a replacement terminal', async () => {
+      const { api } = await loadApi()
+      const compoundFailure = {
+        success: false as const,
+        code: 'TERMINAL_RESOURCE_ROLLBACK_FAILED',
+        error: JSON.stringify({
+          terminalId: 'terminal-recoverable-1',
+          primaryCode: 'CONVERSATION_DURABILITY_FAILED',
+          cleanupStage: 'kill'
+        })
+      }
+      mockInvoke.mockResolvedValueOnce(compoundFailure)
+
+      const result = await api.spawn({
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+      })
+
+      expect(result).toBe(compoundFailure)
+      expect(mockInvoke).toHaveBeenCalledTimes(1)
+      expect(mockInvoke.mock.calls[0][0]).toBe('terminal_spawn')
+      expect(JSON.parse(result.success ? '{}' : result.error)).toEqual({
+        terminalId: 'terminal-recoverable-1',
+        primaryCode: 'CONVERSATION_DURABILITY_FAILED',
+        cleanupStage: 'kill'
+      })
+    })
+
     it('rotateClaim invokes terminal_rotate_claim with (terminalId, claim) and returns the fresh credential', async () => {
       const { api } = await loadApi()
       mockInvoke.mockResolvedValue({ success: true, data: { claim: 'rotated-claim-64-hex' } })

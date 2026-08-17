@@ -31,6 +31,19 @@ class FakeWebSocket {
     this.sent.push(data)
     const req = JSON.parse(data) as { id: string; type: string; payload: Record<string, unknown> }
     if (req.type === 'spawn') {
+      if (spawnReply === 'compound-failure') {
+        this.emitReply({
+          id: req.id,
+          success: false,
+          error: JSON.stringify({
+            terminalId: 'terminal-recoverable-1',
+            primaryCode: 'CONVERSATION_DURABILITY_FAILED',
+            cleanupStage: 'kill'
+          }),
+          code: 'TERMINAL_RESOURCE_ROLLBACK_FAILED'
+        })
+        return
+      }
       // CAP-3: spawn is the only issuance path — the reply carries the claim.
       this.emitReply({ id: req.id, success: true, data: spawnReplyData })
       return
@@ -106,6 +119,19 @@ class FakeWebSocket {
       this.emitReply({ id: req.id, success: true, data: { claim: rotateReplyClaim } })
       return
     }
+    if ((req.type === 'terminate' || req.type === 'kill') && terminateReply === 'cleanup-failure') {
+      this.emitReply({
+        id: req.id,
+        success: false,
+        error: JSON.stringify({
+          terminalId: req.payload.terminalId,
+          primaryCode: 'TERMINATE_FAILED',
+          cleanupStage: 'flusher_join'
+        }),
+        code: 'TERMINATE_FAILED'
+      })
+      return
+    }
     this.emitReply({ id: req.id, success: true, data: undefined })
   }
 
@@ -125,6 +151,8 @@ class FakeWebSocket {
 
 /** Test knob: make `attach` replies fail with the generic UNAUTHORIZED. */
 let attachReply: 'ok' | 'unauthorized' = 'ok'
+let spawnReply: 'ok' | 'compound-failure' = 'ok'
+let terminateReply: 'ok' | 'cleanup-failure' = 'ok'
 
 /** Test knob: the spawn reply data (CAP-3 issuance carries the claim). */
 let spawnReplyData: Record<string, unknown> = {
@@ -167,6 +195,7 @@ type Tracker = {
   streamAttached: boolean
   claim?: string
   disconnected: boolean
+  cleanupOnly: boolean
 }
 
 type ClientInternals = {
@@ -198,6 +227,9 @@ function restoreVisibility(): void {
 }
 
 afterEach(() => {
+  attachReply = 'ok'
+  spawnReply = 'ok'
+  terminateReply = 'ok'
   resumeReply = 'ok'
   resumeGrantData = {
     terminal: {
@@ -860,6 +892,73 @@ describe('WebTerminalClient frame handling & request lifecycle', () => {
       client.dispose()
     })
 
+    it('preserves cleanup failure detail and retains only the existing id for retry', async () => {
+      vi.useFakeTimers()
+      const { client, internals } = makeClient()
+      await client.connect()
+      await client.attach('t1', 'lease-abc')
+      terminateReply = 'cleanup-failure'
+
+      const result = await client.request<void>('terminate', { terminalId: 't1' })
+
+      expect(result).toEqual({
+        success: false,
+        code: 'TERMINATE_FAILED',
+        error: JSON.stringify({
+          terminalId: 't1',
+          primaryCode: 'TERMINATE_FAILED',
+          cleanupStage: 'flusher_join'
+        })
+      })
+      expect(internals.trackers.get('t1')).toMatchObject({
+        claim: undefined,
+        refCount: 0,
+        streamAttached: false,
+        disconnected: true,
+        cleanupOnly: true,
+        exited: false
+      })
+      expect(findSentRequest(internals.socket, 'spawn')).toBeUndefined()
+      expect(findSentRequest(internals.socket, 'attach')?.payload.terminalId).toBe('t1')
+      client.dispose()
+    })
+
+    it('retains compound rollback terminal identity without attach, reconnect, or respawn', async () => {
+      vi.useFakeTimers()
+      const { client, internals } = makeClient()
+      spawnReply = 'compound-failure'
+
+      const result = await client.request('spawn', {
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        cwdSource: 'workspace',
+        cols: 80,
+        rows: 24
+      })
+
+      expect(result).toEqual({
+        success: false,
+        code: 'TERMINAL_RESOURCE_ROLLBACK_FAILED',
+        error: JSON.stringify({
+          terminalId: 'terminal-recoverable-1',
+          primaryCode: 'CONVERSATION_DURABILITY_FAILED',
+          cleanupStage: 'kill'
+        })
+      })
+      expect(internals.trackers.get('terminal-recoverable-1')).toMatchObject({
+        claim: undefined,
+        refCount: 0,
+        streamAttached: false,
+        disconnected: true,
+        cleanupOnly: true,
+        exited: false
+      })
+      const sentTypes = internals.socket.sent.map(
+        (raw) => (JSON.parse(raw) as { type: string }).type
+      )
+      expect(sentTypes).toEqual(['spawn'])
+      client.dispose()
+    })
+
     it('reconnect re-attaches terminals with a stored claim only', async () => {
       vi.useFakeTimers()
       const { client, internals } = makeClient()
@@ -873,7 +972,8 @@ describe('WebTerminalClient frame handling & request lifecycle', () => {
         exited: false,
         refCount: 1,
         streamAttached: false,
-        disconnected: false
+        disconnected: false,
+        cleanupOnly: false
       })
 
       internals.socket.close()

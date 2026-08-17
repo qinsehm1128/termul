@@ -508,14 +508,16 @@ export function createTauriTerminalApi(): TerminalApi {
       return invokeIpc<void>(IPC_COMMANDS.CLOSE_VIEW, { terminalId })
     },
 
-    /** Explicitly terminate the PTY resource. */
+    /** Explicitly terminate the PTY resource. Structured cleanup failures pass through unchanged. */
     async terminate(terminalId: string): Promise<IpcResult<void>> {
-      return invokeIpc<void>(IPC_COMMANDS.TERMINATE, { terminalId })
+      const result = await invokeIpc<void>(IPC_COMMANDS.TERMINATE, { terminalId })
+      return result
     },
 
     /** @deprecated compatibility alias for terminate. */
     async kill(terminalId: string): Promise<IpcResult<void>> {
-      return invokeIpc<void>(IPC_COMMANDS.KILL, { terminalId })
+      const result = await invokeIpc<void>(IPC_COMMANDS.KILL, { terminalId })
+      return result
     },
 
     /**

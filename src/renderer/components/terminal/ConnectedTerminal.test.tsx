@@ -658,6 +658,39 @@ describe('ConnectedTerminal', () => {
     })
   })
 
+  it('keeps a compound cleanup failure on its recoverable id without respawning', async () => {
+    const detail = {
+      terminalId: 'terminal-recoverable-1',
+      primaryCode: 'CONVERSATION_DURABILITY_FAILED',
+      cleanupStage: 'reader_join'
+    }
+    const serializedDetail = JSON.stringify(detail)
+    vi.mocked(terminalApi).spawn.mockResolvedValue({
+      success: false,
+      error: serializedDetail,
+      code: 'TERMINAL_RESOURCE_ROLLBACK_FAILED'
+    })
+    const onError = vi.fn()
+
+    const { rerender } = render(<ConnectedTerminal onError={onError} />)
+
+    await vi.waitFor(() => {
+      expect(onError).toHaveBeenCalledWith(serializedDetail)
+    })
+    const onDataCalls = vi.mocked(terminalApi).onData.mock.calls.length
+    const onExitCalls = vi.mocked(terminalApi).onExit.mock.calls.length
+
+    rerender(<ConnectedTerminal onError={onError} className="cleanup-retry-state" />)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(JSON.parse(onError.mock.calls[0][0] as string)).toEqual(detail)
+    expect(vi.mocked(terminalApi).spawn).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(terminalApi).onData).toHaveBeenCalledTimes(onDataCalls)
+    expect(vi.mocked(terminalApi).onExit).toHaveBeenCalledTimes(onExitCalls)
+    expect(addRendererRef).not.toHaveBeenCalled()
+    expect(mockTerminalStoreState.restartTerminalResource).not.toHaveBeenCalled()
+  })
+
   it('should focus terminal by default', () => {
     render(<ConnectedTerminal />)
     expect(mockTerminalInstance.focus).toHaveBeenCalled()
