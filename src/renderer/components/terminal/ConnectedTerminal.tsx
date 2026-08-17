@@ -254,13 +254,24 @@ function ConnectedTerminalComponent({
 
   // 1. STABLE ID DERIVATION
   const targetId = storeTerminalId || externalTerminalId
+  const [cleanupRecoveryId, setCleanupRecoveryId] = useState<string | null>(null)
 
   // 2. STORE HOOKS (Must be at the top)
-  const { healthStatus, restartTerminalResource } = useTerminalStore(
+  const {
+    healthStatus,
+    cleanupRecovery,
+    recordTerminalCleanupFailure,
+    retryTerminalCleanup,
+    restartTerminalResource
+  } = useTerminalStore(
     useShallow((state) => {
       const term = state.terminals.find((t) => t.id === targetId)
+      const recoveryId = cleanupRecoveryId ?? term?.ptyId ?? externalTerminalId ?? targetId
       return {
         healthStatus: term?.healthStatus || 'running',
+        cleanupRecovery: recoveryId ? state.cleanupRecoveries[recoveryId] : undefined,
+        recordTerminalCleanupFailure: state.recordTerminalCleanupFailure,
+        retryTerminalCleanup: state.retryTerminalCleanup,
         restartTerminalResource: state.restartTerminalResource
       }
     })
@@ -1017,7 +1028,7 @@ function ConnectedTerminalComponent({
           const result = await terminalApi.spawn(spawnOpts)
           devLog(`[ConnectedTerminal.initTerminal] SPAWN RESULT [${spawnDebugId}]`, {
             success: result.success,
-            error: result.success ? undefined : result.error,
+            code: result.success ? undefined : result.code,
             ptyId: result.success ? result.data.id : 'FAILED'
           })
 
@@ -1147,8 +1158,15 @@ function ConnectedTerminalComponent({
               useTerminalStore.getState().setTerminalClaim(result.data.id, result.data.claim)
             }
           } else {
-            const errorMsg = result.error || tRef.current('errors.unknownSpawn')
-            console.error('[Terminal Spawn Failed]', errorMsg)
+            const cleanupFailure = recordTerminalCleanupFailure(result)
+            if (cleanupFailure) setCleanupRecoveryId(cleanupFailure.terminalId)
+            const errorMsg = cleanupFailure
+              ? tRef.current('cleanup.quarantined')
+              : result.error || tRef.current('errors.unknownSpawn')
+            console.error('[Terminal Spawn Failed]', {
+              code: result.code,
+              cleanupStage: cleanupFailure?.cleanupStage
+            })
             terminal.write(
               `\x1b[31m\r\n${tRef.current('errors.spawnProcessFailed')}:\r\n${errorMsg}\x1b[0m\r\n`
             )
@@ -1827,7 +1845,15 @@ function ConnectedTerminalComponent({
             if (result.data.claim) {
               useTerminalStore.getState().setTerminalClaim(result.data.id, result.data.claim)
             }
-          } else if (onErrorRef.current) onErrorRef.current(result.error)
+          } else {
+            const cleanupFailure = recordTerminalCleanupFailure(result)
+            if (cleanupFailure) setCleanupRecoveryId(cleanupFailure.terminalId)
+            if (onErrorRef.current) {
+              onErrorRef.current(
+                cleanupFailure ? tRef.current('cleanup.quarantined') : result.error
+              )
+            }
+          }
         } catch (err) {
           if (onErrorRef.current)
             onErrorRef.current(
@@ -1911,6 +1937,9 @@ function ConnectedTerminalComponent({
   ])
 
   const isCrashed = healthStatus === 'crashed'
+  const cleanupStageLabel = cleanupRecovery
+    ? t(`cleanup.stages.${cleanupRecovery.cleanupStage}`)
+    : ''
 
   return (
     <ContextMenu>
@@ -1930,7 +1959,46 @@ function ConnectedTerminalComponent({
           >
             <div ref={containerRef} className="w-full h-full" />
           </div>
-          {isCrashed && (
+          {cleanupRecovery && (
+            <div className="absolute inset-x-4 top-4 z-[60]" role="alert" aria-live="polite">
+              <div className="flex items-start gap-3 rounded-xl border border-destructive/50 bg-card/95 p-4 shadow-xl text-foreground">
+                <AlertTriangle className="mt-0.5 shrink-0 text-destructive" size={20} />
+                <div className="min-w-0 flex-1">
+                  <h3 className="font-semibold">{t('cleanup.title')}</h3>
+                  <p className="mt-1 text-sm text-muted-foreground">
+                    {t('cleanup.description', {
+                      terminalId: cleanupRecovery.terminalId,
+                      stage: cleanupStageLabel
+                    })}
+                  </p>
+                  {cleanupRecovery.retryFailed && (
+                    <p className="mt-2 text-sm text-destructive">{t('cleanup.retryFailed')}</p>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  disabled={cleanupRecovery.retrying}
+                  aria-label={t('cleanup.retryTerminationFor', {
+                    terminalId: cleanupRecovery.terminalId
+                  })}
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    void retryTerminalCleanup(cleanupRecovery.terminalId)
+                  }}
+                  className="inline-flex shrink-0 items-center gap-2 rounded-lg bg-destructive px-3 py-2 text-sm font-semibold text-destructive-foreground hover:bg-destructive/90 disabled:cursor-wait disabled:opacity-60"
+                >
+                  <RefreshCcw
+                    size={16}
+                    className={cleanupRecovery.retrying ? 'animate-spin' : undefined}
+                  />
+                  {cleanupRecovery.retrying
+                    ? t('cleanup.retryInProgress')
+                    : t('cleanup.retryTermination')}
+                </button>
+              </div>
+            </div>
+          )}
+          {isCrashed && !cleanupRecovery && (
             <div className="absolute inset-0 bg-background/40 backdrop-blur-md flex items-center justify-center z-50 p-4 md:p-8 animate-in fade-in zoom-in-95 duration-300 text-foreground">
               <div className="grid grid-cols-1 md:grid-cols-[140px_1fr] gap-6 bg-card/95 border border-border/50 p-8 rounded-2xl shadow-2xl max-w-2xl w-full border-t-4 border-t-destructive">
                 <div className="flex flex-col items-center justify-center border-b md:border-b-0 md:border-r border-border/50 pb-6 md:pb-0 md:pr-6">

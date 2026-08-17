@@ -61,6 +61,21 @@
     "retry": "Retry connection",
     "retrying": "Retrying…"
   },
+  "cleanup": {
+    "title": "Terminal cleanup needs attention",
+    "quarantined": "The terminal process stopped, but cleanup is incomplete.",
+    "description": "Terminal {{terminalId}} is retained at the {{stage}} stage. Retry termination to finish cleanup; no replacement process will be started.",
+    "retryTermination": "Retry termination",
+    "retryTerminationFor": "Retry termination for terminal {{terminalId}}",
+    "retryInProgress": "Retrying…",
+    "retryFailed": "Cleanup is still incomplete. You can retry termination again.",
+    "stages": {
+      "kill": "process termination",
+      "wait": "process wait",
+      "flusher_join": "output flush",
+      "reader_join": "output reader"
+    }
+  },
   "environment": {
     "applied_one": "Project env: {{formattedCount}} variable applied",
     "applied_other": "Project env: {{formattedCount}} variables applied"

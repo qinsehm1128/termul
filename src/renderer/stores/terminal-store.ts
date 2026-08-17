@@ -3,6 +3,10 @@ import type {
   TerminalResourceDescriptor,
   TerminalResourceHydrationStatus
 } from '@shared/types/session-workspace.types'
+import {
+  readTerminalResourceFailure,
+  type TerminalCleanupRecoveryInput
+} from '@shared/types/web-terminal-protocol.types'
 import { create } from 'zustand'
 import { useShallow } from 'zustand/shallow'
 import { i18n } from '@/i18n'
@@ -18,6 +22,12 @@ export const TRUNCATED_BUFFER_SIZE = 5000
 export const MAX_TRANSCRIPT_CHARS = 1_500_000
 const LINE_BREAK_PATTERN = /\r\n|\r|\n/
 const terminalResumeInFlight = new Map<string, Promise<IpcResult<void>>>()
+const terminalCleanupRetryInFlight = new Map<string, Promise<boolean>>()
+
+export interface TerminalCleanupRecovery extends TerminalCleanupRecoveryInput {
+  retrying: boolean
+  retryFailed: boolean
+}
 
 // ADR-004.4: descriptive-only agent metadata applied to a Terminal record.
 export interface TerminalAgentMetadata {
@@ -47,6 +57,8 @@ export interface TerminalState {
   activeTerminalId: string
   // Index for O(1) ptyId lookups
   ptyIdIndex: Map<string, string>
+  /** Secret-free cleanup-only records keyed by the retained host terminal id. */
+  cleanupRecoveries: Record<string, TerminalCleanupRecovery>
 
   // Actions
   selectTerminal: (id: string) => void
@@ -62,6 +74,8 @@ export interface TerminalState {
   closeTerminalView: (id: string) => Promise<boolean>
   reopenTerminalView: (id: string) => void
   terminateTerminalResource: (id: string) => Promise<boolean>
+  recordTerminalCleanupFailure: (result: IpcResult<unknown>) => TerminalCleanupRecoveryInput | null
+  retryTerminalCleanup: (terminalId: string) => Promise<boolean>
   renameTerminal: (id: string, name: string) => void
   reorderTerminals: (projectId: string, orderedIds: string[]) => void
   setTerminals: (terminals: Terminal[]) => void
@@ -108,6 +122,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
   terminals: [],
   activeTerminalId: '',
   ptyIdIndex: new Map(),
+  cleanupRecoveries: {},
 
   selectTerminal: (id: string): void => {
     set((state) => ({
@@ -230,10 +245,99 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
     if (!terminal) return false
     if (terminal.ptyId) {
       const result = await terminalApi.terminate(terminal.ptyId)
-      if (!result.success) return false
+      if (!result.success) {
+        get().recordTerminalCleanupFailure(result)
+        return false
+      }
+      set((state) => {
+        if (!(terminal.ptyId! in state.cleanupRecoveries)) return state
+        const cleanupRecoveries = { ...state.cleanupRecoveries }
+        delete cleanupRecoveries[terminal.ptyId!]
+        return { cleanupRecoveries }
+      })
     }
     get().closeTerminal(id, terminal.projectId ?? '')
     return true
+  },
+
+  recordTerminalCleanupFailure: (
+    result: IpcResult<unknown>
+  ): TerminalCleanupRecoveryInput | null => {
+    const failure = readTerminalResourceFailure(result)
+    if (!failure) return null
+    set((state) => ({
+      cleanupRecoveries: {
+        ...state.cleanupRecoveries,
+        [failure.terminalId]: {
+          ...failure,
+          retrying: false,
+          retryFailed: false
+        }
+      }
+    }))
+    return failure
+  },
+
+  retryTerminalCleanup: (terminalId: string): Promise<boolean> => {
+    const existing = terminalCleanupRetryInFlight.get(terminalId)
+    if (existing) return existing
+    if (!get().cleanupRecoveries[terminalId]) return Promise.resolve(false)
+
+    set((state) => ({
+      cleanupRecoveries: {
+        ...state.cleanupRecoveries,
+        [terminalId]: {
+          ...state.cleanupRecoveries[terminalId],
+          retrying: true,
+          retryFailed: false
+        }
+      }
+    }))
+
+    const task = (async (): Promise<boolean> => {
+      let result: IpcResult<void>
+      try {
+        result = await terminalApi.terminate(terminalId)
+      } catch {
+        result = { success: false, error: 'Terminal cleanup retry failed', code: 'NETWORK_ERROR' }
+      }
+
+      if (result.success) {
+        set((state) => {
+          if (!state.cleanupRecoveries[terminalId]) return state
+          const cleanupRecoveries = { ...state.cleanupRecoveries }
+          delete cleanupRecoveries[terminalId]
+          return { cleanupRecoveries }
+        })
+        return true
+      }
+
+      const decoded = readTerminalResourceFailure(result)
+      set((state) => {
+        const retained = state.cleanupRecoveries[terminalId]
+        if (!retained) return state
+        return {
+          cleanupRecoveries: {
+            ...state.cleanupRecoveries,
+            [terminalId]: {
+              ...(decoded?.terminalId === terminalId ? decoded : retained),
+              retrying: false,
+              retryFailed: true
+            }
+          }
+        }
+      })
+      return false
+    })()
+
+    terminalCleanupRetryInFlight.set(terminalId, task)
+    const clearInFlight = (): void => {
+      if (terminalCleanupRetryInFlight.get(terminalId) === task) {
+        terminalCleanupRetryInFlight.delete(terminalId)
+      }
+    }
+    void task.then(clearInFlight, clearInFlight)
+    return task
   },
 
   renameTerminal: (id: string, name: string): void => {
@@ -756,7 +860,10 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
     if (!terminal?.ptyId || !terminal.conversationId) return false
 
     const terminated = await terminalApi.terminate(terminal.ptyId)
-    if (!terminated.success) return false
+    if (!terminated.success) {
+      get().recordTerminalCleanupFailure(terminated)
+      return false
+    }
 
     const previousPtyId = terminal.ptyId
     set((state) => {
@@ -981,6 +1088,8 @@ export function useTerminalActions(): Pick<
   | 'closeTerminalView'
   | 'reopenTerminalView'
   | 'terminateTerminalResource'
+  | 'recordTerminalCleanupFailure'
+  | 'retryTerminalCleanup'
   | 'restartTerminalResource'
   | 'renameTerminal'
   | 'reorderTerminals'
@@ -1003,6 +1112,8 @@ export function useTerminalActions(): Pick<
       closeTerminalView: state.closeTerminalView,
       reopenTerminalView: state.reopenTerminalView,
       terminateTerminalResource: state.terminateTerminalResource,
+      recordTerminalCleanupFailure: state.recordTerminalCleanupFailure,
+      retryTerminalCleanup: state.retryTerminalCleanup,
       restartTerminalResource: state.restartTerminalResource,
       renameTerminal: state.renameTerminal,
       reorderTerminals: state.reorderTerminals,

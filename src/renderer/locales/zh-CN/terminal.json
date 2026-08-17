@@ -61,6 +61,21 @@
     "retry": "重试连接",
     "retrying": "正在重试…"
   },
+  "cleanup": {
+    "title": "终端清理需要处理",
+    "quarantined": "终端进程已停止，但清理尚未完成。",
+    "description": "终端 {{terminalId}} 保留在“{{stage}}”阶段。请重试终止以完成清理；不会启动替代进程。",
+    "retryTermination": "重试终止",
+    "retryTerminationFor": "重试终止终端 {{terminalId}}",
+    "retryInProgress": "正在重试…",
+    "retryFailed": "清理仍未完成。你可以再次重试终止。",
+    "stages": {
+      "kill": "终止进程",
+      "wait": "等待进程退出",
+      "flusher_join": "刷新输出",
+      "reader_join": "关闭输出读取器"
+    }
+  },
   "environment": {
     "applied_one": "已应用 {{formattedCount}} 个项目环境变量",
     "applied_other": "已应用 {{formattedCount}} 个项目环境变量"

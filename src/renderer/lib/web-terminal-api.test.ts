@@ -923,6 +923,66 @@ describe('WebTerminalClient frame handling & request lifecycle', () => {
       client.dispose()
     })
 
+    it('retries the retained cleanup id once per action and clears only cleanup-only tracking on success', async () => {
+      vi.useFakeTimers()
+      const { client, internals } = makeClient()
+      await client.connect()
+      internals.trackers.set('unrelated-live-terminal', {
+        lastSeq: 9,
+        exited: false,
+        refCount: 0,
+        streamAttached: false,
+        claim: 'unrelated-memory-claim',
+        disconnected: false,
+        cleanupOnly: false
+      })
+      terminateReply = 'cleanup-failure'
+
+      const failed = await client.request<void>('terminate', {
+        terminalId: 'terminal-cleanup-retry'
+      })
+      expect(failed).toEqual({
+        success: false,
+        code: 'TERMINATE_FAILED',
+        error: JSON.stringify({
+          terminalId: 'terminal-cleanup-retry',
+          primaryCode: 'TERMINATE_FAILED',
+          cleanupStage: 'flusher_join'
+        })
+      })
+      expect(internals.trackers.get('terminal-cleanup-retry')).toMatchObject({
+        cleanupOnly: true,
+        claim: undefined,
+        disconnected: true
+      })
+
+      terminateReply = 'ok'
+      const succeeded = await client.request<void>('terminate', {
+        terminalId: 'terminal-cleanup-retry'
+      })
+      if (succeeded.success) client.removeTracker('terminal-cleanup-retry')
+
+      expect(succeeded).toEqual({ success: true, data: undefined })
+      expect(internals.trackers.has('terminal-cleanup-retry')).toBe(false)
+      expect(internals.trackers.get('unrelated-live-terminal')).toMatchObject({
+        claim: 'unrelated-memory-claim',
+        cleanupOnly: false
+      })
+      const sentTypes = internals.socket.sent.map(
+        (raw) => JSON.parse(raw) as { type: string; payload: { terminalId?: string } }
+      )
+      expect(
+        sentTypes.filter(
+          (frame) =>
+            frame.type === 'terminate' && frame.payload.terminalId === 'terminal-cleanup-retry'
+        )
+      ).toHaveLength(2)
+      expect(sentTypes.some((frame) => frame.type === 'spawn')).toBe(false)
+      expect(sentTypes.some((frame) => frame.type === 'attach')).toBe(false)
+
+      client.dispose()
+    })
+
     it('retains compound rollback terminal identity without attach, reconnect, or respawn', async () => {
       vi.useFakeTimers()
       const { client, internals } = makeClient()

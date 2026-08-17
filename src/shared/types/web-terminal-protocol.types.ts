@@ -56,6 +56,12 @@ export interface TerminalResourceFailureV1 {
   cleanupStage: TerminalCleanupStage
 }
 
+/** Exact secret-free input accepted by the renderer cleanup-recovery store. */
+export type TerminalCleanupRecoveryInput = Readonly<TerminalResourceFailureV1>
+
+const SAFE_TERMINAL_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/
+const SAFE_PRIMARY_CODE = /^[A-Z][A-Z0-9_]{0,127}$/
+
 /**
  * Decode only the exact cleanup/compound error contract without rewriting the
  * original IpcResult. Callers can retain the recoverable terminal identity
@@ -63,7 +69,7 @@ export interface TerminalResourceFailureV1 {
  */
 export function readTerminalResourceFailure(
   result: IpcResult<unknown>
-): TerminalResourceFailureV1 | null {
+): TerminalCleanupRecoveryInput | null {
   if (
     result.success ||
     !TERMINAL_RESOURCE_FAILURE_CODES.includes(result.code as TerminalResourceFailureCode)
@@ -84,9 +90,9 @@ export function readTerminalResourceFailure(
   if (keys.join(',') !== 'cleanupStage,primaryCode,terminalId') return null
   if (
     typeof record.terminalId !== 'string' ||
-    record.terminalId.length === 0 ||
+    !SAFE_TERMINAL_ID.test(record.terminalId) ||
     typeof record.primaryCode !== 'string' ||
-    record.primaryCode.length === 0 ||
+    !SAFE_PRIMARY_CODE.test(record.primaryCode) ||
     typeof record.cleanupStage !== 'string' ||
     !TERMINAL_CLEANUP_STAGES.includes(record.cleanupStage as TerminalCleanupStage)
   ) {

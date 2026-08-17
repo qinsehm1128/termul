@@ -50,7 +50,8 @@ describe('Conversation terminal view/resource lifecycle', () => {
         }
       ],
       activeTerminalId: 'record-1',
-      ptyIdIndex: new Map([['pty-1', 'record-1']])
+      ptyIdIndex: new Map([['pty-1', 'record-1']]),
+      cleanupRecoveries: {}
     })
     useWorkspaceStore.getState().resetLayout()
     useWorkspaceStore.getState().addTerminalTab('record-1')
@@ -115,6 +116,35 @@ describe('Conversation terminal view/resource lifecycle', () => {
     expect(terminalTabExists()).toBe(false)
     expect(useAcpStore.getState().messages).toBe(beforeMessages)
     expect(terminalApi.terminate).toHaveBeenCalledWith('pty-1')
+  })
+
+  it('navigation close/reopen preserves cleanup-only recovery without making it live or spawning', async () => {
+    useTerminalStore.getState().recordTerminalCleanupFailure({
+      success: false,
+      code: 'TERMINATE_FAILED',
+      error: JSON.stringify({
+        terminalId: 'pty-1',
+        primaryCode: 'TERMINATE_FAILED',
+        cleanupStage: 'reader_join'
+      })
+    })
+
+    await useTerminalStore.getState().closeTerminalView('record-1')
+    useWorkspaceStore.getState().closeTerminalView('record-1')
+    useWorkspaceStore.getState().reopenTerminalView('record-1')
+
+    expect(useTerminalStore.getState().cleanupRecoveries['pty-1']).toMatchObject({
+      terminalId: 'pty-1',
+      cleanupStage: 'reader_join',
+      retrying: false
+    })
+    expect(useTerminalStore.getState().terminals[0]).toMatchObject({
+      id: 'record-1',
+      ptyId: 'pty-1',
+      claim: 'in-memory-claim'
+    })
+    expect(terminalApi.terminate).not.toHaveBeenCalled()
+    expect(terminalApi.spawn).not.toHaveBeenCalled()
   })
 
   it('restart explicitly terminates and respawns in the same Conversation without touching chat', async () => {

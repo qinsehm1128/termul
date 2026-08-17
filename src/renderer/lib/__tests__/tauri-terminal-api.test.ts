@@ -406,6 +406,39 @@ describe('tauri-terminal-api', () => {
       ])
     })
 
+    it('retries cleanup through invoke with the exact retained id and never spawns a replacement', async () => {
+      const { api } = await loadApi()
+      const cleanupFailure = {
+        success: false as const,
+        code: 'TERMINATE_FAILED',
+        error: JSON.stringify({
+          terminalId: 'terminal-retained-retry',
+          primaryCode: 'TERMINATE_FAILED',
+          cleanupStage: 'flusher_join'
+        })
+      }
+      mockInvoke
+        .mockResolvedValueOnce(cleanupFailure)
+        .mockResolvedValueOnce({ success: true, data: undefined })
+
+      const failed = await api.terminate('terminal-retained-retry')
+      const succeeded = await api.terminate('terminal-retained-retry')
+
+      expect(failed).toBe(cleanupFailure)
+      expect(succeeded).toEqual({ success: true, data: undefined })
+      expect(mockInvoke.mock.calls).toEqual([
+        ['terminal_terminate', { terminalId: 'terminal-retained-retry' }],
+        ['terminal_terminate', { terminalId: 'terminal-retained-retry' }]
+      ])
+      expect(mockInvoke.mock.calls.some(([command]) => command === 'terminal_spawn')).toBe(false)
+      expect(mockInvoke.mock.calls.some(([command]) => command === 'terminal_attach')).toBe(false)
+      expect(JSON.parse(failed.success ? '{}' : failed.error)).toEqual({
+        terminalId: 'terminal-retained-retry',
+        primaryCode: 'TERMINATE_FAILED',
+        cleanupStage: 'flusher_join'
+      })
+    })
+
     it('preserves compound rollback detail without spawning a replacement terminal', async () => {
       const { api } = await loadApi()
       const compoundFailure = {

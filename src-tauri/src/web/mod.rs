@@ -85,20 +85,31 @@ pub(crate) fn test_pty_manager() -> Arc<PtyManager> {
 pub(crate) const ACP_PRODUCER_STOP_FAILED: &str = "ACP_PRODUCER_STOP_FAILED";
 pub(crate) const CONVERSATION_PERSISTENCE_DRAIN_FAILED: &str =
     "CONVERSATION_PERSISTENCE_DRAIN_FAILED";
-pub(crate) const CONVERSATION_CATALOG_FLUSH_FAILED: &str = "CONVERSATION_CATALOG_FLUSH_FAILED";
+pub(crate) const CONVERSATION_CATALOG_FLUSH_FAILED: &str = "CATALOG_FLUSH_FAILED";
 pub(crate) const ACP_PERSISTENCE_SHUTDOWN_FAILED: &str = "ACP_PERSISTENCE_SHUTDOWN_FAILED";
+pub(crate) const PTY_CLEANUP_FAILED: &str = "PTY_CLEANUP_FAILED";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct StandaloneShutdownReceipt {
+    pty_shutdown: crate::pty::manager::PtyShutdownReceipt,
+}
 
 #[derive(Debug)]
 struct StandaloneShutdownError {
     codes: Vec<&'static str>,
+    receipt: StandaloneShutdownReceipt,
 }
 
 impl fmt::Display for StandaloneShutdownError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "standalone shutdown failed: {}",
-            self.codes.join(",")
+            "standalone shutdown failed: {} (pty attempted={} succeeded={} failed={} in_flight={})",
+            self.codes.join(","),
+            self.receipt.pty_shutdown.attempted,
+            self.receipt.pty_shutdown.succeeded,
+            self.receipt.pty_shutdown.failed,
+            self.receipt.pty_shutdown.in_flight
         )
     }
 }
@@ -127,7 +138,7 @@ async fn shutdown_standalone_resources_until(
     pty: &PtyManager,
     ws_relay: &WsRelaySink,
     deadline: tokio::time::Instant,
-) -> Result<(), StandaloneShutdownError> {
+) -> Result<StandaloneShutdownReceipt, StandaloneShutdownError> {
     let mut failures = Vec::new();
 
     if acp.stop_producers().await.is_err() {
@@ -172,14 +183,32 @@ async fn shutdown_standalone_resources_until(
         );
     }
 
-    // PTY cleanup is infallible at this boundary and must run even when every
-    // preceding durability stage failed.
-    pty.kill_all().await;
+    // The same absolute host deadline bounds every PTY job. All <=30 resources are scheduled
+    // concurrently, and failed/in-flight jobs remain owned for later explicit retry.
+    let pty_shutdown = pty.kill_all_until(deadline).await;
+    info!(
+        target: "termul::web::shutdown",
+        stable_code = if pty_shutdown.clean_success() { "OK" } else { PTY_CLEANUP_FAILED },
+        shutdown_phase = "cleanup_ptys",
+        attempted = pty_shutdown.attempted,
+        succeeded = pty_shutdown.succeeded,
+        failed = pty_shutdown.failed,
+        in_flight = pty_shutdown.in_flight,
+        elapsed_ms = pty_shutdown.elapsed_ms,
+        "standalone PTY cleanup aggregate completed"
+    );
+    if !pty_shutdown.clean_success() {
+        record_shutdown_failure(&mut failures, PTY_CLEANUP_FAILED, "cleanup_ptys");
+    }
 
+    let receipt = StandaloneShutdownReceipt { pty_shutdown };
     if failures.is_empty() {
-        Ok(())
+        Ok(receipt)
     } else {
-        Err(StandaloneShutdownError { codes: failures })
+        Err(StandaloneShutdownError {
+            codes: failures,
+            receipt,
+        })
     }
 }
 
@@ -313,6 +342,10 @@ pub async fn serve_router(
     acp_install: Option<Arc<crate::acp::install::AcpInstallService>>,
     authority: Arc<RemoteAccessAuthority>,
 ) -> Result<(SocketAddr, JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
+    // The owning host computes ingress provenance before this shared composition is entered.
+    // Capture it independently from the listener address: cloudflared connects to a loopback
+    // socket, but its requests must remain PublicTunnel and never inherit LocalOperator rights.
+    let host_ingress_provenance = authority.ingress_provenance();
     let bind_addr = cfg.bind_addr().ok_or_else(|| {
         format!(
             "invalid host '{}': use 127.0.0.1 (default) or 0.0.0.0 (expose)",
@@ -332,7 +365,10 @@ pub async fn serve_router(
             .set_public_origin(local_origin)
             .map_err(|error| format!("failed to register listener Origin: {error}"))?;
     }
-    info!("ACP web server listening on http://{}", addr);
+    info!(
+        ingress_provenance = host_ingress_provenance.as_str(),
+        "ACP web server listening on http://{}", addr
+    );
 
     if !assets::dist_web_ready() {
         warn!(
@@ -349,6 +385,9 @@ pub async fn serve_router(
     } else {
         HistoryMode::LiveOnly
     };
+    // Origin registration above must not rewrite the host decision. `router` reads this exact
+    // value and injects it before request middleware; ConnectInfo remains transport metadata only.
+    debug_assert_eq!(authority.ingress_provenance(), host_ingress_provenance);
     let app = router::router(
         Arc::clone(&acp),
         pty,
@@ -437,11 +476,11 @@ async fn shutdown_signal() -> Result<(), std::io::Error> {
 mod tests {
     use super::*;
     use crate::conversation::{
-        AgentSessionBinding, AgentSessionBindingState, ConversationCreator, ConversationId,
-        ConversationLifecycleState, ConversationMutation, ConversationPersistenceAdapter,
-        ConversationRecordV2, ConversationRepository, ConversationWriter, CreationPartition,
-        ExecutionTarget, LegacyConversationReader, ReaderPrecedence,
-        AGENT_SESSION_BINDING_SCHEMA_VERSION, CONVERSATION_SCHEMA_VERSION,
+        AgentSessionBinding, AgentSessionBindingState, ConversationCreator, ConversationEventType,
+        ConversationId, ConversationLifecycleState, ConversationMutation,
+        ConversationPersistenceAdapter, ConversationRecordV2, ConversationRepository,
+        ConversationWriter, CreationPartition, ExecutionTarget, LegacyConversationReader,
+        ReaderPrecedence, AGENT_SESSION_BINDING_SCHEMA_VERSION, CONVERSATION_SCHEMA_VERSION,
     };
     use chrono::Utc;
     use serde_json::json;
@@ -613,7 +652,7 @@ mod tests {
             ".shutdown_conversation_persistence_until(deadline)",
             ".flush_catalog_until(deadline)",
             "acp.shutdown_persistence().await",
-            "pty.kill_all().await",
+            "pty.kill_all_until(deadline).await",
         ];
         let positions = ordered_calls.map(|needle| {
             body.find(needle)
@@ -626,8 +665,9 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn standalone_shutdown_propagates_stable_failures() {
-        let (_temp, repository, relay, _conversation_id) =
+    async fn standalone_catalog_flush_failed_blocks_clean_exit_under_host_deadline_and_later_mutation_responsive(
+    ) {
+        let (_temp, repository, relay, conversation_id) =
             conversation_relay_fixture("standalone-catalog-failure").await;
         repository.reset_catalog_write_counters();
         repository.fail_next_catalog_writes(usize::MAX);
@@ -641,17 +681,24 @@ mod tests {
         let relay_sink: Arc<dyn EventSink> = relay.clone();
         let acp = Arc::new(AcpManager::new(vec![relay_sink]));
         let pty = test_pty_manager();
+        let pending_generation = repository.catalog_pending_generation();
 
         let error = shutdown_standalone_resources_until(
             &acp,
             &pty,
             &relay,
-            tokio::time::Instant::now() + Duration::from_millis(50),
+            tokio::time::Instant::now() + Duration::from_secs(5),
         )
         .await
         .expect_err("catalog barrier failure must block clean success");
         assert!(error.codes.contains(&CONVERSATION_CATALOG_FLUSH_FAILED));
         assert!(!error.codes.contains(&CONVERSATION_PERSISTENCE_DRAIN_FAILED));
+        assert_eq!(error.receipt.pty_shutdown.attempted, 0);
+        assert_eq!(
+            repository.catalog_pending_generation(),
+            pending_generation,
+            "failed final generation remains retryable"
+        );
         assert_eq!(
             relay
                 .ordered_conversation_persistence()
@@ -660,6 +707,81 @@ mod tests {
             0,
             "later cleanup still runs after a stable catalog failure"
         );
+
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
+        let mutation_started = std::time::Instant::now();
+        writer
+            .append_event(
+                conversation_id,
+                Utc::now(),
+                ConversationEventType::MessageChunk,
+                json!({"ordinal": 2}),
+                ConversationMutation::AcpEventAppend,
+            )
+            .await
+            .expect("later canonical mutation remains responsive");
+        assert!(mutation_started.elapsed() < Duration::from_secs(1));
+        assert!(repository.catalog_pending_generation() > pending_generation);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loopback_listener_preserves_host_public_tunnel_provenance() {
+        const TOKEN: &str = "public-tunnel-provenance-token";
+        let temp = tempfile::tempdir().unwrap();
+        let relay = Arc::new(WsRelaySink::new());
+        let relay_sink: Arc<dyn EventSink> = relay.clone();
+        let acp = Arc::new(AcpManager::new(vec![relay_sink]));
+        let pty = test_pty_manager();
+        let authority = Arc::new(RemoteAccessAuthority::for_tests(TOKEN));
+        authority.set_ingress_provenance(crate::web::auth::IngressProvenance::PublicTunnel);
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let (addr, handle) = serve_router(
+            acp,
+            Arc::clone(&pty),
+            pty.terminal_events(),
+            pty.cwd_tracker(),
+            pty.git_tracker(),
+            pty.exit_code_tracker(),
+            relay,
+            Arc::new(ProjectRegistry::new()),
+            None,
+            None,
+            server_config(temp.path()),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            None,
+            None,
+            None,
+            None,
+            Arc::clone(&authority),
+        )
+        .await
+        .expect("public-tunnel router starts on loopback");
+
+        let target = temp.path().join("must-not-be-created");
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/fs/mkdir"))
+            .bearer_auth(TOKEN)
+            .json(&json!({"path": target}))
+            .send()
+            .await
+            .expect("loopback HTTP request completes");
+        let body: serde_json::Value = response.json().await.expect("IPC body decodes");
+        assert_eq!(body["success"], false);
+        assert_eq!(body["code"], "FORBIDDEN");
+        assert!(!target.exists());
+        assert_eq!(
+            authority.ingress_provenance(),
+            crate::web::auth::IngressProvenance::PublicTunnel
+        );
+
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("router stops")
+            .expect("serve task joins");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

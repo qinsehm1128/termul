@@ -1241,12 +1241,17 @@ fn clear_desktop_remote_generation() {
 pub(crate) struct DesktopExitDurabilityOutcome {
     pub failures: Vec<&'static str>,
     pub conversation_drain_attempts: usize,
+    pub catalog_flush_attempts: usize,
+    pub pty_shutdown: Option<crate::pty::manager::PtyShutdownReceipt>,
 }
 
 impl DesktopExitDurabilityOutcome {
     #[must_use]
     pub fn clean_success(&self) -> bool {
         self.failures.is_empty()
+            && self
+                .pty_shutdown
+                .is_none_or(|receipt| receipt.clean_success())
     }
 }
 
@@ -1292,6 +1297,29 @@ pub(crate) async fn stop_desktop_producers_and_drain(
         log::info!(
             "[desktop-exit] shutdown_phase=drain_conversation_persistence stable_code=OK result=PASS"
         );
+    }
+
+    outcome.catalog_flush_attempts = 1;
+    let catalog_result = match ws_relay {
+        Some(ws_relay) => ws_relay.flush_catalog_until(deadline).await,
+        None => Err("Conversation relay is unavailable".to_string()),
+    };
+    match catalog_result {
+        Ok(receipt) => log::info!(
+            "[desktop-exit] shutdown_phase=flush_conversation_catalog stable_code=OK result=PASS requested_generation={} flushed_generation={} write_count={}",
+            receipt.requested_generation,
+            receipt.flushed_generation,
+            receipt.write_count
+        ),
+        Err(_) => {
+            log::error!(
+                "[desktop-exit] shutdown_phase=flush_conversation_catalog stable_code={} result=FAILED",
+                crate::web::CONVERSATION_CATALOG_FLUSH_FAILED
+            );
+            outcome
+                .failures
+                .push(crate::web::CONVERSATION_CATALOG_FLUSH_FAILED);
+        }
     }
     outcome
 }
@@ -1410,6 +1438,9 @@ pub fn run() {
             app.manage(Arc::clone(&conversation_bootstrap.reader));
             app.manage(Arc::clone(&conversation_bootstrap.creation));
             app.manage(Arc::clone(&conversation_bootstrap.persistence_adapter));
+            // Publish the exact bootstrap-owned ordering/shutdown authority. Relay construction
+            // below resolves this same core; no second writer task set is admitted.
+            app.manage(Arc::clone(&conversation_bootstrap.ordered_persistence));
             app.manage(Arc::clone(&conversation_bootstrap.workspace));
             app.manage(Arc::clone(&conversation_bootstrap.application));
             let conversation_migration_control = Arc::new(
@@ -1633,6 +1664,15 @@ pub fn run() {
                 Arc::clone(&conversation_bootstrap.persistence_adapter),
                 None,
             ));
+            let relay_ordered = ws_relay
+                .ordered_conversation_persistence()
+                .ok_or_else(|| anyhow::anyhow!("desktop relay is missing ordered persistence"))?;
+            if !relay_ordered.shares_authority(&conversation_bootstrap.ordered_persistence) {
+                return Err(anyhow::anyhow!(
+                    "desktop relay did not retain the bootstrap ordering authority"
+                )
+                .into());
+            }
             sinks.push(ws_relay.clone());
             let acp_manager = Arc::new(AcpManager::with_conversation_services(
                 sinks,
@@ -2101,20 +2141,45 @@ pub fn run() {
 
                 let deadline = tokio::time::Instant::now()
                     + crate::conversation::DEFAULT_DRAIN_TIMEOUT;
-                let durability = stop_desktop_producers_and_drain(
+                let mut durability = stop_desktop_producers_and_drain(
                     acp_manager.as_deref(),
                     ws_relay.as_deref(),
                     deadline,
                 )
                 .await;
-                let mut clean_exit = durability.clean_success();
 
                 if let Some(ssh_manager) = ssh_manager {
                     ssh_manager.shutdown().await;
                 }
                 if let Some(pty_manager) = pty_manager {
-                    pty_manager.kill_all().await;
+                    let receipt = pty_manager.kill_all_until(deadline).await;
+                    log::info!(
+                        "[desktop-exit] shutdown_phase=cleanup_ptys stable_code={} result={} attempted={} succeeded={} failed={} in_flight={} elapsed_ms={}",
+                        if receipt.clean_success() {
+                            "OK"
+                        } else {
+                            crate::web::PTY_CLEANUP_FAILED
+                        },
+                        if receipt.clean_success() { "PASS" } else { "FAILED" },
+                        receipt.attempted,
+                        receipt.succeeded,
+                        receipt.failed,
+                        receipt.in_flight,
+                        receipt.elapsed_ms
+                    );
+                    if !receipt.clean_success() {
+                        durability.failures.push(crate::web::PTY_CLEANUP_FAILED);
+                    }
+                    durability.pty_shutdown = Some(receipt);
+                } else {
+                    log::error!(
+                        "[desktop-exit] shutdown_phase=cleanup_ptys stable_code={} result=FAILED attempted=0 succeeded=0 failed=0 in_flight=0 elapsed_ms=0",
+                        crate::web::PTY_CLEANUP_FAILED
+                    );
+                    durability.failures.push(crate::web::PTY_CLEANUP_FAILED);
                 }
+                let mut clean_exit = durability.clean_success();
+
                 if let Some(acp_manager) = acp_manager {
                     if acp_manager.shutdown_persistence().await.is_err() {
                         log::error!(
@@ -2193,6 +2258,128 @@ mod tests {
             handler.matches("commands::acp_history_get_page,").count(),
             1
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn desktop_catalog_flush_failed_blocks_clean_exit_under_host_deadline_and_later_mutation_responsive(
+    ) {
+        use crate::conversation::{
+            AgentSessionBinding, AgentSessionBindingState, ConversationCreator,
+            ConversationEventType, ConversationLifecycleState, ConversationMutation,
+            ConversationRecordV2, ConversationWriter, CreationPartition, ExecutionTarget,
+            AGENT_SESSION_BINDING_SCHEMA_VERSION, CONVERSATION_SCHEMA_VERSION,
+        };
+        use crate::web::sink::{AcpEvent, EventSink};
+        use chrono::Utc;
+        use serde_json::json;
+        use std::time::Duration;
+        use uuid::Uuid;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bootstrap = crate::conversation::ConversationBootstrap::run(
+            crate::conversation::HostConversationRoots::desktop(
+                temp.path().join("state"),
+                temp.path().join("visible"),
+            ),
+            crate::conversation::MigrationHostMode::Desktop,
+        )
+        .unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let conversation_id = crate::conversation::ConversationId::new_v4();
+        let created_at = Utc::now();
+        bootstrap
+            .writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: workspace.to_string_lossy().into_owned(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::InitializingAgent,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                },
+                ConversationMutation::CreateConversation,
+            )
+            .await
+            .unwrap();
+        bootstrap
+            .writer
+            .bind_agent_session(
+                conversation_id,
+                AgentSessionBinding {
+                    schema_version: AGENT_SESSION_BINDING_SCHEMA_VERSION,
+                    binding_id: Uuid::new_v4(),
+                    agent_session_id: "desktop-catalog-failure".to_string(),
+                    runtime_agent_id: "runtime-desktop-exit".to_string(),
+                    stable_agent_namespace: "config:desktop-exit".to_string(),
+                    execution_cwd: workspace.to_string_lossy().into_owned(),
+                    bound_at_utc: created_at,
+                    state: AgentSessionBindingState::Active,
+                },
+                created_at,
+            )
+            .await
+            .unwrap();
+
+        let relay = Arc::new(WsRelaySink::with_conversation_persistence(
+            32,
+            Arc::clone(&bootstrap.persistence_adapter),
+            None,
+        ));
+        assert!(relay
+            .ordered_conversation_persistence()
+            .unwrap()
+            .shares_authority(&bootstrap.ordered_persistence));
+        bootstrap.repository.reset_catalog_write_counters();
+        bootstrap.repository.fail_next_catalog_writes(usize::MAX);
+        relay
+            .emit(&AcpEvent {
+                sid: Some("desktop-catalog-failure".to_string()),
+                type_: "acp:message_chunk",
+                payload: json!({"ordinal": 1}),
+            })
+            .unwrap();
+        let pending_generation = bootstrap.repository.catalog_pending_generation();
+        let relay_sink: Arc<dyn EventSink> = relay.clone();
+        let acp = Arc::new(AcpManager::new(vec![relay_sink]));
+
+        let outcome = stop_desktop_producers_and_drain(
+            Some(&acp),
+            Some(&relay),
+            tokio::time::Instant::now() + Duration::from_millis(50),
+        )
+        .await;
+        assert!(!outcome.clean_success());
+        assert_eq!(outcome.conversation_drain_attempts, 1);
+        assert_eq!(outcome.catalog_flush_attempts, 1);
+        assert!(outcome
+            .failures
+            .contains(&crate::web::CONVERSATION_CATALOG_FLUSH_FAILED));
+        assert_eq!(
+            bootstrap.repository.catalog_pending_generation(),
+            pending_generation,
+            "failed final generation remains retryable"
+        );
+
+        let mutation_started = std::time::Instant::now();
+        ConversationWriter::append_event(
+            &bootstrap.writer,
+            conversation_id,
+            Utc::now(),
+            ConversationEventType::MessageChunk,
+            json!({"ordinal": 2}),
+            ConversationMutation::AcpEventAppend,
+        )
+        .await
+        .expect("later canonical mutation remains responsive");
+        assert!(mutation_started.elapsed() < Duration::from_secs(1));
+        assert!(bootstrap.repository.catalog_pending_generation() > pending_generation);
     }
 
     #[test]

@@ -1,5 +1,16 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { terminalApi } from '@/lib/terminal-api'
 import { serializeTerminalsForProject } from '../hooks/useTerminalAutoSave'
+
+vi.mock('@/lib/terminal-api', () => ({
+  terminalApi: {
+    closeView: vi.fn(async () => ({ success: true, data: undefined })),
+    terminate: vi.fn(async () => ({ success: true, data: undefined })),
+    spawn: vi.fn(),
+    resume: vi.fn()
+  }
+}))
+
 import { useProjectStore } from './project-store'
 import { useSessionWorkspaceSyncStore } from './session-workspace-sync-store'
 import {
@@ -29,8 +40,14 @@ describe('terminal-store', () => {
         { id: 't2', name: 'Terminal 2', projectId: '1', shell: 'powershell', output: [] },
         { id: 't3', name: 'Terminal 3', projectId: '2', shell: 'bash', output: [] }
       ],
-      activeTerminalId: 't1'
+      activeTerminalId: 't1',
+      ptyIdIndex: new Map(),
+      cleanupRecoveries: {}
     })
+    vi.mocked(terminalApi.terminate).mockReset()
+    vi.mocked(terminalApi.terminate).mockResolvedValue({ success: true, data: undefined })
+    vi.mocked(terminalApi.spawn).mockReset()
+    vi.mocked(terminalApi.resume).mockReset()
   })
 
   describe('initial state', () => {
@@ -838,6 +855,114 @@ describe('terminal-store', () => {
       useTerminalStore.getState().setTerminalNeedsAttention('does-not-exist', true)
       const after = useTerminalStore.getState().terminals
       expect(after).toBe(before)
+    })
+  })
+
+  describe('cleanup-only recovery', () => {
+    const failure = (
+      terminalId: string,
+      cleanupStage: 'kill' | 'wait' | 'flusher_join' | 'reader_join' = 'reader_join'
+    ) => ({
+      success: false as const,
+      code: 'TERMINATE_FAILED',
+      error: JSON.stringify({
+        terminalId,
+        primaryCode: 'TERMINATE_FAILED',
+        cleanupStage
+      })
+    })
+
+    it('deduplicates sanitized records by retained terminal id and rejects extra-key secret shapes', () => {
+      const { recordTerminalCleanupFailure } = useTerminalStore.getState()
+
+      expect(recordTerminalCleanupFailure(failure('pty-cleanup-1', 'kill'))).toEqual({
+        terminalId: 'pty-cleanup-1',
+        primaryCode: 'TERMINATE_FAILED',
+        cleanupStage: 'kill'
+      })
+      expect(recordTerminalCleanupFailure(failure('pty-cleanup-1', 'reader_join'))).not.toBeNull()
+      expect(
+        recordTerminalCleanupFailure({
+          success: false,
+          code: 'TERMINATE_FAILED',
+          error: JSON.stringify({
+            terminalId: 'pty-cleanup-2',
+            primaryCode: 'TERMINATE_FAILED',
+            cleanupStage: 'kill',
+            claim: 'must-never-enter-renderer-recovery-state'
+          })
+        })
+      ).toBeNull()
+
+      const recoveries = useTerminalStore.getState().cleanupRecoveries
+      expect(Object.keys(recoveries)).toEqual(['pty-cleanup-1'])
+      expect(recoveries['pty-cleanup-1']).toEqual({
+        terminalId: 'pty-cleanup-1',
+        primaryCode: 'TERMINATE_FAILED',
+        cleanupStage: 'reader_join',
+        retrying: false,
+        retryFailed: false
+      })
+      expect(JSON.stringify(recoveries)).not.toContain('claim')
+    })
+
+    it('coalesces double-click retries, retains failure, and never attaches, resumes, or spawns', async () => {
+      const { recordTerminalCleanupFailure, retryTerminalCleanup } = useTerminalStore.getState()
+      recordTerminalCleanupFailure(failure('pty-cleanup-retry'))
+
+      let resolveRetry!: (value: ReturnType<typeof failure>) => void
+      vi.mocked(terminalApi.terminate).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveRetry = resolve
+          })
+      )
+
+      const first = retryTerminalCleanup('pty-cleanup-retry')
+      const second = retryTerminalCleanup('pty-cleanup-retry')
+      expect(first).toBe(second)
+      expect(terminalApi.terminate).toHaveBeenCalledTimes(1)
+      expect(terminalApi.terminate).toHaveBeenCalledWith('pty-cleanup-retry')
+      expect(useTerminalStore.getState().cleanupRecoveries['pty-cleanup-retry']?.retrying).toBe(
+        true
+      )
+
+      resolveRetry(failure('pty-cleanup-retry', 'flusher_join'))
+      await expect(first).resolves.toBe(false)
+
+      expect(useTerminalStore.getState().cleanupRecoveries['pty-cleanup-retry']).toMatchObject({
+        terminalId: 'pty-cleanup-retry',
+        cleanupStage: 'flusher_join',
+        retrying: false,
+        retryFailed: true
+      })
+      expect(terminalApi.spawn).not.toHaveBeenCalled()
+      expect(terminalApi.resume).not.toHaveBeenCalled()
+    })
+
+    it('clears only cleanup-only tracking after successful terminate and preserves terminal state', async () => {
+      useTerminalStore.setState((state) => ({
+        terminals: state.terminals.map((terminal) =>
+          terminal.id === 't1'
+            ? { ...terminal, ptyId: 'pty-cleanup-success', claim: 'memory-only-claim' }
+            : terminal
+        )
+      }))
+      const beforeTerminal = useTerminalStore
+        .getState()
+        .terminals.find((terminal) => terminal.id === 't1')
+      const { recordTerminalCleanupFailure, retryTerminalCleanup } = useTerminalStore.getState()
+      recordTerminalCleanupFailure(failure('pty-cleanup-success'))
+
+      await expect(retryTerminalCleanup('pty-cleanup-success')).resolves.toBe(true)
+
+      expect(useTerminalStore.getState().cleanupRecoveries['pty-cleanup-success']).toBeUndefined()
+      expect(
+        useTerminalStore.getState().terminals.find((terminal) => terminal.id === 't1')
+      ).toEqual(beforeTerminal)
+      expect(terminalApi.terminate).toHaveBeenCalledWith('pty-cleanup-success')
+      expect(terminalApi.spawn).not.toHaveBeenCalled()
+      expect(terminalApi.resume).not.toHaveBeenCalled()
     })
   })
 

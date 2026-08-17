@@ -1,4 +1,4 @@
-import { cleanup, render } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { toast } from 'sonner'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as appSettingsStore from '@/stores/app-settings-store'
@@ -315,7 +315,19 @@ const mockTerminalStoreState = {
   truncateHiddenTerminalBuffers: vi.fn(),
   getTerminalCount: vi.fn(() => 0),
   isTerminalLimitReached: vi.fn(() => false),
-  cleanupProjectTerminals: vi.fn()
+  cleanupProjectTerminals: vi.fn(),
+  cleanupRecoveries: {} as Record<
+    string,
+    {
+      terminalId: string
+      primaryCode: string
+      cleanupStage: 'kill' | 'wait' | 'flusher_join' | 'reader_join'
+      retrying: boolean
+      retryFailed: boolean
+    }
+  >,
+  recordTerminalCleanupFailure: vi.fn(),
+  retryTerminalCleanup: vi.fn(async () => true)
 }
 
 vi.mock('@/stores/terminal-store', () => ({
@@ -414,6 +426,28 @@ describe('ConnectedTerminal', () => {
     mockTerminalStoreState.consumeTranscript.mockReturnValue('')
     mockTerminalStoreState.consumeDetachedOutput.mockReset()
     mockTerminalStoreState.consumeDetachedOutput.mockReturnValue('')
+    mockTerminalStoreState.cleanupRecoveries = {}
+    mockTerminalStoreState.recordTerminalCleanupFailure.mockReset()
+    mockTerminalStoreState.recordTerminalCleanupFailure.mockImplementation((result) => {
+      if (result.success) return null
+      try {
+        const detail = JSON.parse(result.error) as {
+          terminalId: string
+          primaryCode: string
+          cleanupStage: 'kill' | 'wait' | 'flusher_join' | 'reader_join'
+        }
+        mockTerminalStoreState.cleanupRecoveries[detail.terminalId] = {
+          ...detail,
+          retrying: false,
+          retryFailed: false
+        }
+        return detail
+      } catch {
+        return null
+      }
+    })
+    mockTerminalStoreState.retryTerminalCleanup.mockReset()
+    mockTerminalStoreState.retryTerminalCleanup.mockResolvedValue(true)
 
     vi.mocked(terminalApi).spawn.mockResolvedValue({
       success: true,
@@ -427,6 +461,8 @@ describe('ConnectedTerminal', () => {
     })
     vi.mocked(terminalApi).write.mockResolvedValue({ success: true, data: undefined })
     vi.mocked(terminalApi).resize.mockResolvedValue({ success: true, data: undefined })
+    vi.mocked(terminalApi).terminate.mockReset()
+    vi.mocked(terminalApi).terminate.mockResolvedValue({ success: true, data: undefined })
 
     // Reset clipboard mocks
     vi.mocked(clipboardApi).readText.mockResolvedValue({ success: true, data: '' })
@@ -658,35 +694,73 @@ describe('ConnectedTerminal', () => {
     })
   })
 
-  it('keeps a compound cleanup failure on its recoverable id without respawning', async () => {
+  it('renders one sanitized cleanup-only recovery and retries only the retained id', async () => {
     const detail = {
       terminalId: 'terminal-recoverable-1',
       primaryCode: 'CONVERSATION_DURABILITY_FAILED',
-      cleanupStage: 'reader_join'
+      cleanupStage: 'reader_join' as const
     }
-    const serializedDetail = JSON.stringify(detail)
     vi.mocked(terminalApi).spawn.mockResolvedValue({
       success: false,
-      error: serializedDetail,
+      error: JSON.stringify(detail),
       code: 'TERMINAL_RESOURCE_ROLLBACK_FAILED'
+    })
+    vi.mocked(terminalApi)
+      .terminate.mockResolvedValueOnce({
+        success: false,
+        error: JSON.stringify({
+          terminalId: detail.terminalId,
+          primaryCode: 'TERMINATE_FAILED',
+          cleanupStage: 'reader_join'
+        }),
+        code: 'TERMINATE_FAILED'
+      })
+      .mockResolvedValueOnce({ success: true, data: undefined })
+    mockTerminalStoreState.retryTerminalCleanup.mockImplementation(async (terminalId: string) => {
+      const result = await terminalApi.terminate(terminalId)
+      const retained = mockTerminalStoreState.cleanupRecoveries[terminalId]
+      if (result.success) {
+        delete mockTerminalStoreState.cleanupRecoveries[terminalId]
+        return true
+      }
+      if (retained) {
+        mockTerminalStoreState.cleanupRecoveries[terminalId] = {
+          ...retained,
+          retrying: false,
+          retryFailed: true
+        }
+      }
+      return false
     })
     const onError = vi.fn()
 
     const { rerender } = render(<ConnectedTerminal onError={onError} />)
 
     await vi.waitFor(() => {
-      expect(onError).toHaveBeenCalledWith(serializedDetail)
+      expect(screen.getByRole('alert')).toHaveTextContent(detail.terminalId)
     })
-    const onDataCalls = vi.mocked(terminalApi).onData.mock.calls.length
-    const onExitCalls = vi.mocked(terminalApi).onExit.mock.calls.length
+    expect(onError).toHaveBeenCalledWith('The terminal process stopped, but cleanup is incomplete.')
+    expect(onError).not.toHaveBeenCalledWith(expect.stringContaining('primaryCode'))
+    expect(screen.getAllByRole('button', { name: /retry termination for terminal/i })).toHaveLength(
+      1
+    )
 
+    fireEvent.click(screen.getByRole('button', { name: /retry termination for terminal/i }))
+    await vi.waitFor(() => expect(terminalApi.terminate).toHaveBeenCalledTimes(1))
     rerender(<ConnectedTerminal onError={onError} className="cleanup-retry-state" />)
-    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Cleanup is still incomplete. You can retry termination again.'
+    )
 
-    expect(JSON.parse(onError.mock.calls[0][0] as string)).toEqual(detail)
+    fireEvent.click(screen.getByRole('button', { name: /retry termination for terminal/i }))
+    await vi.waitFor(() => expect(terminalApi.terminate).toHaveBeenCalledTimes(2))
+    rerender(<ConnectedTerminal onError={onError} className="cleanup-retry-cleared" />)
+    expect(screen.queryByRole('alert')).toBeNull()
+
+    expect(terminalApi.terminate).toHaveBeenNthCalledWith(1, detail.terminalId)
+    expect(terminalApi.terminate).toHaveBeenNthCalledWith(2, detail.terminalId)
     expect(vi.mocked(terminalApi).spawn).toHaveBeenCalledTimes(1)
-    expect(vi.mocked(terminalApi).onData).toHaveBeenCalledTimes(onDataCalls)
-    expect(vi.mocked(terminalApi).onExit).toHaveBeenCalledTimes(onExitCalls)
+    expect(mockTerminalStoreState.resumeTerminalResource).not.toHaveBeenCalled()
     expect(addRendererRef).not.toHaveBeenCalled()
     expect(mockTerminalStoreState.restartTerminalResource).not.toHaveBeenCalled()
   })
