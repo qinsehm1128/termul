@@ -165,6 +165,8 @@ export function AgentChatPanel({
   const discoveredReopenContext = useAcpStore((s) => s.discoveredReopenContexts[sessionId] ?? null)
   const hasHistoryEntry = useAcpStore((s) => s.sessionIndex.some((e) => e.id === sessionId))
   const isOpeningHistory = useAcpStore((s) => Boolean(s.openingHistoryIds[sessionId]))
+  const historyBackfill = useAcpStore((s) => s.historyBackfill[sessionId])
+  const retryHistoryBackfill = useAcpStore((s) => s.retryHistoryBackfill)
   const isRestoringChat = useAcpStore((s) => Boolean(s.restoringChatIds[sessionId]))
   const isLaunchingSession = useAcpStore((s) => Boolean(s.launchingSessionIds[sessionId]))
   const [rehydrateError, setRehydrateError] = useState<string | null>(null)
@@ -226,6 +228,12 @@ export function AgentChatPanel({
       toast.error(t('panel.cancelFailed'))
     })
   }, [cancelPrompt, sessionId, t])
+
+  const handleRetryHistory = useCallback(() => {
+    void retryHistoryBackfill(sessionId).catch(() => {
+      toast.error(t('history.retryHistoryFailed'))
+    })
+  }, [retryHistoryBackfill, sessionId, t])
 
   const handleSetConfig = useCallback(
     async (configId: string, valueId: string) => {
@@ -470,6 +478,42 @@ export function AgentChatPanel({
             </button>
           </div>
         )}
+      {historyBackfill && !historyBackfill.complete && (
+        <div
+          className={`flex flex-wrap items-start justify-between gap-2 border-b px-3 py-2 text-xs ${
+            historyBackfill.errorCode
+              ? 'border-destructive/30 bg-destructive/10 text-destructive'
+              : 'border-warning/30 bg-warning/10 text-warning'
+          }`}
+          role={historyBackfill.errorCode ? 'alert' : 'status'}
+          aria-live={historyBackfill.errorCode ? 'assertive' : 'polite'}
+          aria-atomic="true"
+        >
+          <span className="min-w-0 flex-1 break-words">
+            {historyBackfill.errorCode
+              ? t('history.backfillIncomplete', {
+                  loadedRecordCount: historyBackfill.loadedRecordCount,
+                  targetLastSeq: historyBackfill.targetLastSeq,
+                  nextCursor: historyBackfill.nextCursor,
+                  errorCode: historyBackfill.errorCode
+                })
+              : t('history.backfillProgress', {
+                  loadedRecordCount: historyBackfill.loadedRecordCount,
+                  targetLastSeq: historyBackfill.targetLastSeq,
+                  nextCursor: historyBackfill.nextCursor
+                })}
+          </span>
+          {historyBackfill.errorCode && (
+            <button
+              type="button"
+              onClick={handleRetryHistory}
+              className="shrink-0 rounded-md border border-current/40 px-2 py-1 text-xs font-medium hover:bg-destructive/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              {t('history.retryHistory')}
+            </button>
+          )}
+        </div>
+      )}
       {transportReconnecting && (
         // Story 5.3 (AC3, T5.3): transport-level reconnect overlay. This is
         // DISTINCT from the session-level "Reconnecting to agent…" banner

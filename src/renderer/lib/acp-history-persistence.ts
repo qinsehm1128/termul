@@ -5,7 +5,9 @@ import {
   assertConversationHistoryPage,
   assertConversationHistoryPageRequest,
   type ConversationHistoryPageV1,
+  ConversationHistoryPageValidationError,
   type ConversationHistoryRecordV1,
+  conversationHistoryPageEncodedBytes,
   type PersistedSessionSummary
 } from '@shared/types/web-protocol.types'
 import { runtimeT } from '@/i18n/runtime'
@@ -92,8 +94,10 @@ export interface HistoryPageProgress {
 export interface LoadSessionPayloadOptions {
   /** Store-owned index metadata avoids a redundant list request before page one. */
   metadata?: SessionIndexEntry
-  /** Awaited before the next request, guaranteeing page one is installed first. */
+  /** Awaited before the next request whenever a bounded transcript snapshot is published. */
   onPage?: (payload: SessionPayload, progress: HistoryPageProgress) => void | Promise<void>
+  /** Per-page cursor/count progress without rebuilding or copying the transcript prefix. */
+  onProgress?: (progress: HistoryPageProgress) => void | Promise<void>
 }
 
 export class ConversationHistoryLoadError extends Error {
@@ -267,24 +271,37 @@ function asContentBlock(value: unknown): ContentBlock | null {
   return object && typeof object.type === 'string' ? (object as ContentBlock) : null
 }
 
-function appendHistoryBlock(existing: ContentBlock[], incoming: ContentBlock): ContentBlock[] {
+let historyTraversalStarts = 0
+let historyPageRequests = 0
+let historyPageApplications = 0
+let historyRecordApplications = 0
+let historyTranscriptEntriesCopied = 0
+let historyToolEntriesCopied = 0
+let historyToolIndexLookups = 0
+let historySnapshotsCreated = 0
+
+function cloneHistoryBlock(block: ContentBlock): ContentBlock {
+  return { ...block } as ContentBlock
+}
+
+/** Mutate only the accumulator-private block array; published snapshots own cloned blocks. */
+function appendHistoryBlock(existing: ContentBlock[], incoming: ContentBlock): void {
   if (incoming.type === 'text') {
     const last = existing.at(-1)
     if (last?.type === 'text') {
-      return [
-        ...existing.slice(0, -1),
-        { ...last, text: (last.text ?? '') + (incoming.text ?? '') }
-      ]
+      last.text = (last.text ?? '') + (incoming.text ?? '')
+      return
     }
   }
-  return [...existing, incoming]
+  existing.push(cloneHistoryBlock(incoming))
 }
 
 class ProgressiveHistoryAccumulator {
   private readonly sessionId: string
   private readonly baseMetadata: SessionIndexEntry
-  private messages: ChatMessage[] = []
-  private toolCalls: ToolCall[] = []
+  private readonly messages: ChatMessage[] = []
+  private readonly toolCalls: ToolCall[] = []
+  private readonly toolCallIndexById = new Map<string, number>()
   private sessionUsage: SessionUsage | undefined
   private plan: PlanEntry[] | undefined
   private planSeen = false
@@ -323,24 +340,43 @@ class ProgressiveHistoryAccumulator {
       limit,
       targetLastSeq: this.targetLastSeqValue
     })
-    for (const record of page.records) this.applyRecord(record)
+    for (const record of page.records) {
+      historyRecordApplications += 1
+      this.applyRecord(record)
+    }
     this.cursorValue = page.nextCursor
     this.targetLastSeqValue = page.targetLastSeq
     this.loadedRecordCountValue += page.records.length
     this.pageNumberValue += 1
+    historyPageApplications += 1
   }
 
   snapshot(): SessionPayload {
+    const messages = this.messages.map((message) => ({
+      ...message,
+      blocks: message.blocks.map(cloneHistoryBlock)
+    }))
+    const toolCalls = this.toolCalls.map((toolCall) => ({ ...toolCall }))
+    historyTranscriptEntriesCopied += messages.length
+    historyToolEntriesCopied += toolCalls.length
+    historySnapshotsCreated += 1
     return {
       metadata: {
         ...this.baseMetadata,
-        messageCount: this.messages.length,
+        messageCount: messages.length,
         lastSeq: this.cursorValue
       },
-      messages: [...this.messages],
-      ...(this.toolCalls.length > 0 ? { toolCalls: [...this.toolCalls] } : {}),
-      ...(this.sessionUsage ? { sessionUsage: { ...this.sessionUsage } } : {}),
-      ...(this.planSeen ? { plan: [...(this.plan ?? [])] } : {})
+      messages,
+      ...(toolCalls.length > 0 ? { toolCalls } : {}),
+      ...(this.sessionUsage
+        ? {
+            sessionUsage: {
+              ...this.sessionUsage,
+              ...(this.sessionUsage.cost ? { cost: { ...this.sessionUsage.cost } } : {})
+            }
+          }
+        : {}),
+      ...(this.planSeen ? { plan: (this.plan ?? []).map((entry) => ({ ...entry })) } : {})
     }
   }
 
@@ -371,6 +407,8 @@ class ProgressiveHistoryAccumulator {
         this.updatePlan(payload)
         break
       default:
+        // Payload-free cursor markers are intentionally absent from records. Unknown future
+        // renderer records consume their canonical cursor but never persist opaque payload data.
         break
     }
   }
@@ -378,7 +416,10 @@ class ProgressiveHistoryAccumulator {
   private pushUserPrompt(record: ConversationHistoryRecordV1, payload: JsonObject | null): void {
     const turnId = typeof payload?.turnId === 'string' && payload.turnId ? payload.turnId : null
     const content = Array.isArray(payload?.content)
-      ? payload.content.map(asContentBlock).filter((block): block is ContentBlock => block !== null)
+      ? payload.content
+          .map(asContentBlock)
+          .filter((block): block is ContentBlock => block !== null)
+          .map(cloneHistoryBlock)
       : []
     this.messages.push({
       id: turnId ? `turn:${turnId}` : `user:seq-${record.seq}`,
@@ -396,12 +437,7 @@ class ProgressiveHistoryAccumulator {
     if (!content) return
     if (this.openRole === role) {
       const last = this.messages.at(-1)
-      if (last) {
-        this.messages = [
-          ...this.messages.slice(0, -1),
-          { ...last, blocks: appendHistoryBlock(last.blocks, content) }
-        ]
-      }
+      if (last) appendHistoryBlock(last.blocks, content)
       return
     }
     if (content.type === 'text' && !(content.text ?? '')) return
@@ -409,7 +445,7 @@ class ProgressiveHistoryAccumulator {
     this.messages.push({
       id: `snapshot:${role}:${record.seq}`,
       role,
-      blocks: [content],
+      blocks: [cloneHistoryBlock(content)],
       streaming: false,
       timestamp: record.recordedAt,
       seq: record.seq
@@ -424,36 +460,35 @@ class ProgressiveHistoryAccumulator {
       timestamp: typeof toolCall.timestamp === 'number' ? toolCall.timestamp : record.recordedAt,
       seq: typeof toolCall.seq === 'number' ? toolCall.seq : record.seq
     }
-    const index = this.toolCalls.findIndex((entry) => entry.toolCallId === stamped.toolCallId)
-    if (index === -1) {
-      this.toolCalls = [...this.toolCalls, stamped]
+    historyToolIndexLookups += 1
+    const index = this.toolCallIndexById.get(stamped.toolCallId)
+    if (index === undefined) {
+      this.toolCallIndexById.set(stamped.toolCallId, this.toolCalls.length)
+      this.toolCalls.push(stamped)
       return
     }
     const previous = this.toolCalls[index]
-    const next = [...this.toolCalls]
-    next[index] = {
+    this.toolCalls[index] = {
       ...previous,
       ...stamped,
       timestamp: previous.timestamp,
       seq: previous.seq
     }
-    this.toolCalls = next
   }
 
   private updateToolCall(payload: JsonObject | null): void {
     const update = asJsonObject(payload?.update)
     if (!update || typeof update.toolCallId !== 'string' || !update.toolCallId) return
-    const index = this.toolCalls.findIndex((entry) => entry.toolCallId === update.toolCallId)
-    if (index === -1) return
+    historyToolIndexLookups += 1
+    const index = this.toolCallIndexById.get(update.toolCallId)
+    if (index === undefined) return
     const previous = this.toolCalls[index]
-    const next = [...this.toolCalls]
-    next[index] = {
+    this.toolCalls[index] = {
       ...previous,
       ...(update as ToolCall),
       timestamp: previous.timestamp,
       seq: previous.seq
     }
-    this.toolCalls = next
   }
 
   private updateUsage(record: ConversationHistoryRecordV1, payload: JsonObject | null): void {
@@ -462,22 +497,28 @@ class ProgressiveHistoryAccumulator {
     if (
       typeof used !== 'number' ||
       typeof size !== 'number' ||
-      !Number.isFinite(used) ||
-      !Number.isFinite(size) ||
-      used <= 0 ||
+      !Number.isSafeInteger(used) ||
+      !Number.isSafeInteger(size) ||
+      used < 0 ||
       size <= 0
     ) {
       return
     }
     this.baselineUsed ??= used
     const cost = asJsonObject(payload?.cost)
+    const validCost =
+      typeof cost?.amount === 'number' &&
+      Number.isFinite(cost.amount) &&
+      cost.amount > 0 &&
+      typeof cost.currency === 'string' &&
+      cost.currency.length > 0
+        ? { amount: cost.amount, currency: cost.currency }
+        : undefined
     this.sessionUsage = {
       used,
       size,
       baselineUsed: this.baselineUsed,
-      ...(typeof cost?.amount === 'number' && typeof cost.currency === 'string'
-        ? { cost: { amount: cost.amount, currency: cost.currency } }
-        : {}),
+      ...(validCost ? { cost: validCost } : {}),
       updatedAt: record.recordedAt,
       source: 'reported'
     }
@@ -487,34 +528,82 @@ class ProgressiveHistoryAccumulator {
     const plan = asJsonObject(payload?.plan)
     if (!Array.isArray(plan?.entries)) return
     this.planSeen = true
-    const entries = plan.entries.filter((entry): entry is PlanEntry => {
+    this.plan = plan.entries.flatMap((entry) => {
       const object = asJsonObject(entry)
       return object !== null && typeof object.content === 'string'
+        ? [{ ...(object as PlanEntry) }]
+        : []
     })
-    this.plan = entries.length > 0 ? entries : undefined
   }
 }
 
 interface PartialHistoryAssembly {
   mode: 'server' | 'tauri_store'
   accumulator: ProgressiveHistoryAccumulator
+  publishedPayload?: SessionPayload
+  publishedProgress?: HistoryPageProgress
+}
+
+interface HistoryProgressSubscriber {
+  options: LoadSessionPayloadOptions
+  tail: Promise<void>
+}
+
+interface HistoryLoadFlight {
+  mode: 'server' | 'tauri_store'
+  subscribers: Set<HistoryProgressSubscriber>
+  promise: Promise<SessionPayload | null>
+  lastProgress?: HistoryPageProgress
+  lastPublishedPayload?: SessionPayload
+  lastPublishedProgress?: HistoryPageProgress
 }
 
 const partialHistoryAssemblies = new Map<string, PartialHistoryAssembly>()
-const historyPageRequestTails = new Map<string, Promise<void>>()
-const historyPageEncoder = new TextEncoder()
+const historyLoadFlights = new Map<string, HistoryLoadFlight>()
 let currentHistoryInFlightBytes = 0
 let peakHistoryInFlightBytes = 0
 
-export function historyPagingMetrics(): { currentBytes: number; peakBytes: number } {
-  return { currentBytes: currentHistoryInFlightBytes, peakBytes: peakHistoryInFlightBytes }
+export interface HistoryPagingMetrics {
+  currentBytes: number
+  peakBytes: number
+  traversalStarts: number
+  pageRequests: number
+  pageApplications: number
+  recordApplications: number
+  transcriptEntriesCopied: number
+  toolEntriesCopied: number
+  toolIndexLookups: number
+  snapshotsCreated: number
+}
+
+export function historyPagingMetrics(): HistoryPagingMetrics {
+  return {
+    currentBytes: currentHistoryInFlightBytes,
+    peakBytes: peakHistoryInFlightBytes,
+    traversalStarts: historyTraversalStarts,
+    pageRequests: historyPageRequests,
+    pageApplications: historyPageApplications,
+    recordApplications: historyRecordApplications,
+    transcriptEntriesCopied: historyTranscriptEntriesCopied,
+    toolEntriesCopied: historyToolEntriesCopied,
+    toolIndexLookups: historyToolIndexLookups,
+    snapshotsCreated: historySnapshotsCreated
+  }
 }
 
 export function _resetHistoryPagingForTesting(): void {
   partialHistoryAssemblies.clear()
-  historyPageRequestTails.clear()
+  historyLoadFlights.clear()
   currentHistoryInFlightBytes = 0
   peakHistoryInFlightBytes = 0
+  historyTraversalStarts = 0
+  historyPageRequests = 0
+  historyPageApplications = 0
+  historyRecordApplications = 0
+  historyTranscriptEntriesCopied = 0
+  historyToolEntriesCopied = 0
+  historyToolIndexLookups = 0
+  historySnapshotsCreated = 0
 }
 
 function stablePayload(payload: SessionPayload): string {
@@ -842,7 +931,12 @@ export function setCachedSessionPayload(id: string, payload: SessionPayload): vo
 
 function historyErrorCode(error: unknown): string | undefined {
   if (typeof error !== 'object' || error === null || !('code' in error)) return undefined
-  return typeof error.code === 'string' ? error.code : undefined
+  const code = typeof error.code === 'string' ? error.code : undefined
+  return code && /^[A-Z0-9_]+$|^[a-z][a-z_]*$/.test(code) && code.length <= 64 ? code : undefined
+}
+
+function safeHistoryLogSessionId(id: string): string {
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(id) ? id : '[redacted]'
 }
 
 function isTransientHistoryError(error: unknown): boolean {
@@ -865,7 +959,7 @@ async function historyMetadata(
     if (options.metadata.id !== id) {
       throw new ConversationHistoryLoadError(
         'VALIDATION_ERROR',
-        `history metadata id ${options.metadata.id} does not match ${id}`
+        'history metadata id does not match the requested session'
       )
     }
     return options.metadata
@@ -890,103 +984,157 @@ async function requestHistoryPage(
   id: string,
   mode: 'server' | 'tauri_store',
   afterSeq: number,
-  limit: number
+  limit: number,
+  targetLastSeq?: number
 ): Promise<ConversationHistoryPageV1> {
-  assertConversationHistoryPageRequest(afterSeq, limit)
-  const previous = historyPageRequestTails.get(id)
-  const request = (async () => {
-    if (previous) await previous.catch(() => undefined)
-    if (mode === 'server') {
-      const transport = getAcpTransport()
-      if (!transport.getSessionPayloadPage) {
-        throw new AcpTransportError(
-          'CONVERSATION_HISTORY_PAGING_REQUIRED',
-          'bounded server history is unavailable'
-        )
-      }
-      return transport.getSessionPayloadPage(id, afterSeq, limit)
+  assertConversationHistoryPageRequest(afterSeq, limit, targetLastSeq)
+  historyPageRequests += 1
+  if (mode === 'server') {
+    const transport = getAcpTransport()
+    if (!transport.getSessionPayloadPage) {
+      throw new AcpTransportError(
+        'CONVERSATION_HISTORY_PAGING_REQUIRED',
+        'bounded server history is unavailable'
+      )
     }
-    return acpHistoryApi.getPage(id, afterSeq, limit)
-  })()
-  const completion = request.then(
-    () => undefined,
-    () => undefined
-  )
-  historyPageRequestTails.set(id, completion)
-  try {
-    return await request
-  } finally {
-    if (historyPageRequestTails.get(id) === completion) historyPageRequestTails.delete(id)
+    // The WebSocket facade owns its per-session target map and forwards the first frontier on all
+    // continuation frames. The shared loader still validates that returned frontier below.
+    return transport.getSessionPayloadPage(id, afterSeq, limit)
   }
+  return acpHistoryApi.getPage(id, afterSeq, limit, targetLastSeq)
 }
 
 function historyPageBytes(page: ConversationHistoryPageV1): number {
   try {
-    return historyPageEncoder.encode(JSON.stringify(page)).byteLength
+    return conversationHistoryPageEncodedBytes(page)
   } catch (error) {
-    throw new ConversationHistoryLoadError(
-      'VALIDATION_ERROR',
-      `history page is not serializable: ${String(error)}`
-    )
+    if (
+      error instanceof ConversationHistoryPageValidationError &&
+      /encoded limit/.test(error.message)
+    ) {
+      throw new ConversationHistoryLoadError(
+        'CONVERSATION_HISTORY_IN_FLIGHT_LIMIT',
+        'history page exceeds the bounded in-flight budget'
+      )
+    }
+    throw error
   }
 }
 
-export async function loadSessionPayload(
-  id: string,
-  options: LoadSessionPayloadOptions = {}
-): Promise<SessionPayload | null> {
-  const transport = getAcpTransport()
-  const negotiatedMode = transport.historyMode?.()
-  if (negotiatedMode === 'live_only') return null
-  const mode: 'server' | 'tauri_store' = negotiatedMode === 'server' ? 'server' : 'tauri_store'
+function historyFlightKey(mode: 'server' | 'tauri_store', id: string): string {
+  return `${mode}\0${id}`
+}
 
-  const partial = partialHistoryAssemblies.get(id)
-  if (partial && partial.mode !== mode) partialHistoryAssemblies.delete(id)
-  const currentPartial = partial?.mode === mode ? partial : undefined
-  if (mode === 'tauri_store' && !currentPartial) {
-    const cached = payloadCache.get(id)
-    if (cached) {
-      touchPayload(id, cached)
-      await options.onPage?.(cached, {
-        sessionId: id,
-        pageNumber: 0,
-        pageRecordCount: 0,
-        loadedRecordCount: cached.metadata.lastSeq ?? maxPayloadSeq(cached),
-        nextCursor: cached.metadata.lastSeq ?? maxPayloadSeq(cached),
-        targetLastSeq: cached.metadata.lastSeq ?? maxPayloadSeq(cached),
-        complete: true,
-        inFlightBytes: 0,
-        resumed: true
+function enqueueHistorySubscriber(
+  subscriber: HistoryProgressSubscriber,
+  callback: () => void | Promise<void>
+): Promise<void> {
+  subscriber.tail = subscriber.tail.then(callback)
+  return subscriber.tail
+}
+
+function addHistorySubscriber(
+  flight: HistoryLoadFlight,
+  options: LoadSessionPayloadOptions
+): Promise<void> {
+  const subscriber: HistoryProgressSubscriber = { options, tail: Promise.resolve() }
+  flight.subscribers.add(subscriber)
+  return enqueueHistorySubscriber(subscriber, async () => {
+    if (flight.lastPublishedPayload && flight.lastPublishedProgress) {
+      await options.onPage?.(flight.lastPublishedPayload, {
+        ...flight.lastPublishedProgress,
+        resumed: true,
+        inFlightBytes: 0
       })
-      return cached
     }
-  }
+    if (flight.lastProgress) {
+      await options.onProgress?.({ ...flight.lastProgress, resumed: true, inFlightBytes: 0 })
+    }
+  })
+}
 
-  let assembly = currentPartial
+async function publishHistorySnapshot(
+  flight: HistoryLoadFlight,
+  assembly: PartialHistoryAssembly,
+  payload: SessionPayload,
+  progress: HistoryPageProgress
+): Promise<void> {
+  assembly.publishedPayload = payload
+  assembly.publishedProgress = progress
+  flight.lastPublishedPayload = payload
+  flight.lastPublishedProgress = progress
+  await Promise.all(
+    [...flight.subscribers].map((subscriber) =>
+      enqueueHistorySubscriber(subscriber, () => subscriber.options.onPage?.(payload, progress))
+    )
+  )
+}
+
+async function publishHistoryProgress(
+  flight: HistoryLoadFlight,
+  progress: HistoryPageProgress
+): Promise<void> {
+  flight.lastProgress = progress
+  await Promise.all(
+    [...flight.subscribers].map((subscriber) =>
+      enqueueHistorySubscriber(subscriber, () => subscriber.options.onProgress?.(progress))
+    )
+  )
+}
+
+function accumulatorProgress(
+  id: string,
+  assembly: PartialHistoryAssembly,
+  pageRecordCount: number,
+  inFlightBytes: number,
+  resumed: boolean,
+  complete = false
+): HistoryPageProgress {
+  return {
+    sessionId: id,
+    pageNumber: assembly.accumulator.pageNumber,
+    pageRecordCount,
+    loadedRecordCount: assembly.accumulator.loadedRecordCount,
+    nextCursor: assembly.accumulator.cursor,
+    targetLastSeq: assembly.accumulator.targetLastSeq ?? assembly.accumulator.cursor,
+    complete,
+    inFlightBytes,
+    resumed
+  }
+}
+
+async function runHistoryTraversal(
+  id: string,
+  mode: 'server' | 'tauri_store',
+  options: LoadSessionPayloadOptions,
+  flight: HistoryLoadFlight
+): Promise<SessionPayload | null> {
+  const existingPartial = partialHistoryAssemblies.get(id)
+  if (existingPartial && existingPartial.mode !== mode) partialHistoryAssemblies.delete(id)
+  let assembly = existingPartial?.mode === mode ? existingPartial : undefined
   if (!assembly) {
     const metadata = await historyMetadata(id, mode, options)
     if (!metadata) return null
     assembly = { mode, accumulator: new ProgressiveHistoryAccumulator(metadata) }
     partialHistoryAssemblies.set(id, assembly)
   } else if (assembly.accumulator.cursor > 0 && assembly.accumulator.targetLastSeq !== undefined) {
-    const resumedPayload = assembly.accumulator.snapshot()
-    await options.onPage?.(resumedPayload, {
-      sessionId: id,
-      pageNumber: assembly.accumulator.pageNumber,
-      pageRecordCount: 0,
-      loadedRecordCount: assembly.accumulator.loadedRecordCount,
-      nextCursor: assembly.accumulator.cursor,
-      targetLastSeq: assembly.accumulator.targetLastSeq,
-      complete: false,
-      inFlightBytes: 0,
-      resumed: true
-    })
+    const resumedProgress = accumulatorProgress(id, assembly, 0, 0, true)
+    const resumedPayload = assembly.publishedPayload ?? assembly.accumulator.snapshot()
+    await publishHistorySnapshot(flight, assembly, resumedPayload, resumedProgress)
+    await publishHistoryProgress(flight, resumedProgress)
   }
 
+  let lastPageBytes = 0
   try {
     while (true) {
       const afterSeq = assembly.accumulator.cursor
-      const page = await requestHistoryPage(id, mode, afterSeq, RENDERER_HISTORY_PAGE_SIZE)
+      const page = await requestHistoryPage(
+        id,
+        mode,
+        afterSeq,
+        RENDERER_HISTORY_PAGE_SIZE,
+        assembly.accumulator.targetLastSeq
+      )
       assertConversationHistoryPage(page, {
         sessionId: id,
         afterSeq,
@@ -994,6 +1142,7 @@ export async function loadSessionPayload(
         targetLastSeq: assembly.accumulator.targetLastSeq
       })
       const inFlightBytes = historyPageBytes(page)
+      lastPageBytes = inFlightBytes
       if (
         inFlightBytes > MAX_HISTORY_IN_FLIGHT_BYTES ||
         currentHistoryInFlightBytes + inFlightBytes > MAX_HISTORY_IN_FLIGHT_BYTES
@@ -1008,22 +1157,25 @@ export async function loadSessionPayload(
       peakHistoryInFlightBytes = Math.max(peakHistoryInFlightBytes, currentHistoryInFlightBytes)
       try {
         assembly.accumulator.applyPage(page, RENDERER_HISTORY_PAGE_SIZE)
-        const payload = assembly.accumulator.snapshot()
-        await options.onPage?.(payload, {
-          sessionId: id,
-          pageNumber: assembly.accumulator.pageNumber,
-          pageRecordCount: page.records.length,
-          loadedRecordCount: assembly.accumulator.loadedRecordCount,
-          nextCursor: page.nextCursor,
-          targetLastSeq: page.targetLastSeq,
-          complete: page.complete,
+        const progress = accumulatorProgress(
+          id,
+          assembly,
+          page.records.length,
           inFlightBytes,
-          resumed: false
-        })
+          false,
+          page.complete
+        )
+        let payload: SessionPayload | undefined
+        if (assembly.accumulator.pageNumber === 1 || page.complete) {
+          payload = assembly.accumulator.snapshot()
+          await publishHistorySnapshot(flight, assembly, payload, progress)
+        }
+        await publishHistoryProgress(flight, progress)
         if (page.complete) {
+          const completedPayload = payload ?? assembly.accumulator.snapshot()
           partialHistoryAssemblies.delete(id)
-          touchPayload(id, payload)
-          return payload
+          touchPayload(id, completedPayload)
+          return completedPayload
         }
       } finally {
         currentHistoryInFlightBytes = Math.max(0, currentHistoryInFlightBytes - inFlightBytes)
@@ -1031,14 +1183,95 @@ export async function loadSessionPayload(
     }
   } catch (error) {
     const transient = isTransientHistoryError(error)
-    if (!transient) partialHistoryAssemblies.delete(id)
+    if (assembly.accumulator.cursor > 0) {
+      // Every later-page failure retains the verified prefix and pinned frontier. Stable failures
+      // (for example `stale` or an oversized page) must not silently turn Retry history into a
+      // cursor-zero traversal that can replace the visible prefix with a newer snapshot.
+      const failureProgress = accumulatorProgress(id, assembly, 0, 0, true)
+      if (assembly.publishedProgress?.nextCursor !== assembly.accumulator.cursor) {
+        const retainedPayload = assembly.accumulator.snapshot()
+        await publishHistorySnapshot(flight, assembly, retainedPayload, failureProgress)
+      }
+      flight.lastProgress = failureProgress
+    } else {
+      partialHistoryAssemblies.delete(id)
+    }
+    const code = historyErrorCode(error) ?? 'TRANSPORT_ERROR'
     void logFrontendError({
       level: transient ? 'warn' : 'error',
       source: 'acp.historyPaging',
-      message: `History page load failed code=${historyErrorCode(error) ?? 'TRANSPORT_ERROR'} cursor=${assembly.accumulator.cursor} retainedRecords=${assembly.accumulator.loadedRecordCount}`
+      message: `History page load failed sessionId=${safeHistoryLogSessionId(id)} code=${code} cursor=${assembly.accumulator.cursor} retainedRecordCount=${assembly.accumulator.loadedRecordCount} targetLastSeq=${assembly.accumulator.targetLastSeq ?? 0} pageBytes=${lastPageBytes}`
     })
     throw error
   }
+}
+
+export async function loadSessionPayload(
+  id: string,
+  options: LoadSessionPayloadOptions = {}
+): Promise<SessionPayload | null> {
+  if (options.metadata && options.metadata.id !== id) {
+    throw new ConversationHistoryLoadError(
+      'VALIDATION_ERROR',
+      'history metadata id does not match the requested session'
+    )
+  }
+  const transport = getAcpTransport()
+  const negotiatedMode = transport.historyMode?.()
+  if (negotiatedMode === 'live_only') return null
+  const mode: 'server' | 'tauri_store' = negotiatedMode === 'server' ? 'server' : 'tauri_store'
+  const key = historyFlightKey(mode, id)
+  const existingFlight = historyLoadFlights.get(key)
+  if (existingFlight) {
+    await addHistorySubscriber(existingFlight, options)
+    return existingFlight.promise
+  }
+
+  const partial = partialHistoryAssemblies.get(id)
+  if (partial && partial.mode !== mode) partialHistoryAssemblies.delete(id)
+  const currentPartial = partial?.mode === mode ? partial : undefined
+  if (mode === 'tauri_store' && !currentPartial) {
+    const cached = payloadCache.get(id)
+    if (cached) {
+      touchPayload(id, cached)
+      const cursor = cached.metadata.lastSeq ?? maxPayloadSeq(cached)
+      const progress: HistoryPageProgress = {
+        sessionId: id,
+        pageNumber: 0,
+        pageRecordCount: 0,
+        loadedRecordCount: cursor,
+        nextCursor: cursor,
+        targetLastSeq: cursor,
+        complete: true,
+        inFlightBytes: 0,
+        resumed: true
+      }
+      await options.onPage?.(cached, progress)
+      await options.onProgress?.(progress)
+      return cached
+    }
+  }
+
+  let resolveFlight!: (payload: SessionPayload | null) => void
+  let rejectFlight!: (error: unknown) => void
+  const promise = new Promise<SessionPayload | null>((resolve, reject) => {
+    resolveFlight = resolve
+    rejectFlight = reject
+  })
+  const flight: HistoryLoadFlight = {
+    mode,
+    subscribers: new Set(),
+    promise
+  }
+  historyLoadFlights.set(key, flight)
+  await addHistorySubscriber(flight, options)
+  historyTraversalStarts += 1
+  void runHistoryTraversal(id, mode, options, flight)
+    .then(resolveFlight, rejectFlight)
+    .finally(() => {
+      if (historyLoadFlights.get(key) === flight) historyLoadFlights.delete(key)
+    })
+  return promise
 }
 
 export async function saveSessionPayload(id: string, payload: SessionPayload): Promise<void> {

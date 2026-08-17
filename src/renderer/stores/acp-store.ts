@@ -571,6 +571,8 @@ interface AcpState {
   // Actions — chat history (P5)
   loadSessionIndex: () => Promise<void>
   openHistorySession: (id: string) => Promise<void>
+  /** Resume only the retained durable-history traversal; never reconnect or spawn an agent. */
+  retryHistoryBackfill: (id: string) => Promise<void>
   /** R1: Proactively reattach a still-running ACP session on refresh. Mirrors
    * `openHistorySessionInner`'s transcript-install + resume but skips
    * `ensureLiveAgent` (no cold-spawn): the caller passes the authoritative
@@ -1986,6 +1988,8 @@ type InFlightHistoryOpen = {
 }
 
 const inFlightHistoryOpens = new Map<SessionId, InFlightHistoryOpen>()
+/** History-only retries are deduped independently from agent reconnect/open operations. */
+const inFlightHistoryBackfillRetries = new Map<SessionId, Promise<void>>()
 
 type InFlightDiscoveredOpen = {
   generation: number
@@ -2085,6 +2089,7 @@ export function _resetInFlightHistoryOpensForTesting(): void {
     invalidateSessionReopen(sessionId)
   }
   inFlightHistoryOpens.clear()
+  inFlightHistoryBackfillRetries.clear()
   inFlightDiscoveredOpens.clear()
   for (const tracker of restorePreloadTrackers.values()) {
     if (tracker.timer) clearTimeout(tracker.timer)
@@ -2356,6 +2361,119 @@ function mergeReopenOutcomeIfUnchanged(
   })
 }
 
+function backfillStateFromProgress(
+  progress: HistoryPageProgress,
+  errorCode?: string
+): HistoryBackfillState {
+  return {
+    loading: !progress.complete && errorCode === undefined,
+    complete: progress.complete,
+    loadedRecordCount: progress.loadedRecordCount,
+    nextCursor: progress.nextCursor,
+    targetLastSeq: progress.targetLastSeq,
+    ...(errorCode ? { errorCode } : {})
+  }
+}
+
+function installHistoryProjection(
+  state: AcpState,
+  sessionId: SessionId,
+  payload: SessionPayload,
+  progress: HistoryPageProgress
+): Pick<AcpState, 'messages' | 'toolCalls' | 'sessionUsage' | 'plans' | 'historyBackfill'> {
+  return {
+    messages: { ...state.messages, [sessionId]: payload.messages },
+    toolCalls: { ...state.toolCalls, [sessionId]: restoredToolCalls(payload) },
+    sessionUsage: payload.sessionUsage
+      ? { ...state.sessionUsage, [sessionId]: payload.sessionUsage }
+      : dropRecordKey(state.sessionUsage, sessionId),
+    plans:
+      payload.plan !== undefined
+        ? payload.plan.length > 0
+          ? { ...state.plans, [sessionId]: payload.plan }
+          : dropPlanForSession(state.plans, sessionId)
+        : state.plans,
+    historyBackfill: {
+      ...state.historyBackfill,
+      [sessionId]: backfillStateFromProgress(progress)
+    }
+  }
+}
+
+function updateHistoryProgress(
+  set: TurnEndSetter,
+  sessionId: SessionId,
+  progress: HistoryPageProgress
+): void {
+  set((state) => {
+    const current = state.historyBackfill[sessionId]
+    if (
+      current &&
+      current.loading === !progress.complete &&
+      current.complete === progress.complete &&
+      current.loadedRecordCount === progress.loadedRecordCount &&
+      current.nextCursor === progress.nextCursor &&
+      current.targetLastSeq === progress.targetLastSeq &&
+      current.errorCode === undefined
+    ) {
+      return {}
+    }
+    return {
+      historyBackfill: {
+        ...state.historyBackfill,
+        [sessionId]: backfillStateFromProgress(progress)
+      }
+    }
+  })
+}
+
+function historyBackfillErrorCode(error: unknown): string {
+  if (typeof error !== 'object' || error === null || !('code' in error)) return 'TRANSPORT_ERROR'
+  const code = typeof error.code === 'string' ? error.code : ''
+  return code && /^[A-Z0-9_]+$|^[a-z][a-z_]*$/.test(code) && code.length <= 64
+    ? code
+    : 'TRANSPORT_ERROR'
+}
+
+function safeHistorySessionIdForLog(sessionId: string): string {
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(sessionId) ? sessionId : '[redacted]'
+}
+
+function rehydratePlanFromHistoryIfNeeded(
+  get: () => AcpState,
+  set: TurnEndSetter,
+  sessionId: SessionId,
+  payload: SessionPayload
+): void {
+  // An explicit canonical PlanUpdate replacement, including `entries: []`, is authoritative and
+  // must never be overwritten by an older renderer-authored termul-plan fence.
+  if (payload.plan !== undefined || get().plans[sessionId]) return
+  const rehydrated = scanPlanFenceFromMessages(payload.messages)
+  if (rehydrated && rehydrated.length > 0) {
+    set((state) => ({ plans: { ...state.plans, [sessionId]: rehydrated } }))
+    return
+  }
+
+  let lastAgent: ChatMessage | undefined
+  for (let index = payload.messages.length - 1; index >= 0; index -= 1) {
+    if (payload.messages[index].role === 'agent') {
+      lastAgent = payload.messages[index]
+      break
+    }
+  }
+  const hasMalformedFence =
+    lastAgent?.blocks.some(
+      (block) => block.type === 'text' && extractTermulPlanFenceJson(block.text) !== null
+    ) ?? false
+  if (hasMalformedFence) {
+    void logFrontendError({
+      level: 'warn',
+      source: 'planRehydrate',
+      message: `Malformed termul-plan fence in history session ${safeHistorySessionIdForLog(sessionId)}; leaving plans empty`
+    })
+  }
+}
+
 async function openHistorySessionInner(
   get: () => AcpState,
   set: TurnEndSetter,
@@ -2409,29 +2527,9 @@ async function openHistorySessionInner(
           worktreeBranch: meta.worktreeBranch
         }
       },
-      // Install page one immediately, then replace these arrays atomically with each assembled
-      // prefix. Never clear an installed prefix while a later request is in flight or retrying.
-      messages: { ...s.messages, [id]: nextPayload.messages },
-      toolCalls: { ...s.toolCalls, [id]: restoredToolCalls(nextPayload) },
-      sessionUsage: nextPayload.sessionUsage
-        ? { ...s.sessionUsage, [id]: nextPayload.sessionUsage }
-        : dropRecordKey(s.sessionUsage, id),
-      plans:
-        nextPayload.plan !== undefined
-          ? nextPayload.plan.length > 0
-            ? { ...s.plans, [id]: nextPayload.plan }
-            : dropPlanForSession(s.plans, id)
-          : s.plans,
-      historyBackfill: {
-        ...s.historyBackfill,
-        [id]: {
-          loading: !progress.complete,
-          complete: progress.complete,
-          loadedRecordCount: progress.loadedRecordCount,
-          nextCursor: progress.nextCursor,
-          targetLastSeq: progress.targetLastSeq
-        }
-      }
+      // Page one is visible before page two. Later pages update cursor/count only; a single
+      // retained snapshot is installed on failure and one final replacement lands on completion.
+      ...installHistoryProjection(s, id, nextPayload, progress)
     }))
     if (!installedFirstPage) {
       installedFirstPage = true
@@ -2443,16 +2541,14 @@ async function openHistorySessionInner(
   try {
     payload = await loadSessionPayload(id, {
       metadata: indexMetadata,
-      onPage: installPage
+      onPage: installPage,
+      onProgress: (progress) => {
+        if (deletedMidOpen() || !isCurrentSessionReopen(id, reopenGeneration)) return
+        updateHistoryProgress(set, id, progress)
+      }
     })
   } catch (error) {
-    const code =
-      typeof error === 'object' &&
-      error !== null &&
-      'code' in error &&
-      typeof error.code === 'string'
-        ? error.code
-        : 'TRANSPORT_ERROR'
+    const code = historyBackfillErrorCode(error)
     set((s) => {
       const current = s.historyBackfill[id]
       if (!current) return {}
@@ -2482,35 +2578,8 @@ async function openHistorySessionInner(
   }
   const meta = payload.metadata
 
-  // Rehydrate the sticky plan from the latest assistant message's
-  // `termul-plan` fence (single source of truth). Scans the payload messages
-  // (not the trimmed live window) so the fence is found even when the
-  // trimming boundary lands on the snapshot carrier. Skip silently when a
-  // live `plans[id]` already exists from an in-flight turn — the live plan
-  // owns the active turn; the fence only rehydrates a closed/reopened chat.
-  if (!get().plans[id]) {
-    const rehydrated = scanPlanFenceFromMessages(payload.messages)
-    if (rehydrated && rehydrated.length > 0) {
-      set((s) => ({ plans: { ...s.plans, [id]: rehydrated } }))
-    } else {
-      // Detect a malformed fence (fence present but JSON unparseable / not an
-      // array / empty after coercion) and warn so a corrupted snapshot is
-      // visible without crashing the rehydrate. Leave `plans[id]` empty so
-      // the agent can still emit a fresh plan.
-      const lastAgent = [...payload.messages].reverse().find((m) => m.role === 'agent')
-      const hasMalformedFence =
-        lastAgent?.blocks.some(
-          (b) => b.type === 'text' && extractTermulPlanFenceJson(b.text) !== null
-        ) ?? false
-      if (hasMalformedFence) {
-        void logFrontendError({
-          level: 'warn',
-          source: 'planRehydrate',
-          message: `Malformed termul-plan fence in history session ${id}; leaving plans empty`
-        })
-      }
-    }
-  }
+  // Legacy fences are a fallback only when canonical history contains no PlanUpdate at all.
+  rehydratePlanFromHistoryIfNeeded(get, set, id, payload)
 
   // A detached or suspended canonical Conversation is intentionally history-only. The host
   // projects both states as a closed Conversation-backed row: install its durable transcript, but
@@ -2676,6 +2745,88 @@ async function openHistorySessionInner(
     }
   }
   // 'local' → nothing more; the transcript is already shown.
+}
+
+async function retryHistoryBackfillInner(
+  get: () => AcpState,
+  set: TurnEndSetter,
+  sessionId: SessionId
+): Promise<void> {
+  const initial = get().historyBackfill[sessionId]
+  if (!initial || initial.complete) return
+  const metadata = get().sessionIndex.find((entry) => entry.id === sessionId)
+  if (!metadata || !get().sessions[sessionId]) {
+    throw Object.assign(new Error('history session is unavailable'), {
+      code: 'CONVERSATION_NOT_FOUND'
+    })
+  }
+  const stillPresent = (): boolean =>
+    Boolean(get().sessions[sessionId] && get().sessionIndex.some((entry) => entry.id === sessionId))
+
+  set((state) => {
+    const current = state.historyBackfill[sessionId]
+    if (!current || current.complete) return {}
+    const { errorCode: _errorCode, ...retained } = current
+    return {
+      historyBackfill: {
+        ...state.historyBackfill,
+        [sessionId]: { ...retained, loading: true }
+      }
+    }
+  })
+
+  let payload: SessionPayload | null
+  try {
+    payload = await loadSessionPayload(sessionId, {
+      metadata,
+      onPage: (nextPayload, progress) => {
+        if (!stillPresent()) return
+        rebaseSeqCounter(maxPayloadSeq(nextPayload))
+        set((state) => installHistoryProjection(state, sessionId, nextPayload, progress))
+      },
+      onProgress: (progress) => {
+        if (stillPresent()) updateHistoryProgress(set, sessionId, progress)
+      }
+    })
+  } catch (error) {
+    if (stillPresent()) {
+      const code = historyBackfillErrorCode(error)
+      set((state) => {
+        const current = state.historyBackfill[sessionId]
+        if (!current) return {}
+        return {
+          historyBackfill: {
+            ...state.historyBackfill,
+            [sessionId]: { ...current, loading: false, complete: false, errorCode: code }
+          }
+        }
+      })
+    }
+    throw error
+  }
+  if (!stillPresent()) return
+  if (!payload) {
+    const error = Object.assign(new Error('history session is unavailable'), {
+      code: 'CONVERSATION_NOT_FOUND'
+    })
+    set((state) => {
+      const current = state.historyBackfill[sessionId]
+      if (!current) return {}
+      return {
+        historyBackfill: {
+          ...state.historyBackfill,
+          [sessionId]: {
+            ...current,
+            loading: false,
+            complete: false,
+            errorCode: 'CONVERSATION_NOT_FOUND'
+          }
+        }
+      }
+    })
+    throw error
+  }
+  rehydratePlanFromHistoryIfNeeded(get, set, sessionId, payload)
 }
 
 /**
@@ -4341,6 +4492,19 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     })()
     inFlightHistoryOpens.set(id, { generation: reopenGeneration, promise: task })
     set((s) => ({ openingHistoryIds: { ...s.openingHistoryIds, [id]: true } }))
+    return task
+  },
+
+  retryHistoryBackfill: async (id) => {
+    const existing = inFlightHistoryBackfillRetries.get(id)
+    if (existing) return existing
+    let task!: Promise<void>
+    task = retryHistoryBackfillInner(get, set, id).finally(() => {
+      if (inFlightHistoryBackfillRetries.get(id) === task) {
+        inFlightHistoryBackfillRetries.delete(id)
+      }
+    })
+    inFlightHistoryBackfillRetries.set(id, task)
     return task
   },
 

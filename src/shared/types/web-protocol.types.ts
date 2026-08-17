@@ -357,6 +357,8 @@ export const CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION = 1 as const
 export const CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION = 1 as const
 export const MIN_CONVERSATION_HISTORY_PAGE_LIMIT = 1 as const
 export const MAX_CONVERSATION_HISTORY_PAGE_LIMIT = 1_000 as const
+export const MAX_CONVERSATION_HISTORY_RECORD_BYTES = 256 * 1024
+export const MAX_CONVERSATION_HISTORY_PAGE_BYTES = 4 * 1024 * 1024
 
 /** Stable renderer-facing event dialect carried in bounded history pages. */
 export interface ConversationHistoryRecordV1 {
@@ -381,6 +383,8 @@ export interface GetSessionPayloadPageRequest {
   sessionId: string
   afterSeq: number
   limit: number
+  /** First-page frontier echoed unchanged on every continuation request. */
+  targetLastSeq?: number
 }
 
 export class ConversationHistoryPageValidationError extends Error {
@@ -401,7 +405,11 @@ function isHistoryCursor(value: unknown): value is number {
 }
 
 /** Validate cursor/limit before a transport request or page-sized allocation is created. */
-export function assertConversationHistoryPageRequest(afterSeq: number, limit: number): void {
+export function assertConversationHistoryPageRequest(
+  afterSeq: number,
+  limit: number,
+  targetLastSeq?: number
+): void {
   if (!isHistoryCursor(afterSeq)) {
     historyValidationFailure('history afterSeq must be a non-negative safe integer')
   }
@@ -412,6 +420,57 @@ export function assertConversationHistoryPageRequest(afterSeq: number, limit: nu
   ) {
     historyValidationFailure('history limit must be an integer between 1 and 1000')
   }
+  if (targetLastSeq !== undefined) {
+    if (!isHistoryCursor(targetLastSeq)) {
+      historyValidationFailure('history targetLastSeq must be a non-negative safe integer')
+    }
+    if (afterSeq > targetLastSeq) {
+      historyValidationFailure('history afterSeq must not exceed targetLastSeq')
+    }
+  }
+}
+
+const conversationHistoryEncoder = new TextEncoder()
+
+function encodedHistoryJsonBytes(value: unknown, label: string): number {
+  let json: string | undefined
+  try {
+    json = JSON.stringify(value)
+  } catch {
+    historyValidationFailure(`${label} must be serializable JSON`)
+  }
+  if (json === undefined) historyValidationFailure(`${label} must be serializable JSON`)
+  return conversationHistoryEncoder.encode(json).byteLength
+}
+
+/**
+ * Measure one decoded page without constructing a second full-page JSON string. Records are
+ * measured individually and rejected at the canonical 256 KiB record / 4 MiB page bounds before
+ * the renderer accumulator or live store can publish them.
+ */
+export function conversationHistoryPageEncodedBytes(page: ConversationHistoryPageV1): number {
+  const envelopeBytes = encodedHistoryJsonBytes(
+    {
+      schemaVersion: page.schemaVersion,
+      records: [],
+      nextCursor: page.nextCursor,
+      complete: page.complete,
+      targetLastSeq: page.targetLastSeq
+    },
+    'history page'
+  )
+  let totalBytes = envelopeBytes
+  for (let index = 0; index < page.records.length; index += 1) {
+    const recordBytes = encodedHistoryJsonBytes(page.records[index], 'history record')
+    if (recordBytes > MAX_CONVERSATION_HISTORY_RECORD_BYTES) {
+      historyValidationFailure('history record exceeds the 256 KiB encoded limit')
+    }
+    totalBytes += recordBytes + (index === 0 ? 0 : 1)
+    if (totalBytes > MAX_CONVERSATION_HISTORY_PAGE_BYTES) {
+      historyValidationFailure('history page exceeds the 4 MiB encoded limit')
+    }
+  }
+  return totalBytes
 }
 
 /**
@@ -427,7 +486,7 @@ export function assertConversationHistoryPage(
     targetLastSeq?: number
   }
 ): asserts page is ConversationHistoryPageV1 {
-  assertConversationHistoryPageRequest(expected.afterSeq, expected.limit)
+  assertConversationHistoryPageRequest(expected.afterSeq, expected.limit, expected.targetLastSeq)
   if (!expected.sessionId.trim()) historyValidationFailure('history sessionId must be non-empty')
   if (typeof page !== 'object' || page === null) {
     historyValidationFailure('history page must be an object')

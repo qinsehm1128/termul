@@ -41,15 +41,19 @@ export const acpHistoryApi = {
   async getPage(
     sessionId: string,
     afterSeq: number,
-    limit: number
+    limit: number,
+    targetLastSeq?: number
   ): Promise<ConversationHistoryPageV1> {
-    assertConversationHistoryPageRequest(afterSeq, limit)
-    const page = await invokeHistory<ConversationHistoryPageV1>('acp_history_get_page', {
-      sessionId,
-      afterSeq,
-      limit
-    })
-    assertConversationHistoryPage(page, { sessionId, afterSeq, limit })
+    assertConversationHistoryPageRequest(afterSeq, limit, targetLastSeq)
+    const args: {
+      sessionId: string
+      afterSeq: number
+      limit: number
+      targetLastSeq?: number
+    } = { sessionId, afterSeq, limit }
+    if (targetLastSeq !== undefined) args.targetLastSeq = targetLastSeq
+    const page = await invokeHistory<ConversationHistoryPageV1>('acp_history_get_page', args)
+    assertConversationHistoryPage(page, { sessionId, afterSeq, limit, targetLastSeq })
     return page
   },
 

@@ -58,18 +58,30 @@ describe('acpHistoryApi command contract', () => {
     expect(invoke).toHaveBeenCalledWith(command, args)
   })
 
-  it('getPage invokes the exact command/args and returns the exact page unchanged', async () => {
+  it('getPage omits the target on page one and returns the exact page identity', async () => {
     vi.mocked(invoke).mockResolvedValueOnce({ success: true, data: page })
 
-    const result = await acpHistoryApi.getPage('s-1', 17, 250)
+    const result = await acpHistoryApi.getPage('s-1', 0, 250)
 
     expect(invoke).toHaveBeenCalledTimes(1)
     expect(invoke).toHaveBeenCalledWith('acp_history_get_page', {
       sessionId: 's-1',
-      afterSeq: 17,
+      afterSeq: 0,
       limit: 250
     })
     expect(result).toBe(page)
+  })
+
+  it('getPage forwards the exact pinned targetLastSeq on continuation pages', async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({ success: true, data: page })
+
+    await expect(acpHistoryApi.getPage('s-1', 17, 250, 42)).resolves.toBe(page)
+    expect(invoke).toHaveBeenCalledWith('acp_history_get_page', {
+      sessionId: 's-1',
+      afterSeq: 17,
+      limit: 250,
+      targetLastSeq: 42
+    })
   })
 
   it('getPage preserves structured CONVERSATION_HISTORY_PAGING_REQUIRED failures', async () => {
@@ -95,8 +107,14 @@ describe('acpHistoryApi command contract', () => {
     await expect(acpHistoryApi.getPage('s-1', 17, 250)).rejects.toBe(rejection)
   })
 
-  it('getPage rejects invalid bounds before invoking', async () => {
+  it('getPage rejects invalid bounds and targets before invoking', async () => {
     await expect(acpHistoryApi.getPage('s-1', 0, 0)).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR'
+    })
+    await expect(acpHistoryApi.getPage('s-1', 17, 250, 16)).rejects.toMatchObject({
+      code: 'VALIDATION_ERROR'
+    })
+    await expect(acpHistoryApi.getPage('s-1', 17, 250, Number.NaN)).rejects.toMatchObject({
       code: 'VALIDATION_ERROR'
     })
     expect(invoke).not.toHaveBeenCalled()

@@ -114,7 +114,7 @@ function historyRecord(sessionId: string, seq: number, type: string, recordPaylo
 }
 
 function historyPage(
-  sessionId: string,
+  _sessionId: string,
   records: ReturnType<typeof historyRecord>[],
   targetLastSeq: number,
   complete = records.at(-1)?.seq === targetLastSeq
@@ -527,44 +527,169 @@ describe('payload restore helpers', () => {
 })
 
 describe('progressive bounded history assembly', () => {
-  it('installs the first 250 records before requesting page two and completes in order', async () => {
-    const sessionId = 'progressive'
-    const records = Array.from({ length: 500 }, (_, index) =>
-      historyRecord(sessionId, index + 1, 'user_prompt', {
-        turnId: `turn-${index + 1}`,
-        content: [{ type: 'text', text: `message-${index + 1}` }]
-      })
+  it('assembles the real 50,000-record / 200-page path linearly with bounded snapshots', async () => {
+    const sessionId = 'progressive-50k'
+    const targetLastSeq = 50_000
+    mockHistoryApi.getPage.mockImplementation(
+      async (_id, afterSeq: number, limit: number, target?: number) => {
+        expect(limit).toBe(RENDERER_HISTORY_PAGE_SIZE)
+        expect(target).toBe(afterSeq === 0 ? undefined : targetLastSeq)
+        const count = Math.min(limit, targetLastSeq - afterSeq)
+        const records = Array.from({ length: count }, (_, index) => {
+          const seq = afterSeq + index + 1
+          return historyRecord(sessionId, seq, 'user_prompt', {
+            turnId: `turn-${seq}`,
+            content: [{ type: 'text', text: `message-${seq}` }]
+          })
+        })
+        return historyPage(sessionId, records, targetLastSeq)
+      }
     )
-    mockHistoryApi.getPage.mockImplementation(async (_id, afterSeq, limit) => {
-      expect(limit).toBe(RENDERER_HISTORY_PAGE_SIZE)
-      const pageRecords = records.filter((record) => record.seq > afterSeq).slice(0, limit)
-      return historyPage(sessionId, pageRecords, 500)
-    })
-    const progress: Array<{ loaded: number; messages: number; complete: boolean }> = []
+    const snapshots: Array<{ loaded: number; messages: number; complete: boolean }> = []
+    const progressCounts: number[] = []
 
     const result = await loadSessionPayload(sessionId, {
-      metadata: entry(sessionId, { lastSeq: 500, messageCount: 500 }),
+      metadata: entry(sessionId, { lastSeq: targetLastSeq, messageCount: targetLastSeq }),
       onPage: async (current, state) => {
-        progress.push({
+        snapshots.push({
           loaded: state.loadedRecordCount,
           messages: current.messages.length,
           complete: state.complete
         })
         if (state.pageNumber === 1) {
+          // Page one is installed and awaited before the traversal can request page two.
           expect(mockHistoryApi.getPage).toHaveBeenCalledTimes(1)
         }
-      }
+      },
+      onProgress: (state) => progressCounts.push(state.loadedRecordCount)
     })
 
-    expect(progress).toEqual([
+    expect(snapshots).toEqual([
       { loaded: 250, messages: 250, complete: false },
-      { loaded: 500, messages: 500, complete: true }
+      { loaded: 50_000, messages: 50_000, complete: true }
     ])
-    expect(result?.messages.map((message) => message.seq)).toEqual(
-      Array.from({ length: 500 }, (_, index) => index + 1)
+    expect(progressCounts).toHaveLength(200)
+    expect(progressCounts[0]).toBe(250)
+    expect(progressCounts.at(-1)).toBe(50_000)
+    expect(result?.messages).toHaveLength(50_000)
+    for (let index = 0; index < 50_000; index += 1) {
+      expect(result?.messages[index].seq).toBe(index + 1)
+    }
+    expect(mockHistoryApi.getPage).toHaveBeenCalledTimes(200)
+    const metrics = historyPagingMetrics()
+    expect(metrics).toMatchObject({
+      traversalStarts: 1,
+      pageRequests: 200,
+      pageApplications: 200,
+      recordApplications: 50_000,
+      transcriptEntriesCopied: 50_250,
+      toolIndexLookups: 0,
+      snapshotsCreated: 2,
+      currentBytes: 0
+    })
+    expect(metrics.transcriptEntriesCopied).toBeLessThanOrEqual(100_000)
+    expect(metrics.peakBytes).toBeGreaterThan(0)
+    expect(metrics.peakBytes).toBeLessThanOrEqual(MAX_HISTORY_IN_FLIGHT_BYTES)
+  })
+
+  it('deduplicates the whole traversal and replays shared snapshot/progress to concurrent callers', async () => {
+    const sessionId = 'whole-load-flight'
+    let releasePageTwo!: () => void
+    const pageTwoGate = new Promise<void>((resolve) => {
+      releasePageTwo = resolve
+    })
+    mockHistoryApi.getPage.mockImplementation(
+      async (_id, afterSeq: number, limit: number, targetLastSeq?: number) => {
+        expect(targetLastSeq).toBe(afterSeq === 0 ? undefined : 500)
+        if (afterSeq === 250) await pageTwoGate
+        const records = Array.from({ length: Math.min(limit, 500 - afterSeq) }, (_, index) => {
+          const seq = afterSeq + index + 1
+          return historyRecord(sessionId, seq, 'user_prompt', {
+            content: [{ type: 'text', text: `message-${seq}` }]
+          })
+        })
+        return historyPage(sessionId, records, 500)
+      }
     )
-    expect(historyPagingMetrics().peakBytes).toBeGreaterThan(0)
-    expect(historyPagingMetrics().peakBytes).toBeLessThanOrEqual(MAX_HISTORY_IN_FLIGHT_BYTES)
+    const firstSnapshots: number[] = []
+    const secondSnapshots: number[] = []
+    const first = loadSessionPayload(sessionId, {
+      metadata: entry(sessionId),
+      onPage: (payload) => firstSnapshots.push(payload.messages.length)
+    })
+    await vi.waitFor(() => expect(firstSnapshots).toEqual([250]))
+
+    const second = loadSessionPayload(sessionId, {
+      metadata: entry(sessionId),
+      onPage: (payload) => secondSnapshots.push(payload.messages.length)
+    })
+    await vi.waitFor(() => expect(secondSnapshots).toEqual([250]))
+    expect(mockHistoryApi.getPage.mock.calls.map(([, afterSeq]) => afterSeq)).toEqual([0, 250])
+
+    releasePageTwo()
+    const [firstResult, secondResult] = await Promise.all([first, second])
+    expect(firstResult).toBe(secondResult)
+    expect(firstSnapshots).toEqual([250, 500])
+    expect(secondSnapshots).toEqual([250, 500])
+    expect(mockHistoryApi.getPage.mock.calls.map(([, afterSeq]) => afterSeq)).toEqual([0, 250])
+    expect(historyPagingMetrics()).toMatchObject({ traversalStarts: 1, pageRequests: 2 })
+  })
+
+  it('keeps the first frontier pinned across concurrent appends on Desktop pages', async () => {
+    const sessionId = 'active-append'
+    let currentLastSeq = 500
+    mockHistoryApi.getPage.mockImplementation(
+      async (_id, afterSeq: number, limit: number, targetLastSeq?: number) => {
+        const pinnedTarget = targetLastSeq ?? currentLastSeq
+        expect(pinnedTarget).toBe(500)
+        const records = Array.from(
+          { length: Math.min(limit, pinnedTarget - afterSeq) },
+          (_, index) => {
+            const seq = afterSeq + index + 1
+            return historyRecord(sessionId, seq, 'user_prompt', {
+              content: [{ type: 'text', text: `message-${seq}` }]
+            })
+          }
+        )
+        if (afterSeq === 0) currentLastSeq = 750
+        return historyPage(sessionId, records, pinnedTarget)
+      }
+    )
+
+    const result = await loadSessionPayload(sessionId, { metadata: entry(sessionId) })
+
+    expect(result?.metadata.lastSeq).toBe(500)
+    expect(result?.messages).toHaveLength(500)
+    expect(mockHistoryApi.getPage.mock.calls).toEqual([
+      [sessionId, 0, RENDERER_HISTORY_PAGE_SIZE, undefined],
+      [sessionId, 250, RENDERER_HISTORY_PAGE_SIZE, 500]
+    ])
+  })
+
+  it('uses one O(1) tool id lookup per tool record without linear scans', async () => {
+    const sessionId = 'tool-index'
+    const targetLastSeq = 10_000
+    mockHistoryApi.getPage.mockImplementation(async (_id, afterSeq: number, limit: number) => {
+      const records = Array.from(
+        { length: Math.min(limit, targetLastSeq - afterSeq) },
+        (_, index) => {
+          const seq = afterSeq + index + 1
+          return historyRecord(sessionId, seq, 'tool_call', {
+            toolCall: { toolCallId: `tool-${seq}`, status: 'completed' }
+          })
+        }
+      )
+      return historyPage(sessionId, records, targetLastSeq)
+    })
+
+    const result = await loadSessionPayload(sessionId, { metadata: entry(sessionId) })
+
+    expect(result?.toolCalls).toHaveLength(targetLastSeq)
+    expect(historyPagingMetrics()).toMatchObject({
+      recordApplications: targetLastSeq,
+      toolIndexLookups: targetLastSeq,
+      pageRequests: 40
+    })
   })
 
   it('preserves message/tool/usage/plan semantics across page boundaries', async () => {
@@ -585,7 +710,7 @@ describe('progressive bounded history assembly', () => {
             toolCall: { toolCallId: 'tool-1', status: 'in_progress' }
           })
         ],
-        7,
+        10,
         false
       ),
       historyPage(
@@ -605,12 +730,20 @@ describe('progressive bounded history assembly', () => {
           }),
           historyRecord(sessionId, 7, 'plan_update', {
             plan: { entries: [{ content: 'ship', status: 'in_progress' }] }
+          }),
+          historyRecord(sessionId, 8, 'usage_update', {
+            used: 0,
+            size: 100
+          }),
+          historyRecord(sessionId, 9, 'plan_update', {
+            plan: { entries: [] }
           })
         ],
-        7,
-        true
+        10,
+        false
       )
     ]
+    pages[1] = { ...pages[1], nextCursor: 10, complete: true }
     mockHistoryApi.getPage.mockImplementation(async (_id, afterSeq) =>
       afterSeq === 0 ? pages[0] : pages[1]
     )
@@ -621,10 +754,15 @@ describe('progressive bounded history assembly', () => {
     expect(result?.toolCalls).toEqual([
       expect.objectContaining({ toolCallId: 'tool-1', status: 'completed', seq: 3, timestamp: 3 })
     ])
-    expect(result?.sessionUsage).toEqual(
-      expect.objectContaining({ used: 10, size: 100, baselineUsed: 10, updatedAt: 6 })
-    )
-    expect(result?.plan).toEqual([{ content: 'ship', status: 'in_progress' }])
+    expect(result?.sessionUsage).toEqual({
+      used: 0,
+      size: 100,
+      baselineUsed: 10,
+      updatedAt: 8,
+      source: 'reported'
+    })
+    expect(result).toHaveProperty('plan', [])
+    expect(result?.metadata.lastSeq).toBe(10)
   })
 
   it('retains installed pages after a transient failure and resumes from the failed cursor', async () => {
@@ -675,7 +813,71 @@ describe('progressive bounded history assembly', () => {
       'retained',
       'completed'
     ])
-    expect(mockHistoryApi.getPage.mock.calls.map(([, afterSeq]) => afterSeq)).toEqual([0, 1, 1])
+    expect(
+      mockHistoryApi.getPage.mock.calls.map(([, afterSeq, , targetLastSeq]) => [
+        afterSeq,
+        targetLastSeq
+      ])
+    ).toEqual([
+      [0, undefined],
+      [1, 2],
+      [1, 2]
+    ])
+  })
+
+  it('retains the pinned prefix after a stable later-page failure and retries its exact cursor', async () => {
+    const sessionId = 'stable-retry'
+    let pageTwoAttempts = 0
+    mockHistoryApi.getPage.mockImplementation(async (_id, afterSeq) => {
+      if (afterSeq === 0) {
+        return historyPage(
+          sessionId,
+          [
+            historyRecord(sessionId, 1, 'user_prompt', {
+              content: [{ type: 'text', text: 'retained' }]
+            })
+          ],
+          2,
+          false
+        )
+      }
+      pageTwoAttempts += 1
+      if (pageTwoAttempts === 1) {
+        throw Object.assign(new Error('pinned history frontier is temporarily unavailable'), {
+          code: 'stale'
+        })
+      }
+      return historyPage(
+        sessionId,
+        [
+          historyRecord(sessionId, 2, 'user_prompt', {
+            content: [{ type: 'text', text: 'completed' }]
+          })
+        ],
+        2,
+        true
+      )
+    })
+
+    await expect(
+      loadSessionPayload(sessionId, { metadata: entry(sessionId) })
+    ).rejects.toMatchObject({ code: 'stale' })
+    const result = await loadSessionPayload(sessionId, { metadata: entry(sessionId) })
+
+    expect(result?.messages.map((message) => message.blocks[0]?.text)).toEqual([
+      'retained',
+      'completed'
+    ])
+    expect(
+      mockHistoryApi.getPage.mock.calls.map(([, afterSeq, , targetLastSeq]) => [
+        afterSeq,
+        targetLastSeq
+      ])
+    ).toEqual([
+      [0, undefined],
+      [1, 2],
+      [1, 2]
+    ])
   })
 
   it('rejects an oversized page without exceeding the 4 MiB retained-byte metric', async () => {
@@ -852,7 +1054,12 @@ describe('bounded full-payload cache', () => {
     )
     const reloaded = await loadSessionPayload('s-0')
     expect(reloaded?.messages[0].blocks[0]?.text).toBe('reloaded')
-    expect(mockHistoryApi.getPage).toHaveBeenCalledWith('s-0', 0, RENDERER_HISTORY_PAGE_SIZE)
+    expect(mockHistoryApi.getPage).toHaveBeenCalledWith(
+      's-0',
+      0,
+      RENDERER_HISTORY_PAGE_SIZE,
+      undefined
+    )
     expect(mockHistoryApi.get).not.toHaveBeenCalled()
   })
 

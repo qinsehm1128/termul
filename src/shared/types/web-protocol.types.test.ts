@@ -6,8 +6,11 @@ import {
   CONVERSATION_APPLICATION_ERROR_CODES,
   type ConversationHistoryPageV1,
   ConversationHistoryPageValidationError,
+  conversationHistoryPageEncodedBytes,
+  type GetSessionPayloadPageRequest,
   isHumanRelayedCap,
   isOsFulfilledCap,
+  MAX_CONVERSATION_HISTORY_PAGE_BYTES,
   MAX_CONVERSATION_HISTORY_PAGE_LIMIT,
   type ReliabilityTier,
   WS_ERROR_CODES,
@@ -148,10 +151,31 @@ describe('web-protocol.types — bounded history page contract', () => {
     targetLastSeq: 42
   }
 
-  it('pins exact camelCase request/result casing and unchanged record payloads', () => {
-    const request = { sessionId: 's-1', afterSeq: 17, limit: 250 }
-    assertConversationHistoryPageRequest(request.afterSeq, request.limit)
-    assertConversationHistoryPage(page, request)
+  it('pins first-page omission, continuation target, exact camelCase result, and payload identity', () => {
+    const firstRequest: GetSessionPayloadPageRequest = {
+      sessionId: 's-1',
+      afterSeq: 0,
+      limit: 250
+    }
+    const continuationRequest: GetSessionPayloadPageRequest = {
+      sessionId: 's-1',
+      afterSeq: 17,
+      limit: 250,
+      targetLastSeq: 42
+    }
+    expect(firstRequest).not.toHaveProperty('targetLastSeq')
+    expect(continuationRequest).toEqual({
+      sessionId: 's-1',
+      afterSeq: 17,
+      limit: 250,
+      targetLastSeq: 42
+    })
+    assertConversationHistoryPageRequest(
+      continuationRequest.afterSeq,
+      continuationRequest.limit,
+      continuationRequest.targetLastSeq
+    )
+    assertConversationHistoryPage(page, continuationRequest)
     expect(CONVERSATION_APPLICATION_ERROR_CODES).toContain('CONVERSATION_HISTORY_PAGING_REQUIRED')
     expect(page).toEqual({
       schemaVersion: 1,
@@ -186,6 +210,53 @@ describe('web-protocol.types — bounded history page contract', () => {
     expect(() => assertConversationHistoryPageRequest(afterSeq, 250)).toThrow(
       ConversationHistoryPageValidationError
     )
+  })
+
+  it.each([
+    -1,
+    1.5,
+    Number.POSITIVE_INFINITY
+  ])('rejects invalid targetLastSeq %s before transport allocation', (targetLastSeq) => {
+    expect(() => assertConversationHistoryPageRequest(0, 250, targetLastSeq)).toThrow(
+      ConversationHistoryPageValidationError
+    )
+  })
+
+  it('accepts canonical cursor gaps whose payload-free markers still advance nextCursor', () => {
+    const gapped: ConversationHistoryPageV1 = {
+      schemaVersion: 1,
+      records: [
+        { ...page.records[0], seq: 18 },
+        { ...page.records[0], seq: 20, recordedAt: 20 }
+      ],
+      nextCursor: 21,
+      complete: true,
+      targetLastSeq: 21
+    }
+    expect(() =>
+      assertConversationHistoryPage(gapped, {
+        sessionId: 's-1',
+        afterSeq: 17,
+        limit: 250,
+        targetLastSeq: 21
+      })
+    ).not.toThrow()
+  })
+
+  it('rejects a decoded page above the exact 4 MiB bound before publication', () => {
+    const oversized: ConversationHistoryPageV1 = {
+      schemaVersion: 1,
+      records: [
+        {
+          ...page.records[0],
+          payload: { text: 'x'.repeat(MAX_CONVERSATION_HISTORY_PAGE_BYTES) }
+        }
+      ],
+      nextCursor: 18,
+      complete: true,
+      targetLastSeq: 18
+    }
+    expect(() => conversationHistoryPageEncodedBytes(oversized)).toThrow(/encoded limit/)
   })
 
   it('rejects cross-session pages, cursor regression, target drift, and invalid completion', () => {
