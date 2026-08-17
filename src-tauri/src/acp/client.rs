@@ -19,10 +19,11 @@ use agent_client_protocol::schema::v1::{
 
 use crate::acp::config::AgentId;
 use crate::acp::events::{
-    self, ChunkRole, CommandsUpdateEvent, ConfigOptionsUpdateEvent, FanOutError, FanOutReceipt,
+    self, ChunkRole, CommandsUpdateEvent, ConfigOptionsUpdateEvent, DeliveryError, DeliveryReceipt,
     MessageChunkEvent, ModeUpdateEvent, PlanUpdateEvent, SessionInfoUpdateEvent, ToolCallEvent,
     ToolCallUpdateEvent, UsageCostEvent, UsageUpdateEvent,
 };
+use crate::conversation::ConversationPersistenceAdapter;
 use crate::web::EventSink;
 
 /// Cursor ACP extension: when present on `clientCapabilities._meta`, Cursor
@@ -184,11 +185,12 @@ pub async fn handle_write_text_file(
 /// payload struct is built first and then borrowed, so `session_id` moves into
 /// the struct once and the `sid` borrows from it — no extra clone, no borrow
 /// conflict (serialize-once-fan-out-N is preserved by [`events::fan_out`]).
-pub fn emit_session_update(
+pub async fn emit_session_update(
     sinks: &[Arc<dyn EventSink>],
+    persistence: Option<&ConversationPersistenceAdapter>,
     agent_id: &AgentId,
     notification: SessionNotification,
-) -> Result<FanOutReceipt, FanOutError> {
+) -> Result<DeliveryReceipt, DeliveryError> {
     let session_id = crate::acp::config::SessionId::from(notification.session_id);
 
     match notification.update {
@@ -199,42 +201,31 @@ pub fn emit_session_update(
                 role: ChunkRole::User,
                 content: chunk.content,
             };
-            return events::fan_out(
+            return events::deliver(
                 sinks,
+                persistence,
                 Some(event.session_id.0.as_str()),
                 events::EVENT_MESSAGE_CHUNK,
                 &event,
-            );
+            )
+            .await;
         }
         SessionUpdate::AgentMessageChunk(chunk) => {
-            let preview = match &chunk.content {
-                agent_client_protocol::schema::v1::ContentBlock::Text(text) => {
-                    let t: &str = text.text.as_ref();
-                    if t.chars().count() > 40 {
-                        let truncated: String = t.chars().take(40).collect();
-                        format!("{truncated}…")
-                    } else {
-                        t.to_string()
-                    }
-                }
-                other => format!("{other:?}"),
-            };
-            log::debug!(
-                "[acp] agent {agent_id} session {} agent_message_chunk: {preview}",
-                session_id.0
-            );
+            // Message/transcript content is never written to operational logs.
             let event = MessageChunkEvent {
                 agent_id: agent_id.clone(),
                 session_id,
                 role: ChunkRole::Agent,
                 content: chunk.content,
             };
-            return events::fan_out(
+            return events::deliver(
                 sinks,
+                persistence,
                 Some(event.session_id.0.as_str()),
                 events::EVENT_MESSAGE_CHUNK,
                 &event,
-            );
+            )
+            .await;
         }
         SessionUpdate::AgentThoughtChunk(chunk) => {
             let event = MessageChunkEvent {
@@ -243,12 +234,14 @@ pub fn emit_session_update(
                 role: ChunkRole::Thought,
                 content: chunk.content,
             };
-            return events::fan_out(
+            return events::deliver(
                 sinks,
+                persistence,
                 Some(event.session_id.0.as_str()),
                 events::EVENT_MESSAGE_CHUNK,
                 &event,
-            );
+            )
+            .await;
         }
         SessionUpdate::ToolCall(tool_call) => {
             let event = ToolCallEvent {
@@ -256,12 +249,14 @@ pub fn emit_session_update(
                 session_id,
                 tool_call,
             };
-            return events::fan_out(
+            return events::deliver(
                 sinks,
+                persistence,
                 Some(event.session_id.0.as_str()),
                 events::EVENT_TOOL_CALL,
                 &event,
-            );
+            )
+            .await;
         }
         SessionUpdate::ToolCallUpdate(update) => {
             let event = ToolCallUpdateEvent {
@@ -269,12 +264,14 @@ pub fn emit_session_update(
                 session_id,
                 update,
             };
-            return events::fan_out(
+            return events::deliver(
                 sinks,
+                persistence,
                 Some(event.session_id.0.as_str()),
                 events::EVENT_TOOL_CALL_UPDATE,
                 &event,
-            );
+            )
+            .await;
         }
         SessionUpdate::Plan(plan) => {
             // ACP agent-plan: each update is a full replace; forward verbatim.
@@ -284,12 +281,14 @@ pub fn emit_session_update(
                 session_id,
                 plan,
             };
-            return events::fan_out(
+            return events::deliver(
                 sinks,
+                persistence,
                 Some(event.session_id.0.as_str()),
                 events::EVENT_PLAN_UPDATE,
                 &event,
-            );
+            )
+            .await;
         }
         SessionUpdate::AvailableCommandsUpdate(update) => {
             let event = CommandsUpdateEvent {
@@ -297,12 +296,14 @@ pub fn emit_session_update(
                 session_id,
                 available_commands: update.available_commands,
             };
-            return events::fan_out(
+            return events::deliver(
                 sinks,
+                persistence,
                 Some(event.session_id.0.as_str()),
                 events::EVENT_COMMANDS_UPDATE,
                 &event,
-            );
+            )
+            .await;
         }
         SessionUpdate::CurrentModeUpdate(update) => {
             let event = ModeUpdateEvent {
@@ -311,12 +312,14 @@ pub fn emit_session_update(
                 current_mode_id: update.current_mode_id,
                 available_modes: Vec::new(),
             };
-            return events::fan_out(
+            return events::deliver(
                 sinks,
+                persistence,
                 Some(event.session_id.0.as_str()),
                 events::EVENT_MODE_UPDATE,
                 &event,
-            );
+            )
+            .await;
         }
         SessionUpdate::ConfigOptionUpdate(update) => {
             let event = ConfigOptionsUpdateEvent {
@@ -324,12 +327,14 @@ pub fn emit_session_update(
                 session_id,
                 config_options: update.config_options,
             };
-            return events::fan_out(
+            return events::deliver(
                 sinks,
+                persistence,
                 Some(event.session_id.0.as_str()),
                 events::EVENT_CONFIG_OPTIONS_UPDATE,
                 &event,
-            );
+            )
+            .await;
         }
         SessionUpdate::SessionInfoUpdate(update) => {
             // `title` is `MaybeUndefined<String>`: Undefined = not sent (skip),
@@ -342,12 +347,14 @@ pub fn emit_session_update(
                         session_id,
                         title: None,
                     };
-                    return events::fan_out(
+                    return events::deliver(
                         sinks,
+                        persistence,
                         Some(event.session_id.0.as_str()),
                         events::EVENT_SESSION_INFO_UPDATE,
                         &event,
-                    );
+                    )
+                    .await;
                 }
                 Some(Some(t)) => {
                     let event = SessionInfoUpdateEvent {
@@ -355,12 +362,14 @@ pub fn emit_session_update(
                         session_id,
                         title: Some(t.clone()),
                     };
-                    return events::fan_out(
+                    return events::deliver(
                         sinks,
+                        persistence,
                         Some(event.session_id.0.as_str()),
                         events::EVENT_SESSION_INFO_UPDATE,
                         &event,
-                    );
+                    )
+                    .await;
                 }
             }
         }
@@ -376,29 +385,24 @@ pub fn emit_session_update(
                 size: update.size,
                 cost,
             };
-            return events::fan_out(
+            return events::deliver(
                 sinks,
+                persistence,
                 Some(event.session_id.0.as_str()),
                 events::EVENT_USAGE_UPDATE,
                 &event,
-            );
+            )
+            .await;
         }
         // Any future (non_exhaustive) variants have no dedicated event;
         // ignore them — but log so a silently-dropped update can be diagnosed
         // instead of vanishing.
-        ref other => {
-            log::debug!(
-                "[acp] agent {agent_id} sent an unhandled session/update variant: {other:?}"
-            );
+        _ => {
+            log::debug!("[acp] agent {agent_id} sent an unhandled session/update variant");
         }
     }
 
-    Ok(FanOutReceipt {
-        sink_count: sinks.len(),
-        delivered_count: 0,
-        durable_admission_count: 0,
-        session_seq: None,
-    })
+    Ok(DeliveryReceipt::empty(sinks.len()))
 }
 
 #[cfg(test)]

@@ -4,6 +4,7 @@
 //! opaque external binding and is never accepted as Conversation identity or a path component.
 
 use std::fmt;
+use std::io::{self, Write};
 
 use chrono::{DateTime, Datelike, NaiveDate, SecondsFormat, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -18,6 +19,10 @@ pub const CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION: u32 = 1;
 pub const CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION: u32 = 1;
 pub const MIN_CONVERSATION_HISTORY_PAGE_LIMIT: usize = 1;
 pub const MAX_CONVERSATION_HISTORY_PAGE_LIMIT: usize = 1_000;
+/// Maximum encoded size of one canonical Conversation JSONL record, excluding its newline.
+pub const MAX_CONVERSATION_RECORD_BYTES: usize = 256 * 1024;
+/// Maximum encoded size of one renderer-facing Conversation history page.
+pub const MAX_CONVERSATION_HISTORY_PAGE_BYTES: usize = 4 * 1024 * 1024;
 
 const MACOS_EINVAL: i32 = 22;
 const MACOS_ENOTSUP: i32 = 45;
@@ -319,6 +324,8 @@ pub enum ConversationErrorCode {
     ConversationRecoveryRequired,
     ConversationDurabilityUnsupported,
     LegacyCompatibilityReadOnly,
+    ConversationRecordTooLarge,
+    ConversationPageTooLarge,
     ValidationError,
 }
 
@@ -386,12 +393,18 @@ pub enum ConversationHistoryPageValidationError {
     TargetChanged,
     CompletionMismatch,
     RecordSequenceConflict,
+    RecordTooLarge,
+    PageTooLarge,
 }
 
 impl ConversationHistoryPageValidationError {
     #[must_use]
     pub const fn stable_code(self) -> &'static str {
-        "VALIDATION_ERROR"
+        match self {
+            Self::RecordTooLarge => "CONVERSATION_RECORD_TOO_LARGE",
+            Self::PageTooLarge => "CONVERSATION_PAGE_TOO_LARGE",
+            _ => "VALIDATION_ERROR",
+        }
     }
 }
 
@@ -410,6 +423,8 @@ impl fmt::Display for ConversationHistoryPageValidationError {
             Self::TargetChanged => "history page targetLastSeq changed during traversal",
             Self::CompletionMismatch => "history page complete flag disagrees with nextCursor",
             Self::RecordSequenceConflict => "history page records are not strictly ordered",
+            Self::RecordTooLarge => "history record exceeds the 256 KiB encoded limit",
+            Self::PageTooLarge => "history page exceeds the 4 MiB encoded limit",
         };
         formatter.write_str(detail)
     }
@@ -470,10 +485,50 @@ impl ConversationHistoryPageV1 {
             if record.seq <= previous_seq || record.seq > self.next_cursor {
                 return Err(ValidationError::RecordSequenceConflict);
             }
+            if encoded_json_len_bounded(record, MAX_CONVERSATION_RECORD_BYTES).is_none() {
+                return Err(ValidationError::RecordTooLarge);
+            }
             previous_seq = record.seq;
+        }
+        if encoded_json_len_bounded(self, MAX_CONVERSATION_HISTORY_PAGE_BYTES).is_none() {
+            return Err(ValidationError::PageTooLarge);
         }
         Ok(())
     }
+}
+
+struct BoundedJsonCounter {
+    bytes: usize,
+    limit: usize,
+}
+
+impl Write for BoundedJsonCounter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let next = self.bytes.checked_add(buffer.len()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "encoded JSON length overflow")
+        })?;
+        if next > self.limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "encoded JSON exceeds configured limit",
+            ));
+        }
+        self.bytes = next;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Count JSON bytes without allocating the encoded value. `None` means serialization failed or
+/// crossed `limit`; callers use the same helper before page/cache allocation and wire emission.
+pub(crate) fn encoded_json_len_bounded<T: Serialize>(value: &T, limit: usize) -> Option<usize> {
+    let mut counter = BoundedJsonCounter { bytes: 0, limit };
+    serde_json::to_writer(&mut counter, value)
+        .ok()
+        .map(|()| counter.bytes)
 }
 
 /// Canonical event-derived history summary exposed to persistence adapters.
@@ -742,8 +797,7 @@ mod tests {
             ConversationHistoryPageValidationError::CursorRegression
         );
         assert_eq!(
-            page.validate("session-a", 17, 250, Some(21))
-                .unwrap_err(),
+            page.validate("session-a", 17, 250, Some(21)).unwrap_err(),
             ConversationHistoryPageValidationError::TargetChanged
         );
         page.complete = true;

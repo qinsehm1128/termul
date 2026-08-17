@@ -26,19 +26,21 @@ use crate::conversation::catalog::{
     ConversationCatalogSnapshot, ConversationProvenanceFileV1, CATALOG_FILE,
     CONVERSATION_METADATA_FILE, PROVENANCE_FILE,
 };
+#[cfg(test)]
+use crate::conversation::catalog::{CatalogAdmissionMetrics, ConversationCatalogGeneration};
 use crate::conversation::contracts::{
-    AgentSessionBinding, AgentSessionBindingState, ConversationErrorCode,
+    encoded_json_len_bounded, AgentSessionBinding, AgentSessionBindingState, ConversationErrorCode,
     ConversationHistorySummaryV1, ConversationId, ConversationLifecycleState, ConversationRecordV2,
     ExecutionTarget, ProjectAttachment, AGENT_SESSION_BINDING_SCHEMA_VERSION,
-    CONVERSATION_SCHEMA_VERSION, PROJECT_ATTACHMENT_SCHEMA_VERSION,
+    CONVERSATION_SCHEMA_VERSION, MAX_CONVERSATION_RECORD_BYTES, PROJECT_ATTACHMENT_SCHEMA_VERSION,
 };
 use crate::conversation::durable_fs::{DirectoryPermissions, DurableFileSystem};
 use crate::conversation::event_log::{
-    apply_event, read_event_page as read_event_page_from_log, BindingEventPayloadV1,
-    BindingReplacementPayloadV1, ConversationEventRecordV2, ConversationEventType,
-    ConversationFrontier, EventLogRepairWarning, EventLogScan, ExecutionTargetEventPayloadV1,
-    ProjectAttachmentEventPayloadV1, CONVERSATION_EVENT_SCHEMA_VERSION, EVENT_LOG_FILES,
-    MAX_EVENT_PAGE_LIMIT, MIN_EVENT_PAGE_LIMIT,
+    apply_event, encode_event_record_bounded, read_event_page as read_event_page_from_log,
+    BindingEventPayloadV1, BindingReplacementPayloadV1, ConversationEventRecordV2,
+    ConversationEventType, ConversationFrontier, EventLogRepairWarning, EventLogScan,
+    EventRecordEncodingError, ExecutionTargetEventPayloadV1, ProjectAttachmentEventPayloadV1,
+    CONVERSATION_EVENT_SCHEMA_VERSION, EVENT_LOG_FILES, MAX_EVENT_PAGE_LIMIT, MIN_EVENT_PAGE_LIMIT,
 };
 use crate::conversation::locator::ConversationLocator;
 use crate::conversation::write_authority::RepositoryWritePermit;
@@ -131,10 +133,22 @@ pub struct CatalogFlushReceipt {
     pub write_count: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogFlushFailureStage {
+    Deadline,
+    Serialization,
+    Replacement,
+    Worker,
+}
+
+/// Typed, secret-safe failure receipt. Pending generation state is retained for deterministic
+/// retry after either serialization or atomic replacement failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogFlushError {
     pub code: &'static str,
+    pub stage: CatalogFlushFailureStage,
     pub generation: u64,
+    pub pending_generation: u64,
     pub detail: String,
 }
 
@@ -142,8 +156,8 @@ impl fmt::Display for CatalogFlushError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "{} while flushing catalog generation {}: {}",
-            self.code, self.generation, self.detail
+            "{} while flushing catalog generation {} at {:?}: {}",
+            self.code, self.generation, self.stage, self.detail
         )
     }
 }
@@ -172,6 +186,8 @@ pub struct CatalogFlushCoordinator {
     path: PathBuf,
     scheduled: AtomicBool,
     wake: Notify,
+    #[cfg(test)]
+    fail_serializations_remaining: std::sync::atomic::AtomicUsize,
 }
 
 impl CatalogFlushCoordinator {
@@ -194,6 +210,8 @@ impl CatalogFlushCoordinator {
             path,
             scheduled: AtomicBool::new(false),
             wake: Notify::new(),
+            #[cfg(test)]
+            fail_serializations_remaining: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -290,59 +308,101 @@ impl CatalogFlushCoordinator {
                 .map_err(|_| self.deadline_error())?,
             None => self.flush_lock.lock().await,
         };
-        let snapshot = {
+        // Capture only immutable chunk Arcs under the global lock. No entry flattening or JSON
+        // serialization is allowed in this critical section.
+        let generation = {
             let state = self.state.lock();
-            let snapshot = state.catalog.snapshot();
-            if state.flushed_generation >= snapshot.generation {
+            let generation = state.catalog.capture();
+            if state.flushed_generation >= generation.generation {
                 return Ok(CatalogFlushReceipt {
-                    requested_generation: snapshot.generation,
+                    requested_generation: generation.generation,
                     flushed_generation: state.flushed_generation,
                     write_count: state.write_count,
                 });
             }
-            snapshot
+            generation
         };
         let started = Instant::now();
-        let durable_fs = self.durable_fs.clone();
-        let path = self.path.clone();
-        let bytes = snapshot.bytes.clone();
-        let write = tokio::task::spawn_blocking(move || durable_fs.replace_bytes(&path, &bytes));
-        let outcome = match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline, write)
+        #[cfg(test)]
+        let fail_serialization = self
+            .fail_serializations_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok();
+        #[cfg(not(test))]
+        let fail_serialization = false;
+        let serialize_generation = generation.clone();
+        let serialize = tokio::task::spawn_blocking(move || {
+            if fail_serialization {
+                Err(())
+            } else {
+                Ok(serialize_generation.deterministic_bytes())
+            }
+        });
+        let bytes = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, serialize)
                 .await
                 .map_err(|_| self.deadline_error())?,
-            None => write.await,
+            None => serialize.await,
         }
-        .map_err(|_| CatalogFlushError {
-            code: "CONVERSATION_CATALOG_WRITE_FAILED",
-            generation: snapshot.generation,
-            detail: "catalog cache writer task failed".to_string(),
+        .map_err(|_| {
+            self.flush_error(
+                CatalogFlushFailureStage::Worker,
+                generation.generation,
+                "catalog serialization task failed",
+            )
         })?
-        .map_err(|_| CatalogFlushError {
-            code: "CONVERSATION_CATALOG_WRITE_FAILED",
-            generation: snapshot.generation,
-            detail: "catalog cache replacement failed".to_string(),
+        .map_err(|()| {
+            self.flush_error(
+                CatalogFlushFailureStage::Serialization,
+                generation.generation,
+                "catalog generation serialization failed",
+            )
         })?;
-        let _ = outcome;
+
+        let durable_fs = self.durable_fs.clone();
+        let path = self.path.clone();
+        let replace = tokio::task::spawn_blocking(move || durable_fs.replace_bytes(&path, &bytes));
+        match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, replace)
+                .await
+                .map_err(|_| self.deadline_error())?,
+            None => replace.await,
+        }
+        .map_err(|_| {
+            self.flush_error(
+                CatalogFlushFailureStage::Worker,
+                generation.generation,
+                "catalog replacement task failed",
+            )
+        })?
+        .map_err(|_| {
+            self.flush_error(
+                CatalogFlushFailureStage::Replacement,
+                generation.generation,
+                "catalog atomic replacement failed",
+            )
+        })?;
 
         let receipt = {
             let mut state = self.state.lock();
             state.write_count = state.write_count.saturating_add(1);
-            state.flushed_generation = state.flushed_generation.max(snapshot.generation);
-            if state.catalog.generation() == snapshot.generation {
+            state.flushed_generation = state.flushed_generation.max(generation.generation);
+            if state.catalog.generation() == generation.generation {
                 state.first_dirty_at = None;
                 state.last_dirty_at = None;
             }
             CatalogFlushReceipt {
-                requested_generation: snapshot.generation,
+                requested_generation: generation.generation,
                 flushed_generation: state.flushed_generation,
                 write_count: state.write_count,
             }
         };
         log::info!(
             "[conversation-repository] catalog flush complete generation={} entry_count={} write_count={} duration_ms={}",
-            snapshot.generation,
-            snapshot.entry_count,
+            generation.generation,
+            generation.entry_count,
             receipt.write_count,
             started.elapsed().as_millis()
         );
@@ -380,7 +440,8 @@ impl CatalogFlushCoordinator {
 
     #[must_use]
     pub fn snapshot(&self) -> ConversationCatalogSnapshot {
-        self.state.lock().catalog.snapshot()
+        let generation = self.state.lock().catalog.capture();
+        generation.snapshot()
     }
 
     #[must_use]
@@ -394,10 +455,28 @@ impl CatalogFlushCoordinator {
     }
 
     fn deadline_error(&self) -> CatalogFlushError {
+        let generation = self.state.lock().catalog.generation();
         CatalogFlushError {
             code: "CONVERSATION_CATALOG_FLUSH_DEADLINE",
-            generation: self.state.lock().catalog.generation(),
+            stage: CatalogFlushFailureStage::Deadline,
+            generation,
+            pending_generation: generation,
             detail: "catalog cache flush exceeded the host deadline".to_string(),
+        }
+    }
+
+    fn flush_error(
+        &self,
+        stage: CatalogFlushFailureStage,
+        generation: u64,
+        detail: &'static str,
+    ) -> CatalogFlushError {
+        CatalogFlushError {
+            code: "CATALOG_FLUSH_FAILED",
+            stage,
+            generation,
+            pending_generation: self.state.lock().catalog.generation(),
+            detail: detail.to_string(),
         }
     }
 
@@ -413,8 +492,54 @@ impl CatalogFlushCoordinator {
     }
 
     #[cfg(test)]
-    fn fail_next_writes(&self, count: usize) {
+    pub(crate) fn new_for_test(
+        catalog: ConversationCatalog,
+        durable_fs: DurableFileSystem,
+        path: PathBuf,
+    ) -> Arc<Self> {
+        Self::new(catalog, durable_fs, path)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn admit_for_test(
+        self: &Arc<Self>,
+        record: &ConversationRecordV2,
+        frontier: &ConversationFrontier,
+    ) -> u64 {
+        self.upsert(record, frontier)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capture_for_test(&self) -> ConversationCatalogGeneration {
+        self.state.lock().catalog.capture()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_writes(&self, count: usize) {
         self.durable_fs.fail_next_catalog_replaces(count);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_serializations(&self, count: usize) {
+        self.fail_serializations_remaining
+            .store(count, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_generation(&self) -> u64 {
+        self.state.lock().catalog.generation()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_admission_metrics(&self) -> CatalogAdmissionMetrics {
+        self.state.lock().catalog.last_admission_metrics()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn flush_once_for_test(
+        &self,
+    ) -> std::result::Result<CatalogFlushReceipt, CatalogFlushError> {
+        self.flush_once(None).await
     }
 }
 
@@ -622,27 +747,16 @@ impl ActiveTailCache {
         Some(entry.records.clone())
     }
 
-    fn insert(
+    fn insert_prevalidated(
         &mut self,
         conversation_id: ConversationId,
         after_seq: u64,
         limit: usize,
         scan_last_seq: u64,
         records: Vec<ConversationEventRecordV2>,
+        retained_bytes: usize,
     ) {
         self.invalidate(conversation_id);
-        if records.is_empty()
-            || records
-                .iter()
-                .any(|record| record.conversation_id != conversation_id)
-            || records.iter().any(event_contains_sensitive_cache_data)
-        {
-            return;
-        }
-        let retained_bytes = encoded_page_bytes(&records);
-        if retained_bytes > ACTIVE_TAIL_CACHE_MAX_BYTES {
-            return;
-        }
         while self.entries.len() >= ACTIVE_TAIL_CACHE_MAX_CONVERSATIONS
             || self.retained_bytes.saturating_add(retained_bytes) > ACTIVE_TAIL_CACHE_MAX_BYTES
         {
@@ -695,11 +809,28 @@ fn encoded_page_bytes(records: &[ConversationEventRecordV2]) -> usize {
         .len()
         .saturating_mul(std::mem::size_of::<ConversationEventRecordV2>());
     records.iter().fold(structural_bytes, |total, record| {
-        let encoded_bytes = serde_json::to_vec(record).map_or(usize::MAX, |encoded| encoded.len());
+        let encoded_bytes =
+            encoded_json_len_bounded(record, MAX_CONVERSATION_RECORD_BYTES).unwrap_or(usize::MAX);
         total
             .saturating_add(encoded_bytes)
             .saturating_add(value_heap_bytes(&record.payload))
     })
+}
+
+fn cache_retained_bytes(
+    conversation_id: ConversationId,
+    records: &[ConversationEventRecordV2],
+) -> Option<usize> {
+    if records.is_empty()
+        || records
+            .iter()
+            .any(|record| record.conversation_id != conversation_id)
+        || records.iter().any(event_contains_sensitive_cache_data)
+    {
+        return None;
+    }
+    let retained_bytes = encoded_page_bytes(records);
+    (retained_bytes <= ACTIVE_TAIL_CACHE_MAX_BYTES).then_some(retained_bytes)
 }
 
 fn value_heap_bytes(value: &Value) -> usize {
@@ -903,10 +1034,7 @@ impl ConversationRepository {
             .as_ref()
             .is_some_and(|previous| previous != &catalog_bytes)
         {
-            log::warn!(
-                "[conversation-repository] stale or corrupt catalog ignored root={}",
-                private_root.display()
-            );
+            log::warn!("[conversation-repository] stale or corrupt catalog ignored");
             recovery_items.push(RepositoryRecoveryItem {
                 code: ConversationErrorCode::ConversationCorrupt,
                 kind: RepositoryRecoveryKind::CatalogIgnored,
@@ -917,11 +1045,9 @@ impl ConversationRepository {
                 requires_action: false,
             });
         }
-        if let Err(error) = durable_fs.replace_bytes(&catalog_path, &catalog_bytes) {
+        if let Err(_error) = durable_fs.replace_bytes(&catalog_path, &catalog_bytes) {
             log::warn!(
-                "[conversation-repository] cache rewrite failure root={} error={}",
-                private_root.display(),
-                error
+                "[conversation-repository] cache rewrite failure code=CONVERSATION_DURABILITY_FAILED"
             );
             recovery_items.push(RepositoryRecoveryItem {
                 code: ConversationErrorCode::ConversationDurabilityFailed,
@@ -996,8 +1122,7 @@ impl ConversationRepository {
             fail_agent_binding_appends_remaining: std::sync::atomic::AtomicUsize::new(0),
         });
         log::info!(
-            "[conversation-repository] open complete root={} valid_count={} recovery_item_count={} scanned_event_count={} sparse_index_entry_count={} retained_payload_bytes={} duration_ms={}",
-            private_root.display(),
+            "[conversation-repository] open complete valid_count={} recovery_item_count={} scanned_event_count={} sparse_index_entry_count={} retained_payload_bytes={} duration_ms={}",
             report.valid_conversation_count,
             report.recovery_items.len(),
             report.scanned_event_count,
@@ -1192,6 +1317,23 @@ impl ConversationRepository {
     }
 
     #[cfg(test)]
+    pub(crate) fn catalog_pending_generation(&self) -> u64 {
+        self.catalog_flush.pending_generation()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn catalog_last_admission_metrics(&self) -> CatalogAdmissionMetrics {
+        self.catalog_flush.last_admission_metrics()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn flush_catalog_once_for_test(
+        &self,
+    ) -> std::result::Result<CatalogFlushReceipt, CatalogFlushError> {
+        self.catalog_flush.flush_once_for_test().await
+    }
+
+    #[cfg(test)]
     pub(crate) fn event_log_scan(
         &self,
         conversation_id: ConversationId,
@@ -1362,6 +1504,50 @@ impl ConversationRepository {
         Ok(event)
     }
 
+    /// Append one coordinator-owned event only when the caller's source cursor is exactly the
+    /// canonical next sequence. The check and append share the per-Conversation lock, preventing
+    /// any second ordering lane from consuming or aliasing the cursor.
+    pub(crate) async fn append_ordered_event(
+        self: &Arc<Self>,
+        permit: &RepositoryWritePermit,
+        conversation_id: ConversationId,
+        expected_seq: u64,
+        recorded_at_utc: DateTime<Utc>,
+        type_: ConversationEventType,
+        payload: Value,
+    ) -> Result<ConversationEventRecordV2> {
+        self.validate_write_permit(permit, conversation_id, "append_ordered_event")?;
+        let lock = self.conversation_lock(conversation_id);
+        let guard = lock.lock().await;
+        let current = self
+            .states
+            .lock()
+            .get(&conversation_id)
+            .map(|state| state.record.last_seq)
+            .ok_or_else(|| not_found("append_ordered_event", conversation_id))?;
+        let next = current.checked_add(1).ok_or_else(|| {
+            repository_error(
+                ConversationErrorCode::ConversationRecoveryRequired,
+                "append_ordered_event",
+                Some(conversation_id),
+                "canonical sequence overflow".to_string(),
+            )
+        })?;
+        if expected_seq != next {
+            return Err(repository_error(
+                ConversationErrorCode::ConversationConflict,
+                "append_ordered_event",
+                Some(conversation_id),
+                format!("expected canonical seq {expected_seq}, next seq is {next}"),
+            ));
+        }
+        let event = self.append_event_locked(conversation_id, recorded_at_utc, type_, payload)?;
+        debug_assert_eq!(event.seq, expected_seq);
+        drop(guard);
+        self.mark_catalog_entry_dirty(conversation_id);
+        Ok(event)
+    }
+
     pub fn read_event_page(
         &self,
         conversation_id: ConversationId,
@@ -1444,15 +1630,43 @@ impl ConversationRepository {
             .get(&conversation_id)
             .is_some_and(|state| state.scan.last_seq() == scan.last_seq());
         if scan_is_current {
-            self.active_tail_cache.lock().insert(
-                conversation_id,
-                after_seq,
-                limit,
-                scan.last_seq(),
-                records.clone(),
-            );
+            // Measure the owned page before cloning it into the disposable cache. Oversized or
+            // sensitive pages return directly without the prior memory-amplifying deep clone.
+            if let Some(retained_bytes) = cache_retained_bytes(conversation_id, &records) {
+                self.active_tail_cache.lock().insert_prevalidated(
+                    conversation_id,
+                    after_seq,
+                    limit,
+                    scan.last_seq(),
+                    records.clone(),
+                    retained_bytes,
+                );
+            }
         }
         Ok(records)
+    }
+
+    /// Traverse canonical JSONL on Tokio's dedicated blocking pool. Async Tauri/HTTP/WS adapters
+    /// use this entry point so bounded filesystem reads never monopolize a runtime worker.
+    pub async fn read_event_page_blocking(
+        self: &Arc<Self>,
+        conversation_id: ConversationId,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<Vec<ConversationEventRecordV2>> {
+        let repository = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            repository.read_event_page(conversation_id, after_seq, limit)
+        })
+        .await
+        .map_err(|_| {
+            repository_error(
+                ConversationErrorCode::ConversationRecoveryRequired,
+                "read_event_page",
+                Some(conversation_id),
+                "blocking history traversal task failed".to_string(),
+            )
+        })?
     }
 
     /// Compatibility full-history wrapper implemented exclusively through bounded pages.
@@ -1520,7 +1734,7 @@ impl ConversationRepository {
         self.states
             .lock()
             .get(&conversation_id)
-            .map(|state| state.scan.frontier.binding.history.clone())
+            .map(|state| state.scan.frontier.binding.history.to_vec())
             .ok_or_else(|| not_found("binding_history", conversation_id))
     }
 
@@ -1837,14 +2051,9 @@ impl ConversationRepository {
         conversation_id: ConversationId,
     ) -> Result<()> {
         self.validate_write_permit(permit, conversation_id, "refresh_lifecycle_catalog")?;
-        let snapshot = self.catalog_entry_snapshot(conversation_id);
-        let coordinator = Arc::clone(&self.catalog_flush);
-        repository_runtime_handle().spawn(async move {
-            tokio::task::yield_now().await;
-            if let Some((record, frontier)) = snapshot {
-                coordinator.upsert(&record, &frontier);
-            }
-        });
+        // Mutation success is not published until its immutable catalog generation is admitted.
+        // Only later serialization/replacement remains asynchronous and coalesced.
+        self.mark_catalog_entry_dirty(conversation_id);
         Ok(())
     }
 
@@ -2412,13 +2621,19 @@ impl ConversationRepository {
             )
         })?;
         let directory = self.conversation_dir(&record, "append_event")?;
-        let bytes = serde_json::to_vec(&event).map_err(|error| {
-            repository_error(
+        let bytes = encode_event_record_bounded(&event).map_err(|error| match error {
+            EventRecordEncodingError::TooLarge => repository_error(
+                ConversationErrorCode::ConversationRecordTooLarge,
+                "append_event",
+                Some(conversation_id),
+                format!("encoded canonical record exceeds {MAX_CONVERSATION_RECORD_BYTES} bytes"),
+            ),
+            EventRecordEncodingError::Serialization => repository_error(
                 ConversationErrorCode::ConversationRecoveryRequired,
                 "append_event",
                 Some(conversation_id),
-                error.to_string(),
-            )
+                "canonical event serialization failed".to_string(),
+            ),
         })?;
         let stream_path = directory.join(stream.file_name());
         let actual_stream_bytes = fs::metadata(&stream_path)
@@ -3703,7 +3918,7 @@ mod tests {
                     *id,
                     time(22),
                     ConversationEventType::MessageChunk,
-                    json!({"blob":"x".repeat(300_000)}),
+                    json!({"blob":"x".repeat(250_000)}),
                     ConversationMutation::AcpEventAppend,
                 )
                 .await

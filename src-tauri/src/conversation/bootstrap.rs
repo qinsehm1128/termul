@@ -28,6 +28,7 @@ use crate::conversation::migration::{
     LegacyMigrationCallbacks, LegacyRootConfiguration, MigrationAdmissionState, MigrationContext,
     MigrationHostMode, MigrationPhase, ReaderPrecedence,
 };
+use crate::conversation::ordered_persistence::OrderedConversationPersistence;
 use crate::conversation::persistence_adapter::ConversationPersistenceAdapter;
 use crate::conversation::repository::{CatalogFlushCoordinator, ConversationRepository};
 use crate::conversation::session_workspace::SessionWorkspaceService;
@@ -81,6 +82,8 @@ pub struct BootstrapOutcome {
     pub reader: Arc<ConversationReader>,
     pub creation: Arc<ConversationCreationService>,
     pub persistence_adapter: Arc<ConversationPersistenceAdapter>,
+    /// Sole bootstrap-owned ordering/backpressure/shutdown authority for canonical ACP events.
+    pub ordered_persistence: Arc<OrderedConversationPersistence>,
     pub workspace: Arc<SessionWorkspaceService>,
     pub application: Arc<ConversationApplicationService>,
     pub layout_generation: uuid::Uuid,
@@ -356,6 +359,11 @@ impl ConversationBootstrap {
             Arc::clone(&writer),
             Arc::clone(&reader),
         ));
+        // Construct the canonical ordered lane exactly once after adapter bootstrap. Later host
+        // composition injects this exact Arc; raw adapter append remains Conversation-module-only.
+        let ordered_persistence = Arc::new(OrderedConversationPersistence::new(Arc::clone(
+            &persistence_adapter,
+        )));
         let workspace = Arc::new(SessionWorkspaceService::new(Arc::clone(&writer)));
         let application = Arc::new(ConversationApplicationService::new(
             Arc::clone(&reader),
@@ -431,6 +439,7 @@ impl ConversationBootstrap {
             reader,
             creation,
             persistence_adapter,
+            ordered_persistence,
             workspace,
             application,
             layout_generation: report.target_generation,

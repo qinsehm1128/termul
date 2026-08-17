@@ -36,8 +36,7 @@ use crate::acp::session_persistence::{
     PersistedEventRecord, PersistedSessionStatus, SessionMetadata,
 };
 use crate::conversation::contracts::{
-    ConversationHistoryPageV1, ConversationHistoryRecordV1,
-    ConversationHistoryPageValidationError,
+    ConversationHistoryPageV1, ConversationHistoryPageValidationError, ConversationHistoryRecordV1,
 };
 
 /// The renderer session-metadata shape (`SessionIndexEntry` in
@@ -115,7 +114,9 @@ impl fmt::Display for SessionPayloadAccumulatorError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Page(error) => error.fmt(formatter),
-            Self::SessionMismatch => formatter.write_str("history record belongs to another session"),
+            Self::SessionMismatch => {
+                formatter.write_str("history record belongs to another session")
+            }
             Self::CursorRegression => formatter.write_str("history cursor did not advance"),
             Self::RecordSequenceConflict => {
                 formatter.write_str("history records are not strictly ordered")
@@ -383,10 +384,7 @@ impl SessionPayloadAccumulator {
             .as_object()
             .cloned()
             .unwrap_or_default();
-        let timeline = (
-            merged.get("timestamp").cloned(),
-            merged.get("seq").cloned(),
-        );
+        let timeline = (merged.get("timestamp").cloned(), merged.get("seq").cloned());
         merged.extend(update.clone());
         if let Some(timestamp) = timeline.0 {
             merged.insert("timestamp".to_string(), timestamp);
@@ -445,7 +443,9 @@ pub fn materialize_session_payload(
     metadata: &SessionMetadata,
     records: &[PersistedEventRecord],
 ) -> MaterializedSessionPayload {
-    let next_cursor = records.last().map_or(metadata.last_seq, |record| record.seq);
+    let next_cursor = records
+        .last()
+        .map_or(metadata.last_seq, |record| record.seq);
     let mut accumulator = SessionPayloadAccumulator::new(metadata);
     accumulator
         .push_records(records, next_cursor)
@@ -488,7 +488,18 @@ fn is_empty_text_block(block: &Value) -> bool {
 mod tests {
     use super::*;
     use crate::acp::session_persistence::SESSION_SCHEMA_VERSION;
+    use crate::conversation::write_authority::ConversationMutation;
+    use crate::conversation::{
+        AgentSessionBinding, AgentSessionBindingState, ConversationCreator, ConversationEventType,
+        ConversationId, ConversationLifecycleState, ConversationPersistenceAdapter,
+        ConversationReader, ConversationRecordV2, ConversationRepository, ConversationWriter,
+        CreationPartition, ExecutionTarget, LegacyConversationReader, ReaderPrecedence,
+        AGENT_SESSION_BINDING_SCHEMA_VERSION, CONVERSATION_SCHEMA_VERSION,
+    };
+    use chrono::{TimeZone, Utc};
     use serde_json::json;
+    use std::sync::Arc;
+    use uuid::Uuid;
 
     fn metadata() -> SessionMetadata {
         SessionMetadata {
@@ -650,10 +661,12 @@ mod tests {
     fn incremental_pages_preserve_message_tool_usage_and_plan_state() {
         let mut accumulator = SessionPayloadAccumulator::new(&metadata());
         let page_one = ConversationHistoryPageV1 {
-            schema_version: crate::conversation::contracts::CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION,
+            schema_version:
+                crate::conversation::contracts::CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION,
             records: vec![
                 ConversationHistoryRecordV1 {
-                    schema_version: crate::conversation::contracts::CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
+                    schema_version:
+                        crate::conversation::contracts::CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
                     session_id: "session-1".to_string(),
                     seq: 1,
                     type_: "user_prompt".to_string(),
@@ -661,7 +674,8 @@ mod tests {
                     payload: user_prompt(1, Some("turn-1"), "hello").payload,
                 },
                 ConversationHistoryRecordV1 {
-                    schema_version: crate::conversation::contracts::CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
+                    schema_version:
+                        crate::conversation::contracts::CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
                     session_id: "session-1".to_string(),
                     seq: 2,
                     type_: "message_chunk".to_string(),
@@ -669,7 +683,8 @@ mod tests {
                     payload: chunk(2, "agent", "a").payload,
                 },
                 ConversationHistoryRecordV1 {
-                    schema_version: crate::conversation::contracts::CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
+                    schema_version:
+                        crate::conversation::contracts::CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
                     session_id: "session-1".to_string(),
                     seq: 3,
                     type_: "tool_call".to_string(),
@@ -688,10 +703,12 @@ mod tests {
         assert_eq!(first.tool_calls.len(), 1);
 
         let page_two = ConversationHistoryPageV1 {
-            schema_version: crate::conversation::contracts::CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION,
+            schema_version:
+                crate::conversation::contracts::CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION,
             records: vec![
                 ConversationHistoryRecordV1 {
-                    schema_version: crate::conversation::contracts::CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
+                    schema_version:
+                        crate::conversation::contracts::CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
                     session_id: "session-1".to_string(),
                     seq: 4,
                     type_: "message_chunk".to_string(),
@@ -699,7 +716,8 @@ mod tests {
                     payload: chunk(4, "agent", "b").payload,
                 },
                 ConversationHistoryRecordV1 {
-                    schema_version: crate::conversation::contracts::CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
+                    schema_version:
+                        crate::conversation::contracts::CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
                     session_id: "session-1".to_string(),
                     seq: 5,
                     type_: "tool_call_update".to_string(),
@@ -707,7 +725,8 @@ mod tests {
                     payload: json!({"update":{"toolCallId":"t-1","status":"failed"}}),
                 },
                 ConversationHistoryRecordV1 {
-                    schema_version: crate::conversation::contracts::CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
+                    schema_version:
+                        crate::conversation::contracts::CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
                     session_id: "session-1".to_string(),
                     seq: 6,
                     type_: "usage_update".to_string(),
@@ -715,7 +734,8 @@ mod tests {
                     payload: json!({"used":10,"size":100,"cost":{"amount":1.5,"currency":"USD"}}),
                 },
                 ConversationHistoryRecordV1 {
-                    schema_version: crate::conversation::contracts::CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
+                    schema_version:
+                        crate::conversation::contracts::CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
                     session_id: "session-1".to_string(),
                     seq: 7,
                     type_: "plan_update".to_string(),
@@ -730,14 +750,155 @@ mod tests {
         accumulator.push_history_page(&page_two, 4).unwrap();
         let payload = accumulator.finish();
         assert_eq!(
-            payload.messages.iter().map(|message| message.seq).collect::<Vec<_>>(),
+            payload
+                .messages
+                .iter()
+                .map(|message| message.seq)
+                .collect::<Vec<_>>(),
             vec![1, 2, 4]
         );
         assert_eq!(payload.tool_calls[0]["status"], "failed");
         assert_eq!(payload.tool_calls[0]["seq"], 3);
-        assert_eq!(payload.session_usage.as_ref().unwrap()["baselineUsed"], 10.0);
+        assert_eq!(
+            payload.session_usage.as_ref().unwrap()["baselineUsed"],
+            10.0
+        );
         assert_eq!(payload.plan.as_ref().unwrap()[0]["content"], "ship");
         assert_eq!(payload.metadata.last_seq, 7);
+    }
+
+    #[tokio::test]
+    async fn canonical_cold_restart_materializes_usage_plan_and_empty_clear_from_real_pages() {
+        let temp = tempfile::tempdir().unwrap();
+        let private = temp.path().canonicalize().unwrap().join("private");
+        let visible = temp.path().join("visible");
+        std::fs::create_dir_all(&visible).unwrap();
+        let (repository, _) = ConversationRepository::open(private.clone()).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
+        let conversation_id =
+            ConversationId::parse("55555555-5555-4555-8555-555555555555").unwrap();
+        let created_at = Utc
+            .timestamp_millis_opt(1_766_000_000_000)
+            .single()
+            .unwrap();
+        writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: visible.to_string_lossy().into_owned(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::Ready,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                },
+                ConversationMutation::CreateConversation,
+            )
+            .await
+            .unwrap();
+        writer
+            .bind_agent_session(
+                conversation_id,
+                AgentSessionBinding {
+                    schema_version: AGENT_SESSION_BINDING_SCHEMA_VERSION,
+                    binding_id: Uuid::new_v4(),
+                    agent_session_id: "session-cold".to_string(),
+                    runtime_agent_id: "runtime-cold".to_string(),
+                    stable_agent_namespace: "config:test".to_string(),
+                    execution_cwd: visible.to_string_lossy().into_owned(),
+                    bound_at_utc: created_at,
+                    state: AgentSessionBindingState::Active,
+                },
+                created_at,
+            )
+            .await
+            .unwrap();
+        for (type_, payload) in [
+            (
+                ConversationEventType::UsageUpdate,
+                json!({
+                    "agentId":"runtime-cold",
+                    "sessionId":"session-cold",
+                    "used":12,
+                    "size":120,
+                    "cost":{"amount":2.5,"currency":"USD"}
+                }),
+            ),
+            (
+                ConversationEventType::PlanUpdate,
+                json!({
+                    "agentId":"runtime-cold",
+                    "sessionId":"session-cold",
+                    "plan":{"entries":[{"content":"ship","priority":"high","status":"in_progress"}]}
+                }),
+            ),
+            (
+                ConversationEventType::PlanUpdate,
+                json!({
+                    "agentId":"runtime-cold",
+                    "sessionId":"session-cold",
+                    "plan":{"entries":[]}
+                }),
+            ),
+        ] {
+            writer
+                .append_event(
+                    conversation_id,
+                    created_at,
+                    type_,
+                    payload,
+                    ConversationMutation::AcpEventAppend,
+                )
+                .await
+                .unwrap();
+        }
+        drop(writer);
+        drop(repository);
+
+        let (repository, _) = ConversationRepository::open(private).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
+        let reader = Arc::new(ConversationReader::new(
+            Arc::clone(&repository),
+            LegacyConversationReader::default(),
+            ReaderPrecedence::ConversationV2Only,
+        ));
+        let adapter = ConversationPersistenceAdapter::new(writer, reader);
+        let (_, metadata, target_last_seq) = adapter
+            .history_metadata("session-cold", "cold_restart_test")
+            .unwrap();
+        let mut accumulator = SessionPayloadAccumulator::new(&metadata);
+        while accumulator.cursor() < target_last_seq {
+            let page = adapter
+                .history_page_at(
+                    "session-cold",
+                    accumulator.cursor(),
+                    2,
+                    Some(target_last_seq),
+                )
+                .unwrap();
+            accumulator.push_history_page(&page, 2).unwrap();
+        }
+        let payload = accumulator.finish();
+        assert_eq!(payload.session_usage.as_ref().unwrap()["used"], 12.0);
+        assert_eq!(
+            payload.session_usage.as_ref().unwrap()["baselineUsed"],
+            12.0
+        );
+        assert_eq!(payload.plan, Some(Vec::new()));
+        assert_eq!(
+            adapter.latest_durable_plan("session-cold").unwrap(),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            adapter
+                .latest_durable_usage("session-cold")
+                .unwrap()
+                .unwrap()["used"],
+            12
+        );
     }
 
     #[test]

@@ -32,7 +32,8 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
 use crate::acp::config::{AgentId, SessionId};
-use crate::acp::events::{self, FanOutError, FanOutReceipt, PlanUpdateEvent};
+use crate::acp::events::{self, DeliveryError, DeliveryReceipt, PlanUpdateEvent};
+use crate::conversation::ConversationPersistenceAdapter;
 use crate::web::EventSink;
 
 /// The hidden subcommand flag the child detects in argv (passed as the sole
@@ -179,9 +180,8 @@ pub fn map_todos_to_plan_entries(todos: &[TermulPlanTodo]) -> Vec<PlanEntry> {
         .collect()
 }
 
-/// In-memory plan cache (per session). v1 is emit-and-cache; durable
-/// persistence across resume is deferred (Ask First). Kept as a seam so a
-/// future persistence layer can read the latest plan without re-deriving it.
+/// In-memory plan cache (per session). Canonical `PlanUpdate` records hydrate this cache on a
+/// cold bind; every live update remains a full replacement, including an empty durable clear.
 #[derive(Default)]
 pub struct PlanStore {
     inner: Mutex<HashMap<String, Vec<PlanEntry>>>,
@@ -216,24 +216,27 @@ impl PlanStore {
 ///
 /// `agent_id` is the Termul-side `AgentId` (used for the wire event payload);
 /// the renderer keys plan state by `session_id`.
-pub fn emit_plan_update(
+pub async fn emit_plan_update(
     sinks: &[Arc<dyn EventSink>],
+    persistence: Option<&ConversationPersistenceAdapter>,
     agent_id: &AgentId,
     session_id: &SessionId,
     entries: Vec<PlanEntry>,
-) -> Result<FanOutReceipt, FanOutError> {
+) -> Result<DeliveryReceipt, DeliveryError> {
     let plan = Plan::new(entries);
     let event = PlanUpdateEvent {
         agent_id: agent_id.clone(),
         session_id: session_id.clone(),
         plan,
     };
-    events::fan_out(
+    events::deliver(
         sinks,
+        persistence,
         Some(session_id.0.as_str()),
         events::EVENT_PLAN_UPDATE,
         &event,
     )
+    .await
 }
 
 #[cfg(test)]
@@ -305,8 +308,8 @@ mod tests {
         assert_eq!(entries[0].priority, PlanEntryPriority::Low);
     }
 
-    #[test]
-    fn emit_plan_update_fires_event_with_entries() {
+    #[tokio::test]
+    async fn emit_plan_update_fires_event_with_entries() {
         let sink = Arc::new(CapturingSink::default());
         let sinks: Vec<Arc<dyn EventSink>> = vec![sink.clone()];
         let (agent_id, session_id) = make_ids();
@@ -328,7 +331,9 @@ mod tests {
             },
         ];
         let entries = map_todos_to_plan_entries(&todos);
-        emit_plan_update(&sinks, &agent_id, &session_id, entries).unwrap();
+        emit_plan_update(&sinks, None, &agent_id, &session_id, entries)
+            .await
+            .unwrap();
 
         let captured = sink.events.lock().unwrap();
         assert_eq!(captured.len(), 1);
@@ -340,15 +345,17 @@ mod tests {
         assert_eq!(payload["plan"]["entries"][0]["content"], "one");
     }
 
-    #[test]
-    fn emit_plan_update_empty_entries_emits_clear() {
+    #[tokio::test]
+    async fn emit_plan_update_empty_entries_emits_clear() {
         // The renderer's `_onPlanUpdate` treats `entries.length === 0` as
         // "clear the plan" (dropPlanForSession). Verify the host emits exactly
         // that shape for an empty todos list.
         let sink = Arc::new(CapturingSink::default());
         let sinks: Vec<Arc<dyn EventSink>> = vec![sink.clone()];
         let (agent_id, session_id) = make_ids();
-        emit_plan_update(&sinks, &agent_id, &session_id, vec![]).unwrap();
+        emit_plan_update(&sinks, None, &agent_id, &session_id, vec![])
+            .await
+            .unwrap();
 
         let captured = sink.events.lock().unwrap();
         assert_eq!(captured.len(), 1);

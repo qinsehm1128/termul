@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -34,6 +35,8 @@ pub const CONVERSATION_METADATA_FILE: &str = "conversation.json";
 pub const PROVENANCE_FILE: &str = "provenance.json";
 pub const EMPTY_CATALOG_GENERATED_AT_UTC: &str = "1970-01-01T00:00:00.000Z";
 pub const PROVENANCE_SCHEMA_VERSION: u32 = 1;
+/// Immutable catalog chunk size used by mutation admission and frozen generations.
+pub const CATALOG_CHUNK_ENTRIES: usize = 1_024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -70,57 +73,48 @@ impl ConversationCatalogFileV1 {
     }
 }
 
-/// Stable immutable view handed to the asynchronous cache writer.
-///
-/// The generation and upsert counter are process-local instrumentation only; neither is serialized
-/// into `catalog.json`, so rollback and rebuild bytes remain unchanged.
+/// Per-admission copy accounting. A 50,000-entry catalog references at most 49 frozen chunk
+/// pointers and clones at most one 1024-entry dirty chunk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CatalogAdmissionMetrics {
+    pub cloned_chunk_pointers: usize,
+    pub cloned_dirty_entries: usize,
+    pub serialized_bytes_under_lock: usize,
+}
+
+/// Frozen immutable catalog generation captured under the global state lock. Serialization is a
+/// separate operation and therefore always runs after the lock is released.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConversationCatalogSnapshot {
+pub struct ConversationCatalogGeneration {
     pub generation: u64,
     pub upsert_count: u64,
     pub entry_count: usize,
-    pub bytes: Vec<u8>,
+    generated_at_utc: Arc<str>,
+    chunks: Arc<Vec<Arc<Vec<ConversationCatalogEntryV1>>>>,
 }
 
-/// In-memory disposable cache updated from validated Conversation frontiers.
-#[derive(Debug, Clone)]
-pub struct ConversationCatalog {
-    file: ConversationCatalogFileV1,
-    generation: u64,
-    upsert_count: u64,
-}
-
-impl ConversationCatalog {
+impl ConversationCatalogGeneration {
     #[must_use]
-    pub fn from_file(file: ConversationCatalogFileV1) -> Self {
-        Self {
-            file,
-            generation: 0,
-            upsert_count: 0,
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    #[must_use]
+    pub fn deterministic_file(&self) -> ConversationCatalogFileV1 {
+        ConversationCatalogFileV1 {
+            schema_version: CATALOG_SCHEMA_VERSION,
+            generated_at_utc: self.generated_at_utc.to_string(),
+            conversations: self
+                .chunks
+                .iter()
+                .flat_map(|chunk| chunk.iter().cloned())
+                .collect(),
         }
     }
 
-    /// Insert or replace exactly one canonical entry and advance the local dirty generation.
-    pub fn upsert(&mut self, record: &ConversationRecordV2, frontier: &ConversationFrontier) -> u64 {
-        let entry = entry_from_frontier(record, frontier);
-        self.file.generated_at_utc = self
-            .file
-            .generated_at_utc
-            .clone()
-            .max(entry.created_at_utc.clone())
-            .max(entry.last_activity_at_utc.clone());
-        match self
-            .file
-            .conversations
-            .binary_search_by_key(&record.conversation_id.to_string(), |entry| {
-                entry.conversation_id.to_string()
-            }) {
-            Ok(index) => self.file.conversations[index] = entry,
-            Err(index) => self.file.conversations.insert(index, entry),
-        }
-        self.generation = self.generation.saturating_add(1);
-        self.upsert_count = self.upsert_count.saturating_add(1);
-        self.generation
+    #[must_use]
+    pub fn deterministic_bytes(&self) -> Vec<u8> {
+        self.deterministic_file().deterministic_bytes()
     }
 
     #[must_use]
@@ -128,9 +122,132 @@ impl ConversationCatalog {
         ConversationCatalogSnapshot {
             generation: self.generation,
             upsert_count: self.upsert_count,
-            entry_count: self.file.conversations.len(),
-            bytes: self.file.deterministic_bytes(),
+            entry_count: self.entry_count,
+            chunk_count: self.chunk_count(),
+            bytes: self.deterministic_bytes(),
         }
+    }
+}
+
+/// Stable immutable view handed to compatibility callers and tests. Production flush capture uses
+/// [`ConversationCatalogGeneration`] and serializes only after releasing the global lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationCatalogSnapshot {
+    pub generation: u64,
+    pub upsert_count: u64,
+    pub entry_count: usize,
+    pub chunk_count: usize,
+    pub bytes: Vec<u8>,
+}
+
+/// In-memory disposable cache updated from validated Conversation frontiers.
+#[derive(Debug, Clone)]
+pub struct ConversationCatalog {
+    generated_at_utc: Arc<str>,
+    chunks: Arc<Vec<Arc<Vec<ConversationCatalogEntryV1>>>>,
+    generation: u64,
+    upsert_count: u64,
+    last_admission_metrics: CatalogAdmissionMetrics,
+}
+
+impl ConversationCatalog {
+    #[must_use]
+    pub fn from_file(mut file: ConversationCatalogFileV1) -> Self {
+        file.conversations
+            .sort_by_key(|entry| entry.conversation_id.to_string());
+        let chunks = file
+            .conversations
+            .chunks(CATALOG_CHUNK_ENTRIES)
+            .map(|chunk| Arc::new(chunk.to_vec()))
+            .collect();
+        Self {
+            generated_at_utc: Arc::from(file.generated_at_utc),
+            chunks: Arc::new(chunks),
+            generation: 0,
+            upsert_count: 0,
+            last_admission_metrics: CatalogAdmissionMetrics::default(),
+        }
+    }
+
+    /// Insert or replace exactly one canonical entry and advance the local dirty generation.
+    pub fn upsert(
+        &mut self,
+        record: &ConversationRecordV2,
+        frontier: &ConversationFrontier,
+    ) -> u64 {
+        let entry = entry_from_frontier(record, frontier);
+        self.generated_at_utc = Arc::from(
+            self.generated_at_utc
+                .as_ref()
+                .max(entry.created_at_utc.as_str())
+                .max(entry.last_activity_at_utc.as_str()),
+        );
+        let target = record.conversation_id.to_string();
+        let chunk_index = self
+            .chunks
+            .iter()
+            .position(|chunk| {
+                chunk
+                    .last()
+                    .is_some_and(|candidate| candidate.conversation_id.to_string() >= target)
+            })
+            .unwrap_or_else(|| self.chunks.len().saturating_sub(1));
+        let cloned_chunk_pointers = if Arc::strong_count(&self.chunks) > 1 {
+            self.chunks.len()
+        } else {
+            0
+        };
+        let chunks = Arc::make_mut(&mut self.chunks);
+        if chunks.is_empty() {
+            chunks.push(Arc::new(vec![entry]));
+            self.last_admission_metrics = CatalogAdmissionMetrics {
+                cloned_chunk_pointers,
+                cloned_dirty_entries: 0,
+                serialized_bytes_under_lock: 0,
+            };
+        } else {
+            let cloned_dirty_entries = if Arc::strong_count(&chunks[chunk_index]) > 1 {
+                chunks[chunk_index].len()
+            } else {
+                0
+            };
+            let chunk = Arc::make_mut(&mut chunks[chunk_index]);
+            match chunk
+                .binary_search_by_key(&target, |candidate| candidate.conversation_id.to_string())
+            {
+                Ok(index) => chunk[index] = entry,
+                Err(index) => chunk.insert(index, entry),
+            }
+            if chunk.len() > CATALOG_CHUNK_ENTRIES {
+                let right = Arc::new(chunk.split_off(chunk.len() / 2));
+                chunks.insert(chunk_index + 1, right);
+            }
+            self.last_admission_metrics = CatalogAdmissionMetrics {
+                cloned_chunk_pointers,
+                cloned_dirty_entries,
+                serialized_bytes_under_lock: 0,
+            };
+        }
+        self.generation = self.generation.saturating_add(1);
+        self.upsert_count = self.upsert_count.saturating_add(1);
+        self.generation
+    }
+
+    /// Capture one immutable generation without serializing or flattening entries.
+    #[must_use]
+    pub fn capture(&self) -> ConversationCatalogGeneration {
+        ConversationCatalogGeneration {
+            generation: self.generation,
+            upsert_count: self.upsert_count,
+            entry_count: self.len(),
+            generated_at_utc: Arc::clone(&self.generated_at_utc),
+            chunks: Arc::clone(&self.chunks),
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> ConversationCatalogSnapshot {
+        self.capture().snapshot()
     }
 
     #[must_use]
@@ -144,18 +261,23 @@ impl ConversationCatalog {
     }
 
     #[must_use]
+    pub const fn last_admission_metrics(&self) -> CatalogAdmissionMetrics {
+        self.last_admission_metrics
+    }
+
+    #[must_use]
     pub fn deterministic_bytes(&self) -> Vec<u8> {
-        self.file.deterministic_bytes()
+        self.capture().deterministic_bytes()
     }
 
     #[must_use]
     pub fn len(&self) -> usize {
-        self.file.conversations.len()
+        self.chunks.iter().map(|chunk| chunk.len()).sum()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.file.conversations.is_empty()
+        self.chunks.iter().all(|chunk| chunk.is_empty())
     }
 }
 
@@ -649,7 +771,17 @@ mod tests {
         ConversationEventRecordV2, ConversationEventType, EVENT_LOG_FILES,
     };
     use serde_json::json;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
+
+    use crate::conversation::repository::{
+        CatalogFlushCoordinator, CatalogFlushFailureStage, CATALOG_FLUSH_DEBOUNCE,
+        CATALOG_FLUSH_MAX_DELAY,
+    };
+
+    static LARGE_CATALOG_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     const FIRST: &str = "018f7a1c-1b4d-7c8a-9f01-0123456789ab";
     const SECOND: &str = "028f7a1c-1b4d-7c8a-9f01-0123456789ab";
@@ -679,6 +811,57 @@ mod tests {
             last_seq: 0,
             created_by: ConversationCreator::Termul,
         }
+    }
+
+    fn large_catalog(
+        entry_count: usize,
+    ) -> (
+        ConversationCatalog,
+        ConversationCatalogFileV1,
+        ConversationRecordV2,
+    ) {
+        let mut conversations = Vec::with_capacity(entry_count);
+        let mut first_record = None;
+        for index in 0..entry_count {
+            let id = format!("00000000-0000-4000-8000-{index:012x}");
+            let value = record(&id, "2026-08-15T09:45:15.000Z");
+            first_record.get_or_insert_with(|| value.clone());
+            conversations.push(entry_from_frontier(
+                &value,
+                &ConversationFrontier::default(),
+            ));
+        }
+        let file = ConversationCatalogFileV1 {
+            schema_version: CATALOG_SCHEMA_VERSION,
+            generated_at_utc: "2026-08-15T09:45:15.000Z".to_string(),
+            conversations,
+        };
+        (
+            ConversationCatalog::from_file(file.clone()),
+            file,
+            first_record.expect("large catalog has at least one record"),
+        )
+    }
+
+    fn percentile_99_micros(mut samples: Vec<u128>) -> u128 {
+        samples.sort_unstable();
+        let index = (samples.len() * 99 / 100).min(samples.len() - 1);
+        samples[index]
+    }
+
+    fn mutation_admission_p99_micros(
+        coordinator: &Arc<CatalogFlushCoordinator>,
+        record: &ConversationRecordV2,
+        samples: usize,
+    ) -> u128 {
+        let frontier = ConversationFrontier::default();
+        let mut timings = Vec::with_capacity(samples);
+        for _ in 0..samples {
+            let started = Instant::now();
+            coordinator.admit_for_test(record, &frontier);
+            timings.push(started.elapsed().as_micros());
+        }
+        percentile_99_micros(timings)
     }
 
     fn write_conversation(
@@ -753,6 +936,182 @@ mod tests {
         assert_eq!(
             incremental.deterministic_bytes(),
             rebuilt.catalog.deterministic_bytes()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_50000_capture_p99_le_2ms_and_mutation_p99_le_5ms() {
+        let _serial = LARGE_CATALOG_TEST_LOCK.lock().await;
+        let (catalog, expected_file, mutation_record) = large_catalog(50_000);
+        let temp = tempfile::tempdir().unwrap();
+        let durable_fs = DurableFileSystem::new();
+        let coordinator = CatalogFlushCoordinator::new_for_test(
+            catalog,
+            durable_fs,
+            temp.path().canonicalize().unwrap().join(CATALOG_FILE),
+        );
+
+        let mut capture_samples = Vec::with_capacity(1_000);
+        for _ in 0..1_000 {
+            let started = Instant::now();
+            let generation = coordinator.capture_for_test();
+            capture_samples.push(started.elapsed().as_micros());
+            assert_eq!(generation.entry_count, 50_000);
+            assert_eq!(generation.chunk_count(), 49);
+        }
+        let capture_p99_micros = percentile_99_micros(capture_samples);
+
+        // Retain the frozen generation while admitting the next mutation. This is the exact
+        // production overlap that exercises pointer-vector and one-dirty-chunk copy-on-write.
+        let frozen = coordinator.capture_for_test();
+        coordinator.admit_for_test(&mutation_record, &ConversationFrontier::default());
+        let metrics = coordinator.last_admission_metrics();
+        assert!(metrics.cloned_chunk_pointers <= 49, "{metrics:?}");
+        assert!(
+            metrics.cloned_dirty_entries <= CATALOG_CHUNK_ENTRIES,
+            "{metrics:?}"
+        );
+        assert_eq!(metrics.serialized_bytes_under_lock, 0);
+
+        let serialize = tokio::task::spawn_blocking(move || frozen.deterministic_bytes());
+        let mutation_p99_micros =
+            mutation_admission_p99_micros(&coordinator, &mutation_record, 1_000);
+        let serialized = serialize.await.unwrap();
+        assert_eq!(serialized, expected_file.deterministic_bytes());
+        assert!(
+            capture_p99_micros <= 2_000,
+            "capture p99 {capture_p99_micros}us"
+        );
+        assert!(
+            mutation_p99_micros <= 5_000,
+            "mutation admission p99 {mutation_p99_micros}us"
+        );
+        println!(
+            "catalog_metrics entry_count=50000 chunk_count=49 capture_p99_us={capture_p99_micros} mutation_p99_us={mutation_p99_micros} serialized_bytes_under_lock=0"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_50000_heartbeat_gap_le_50ms_debounce_100ms_max_delay_1s() {
+        let _serial = LARGE_CATALOG_TEST_LOCK.lock().await;
+        let (catalog, _expected_file, mutation_record) = large_catalog(50_000);
+        let temp = tempfile::tempdir().unwrap();
+        let durable_fs = DurableFileSystem::new();
+        let coordinator = CatalogFlushCoordinator::new_for_test(
+            catalog,
+            durable_fs,
+            temp.path().canonicalize().unwrap().join(CATALOG_FILE),
+        );
+        coordinator.admit_for_test(&mutation_record, &ConversationFrontier::default());
+
+        let done = Arc::new(AtomicBool::new(false));
+        let heartbeat_done = Arc::clone(&done);
+        let heartbeat = tokio::spawn(async move {
+            let mut previous = Instant::now();
+            let mut maximum_gap = Duration::ZERO;
+            while !heartbeat_done.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                let now = Instant::now();
+                maximum_gap = maximum_gap.max(now.saturating_duration_since(previous));
+                previous = now;
+            }
+            maximum_gap
+        });
+        tokio::task::yield_now().await;
+        let flush_started = Instant::now();
+        let receipt = coordinator.flush_once_for_test().await.unwrap();
+        let flush_duration = flush_started.elapsed();
+        done.store(true, Ordering::Release);
+        let maximum_gap = heartbeat.await.unwrap();
+
+        assert_eq!(CATALOG_FLUSH_DEBOUNCE, Duration::from_millis(100));
+        assert_eq!(CATALOG_FLUSH_MAX_DELAY, Duration::from_secs(1));
+        assert!(
+            maximum_gap <= Duration::from_millis(50),
+            "heartbeat gap {maximum_gap:?}"
+        );
+        assert!(
+            flush_duration <= CATALOG_FLUSH_MAX_DELAY,
+            "flush took {flush_duration:?}"
+        );
+        assert!(receipt.flushed_generation >= receipt.requested_generation);
+        println!(
+            "catalog_heartbeat entry_count=50000 max_gap_ms={} flush_ms={} debounce_ms=100 max_delay_ms=1000",
+            maximum_gap.as_millis(),
+            flush_duration.as_millis()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_serialization_failure_returns_catalog_flush_failed_and_keeps_mutation_p99_le_5ms(
+    ) {
+        let _serial = LARGE_CATALOG_TEST_LOCK.lock().await;
+        let (catalog, _expected_file, mutation_record) = large_catalog(50_000);
+        let temp = tempfile::tempdir().unwrap();
+        let durable_fs = DurableFileSystem::new();
+        let coordinator = CatalogFlushCoordinator::new_for_test(
+            catalog,
+            durable_fs,
+            temp.path().canonicalize().unwrap().join(CATALOG_FILE),
+        );
+        let admitted_generation =
+            coordinator.admit_for_test(&mutation_record, &ConversationFrontier::default());
+        coordinator.fail_next_serializations(1);
+        let error = coordinator.flush_once_for_test().await.unwrap_err();
+        assert_eq!(error.code, "CATALOG_FLUSH_FAILED");
+        assert_eq!(error.stage, CatalogFlushFailureStage::Serialization);
+        assert_eq!(error.generation, admitted_generation);
+        assert_eq!(error.pending_generation, admitted_generation);
+        assert_eq!(coordinator.pending_generation(), admitted_generation);
+
+        let mutation_p99_micros =
+            mutation_admission_p99_micros(&coordinator, &mutation_record, 1_000);
+        assert!(
+            mutation_p99_micros <= 5_000,
+            "post-serialization-failure mutation p99 {mutation_p99_micros}us"
+        );
+        let pending_generation = coordinator.pending_generation();
+        let retry = coordinator.flush_once_for_test().await.unwrap();
+        assert!(retry.flushed_generation >= pending_generation);
+        println!(
+            "catalog_failure stage=serialization code={} pending_generation={} mutation_p99_us={mutation_p99_micros}",
+            error.code, pending_generation
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn catalog_replace_failure_returns_catalog_flush_failed_and_keeps_mutation_p99_le_5ms() {
+        let _serial = LARGE_CATALOG_TEST_LOCK.lock().await;
+        let (catalog, _expected_file, mutation_record) = large_catalog(50_000);
+        let temp = tempfile::tempdir().unwrap();
+        let durable_fs = DurableFileSystem::new();
+        let coordinator = CatalogFlushCoordinator::new_for_test(
+            catalog,
+            durable_fs,
+            temp.path().canonicalize().unwrap().join(CATALOG_FILE),
+        );
+        let admitted_generation =
+            coordinator.admit_for_test(&mutation_record, &ConversationFrontier::default());
+        coordinator.fail_next_writes(1);
+        let error = coordinator.flush_once_for_test().await.unwrap_err();
+        assert_eq!(error.code, "CATALOG_FLUSH_FAILED");
+        assert_eq!(error.stage, CatalogFlushFailureStage::Replacement);
+        assert_eq!(error.generation, admitted_generation);
+        assert_eq!(error.pending_generation, admitted_generation);
+        assert_eq!(coordinator.pending_generation(), admitted_generation);
+
+        let mutation_p99_micros =
+            mutation_admission_p99_micros(&coordinator, &mutation_record, 1_000);
+        assert!(
+            mutation_p99_micros <= 5_000,
+            "post-replacement-failure mutation p99 {mutation_p99_micros}us"
+        );
+        let pending_generation = coordinator.pending_generation();
+        let retry = coordinator.flush_once_for_test().await.unwrap();
+        assert!(retry.flushed_generation >= pending_generation);
+        println!(
+            "catalog_failure stage=replacement code={} pending_generation={} mutation_p99_us={mutation_p99_micros}",
+            error.code, pending_generation
         );
     }
 

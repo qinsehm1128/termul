@@ -27,6 +27,7 @@ use crate::acp::host_mcp::{
     emit_plan_update, map_todos_to_plan_entries, FrameKind, FrameReply, FrameRequest, PlanStore,
 };
 use crate::acp::session_persistence::SessionPersistence;
+use crate::conversation::ConversationPersistenceAdapter;
 use crate::web::EventSink;
 
 /// Per-session auth + routing context, keyed by the random token.
@@ -65,12 +66,13 @@ pub struct HostPlanServer {
     /// retrying. Cleared on `unregister_session`. In-memory only — a resumed
     /// session in a new process can set the title once again.
     title_set_for_session: Mutex<HashSet<String>>,
-    /// Per-session plan cache (emit-and-cache). v1 doesn't persist; this is
-    /// the seam a future persistence layer reads from on resume. Updated in
-    /// `process_request` (set on emit) + `unregister_*` (drop on close).
+    /// Per-session plan cache. Cold binds hydrate the latest canonical full replacement; live
+    /// updates replace it only after durable acknowledgement, including empty clears.
     plan_store: PlanStore,
     /// Durable store used by the title tool. Absent in live-only tests/modes.
     persistence: Option<Arc<SessionPersistence>>,
+    /// Canonical Conversation history used for durable plan acknowledgement and cold hydration.
+    conversation_persistence: Option<Arc<ConversationPersistenceAdapter>>,
 }
 
 impl HostPlanServer {
@@ -86,6 +88,22 @@ impl HostPlanServer {
         sinks: Vec<Arc<dyn EventSink>>,
         persistence: Option<Arc<SessionPersistence>>,
     ) -> Arc<Self> {
+        Self::start_inner(sinks, persistence, None)
+    }
+
+    #[must_use]
+    pub fn start_with_conversation_persistence(
+        sinks: Vec<Arc<dyn EventSink>>,
+        persistence: Arc<ConversationPersistenceAdapter>,
+    ) -> Arc<Self> {
+        Self::start_inner(sinks, None, Some(persistence))
+    }
+
+    fn start_inner(
+        sinks: Vec<Arc<dyn EventSink>>,
+        persistence: Option<Arc<SessionPersistence>>,
+        conversation_persistence: Option<Arc<ConversationPersistenceAdapter>>,
+    ) -> Arc<Self> {
         let server = Arc::new(Self {
             port: std::sync::OnceLock::new(),
             sinks,
@@ -94,6 +112,7 @@ impl HostPlanServer {
             title_set_for_session: Mutex::new(HashSet::new()),
             plan_store: PlanStore::new(),
             persistence,
+            conversation_persistence,
         });
         let server_for_thread = Arc::clone(&server);
         let (port_tx, port_rx) = std::sync::mpsc::channel::<u16>();
@@ -194,19 +213,36 @@ impl HostPlanServer {
     /// responds. No-op (logged) if the token is unknown (e.g. the session was
     /// for an ephemeral background gen that wasn't registered).
     pub fn bind_session(&self, token: &str, real_session_id: &str) {
-        let mut sessions = self.sessions.lock();
-        match sessions.get_mut(token) {
-            Some(auth) => {
-                auth.real_session_id = Some(real_session_id.to_string());
-                log::debug!(
-                    "[host-mcp] bound token → session {real_session_id} (agent {})",
-                    auth.agent_id
-                );
+        let bound = {
+            let mut sessions = self.sessions.lock();
+            match sessions.get_mut(token) {
+                Some(auth) => {
+                    auth.real_session_id = Some(real_session_id.to_string());
+                    log::debug!(
+                        "[host-mcp] bound token → session {real_session_id} (agent {})",
+                        auth.agent_id
+                    );
+                    true
+                }
+                None => {
+                    log::warn!(
+                        "[host-mcp] bind_session: unknown token (session {real_session_id} not registered)"
+                    );
+                    false
+                }
             }
-            None => {
-                log::warn!(
-                    "[host-mcp] bind_session: unknown token (session {real_session_id} not registered)"
-                );
+        };
+        if !bound {
+            return;
+        }
+        if let Some(persistence) = &self.conversation_persistence {
+            match persistence.latest_durable_plan(real_session_id) {
+                Ok(Some(entries)) => self.plan_store.set(real_session_id, entries),
+                Ok(None) => {}
+                Err(error) => log::warn!(
+                    "[host-mcp] durable plan hydration failed code={}",
+                    error.code
+                ),
             }
         }
     }
@@ -407,7 +443,15 @@ impl HostPlanServer {
                 let agent_id = AgentId(auth.agent_id.clone());
                 let session_id = SessionId(real_session_id.clone());
                 let count = entries.len();
-                match emit_plan_update(&self.sinks, &agent_id, &session_id, entries.clone()) {
+                match emit_plan_update(
+                    &self.sinks,
+                    self.conversation_persistence.as_deref(),
+                    &agent_id,
+                    &session_id,
+                    entries.clone(),
+                )
+                .await
+                {
                     Ok(_) => {
                         self.plan_store.set(&real_session_id, entries);
                         log::info!(
@@ -475,6 +519,15 @@ impl HostPlanServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversation::write_authority::ConversationMutation;
+    use crate::conversation::{
+        AgentSessionBinding, AgentSessionBindingState, ConversationCreator, ConversationEventType,
+        ConversationId, ConversationLifecycleState, ConversationReader, ConversationRecordV2,
+        ConversationRepository, ConversationWriter, CreationPartition, ExecutionTarget,
+        LegacyConversationReader, ReaderPrecedence, AGENT_SESSION_BINDING_SCHEMA_VERSION,
+        CONVERSATION_SCHEMA_VERSION,
+    };
+    use chrono::{TimeZone, Utc};
     use std::sync::Mutex as StdMutex;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
@@ -524,6 +577,111 @@ mod tests {
         assert!(!token.is_empty());
         assert!(!provisional.is_empty());
         assert_ne!(token, provisional, "token and provisional sid must differ");
+    }
+
+    #[tokio::test]
+    async fn cold_bind_hydrates_latest_canonical_plan_and_empty_clear() {
+        let temp = tempfile::tempdir().unwrap();
+        let private = temp.path().canonicalize().unwrap().join("private");
+        let visible = temp.path().join("visible");
+        std::fs::create_dir_all(&visible).unwrap();
+        let (repository, _) = ConversationRepository::open(private.clone()).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
+        let conversation_id =
+            ConversationId::parse("66666666-6666-4666-8666-666666666666").unwrap();
+        let created_at = Utc
+            .timestamp_millis_opt(1_766_000_000_000)
+            .single()
+            .unwrap();
+        writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: visible.to_string_lossy().into_owned(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::Ready,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                },
+                ConversationMutation::CreateConversation,
+            )
+            .await
+            .unwrap();
+        writer
+            .bind_agent_session(
+                conversation_id,
+                AgentSessionBinding {
+                    schema_version: AGENT_SESSION_BINDING_SCHEMA_VERSION,
+                    binding_id: Uuid::new_v4(),
+                    agent_session_id: "sess-cold-plan".to_string(),
+                    runtime_agent_id: "agent-1".to_string(),
+                    stable_agent_namespace: "config:test".to_string(),
+                    execution_cwd: visible.to_string_lossy().into_owned(),
+                    bound_at_utc: created_at,
+                    state: AgentSessionBindingState::Active,
+                },
+                created_at,
+            )
+            .await
+            .unwrap();
+        writer
+            .append_event(
+                conversation_id,
+                created_at,
+                ConversationEventType::PlanUpdate,
+                serde_json::json!({
+                    "agentId":"agent-1",
+                    "sessionId":"sess-cold-plan",
+                    "plan":{"entries":[{"content":"ship","priority":"high","status":"in_progress"}]}
+                }),
+                ConversationMutation::AcpEventAppend,
+            )
+            .await
+            .unwrap();
+        drop(writer);
+        drop(repository);
+
+        let (repository, _) = ConversationRepository::open(private).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
+        let reader = Arc::new(ConversationReader::new(
+            Arc::clone(&repository),
+            LegacyConversationReader::default(),
+            ReaderPrecedence::ConversationV2Only,
+        ));
+        let adapter = Arc::new(ConversationPersistenceAdapter::new(
+            Arc::clone(&writer),
+            reader,
+        ));
+        let server =
+            HostPlanServer::start_with_conversation_persistence(vec![], Arc::clone(&adapter));
+        let (_port, token, _provisional) = server.register_session("agent-1");
+        server.bind_session(&token, "sess-cold-plan");
+        let hydrated = server.plan_store.get("sess-cold-plan").unwrap();
+        assert_eq!(hydrated.len(), 1);
+        assert_eq!(hydrated[0].content, "ship");
+
+        writer
+            .append_event(
+                conversation_id,
+                created_at,
+                ConversationEventType::PlanUpdate,
+                serde_json::json!({
+                    "agentId":"agent-1",
+                    "sessionId":"sess-cold-plan",
+                    "plan":{"entries":[]}
+                }),
+                ConversationMutation::AcpEventAppend,
+            )
+            .await
+            .unwrap();
+        let cleared = HostPlanServer::start_with_conversation_persistence(vec![], adapter);
+        let (_port, token, _provisional) = cleared.register_session("agent-1");
+        cleared.bind_session(&token, "sess-cold-plan");
+        assert_eq!(cleared.plan_store.get("sess-cold-plan"), Some(Vec::new()));
     }
 
     #[test]

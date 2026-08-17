@@ -9,7 +9,7 @@
 use std::cell::Cell;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{copy, BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{self, copy, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -19,10 +19,11 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::conversation::contracts::{
-    format_created_at_utc, parse_created_at_utc, AgentSessionBinding, AgentSessionBindingState,
-    ConversationErrorCode, ConversationId, ConversationLifecycleState, ConversationTitleSource,
-    ExecutionTarget, ProjectAttachment, AGENT_SESSION_BINDING_SCHEMA_VERSION,
-    PROJECT_ATTACHMENT_SCHEMA_VERSION,
+    encoded_json_len_bounded, format_created_at_utc, parse_created_at_utc, AgentSessionBinding,
+    AgentSessionBindingState, ConversationErrorCode, ConversationId, ConversationLifecycleState,
+    ConversationTitleSource, ExecutionTarget, ProjectAttachment,
+    AGENT_SESSION_BINDING_SCHEMA_VERSION, MAX_CONVERSATION_HISTORY_PAGE_BYTES,
+    MAX_CONVERSATION_RECORD_BYTES, PROJECT_ATTACHMENT_SCHEMA_VERSION,
 };
 use crate::conversation::durable_fs::DurableFileSystem;
 
@@ -31,6 +32,9 @@ pub const SPARSE_OFFSET_STRIDE: u64 = 256;
 /// Immutable sparse-index chunk size. Only the append tail is copied when an overlapping reader
 /// holds the previous [`EventLogScan`] generation.
 pub const SPARSE_INDEX_CHUNK_ENTRIES: usize = 1_024;
+/// Immutable binding/attachment history chunk size. Entries are individually shared so cloning an
+/// overlapping frontier copies at most 1024 `Arc` pointers, never opaque binding/path strings.
+pub const FRONTIER_HISTORY_CHUNK_ENTRIES: usize = 1_024;
 pub const MIN_EVENT_PAGE_LIMIT: usize = 1;
 pub const MAX_EVENT_PAGE_LIMIT: usize = 1_000;
 pub const MESSAGES_FILE: &str = "messages.jsonl";
@@ -74,6 +78,10 @@ pub enum ConversationEventType {
     PromptComplete,
     ToolCall,
     ToolCallUpdate,
+    UsageUpdate,
+    PlanUpdate,
+    /// Payload-free durable marker for a relay event that has no materialized history payload.
+    RelayCursorAdvanced,
     BindingBound,
     BindingDetached,
     BindingRebound,
@@ -103,6 +111,9 @@ impl ConversationEventType {
             | Self::SessionInfoUpdate
             | Self::LocalTitleGenerated
             | Self::PromptComplete
+            | Self::UsageUpdate
+            | Self::PlanUpdate
+            | Self::RelayCursorAdvanced
             | Self::CreationFailed => ConversationEventStream::Messages,
         }
     }
@@ -162,6 +173,66 @@ impl ConversationEventRecordV2 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EventRecordEncodingError {
+    Serialization,
+    TooLarge,
+}
+
+struct BoundedJsonBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl BoundedJsonBuffer {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::with_capacity(limit.min(8 * 1024)),
+            limit,
+            exceeded: false,
+        }
+    }
+}
+
+impl Write for BoundedJsonBuffer {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let Some(next) = self.bytes.len().checked_add(buffer.len()) else {
+            self.exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "encoded event length overflow",
+            ));
+        };
+        if next > self.limit {
+            self.exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "encoded event exceeds configured limit",
+            ));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serialize one canonical record into a bounded buffer. The writer stops as soon as the stable
+/// 256 KiB limit is crossed, so no unbounded intermediate `Vec` is created.
+pub(crate) fn encode_event_record_bounded(
+    record: &ConversationEventRecordV2,
+) -> std::result::Result<Vec<u8>, EventRecordEncodingError> {
+    let mut writer = BoundedJsonBuffer::new(MAX_CONVERSATION_RECORD_BYTES);
+    match serde_json::to_writer(&mut writer, record) {
+        Ok(()) => Ok(writer.bytes),
+        Err(_) if writer.exceeded => Err(EventRecordEncodingError::TooLarge),
+        Err(_) => Err(EventRecordEncodingError::Serialization),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BindingEventPayloadV1 {
@@ -211,6 +282,10 @@ pub struct ConversationFrontier {
     pub attachment: AttachmentMaterialization,
     pub execution_target: Option<ExecutionTarget>,
     pub summary: ConversationSummaryFrontier,
+    /// Latest full canonical usage replacement. Absent means no usage update has ever committed.
+    pub latest_usage: Option<Value>,
+    /// Latest full canonical plan replacement. An empty `entries` array is a durable clear.
+    pub latest_plan: Option<Value>,
     pub lifecycle_state: Option<ConversationLifecycleState>,
     pub last_seq: u64,
 }
@@ -281,10 +356,7 @@ impl SparseOffsetEntries {
 
     #[must_use]
     pub fn get(&self, index: usize) -> Option<&SparseEventOffset> {
-        let sealed_len = self
-            .chunks
-            .len()
-            .saturating_mul(SPARSE_INDEX_CHUNK_ENTRIES);
+        let sealed_len = self.chunks.len().saturating_mul(SPARSE_INDEX_CHUNK_ENTRIES);
         if index < sealed_len {
             let chunk_index = index / SPARSE_INDEX_CHUNK_ENTRIES;
             let entry_index = index % SPARSE_INDEX_CHUNK_ENTRIES;
@@ -299,8 +371,7 @@ impl SparseOffsetEntries {
             self.tail.reserve_exact(SPARSE_INDEX_CHUNK_ENTRIES);
             #[cfg(test)]
             record_sparse_index_allocation(
-                SPARSE_INDEX_CHUNK_ENTRIES
-                    .saturating_mul(std::mem::size_of::<SparseEventOffset>()),
+                SPARSE_INDEX_CHUNK_ENTRIES.saturating_mul(std::mem::size_of::<SparseEventOffset>()),
             );
         }
         self.tail.push(entry);
@@ -357,10 +428,7 @@ impl SparseOffsetEntries {
 
     /// Compatibility iterator used by repository validation tests. Sparse entries are `Copy`, so
     /// a small requested window does not expose or flatten the chunk storage.
-    pub fn windows(
-        &self,
-        size: usize,
-    ) -> impl Iterator<Item = Vec<SparseEventOffset>> + '_ {
+    pub fn windows(&self, size: usize) -> impl Iterator<Item = Vec<SparseEventOffset>> + '_ {
         assert!(size > 0, "window size must be non-zero");
         let window_count = self.len().checked_sub(size).map_or(0, |count| count + 1);
         (0..window_count).map(move |start| {
@@ -376,14 +444,12 @@ impl SparseOffsetEntries {
 
     #[cfg(test)]
     fn get_mut_for_test(&mut self, index: usize) -> Option<&mut SparseEventOffset> {
-        let sealed_len = self
-            .chunks
-            .len()
-            .saturating_mul(SPARSE_INDEX_CHUNK_ENTRIES);
+        let sealed_len = self.chunks.len().saturating_mul(SPARSE_INDEX_CHUNK_ENTRIES);
         if index < sealed_len {
             let chunk_index = index / SPARSE_INDEX_CHUNK_ENTRIES;
             let entry_index = index % SPARSE_INDEX_CHUNK_ENTRIES;
-            Arc::make_mut(Arc::make_mut(&mut self.chunks).get_mut(chunk_index)?).get_mut(entry_index)
+            Arc::make_mut(Arc::make_mut(&mut self.chunks).get_mut(chunk_index)?)
+                .get_mut(entry_index)
         } else {
             self.tail.get_mut(index.saturating_sub(sealed_len))
         }
@@ -501,6 +567,8 @@ thread_local! {
     static SPARSE_LOOKUP_COMPARISONS: Cell<usize> = const { Cell::new(0) };
     static SPARSE_INDEX_COPIED_ENTRIES: Cell<usize> = const { Cell::new(0) };
     static SPARSE_INDEX_ALLOCATED_BYTES: Cell<usize> = const { Cell::new(0) };
+    static FRONTIER_HISTORY_COPIED_ENTRIES: Cell<usize> = const { Cell::new(0) };
+    static TOTAL_OVERLAP_ALLOCATED_BYTES: Cell<usize> = const { Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -517,6 +585,26 @@ fn record_sparse_index_clone(copied_entries: usize, allocated_bytes: usize) {
 fn record_sparse_index_allocation(allocated_bytes: usize) {
     SPARSE_INDEX_ALLOCATED_BYTES.set(
         SPARSE_INDEX_ALLOCATED_BYTES
+            .get()
+            .saturating_add(allocated_bytes),
+    );
+    record_total_overlap_allocation(allocated_bytes);
+}
+
+#[cfg(test)]
+fn record_frontier_history_clone(copied_entries: usize, allocated_bytes: usize) {
+    FRONTIER_HISTORY_COPIED_ENTRIES.set(
+        FRONTIER_HISTORY_COPIED_ENTRIES
+            .get()
+            .saturating_add(copied_entries),
+    );
+    record_total_overlap_allocation(allocated_bytes);
+}
+
+#[cfg(test)]
+fn record_total_overlap_allocation(allocated_bytes: usize) {
+    TOTAL_OVERLAP_ALLOCATED_BYTES.set(
+        TOTAL_OVERLAP_ALLOCATED_BYTES
             .get()
             .saturating_add(allocated_bytes),
     );
@@ -547,6 +635,8 @@ fn sparse_lookup_comparisons() -> usize {
 fn reset_sparse_index_clone_metrics() {
     SPARSE_INDEX_COPIED_ENTRIES.set(0);
     SPARSE_INDEX_ALLOCATED_BYTES.set(0);
+    FRONTIER_HISTORY_COPIED_ENTRIES.set(0);
+    TOTAL_OVERLAP_ALLOCATED_BYTES.set(0);
 }
 
 #[cfg(test)]
@@ -557,16 +647,151 @@ fn sparse_index_clone_metrics() -> (usize, usize) {
     )
 }
 
+#[cfg(test)]
+fn total_overlap_clone_metrics() -> (usize, usize) {
+    (
+        FRONTIER_HISTORY_COPIED_ENTRIES.get(),
+        TOTAL_OVERLAP_ALLOCATED_BYTES.get(),
+    )
+}
+
+/// Append-oriented immutable chunk history. Sealed chunks and every contained value are shared;
+/// cloning an [`EventLogScan`] copies only the at-most-1024 pointer tail.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ChunkedHistory<T> {
+    chunks: Arc<Vec<Arc<Vec<Arc<T>>>>>,
+    tail: Vec<Arc<T>>,
+}
+
+impl<T> Default for ChunkedHistory<T> {
+    fn default() -> Self {
+        Self {
+            chunks: Arc::new(Vec::new()),
+            tail: Vec::new(),
+        }
+    }
+}
+
+impl<T> Clone for ChunkedHistory<T> {
+    fn clone(&self) -> Self {
+        let mut tail = Vec::with_capacity(self.tail.len());
+        tail.extend(self.tail.iter().cloned());
+        #[cfg(test)]
+        record_frontier_history_clone(
+            self.tail.len(),
+            tail.capacity()
+                .saturating_mul(std::mem::size_of::<Arc<T>>()),
+        );
+        Self {
+            chunks: Arc::clone(&self.chunks),
+            tail,
+        }
+    }
+}
+
+impl<T> ChunkedHistory<T> {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.chunks
+            .len()
+            .saturating_mul(FRONTIER_HISTORY_CHUNK_ENTRIES)
+            .saturating_add(self.tail.len())
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.chunks.is_empty() && self.tail.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &T> {
+        self.chunks
+            .iter()
+            .flat_map(|chunk| chunk.iter().map(AsRef::as_ref))
+            .chain(self.tail.iter().map(AsRef::as_ref))
+    }
+
+    fn push(&mut self, value: T) {
+        if self.tail.capacity() < FRONTIER_HISTORY_CHUNK_ENTRIES {
+            let additional = FRONTIER_HISTORY_CHUNK_ENTRIES.saturating_sub(self.tail.capacity());
+            self.tail.reserve_exact(additional);
+            #[cfg(test)]
+            record_total_overlap_allocation(
+                additional.saturating_mul(std::mem::size_of::<Arc<T>>()),
+            );
+        }
+        self.tail.push(Arc::new(value));
+        if self.tail.len() == FRONTIER_HISTORY_CHUNK_ENTRIES {
+            let sealed = Arc::new(std::mem::take(&mut self.tail));
+            #[cfg(test)]
+            if Arc::strong_count(&self.chunks) > 1 {
+                record_total_overlap_allocation(
+                    self.chunks
+                        .len()
+                        .saturating_mul(std::mem::size_of::<Arc<Vec<Arc<T>>>>()),
+                );
+            }
+            Arc::make_mut(&mut self.chunks).push(sealed);
+        }
+    }
+
+    fn replace(&mut self, index: usize, value: T) -> bool {
+        let sealed_len = self
+            .chunks
+            .len()
+            .saturating_mul(FRONTIER_HISTORY_CHUNK_ENTRIES);
+        if index < sealed_len {
+            let chunk_index = index / FRONTIER_HISTORY_CHUNK_ENTRIES;
+            let entry_index = index % FRONTIER_HISTORY_CHUNK_ENTRIES;
+            #[cfg(test)]
+            if Arc::strong_count(&self.chunks) > 1 {
+                record_total_overlap_allocation(
+                    self.chunks
+                        .len()
+                        .saturating_mul(std::mem::size_of::<Arc<Vec<Arc<T>>>>()),
+                );
+            }
+            let chunks = Arc::make_mut(&mut self.chunks);
+            let Some(chunk) = chunks.get_mut(chunk_index) else {
+                return false;
+            };
+            #[cfg(test)]
+            if Arc::strong_count(chunk) > 1 {
+                record_total_overlap_allocation(
+                    FRONTIER_HISTORY_CHUNK_ENTRIES.saturating_mul(std::mem::size_of::<Arc<T>>()),
+                );
+            }
+            let entries = Arc::make_mut(chunk);
+            let Some(entry) = entries.get_mut(entry_index) else {
+                return false;
+            };
+            *entry = Arc::new(value);
+            true
+        } else if let Some(entry) = self.tail.get_mut(index.saturating_sub(sealed_len)) {
+            *entry = Arc::new(value);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl<T: Clone> ChunkedHistory<T> {
+    #[must_use]
+    pub fn to_vec(&self) -> Vec<T> {
+        self.iter().cloned().collect()
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BindingMaterialization {
     pub current: Option<AgentSessionBinding>,
-    pub history: Vec<AgentSessionBinding>,
+    pub history: ChunkedHistory<AgentSessionBinding>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AttachmentMaterialization {
     pub current: Option<ProjectAttachment>,
-    pub history: Vec<ProjectAttachment>,
+    pub history: ChunkedHistory<ProjectAttachment>,
     pub has_events: bool,
 }
 
@@ -581,6 +806,8 @@ pub enum EventLogErrorKind {
     SequenceConflict,
     InvalidBindingHistory,
     InvalidAttachmentHistory,
+    RecordTooLarge,
+    PageTooLarge,
     Durability,
 }
 
@@ -613,10 +840,11 @@ impl std::error::Error for EventLogError {}
 impl EventLogError {
     #[must_use]
     pub fn stable_code(&self) -> String {
-        if self.kind == EventLogErrorKind::InvalidPageLimit {
-            "VALIDATION_ERROR".to_string()
-        } else {
-            stable_error_code(self.code)
+        match self.kind {
+            EventLogErrorKind::InvalidPageLimit => "VALIDATION_ERROR".to_string(),
+            EventLogErrorKind::RecordTooLarge => "CONVERSATION_RECORD_TOO_LARGE".to_string(),
+            EventLogErrorKind::PageTooLarge => "CONVERSATION_PAGE_TOO_LARGE".to_string(),
+            _ => stable_error_code(self.code),
         }
     }
 }
@@ -748,6 +976,7 @@ pub fn apply_event(
     apply_binding_event(&mut frontier.binding, record, path)?;
     apply_attachment_event(&mut frontier.attachment, record, path)?;
     apply_execution_target_event(&mut frontier.execution_target, record, path)?;
+    apply_durable_replacements(frontier, record, path)?;
     apply_summary_event(&mut frontier.summary, record)?;
     match record.type_ {
         ConversationEventType::CreationFailed => {
@@ -773,6 +1002,50 @@ const fn event_streams() -> [ConversationEventStream; 4] {
         ConversationEventStream::Bindings,
         ConversationEventStream::Attachments,
     ]
+}
+
+enum BoundedJsonLine {
+    Eof,
+    Complete(Vec<u8>),
+    Torn(Vec<u8>),
+}
+
+enum BoundedJsonLineError {
+    Io(io::Error),
+    TooLarge,
+}
+
+/// Read at most one record plus newline and one overflow sentinel byte. `Read::take` bounds the
+/// allocation even for an imported JSONL line with no newline.
+fn read_bounded_jsonl_line(
+    reader: &mut impl BufRead,
+) -> std::result::Result<BoundedJsonLine, BoundedJsonLineError> {
+    let mut line = Vec::with_capacity(8 * 1024);
+    loop {
+        let available = reader.fill_buf().map_err(BoundedJsonLineError::Io)?;
+        if available.is_empty() {
+            return if line.is_empty() {
+                Ok(BoundedJsonLine::Eof)
+            } else {
+                Ok(BoundedJsonLine::Torn(line))
+            };
+        }
+        if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+            let content_bytes = line.len().saturating_add(newline);
+            if content_bytes > MAX_CONVERSATION_RECORD_BYTES {
+                return Err(BoundedJsonLineError::TooLarge);
+            }
+            line.extend_from_slice(&available[..=newline]);
+            reader.consume(newline + 1);
+            return Ok(BoundedJsonLine::Complete(line));
+        }
+        if line.len().saturating_add(available.len()) > MAX_CONVERSATION_RECORD_BYTES {
+            return Err(BoundedJsonLineError::TooLarge);
+        }
+        let consumed = available.len();
+        line.extend_from_slice(available);
+        reader.consume(consumed);
+    }
 }
 
 struct StreamScanner {
@@ -819,39 +1092,52 @@ impl StreamScanner {
         durable_fs: &DurableFileSystem,
     ) -> Result<Option<ConversationEventRecordV2>> {
         let line_offset = self.offset;
-        let mut line = Vec::new();
-        let bytes_read = self
-            .reader
-            .as_mut()
-            .expect("stream reader remains open until EOF or torn-tail repair")
-            .read_until(b'\n', &mut line)
-            .map_err(|source| {
-                error(
+        let line = match read_bounded_jsonl_line(
+            self.reader
+                .as_mut()
+                .expect("stream reader remains open until EOF or torn-tail repair"),
+        ) {
+            Ok(BoundedJsonLine::Eof) => {
+                self.offsets.validated_bytes = self.offset;
+                return Ok(None);
+            }
+            Ok(BoundedJsonLine::Complete(line)) => line,
+            Ok(BoundedJsonLine::Torn(_line)) => {
+                self.reader.take();
+                let warning = repair_torn_tail(
+                    directory,
+                    conversation_id,
+                    self.stream,
+                    &self.path,
+                    line_offset,
+                    durable_fs,
+                )?;
+                self.offsets.validated_bytes = line_offset;
+                self.repairs.push(warning);
+                return Ok(None);
+            }
+            Err(BoundedJsonLineError::Io(source)) => {
+                return Err(error(
                     ConversationErrorCode::ConversationRecoveryRequired,
                     EventLogErrorKind::Io,
                     conversation_id,
                     &self.path,
                     format!("stream read failed at byte offset {line_offset}: {source}"),
-                )
-            })?;
-        if bytes_read == 0 {
-            self.offsets.validated_bytes = self.offset;
-            return Ok(None);
-        }
-        if line.last() != Some(&b'\n') {
-            self.reader.take();
-            let warning = repair_torn_tail(
-                directory,
-                conversation_id,
-                self.stream,
-                &self.path,
-                line_offset,
-                durable_fs,
-            )?;
-            self.offsets.validated_bytes = line_offset;
-            self.repairs.push(warning);
-            return Ok(None);
-        }
+                ));
+            }
+            Err(BoundedJsonLineError::TooLarge) => {
+                return Err(error_at(
+                    ConversationErrorCode::ConversationRecordTooLarge,
+                    EventLogErrorKind::RecordTooLarge,
+                    conversation_id,
+                    &self.path,
+                    None,
+                    Some(line_offset),
+                    format!("encoded JSONL record exceeds {MAX_CONVERSATION_RECORD_BYTES} bytes"),
+                ));
+            }
+        };
+        let bytes_read = line.len();
         self.offset = self.offset.checked_add(bytes_read as u64).ok_or_else(|| {
             error(
                 ConversationErrorCode::ConversationRecoveryRequired,
@@ -1030,6 +1316,17 @@ fn decode_record(
     offset: u64,
     previous_seq: u64,
 ) -> Result<ConversationEventRecordV2> {
+    if line.len() > MAX_CONVERSATION_RECORD_BYTES {
+        return Err(error_at(
+            ConversationErrorCode::ConversationRecordTooLarge,
+            EventLogErrorKind::RecordTooLarge,
+            conversation_id,
+            path,
+            None,
+            Some(offset),
+            format!("encoded JSONL record exceeds {MAX_CONVERSATION_RECORD_BYTES} bytes"),
+        ));
+    }
     if line.is_empty() {
         return Err(error_at(
             ConversationErrorCode::ConversationRecoveryRequired,
@@ -1236,29 +1533,43 @@ impl PageStreamReader {
             ));
         }
         let line_offset = self.offset;
-        let mut line = Vec::new();
-        let bytes_read = self.reader.read_until(b'\n', &mut line).map_err(|source| {
-            error_at(
-                ConversationErrorCode::ConversationRecoveryRequired,
-                EventLogErrorKind::Io,
-                conversation_id,
-                &self.path,
-                None,
-                Some(line_offset),
-                format!("paged stream read failed at byte offset {line_offset}: {source}"),
-            )
-        })?;
-        if bytes_read == 0 || line.last() != Some(&b'\n') {
-            return Err(error_at(
-                ConversationErrorCode::ConversationRecoveryRequired,
-                EventLogErrorKind::CorruptRecord,
-                conversation_id,
-                &self.path,
-                None,
-                Some(line_offset),
-                format!("validated stream ended unexpectedly at byte offset {line_offset}"),
-            ));
-        }
+        let line = match read_bounded_jsonl_line(&mut self.reader) {
+            Ok(BoundedJsonLine::Complete(line)) => line,
+            Ok(BoundedJsonLine::Eof | BoundedJsonLine::Torn(_)) => {
+                return Err(error_at(
+                    ConversationErrorCode::ConversationRecoveryRequired,
+                    EventLogErrorKind::CorruptRecord,
+                    conversation_id,
+                    &self.path,
+                    None,
+                    Some(line_offset),
+                    format!("validated stream ended unexpectedly at byte offset {line_offset}"),
+                ));
+            }
+            Err(BoundedJsonLineError::Io(source)) => {
+                return Err(error_at(
+                    ConversationErrorCode::ConversationRecoveryRequired,
+                    EventLogErrorKind::Io,
+                    conversation_id,
+                    &self.path,
+                    None,
+                    Some(line_offset),
+                    format!("paged stream read failed at byte offset {line_offset}: {source}"),
+                ));
+            }
+            Err(BoundedJsonLineError::TooLarge) => {
+                return Err(error_at(
+                    ConversationErrorCode::ConversationRecordTooLarge,
+                    EventLogErrorKind::RecordTooLarge,
+                    conversation_id,
+                    &self.path,
+                    None,
+                    Some(line_offset),
+                    format!("encoded JSONL record exceeds {MAX_CONVERSATION_RECORD_BYTES} bytes"),
+                ));
+            }
+        };
+        let bytes_read = line.len();
         let next_offset = self.offset.checked_add(bytes_read as u64).ok_or_else(|| {
             error_at(
                 ConversationErrorCode::ConversationRecoveryRequired,
@@ -1373,6 +1684,7 @@ pub fn read_event_page(
     }
 
     let mut records = Vec::with_capacity(limit);
+    let mut encoded_bytes = 0usize;
     let mut previous_seq = after_seq;
     while records.len() < limit {
         let Some(next_index) = pending
@@ -1398,6 +1710,38 @@ pub fn read_event_page(
                 format!("global paged sequence conflict at seq {}", record.seq),
             ));
         }
+        let record_bytes = encoded_json_len_bounded(&record, MAX_CONVERSATION_RECORD_BYTES)
+            .ok_or_else(|| {
+                error_at(
+                    ConversationErrorCode::ConversationRecordTooLarge,
+                    EventLogErrorKind::RecordTooLarge,
+                    conversation_id,
+                    &directory.join(record.type_.stream().file_name()),
+                    Some(record.seq),
+                    None,
+                    format!(
+                        "encoded canonical record exceeds {MAX_CONVERSATION_RECORD_BYTES} bytes"
+                    ),
+                )
+            })?
+            .saturating_add(1);
+        if encoded_bytes.saturating_add(record_bytes) > MAX_CONVERSATION_HISTORY_PAGE_BYTES {
+            if records.is_empty() {
+                return Err(error_at(
+                    ConversationErrorCode::ConversationPageTooLarge,
+                    EventLogErrorKind::PageTooLarge,
+                    conversation_id,
+                    directory,
+                    Some(record.seq),
+                    None,
+                    format!(
+                        "encoded canonical page cannot advance within {MAX_CONVERSATION_HISTORY_PAGE_BYTES} bytes"
+                    ),
+                ));
+            }
+            break;
+        }
+        encoded_bytes = encoded_bytes.saturating_add(record_bytes);
         previous_seq = record.seq;
         records.push(record);
         pending[next_index] = readers[next_index].next_record(conversation_id)?;
@@ -1521,7 +1865,9 @@ fn apply_binding_event(
                         "current binding is missing from binding history",
                     )
                 })?;
-            materialized.history[previous_index] = payload.previous_binding;
+            debug_assert!(materialized
+                .history
+                .replace(previous_index, payload.previous_binding));
             materialized.history.push(payload.binding.clone());
             materialized.current = Some(payload.binding);
         }
@@ -1568,7 +1914,9 @@ fn apply_same_binding_transition(
                 "current binding is missing from binding history",
             )
         })?;
-    materialized.history[history_index] = payload.binding.clone();
+    debug_assert!(materialized
+        .history
+        .replace(history_index, payload.binding.clone()));
     materialized.current = Some(payload.binding);
     Ok(())
 }
@@ -1695,13 +2043,47 @@ fn validate_execution_target_snapshot(
     }
 }
 
+fn apply_durable_replacements(
+    frontier: &mut ConversationFrontier,
+    record: &ConversationEventRecordV2,
+    path: &Path,
+) -> Result<()> {
+    match record.type_ {
+        ConversationEventType::UsageUpdate => frontier.latest_usage = Some(record.payload.clone()),
+        ConversationEventType::PlanUpdate => frontier.latest_plan = Some(record.payload.clone()),
+        ConversationEventType::RelayCursorAdvanced if !matches!(&record.payload, Value::Object(object) if object.is_empty()) =>
+        {
+            return Err(error(
+                ConversationErrorCode::ConversationRecoveryRequired,
+                EventLogErrorKind::CorruptRecord,
+                record.conversation_id,
+                path,
+                format!(
+                    "relay_cursor_advanced must have an empty payload at seq {}",
+                    record.seq
+                ),
+            ));
+        }
+        ConversationEventType::RelayCursorAdvanced => {}
+        _ => {}
+    }
+    Ok(())
+}
+
 fn apply_summary_event(
     summary: &mut ConversationSummaryFrontier,
     record: &ConversationEventRecordV2,
 ) -> Result<()> {
     let path = Path::new(record.type_.stream().file_name());
     match record.type_.stream() {
-        ConversationEventStream::Messages => {
+        ConversationEventStream::Messages
+            if !matches!(
+                record.type_,
+                ConversationEventType::UsageUpdate
+                    | ConversationEventType::PlanUpdate
+                    | ConversationEventType::RelayCursorAdvanced
+            ) =>
+        {
             summary.message_count = summary.message_count.checked_add(1).ok_or_else(|| {
                 error(
                     ConversationErrorCode::ConversationRecoveryRequired,
@@ -1712,6 +2094,7 @@ fn apply_summary_event(
                 )
             })?;
         }
+        ConversationEventStream::Messages => {}
         ConversationEventStream::ToolCalls => {
             summary.tool_count = summary.tool_count.checked_add(1).ok_or_else(|| {
                 error(
@@ -1725,13 +2108,15 @@ fn apply_summary_event(
         }
         ConversationEventStream::Bindings | ConversationEventStream::Attachments => {}
     }
-    summary.last_activity_at_utc = Some(
-        summary
-            .last_activity_at_utc
-            .map_or(record.recorded_at_utc, |current| {
-                current.max(record.recorded_at_utc)
-            }),
-    );
+    if record.type_ != ConversationEventType::RelayCursorAdvanced {
+        summary.last_activity_at_utc = Some(
+            summary
+                .last_activity_at_utc
+                .map_or(record.recorded_at_utc, |current| {
+                    current.max(record.recorded_at_utc)
+                }),
+        );
+    }
 
     match record.type_ {
         ConversationEventType::UserPrompt if summary.title.is_none() => {
@@ -2095,12 +2480,7 @@ mod tests {
         let mut scan = EventLogScan::default();
         for seq in 1..=1_000_000_u64 {
             let byte_offset = scan.sparse_offsets.messages.validated_bytes;
-            scan.record_appended(
-                ConversationEventStream::Messages,
-                seq,
-                byte_offset,
-                1,
-            );
+            scan.record_appended(ConversationEventStream::Messages, seq, byte_offset, 1);
         }
         scan.frontier.last_seq = 1_000_000;
         assert_eq!(
@@ -2110,11 +2490,7 @@ mod tests {
 
         let original_generation = Arc::new(scan);
         let mut writer_generation = Arc::clone(&original_generation);
-        let original_entries = original_generation
-            .sparse_offsets
-            .messages
-            .entries
-            .len();
+        let original_entries = original_generation.sparse_offsets.messages.entries.len();
         let mut allocated_samples = Vec::with_capacity(10_000);
         let mut max_copied_entries = 0usize;
 
@@ -2123,10 +2499,7 @@ mod tests {
             // generation while the writer publishes the next one through Arc::make_mut.
             let overlapping_reader = Arc::clone(&writer_generation);
             reset_sparse_index_clone_metrics();
-            let stream_bytes = writer_generation
-                .sparse_offsets
-                .messages
-                .validated_bytes;
+            let stream_bytes = writer_generation.sparse_offsets.messages.validated_bytes;
             let next_seq = 1_000_000 + append_index;
             let next_generation = Arc::make_mut(&mut writer_generation);
             next_generation.record_appended(
@@ -2154,14 +2527,185 @@ mod tests {
             "overlapping append allocated {p99_allocated_bytes} bytes at p99"
         );
         assert_eq!(
-            original_generation
-                .sparse_offsets
-                .messages
-                .entries
-                .len(),
+            original_generation.sparse_offsets.messages.entries.len(),
             original_entries,
             "the held reader generation must remain immutable"
         );
+    }
+
+    #[test]
+    fn chunked_frontier_histories_bound_total_overlap_allocation() {
+        let mut scan = EventLogScan::default();
+        let recorded_at_utc = parse_created_at_utc("2026-08-15T09:45:15.000Z").unwrap();
+        for index in 0..10_000_u64 {
+            scan.frontier.binding.history.push(AgentSessionBinding {
+                schema_version: AGENT_SESSION_BINDING_SCHEMA_VERSION,
+                binding_id: Uuid::from_u128(u128::from(index) + 1),
+                agent_session_id: format!("session-{index}"),
+                runtime_agent_id: "runtime".to_string(),
+                stable_agent_namespace: "config:test".to_string(),
+                execution_cwd: "/workspace".to_string(),
+                bound_at_utc: recorded_at_utc,
+                state: AgentSessionBindingState::Replaced,
+            });
+            scan.frontier.attachment.history.push(ProjectAttachment {
+                schema_version: PROJECT_ATTACHMENT_SCHEMA_VERSION,
+                project_id: format!("project-{index}"),
+                attached_at_utc: recorded_at_utc,
+                project_path_snapshot: "/workspace".to_string(),
+                worktree_path: None,
+                worktree_branch: None,
+            });
+            let byte_offset = scan.sparse_offsets.messages.validated_bytes;
+            scan.record_appended(ConversationEventStream::Messages, index + 1, byte_offset, 1);
+        }
+        scan.frontier.last_seq = 10_000;
+        assert_eq!(scan.frontier.binding.history.len(), 10_000);
+        assert_eq!(scan.frontier.attachment.history.len(), 10_000);
+        assert_eq!(scan.frontier.binding.history.chunks.len(), 9);
+        assert_eq!(scan.frontier.attachment.history.chunks.len(), 9);
+
+        let original_generation = Arc::new(scan);
+        let mut writer_generation = Arc::clone(&original_generation);
+        let mut allocated_samples = Vec::with_capacity(10_000);
+        let mut maximum_copied_history_entries = 0usize;
+        for append_index in 1..=10_000_u64 {
+            let overlapping_reader = Arc::clone(&writer_generation);
+            reset_sparse_index_clone_metrics();
+            let next_seq = 10_000 + append_index;
+            let next_generation = Arc::make_mut(&mut writer_generation);
+            let byte_offset = next_generation.sparse_offsets.messages.validated_bytes;
+            next_generation.record_appended(
+                ConversationEventStream::Messages,
+                next_seq,
+                byte_offset,
+                1,
+            );
+            next_generation
+                .frontier
+                .binding
+                .history
+                .push(AgentSessionBinding {
+                    schema_version: AGENT_SESSION_BINDING_SCHEMA_VERSION,
+                    binding_id: Uuid::from_u128(u128::from(next_seq) + 1),
+                    agent_session_id: format!("session-{next_seq}"),
+                    runtime_agent_id: "runtime".to_string(),
+                    stable_agent_namespace: "config:test".to_string(),
+                    execution_cwd: "/workspace".to_string(),
+                    bound_at_utc: recorded_at_utc,
+                    state: AgentSessionBindingState::Active,
+                });
+            next_generation
+                .frontier
+                .attachment
+                .history
+                .push(ProjectAttachment {
+                    schema_version: PROJECT_ATTACHMENT_SCHEMA_VERSION,
+                    project_id: format!("project-{next_seq}"),
+                    attached_at_utc: recorded_at_utc,
+                    project_path_snapshot: "/workspace".to_string(),
+                    worktree_path: None,
+                    worktree_branch: None,
+                });
+            next_generation.frontier.last_seq = next_seq;
+            let (copied_history_entries, total_allocated_bytes) = total_overlap_clone_metrics();
+            maximum_copied_history_entries =
+                maximum_copied_history_entries.max(copied_history_entries);
+            allocated_samples.push(total_allocated_bytes);
+            assert_eq!(overlapping_reader.last_seq(), next_seq - 1);
+        }
+        let p99_allocated_bytes = {
+            allocated_samples.sort_unstable();
+            allocated_samples[allocated_samples.len() * 99 / 100]
+        };
+        assert!(
+            maximum_copied_history_entries <= 2 * FRONTIER_HISTORY_CHUNK_ENTRIES,
+            "copied {maximum_copied_history_entries} history entries"
+        );
+        assert!(
+            p99_allocated_bytes <= 262_144,
+            "total overlap allocation p99 was {p99_allocated_bytes} bytes"
+        );
+        assert_eq!(original_generation.frontier.binding.history.len(), 10_000);
+        assert_eq!(
+            original_generation.frontier.attachment.history.len(),
+            10_000
+        );
+        println!(
+            "frontier_overlap history_entries=10000 p99_allocated_bytes={p99_allocated_bytes} max_copied_entries={maximum_copied_history_entries} chunk_entries=1024"
+        );
+    }
+
+    #[test]
+    fn canonical_record_and_page_bytes_are_bounded_before_materialization() {
+        let (_temp, directory, id, durable_fs) = fixture();
+        let mut oversized = record(1, ConversationEventType::MessageChunk);
+        oversized.payload = json!({"blob":"x".repeat(MAX_CONVERSATION_RECORD_BYTES)});
+        assert_eq!(
+            encode_event_record_bounded(&oversized),
+            Err(EventRecordEncodingError::TooLarge)
+        );
+
+        for seq in 1..=30_u64 {
+            let mut event = record(seq, ConversationEventType::MessageChunk);
+            event.payload = json!({"blob":"x".repeat(200_000)});
+            append(&durable_fs, &directory, &event);
+        }
+        let scan = scan_event_log(&directory, id, &durable_fs).unwrap();
+        let first = read_event_page(&directory, id, &scan, 0, MAX_EVENT_PAGE_LIMIT).unwrap();
+        assert!(!first.is_empty());
+        assert!(first.len() < 30);
+        assert!(
+            encoded_json_len_bounded(&first, MAX_CONVERSATION_HISTORY_PAGE_BYTES).is_some(),
+            "encoded page exceeded the 4 MiB limit"
+        );
+        let cursor = first.last().unwrap().seq;
+        let second = read_event_page(&directory, id, &scan, cursor, MAX_EVENT_PAGE_LIMIT).unwrap();
+        assert_eq!(first.len() + second.len(), 30);
+
+        let path = directory.join(MESSAGES_FILE);
+        durable_fs
+            .replace_bytes(&path, &vec![b'x'; MAX_CONVERSATION_RECORD_BYTES + 1])
+            .unwrap();
+        let error = scan_event_log(&directory, id, &durable_fs).unwrap_err();
+        assert_eq!(error.stable_code(), "CONVERSATION_RECORD_TOO_LARGE");
+        assert_eq!(error.kind, EventLogErrorKind::RecordTooLarge);
+    }
+
+    #[test]
+    fn relay_cursor_marker_is_payload_free_and_non_materialized() {
+        let id = ConversationId::parse(ID).unwrap();
+        let recorded_at_utc = parse_created_at_utc("2026-08-15T09:45:15.000Z").unwrap();
+        let mut frontier = ConversationFrontier::default();
+        apply_event(
+            &mut frontier,
+            &ConversationEventRecordV2::new(
+                id,
+                1,
+                recorded_at_utc,
+                ConversationEventType::RelayCursorAdvanced,
+                json!({}),
+            ),
+        )
+        .unwrap();
+        assert_eq!(frontier.last_seq, 1);
+        assert_eq!(frontier.summary.message_count, 0);
+        assert_eq!(frontier.summary.tool_count, 0);
+        assert!(frontier.latest_usage.is_none());
+        assert!(frontier.latest_plan.is_none());
+
+        let error = apply_event(
+            &mut frontier,
+            &ConversationEventRecordV2::new(
+                id,
+                2,
+                recorded_at_utc,
+                ConversationEventType::RelayCursorAdvanced,
+                json!({"payload":"forbidden"}),
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, EventLogErrorKind::CorruptRecord);
     }
 
     #[test]
@@ -2184,9 +2728,8 @@ mod tests {
             let comparisons = sparse_lookup_comparisons();
             maximum_comparisons = maximum_comparisons.max(comparisons);
             assert!(anchor.seq <= after_seq);
-            if let Some(next) = entries.get(
-                entries.partition_point(|entry| entry.seq <= after_seq),
-            ) {
+            if let Some(next) = entries.get(entries.partition_point(|entry| entry.seq <= after_seq))
+            {
                 assert!(next.seq > after_seq);
             }
         }

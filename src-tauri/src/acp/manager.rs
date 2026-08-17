@@ -813,7 +813,44 @@ fn fan_out_session<P: Serialize>(
     }
     let result = events::fan_out(sinks, Some(session_id), type_, payload);
     if let Err(error) = &result {
-        if error.is_durable_rejection() {
+        let retryable = matches!(
+            error.source_code,
+            Some(
+                "CONVERSATION_PERSISTENCE_BYTES_SATURATED"
+                    | "CONVERSATION_PERSISTENCE_QUEUE_SATURATED"
+                    | "SESSION_PERSISTENCE_QUEUE_FULL"
+            )
+        );
+        if error.is_durable_rejection() && !retryable {
+            circuits.lock().entry(session_id.to_string()).or_insert(
+                error
+                    .source_code
+                    .unwrap_or(CONVERSATION_PERSISTENCE_REJECTED),
+            );
+            log::error!(
+                "[acp] session delivery circuit opened code={} source_code={}",
+                error.code,
+                error.source_code.unwrap_or("UNKNOWN")
+            );
+        }
+    }
+    result
+}
+
+async fn fan_out_session_committed<P: Serialize>(
+    sinks: &[Arc<dyn EventSink>],
+    circuits: &SessionDeliveryCircuits,
+    persistence: Option<&ConversationPersistenceAdapter>,
+    session_id: &str,
+    type_: &'static str,
+    payload: &P,
+) -> Result<events::DeliveryReceipt, events::DeliveryError> {
+    if let Some(source_code) = circuits.lock().get(session_id).copied() {
+        return Err(events::DeliveryError::circuit_open(source_code));
+    }
+    let result = events::deliver(sinks, persistence, Some(session_id), type_, payload).await;
+    if let Err(error) = &result {
+        if error.is_durable_rejection() && !error.is_retryable() {
             circuits.lock().entry(session_id.to_string()).or_insert(
                 error
                     .source_code
@@ -835,6 +872,17 @@ fn log_delivery_error(operation: &'static str, error: &FanOutError) {
         operation,
         error.code,
         error.source_code.unwrap_or("NONE"),
+        error.delivered_count
+    );
+}
+
+fn log_delivery_ticket_error(operation: &'static str, error: &events::DeliveryError) {
+    log::warn!(
+        "[acp] event delivery degraded operation={} code={} source_code={} class={:?} delivered_count={}",
+        operation,
+        error.code,
+        error.source_code.unwrap_or("NONE"),
+        error.class,
         error.delivered_count
     );
 }
@@ -1014,7 +1062,10 @@ impl AcpManager {
         persistence: Arc<ConversationPersistenceAdapter>,
     ) -> Self {
         let host_plan_server =
-            crate::acp::host_mcp::parent::HostPlanServer::start(sinks.clone(), None);
+            crate::acp::host_mcp::parent::HostPlanServer::start_with_conversation_persistence(
+                sinks.clone(),
+                Arc::clone(&persistence),
+            );
         Self {
             sinks,
             agents: Arc::new(Mutex::new(HashMap::new())),
@@ -1110,6 +1161,7 @@ impl AcpManager {
         let thread_killed = killed.clone();
         let thread_start_error = start_error.clone();
         let thread_persistence = self.persistence.clone();
+        let thread_conversation_persistence = self.conversation_persistence.clone();
         let thread_warmup_done = self.warmup_done.clone();
         let thread_host_plan_server = self.host_plan_server.clone();
         let stable_namespace = stable_agent_namespace(&config);
@@ -1129,6 +1181,7 @@ impl AcpManager {
                     thread_killed,
                     thread_start_error,
                     thread_persistence,
+                    thread_conversation_persistence,
                     thread_warmup_done,
                 );
             })
@@ -2418,6 +2471,7 @@ fn run_agent(
     killed: Arc<AtomicBool>,
     start_error: Arc<Mutex<Option<String>>>,
     persistence: Option<Arc<SessionPersistence>>,
+    conversation_persistence: Option<Arc<ConversationPersistenceAdapter>>,
     warmup_done: Arc<Mutex<HashSet<AgentId>>>,
 ) {
     // True once `initialize` succeeded and the agent was surfaced to the
@@ -2452,6 +2506,7 @@ fn run_agent(
         spawned.clone(),
         driver_state.clone(),
         persistence.clone(),
+        conversation_persistence,
         warmup_done.clone(),
     ));
 
@@ -2603,41 +2658,24 @@ async fn drive_connection(
     spawned: Arc<AtomicBool>,
     driver_state: Arc<Mutex<DriverState>>,
     persistence: Option<Arc<SessionPersistence>>,
+    conversation_persistence: Option<Arc<ConversationPersistenceAdapter>>,
     warmup_done: Arc<Mutex<HashSet<AgentId>>>,
 ) -> Result<(), String> {
-    // Forward the agent subprocess's stdio to the log at `debug` (opt-in via
-    // `RUST_LOG`). stderr is where agents print auth/login prompts and runtime
-    // errors, so it is logged verbatim. stdin/stdout carry the JSON-RPC protocol
-    // trace which can include `authenticate` payloads (API keys, OAuth tokens),
-    // so by default those are redacted to direction + byte length — enough to
-    // confirm streaming/traffic without writing secrets to disk.
-    //
-    // Set `TERMUL_ACP_TRACE_RAW=1` to log the full stdin/stdout JSON-RPC bodies
-    // (diagnostics only — may write secrets to the log; never enable in normal
-    // use). Combine with a debug log level to see the trace.
+    // Agent stderr and JSON-RPC/terminal streams can carry credentials, paths, prompts, and
+    // transcript bytes. Operational logging records direction and byte count only; there is no
+    // raw-trace escape hatch.
     let debug_agent_id = agent_id.clone();
-    let trace_raw = std::env::var("TERMUL_ACP_TRACE_RAW")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
     let agent = agent_client_protocol::AcpAgent::new(config.to_mcp_server()).with_debug(
-        move |line: &str, direction: LineDirection| match direction {
-            LineDirection::Stderr => {
-                log::debug!("[acp] {debug_agent_id} stderr {line}");
-            }
-            LineDirection::Stdin => {
-                if trace_raw {
-                    log::debug!("[acp] {debug_agent_id} -> {line}");
-                } else {
-                    log::debug!("[acp] {debug_agent_id} -> ({} bytes)", line.len());
-                }
-            }
-            LineDirection::Stdout => {
-                if trace_raw {
-                    log::debug!("[acp] {debug_agent_id} <- {line}");
-                } else {
-                    log::debug!("[acp] {debug_agent_id} <- ({} bytes)", line.len());
-                }
-            }
+        move |line: &str, direction: LineDirection| {
+            let stream = match direction {
+                LineDirection::Stderr => "stderr",
+                LineDirection::Stdin => "stdin",
+                LineDirection::Stdout => "stdout",
+            };
+            log::debug!(
+                "[acp] {debug_agent_id} stream={stream} bytes={}",
+                line.len()
+            );
         },
     );
 
@@ -2656,6 +2694,7 @@ async fn drive_connection(
     // the title, a native agent `session_info_update` is suppressed here (the
     // durable defense in `append_record` is the second layer).
     let notif_persistence = persistence.clone();
+    let notif_conversation_persistence = conversation_persistence.clone();
     let perm_sinks = sinks.clone();
     let perm_agent_id = agent_id.clone();
     let perm_state = driver_state.clone();
@@ -2750,17 +2789,26 @@ async fn drive_connection(
                     );
                     return Ok(());
                 }
-                if let Err(error) =
-                    client::emit_session_update(&notif_sinks, &notif_agent_id, notification)
+                if let Err(error) = client::emit_session_update(
+                    &notif_sinks,
+                    notif_conversation_persistence.as_deref(),
+                    &notif_agent_id,
+                    notification,
+                )
+                .await
                 {
-                    if error.is_durable_rejection() {
+                    if error.is_retryable() {
+                        // Backpressure cancels only the current turn; draining capacity admits a
+                        // later submission and never opens a permanent session circuit.
+                        notif_state.lock().signal_cancel(&session_id);
+                    } else if error.is_durable_rejection() {
                         notif_circuits.lock().insert(
                             session_id.clone(),
                             error.source_code.unwrap_or(CONVERSATION_PERSISTENCE_REJECTED),
                         );
                         notif_state.lock().signal_cancel(&session_id);
                     }
-                    log_delivery_error("session_update", &error);
+                    log_delivery_ticket_error("session_update", &error);
                 }
                 Ok(())
             },
@@ -3098,6 +3146,7 @@ async fn drive_connection(
                 loop_spawned,
                 allow_terminal,
                 persistence,
+                conversation_persistence,
                 loop_warmup_done,
             )
             .await;
@@ -3126,6 +3175,7 @@ async fn run_command_loop(
     spawned: Arc<AtomicBool>,
     allow_terminal: bool,
     persistence: Option<Arc<SessionPersistence>>,
+    conversation_persistence: Option<Arc<ConversationPersistenceAdapter>>,
     warmup_done: Arc<Mutex<HashSet<AgentId>>>,
 ) -> Result<(), agent_client_protocol::Error> {
     // Step 1: handshake, bounded by INIT_TIMEOUT so a silent agent can never
@@ -3659,6 +3709,7 @@ async fn run_command_loop(
                 let turn_plan_server = host_plan_server.clone();
                 let turn_state = driver_state.clone();
                 let turn_persistence = persistence.clone();
+                let turn_conversation_persistence = conversation_persistence.clone();
                 let turn_session = session_id.clone();
                 let log_session = session_id.clone();
                 // Register before spawning so an immediate `plan` call is
@@ -3753,14 +3804,17 @@ async fn run_command_loop(
                                 stop_reason,
                                 turn_id: turn_turn_id.clone(),
                             };
-                            if let Err(error) = fan_out_session(
+                            if let Err(error) = fan_out_session_committed(
                                 &turn_sinks,
                                 &turn_delivery_circuits,
+                                turn_conversation_persistence.as_deref(),
                                 event.session_id.0.as_str(),
                                 events::EVENT_PROMPT_COMPLETE,
                                 &event,
-                            ) {
-                                log_delivery_error("prompt_complete", &error);
+                            )
+                            .await
+                            {
+                                log_delivery_ticket_error("prompt_complete", &error);
                                 send_reply(&task_slot, Err(error.code.to_string()));
                                 return Ok(());
                             }

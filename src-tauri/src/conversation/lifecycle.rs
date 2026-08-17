@@ -978,6 +978,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn completed_mutation_admits_catalog_generation_before_failed_barrier_retry() {
+        let fixture = fixture().await;
+        fixture
+            .repository
+            .flush_catalog_until(tokio::time::Instant::now() + std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        let before_generation = fixture.repository.catalog_pending_generation();
+        fixture.repository.fail_next_catalog_writes(1);
+
+        fixture
+            .service
+            .detach_agent_binding(fixture.id, revision(&fixture))
+            .await
+            .unwrap();
+        let admitted_generation = fixture.repository.catalog_pending_generation();
+        assert!(admitted_generation > before_generation);
+        let metrics = fixture.repository.catalog_last_admission_metrics();
+        assert_eq!(metrics.serialized_bytes_under_lock, 0);
+
+        let catalog: crate::conversation::ConversationCatalogFileV1 = serde_json::from_slice(
+            &fixture
+                .repository
+                .catalog_flush_coordinator()
+                .snapshot()
+                .bytes,
+        )
+        .unwrap();
+        let admitted = catalog
+            .conversations
+            .iter()
+            .find(|entry| entry.conversation_id == fixture.id)
+            .unwrap();
+        assert_eq!(admitted.lifecycle_state, ConversationLifecycleState::Ready);
+        assert_eq!(admitted.last_seq, revision(&fixture));
+
+        let repository = Arc::clone(&fixture.repository);
+        let failed_barrier =
+            tokio::spawn(async move { repository.flush_catalog_once_for_test().await })
+                .await
+                .unwrap()
+                .unwrap_err();
+        assert_eq!(failed_barrier.code, "CATALOG_FLUSH_FAILED");
+        assert_eq!(
+            failed_barrier.stage,
+            crate::conversation::repository::CatalogFlushFailureStage::Replacement
+        );
+        assert_eq!(failed_barrier.pending_generation, admitted_generation);
+        assert_eq!(
+            fixture.repository.catalog_pending_generation(),
+            admitted_generation
+        );
+        let retry = fixture
+            .repository
+            .flush_catalog_once_for_test()
+            .await
+            .unwrap();
+        assert!(retry.flushed_generation >= admitted_generation);
+    }
+
+    #[tokio::test]
     async fn suspend_supported_and_failures_commit_only_after_provider_success() {
         let fixture = fixture().await;
         let before = revision(&fixture);

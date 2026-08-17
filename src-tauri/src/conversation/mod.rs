@@ -33,12 +33,12 @@ pub use bootstrap::{
     BootstrapError, BootstrapOutcome, ConversationBootstrap, HostConversationRoots,
 };
 pub use catalog::{
-    rebuild_catalog, AcceptedCanonicalConversation, CatalogError, CatalogRebuildResult,
-    CatalogRecoveryIssue, ConversationCatalogEntryV1, ConversationCatalogFileV1,
-    ConversationCatalogSnapshot, ConversationProvenanceFileV1, ConversationProvenanceSourceV1,
-    CATALOG_FILE,
-    CATALOG_SCHEMA_VERSION, CONVERSATION_METADATA_FILE, EMPTY_CATALOG_GENERATED_AT_UTC,
-    PROVENANCE_FILE, PROVENANCE_SCHEMA_VERSION,
+    rebuild_catalog, AcceptedCanonicalConversation, CatalogAdmissionMetrics, CatalogError,
+    CatalogRebuildResult, CatalogRecoveryIssue, ConversationCatalogEntryV1,
+    ConversationCatalogFileV1, ConversationCatalogGeneration, ConversationCatalogSnapshot,
+    ConversationProvenanceFileV1, ConversationProvenanceSourceV1, CATALOG_CHUNK_ENTRIES,
+    CATALOG_FILE, CATALOG_SCHEMA_VERSION, CONVERSATION_METADATA_FILE,
+    EMPTY_CATALOG_GENERATED_AT_UTC, PROVENANCE_FILE, PROVENANCE_SCHEMA_VERSION,
 };
 pub use contracts::{
     format_created_at_utc, parse_created_at_utc, AgentSessionBinding, AgentSessionBindingState,
@@ -48,7 +48,8 @@ pub use contracts::{
     CreationPartition, ExecutionTarget, ProjectAttachment, TerminalResourceRef,
     AGENT_SESSION_BINDING_SCHEMA_VERSION, CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION,
     CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION, CONVERSATION_SCHEMA_VERSION,
-    MAX_CONVERSATION_HISTORY_PAGE_LIMIT, MIN_CONVERSATION_HISTORY_PAGE_LIMIT,
+    MAX_CONVERSATION_HISTORY_PAGE_BYTES, MAX_CONVERSATION_HISTORY_PAGE_LIMIT,
+    MAX_CONVERSATION_RECORD_BYTES, MIN_CONVERSATION_HISTORY_PAGE_LIMIT,
     PROJECT_ATTACHMENT_SCHEMA_VERSION, TERMINAL_RESOURCE_REF_SCHEMA_VERSION,
 };
 pub use creation::{
@@ -65,12 +66,12 @@ pub use durable_fs::{
 };
 pub use event_log::{
     materialize_records, replay_conversation, AttachmentMaterialization, BindingEventPayloadV1,
-    BindingMaterialization, BindingReplacementPayloadV1, ConversationEventRecordV2,
+    BindingMaterialization, BindingReplacementPayloadV1, ChunkedHistory, ConversationEventRecordV2,
     ConversationEventStream, ConversationEventType, ConversationReplay, EventLogError,
     EventLogErrorKind, EventLogRepairWarning, ExecutionTargetEventPayloadV1,
-    ProjectAttachmentEventPayloadV1, ATTACHMENTS_FILE,
-    BINDINGS_FILE, CONVERSATION_EVENT_SCHEMA_VERSION, EVENT_LOG_FILES, MESSAGES_FILE,
-    TOOL_CALLS_FILE,
+    ProjectAttachmentEventPayloadV1, ATTACHMENTS_FILE, BINDINGS_FILE,
+    CONVERSATION_EVENT_SCHEMA_VERSION, EVENT_LOG_FILES, FRONTIER_HISTORY_CHUNK_ENTRIES,
+    MESSAGES_FILE, TOOL_CALLS_FILE,
 };
 pub use lifecycle::{
     AgentLifecycleProviderError, AgentLifecycleProviderErrorKind, ConversationAgentLifecycle,
@@ -101,11 +102,11 @@ pub use ordered_persistence::{
 };
 pub use persistence_adapter::{
     BindingMissCacheStats, ConversationPersistenceAdapter, ConversationPersistenceError,
-    CONVERSATION_HISTORY_PAGING_REQUIRED, MAX_BINDING_MISS_CACHE_ENTRIES,
-    MAX_COMPAT_HISTORY_RECORDS,
+    CONVERSATION_HISTORY_PAGING_REQUIRED, CONVERSATION_PERSISTENCE_COMMIT_INDETERMINATE,
+    DEFAULT_DELIVERY_COMMIT_TIMEOUT, MAX_BINDING_MISS_CACHE_ENTRIES, MAX_COMPAT_HISTORY_RECORDS,
 };
 pub use repository::{
-    CatalogFlushCoordinator, CatalogFlushError, CatalogFlushReceipt,
+    CatalogFlushCoordinator, CatalogFlushError, CatalogFlushFailureStage, CatalogFlushReceipt,
     ConversationAggregateMutationRecord, ConversationMetadataUpdate, ConversationRepository,
     RepositoryBindingIndexStats, RepositoryError, RepositoryOpenReport, RepositoryRecoveryItem,
     RepositoryRecoveryKind, CATALOG_FLUSH_DEBOUNCE, CATALOG_FLUSH_MAX_DELAY,
@@ -122,3 +123,9 @@ pub use workspace_projection::{
     LegacyWorkspaceProjector, WorkspaceProjectionOutcome, WorkspaceProjectionReceiptV1,
 };
 pub use write_authority::{ConversationMutation, ConversationWriteAuthority, ConversationWriter};
+
+// Bootstrap-owned delivery contract consumed by ACP producers. Final integration injects the
+// exact bootstrap coordinator Arc; these types remain transport-neutral and payload-free.
+pub use crate::acp::events::{
+    DeliveryError, DeliveryFailureClass, DeliveryReceipt, DeliveryTicket,
+};
