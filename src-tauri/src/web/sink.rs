@@ -76,6 +76,8 @@ pub const CLIENT_OUTBOUND_BYTES: usize = 8 * 1024 * 1024;
 pub const RELIABLE_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_RELAY_SESSIONS: usize = 256;
 pub const MAX_RELAY_BYTES: usize = 64 * 1024 * 1024;
+pub const SESSION_GATE_STRIPES: usize = 64;
+pub const MAX_CONNECTION_SUBSCRIPTIONS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventSinkPriority {
@@ -295,11 +297,11 @@ pub struct WsRelaySink {
     /// Bounded retained writers for the canonical live ACP append path.
     ordered_conversation_persistence:
         Option<Arc<crate::conversation::OrderedConversationPersistence>>,
-    /// Per-session gate spanning relay sequence assignment and ordered submission. Different
-    /// sessions never share this gate, so backpressure remains isolated to the saturated session.
-    persistence_submission_gates: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    /// Serializes each session's durable replay/catch-up/register handoff.
-    replay_gates: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Fixed striped gates spanning canonical cursor selection, ticket acknowledgement, and live
+    /// publication. The stripe count is constant under unbounded session churn.
+    persistence_submission_gates: [Mutex<()>; SESSION_GATE_STRIPES],
+    /// Fixed striped gates serializing durable replay/catch-up/register handoff.
+    replay_gates: [tokio::sync::Mutex<()>; SESSION_GATE_STRIPES],
 }
 
 /// Per-session seq + append-only bounded ring (held under [`WsRelaySink::sessions`]).
@@ -491,6 +493,19 @@ pub struct RelayHistoryStats {
     pub reserved_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RelayAuxiliaryStats {
+    pub relay_sessions: usize,
+    pub clients: usize,
+    pub subscription_sessions: usize,
+    pub subscriptions: usize,
+    pub delivery_circuits: usize,
+    pub ordered_sessions: usize,
+    pub submission_gate_stripes: usize,
+    pub replay_gate_stripes: usize,
+    pub turn_watermarks: crate::web::permissions::TurnWatermarkStats,
+}
+
 struct HistoryReservation {
     sid: String,
     bytes: usize,
@@ -528,8 +543,8 @@ impl WsRelaySink {
             persistence: None,
             conversation_persistence: None,
             ordered_conversation_persistence: None,
-            persistence_submission_gates: Mutex::new(HashMap::new()),
-            replay_gates: tokio::sync::Mutex::new(HashMap::new()),
+            persistence_submission_gates: std::array::from_fn(|_| Mutex::new(())),
+            replay_gates: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
         }
     }
 
@@ -734,12 +749,20 @@ impl WsRelaySink {
         )
     }
 
-    fn persistence_submission_gate(&self, sid: &str) -> Arc<Mutex<()>> {
-        self.persistence_submission_gates
-            .lock()
-            .entry(sid.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
+    fn session_gate_index(sid: &str) -> usize {
+        sid.bytes()
+            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            }) as usize
+            % SESSION_GATE_STRIPES
+    }
+
+    fn persistence_submission_gate(&self, sid: &str) -> &Mutex<()> {
+        &self.persistence_submission_gates[Self::session_gate_index(sid)]
+    }
+
+    fn replay_gate(&self, sid: &str) -> &tokio::sync::Mutex<()> {
+        &self.replay_gates[Self::session_gate_index(sid)]
     }
 
     fn durable_history_frontier(&self, sid: &str) -> Option<u64> {
@@ -788,16 +811,12 @@ impl WsRelaySink {
         );
     }
 
-    fn persists_conversation_event(type_: &str) -> bool {
+    fn is_retryable_persistence_code(code: &str) -> bool {
         matches!(
-            type_,
-            "user_prompt"
-                | "message_chunk"
-                | "prompt_complete"
-                | "tool_call"
-                | "tool_call_update"
-                | "session_info_update"
-                | "local_title_generated"
+            code,
+            "CONVERSATION_PERSISTENCE_BYTES_SATURATED"
+                | "CONVERSATION_PERSISTENCE_QUEUE_SATURATED"
+                | "SESSION_PERSISTENCE_QUEUE_FULL"
         )
     }
 
@@ -821,12 +840,16 @@ impl WsRelaySink {
 
         let sequenced = self.next_sequenced_event(sid, type_, payload);
         let mut reservation = self.reserve_history(sid, &sequenced)?;
-        let durable_result = if Self::persists_conversation_event(type_) {
+        let durable_result: Result<Option<u64>, (&'static str, String)> =
             if let Some(persistence) = &self.ordered_conversation_persistence {
                 persistence
                     .submit(sid, sequenced.seq, type_, sequenced.payload.clone())
+                    .and_then(|ticket| ticket.wait())
+                    .map(Some)
                     .map_err(|error| (error.code, error.to_string()))
             } else if let Some(persistence) = &self.persistence {
+                // The pre-cutover store historically retained every relay event. Keep compatibility
+                // reads exact while still rejecting before live commit if its queue refuses admission.
                 persistence
                     .enqueue_event(PersistedEventRecord {
                         schema_version: SESSION_SCHEMA_VERSION,
@@ -836,31 +859,31 @@ impl WsRelaySink {
                         recorded_at: now_millis(),
                         payload: sequenced.payload.clone(),
                     })
+                    .map(|()| None)
                     .map_err(|error| (session_persistence_error_code(&error), error.to_string()))
             } else {
-                Ok(())
-            }
-        } else if let Some(persistence) = &self.persistence {
-            // The pre-cutover store historically retained every relay event. Keep compatibility
-            // reads exact while still rejecting before live commit if its queue refuses admission.
-            persistence
-                .enqueue_event(PersistedEventRecord {
-                    schema_version: SESSION_SCHEMA_VERSION,
-                    session_id: sid.to_string(),
-                    seq: sequenced.seq,
-                    type_: type_.to_string(),
-                    recorded_at: now_millis(),
-                    payload: sequenced.payload.clone(),
-                })
-                .map_err(|error| (session_persistence_error_code(&error), error.to_string()))
-        } else {
-            Ok(())
-        };
+                Ok(None)
+            };
 
-        if let Err((source_code, _detail)) = durable_result {
-            self.rollback_history(&mut reservation);
-            self.open_delivery_circuit(sid, source_code);
-            return Err(EventSinkError::persistence_rejected(source_code));
+        match durable_result {
+            Ok(Some(canonical_seq)) if canonical_seq != sequenced.seq => {
+                self.rollback_history(&mut reservation);
+                self.open_delivery_circuit(
+                    sid,
+                    "CONVERSATION_PERSISTENCE_FRONTIER_MISMATCH",
+                );
+                return Err(EventSinkError::persistence_rejected(
+                    "CONVERSATION_PERSISTENCE_FRONTIER_MISMATCH",
+                ));
+            }
+            Ok(_) => {}
+            Err((source_code, _detail)) => {
+                self.rollback_history(&mut reservation);
+                if !Self::is_retryable_persistence_code(source_code) {
+                    self.open_delivery_circuit(sid, source_code);
+                }
+                return Err(EventSinkError::persistence_rejected(source_code));
+            }
         }
         if let Err(error) = self.commit_history(&mut reservation, sequenced.clone()) {
             self.rollback_history(&mut reservation);
@@ -917,11 +940,16 @@ impl WsRelaySink {
                 ));
             };
             sessions.remove(&candidate);
+            let retained_sessions = sessions.len();
+            let retained_bytes = relay_history_bytes(&sessions);
+            drop(sessions);
+            self.retire_auxiliary(&candidate)?;
             log::info!(
-                "[ws-relay] durable history evicted session_count={} retained_bytes={}",
-                sessions.len(),
-                relay_history_bytes(&sessions)
+                "[ws-relay] durable history evicted and retired session_count={} retained_bytes={}",
+                retained_sessions,
+                retained_bytes
             );
+            sessions = self.sessions.lock();
         }
         let last_used = self.history_clock.fetch_add(1, Ordering::AcqRel) + 1;
         let state = sessions
@@ -1041,6 +1069,33 @@ impl WsRelaySink {
             sessions: sessions.len(),
             bytes: sessions.values().map(|state| state.retained_bytes).sum(),
             reserved_bytes: sessions.values().map(|state| state.reserved_bytes).sum(),
+        }
+    }
+
+    #[must_use]
+    pub fn auxiliary_stats(&self) -> RelayAuxiliaryStats {
+        let relay_sessions = self.sessions.lock().len();
+        let clients = self.clients.lock().len();
+        let (subscription_sessions, subscriptions) = {
+            let subscriptions = self.session_subs.lock();
+            (
+                subscriptions.len(),
+                subscriptions.values().map(HashSet::len).sum(),
+            )
+        };
+        RelayAuxiliaryStats {
+            relay_sessions,
+            clients,
+            subscription_sessions,
+            subscriptions,
+            delivery_circuits: self.delivery_circuits.lock().len(),
+            ordered_sessions: self
+                .ordered_conversation_persistence
+                .as_ref()
+                .map_or(0, |ordered| ordered.retained_worker_count()),
+            submission_gate_stripes: self.persistence_submission_gates.len(),
+            replay_gate_stripes: self.replay_gates.len(),
+            turn_watermarks: self.turn_watermark.stats(),
         }
     }
 
@@ -1200,33 +1255,44 @@ impl WsRelaySink {
         sid: &str,
         last_seq: Option<u64>,
     ) -> (ClientId, ClientEventReceiver, ReplayResult) {
-        let client_id = ClientId::new();
-        let (tx, rx) = mpsc::channel::<QueuedClientEvent>(CLIENT_OUTBOUND_RECORDS);
-        let rx = ClientEventReceiver { inner: rx };
+        let (client_id, rx) = self.open_client();
+        let replay = self.subscribe_existing(client_id, sid, last_seq).await;
+        if replay == ReplayResult::Stale {
+            self.unregister_client(client_id);
+        }
+        (client_id, rx, replay)
+    }
+
+    /// Subscribe another session on an existing connection-owned relay client. All sessions share
+    /// the same 512-record/8-MiB budget and one receiver/forwarding task.
+    pub async fn subscribe_existing(
+        &self,
+        client_id: ClientId,
+        sid: &str,
+        last_seq: Option<u64>,
+    ) -> ReplayResult {
+        if !self.clients.lock().contains_key(&client_id) {
+            return ReplayResult::Stale;
+        }
         let Some(cursor) = last_seq else {
-            self.register(client_id, sid, tx);
-            return (client_id, rx, ReplayResult::Ok(0));
+            if !self.register_existing(client_id, sid) {
+                return ReplayResult::Stale;
+            }
+            return ReplayResult::Ok(0);
         };
 
-        let gate = {
-            let mut gates = self.replay_gates.lock().await;
-            gates
-                .entry(sid.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
-        };
-        let _replay_guard = gate.lock().await;
+        let _replay_guard = self.replay_gate(sid).lock().await;
         let mut by_seq = std::collections::BTreeMap::new();
         loop {
             if let Some(ordered) = &self.ordered_conversation_persistence {
                 if ordered.flush_all().await.is_err() {
-                    return (client_id, rx, ReplayResult::Stale);
+                    return ReplayResult::Stale;
                 }
             }
             if let Some(persistence) = &self.conversation_persistence {
                 let durable = match persistence.replay_after(sid, cursor) {
                     Ok(records) => records,
-                    Err(_) => return (client_id, rx, ReplayResult::Stale),
+                    Err(_) => return ReplayResult::Stale,
                 };
                 for record in durable {
                     by_seq.insert(
@@ -1244,14 +1310,14 @@ impl WsRelaySink {
                 // Flush is a queue barrier for everything assigned before it.
                 // The JSONL scan itself runs on spawn_blocking.
                 if persistence.flush_session(sid).await.is_err() {
-                    return (client_id, rx, ReplayResult::Stale);
+                    return ReplayResult::Stale;
                 }
                 let durable = match persistence
                     .replay_after_async(sid.to_string(), cursor)
                     .await
                 {
                     Ok(records) => records,
-                    Err(_) => return (client_id, rx, ReplayResult::Stale),
+                    Err(_) => return ReplayResult::Stale,
                 };
                 for record in durable {
                     by_seq.insert(
@@ -1274,7 +1340,7 @@ impl WsRelaySink {
                         .is_some_and(|next| next < state.base_seq)
                 })
             {
-                return (client_id, rx, ReplayResult::Stale);
+                return ReplayResult::Stale;
             }
             let (ring, last_seq, base_seq) = sessions.get(sid).map_or_else(
                 || (Vec::new(), cursor, cursor.saturating_add(1)),
@@ -1304,22 +1370,24 @@ impl WsRelaySink {
                 .and_then(|start| (start..=frontier).find(|seq| !by_seq.contains_key(seq)));
             if self.conversation_persistence.is_none() && first_missing.is_some() {
                 if self.persistence.is_none() || base_seq <= cursor.saturating_add(1) {
-                    return (client_id, rx, ReplayResult::Stale);
+                    return ReplayResult::Stale;
                 }
                 drop(sessions);
                 continue;
             }
 
-            self.register(client_id, sid, tx.clone());
+            if !self.register_existing(client_id, sid) {
+                return ReplayResult::Stale;
+            }
             let count = by_seq.len() as u64;
             for event in by_seq.into_values() {
                 self.enqueue(client_id, event.clone(), tier_of(&event.type_));
                 if !self.clients.lock().contains_key(&client_id) {
                     drop(sessions);
-                    return (client_id, rx, ReplayResult::Stale);
+                    return ReplayResult::Stale;
                 }
             }
-            return (client_id, rx, ReplayResult::Ok(count));
+            return ReplayResult::Ok(count);
         }
     }
 
@@ -1339,14 +1407,7 @@ impl WsRelaySink {
         let client_id = ClientId::new();
         let (tx, rx) = mpsc::channel::<QueuedClientEvent>(CLIENT_OUTBOUND_RECORDS);
         let rx = ClientEventReceiver { inner: rx };
-        let gate = {
-            let mut gates = self.replay_gates.lock().await;
-            gates
-                .entry(sid.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .clone()
-        };
-        let _replay_guard = gate.lock().await;
+        let _replay_guard = self.replay_gate(sid).lock().await;
         if let Some(ordered) = &self.ordered_conversation_persistence {
             ordered
                 .flush_all()
@@ -1444,6 +1505,38 @@ impl WsRelaySink {
         Ok(event)
     }
 
+    fn open_client(&self) -> (ClientId, ClientEventReceiver) {
+        let client_id = ClientId::new();
+        let (tx, rx) = mpsc::channel::<QueuedClientEvent>(CLIENT_OUTBOUND_RECORDS);
+        self.clients.lock().insert(
+            client_id,
+            ClientSub {
+                tx,
+                budget: Arc::new(ClientOutboundBudget::default()),
+                sessions: HashSet::new(),
+                lossy_ring: VecDeque::new(),
+                reliable_saturation_generation: 0,
+            },
+        );
+        (client_id, ClientEventReceiver { inner: rx })
+    }
+
+    fn register_existing(&self, client_id: ClientId, sid: &str) -> bool {
+        {
+            let mut clients = self.clients.lock();
+            let Some(client) = clients.get_mut(&client_id) else {
+                return false;
+            };
+            client.sessions.insert(sid.to_string());
+        }
+        self.session_subs
+            .lock()
+            .entry(sid.to_string())
+            .or_default()
+            .insert(client_id);
+        true
+    }
+
     /// Register a client + its sender under a session and the reverse index.
     /// Lock order: `clients` then `session_subs` (see module lock-order note).
     fn register(&self, client_id: ClientId, sid: &str, tx: mpsc::Sender<QueuedClientEvent>) {
@@ -1490,11 +1583,12 @@ impl WsRelaySink {
         }
     }
 
-    /// Forget all in-memory relay state for a successfully disposed ephemeral session.
-    pub async fn forget_session(&self, sid: &str) {
-        let gate = self.persistence_submission_gate(sid);
-        let _submission_guard = gate.lock();
-        self.sessions.lock().remove(sid);
+    fn retire_auxiliary(&self, sid: &str) -> Result<(), EventSinkError> {
+        if let Some(ordered) = &self.ordered_conversation_persistence {
+            ordered
+                .retire_session(sid)
+                .map_err(|error| EventSinkError::persistence_rejected(error.code))?;
+        }
         self.delivery_circuits.lock().remove(sid);
         let affected_clients = self.session_subs.lock().remove(sid).unwrap_or_default();
         if !affected_clients.is_empty() {
@@ -1509,9 +1603,23 @@ impl WsRelaySink {
             }
         }
         self.turn_watermark.forget_session(sid);
-        drop(_submission_guard);
-        self.persistence_submission_gates.lock().remove(sid);
-        self.replay_gates.lock().await.remove(sid);
+        Ok(())
+    }
+
+    /// Retire every auxiliary structure keyed by one successfully closed/deleted/disposed ACP
+    /// session. Admitted ordered work is observed first; canonical Conversation JSON/JSONL is
+    /// deliberately untouched. Repeated calls are successful no-ops.
+    pub async fn retire_session(&self, sid: &str) -> Result<(), String> {
+        let _submission_guard = self.persistence_submission_gate(sid).lock();
+        self.retire_auxiliary(sid)
+            .map_err(|error| error.code.to_string())?;
+        self.sessions.lock().remove(sid);
+        Ok(())
+    }
+
+    /// Compatibility alias for older call sites; all lifecycle owners use `retire_session`.
+    pub async fn forget_session(&self, sid: &str) {
+        let _ = self.retire_session(sid).await;
     }
 
     /// Remove a client entirely (e.g. on WS close).
@@ -1992,6 +2100,47 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn sixty_four_sessions_share_one_connection_outbound_budget() {
+        let relay = Arc::new(WsRelaySink::new());
+        let (client, _rx, replay) = relay.subscribe("aggregate-0", None).await;
+        assert_eq!(replay, ReplayResult::Ok(0));
+        for ordinal in 1..MAX_CONNECTION_SUBSCRIPTIONS {
+            assert_eq!(
+                relay
+                    .subscribe_existing(client, &format!("aggregate-{ordinal}"), None)
+                    .await,
+                ReplayResult::Ok(0)
+            );
+        }
+        assert_eq!(
+            relay
+                .clients
+                .lock()
+                .get(&client)
+                .unwrap()
+                .sessions
+                .len(),
+            MAX_CONNECTION_SUBSCRIPTIONS
+        );
+        let sinks: Vec<Arc<dyn EventSink>> = vec![relay.clone()];
+        for ordinal in 0..=CLIENT_OUTBOUND_RECORDS {
+            let sid = format!("aggregate-{}", ordinal % MAX_CONNECTION_SUBSCRIPTIONS);
+            fan_out(
+                &sinks,
+                Some(&sid),
+                "acp:permission_request",
+                &TestPayload::new("agent", &sid, &format!("reliable-{ordinal}")),
+            )
+            .unwrap();
+        }
+        let stats = relay.client_outbound_stats(client).unwrap();
+        assert!(stats.records <= CLIENT_OUTBOUND_RECORDS);
+        assert!(stats.bytes <= CLIENT_OUTBOUND_BYTES);
+        assert!(stats.max_records <= CLIENT_OUTBOUND_RECORDS);
+        assert!(stats.max_bytes <= CLIENT_OUTBOUND_BYTES);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn production_slow_client_is_bounded() {
         let relay = Arc::new(WsRelaySink::new());
         let (client, _rx, replay) = relay.subscribe("slow-client-session", None).await;
@@ -2031,7 +2180,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn global_history_lru_is_byte_and_session_bounded() {
+    async fn lru_eviction_retires_all_auxiliary_state_idempotently() {
         let root = temp_dir("global-history-lru");
         let cwd = root.join("cwd");
         std::fs::create_dir_all(&cwd).expect("session cwd");
@@ -2068,6 +2217,11 @@ mod tests {
             .await
             .expect("durable frontier flush");
 
+        relay.turn_watermark().mark_seen("lru-session-0", "turn-0");
+        relay
+            .delivery_circuits
+            .lock()
+            .insert("lru-session-0".to_string(), "TEST_FATAL");
         let newest = format!("lru-session-{MAX_RELAY_SESSIONS}");
         fan_out(
             &sinks,
@@ -2092,6 +2246,12 @@ mod tests {
         assert_eq!(replayed.type_, "tool_call");
         assert_eq!(replayed.payload["agentId"], "agent");
         assert_eq!(replayed.payload["sessionId"], "lru-session-0");
+        assert!(!relay.turn_watermark().is_seen("lru-session-0", "turn-0"));
+        assert!(!relay.delivery_circuits.lock().contains_key("lru-session-0"));
+        assert_eq!(relay.auxiliary_stats().submission_gate_stripes, SESSION_GATE_STRIPES);
+        assert_eq!(relay.auxiliary_stats().replay_gate_stripes, SESSION_GATE_STRIPES);
+        relay.retire_session("lru-session-0").await.unwrap();
+        relay.retire_session("lru-session-0").await.unwrap();
 
         persistence
             .shutdown()
@@ -2117,7 +2277,8 @@ mod tests {
         assert_eq!(ws.session_watermark("temp"), 1);
         assert_eq!(ws.session_subscriber_count("temp"), 1);
         assert!(ws.turn_watermark().is_seen("temp", "turn-1"));
-        assert!(ws.replay_gates.lock().await.contains_key("temp"));
+        assert_eq!(ws.persistence_submission_gates.len(), SESSION_GATE_STRIPES);
+        assert_eq!(ws.replay_gates.len(), SESSION_GATE_STRIPES);
 
         ws.forget_session("temp").await;
 
@@ -2125,7 +2286,8 @@ mod tests {
         assert_eq!(ws.session_subscriber_count("temp"), 0);
         assert!(!ws.clients.lock().contains_key(&client));
         assert!(!ws.turn_watermark().is_seen("temp", "turn-1"));
-        assert!(!ws.replay_gates.lock().await.contains_key("temp"));
+        assert_eq!(ws.persistence_submission_gates.len(), SESSION_GATE_STRIPES);
+        assert_eq!(ws.replay_gates.len(), SESSION_GATE_STRIPES);
     }
 
     /// AC: `WsRelaySink` delivers session + agent-level events in emission

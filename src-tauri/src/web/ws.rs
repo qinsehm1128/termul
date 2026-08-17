@@ -46,12 +46,15 @@ use crate::acp::config::AgentConfig;
 use crate::acp::{AcpManager, AgentId, FileProjectRegistry, SessionCreationContext, SessionId};
 use crate::pty::PtyManager;
 use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub};
-use crate::web::auth::{auth_error_response, RemoteAccessAuthority, RemoteAuthError};
+use crate::web::auth::{
+    auth_error_response, RemoteAccessAuthority, RemoteAuthError, RemoteCapability, RemotePrincipal,
+};
 use crate::web::permissions::{TurnClaim, DEFAULT_PERMISSION_RECONNECT_GRACE};
 use crate::web::project_registry::{ProjectRegistry, ProjectSwitchContext};
 use crate::web::sink::{
     broadcast_projects_changed, AcpEvent, ClientId, ReplayResult, WsRelaySink,
-    CLIENT_OUTBOUND_BYTES, CLIENT_OUTBOUND_RECORDS, RELIABLE_CLIENT_TIMEOUT,
+    CLIENT_OUTBOUND_BYTES, CLIENT_OUTBOUND_RECORDS, MAX_CONNECTION_SUBSCRIPTIONS,
+    RELIABLE_CLIENT_TIMEOUT,
 };
 use crate::web::EventSink;
 
@@ -632,6 +635,15 @@ fn auth_required_event() -> SequencedEvent {
     SequencedEvent::new(None, 0, AUTH_REQUIRED_TYPE, json!({}))
 }
 
+fn reauthentication_required_event() -> SequencedEvent {
+    SequencedEvent::new(
+        None,
+        0,
+        "reauthentication_required",
+        json!({"code":"REAUTHENTICATION_REQUIRED"}),
+    )
+}
+
 /// Axum WS upgrade handler for `/ws` (AC1).
 ///
 /// The upgrade validates the exact browser Origin before switching protocols;
@@ -704,6 +716,14 @@ const PING_PAYLOAD: &[u8] = b"keepalive";
 /// task calls this with `last_activity.load()` + `now_ms()` on each ping tick.
 fn watchdog_is_stale(last_activity_ms: u64, now_ms_value: u64) -> bool {
     now_ms_value.saturating_sub(last_activity_ms) > PONG_TIMEOUT.as_millis() as u64
+}
+
+fn generation_requires_reauthentication(
+    authenticated_generation: u64,
+    current: crate::web::auth::RemoteGenerationState,
+) -> bool {
+    authenticated_generation != 0
+        && (!current.active || current.generation != authenticated_generation)
 }
 
 /// Epoch-millis timestamp for the keepalive watchdog. Uses `SystemTime` (not
@@ -780,6 +800,9 @@ async fn run_relay(
     // reasoning phases and to surface a dead client promptly.
     let last_activity = Arc::new(AtomicU64::new(now_ms()));
     let write_last_activity = Arc::clone(&last_activity);
+    let authenticated_generation = Arc::new(AtomicU64::new(0));
+    let write_authenticated_generation = Arc::clone(&authenticated_generation);
+    let mut generation_rx = authority.subscribe_generation();
 
     let write_tx = out_tx.clone();
     let mut write_task = tokio::spawn(async move {
@@ -797,6 +820,21 @@ async fn run_relay(
                 break;
             }
             tokio::select! {
+                biased;
+                changed = generation_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let authenticated = write_authenticated_generation.load(Ordering::Acquire);
+                    let current = *generation_rx.borrow_and_update();
+                    if generation_requires_reauthentication(authenticated, current) {
+                        let terminal = serde_json::to_string(&reauthentication_required_event())
+                            .expect("credential-free reauthentication frame serializes");
+                        let _ = sink.send(Message::Text(terminal.into())).await;
+                        let _ = sink.send(Message::Close(None)).await;
+                        break;
+                    }
+                }
                 () = write_disconnect.notified() => break,
                 queued = out_rx.recv_queued() => {
                     let Some(mut queued) = queued else { break };
@@ -853,8 +891,10 @@ async fn run_relay(
     let read_last_activity = Arc::clone(&last_activity);
     let read_subscribed_clients = Arc::clone(&subscribed_clients);
     let read_relay = Arc::clone(&relay);
+    let read_authenticated_generation = Arc::clone(&authenticated_generation);
     let mut read_task = tokio::spawn(async move {
         let mut authed = false;
+        let mut principal = None;
         while let Some(frame) = stream.next().await {
             let msg = match frame {
                 Ok(m) => m,
@@ -873,6 +913,7 @@ async fn run_relay(
                     if !dispatch_connection_text_with_conversation(
                         &t,
                         &mut authed,
+                        &mut principal,
                         &acp,
                         &read_relay,
                         &registry,
@@ -896,6 +937,10 @@ async fn run_relay(
                     {
                         break; // write half closed.
                     }
+                    read_authenticated_generation.store(
+                        principal.as_ref().map_or(0, RemotePrincipal::generation),
+                        Ordering::Release,
+                    );
                 }
                 Message::Binary(_) => {
                     // Protocol error — close the connection.
@@ -1013,6 +1058,7 @@ fn authenticated_send_prompt(text: &str, authed: bool) -> Option<(String, Value)
 async fn dispatch_connection_text_with_conversation(
     text: &str,
     authed: &mut bool,
+    principal: &mut Option<RemotePrincipal>,
     acp: &Arc<AcpManager>,
     relay: &Arc<WsRelaySink>,
     registry: &Arc<ProjectRegistry>,
@@ -1033,6 +1079,21 @@ async fn dispatch_connection_text_with_conversation(
     peer: SocketAddr,
 ) -> bool {
     if let Some((id, payload)) = authenticated_send_prompt(text, *authed) {
+        if principal.as_ref().is_none_or(|principal| {
+            authority
+                .authorize(principal, RemoteCapability::Connect)
+                .is_err()
+        }) {
+            *authed = false;
+            *principal = None;
+            return write_tx
+                .send(Outbound::Reply(WsReply::err_with_code(
+                    id,
+                    "REAUTHENTICATION_REQUIRED",
+                    "remote access generation is no longer authorized",
+                )))
+                .is_ok();
+        }
         return match accept_send_prompt(id, &payload, acp, relay).await {
             Ok(accepted) => {
                 let prompt_acp = Arc::clone(acp);
@@ -1051,6 +1112,7 @@ async fn dispatch_connection_text_with_conversation(
     let reply = handle_request_with_conversation(
         text,
         authed,
+        principal,
         acp,
         relay,
         registry,
@@ -1096,9 +1158,12 @@ async fn dispatch_connection_text(
 ) -> bool {
     let current_conversation = Arc::new(parking_lot::Mutex::new(None));
     let authority = Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token"));
+    let mut principal = (*authed)
+        .then(|| authority.verify_bearer("test-remote-access-token").unwrap());
     dispatch_connection_text_with_conversation(
         text,
         authed,
+        &mut principal,
         acp,
         relay,
         registry,
@@ -1201,9 +1266,13 @@ async fn handle_request(
     acp_install: Option<&Arc<crate::acp::install::AcpInstallService>>,
 ) -> WsReply {
     let current_conversation = Arc::new(parking_lot::Mutex::new(None));
+    let authority = Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token"));
+    let mut principal = (*authed)
+        .then(|| authority.verify_bearer("test-remote-access-token").unwrap());
     handle_request_with_conversation(
         text,
         authed,
+        &mut principal,
         acp,
         relay,
         registry,
@@ -1220,7 +1289,7 @@ async fn handle_request(
         acp_catalog,
         acp_install,
         None,
-        &Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token")),
+        &authority,
         SocketAddr::from(([127, 0, 0, 1], 3000)),
     )
     .await
@@ -1236,6 +1305,7 @@ struct AuthenticatePayload {
 async fn handle_request_with_conversation(
     text: &str,
     authed: &mut bool,
+    principal: &mut Option<RemotePrincipal>,
     acp: &Arc<AcpManager>,
     relay: &Arc<WsRelaySink>,
     registry: &Arc<ProjectRegistry>,
@@ -1290,7 +1360,8 @@ async fn handle_request_with_conversation(
                 }
             };
             match authority.verify_bearer_for_peer(&payload.token, peer.ip()) {
-                Ok(_) => {
+                Ok(verified_principal) => {
+                    *principal = Some(verified_principal);
                     *authed = true;
                     info!(
                         target: "termul::web::ws",
@@ -1337,6 +1408,29 @@ async fn handle_request_with_conversation(
             id,
             WsErrorCode::Unauthorized,
             "pre-auth: send an `authenticate` request first",
+        );
+    }
+
+    // Post-auth requests are reauthorized against the current credential generation. A stale
+    // principal cannot read, mutate, subscribe, or keep a superseded socket alive.
+    let Some(verified_principal) = principal.as_ref() else {
+        *authed = false;
+        return WsReply::err_with_code(
+            id,
+            "REAUTHENTICATION_REQUIRED",
+            "remote access principal is unavailable",
+        );
+    };
+    if authority
+        .authorize(verified_principal, RemoteCapability::Connect)
+        .is_err()
+    {
+        *authed = false;
+        *principal = None;
+        return WsReply::err_with_code(
+            id,
+            "REAUTHENTICATION_REQUIRED",
+            "remote access generation is no longer authorized",
         );
     }
 
@@ -1513,7 +1607,15 @@ async fn handle_request_with_conversation(
             .await
         }
         "close_session" => {
-            handle_close_session(id, &req.payload, acp, current_session, current_project).await
+            handle_close_session(
+                id,
+                &req.payload,
+                acp,
+                relay,
+                current_session,
+                current_project,
+            )
+            .await
         }
         "dispose_ephemeral_session" => {
             handle_dispose_ephemeral_session(
@@ -1803,6 +1905,8 @@ async fn handle_get_session_payload_page(
         session_id: String,
         after_seq: u64,
         limit: usize,
+        #[serde(default)]
+        target_last_seq: Option<u64>,
     }
     let request: Request = match serde_json::from_value::<Request>(payload.clone()) {
         Ok(request)
@@ -1835,7 +1939,15 @@ async fn handle_get_session_payload_page(
             "bounded canonical history is unavailable",
         );
     };
-    match persistence.history_page(&request.session_id, request.after_seq, request.limit) {
+    match persistence
+        .history_page_blocking(
+            request.session_id.clone(),
+            request.after_seq,
+            request.limit,
+            request.target_last_seq,
+        )
+        .await
+    {
         Ok(page) => {
             tracing::info!(
                 target: "termul::web::ws",
@@ -2407,6 +2519,25 @@ struct ConversationLifecycleWsPayload {
     request: Option<crate::conversation::PrepareConversationRequest>,
 }
 
+async fn retire_ws_deleted_binding_if_updated(
+    relay: &WsRelaySink,
+    current_session_id: Option<&str>,
+    outcome: &crate::conversation::ConversationLifecycleOutcome,
+) -> Result<(), String> {
+    if matches!(
+        outcome,
+        crate::conversation::ConversationLifecycleOutcome::Updated {
+            action: crate::conversation::ConversationLifecycleAction::DeleteConversation,
+            ..
+        }
+    ) {
+        if let Some(session_id) = current_session_id {
+            relay.retire_session(session_id).await?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 async fn handle_conversation_lifecycle(
     id: String,
@@ -2445,6 +2576,14 @@ async fn handle_conversation_lifecycle(
             Ok(service) => service,
             Err(error) => return WsReply::err_with_code(id, error.code.as_str(), error.detail),
         };
+    let current_session_id = if matches!(mutation, ConversationWsMutation::Delete) {
+        acp.conversation_creation()
+            .and_then(|creation| creation.repository().current_binding(conversation_id).ok())
+            .flatten()
+            .map(|binding| binding.agent_session_id)
+    } else {
+        None
+    };
     let result = match mutation {
         ConversationWsMutation::Detach => {
             service
@@ -2482,19 +2621,35 @@ async fn handle_conversation_lifecycle(
         }
     };
     match result {
-        Ok(outcome) => match relay.emit(&AcpEvent {
-            sid: None,
-            type_: "conversation_lifecycle",
-            payload: serde_json::to_value(&outcome)
-                .expect("Conversation lifecycle outcome serializes"),
-        }) {
-            Ok(_) => ok_with_payload(id, &outcome),
-            Err(error) => WsReply::err_with_code(
-                id,
-                error.code,
-                "conversation lifecycle event delivery degraded",
-            ),
-        },
+        Ok(outcome) => {
+            if retire_ws_deleted_binding_if_updated(
+                relay,
+                current_session_id.as_deref(),
+                &outcome,
+            )
+            .await
+            .is_err()
+            {
+                return WsReply::err_with_code(
+                    id,
+                    "CONVERSATION_RETIREMENT_FAILED",
+                    "Conversation auxiliary retirement failed",
+                );
+            }
+            match relay.emit(&AcpEvent {
+                sid: None,
+                type_: "conversation_lifecycle",
+                payload: serde_json::to_value(&outcome)
+                    .expect("Conversation lifecycle outcome serializes"),
+            }) {
+                Ok(_) => ok_with_payload(id, &outcome),
+                Err(error) => WsReply::err_with_code(
+                    id,
+                    error.code,
+                    "conversation lifecycle event delivery degraded",
+                ),
+            }
+        }
         Err(error) => WsReply::err_with_code(id, error.code.as_str(), error.detail),
     }
 }
@@ -2529,6 +2684,24 @@ async fn handle_conversation_lifecycle_with_service(
             "CONVERSATION_SERVICE_UNAVAILABLE",
             "bootstrap-published Conversation application service is unavailable",
         );
+    };
+    let current_session_id = if matches!(mutation, ConversationWsMutation::Delete) {
+        match service
+            .writer()
+            .repository()
+            .current_binding(conversation_id)
+        {
+            Ok(binding) => binding.map(|binding| binding.agent_session_id),
+            Err(_) => {
+                return WsReply::err_with_code(
+                    id,
+                    "CONVERSATION_RECOVERY_REQUIRED",
+                    "failed to resolve Conversation binding before delete",
+                )
+            }
+        }
+    } else {
+        None
     };
     let result = match mutation {
         ConversationWsMutation::Detach => {
@@ -2567,19 +2740,35 @@ async fn handle_conversation_lifecycle_with_service(
         }
     };
     match result {
-        Ok(outcome) => match relay.emit(&AcpEvent {
-            sid: None,
-            type_: "conversation_lifecycle",
-            payload: serde_json::to_value(&outcome)
-                .expect("Conversation lifecycle outcome serializes"),
-        }) {
-            Ok(_) => ok_with_payload(id, &outcome),
-            Err(error) => WsReply::err_with_code(
-                id,
-                error.code,
-                "conversation lifecycle event delivery degraded",
-            ),
-        },
+        Ok(outcome) => {
+            if retire_ws_deleted_binding_if_updated(
+                relay,
+                current_session_id.as_deref(),
+                &outcome,
+            )
+            .await
+            .is_err()
+            {
+                return WsReply::err_with_code(
+                    id,
+                    "CONVERSATION_RETIREMENT_FAILED",
+                    "Conversation auxiliary retirement failed",
+                );
+            }
+            match relay.emit(&AcpEvent {
+                sid: None,
+                type_: "conversation_lifecycle",
+                payload: serde_json::to_value(&outcome)
+                    .expect("Conversation lifecycle outcome serializes"),
+            }) {
+                Ok(_) => ok_with_payload(id, &outcome),
+                Err(error) => WsReply::err_with_code(
+                    id,
+                    error.code,
+                    "conversation lifecycle event delivery degraded",
+                ),
+            }
+        }
         Err(error) => WsReply::err_with_code(id, error.code, error.detail),
     }
 }
@@ -3766,6 +3955,13 @@ async fn handle_dispose_ephemeral_session(
         .await
     {
         Ok(()) => {
+            if let Err(code) = relay.retire_session(&disposed_session_id.0).await {
+                return WsReply::err_with_code(
+                    id,
+                    "CONVERSATION_RETIREMENT_FAILED",
+                    format!("session auxiliary retirement failed ({code})"),
+                );
+            }
             subscribed_clients.retain(|(session_id, client_id)| {
                 if session_id == &disposed_session_id.0 {
                     relay.unsubscribe(session_id, *client_id);
@@ -3778,7 +3974,6 @@ async fn handle_dispose_ephemeral_session(
                 *current_session.lock() = None;
                 *current_project.lock() = None;
             }
-            relay.forget_session(&disposed_session_id.0).await;
             WsReply::ok(id, Some(json!({})))
         }
         Err(e) => acp_err_to_reply(id, e),
@@ -3789,6 +3984,7 @@ async fn handle_close_session(
     id: String,
     payload: &Value,
     acp: &Arc<AcpManager>,
+    relay: &Arc<WsRelaySink>,
     current_session: &Arc<parking_lot::Mutex<Option<SessionId>>>,
     current_project: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> WsReply {
@@ -3845,6 +4041,13 @@ async fn handle_close_session(
     };
     match close_result {
         Ok(()) => {
+            if let Err(code) = relay.retire_session(&closing_session_id.0).await {
+                return WsReply::err_with_code(
+                    id,
+                    "CONVERSATION_RETIREMENT_FAILED",
+                    format!("session auxiliary retirement failed ({code})"),
+                );
+            }
             if current_session.lock().as_ref() == Some(&closing_session_id) {
                 *current_session.lock() = None;
                 *current_project.lock() = None;
@@ -4294,6 +4497,19 @@ async fn handle_subscribe(
     if parsed.session_id.is_empty() {
         return WsReply::err(id, WsErrorCode::Unsupported, "sessionId is required");
     }
+    let distinct_subscriptions = subscribed_clients
+        .iter()
+        .map(|(session_id, _)| session_id)
+        .collect::<std::collections::HashSet<_>>();
+    if !distinct_subscriptions.contains(&parsed.session_id)
+        && distinct_subscriptions.len() >= MAX_CONNECTION_SUBSCRIPTIONS
+    {
+        return WsReply::err_with_code(
+            id,
+            "SUBSCRIPTION_LIMIT_EXCEEDED",
+            "one connection may subscribe to at most 64 sessions",
+        );
+    }
 
     // Do not drop the currently-live subscription until the replacement is
     // successfully registered. This preserves pending-permission ownership on
@@ -4304,10 +4520,25 @@ async fn handle_subscribe(
         .map(|(_, client_id)| *client_id)
         .collect();
 
-    let (client_id, mut rx, replay) = relay.subscribe(&parsed.session_id, parsed.last_seq).await;
+    let connection_client = subscribed_clients.first().map(|(_, client_id)| *client_id);
+    let (client_id, mut receiver, replay) = if let Some(client_id) = connection_client {
+        (
+            client_id,
+            None,
+            relay
+                .subscribe_existing(client_id, &parsed.session_id, parsed.last_seq)
+                .await,
+        )
+    } else {
+        let (client_id, receiver, replay) =
+            relay.subscribe(&parsed.session_id, parsed.last_seq).await;
+        (client_id, Some(receiver), replay)
+    };
     match replay {
         ReplayResult::Stale => {
-            relay.unregister_client(client_id);
+            if connection_client.is_none() {
+                relay.unregister_client(client_id);
+            }
             WsReply::err(
                 id,
                 WsErrorCode::Stale,
@@ -4315,26 +4546,32 @@ async fn handle_subscribe(
             )
         }
         ReplayResult::Ok(replayed) => {
-            subscribed_clients.retain(|(sid, cid)| {
-                if sid == &parsed.session_id && prior_clients.contains(cid) {
-                    relay.unsubscribe(sid, *cid);
-                    false
-                } else {
-                    true
-                }
-            });
+            if connection_client.is_none() {
+                subscribed_clients.retain(|(sid, cid)| {
+                    if sid == &parsed.session_id && prior_clients.contains(cid) {
+                        relay.unsubscribe(sid, *cid);
+                        false
+                    } else {
+                        true
+                    }
+                });
+            } else {
+                subscribed_clients.retain(|(sid, _)| sid != &parsed.session_id);
+            }
             subscribed_clients.push((parsed.session_id.clone(), client_id));
             if let Some(rendezvous) = relay.rendezvous() {
                 rendezvous.cancel_disconnect_grace(&parsed.session_id);
             }
-            let forward_tx = out_tx.clone();
-            tokio::spawn(async move {
-                while let Some(event) = rx.recv().await {
-                    if forward_tx.send_event(event).await.is_err() {
-                        break;
+            if let Some(mut rx) = receiver.take() {
+                let forward_tx = out_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(event) = rx.recv().await {
+                        if forward_tx.send_event(event).await.is_err() {
+                            break;
+                        }
                     }
-                }
-            });
+                });
+            }
             WsReply::ok(
                 id,
                 Some(json!({
@@ -4615,9 +4852,13 @@ pub(crate) async fn dispatch_conversation_golden_request(
     let current_conversation = Arc::new(parking_lot::Mutex::new(None));
     let current_project = Arc::new(parking_lot::Mutex::new(None));
     let switch_queue = Arc::new(tokio::sync::Mutex::new(ProjectSwitchQueue::default()));
+    let authority = Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token"));
+    let mut principal = (*authed)
+        .then(|| authority.verify_bearer("test-remote-access-token").unwrap());
     handle_request_with_conversation(
         text,
         authed,
+        &mut principal,
         &acp,
         &relay,
         &registry,
@@ -4634,7 +4875,7 @@ pub(crate) async fn dispatch_conversation_golden_request(
         None,
         None,
         Some(service),
-        &Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token")),
+        &authority,
         SocketAddr::from(([127, 0, 0, 1], 3000)),
     )
     .await
@@ -5501,6 +5742,29 @@ mod tests {
         assert!(!is_os_fulfilled_cap("unknown/cap"));
     }
 
+    #[tokio::test]
+    async fn sixty_fifth_distinct_subscription_is_rejected_before_allocation() {
+        let relay = Arc::new(WsRelaySink::new());
+        let (tx, _rx) = outbound_channel();
+        let shared_client = ClientId::new();
+        let mut subscriptions = (0..MAX_CONNECTION_SUBSCRIPTIONS)
+            .map(|ordinal| (format!("session-{ordinal}"), shared_client))
+            .collect::<Vec<_>>();
+        let before = relay.auxiliary_stats();
+        let reply = handle_subscribe(
+            "subscribe-65".to_string(),
+            &json!({"sessionId":"session-64"}),
+            &relay,
+            &tx,
+            &mut subscriptions,
+        )
+        .await;
+        assert!(!reply.ok);
+        assert_eq!(reply.err.unwrap().code, "SUBSCRIPTION_LIMIT_EXCEEDED");
+        assert_eq!(relay.auxiliary_stats(), before);
+        assert_eq!(subscriptions.len(), MAX_CONNECTION_SUBSCRIPTIONS);
+    }
+
     #[test]
     fn human_cap_boundary() {
         assert!(is_human_relayed_cap("request_permission"));
@@ -5540,6 +5804,114 @@ mod tests {
         // Payload is passed through verbatim (camelCase preserved — AC3).
         assert_eq!(v["payload"]["agentId"], "a1");
         assert_eq!(v["payload"]["sessionId"], "sess-1");
+    }
+
+    #[tokio::test]
+    async fn ws_conversation_delete_retires_on_success_and_retains_on_blocked_or_error() {
+        use crate::conversation::{
+            ConversationLifecycleAction, ConversationLifecycleErrorCode,
+            ConversationLifecycleOutcome, ConversationLifecycleState,
+        };
+        let relay = WsRelaySink::new();
+        let conversation_id = crate::conversation::ConversationId::new_v4();
+        relay.turn_watermark().mark_seen("ws-delete", "turn-1");
+        let blocked = ConversationLifecycleOutcome::Blocked {
+            action: ConversationLifecycleAction::DeleteConversation,
+            conversation_id,
+            revision: 4,
+            code: ConversationLifecycleErrorCode::ConversationLiveResources,
+            blockers: Vec::new(),
+        };
+        retire_ws_deleted_binding_if_updated(&relay, Some("ws-delete"), &blocked)
+            .await
+            .unwrap();
+        assert!(relay.turn_watermark().is_seen("ws-delete", "turn-1"));
+        let simulated_error: Result<(), &str> = Err("delete failed");
+        assert!(simulated_error.is_err());
+        assert!(relay.turn_watermark().is_seen("ws-delete", "turn-1"));
+        let updated = ConversationLifecycleOutcome::Updated {
+            action: ConversationLifecycleAction::DeleteConversation,
+            conversation_id,
+            previous_revision: 4,
+            revision: 5,
+            workspace_cwd: "/opaque/workspace".to_string(),
+            lifecycle_state: ConversationLifecycleState::Deleted,
+            current_binding: None,
+            previous_agent_session_id: Some("ws-delete".to_string()),
+        };
+        retire_ws_deleted_binding_if_updated(&relay, Some("ws-delete"), &updated)
+            .await
+            .unwrap();
+        assert!(!relay.turn_watermark().is_seen("ws-delete", "turn-1"));
+    }
+
+    #[tokio::test]
+    async fn ws_close_retires_on_success_and_retains_on_error() {
+        let relay = WsRelaySink::new();
+        relay.turn_watermark().mark_seen("ws-close", "turn-1");
+        let close_result: Result<(), &str> = Err("close failed");
+        assert!(close_result.is_err());
+        assert!(relay.turn_watermark().is_seen("ws-close", "turn-1"));
+        relay.retire_session("ws-close").await.unwrap();
+        assert!(!relay.turn_watermark().is_seen("ws-close", "turn-1"));
+    }
+
+    #[tokio::test]
+    async fn ws_ephemeral_dispose_retires_on_success_and_retains_on_error() {
+        let relay = WsRelaySink::new();
+        relay
+            .turn_watermark()
+            .mark_seen("ws-ephemeral", "turn-1");
+        let dispose_result: Result<(), &str> = Err("dispose failed");
+        assert!(dispose_result.is_err());
+        assert!(relay
+            .turn_watermark()
+            .is_seen("ws-ephemeral", "turn-1"));
+        relay.retire_session("ws-ephemeral").await.unwrap();
+        assert!(!relay
+            .turn_watermark()
+            .is_seen("ws-ephemeral", "turn-1"));
+    }
+
+    #[test]
+    fn generation_revocation_sends_only_reauthentication_required_without_credential_and_closes() {
+        let authority = RemoteAccessAuthority::for_tests("first-generation-token");
+        let first = authority
+            .verify_bearer("first-generation-token")
+            .unwrap();
+        let generation_rx = authority.subscribe_generation();
+        let rotated = authority.rotate_desktop_credential().unwrap();
+        let current = *generation_rx.borrow();
+        assert!(generation_requires_reauthentication(first.generation(), current));
+        assert!(authority
+            .authorize(&first, RemoteCapability::Connect)
+            .is_err());
+
+        let event = reauthentication_required_event();
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert_eq!(event.type_, "reauthentication_required");
+        assert_eq!(event.payload, json!({"code":"REAUTHENTICATION_REQUIRED"}));
+        for forbidden in [
+            "first-generation-token",
+            rotated.bearer(),
+            "access_url",
+            "accessUrl",
+            "bearer",
+            "pairing",
+            "QRCode",
+        ] {
+            assert!(!encoded.contains(forbidden));
+        }
+        let source = include_str!("ws.rs");
+        let branch = source
+            .split("generation_requires_reauthentication(authenticated, current)")
+            .nth(1)
+            .unwrap()
+            .split("() = write_disconnect.notified()")
+            .next()
+            .unwrap();
+        assert_eq!(branch.matches("reauthentication_required_event()").count(), 1);
+        assert_eq!(branch.matches("Message::Close(None)").count(), 1);
     }
 
     #[test]
@@ -5734,6 +6106,7 @@ mod tests {
         let authority = Arc::new(RemoteAccessAuthority::for_tests("expected-token"));
         let peer = SocketAddr::from(([192, 0, 2, 44], 3000));
         let mut authed = false;
+        let mut principal = None;
 
         for attempt in 1..=6 {
             let reply = handle_request_with_conversation(
@@ -5741,6 +6114,7 @@ mod tests {
                     r#"{{"id":"auth-{attempt}","type":"authenticate","payload":{{"token":"wrong"}}}}"#
                 ),
                 &mut authed,
+                &mut principal,
                 &acp,
                 &relay,
                 &registry,
@@ -8178,9 +8552,11 @@ mod tests {
             let current_project = Arc::new(parking_lot::Mutex::new(None));
             let switch_queue = Arc::new(tokio::sync::Mutex::new(ProjectSwitchQueue::default()));
             let mut authed = false;
+            let mut principal = None;
             let reply = handle_request_with_conversation(
                 r#"{"id":"legacy","type":"resolve_legacy_conversation_id","payload":{"sourceKind":"legacyStorageKey","value":"storage-one"}}"#,
                 &mut authed,
+                &mut principal,
                 &acp,
                 &relay,
                 &registry,

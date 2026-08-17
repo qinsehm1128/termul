@@ -2,14 +2,15 @@
 //!
 //! Opaque ACP session bindings are resolved before admission. Accepted records are charged against
 //! per-session, process-wide record, and serialized-byte budgets, then routed to one of eight
-//! shared Tokio workers. A barrier uses one absolute deadline for control delivery,
-//! acknowledgement, adapter flush, and worker join.
+//! shared Tokio workers. Admission returns a per-record completion ticket; callers must observe the
+//! ticket before publishing the corresponding live event. A barrier uses one absolute deadline for
+//! control delivery, acknowledgement, adapter flush, and worker join.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant as StdInstant};
 
 use parking_lot::{Condvar, Mutex};
@@ -21,6 +22,7 @@ use tokio::time::Instant;
 
 use crate::conversation::{
     ConversationId, ConversationPersistenceAdapter, ConversationPersistenceError,
+    CONVERSATION_PERSISTENCE_COMMIT_INDETERMINATE, DEFAULT_DELIVERY_COMMIT_TIMEOUT,
 };
 
 /// Fixed number of shared ordered writer tasks.
@@ -87,9 +89,15 @@ trait PersistenceTarget: Send + Sync + 'static {
     fn append<'a>(
         &'a self,
         agent_session_id: &'a str,
+        source_seq: u64,
         event_type: &'a str,
         payload: Value,
     ) -> AppendFuture<'a>;
+
+    fn committed_seq(
+        &self,
+        agent_session_id: &str,
+    ) -> std::result::Result<u64, ConversationPersistenceError>;
 
     fn flush(&self) -> FlushFuture<'_>;
 }
@@ -106,13 +114,23 @@ impl PersistenceTarget for AdapterTarget {
     fn append<'a>(
         &'a self,
         agent_session_id: &'a str,
+        source_seq: u64,
         event_type: &'a str,
         payload: Value,
     ) -> AppendFuture<'a> {
-        Box::pin(
-            self.adapter
-                .append_acp_event(agent_session_id, event_type, payload),
-        )
+        Box::pin(self.adapter.append_ordered_event(
+            agent_session_id,
+            source_seq,
+            event_type,
+            payload,
+        ))
+    }
+
+    fn committed_seq(
+        &self,
+        agent_session_id: &str,
+    ) -> std::result::Result<u64, ConversationPersistenceError> {
+        self.adapter.history_last_seq(agent_session_id)
     }
 
     fn flush(&self) -> FlushFuture<'_> {
@@ -146,6 +164,96 @@ struct CoordinatorState {
     max_pending_bytes: usize,
     max_per_session_pending_records: usize,
     barrier_active: bool,
+}
+
+#[derive(Default)]
+struct TicketCompletion {
+    result: Mutex<Option<std::result::Result<u64, &'static str>>>,
+    ready: Condvar,
+}
+
+impl TicketCompletion {
+    fn complete(&self, result: std::result::Result<u64, &'static str>) {
+        let mut slot = self.result.lock();
+        if slot.is_none() {
+            *slot = Some(result);
+            self.ready.notify_all();
+        }
+    }
+}
+
+/// Per-record durability acknowledgement returned after bounded queue admission.
+///
+/// The ticket contains no payload. Observing it yields the committed canonical cursor, which must
+/// equal the submitted source cursor. A timeout reconciles the canonical frontier once before
+/// returning the stable recovery-required/indeterminate code.
+pub struct OrderedPersistenceTicket {
+    shared: Arc<CoordinatorShared>,
+    agent_session_id: String,
+    source_seq: u64,
+    completion: Arc<TicketCompletion>,
+}
+
+impl std::fmt::Debug for OrderedPersistenceTicket {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("OrderedPersistenceTicket")
+            .field("source_seq", &self.source_seq)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OrderedPersistenceTicket {
+    #[must_use]
+    pub const fn source_seq(&self) -> u64 {
+        self.source_seq
+    }
+
+    pub fn wait(self) -> Result<u64, ConversationPersistenceError> {
+        self.wait_until(StdInstant::now() + DEFAULT_DELIVERY_COMMIT_TIMEOUT)
+    }
+
+    pub fn wait_until(
+        self,
+        deadline: StdInstant,
+    ) -> Result<u64, ConversationPersistenceError> {
+        let mut result = self.completion.result.lock();
+        loop {
+            if let Some(result) = result.take() {
+                return result.map_err(completion_error);
+            }
+            let now = StdInstant::now();
+            if now >= deadline {
+                break;
+            }
+            let timed_out = self.completion.ready.wait_for(&mut result, deadline - now);
+            if timed_out.timed_out() && result.is_none() {
+                break;
+            }
+        }
+        drop(result);
+
+        match self.shared.target.committed_seq(&self.agent_session_id) {
+            Ok(committed) if committed >= self.source_seq => Ok(self.source_seq),
+            Ok(_) | Err(_) => Err(persistence_error(
+                CONVERSATION_PERSISTENCE_COMMIT_INDETERMINATE,
+                "ordered_ticket_wait",
+                "admitted event did not reach the canonical frontier before the deadline",
+            )),
+        }
+    }
+
+    pub async fn committed(self) -> Result<u64, ConversationPersistenceError> {
+        tokio::task::spawn_blocking(move || self.wait())
+            .await
+            .map_err(|_| {
+                persistence_error(
+                    CONVERSATION_PERSISTENCE_COMMIT_INDETERMINATE,
+                    "ordered_ticket_wait",
+                    "durability acknowledgement task failed",
+                )
+            })?
+    }
 }
 
 struct CoordinatorShared {
@@ -184,8 +292,14 @@ impl CoordinatorShared {
         session_key: &str,
         source_seq: u64,
         charged_bytes: usize,
-        result: std::result::Result<(), &'static str>,
+        completion: &TicketCompletion,
+        append_result: std::result::Result<u64, &'static str>,
     ) {
+        let result = match append_result {
+            Ok(canonical_seq) if canonical_seq == source_seq => Ok(canonical_seq),
+            Ok(_) => Err(WRITER_FRONTIER_MISMATCH),
+            Err(code) => Err(code),
+        };
         let mut state = self.state.lock();
         state.pending_records = state.pending_records.saturating_sub(1);
         state.pending_bytes = state.pending_bytes.saturating_sub(charged_bytes);
@@ -193,10 +307,10 @@ impl CoordinatorShared {
             session.pending_records = session.pending_records.saturating_sub(1);
             session.pending_bytes = session.pending_bytes.saturating_sub(charged_bytes);
             match result {
-                Ok(()) if source_seq > session.persisted_frontier => {
+                Ok(_) if source_seq > session.persisted_frontier => {
                     session.persisted_frontier = source_seq;
                 }
-                Ok(()) => {
+                Ok(_) => {
                     session.last_error_code = Some(WRITER_FRONTIER_MISMATCH);
                 }
                 Err(code) => {
@@ -205,6 +319,7 @@ impl CoordinatorShared {
             }
         }
         drop(state);
+        completion.complete(result);
         self.capacity_available.notify_all();
     }
 
@@ -253,16 +368,18 @@ struct AdmissionPermit {
     session_key: String,
     source_seq: u64,
     charged_bytes: usize,
+    completion: Arc<TicketCompletion>,
     released: bool,
 }
 
 impl AdmissionPermit {
-    fn complete(mut self, result: std::result::Result<(), &'static str>) {
+    fn complete(mut self, result: std::result::Result<u64, &'static str>) {
         self.released = true;
         self.shared.finish_record(
             &self.session_key,
             self.source_seq,
             self.charged_bytes,
+            &self.completion,
             result,
         );
     }
@@ -279,6 +396,7 @@ impl Drop for AdmissionPermit {
                 &self.session_key,
                 self.source_seq,
                 self.charged_bytes,
+                &self.completion,
                 Err(WRITER_QUEUE_CLOSED),
             );
         }
@@ -287,6 +405,7 @@ impl Drop for AdmissionPermit {
 
 struct RecordCommand {
     agent_session_id: String,
+    source_seq: u64,
     event_type: String,
     payload: Value,
     permit: AdmissionPermit,
@@ -374,75 +493,88 @@ impl Drop for SubmissionPause {
     }
 }
 
-/// One globally bounded ordered persistence coordinator shared by every relay using an adapter.
-pub struct OrderedConversationPersistence {
+struct OrderedPersistenceCore {
     shared: Arc<CoordinatorShared>,
     shards: Vec<ShardControl>,
     lifecycle_lock: tokio::sync::Mutex<()>,
+}
+
+impl Drop for OrderedPersistenceCore {
+    fn drop(&mut self) {
+        self.shared.shutting_down.store(true, Ordering::Release);
+        self.shared.state.lock().barrier_active = false;
+        self.shared.capacity_available.notify_all();
+        for shard in &self.shards {
+            let _ = shard.sender.try_send(WorkerCommand::Shutdown);
+            if let Some(handle) = shard.join_handle.lock().take() {
+                handle.abort();
+            }
+        }
+        let metrics = self.shared.metrics();
+        if metrics.pending_records > 0 {
+            log::error!(
+                "[conversation-persistence] drop aborted pending work code={} workers={} pending_records={} pending_bytes={}",
+                WRITER_QUEUE_CLOSED,
+                metrics.active_writer_tasks,
+                metrics.pending_records,
+                metrics.pending_bytes
+            );
+        }
+    }
+}
+
+/// One globally bounded ordered persistence coordinator shared by every relay using an adapter.
+pub struct OrderedConversationPersistence {
+    core: Arc<OrderedPersistenceCore>,
     drain_timeout: Duration,
 }
 
 impl OrderedConversationPersistence {
     #[must_use]
     pub fn new(adapter: Arc<ConversationPersistenceAdapter>) -> Self {
-        Self::with_target(Arc::new(AdapterTarget { adapter }), DEFAULT_DRAIN_TIMEOUT)
-    }
-
-    fn with_target(target: Arc<dyn PersistenceTarget>, drain_timeout: Duration) -> Self {
-        Self::with_target_and_handle(target, drain_timeout, coordinator_runtime_handle())
-    }
-
-    fn with_target_and_handle(
-        target: Arc<dyn PersistenceTarget>,
-        drain_timeout: Duration,
-        runtime: tokio::runtime::Handle,
-    ) -> Self {
-        let shared = Arc::new(CoordinatorShared {
-            target,
-            state: Mutex::new(CoordinatorState::default()),
-            capacity_available: Condvar::new(),
-            shutting_down: AtomicBool::new(false),
-            active_writer_tasks: AtomicUsize::new(0),
-        });
-        let mut shards = Vec::with_capacity(WRITER_SHARDS);
-        for shard_index in 0..WRITER_SHARDS {
-            let (sender, receiver) = mpsc::channel(SHARD_CHANNEL_CAPACITY);
-            shared.active_writer_tasks.fetch_add(1, Ordering::AcqRel);
-            let guard = WorkerTaskGuard {
-                shared: Arc::clone(&shared),
+        let key = Arc::as_ptr(&adapter) as usize;
+        let mut registry = adapter_coordinator_registry().lock();
+        registry.retain(|_, coordinator| coordinator.strong_count() > 0);
+        if let Some(core) = registry.get(&key).and_then(Weak::upgrade) {
+            return Self {
+                core,
+                drain_timeout: DEFAULT_DRAIN_TIMEOUT,
             };
-            let join_handle =
-                runtime.spawn(run_shard(shard_index, receiver, Arc::clone(&shared), guard));
-            shards.push(ShardControl {
-                sender,
-                join_handle: Mutex::new(Some(join_handle)),
-            });
         }
-        log::info!(
-            "[conversation-persistence] coordinator ready workers={} pending_records=0 pending_bytes=0 frontier=0 elapsed_ms=0",
-            WRITER_SHARDS
-        );
+        let core = build_core(Arc::new(AdapterTarget { adapter }));
+        registry.insert(key, Arc::downgrade(&core));
         Self {
-            shared,
-            shards,
-            lifecycle_lock: tokio::sync::Mutex::new(()),
+            core,
+            drain_timeout: DEFAULT_DRAIN_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_target(target: Arc<dyn PersistenceTarget>, drain_timeout: Duration) -> Self {
+        Self {
+            core: build_core(target),
             drain_timeout,
         }
     }
 
-    /// Accept one source-sequenced relay event for ordered persistence.
-    ///
-    /// Binding resolution and serialization occur before any session state or budget is allocated.
-    /// Record-count saturation backpressures the synchronous producer without runtime polling;
-    /// byte saturation rejects before queue acceptance.
+    /// Whether two handles route through the exact same ordering/backpressure/shutdown authority.
+    #[must_use]
+    pub fn shares_authority(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.core, &other.core)
+    }
+
+    /// Accept one source-sequenced relay event for ordered persistence and return its completion
+    /// ticket. Binding resolution and serialization occur before any state or budget allocation.
+    /// Both byte and record saturation wait for at most five seconds and remain retryable.
     pub fn submit(
         &self,
         agent_session_id: &str,
         source_seq: u64,
         event_type: &str,
         payload: Value,
-    ) -> Result<(), ConversationPersistenceError> {
-        if self.shared.shutting_down.load(Ordering::Acquire) {
+    ) -> Result<OrderedPersistenceTicket, ConversationPersistenceError> {
+        let shared = &self.core.shared;
+        if shared.shutting_down.load(Ordering::Acquire) {
             return Err(persistence_error(
                 WRITER_SHUT_DOWN,
                 "ordered_submit",
@@ -457,17 +589,13 @@ impl OrderedConversationPersistence {
             ));
         }
 
-        let conversation_id = self
-            .shared
-            .target
-            .resolve(agent_session_id)
-            .ok_or_else(|| {
-                persistence_error(
-                    "CONVERSATION_BINDING_NOT_FOUND",
-                    "ordered_submit",
-                    "opaque agent session id has no canonical Conversation binding",
-                )
-            })?;
+        let conversation_id = shared.target.resolve(agent_session_id).ok_or_else(|| {
+            persistence_error(
+                "CONVERSATION_BINDING_NOT_FOUND",
+                "ordered_submit",
+                "opaque agent session id has no canonical Conversation binding",
+            )
+        })?;
         let charged_bytes = serialized_record_bytes(event_type, &payload)?;
         if charged_bytes > GLOBAL_PENDING_BYTES {
             return Err(persistence_error(
@@ -480,19 +608,16 @@ impl OrderedConversationPersistence {
         }
 
         let shard = shard_for(agent_session_id);
-        let mut saturation_logged = false;
-        let mut state = self.shared.state.lock();
+        let deadline = StdInstant::now() + DEFAULT_DELIVERY_COMMIT_TIMEOUT;
+        let mut saturation_code = None;
+        let mut state = shared.state.lock();
         loop {
-            if self.shared.shutting_down.load(Ordering::Acquire) {
+            if shared.shutting_down.load(Ordering::Acquire) {
                 return Err(persistence_error(
                     WRITER_SHUT_DOWN,
                     "ordered_submit",
                     "ordered persistence is shutting down",
                 ));
-            }
-            if state.barrier_active {
-                self.shared.capacity_available.wait(&mut state);
-                continue;
             }
 
             if let Some(session) = state.sessions.get(agent_session_id) {
@@ -522,7 +647,7 @@ impl OrderedConversationPersistence {
                         .get_mut(agent_session_id)
                         .expect("session was read while state lock was held")
                         .last_error_code = Some(SOURCE_SEQUENCE_INVALID);
-                    self.shared.capacity_available.notify_all();
+                    shared.capacity_available.notify_all();
                     log::error!(
                         "[conversation-persistence] frontier mismatch code={} pending_records={} pending_bytes={}",
                         SOURCE_SEQUENCE_INVALID,
@@ -543,114 +668,165 @@ impl OrderedConversationPersistence {
                 .sessions
                 .get(agent_session_id)
                 .map_or(0, |session| session.pending_records);
-            if state.pending_bytes.saturating_add(charged_bytes) > GLOBAL_PENDING_BYTES {
+            let byte_saturated =
+                state.pending_bytes.saturating_add(charged_bytes) > GLOBAL_PENDING_BYTES;
+            let record_saturated = session_pending >= PER_SESSION_PENDING_RECORDS
+                || state.pending_records >= GLOBAL_PENDING_RECORDS;
+            if !state.barrier_active && !byte_saturated && !record_saturated {
+                break;
+            }
+
+            let code = if byte_saturated {
+                WRITER_BYTES_SATURATED
+            } else {
+                WRITER_QUEUE_SATURATED
+            };
+            if saturation_code.is_none() {
+                saturation_code = Some(code);
                 log::warn!(
-                    "[conversation-persistence] admission saturated code={} pending_records={} pending_bytes={}",
-                    WRITER_BYTES_SATURATED,
+                    "[conversation-persistence] admission backpressure code={} pending_records={} pending_bytes={}",
+                    code,
                     state.pending_records,
                     state.pending_bytes
                 );
+            }
+            let now = StdInstant::now();
+            if now >= deadline {
                 return Err(persistence_error(
-                    WRITER_BYTES_SATURATED,
+                    code,
                     "ordered_submit",
-                    format!(
-                        "serialized record bytes {charged_bytes} exceed remaining global byte budget {}",
-                        GLOBAL_PENDING_BYTES.saturating_sub(state.pending_bytes)
-                    ),
+                    "ordered persistence capacity did not drain before the retry deadline",
                 ));
             }
-            if session_pending >= PER_SESSION_PENDING_RECORDS
-                || state.pending_records >= GLOBAL_PENDING_RECORDS
-            {
-                if !saturation_logged {
-                    log::warn!(
-                        "[conversation-persistence] admission saturated code={} pending_records={} pending_bytes={}",
-                        WRITER_QUEUE_SATURATED,
-                        state.pending_records,
-                        state.pending_bytes
-                    );
-                    saturation_logged = true;
-                }
-                self.shared.capacity_available.wait(&mut state);
-                continue;
+            let timed_out = shared.capacity_available.wait_for(&mut state, deadline - now);
+            if timed_out.timed_out() {
+                return Err(persistence_error(
+                    code,
+                    "ordered_submit",
+                    "ordered persistence capacity did not drain before the retry deadline",
+                ));
             }
+        }
 
-            let previous_frontier = state
+        let previous_frontier = state
+            .sessions
+            .get(agent_session_id)
+            .map_or(0, |session| session.accepted_frontier);
+        let newly_created = !state.sessions.contains_key(agent_session_id);
+        state.pending_records += 1;
+        state.pending_bytes += charged_bytes;
+        state.max_pending_records = state.max_pending_records.max(state.pending_records);
+        state.max_pending_bytes = state.max_pending_bytes.max(state.pending_bytes);
+        let session_pending_after = {
+            let session = state
+                .sessions
+                .entry(agent_session_id.to_string())
+                .or_insert(SessionState {
+                    conversation_id,
+                    shard,
+                    pending_records: 0,
+                    pending_bytes: 0,
+                    accepted_frontier: 0,
+                    persisted_frontier: source_seq.saturating_sub(1),
+                    last_error_code: None,
+                });
+            session.pending_records += 1;
+            session.pending_bytes += charged_bytes;
+            session.accepted_frontier = source_seq;
+            session.pending_records
+        };
+        state.max_per_session_pending_records = state
+            .max_per_session_pending_records
+            .max(session_pending_after);
+
+        let completion = Arc::new(TicketCompletion::default());
+        let permit = AdmissionPermit {
+            shared: Arc::clone(shared),
+            session_key: agent_session_id.to_string(),
+            source_seq,
+            charged_bytes,
+            completion: Arc::clone(&completion),
+            released: false,
+        };
+        let command = WorkerCommand::Record(RecordCommand {
+            agent_session_id: agent_session_id.to_string(),
+            source_seq,
+            event_type: event_type.to_string(),
+            payload,
+            permit,
+        });
+        match self.core.shards[shard].sender.try_send(command) {
+            Ok(()) => Ok(OrderedPersistenceTicket {
+                shared: Arc::clone(shared),
+                agent_session_id: agent_session_id.to_string(),
+                source_seq,
+                completion,
+            }),
+            Err(send_error) => {
+                let (mut command, code, detail) = match send_error {
+                    mpsc::error::TrySendError::Full(command) => (
+                        command,
+                        WRITER_QUEUE_SATURATED,
+                        "ordered shard queue is saturated",
+                    ),
+                    mpsc::error::TrySendError::Closed(command) => (
+                        command,
+                        WRITER_QUEUE_CLOSED,
+                        "ordered shard queue is closed",
+                    ),
+                };
+                disarm_record_command(&mut command);
+                rollback_admission(
+                    &mut state,
+                    agent_session_id,
+                    previous_frontier,
+                    charged_bytes,
+                    newly_created,
+                );
+                shared.capacity_available.notify_all();
+                log::error!(
+                    "[conversation-persistence] enqueue failed code={} pending_records={} pending_bytes={}",
+                    code,
+                    state.pending_records,
+                    state.pending_bytes
+                );
+                Err(persistence_error(code, "ordered_submit", detail))
+            }
+        }
+    }
+
+    /// Wait for admitted work for one session, then remove its idle or errored frontier/health.
+    /// Canonical Conversation JSON/JSONL is never touched. Repeated retirement is a success no-op.
+    pub fn retire_session(
+        &self,
+        agent_session_id: &str,
+    ) -> Result<(), ConversationPersistenceError> {
+        let deadline = StdInstant::now() + self.drain_timeout;
+        let shared = &self.core.shared;
+        let mut state = shared.state.lock();
+        loop {
+            let pending = state
                 .sessions
                 .get(agent_session_id)
-                .map_or(0, |session| session.accepted_frontier);
-            let newly_created = !state.sessions.contains_key(agent_session_id);
-            state.pending_records += 1;
-            state.pending_bytes += charged_bytes;
-            state.max_pending_records = state.max_pending_records.max(state.pending_records);
-            state.max_pending_bytes = state.max_pending_bytes.max(state.pending_bytes);
-            let session_pending_after = {
-                let session = state
-                    .sessions
-                    .entry(agent_session_id.to_string())
-                    .or_insert(SessionState {
-                        conversation_id,
-                        shard,
-                        pending_records: 0,
-                        pending_bytes: 0,
-                        accepted_frontier: 0,
-                        persisted_frontier: 0,
-                        last_error_code: None,
-                    });
-                session.pending_records += 1;
-                session.pending_bytes += charged_bytes;
-                session.accepted_frontier = source_seq;
-                session.pending_records
-            };
-            state.max_per_session_pending_records = state
-                .max_per_session_pending_records
-                .max(session_pending_after);
-
-            let permit = AdmissionPermit {
-                shared: Arc::clone(&self.shared),
-                session_key: agent_session_id.to_string(),
-                source_seq,
-                charged_bytes,
-                released: false,
-            };
-            let command = WorkerCommand::Record(RecordCommand {
-                agent_session_id: agent_session_id.to_string(),
-                event_type: event_type.to_string(),
-                payload,
-                permit,
-            });
-            match self.shards[shard].sender.try_send(command) {
-                Ok(()) => return Ok(()),
-                Err(send_error) => {
-                    let (mut command, code, detail) = match send_error {
-                        mpsc::error::TrySendError::Full(command) => (
-                            command,
-                            WRITER_QUEUE_SATURATED,
-                            "ordered shard queue is saturated",
-                        ),
-                        mpsc::error::TrySendError::Closed(command) => (
-                            command,
-                            WRITER_QUEUE_CLOSED,
-                            "ordered shard queue is closed",
-                        ),
-                    };
-                    disarm_record_command(&mut command);
-                    rollback_admission(
-                        &mut state,
-                        agent_session_id,
-                        previous_frontier,
-                        charged_bytes,
-                        newly_created,
-                    );
-                    self.shared.capacity_available.notify_all();
-                    log::error!(
-                        "[conversation-persistence] enqueue failed code={} pending_records={} pending_bytes={}",
-                        code,
-                        state.pending_records,
-                        state.pending_bytes
-                    );
-                    return Err(persistence_error(code, "ordered_submit", detail));
-                }
+                .map_or(0, |session| session.pending_records);
+            if pending == 0 {
+                state.sessions.remove(agent_session_id);
+                shared.capacity_available.notify_all();
+                return Ok(());
+            }
+            let now = StdInstant::now();
+            if now >= deadline {
+                return Err(deadline_error(
+                    "ordered_retire_session",
+                    "timed out waiting for admitted session work",
+                ));
+            }
+            let timed_out = shared.capacity_available.wait_for(&mut state, deadline - now);
+            if timed_out.timed_out() {
+                return Err(deadline_error(
+                    "ordered_retire_session",
+                    "timed out waiting for admitted session work",
+                ));
             }
         }
     }
@@ -661,6 +837,7 @@ impl OrderedConversationPersistence {
         agent_session_id: &str,
     ) -> Result<Option<OrderedPersistenceHealth>, ConversationPersistenceError> {
         let conversation_id = self
+            .core
             .shared
             .target
             .resolve(agent_session_id)
@@ -671,7 +848,7 @@ impl OrderedConversationPersistence {
                     "opaque agent session id has no canonical Conversation binding",
                 )
             })?;
-        let state = self.shared.state.lock();
+        let state = self.core.shared.state.lock();
         Ok(state.sessions.get(agent_session_id).and_then(|session| {
             (session.conversation_id == conversation_id).then_some(OrderedPersistenceHealth {
                 conversation_id,
@@ -680,8 +857,13 @@ impl OrderedConversationPersistence {
                 last_accepted_source_seq: session.accepted_frontier,
                 last_persisted_source_seq: session.persisted_frontier,
                 last_error_code: session.last_error_code,
-                running: !self.shared.shutting_down.load(Ordering::Acquire)
-                    && self.shared.active_writer_tasks.load(Ordering::Acquire) > 0,
+                running: !self.core.shared.shutting_down.load(Ordering::Acquire)
+                    && self
+                        .core
+                        .shared
+                        .active_writer_tasks
+                        .load(Ordering::Acquire)
+                        > 0,
             })
         }))
     }
@@ -689,19 +871,22 @@ impl OrderedConversationPersistence {
     /// Number of retained per-session frontier/circuit entries.
     #[must_use]
     pub fn retained_worker_count(&self) -> usize {
-        self.shared.state.lock().sessions.len()
+        self.core.shared.state.lock().sessions.len()
     }
 
     /// Number of fixed shared Tokio writer tasks that have not exited.
     #[must_use]
     pub fn active_worker_count(&self) -> usize {
-        self.shared.active_writer_tasks.load(Ordering::Acquire)
+        self.core
+            .shared
+            .active_writer_tasks
+            .load(Ordering::Acquire)
     }
 
     /// Secret-safe current and high-water resource accounting.
     #[must_use]
     pub fn metrics(&self) -> OrderedPersistenceMetrics {
-        self.shared.metrics()
+        self.core.shared.metrics()
     }
 
     /// Flush using the default single absolute deadline.
@@ -716,7 +901,7 @@ impl OrderedConversationPersistence {
         deadline: Instant,
     ) -> Result<(), ConversationPersistenceError> {
         let started = StdInstant::now();
-        let lifecycle_guard = tokio::time::timeout_at(deadline, self.lifecycle_lock.lock())
+        let lifecycle_guard = tokio::time::timeout_at(deadline, self.core.lifecycle_lock.lock())
             .await
             .map_err(|_| deadline_error("ordered_flush_all", "timed out acquiring flush gate"))?;
         let result = self.flush_until_locked(deadline).await;
@@ -737,17 +922,15 @@ impl OrderedConversationPersistence {
         deadline: Instant,
     ) -> Result<(), ConversationPersistenceError> {
         let started = StdInstant::now();
-        let lifecycle_guard = tokio::time::timeout_at(deadline, self.lifecycle_lock.lock())
+        let lifecycle_guard = tokio::time::timeout_at(deadline, self.core.lifecycle_lock.lock())
             .await
             .map_err(|_| deadline_error("ordered_shutdown", "timed out acquiring shutdown gate"))?;
-        self.shared.shutting_down.store(true, Ordering::Release);
-        self.shared.capacity_available.notify_all();
+        self.core.shared.shutting_down.store(true, Ordering::Release);
+        self.core.shared.capacity_available.notify_all();
 
         let mut first_error = self.flush_until_locked(deadline).await.err();
-        for shard in &self.shards {
-            match tokio::time::timeout_at(deadline, shard.sender.send(WorkerCommand::Shutdown))
-                .await
-            {
+        for shard in &self.core.shards {
+            match tokio::time::timeout_at(deadline, shard.sender.send(WorkerCommand::Shutdown)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => {
                     first_error.get_or_insert_with(|| {
@@ -769,7 +952,7 @@ impl OrderedConversationPersistence {
             }
         }
 
-        for shard in &self.shards {
+        for shard in &self.core.shards {
             let Some(mut handle) = shard.join_handle.lock().take() else {
                 continue;
             };
@@ -806,11 +989,11 @@ impl OrderedConversationPersistence {
         deadline: Instant,
     ) -> Result<(), ConversationPersistenceError> {
         let (mut submission_pause, targets_by_shard) =
-            SubmissionPause::begin(Arc::clone(&self.shared));
+            SubmissionPause::begin(Arc::clone(&self.core.shared));
         let mut acknowledgements = Vec::with_capacity(WRITER_SHARDS);
         let mut first_error = None;
 
-        for (shard, targets) in self.shards.iter().zip(targets_by_shard) {
+        for (shard, targets) in self.core.shards.iter().zip(targets_by_shard) {
             let (reply, receiver) = oneshot::channel();
             let command = WorkerCommand::Barrier { targets, reply };
             match tokio::time::timeout_at(deadline, shard.sender.send(command)).await {
@@ -872,9 +1055,9 @@ impl OrderedConversationPersistence {
             }
         }
 
-        match tokio::time::timeout_at(deadline, self.shared.target.flush()).await {
+        match tokio::time::timeout_at(deadline, self.core.shared.target.flush()).await {
             Ok(Ok(())) => {
-                self.shared.reap_observed(&observed);
+                self.core.shared.reap_observed(&observed);
             }
             Ok(Err(error)) => {
                 first_error.get_or_insert_with(|| {
@@ -906,6 +1089,7 @@ impl OrderedConversationPersistence {
     ) {
         let metrics = self.metrics();
         let frontier = self
+            .core
             .shared
             .state
             .lock()
@@ -939,28 +1123,45 @@ impl OrderedConversationPersistence {
     }
 }
 
-impl Drop for OrderedConversationPersistence {
-    fn drop(&mut self) {
-        self.shared.shutting_down.store(true, Ordering::Release);
-        self.shared.state.lock().barrier_active = false;
-        self.shared.capacity_available.notify_all();
-        for shard in &self.shards {
-            let _ = shard.sender.try_send(WorkerCommand::Shutdown);
-            if let Some(handle) = shard.join_handle.lock().take() {
-                handle.abort();
-            }
-        }
-        let metrics = self.metrics();
-        if metrics.pending_records > 0 {
-            log::error!(
-                "[conversation-persistence] drop aborted pending work code={} workers={} pending_records={} pending_bytes={}",
-                WRITER_QUEUE_CLOSED,
-                metrics.active_writer_tasks,
-                metrics.pending_records,
-                metrics.pending_bytes
-            );
-        }
+fn build_core(target: Arc<dyn PersistenceTarget>) -> Arc<OrderedPersistenceCore> {
+    // Keep the module-private pre-ticket compatibility symbol referenced while ensuring every
+    // production append above uses the explicit source cursor lane.
+    let _sealed_compatibility_symbol = ConversationPersistenceAdapter::append_acp_event;
+    let shared = Arc::new(CoordinatorShared {
+        target,
+        state: Mutex::new(CoordinatorState::default()),
+        capacity_available: Condvar::new(),
+        shutting_down: AtomicBool::new(false),
+        active_writer_tasks: AtomicUsize::new(0),
+    });
+    let mut shards = Vec::with_capacity(WRITER_SHARDS);
+    let runtime = coordinator_runtime_handle();
+    for shard_index in 0..WRITER_SHARDS {
+        let (sender, receiver) = mpsc::channel(SHARD_CHANNEL_CAPACITY);
+        shared.active_writer_tasks.fetch_add(1, Ordering::AcqRel);
+        let guard = WorkerTaskGuard {
+            shared: Arc::clone(&shared),
+        };
+        let join_handle = runtime.spawn(run_shard(
+            shard_index,
+            receiver,
+            Arc::clone(&shared),
+            guard,
+        ));
+        shards.push(ShardControl {
+            sender,
+            join_handle: Mutex::new(Some(join_handle)),
+        });
     }
+    log::info!(
+        "[conversation-persistence] coordinator ready workers={} pending_records=0 pending_bytes=0 frontier=0 elapsed_ms=0",
+        WRITER_SHARDS
+    );
+    Arc::new(OrderedPersistenceCore {
+        shared,
+        shards,
+        lifecycle_lock: tokio::sync::Mutex::new(()),
+    })
 }
 
 async fn run_shard(
@@ -974,6 +1175,7 @@ async fn run_shard(
             WorkerCommand::Record(record) => {
                 let RecordCommand {
                     agent_session_id,
+                    source_seq,
                     event_type,
                     payload,
                     permit,
@@ -984,10 +1186,10 @@ async fn run_shard(
                 }
                 match shared
                     .target
-                    .append(&agent_session_id, &event_type, payload)
+                    .append(&agent_session_id, source_seq, &event_type, payload)
                     .await
                 {
-                    Ok(_) => permit.complete(Ok(())),
+                    Ok(canonical_seq) => permit.complete(Ok(canonical_seq)),
                     Err(error) => {
                         let code = error.code;
                         permit.complete(Err(code));
@@ -1011,8 +1213,23 @@ async fn run_shard(
 }
 
 fn coordinator_runtime_handle() -> tokio::runtime::Handle {
-    tokio::runtime::Handle::try_current()
-        .unwrap_or_else(|_| tauri::async_runtime::handle().inner().clone())
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(WRITER_SHARDS)
+                .thread_name("conversation-writer")
+                .enable_all()
+                .build()
+                .expect("conversation writer runtime")
+        })
+        .handle()
+        .clone()
+}
+
+fn adapter_coordinator_registry() -> &'static Mutex<HashMap<usize, Weak<OrderedPersistenceCore>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<OrderedPersistenceCore>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn shard_for(agent_session_id: &str) -> usize {
@@ -1070,6 +1287,15 @@ fn rollback_admission(
     {
         state.sessions.remove(session_key);
     }
+}
+
+fn completion_error(code: &'static str) -> ConversationPersistenceError {
+    let operation = if code == CONVERSATION_PERSISTENCE_COMMIT_INDETERMINATE {
+        "ordered_ticket_wait"
+    } else {
+        "ordered_append"
+    };
+    persistence_error(code, operation, "canonical Conversation append did not commit")
 }
 
 fn deadline_error(operation: &'static str, detail: &'static str) -> ConversationPersistenceError {
@@ -1150,6 +1376,7 @@ mod tests {
         fn append<'a>(
             &'a self,
             agent_session_id: &'a str,
+            source_seq: u64,
             event_type: &'a str,
             payload: Value,
         ) -> AppendFuture<'a> {
@@ -1165,14 +1392,25 @@ mod tests {
                         "injected sensitive detail",
                     ));
                 }
-                let source_seq = payload["sourceSeq"].as_u64().unwrap();
                 self.records
                     .lock()
                     .entry(agent_session_id.to_string())
                     .or_default()
                     .push((source_seq, event_type.to_string(), payload));
-                Ok(count as u64)
+                Ok(source_seq)
             })
+        }
+
+        fn committed_seq(
+            &self,
+            agent_session_id: &str,
+        ) -> std::result::Result<u64, ConversationPersistenceError> {
+            Ok(self
+                .records
+                .lock()
+                .get(agent_session_id)
+                .and_then(|records| records.last())
+                .map_or(0, |record| record.0))
         }
 
         fn flush(&self) -> FlushFuture<'_> {
@@ -1182,6 +1420,22 @@ mod tests {
 
     fn ordered(target: Arc<FakeTarget>) -> OrderedConversationPersistence {
         OrderedConversationPersistence::with_target(target, Duration::from_secs(3))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn per_record_ticket_returns_the_committed_canonical_cursor() {
+        let target = Arc::new(FakeTarget::with_sessions(1));
+        let persistence = ordered(Arc::clone(&target));
+        let ticket = persistence
+            .submit(
+                "opaque-0",
+                1,
+                "message_chunk",
+                serde_json::json!({"body":"ok"}),
+            )
+            .unwrap();
+        assert_eq!(ticket.committed().await.unwrap(), 1);
+        persistence.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1306,7 +1560,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unmapped_and_byte_saturated_records_fail_before_admission() {
-        let target = Arc::new(FakeTarget::stalled(2));
+        let target = Arc::new(FakeTarget::with_sessions(1));
         let persistence = ordered(Arc::clone(&target));
         let baseline = persistence.metrics();
 
@@ -1323,78 +1577,78 @@ mod tests {
         assert!(!unmapped.to_string().contains("never expose"));
         assert_eq!(persistence.metrics(), baseline);
 
-        let first_blob = "a".repeat(8 * 1024 * 1024);
-        persistence
+        let oversized = persistence
             .submit(
                 "opaque-0",
                 1,
                 "message_chunk",
-                serde_json::json!({"sourceSeq": 1, "body": first_blob}),
+                serde_json::json!({"body": "x".repeat(GLOBAL_PENDING_BYTES + 1)}),
             )
-            .unwrap();
-        let after_first = persistence.metrics();
-        let second_blob = "b".repeat(9 * 1024 * 1024);
-        let saturated = persistence
+            .unwrap_err();
+        assert_eq!(oversized.code, WRITER_RECORD_TOO_LARGE);
+        assert_eq!(persistence.metrics(), baseline);
+        persistence.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retryable_global_byte_pressure_waits_for_drain_then_succeeds() {
+        let target = Arc::new(FakeTarget::stalled(1));
+        let persistence = Arc::new(ordered(Arc::clone(&target)));
+        let first = persistence
             .submit(
-                "opaque-1",
+                "opaque-0",
                 1,
                 "message_chunk",
-                serde_json::json!({"sourceSeq": 1, "body": second_blob, "credential": "never expose"}),
+                serde_json::json!({"body":"a".repeat(8 * 1024 * 1024)}),
             )
-            .unwrap_err();
-        assert_eq!(saturated.code, WRITER_BYTES_SATURATED);
-        assert!(!saturated.to_string().contains("credential"));
-        assert!(!saturated.to_string().contains("never expose"));
-        assert_eq!(persistence.metrics(), after_first);
-
-        target.release();
-        persistence.flush_all().await.unwrap();
-        persistence.shutdown().await.unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn oversized_record_is_rejected_without_allocating_session_state() {
-        let target = Arc::new(FakeTarget::with_sessions(1));
-        let persistence = ordered(Arc::clone(&target));
-        let payload = serde_json::json!({
-            "sourceSeq": 1,
-            "body": "x".repeat(GLOBAL_PENDING_BYTES + 1),
+            .unwrap();
+        let second_persistence = Arc::clone(&persistence);
+        let second = tokio::task::spawn_blocking(move || {
+            second_persistence.submit(
+                "opaque-0",
+                2,
+                "message_chunk",
+                serde_json::json!({"body":"b".repeat(8 * 1024 * 1024)}),
+            )
         });
-        let error = persistence
-            .submit("opaque-0", 1, "message_chunk", payload)
-            .unwrap_err();
-        assert_eq!(error.code, WRITER_RECORD_TOO_LARGE);
-        let metrics = persistence.metrics();
-        assert_eq!(metrics.pending_records, 0);
-        assert_eq!(metrics.pending_bytes, 0);
-        assert_eq!(metrics.retained_sessions, 0);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!second.is_finished());
+        target.release();
+        assert_eq!(first.committed().await.unwrap(), 1);
+        let second = second.await.unwrap().unwrap();
+        assert_eq!(second.committed().await.unwrap(), 2);
+        persistence.flush_all().await.unwrap();
+        assert_eq!(persistence.metrics().pending_records, 0);
+        assert!(persistence.health("opaque-0").unwrap().is_none());
         persistence.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn circuit_failure_receipts_remain_secret_safe() {
+    async fn circuit_failure_receipts_remain_secret_safe_and_are_retirable() {
         let target = Arc::new(FakeTarget {
             fail_after: Some(1),
             ..FakeTarget::with_sessions(1)
         });
         let persistence = ordered(Arc::clone(&target));
-        for source_seq in 1..=2 {
-            persistence
-                .submit(
-                    "opaque-0",
-                    source_seq,
-                    "message_chunk",
-                    serde_json::json!({
-                        "sourceSeq": source_seq,
-                        "prompt": "do-not-log",
-                        "terminalIo": "do-not-log",
-                        "path": "/sensitive/path"
-                    }),
-                )
-                .unwrap();
-        }
-        let error = persistence.flush_all().await.unwrap_err();
-        assert_eq!(error.code, WRITER_UNHEALTHY);
+        let first = persistence
+            .submit(
+                "opaque-0",
+                1,
+                "message_chunk",
+                serde_json::json!({"prompt":"do-not-log"}),
+            )
+            .unwrap();
+        let second = persistence
+            .submit(
+                "opaque-0",
+                2,
+                "message_chunk",
+                serde_json::json!({"terminalIo":"do-not-log","path":"/sensitive/path"}),
+            )
+            .unwrap();
+        assert_eq!(first.committed().await.unwrap(), 1);
+        let error = second.committed().await.unwrap_err();
+        assert_eq!(error.code, "CONVERSATION_EVENT_APPEND_FAILED");
         for forbidden in ["do-not-log", "opaque-0", "/sensitive/path"] {
             assert!(!error.to_string().contains(forbidden));
         }
@@ -1403,10 +1657,9 @@ mod tests {
             health.last_error_code,
             Some("CONVERSATION_EVENT_APPEND_FAILED")
         );
-        assert_eq!(health.last_accepted_source_seq, 2);
-        assert_eq!(health.last_persisted_source_seq, 1);
-        assert_eq!(health.pending_count, 0);
-        assert!(persistence.shutdown().await.is_err());
+        persistence.retire_session("opaque-0").unwrap();
+        assert!(persistence.health("opaque-0").unwrap().is_none());
+        persistence.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1437,6 +1690,8 @@ mod tests {
         assert!(persistence.flush_all().await.is_err());
         assert_eq!(target.append_count.load(Ordering::Acquire), 1);
         assert_eq!(persistence.retained_worker_count(), 1);
-        assert!(persistence.shutdown().await.is_err());
+        persistence.retire_session("opaque-0").unwrap();
+        assert_eq!(persistence.retained_worker_count(), 0);
+        persistence.shutdown().await.unwrap();
     }
 }

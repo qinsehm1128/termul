@@ -148,7 +148,7 @@ describe('RemoteAccessPopover', () => {
     expect(await screen.findByText('Copied')).toBeDefined()
   })
 
-  it('removes the stale access URL on stop and exposes only the rotated URL after restart', async () => {
+  it('renders a newly generated local Desktop access URL and QR after host generation starts', async () => {
     vi.mocked(useRemoteStatus).mockReturnValue(RUNNING)
     stopMock.mockResolvedValueOnce({ success: true, data: STOPPED })
     startMock.mockResolvedValueOnce({ success: true, data: RUNNING_AGAIN })
@@ -189,6 +189,13 @@ describe('RemoteAccessPopover', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Copy tunnel link' }))
     await waitFor(() => expect(clipboardWrite).toHaveBeenLastCalledWith(RUNNING_AGAIN.accessUrl))
     expect(clipboardWrite).not.toHaveBeenCalledWith(RUNNING.accessUrl)
+
+    const revokedPeerFrame = {
+      type: 'reauthentication_required',
+      payload: { code: 'REAUTHENTICATION_REQUIRED' }
+    }
+    expect(JSON.stringify(revokedPeerFrame)).not.toContain(NEXT_RAW_CREDENTIAL)
+    expect(rotatedQr.getAttribute('data-value')).toBe(RUNNING_AGAIN.accessUrl)
   })
 
   it('does not fall back to an uncredentialed tunnel URL when accessUrl is explicitly absent', async () => {

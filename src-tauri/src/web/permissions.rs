@@ -1139,6 +1139,15 @@ pub enum TurnClaim {
     Busy,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnWatermarkStats {
+    pub completed_sessions: usize,
+    pub completed_turns: usize,
+    pub in_flight_sessions: usize,
+    pub seen_sessions: usize,
+    pub seen_turns: usize,
+}
+
 pub struct TurnWatermark {
     /// `session_id → completed turn ids` reconstructed from durable history and
     /// updated on live completion.
@@ -1258,7 +1267,22 @@ impl TurnWatermark {
             .is_some_and(|ids| ids.contains(turn_id))
     }
 
-    /// Forget a session's watermark state (on explicit session close).
+    /// Secret-safe bounded-state counters used by relay retirement tests and diagnostics.
+    #[must_use]
+    pub fn stats(&self) -> TurnWatermarkStats {
+        let completed = self.completed.lock();
+        let in_flight = self.in_flight.lock();
+        let seen = self.seen.lock();
+        TurnWatermarkStats {
+            completed_sessions: completed.len(),
+            completed_turns: completed.values().map(std::collections::HashSet::len).sum(),
+            in_flight_sessions: in_flight.len(),
+            seen_sessions: seen.len(),
+            seen_turns: seen.values().map(std::collections::HashSet::len).sum(),
+        }
+    }
+
+    /// Forget a session's watermark/claim state. Repeated retirement is a no-op.
     pub fn forget_session(&self, session_id: &str) {
         self.completed.lock().remove(session_id);
         self.in_flight.lock().remove(session_id);
@@ -1945,10 +1969,16 @@ mod tests {
     fn turn_watermark_forgets_session_state() {
         let wm = TurnWatermark::new();
         wm.mark_seen("sess-1", "turn-a");
+        assert_eq!(wm.claim_turn("sess-1", Some("turn-b")), TurnClaim::Claimed);
         wm.record_completed("sess-1", "turn-a");
+        let before = wm.stats();
+        assert_eq!(before.completed_sessions, 1);
+        assert_eq!(before.seen_sessions, 1);
+        assert_eq!(before.in_flight_sessions, 1);
         wm.forget_session("sess-1");
         assert!(wm.last_completed("sess-1").is_none());
         assert!(!wm.is_seen("sess-1", "turn-a"));
+        assert_eq!(wm.stats(), TurnWatermarkStats::default());
         // Forgetting a non-existent session is a no-op.
         wm.forget_session("never-existed");
     }

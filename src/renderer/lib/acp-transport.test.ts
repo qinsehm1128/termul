@@ -78,7 +78,7 @@ class FakeWebSocket {
   holdHistoryPages = false
   heldHistoryPageRequests: Array<{
     id: string
-    payload: { sessionId: string; afterSeq: number; limit: number }
+    payload: { sessionId: string; afterSeq: number; limit: number; targetLastSeq?: number }
   }> = []
   reopenOutcome: unknown = {
     modes: {
@@ -359,7 +359,12 @@ class FakeWebSocket {
       return
     }
     if (req.type === 'get_session_payload_page') {
-      const payload = req.payload as { sessionId?: string; afterSeq?: number; limit?: number }
+      const payload = req.payload as {
+        sessionId?: string
+        afterSeq?: number
+        limit?: number
+        targetLastSeq?: number
+      }
       if (
         !payload.sessionId ||
         !Number.isSafeInteger(payload.afterSeq) ||
@@ -389,7 +394,8 @@ class FakeWebSocket {
         payload: {
           sessionId: payload.sessionId,
           afterSeq: payload.afterSeq!,
-          limit: payload.limit!
+          limit: payload.limit!,
+          targetLastSeq: payload.targetLastSeq
         }
       }
       if (this.holdHistoryPages) {
@@ -433,7 +439,7 @@ class FakeWebSocket {
 
   replyHistoryPage(request: {
     id: string
-    payload: { sessionId: string; afterSeq: number; limit: number }
+    payload: { sessionId: string; afterSeq: number; limit: number; targetLastSeq?: number }
   }): void {
     const records = this.sessionHistoryRecords[request.payload.sessionId]
     if (!records) {
@@ -444,9 +450,18 @@ class FakeWebSocket {
       })
       return
     }
-    const targetLastSeq = records.at(-1)?.seq ?? 0
+    const currentLastSeq = records.at(-1)?.seq ?? 0
+    const targetLastSeq = request.payload.targetLastSeq ?? currentLastSeq
+    if (targetLastSeq > currentLastSeq) {
+      this.emitReply({
+        id: request.id,
+        ok: false,
+        err: { code: 'stale', message: 'pinned history frontier is unavailable' }
+      })
+      return
+    }
     const pageRecords = records
-      .filter((record) => record.seq > request.payload.afterSeq)
+      .filter((record) => record.seq > request.payload.afterSeq && record.seq <= targetLastSeq)
       .slice(0, request.payload.limit)
     const nextCursor = pageRecords.at(-1)?.seq ?? targetLastSeq
     const page: ConversationHistoryPageV1 = {
@@ -1074,6 +1089,16 @@ describe('WsAcpTransport', () => {
     }))
 
     const first = await transport.getSessionPayloadPage('s-paged', 0, 250)
+    sock.sessionHistoryRecords['s-paged'].push(
+      ...Array.from({ length: 50 }, (_, index) => ({
+        schemaVersion: 1 as const,
+        sessionId: 's-paged',
+        seq: 501 + index,
+        type: 'message_chunk',
+        recordedAt: 501 + index,
+        payload: { marker: 501 + index }
+      }))
+    )
     const second = await transport.getSessionPayloadPage('s-paged', first.nextCursor, 250)
 
     expect(first.records).toHaveLength(250)
@@ -1096,7 +1121,7 @@ describe('WsAcpTransport', () => {
       },
       {
         type: 'get_session_payload_page',
-        payload: { sessionId: 's-paged', afterSeq: 250, limit: 250 }
+        payload: { sessionId: 's-paged', afterSeq: 250, limit: 250, targetLastSeq: 500 }
       }
     ])
     expect(frames.some((frame) => frame.type === 'get_session_payload')).toBe(false)
@@ -1803,6 +1828,65 @@ describe('WsAcpTransport', () => {
 // Story 5.3 (AC3, T6) — transport-level reconnect listener.
 // Verifies the `setReconnectListener` callback fires `true` on
 // `scheduleReconnect` (WS drop) and `false` on `reconnect` success.
+describe('WsAcpTransport generation revocation', () => {
+  it('zeroizes revoked token cancels timers and enters terminal re-pair-required without reconnect', async () => {
+    vi.useFakeTimers()
+    class CountingSocket extends FakeWebSocket {
+      static instances = 0
+      constructor(url: string) {
+        super(url)
+        CountingSocket.instances += 1
+      }
+    }
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      token: 'revoked-secret-token',
+      WebSocketImpl: CountingSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const internals = transport as unknown as {
+      socket: FakeWebSocket | null
+      remoteAccessToken: string
+      reconnectTimer: ReturnType<typeof setTimeout> | null
+      heartbeatTimer: ReturnType<typeof setInterval> | null
+      reconnectAttempt: number
+      terminalState: unknown
+    }
+    const revokedSocket = internals.socket!
+    internals.reconnectTimer = setTimeout(() => undefined, 5_000)
+    internals.reconnectAttempt = 4
+    revokedSocket.emit({
+      sid: null,
+      seq: 0,
+      type: 'reauthentication_required',
+      payload: { code: 'REAUTHENTICATION_REQUIRED' }
+    })
+    await Promise.resolve()
+
+    expect(internals.remoteAccessToken).toBe('')
+    expect(internals.reconnectTimer).toBeNull()
+    expect(internals.heartbeatTimer).toBeNull()
+    expect(internals.reconnectAttempt).toBe(0)
+    expect(internals.socket).toBeNull()
+    expect(revokedSocket.readyState).toBe(FakeWebSocket.CLOSED)
+    expect(transport.getTerminalState()).toEqual({
+      code: 'REAUTHENTICATION_REQUIRED',
+      rePairRequired: true
+    })
+    expect(JSON.stringify(internals.terminalState)).not.toMatch(
+      /revoked-secret-token|access[_-]?url|bearer|pairing|qr/i
+    )
+    await expect(transport.connect()).rejects.toMatchObject({
+      code: 'REAUTHENTICATION_REQUIRED'
+    })
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(CountingSocket.instances).toBe(1)
+    expect(vi.getTimerCount()).toBe(0)
+    transport.dispose()
+    vi.useRealTimers()
+  })
+})
+
 describe('WsAcpTransport reconnect listener (Story 5.3)', () => {
   afterEach(() => {
     _resetAcpTransportForTests(null)

@@ -4242,10 +4242,11 @@ pub async fn acp_history_get(
     Ok(acp_history_get_inner(&session_id, host.inner()))
 }
 
-fn acp_history_get_page_inner(
+async fn acp_history_get_page_inner(
     session_id: &str,
     after_seq: u64,
     limit: usize,
+    target_last_seq: Option<u64>,
     host: &HostHistoryStore,
 ) -> IpcResult<crate::conversation::ConversationHistoryPageV1> {
     let Some(persistence) = &host.conversation else {
@@ -4254,13 +4255,17 @@ fn acp_history_get_page_inner(
             "CONVERSATION_SERVICE_UNAVAILABLE",
         );
     };
-    match persistence.history_page(session_id, after_seq, limit) {
+    match persistence
+        .history_page_blocking(session_id.to_string(), after_seq, limit, target_last_seq)
+        .await
+    {
         Ok(page) => {
             log::info!(
-                "[acp-history] page success session_id={} after_seq={} next_cursor={} limit={} count={} complete={}",
+                "[acp-history] page success session_id={} after_seq={} next_cursor={} target_last_seq={} limit={} count={} complete={}",
                 sanitize_log_field(session_id),
                 after_seq,
                 page.next_cursor,
+                page.target_last_seq,
                 limit,
                 page.records.len(),
                 page.complete
@@ -4269,9 +4274,10 @@ fn acp_history_get_page_inner(
         }
         Err(error) => {
             log::warn!(
-                "[acp-history] page rejected session_id={} after_seq={} limit={} code={}",
+                "[acp-history] page rejected session_id={} after_seq={} target_last_seq={} limit={} code={}",
                 sanitize_log_field(session_id),
                 after_seq,
+                target_last_seq.unwrap_or(0),
                 limit,
                 error.code
             );
@@ -4286,14 +4292,19 @@ pub async fn acp_history_get_page(
     session_id: String,
     after_seq: u64,
     limit: usize,
+    target_last_seq: Option<u64>,
     host: State<'_, HostHistoryStore>,
 ) -> Result<IpcResult<crate::conversation::ConversationHistoryPageV1>, String> {
-    Ok(acp_history_get_page_inner(
-        &session_id,
-        after_seq,
-        limit,
-        host.inner(),
-    ))
+    Ok(
+        acp_history_get_page_inner(
+            &session_id,
+            after_seq,
+            limit,
+            target_last_seq,
+            host.inner(),
+        )
+        .await,
+    )
 }
 
 /// Legacy write path (renderer wipe-migration only). Live sessions are authored
@@ -5290,23 +5301,95 @@ pub async fn conversation_replace_binding(
     .await
 }
 
+async fn retire_deleted_binding_if_updated(
+    relay: &crate::web::WsRelaySink,
+    current_session_id: Option<&str>,
+    outcome: &crate::conversation::ConversationLifecycleOutcome,
+) -> Result<(), String> {
+    if matches!(
+        outcome,
+        crate::conversation::ConversationLifecycleOutcome::Updated {
+            action: crate::conversation::ConversationLifecycleAction::DeleteConversation,
+            ..
+        }
+    ) {
+        if let Some(session_id) = current_session_id {
+            relay.retire_session(session_id).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn conversation_delete_with_retirement(
+    service: &crate::conversation::ConversationApplicationService,
+    relay: &crate::web::WsRelaySink,
+    conversation_id: crate::conversation::ConversationId,
+    expected_revision: u64,
+) -> IpcResult<crate::conversation::ConversationLifecycleOutcome> {
+    let current_session_id = match service
+        .writer()
+        .repository()
+        .current_binding(conversation_id)
+    {
+        Ok(binding) => binding.map(|binding| binding.agent_session_id),
+        Err(_) => {
+            return IpcResult::error(
+                "failed to resolve Conversation binding before delete",
+                "CONVERSATION_RECOVERY_REQUIRED",
+            )
+        }
+    };
+    match service
+        .delete_conversation(conversation_id, expected_revision)
+        .await
+    {
+        Ok(outcome) => {
+            if let Err(code) = retire_deleted_binding_if_updated(
+                relay,
+                current_session_id.as_deref(),
+                &outcome,
+            )
+            .await
+            {
+                log::error!(
+                    "[conversation-retirement] operation=tauri_delete code={} conversation_id={}",
+                    code,
+                    conversation_id
+                );
+                return IpcResult::error(
+                    "Conversation auxiliary retirement failed",
+                    "CONVERSATION_RETIREMENT_FAILED",
+                );
+            }
+            IpcResult::success(outcome)
+        }
+        Err(error) => conversation_application_failure(error),
+    }
+}
+
 #[tauri::command]
 pub async fn conversation_delete(
     app: AppHandle,
     conversation_id: String,
     expected_revision: u64,
     service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+    relay: State<'_, Arc<crate::web::WsRelaySink>>,
 ) -> Result<IpcResult<crate::conversation::ConversationLifecycleOutcome>, String> {
     let id = match parse_conversation_id(&conversation_id) {
         Ok(value) => value,
         Err(error) => return Ok(error),
     };
-    run_conversation_lifecycle_command(
-        &app,
-        conversation_id,
-        service.delete_conversation(id, expected_revision),
+    let outcome = conversation_delete_with_retirement(
+        service.inner(),
+        relay.inner(),
+        id,
+        expected_revision,
     )
-    .await
+    .await;
+    if outcome.success {
+        let _ = app.emit("conversation:lifecycle", outcome.data.as_ref());
+    }
+    Ok(outcome)
 }
 
 // ============================================================================
@@ -6011,7 +6094,7 @@ mod tests {
         let adapter = Arc::new(ConversationPersistenceAdapter::new(writer, reader));
         let host = HostHistoryStore::conversation(adapter, None);
 
-        let result = acp_history_get_page_inner("opaque/desktop-page", 17, 250, &host);
+        let result = acp_history_get_page_inner("opaque/desktop-page", 17, 250, None, &host).await;
         assert!(result.success, "page error: {:?}", result.error);
         let page = result.data.unwrap();
         assert_eq!(page.schema_version, 1);
@@ -6034,11 +6117,12 @@ mod tests {
 
         for invalid_limit in [0, 1_001] {
             let invalid =
-                acp_history_get_page_inner("opaque/desktop-page", 0, invalid_limit, &host);
+                acp_history_get_page_inner("opaque/desktop-page", 0, invalid_limit, None, &host).await;
             assert!(!invalid.success);
             assert_eq!(invalid.code.as_deref(), Some("VALIDATION_ERROR"));
         }
-        let invalid_cursor = acp_history_get_page_inner("opaque/desktop-page", 1_052, 17, &host);
+        let invalid_cursor =
+            acp_history_get_page_inner("opaque/desktop-page", 1_052, 17, None, &host).await;
         assert!(!invalid_cursor.success);
         assert_eq!(invalid_cursor.code.as_deref(), Some("VALIDATION_ERROR"));
 
@@ -6166,6 +6250,55 @@ mod tests {
                     .find(".shutdown_conversation_persistence_until(deadline)")
                     .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn tauri_conversation_delete_retires_on_success_and_retains_on_blocked_or_error() {
+        use crate::conversation::{
+            ConversationLifecycleAction, ConversationLifecycleErrorCode,
+            ConversationLifecycleOutcome, ConversationLifecycleState,
+        };
+
+        let relay = crate::web::WsRelaySink::new();
+        let conversation_id = crate::conversation::ConversationId::new_v4();
+        relay
+            .turn_watermark()
+            .mark_seen("tauri-delete", "turn-retained");
+        let blocked = ConversationLifecycleOutcome::Blocked {
+            action: ConversationLifecycleAction::DeleteConversation,
+            conversation_id,
+            revision: 7,
+            code: ConversationLifecycleErrorCode::ConversationLiveResources,
+            blockers: Vec::new(),
+        };
+        retire_deleted_binding_if_updated(&relay, Some("tauri-delete"), &blocked)
+            .await
+            .unwrap();
+        assert!(relay
+            .turn_watermark()
+            .is_seen("tauri-delete", "turn-retained"));
+        let simulated_error: Result<(), &str> = Err("delete failed");
+        assert!(simulated_error.is_err());
+        assert!(relay
+            .turn_watermark()
+            .is_seen("tauri-delete", "turn-retained"));
+
+        let updated = ConversationLifecycleOutcome::Updated {
+            action: ConversationLifecycleAction::DeleteConversation,
+            conversation_id,
+            previous_revision: 7,
+            revision: 8,
+            workspace_cwd: "/opaque/workspace".to_string(),
+            lifecycle_state: ConversationLifecycleState::Deleted,
+            current_binding: None,
+            previous_agent_session_id: Some("tauri-delete".to_string()),
+        };
+        retire_deleted_binding_if_updated(&relay, Some("tauri-delete"), &updated)
+            .await
+            .unwrap();
+        assert!(!relay
+            .turn_watermark()
+            .is_seen("tauri-delete", "turn-retained"));
     }
 
     #[test]

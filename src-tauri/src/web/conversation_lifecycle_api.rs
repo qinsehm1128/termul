@@ -132,10 +132,12 @@ pub async fn replace(
     respond(
         &state,
         conversation_id,
+        None,
         service
             .replace_binding(conversation_id, request.request, request.expected_revision)
             .await,
     )
+    .await
 }
 
 #[derive(Clone, Copy)]
@@ -169,6 +171,23 @@ async fn mutate_revision(
         Ok(service) => service,
         Err((code, detail)) => return failure(code, detail),
     };
+    let current_session_id = if matches!(mutation, Mutation::Delete) {
+        match service
+            .writer()
+            .repository()
+            .current_binding(conversation_id)
+        {
+            Ok(binding) => binding.map(|binding| binding.agent_session_id),
+            Err(_) => {
+                return failure(
+                    "CONVERSATION_RECOVERY_REQUIRED".to_string(),
+                    "failed to resolve Conversation binding before delete".to_string(),
+                )
+            }
+        }
+    } else {
+        None
+    };
     let result = match mutation {
         Mutation::Detach => {
             service
@@ -191,7 +210,7 @@ async fn mutate_revision(
                 .await
         }
     };
-    respond(&state, conversation_id, result)
+    respond(&state, conversation_id, current_session_id, result).await
 }
 
 fn application(
@@ -205,13 +224,36 @@ fn application(
     })
 }
 
-fn respond(
+async fn respond(
     state: &AppState,
     conversation_id: ConversationId,
+    current_session_id: Option<String>,
     result: crate::conversation::application::Result<ConversationLifecycleOutcome>,
 ) -> (StatusCode, Json<IpcBody<ConversationLifecycleOutcome>>) {
     match result {
         Ok(outcome) => {
+            if matches!(
+                outcome,
+                ConversationLifecycleOutcome::Updated {
+                    action: crate::conversation::ConversationLifecycleAction::DeleteConversation,
+                    ..
+                }
+            ) {
+                if let Some(session_id) = current_session_id {
+                    if let Err(code) = state.relay.retire_session(&session_id).await {
+                        warn!(
+                            target: "termul::web::conversation_lifecycle_api",
+                            conversation_id = %conversation_id,
+                            code,
+                            "Conversation delete committed but auxiliary retirement failed"
+                        );
+                        return failure(
+                            "CONVERSATION_RETIREMENT_FAILED".to_string(),
+                            "Conversation auxiliary retirement failed".to_string(),
+                        );
+                    }
+                }
+            }
             if let Err(error) = state.relay.emit(&AcpEvent {
                 sid: None,
                 type_: "conversation_lifecycle",

@@ -499,6 +499,11 @@ type Pending = {
 
 type EventListener = (payload: unknown) => void
 
+export type AcpTransportTerminalState = Readonly<{
+  code: 'REAUTHENTICATION_REQUIRED'
+  rePairRequired: true
+}>
+
 /**
  * Multiplexed ACP WS client.
  *
@@ -535,6 +540,8 @@ export class WsAcpTransport implements AcpTransport {
   private readonly pending = new Map<string, Pending>()
   /** Completion tails serialize bounded history requests independently per session. */
   private readonly historyPageRequests = new Map<string, Promise<void>>()
+  /** First-page canonical frontier pinned across every later page for that session. */
+  private readonly historyPageTargets = new Map<string, number>()
   private readonly listeners = new Map<string, Set<EventListener>>()
   /** Per-session last contiguous delivered seq. */
   private readonly lastSeq = new Map<string, number>()
@@ -548,7 +555,9 @@ export class WsAcpTransport implements AcpTransport {
   private reconnectPriorityProvider?: () => SessionId[]
   private readonly wsUrl: string
   private readonly webSocketCtor: typeof WebSocket
-  private readonly remoteAccessToken: string
+  private remoteAccessToken: string
+  private terminalState: AcpTransportTerminalState | null = null
+  private onTerminalStateChange?: (state: AcpTransportTerminalState) => void
   /**
    * Story 5.3 (AC3): transport-level reconnect listener. Fired `true` when
    * `scheduleReconnect` runs (WS drop detected) and `false` when `reconnect`
@@ -574,6 +583,14 @@ export class WsAcpTransport implements AcpTransport {
    */
   setReconnectListener(listener: (reconnecting: boolean) => void): void {
     this.onReconnectStateChange = listener
+  }
+
+  setTerminalStateListener(listener: (state: AcpTransportTerminalState) => void): void {
+    this.onTerminalStateChange = listener
+  }
+
+  getTerminalState(): AcpTransportTerminalState | null {
+    return this.terminalState
   }
 
   setRecoveryHandler(
@@ -611,6 +628,12 @@ export class WsAcpTransport implements AcpTransport {
   }
 
   async connect(): Promise<void> {
+    if (this.terminalState) {
+      throw new AcpTransportError(
+        this.terminalState.code,
+        runtimeT('chat', 'transport.rePairRequired', 'Remote access must be paired again')
+      )
+    }
     if (this.disposed) return
     this.attachVisibilityListeners()
     if (this.socket?.readyState === WebSocket.OPEN && this.authed) return
@@ -627,10 +650,7 @@ export class WsAcpTransport implements AcpTransport {
     this.disposed = true
     this.detachVisibilityListeners()
     this.clearHeartbeat()
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer)
-      this.reconnectTimer = null
-    }
+    this.clearReconnectTimer()
     for (const [, p] of this.pending) {
       if (p.timer) clearTimeout(p.timer)
       p.reject(
@@ -863,12 +883,28 @@ export class WsAcpTransport implements AcpTransport {
     const previous = this.historyPageRequests.get(sessionId)
     const request = (async () => {
       if (previous) await previous.catch(() => undefined)
-      const page = await this.request<ConversationHistoryPageV1>('get_session_payload_page', {
-        sessionId,
-        afterSeq,
-        limit
-      })
+      if (afterSeq === 0) this.historyPageTargets.delete(sessionId)
+      const targetLastSeq = this.historyPageTargets.get(sessionId)
+      const payload: {
+        sessionId: string
+        afterSeq: number
+        limit: number
+        targetLastSeq?: number
+      } = { sessionId, afterSeq, limit }
+      if (targetLastSeq != null) payload.targetLastSeq = targetLastSeq
+      const page = await this.request<ConversationHistoryPageV1>(
+        'get_session_payload_page',
+        payload
+      )
       assertConversationHistoryPage(page, { sessionId, afterSeq, limit })
+      if (targetLastSeq != null && page.targetLastSeq !== targetLastSeq) {
+        throw new AcpTransportError(
+          'stale',
+          runtimeT('chat', 'transport.historyFrontierChanged', 'History paging frontier changed')
+        )
+      }
+      if (page.complete) this.historyPageTargets.delete(sessionId)
+      else this.historyPageTargets.set(sessionId, page.targetLastSeq)
       return page
     })()
     const completion = request.then(
@@ -1221,6 +1257,46 @@ export class WsAcpTransport implements AcpTransport {
     })
   }
 
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+  }
+
+  private enterReauthenticationRequired(): void {
+    if (this.terminalState) return
+    this.terminalState = { code: 'REAUTHENTICATION_REQUIRED', rePairRequired: true }
+    this.remoteAccessToken = ''
+    remoteAccessCredential = null
+    remoteAccessCredentialConsumed = true
+    this.clearReconnectTimer()
+    this.clearHeartbeat()
+    this.detachVisibilityListeners()
+    this.resumeValidation = null
+    this.reconnectAttempt = 0
+    this.reconnecting = false
+    this.rejectAllPending(
+      'REAUTHENTICATION_REQUIRED',
+      runtimeT('chat', 'transport.rePairRequired', 'Remote access must be paired again')
+    )
+    const socket = this.socket
+    this.socket = null
+    this.authed = false
+    if (socket) {
+      socket.onclose = null
+      socket.onerror = null
+      socket.onmessage = null
+      try {
+        socket.close()
+      } catch {
+        // Already closed.
+      }
+    }
+    this.onReconnectStateChange?.(false)
+    this.onTerminalStateChange?.(this.terminalState)
+  }
+
   private rejectAllPending(code: string, message: string): void {
     for (const [, p] of this.pending) {
       if (p.timer) clearTimeout(p.timer)
@@ -1360,7 +1436,14 @@ export class WsAcpTransport implements AcpTransport {
    * `onReconnectStateChange` machinery runs unchanged.
    */
   private forceReconnect(reason: string): void {
-    if (this.disposed || this.connecting || this.reconnecting || this.reconnectTimer) return
+    if (
+      this.disposed ||
+      this.terminalState ||
+      this.connecting ||
+      this.reconnecting ||
+      this.reconnectTimer
+    )
+      return
     this.discardSocket(reason)
     this.scheduleReconnect()
   }
@@ -1428,7 +1511,7 @@ export class WsAcpTransport implements AcpTransport {
   }
 
   private scheduleReconnect(): void {
-    if (this.disposed || this.reconnectTimer) return
+    if (this.disposed || this.terminalState || this.reconnectTimer) return
     const delay = Math.min(RECONNECT_BASE_MS * 2 ** this.reconnectAttempt, RECONNECT_MAX_MS)
     this.reconnectAttempt += 1
     // Story 5.3 (AC3): fire the reconnect listener BEFORE setting the timer so
@@ -1446,6 +1529,7 @@ export class WsAcpTransport implements AcpTransport {
   }
 
   private async reconnect(): Promise<void> {
+    if (this.terminalState) return
     try {
       await this.connect()
       const prioritized = this.reconnectPriorityProvider?.() ?? []
@@ -1535,6 +1619,9 @@ export class WsAcpTransport implements AcpTransport {
   }
 
   private handleReply(reply: WsReply): void {
+    if (!reply.ok && String(reply.err.code) === 'REAUTHENTICATION_REQUIRED') {
+      this.enterReauthenticationRequired()
+    }
     const pending = this.pending.get(reply.id)
     if (!pending) return
     if (pending.timer) clearTimeout(pending.timer)
@@ -1547,6 +1634,11 @@ export class WsAcpTransport implements AcpTransport {
   }
 
   private async handleEvent(evt: WsEvent): Promise<void> {
+    if (String(evt.type) === 'reauthentication_required') {
+      this.enterReauthenticationRequired()
+      this.emitLocal('reauthentication_required', this.terminalState)
+      return
+    }
     if (evt.type === 'auth_required') {
       // Send the fragment-delivered credential directly (socket is already
       // open); do NOT call request()→connect() or we deadlock on the in-flight

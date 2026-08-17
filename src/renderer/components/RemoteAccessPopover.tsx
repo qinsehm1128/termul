@@ -33,13 +33,9 @@ export function RemoteAccessPopover(): React.JSX.Element {
   const [copiedUrl, setCopiedUrl] = useState(false)
 
   const isRunning = remoteStatus?.running ?? false
-  // Prefer the paired credentialed URL. The fallback supports an in-flight host rollout where
-  // tunnelUrl already contains that fragment; the localhost diagnostic `url` is never shared.
-  const accessUrl = remoteStatus
-    ? 'accessUrl' in remoteStatus
-      ? (remoteStatus.accessUrl ?? null)
-      : remoteStatus.tunnelUrl
-    : null
+  // Trusted local Desktop host state is the only credential source. Revoked WebSocket payloads
+  // are never accepted by this component, and an uncredentialed tunnel URL is never promoted.
+  const accessUrl = remoteStatus?.accessUrl ?? null
   // Track whether a tunnel URL was ever seen this session so the popover can
   // distinguish "Starting tunnel…" (never connected) from "Tunnel
   // disconnected" (was connected, now gone — the 3s status poll cleared it).

@@ -136,10 +136,14 @@ pub async fn acp_resume_session(
 pub async fn acp_close_session(
     manager: State<'_, Arc<AcpManager>>,
     pty: State<'_, Arc<crate::pty::PtyManager>>,
+    relay: State<'_, Arc<WsRelaySink>>,
     agent_id: AgentId,
     session_id: SessionId,
 ) -> Result<(), String> {
-    if let Some(conversation_id) = manager.conversation_id_for_current_session(&session_id.0) {
+    let retirement_id = session_id.0.clone();
+    let result = if let Some(conversation_id) =
+        manager.conversation_id_for_current_session(&session_id.0)
+    {
         let service = crate::conversation::ConversationLifecycleService::from_manager(
             manager.inner().clone(),
             pty.inner().clone(),
@@ -160,18 +164,34 @@ pub async fn acp_close_session(
             .map_err(|error| error.to_string())
     } else {
         manager.close_session(&agent_id, session_id).await
-    }
+    };
+    retire_after_success(result, relay.inner(), &retirement_id).await
 }
 
 #[tauri::command]
 pub async fn acp_dispose_ephemeral_session(
     manager: State<'_, Arc<AcpManager>>,
+    relay: State<'_, Arc<WsRelaySink>>,
     agent_id: AgentId,
     session_id: SessionId,
 ) -> Result<(), String> {
-    manager
+    let retirement_id = session_id.0.clone();
+    let result = manager
         .dispose_ephemeral_session(&agent_id, session_id)
+        .await;
+    retire_after_success(result, relay.inner(), &retirement_id).await
+}
+
+async fn retire_after_success(
+    result: Result<(), String>,
+    relay: &WsRelaySink,
+    session_id: &str,
+) -> Result<(), String> {
+    result?;
+    relay
+        .retire_session(session_id)
         .await
+        .map_err(|code| format!("CONVERSATION_RETIREMENT_FAILED:{code}"))
 }
 
 /// List sessions on an agent (requires `sessionCapabilities.list`).
@@ -781,5 +801,49 @@ mod tests {
 
         persistence.shutdown().await.unwrap();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn tauri_close_retires_on_success_and_retains_on_error() {
+        let relay = WsRelaySink::new();
+        relay.turn_watermark().mark_seen("tauri-close", "turn-1");
+        assert!(retire_after_success(
+            Err("close failed".to_string()),
+            &relay,
+            "tauri-close"
+        )
+        .await
+        .is_err());
+        assert!(relay.turn_watermark().is_seen("tauri-close", "turn-1"));
+
+        retire_after_success(Ok(()), &relay, "tauri-close")
+            .await
+            .unwrap();
+        assert!(!relay.turn_watermark().is_seen("tauri-close", "turn-1"));
+    }
+
+    #[tokio::test]
+    async fn tauri_ephemeral_dispose_retires_on_success_and_retains_on_error() {
+        let relay = WsRelaySink::new();
+        relay
+            .turn_watermark()
+            .mark_seen("tauri-ephemeral", "turn-1");
+        assert!(retire_after_success(
+            Err("dispose failed".to_string()),
+            &relay,
+            "tauri-ephemeral"
+        )
+        .await
+        .is_err());
+        assert!(relay
+            .turn_watermark()
+            .is_seen("tauri-ephemeral", "turn-1"));
+
+        retire_after_success(Ok(()), &relay, "tauri-ephemeral")
+            .await
+            .unwrap();
+        assert!(!relay
+            .turn_watermark()
+            .is_seen("tauri-ephemeral", "turn-1"));
     }
 }

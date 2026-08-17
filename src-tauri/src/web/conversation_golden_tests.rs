@@ -51,7 +51,7 @@ struct GoldenLifecycleProvider;
 
 impl ConversationAgentLifecycle for GoldenLifecycleProvider {
     fn owns_session<'a>(&'a self, _binding: &'a AgentSessionBinding) -> ProviderFuture<'a, bool> {
-        Box::pin(async { true })
+        Box::pin(async { false })
     }
 
     fn suspend<'a>(
@@ -276,6 +276,10 @@ fn app(state: AppState) -> axum::Router {
         .route(
             "/conversations/{conversationId}/lifecycle/detach",
             post(super::conversation_lifecycle_api::detach),
+        )
+        .route(
+            "/conversations/{conversationId}/lifecycle/delete",
+            post(super::conversation_lifecycle_api::delete),
         )
         .with_state(state)
         .layer(Extension(principal))
@@ -1283,6 +1287,58 @@ async fn aggregate_transport_golden_matrix() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn canonical_usage_and_plan_full_replacements_survive_cold_restart() {
+    let fixture = fixture_with_lifecycle().await;
+    let persistence = conversation_persistence(&fixture);
+    let relay = Arc::new(WsRelaySink::with_conversation_persistence(
+        32,
+        Arc::clone(&persistence),
+        None,
+    ));
+    relay
+        .emit(&AcpEvent {
+            sid: Some("opaque/golden/original".to_string()),
+            type_: "acp:usage_update",
+            payload: json!({"tokens":{"input":0,"output":0},"cost":null}),
+        })
+        .unwrap();
+    relay
+        .emit(&AcpEvent {
+            sid: Some("opaque/golden/original".to_string()),
+            type_: "acp:plan_update",
+            payload: json!({"entries":[]}),
+        })
+        .unwrap();
+    relay.shutdown_conversation_persistence().await.unwrap();
+    drop(relay);
+    drop(persistence);
+
+    let (restarted_repository, _) =
+        ConversationRepository::open(fixture.private_root.clone()).unwrap();
+    let restarted_writer = ConversationWriter::for_test(Arc::clone(&restarted_repository));
+    let restarted_reader = Arc::new(ConversationReader::new(
+        Arc::clone(&restarted_repository),
+        LegacyConversationReader::default(),
+        ReaderPrecedence::ConversationV2Only,
+    ));
+    let restarted = ConversationPersistenceAdapter::new(restarted_writer, restarted_reader);
+    let records = restarted
+        .replay_after("opaque/golden/original", 0)
+        .unwrap();
+    let usage = records
+        .iter()
+        .find(|record| record.type_ == "usage_update")
+        .unwrap();
+    let plan = records
+        .iter()
+        .find(|record| record.type_ == "plan_update")
+        .unwrap();
+    assert_eq!(usage.payload, json!({"tokens":{"input":0,"output":0},"cost":null}));
+    assert_eq!(plan.payload, json!({"entries":[]}));
+    assert!(usage.seq < plan.seq);
+}
+
 #[tokio::test]
 async fn lifecycle_transport_golden_matrix_uses_the_same_revisioned_outcome() {
     let conversation_id = ConversationId::parse(ID).unwrap();
@@ -1337,6 +1393,75 @@ async fn lifecycle_transport_golden_matrix_uses_the_same_revisioned_outcome() {
     assert_eq!(
         normalized_workspace(ws.payload.unwrap(), &ws_fixture.workspace_cwd),
         expected
+    );
+}
+
+#[tokio::test]
+async fn http_conversation_delete_retires_on_success_and_retains_on_blocked_or_error() {
+    let fixture = fixture_with_lifecycle().await;
+    let relay = Arc::clone(&fixture.state.relay);
+    relay
+        .turn_watermark()
+        .mark_seen("opaque/golden/original", "turn-retained");
+    let router = app(fixture.state.clone());
+
+    let conflict = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/conversations/{ID}/lifecycle/delete"))
+                .body(Body::from(json!({"expectedRevision":0}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(conflict.status(), axum::http::StatusCode::OK);
+    assert!(relay
+        .turn_watermark()
+        .is_seen("opaque/golden/original", "turn-retained"));
+
+    let conversation_id = ConversationId::parse(ID).unwrap();
+    let suspend_revision = fixture
+        .repository
+        .get_conversation(conversation_id)
+        .unwrap()
+        .last_seq;
+    fixture
+        .service
+        .suspend_binding(conversation_id, suspend_revision)
+        .await
+        .unwrap();
+    let revision = fixture
+        .repository
+        .get_conversation(conversation_id)
+        .unwrap()
+        .last_seq;
+    let deleted = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/conversations/{ID}/lifecycle/delete"))
+                .body(Body::from(
+                    json!({"expectedRevision":revision}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), axum::http::StatusCode::OK);
+    let deleted_body = response_json(deleted).await;
+    assert_eq!(deleted_body["data"]["status"], "updated", "{deleted_body}");
+    assert!(!relay
+        .turn_watermark()
+        .is_seen("opaque/golden/original", "turn-retained"), "{deleted_body}");
+    assert_eq!(
+        fixture
+            .repository
+            .get_conversation(ConversationId::parse(ID).unwrap())
+            .unwrap()
+            .lifecycle_state,
+        ConversationLifecycleState::Deleted
     );
 }
 
