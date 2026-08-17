@@ -23,15 +23,21 @@
 //! - Message `seq` = the run's first record seq; `timestamp` = the run's
 //!   first `recorded_at`; `streaming` is always `false` (restored transcripts
 //!   never shimmer).
-//! - Tool cards are intentionally NOT materialized: desktop history payloads
-//!   also persist only `ChatMessage[]` (`toolCalls` is a live-only store
-//!   slice), and the durable tool DTO whitelist stays untouched.
+//! - Tool calls are upserted by `toolCallId`; updates preserve the original
+//!   timeline `seq`/`timestamp`. The latest valid usage snapshot and plan replace
+//!   their prior values. These rules are identical across page boundaries.
+
+use std::fmt;
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::acp::session_persistence::{
     PersistedEventRecord, PersistedSessionStatus, SessionMetadata,
+};
+use crate::conversation::contracts::{
+    ConversationHistoryPageV1, ConversationHistoryRecordV1,
+    ConversationHistoryPageValidationError,
 };
 
 /// The renderer session-metadata shape (`SessionIndexEntry` in
@@ -74,143 +80,377 @@ pub struct MaterializedChatMessage {
     pub seq: u64,
 }
 
-/// The renderer `SessionPayload` shape served by `get_session_payload`.
+/// The renderer `SessionPayload` shape served by compatibility reads and incrementally assembled
+/// from bounded pages. Empty optional collections are omitted for byte compatibility with older
+/// payloads.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct MaterializedSessionPayload {
     pub metadata: SessionPayloadMetadata,
     pub messages: Vec<MaterializedChatMessage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_usage: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<Vec<Value>>,
 }
 
-/// Materialize the renderer-shaped payload for one session from its durable
-/// metadata + seq-sorted records. Pure: identical input → identical output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionPayloadAccumulatorError {
+    Page(ConversationHistoryPageValidationError),
+    SessionMismatch,
+    CursorRegression,
+    RecordSequenceConflict,
+}
+
+impl SessionPayloadAccumulatorError {
+    #[must_use]
+    pub const fn stable_code(&self) -> &'static str {
+        "VALIDATION_ERROR"
+    }
+}
+
+impl fmt::Display for SessionPayloadAccumulatorError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Page(error) => error.fmt(formatter),
+            Self::SessionMismatch => formatter.write_str("history record belongs to another session"),
+            Self::CursorRegression => formatter.write_str("history cursor did not advance"),
+            Self::RecordSequenceConflict => {
+                formatter.write_str("history records are not strictly ordered")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SessionPayloadAccumulatorError {}
+
+/// Incremental renderer projection. It retains only the materialized transcript/tool/usage/plan
+/// state and the current cursor; callers can feed one bounded page at a time without ever building
+/// a complete raw event vector.
+#[derive(Debug, Clone)]
+pub struct SessionPayloadAccumulator {
+    payload: MaterializedSessionPayload,
+    open_role: Option<&'static str>,
+    baseline_used: Option<f64>,
+    target_last_seq: Option<u64>,
+}
+
+impl SessionPayloadAccumulator {
+    #[must_use]
+    pub fn new(metadata: &SessionMetadata) -> Self {
+        Self {
+            payload: MaterializedSessionPayload {
+                metadata: SessionPayloadMetadata {
+                    id: metadata.session_id.clone(),
+                    agent_id: metadata.runtime_agent_id.clone().unwrap_or_default(),
+                    agent_config_id: metadata
+                        .stable_agent_namespace
+                        .as_deref()
+                        .and_then(|namespace| namespace.strip_prefix("config:"))
+                        .map(str::to_string),
+                    title: metadata
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| "Untitled Chat".to_string()),
+                    cwd: metadata.cwd.clone(),
+                    project_id: metadata.project_id.clone().unwrap_or_default(),
+                    created_at: metadata.created_at,
+                    last_activity_at: metadata.last_activity_at,
+                    message_count: 0,
+                    last_seq: 0,
+                    status: metadata.status.clone(),
+                    worktree_path: metadata.worktree_path.clone(),
+                    worktree_branch: metadata.worktree_branch.clone(),
+                },
+                messages: Vec::new(),
+                tool_calls: Vec::new(),
+                session_usage: None,
+                plan: None,
+            },
+            open_role: None,
+            baseline_used: None,
+            target_last_seq: None,
+        }
+    }
+
+    #[must_use]
+    pub fn cursor(&self) -> u64 {
+        self.payload.metadata.last_seq
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> MaterializedSessionPayload {
+        self.payload.clone()
+    }
+
+    #[must_use]
+    pub fn finish(self) -> MaterializedSessionPayload {
+        self.payload
+    }
+
+    pub fn push_history_page(
+        &mut self,
+        page: &ConversationHistoryPageV1,
+        limit: usize,
+    ) -> Result<(), SessionPayloadAccumulatorError> {
+        page.validate(
+            &self.payload.metadata.id,
+            self.cursor(),
+            limit,
+            self.target_last_seq,
+        )
+        .map_err(SessionPayloadAccumulatorError::Page)?;
+        self.target_last_seq = Some(page.target_last_seq);
+        self.push_wire_records(&page.records, page.next_cursor)
+    }
+
+    pub fn push_records(
+        &mut self,
+        records: &[PersistedEventRecord],
+        next_cursor: u64,
+    ) -> Result<(), SessionPayloadAccumulatorError> {
+        let mut previous_seq = self.cursor();
+        if next_cursor < previous_seq {
+            return Err(SessionPayloadAccumulatorError::CursorRegression);
+        }
+        for record in records {
+            if record.session_id != self.payload.metadata.id {
+                return Err(SessionPayloadAccumulatorError::SessionMismatch);
+            }
+            if record.seq <= previous_seq || record.seq > next_cursor {
+                return Err(SessionPayloadAccumulatorError::RecordSequenceConflict);
+            }
+            self.apply_record(
+                record.seq,
+                record.recorded_at,
+                record.type_.as_str(),
+                &record.payload,
+            );
+            previous_seq = record.seq;
+        }
+        self.advance_cursor(next_cursor)
+    }
+
+    fn push_wire_records(
+        &mut self,
+        records: &[ConversationHistoryRecordV1],
+        next_cursor: u64,
+    ) -> Result<(), SessionPayloadAccumulatorError> {
+        for record in records {
+            self.apply_record(
+                record.seq,
+                record.recorded_at,
+                record.type_.as_str(),
+                &record.payload,
+            );
+        }
+        self.advance_cursor(next_cursor)
+    }
+
+    fn advance_cursor(&mut self, next_cursor: u64) -> Result<(), SessionPayloadAccumulatorError> {
+        if next_cursor < self.cursor() {
+            return Err(SessionPayloadAccumulatorError::CursorRegression);
+        }
+        self.payload.metadata.last_seq = next_cursor;
+        self.payload.metadata.message_count = self.payload.messages.len() as u64;
+        Ok(())
+    }
+
+    fn apply_record(&mut self, seq: u64, recorded_at: u64, type_: &str, payload: &Value) {
+        match type_ {
+            "user_prompt" => self.push_user_prompt(seq, recorded_at, payload),
+            "message_chunk" => self.push_message_chunk(seq, recorded_at, payload),
+            "tool_call" => {
+                self.open_role = None;
+                self.upsert_tool_call(seq, recorded_at, payload);
+            }
+            "tool_call_update" => self.update_tool_call(payload),
+            "prompt_complete" => self.open_role = None,
+            "usage_update" => self.update_usage(recorded_at, payload),
+            "plan_update" => self.update_plan(payload),
+            _ => {}
+        }
+    }
+
+    fn push_user_prompt(&mut self, seq: u64, recorded_at: u64, payload: &Value) {
+        self.open_role = None;
+        let turn_id = payload
+            .get("turnId")
+            .and_then(Value::as_str)
+            .filter(|turn_id| !turn_id.is_empty());
+        let id = turn_id.map_or_else(
+            || format!("user:seq-{seq}"),
+            |turn_id| format!("turn:{turn_id}"),
+        );
+        let blocks = payload
+            .get("content")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        self.payload.messages.push(MaterializedChatMessage {
+            id,
+            role: "user",
+            blocks,
+            streaming: false,
+            timestamp: recorded_at,
+            seq,
+        });
+    }
+
+    fn push_message_chunk(&mut self, seq: u64, recorded_at: u64, payload: &Value) {
+        let role = if payload.get("role").and_then(Value::as_str) == Some("thought") {
+            "thought"
+        } else {
+            "agent"
+        };
+        let Some(content) = payload.get("content").filter(|content| !content.is_null()) else {
+            return;
+        };
+        if self.open_role == Some(role) {
+            if let Some(last) = self.payload.messages.last_mut() {
+                append_block(&mut last.blocks, content.clone());
+            }
+            return;
+        }
+        if is_empty_text_block(content) {
+            return;
+        }
+        self.open_role = Some(role);
+        self.payload.messages.push(MaterializedChatMessage {
+            id: format!("snapshot:{role}:{seq}"),
+            role,
+            blocks: vec![content.clone()],
+            streaming: false,
+            timestamp: recorded_at,
+            seq,
+        });
+    }
+
+    fn upsert_tool_call(&mut self, seq: u64, recorded_at: u64, payload: &Value) {
+        let Some(tool_call) = payload.get("toolCall").and_then(Value::as_object) else {
+            return;
+        };
+        let Some(tool_call_id) = tool_call
+            .get("toolCallId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            return;
+        };
+        let mut stamped = tool_call.clone();
+        stamped
+            .entry("timestamp".to_string())
+            .or_insert_with(|| Value::from(recorded_at));
+        stamped
+            .entry("seq".to_string())
+            .or_insert_with(|| Value::from(seq));
+        if let Some(index) = self.tool_call_index(tool_call_id) {
+            let previous = self.payload.tool_calls[index]
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            let mut merged = previous.clone();
+            merged.extend(stamped);
+            if let Some(value) = previous.get("timestamp") {
+                merged.insert("timestamp".to_string(), value.clone());
+            }
+            if let Some(value) = previous.get("seq") {
+                merged.insert("seq".to_string(), value.clone());
+            }
+            self.payload.tool_calls[index] = Value::Object(merged);
+        } else {
+            self.payload.tool_calls.push(Value::Object(stamped));
+        }
+    }
+
+    fn update_tool_call(&mut self, payload: &Value) {
+        let Some(update) = payload.get("update").and_then(Value::as_object) else {
+            return;
+        };
+        let Some(tool_call_id) = update
+            .get("toolCallId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            return;
+        };
+        let Some(index) = self.tool_call_index(tool_call_id) else {
+            return;
+        };
+        let mut merged = self.payload.tool_calls[index]
+            .as_object()
+            .cloned()
+            .unwrap_or_default();
+        let timeline = (
+            merged.get("timestamp").cloned(),
+            merged.get("seq").cloned(),
+        );
+        merged.extend(update.clone());
+        if let Some(timestamp) = timeline.0 {
+            merged.insert("timestamp".to_string(), timestamp);
+        }
+        if let Some(seq) = timeline.1 {
+            merged.insert("seq".to_string(), seq);
+        }
+        self.payload.tool_calls[index] = Value::Object(merged);
+    }
+
+    fn tool_call_index(&self, tool_call_id: &str) -> Option<usize> {
+        self.payload.tool_calls.iter().position(|tool_call| {
+            tool_call.get("toolCallId").and_then(Value::as_str) == Some(tool_call_id)
+        })
+    }
+
+    fn update_usage(&mut self, recorded_at: u64, payload: &Value) {
+        let Some(used) = payload.get("used").and_then(Value::as_f64) else {
+            return;
+        };
+        let Some(size) = payload.get("size").and_then(Value::as_f64) else {
+            return;
+        };
+        if !used.is_finite() || !size.is_finite() || used <= 0.0 || size <= 0.0 {
+            return;
+        }
+        let baseline_used = *self.baseline_used.get_or_insert(used);
+        let mut usage = Map::new();
+        usage.insert("used".to_string(), Value::from(used));
+        usage.insert("size".to_string(), Value::from(size));
+        usage.insert("baselineUsed".to_string(), Value::from(baseline_used));
+        usage.insert("updatedAt".to_string(), Value::from(recorded_at));
+        usage.insert("source".to_string(), Value::String("reported".to_string()));
+        if let Some(cost) = payload.get("cost").filter(|cost| !cost.is_null()) {
+            usage.insert("cost".to_string(), cost.clone());
+        }
+        self.payload.session_usage = Some(Value::Object(usage));
+    }
+
+    fn update_plan(&mut self, payload: &Value) {
+        let Some(entries) = payload
+            .get("plan")
+            .and_then(|plan| plan.get("entries"))
+            .and_then(Value::as_array)
+        else {
+            return;
+        };
+        self.payload.plan = Some(entries.clone());
+    }
+}
+
+/// Materialize the renderer-shaped payload for one session from durable seq-sorted records. This
+/// compatibility wrapper now feeds the same incremental accumulator used by bounded page handlers.
 #[must_use]
 pub fn materialize_session_payload(
     metadata: &SessionMetadata,
     records: &[PersistedEventRecord],
 ) -> MaterializedSessionPayload {
-    let messages = fold_messages(records);
-    let payload_metadata = SessionPayloadMetadata {
-        id: metadata.session_id.clone(),
-        agent_id: metadata.runtime_agent_id.clone().unwrap_or_default(),
-        // The renderer maps `config:<id>` namespaces back to the bare config
-        // id; anything else (absent or unprefixed) omits the key.
-        agent_config_id: metadata
-            .stable_agent_namespace
-            .as_deref()
-            .and_then(|namespace| namespace.strip_prefix("config:"))
-            .map(str::to_string),
-        title: metadata
-            .title
-            .clone()
-            .unwrap_or_else(|| "Untitled Chat".to_string()),
-        cwd: metadata.cwd.clone(),
-        project_id: metadata.project_id.clone().unwrap_or_default(),
-        created_at: metadata.created_at,
-        last_activity_at: metadata.last_activity_at,
-        message_count: messages.len() as u64,
-        // Derive the cursor from the replayed records themselves (not the
-        // separately-read metadata) so the payload can never advertise a
-        // `lastSeq` that disagrees with the messages it carries when a writer
-        // lands an event between the metadata read and the replay.
-        last_seq: records
-            .last()
-            .map_or(metadata.last_seq, |record| record.seq),
-        status: metadata.status.clone(),
-        worktree_path: metadata.worktree_path.clone(),
-        worktree_branch: metadata.worktree_branch.clone(),
-    };
-    MaterializedSessionPayload {
-        metadata: payload_metadata,
-        messages,
-    }
-}
-
-/// Fold seq-sorted durable records into renderer bubbles.
-fn fold_messages(records: &[PersistedEventRecord]) -> Vec<MaterializedChatMessage> {
-    let mut messages: Vec<MaterializedChatMessage> = Vec::new();
-    // Role of the agent/thought run still open for coalescing (`None` after a
-    // user bubble, a split, or before the first chunk).
-    let mut open_role: Option<&'static str> = None;
-
-    for record in records {
-        match record.type_.as_str() {
-            "user_prompt" => {
-                open_role = None;
-                let turn_id = record
-                    .payload
-                    .get("turnId")
-                    .and_then(Value::as_str)
-                    .filter(|turn_id| !turn_id.is_empty());
-                let id = turn_id.map_or_else(
-                    || format!("user:seq-{}", record.seq),
-                    |turn_id| format!("turn:{turn_id}"),
-                );
-                let blocks = record
-                    .payload
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                messages.push(MaterializedChatMessage {
-                    id,
-                    role: "user",
-                    blocks,
-                    streaming: false,
-                    timestamp: record.recorded_at,
-                    seq: record.seq,
-                });
-            }
-            "message_chunk" => {
-                let role = if record.payload.get("role").and_then(Value::as_str) == Some("thought")
-                {
-                    "thought"
-                } else {
-                    "agent"
-                };
-                let Some(content) = record
-                    .payload
-                    .get("content")
-                    .filter(|content| !content.is_null())
-                else {
-                    // Mirrors the renderer's `if (!content) continue`.
-                    continue;
-                };
-                if open_role == Some(role) {
-                    // Same run still open: coalesce into the trailing bubble
-                    // (`appendBlocks` semantics).
-                    if let Some(last) = messages.last_mut() {
-                        append_block(&mut last.blocks, content.clone());
-                    }
-                    continue;
-                }
-                if is_empty_text_block(content) {
-                    // Mirrors the renderer: an empty text chunk may never OPEN
-                    // a bubble (avoids restoring a flashing empty message).
-                    continue;
-                }
-                open_role = Some(role);
-                messages.push(MaterializedChatMessage {
-                    id: format!("snapshot:{role}:{}", record.seq),
-                    role,
-                    blocks: vec![content.clone()],
-                    streaming: false,
-                    timestamp: record.recorded_at,
-                    seq: record.seq,
-                });
-            }
-            // Split boundaries: a tool card or a completed turn forces the
-            // following chunk run into a fresh bubble.
-            "tool_call" | "prompt_complete" => {
-                open_role = None;
-            }
-            // `tool_call_update` never splits (updates preserve the original
-            // card seq); every other durable event (session_info_update,
-            // mode/plan/commands updates, …) carries no transcript content.
-            _ => {}
-        }
-    }
-    messages
+    let next_cursor = records.last().map_or(metadata.last_seq, |record| record.seq);
+    let mut accumulator = SessionPayloadAccumulator::new(metadata);
+    accumulator
+        .push_records(records, next_cursor)
+        .expect("validated persistence records must form one ordered history");
+    accumulator.finish()
 }
 
 /// `appendBlocks` semantics: text coalesces into a trailing text block; every
@@ -400,6 +640,104 @@ mod tests {
         assert!(payload.messages.iter().all(|message| !message.streaming));
         assert_eq!(payload.metadata.message_count, 6);
         assert_eq!(payload.metadata.last_seq, 12);
+        assert_eq!(payload.tool_calls.len(), 1);
+        assert_eq!(payload.tool_calls[0]["toolCallId"], "t-1");
+        assert_eq!(payload.tool_calls[0]["seq"], 5);
+        assert_eq!(payload.tool_calls[0]["timestamp"], 105);
+    }
+
+    #[test]
+    fn incremental_pages_preserve_message_tool_usage_and_plan_state() {
+        let mut accumulator = SessionPayloadAccumulator::new(&metadata());
+        let page_one = ConversationHistoryPageV1 {
+            schema_version: crate::conversation::contracts::CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION,
+            records: vec![
+                ConversationHistoryRecordV1 {
+                    schema_version: crate::conversation::contracts::CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
+                    session_id: "session-1".to_string(),
+                    seq: 1,
+                    type_: "user_prompt".to_string(),
+                    recorded_at: 101,
+                    payload: user_prompt(1, Some("turn-1"), "hello").payload,
+                },
+                ConversationHistoryRecordV1 {
+                    schema_version: crate::conversation::contracts::CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
+                    session_id: "session-1".to_string(),
+                    seq: 2,
+                    type_: "message_chunk".to_string(),
+                    recorded_at: 102,
+                    payload: chunk(2, "agent", "a").payload,
+                },
+                ConversationHistoryRecordV1 {
+                    schema_version: crate::conversation::contracts::CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
+                    session_id: "session-1".to_string(),
+                    seq: 3,
+                    type_: "tool_call".to_string(),
+                    recorded_at: 103,
+                    payload: tool_call(3).payload,
+                },
+            ],
+            next_cursor: 3,
+            complete: false,
+            target_last_seq: 7,
+        };
+        accumulator.push_history_page(&page_one, 3).unwrap();
+        let first = accumulator.snapshot();
+        assert_eq!(first.metadata.last_seq, 3);
+        assert_eq!(first.messages.len(), 2);
+        assert_eq!(first.tool_calls.len(), 1);
+
+        let page_two = ConversationHistoryPageV1 {
+            schema_version: crate::conversation::contracts::CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION,
+            records: vec![
+                ConversationHistoryRecordV1 {
+                    schema_version: crate::conversation::contracts::CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
+                    session_id: "session-1".to_string(),
+                    seq: 4,
+                    type_: "message_chunk".to_string(),
+                    recorded_at: 104,
+                    payload: chunk(4, "agent", "b").payload,
+                },
+                ConversationHistoryRecordV1 {
+                    schema_version: crate::conversation::contracts::CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
+                    session_id: "session-1".to_string(),
+                    seq: 5,
+                    type_: "tool_call_update".to_string(),
+                    recorded_at: 105,
+                    payload: json!({"update":{"toolCallId":"t-1","status":"failed"}}),
+                },
+                ConversationHistoryRecordV1 {
+                    schema_version: crate::conversation::contracts::CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
+                    session_id: "session-1".to_string(),
+                    seq: 6,
+                    type_: "usage_update".to_string(),
+                    recorded_at: 106,
+                    payload: json!({"used":10,"size":100,"cost":{"amount":1.5,"currency":"USD"}}),
+                },
+                ConversationHistoryRecordV1 {
+                    schema_version: crate::conversation::contracts::CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
+                    session_id: "session-1".to_string(),
+                    seq: 7,
+                    type_: "plan_update".to_string(),
+                    recorded_at: 107,
+                    payload: json!({"plan":{"entries":[{"content":"ship","status":"in_progress"}]}}),
+                },
+            ],
+            next_cursor: 7,
+            complete: true,
+            target_last_seq: 7,
+        };
+        accumulator.push_history_page(&page_two, 4).unwrap();
+        let payload = accumulator.finish();
+        assert_eq!(
+            payload.messages.iter().map(|message| message.seq).collect::<Vec<_>>(),
+            vec![1, 2, 4]
+        );
+        assert_eq!(payload.tool_calls[0]["status"], "failed");
+        assert_eq!(payload.tool_calls[0]["seq"], 3);
+        assert_eq!(payload.session_usage.as_ref().unwrap()["baselineUsed"], 10.0);
+        assert_eq!(payload.plan.as_ref().unwrap()[0]["content"], "ship");
+        assert_eq!(payload.metadata.last_seq, 7);
     }
 
     #[test]

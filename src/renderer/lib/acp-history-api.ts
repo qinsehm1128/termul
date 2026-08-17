@@ -1,4 +1,9 @@
 import type { IpcResult } from '@shared/types/ipc.types'
+import {
+  assertConversationHistoryPage,
+  assertConversationHistoryPageRequest,
+  type ConversationHistoryPageV1
+} from '@shared/types/web-protocol.types'
 import { invoke } from '@tauri-apps/api/core'
 import type { SessionIndexEntry, SessionPayload } from '@/lib/acp-history-persistence'
 
@@ -7,14 +12,20 @@ export interface DesktopHistoryListResult {
   legacyImportComplete: boolean
 }
 
-async function invokeHistory<T>(command: string, args?: Record<string, unknown>): Promise<T> {
-  let result: IpcResult<T>
-  try {
-    result = await invoke<IpcResult<T>>(command, args)
-  } catch (error) {
-    throw new Error(error instanceof Error ? error.message : String(error))
+export class AcpHistoryApiError extends Error {
+  readonly code: string
+
+  constructor(code: string, message: string) {
+    super(message)
+    this.name = 'AcpHistoryApiError'
+    this.code = code
   }
-  if (!result.success) throw new Error(result.error)
+}
+
+async function invokeHistory<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  // Deliberately do not catch invoke rejections: transport errors must propagate unchanged.
+  const result: IpcResult<T> = await invoke<IpcResult<T>>(command, args)
+  if (!result.success) throw new AcpHistoryApiError(result.code, result.error)
   return result.data
 }
 
@@ -25,6 +36,21 @@ export const acpHistoryApi = {
 
   get(sessionId: string): Promise<SessionPayload | null> {
     return invokeHistory<SessionPayload | null>('acp_history_get', { sessionId })
+  },
+
+  async getPage(
+    sessionId: string,
+    afterSeq: number,
+    limit: number
+  ): Promise<ConversationHistoryPageV1> {
+    assertConversationHistoryPageRequest(afterSeq, limit)
+    const page = await invokeHistory<ConversationHistoryPageV1>('acp_history_get_page', {
+      sessionId,
+      afterSeq,
+      limit
+    })
+    assertConversationHistoryPage(page, { sessionId, afterSeq, limit })
+    return page
   },
 
   /** Legacy-store reads for the one-time KV wipe migration only. */

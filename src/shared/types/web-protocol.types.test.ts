@@ -1,8 +1,14 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  assertConversationHistoryPage,
+  assertConversationHistoryPageRequest,
+  CONVERSATION_APPLICATION_ERROR_CODES,
+  type ConversationHistoryPageV1,
+  ConversationHistoryPageValidationError,
   isHumanRelayedCap,
   isOsFulfilledCap,
+  MAX_CONVERSATION_HISTORY_PAGE_LIMIT,
   type ReliabilityTier,
   WS_ERROR_CODES,
   WS_EVENT_TIERS,
@@ -57,10 +63,11 @@ describe('web-protocol.types — event/request type registries (AC2)', () => {
     expect(WS_REQUEST_TYPES).toContain('list_persisted_sessions')
     expect(WS_REQUEST_TYPES).toContain('open_persisted_session')
     expect(WS_REQUEST_TYPES).toContain('get_session_payload')
+    expect(WS_REQUEST_TYPES).toContain('get_session_payload_page')
   })
 
-  it('exports exactly 46 request types including Conversation-first aggregate operations', () => {
-    expect(WS_REQUEST_TYPES).toHaveLength(46)
+  it('exports exactly 47 request types including Conversation-first aggregate operations', () => {
+    expect(WS_REQUEST_TYPES).toHaveLength(47)
     expect(WS_REQUEST_TYPES).toEqual([
       'send_prompt',
       'cancel_prompt',
@@ -89,6 +96,7 @@ describe('web-protocol.types — event/request type registries (AC2)', () => {
       'list_persisted_sessions',
       'open_persisted_session',
       'get_session_payload',
+      'get_session_payload_page',
       'recover_session_snapshot',
       'get_session_cursor',
       // CAP-6 / Story 8: host-owned ACP catalog resolution.
@@ -119,6 +127,88 @@ describe('web-protocol.types — event/request type registries (AC2)', () => {
     for (const e of WS_EVENT_TYPES) {
       expect(WS_REQUEST_TYPES).not.toContain(e)
     }
+  })
+})
+
+describe('web-protocol.types — bounded history page contract', () => {
+  const page: ConversationHistoryPageV1 = {
+    schemaVersion: 1,
+    records: [
+      {
+        schemaVersion: 1,
+        sessionId: 's-1',
+        seq: 18,
+        type: 'message_chunk',
+        recordedAt: 1_766_000_000_018,
+        payload: { role: 'agent', content: { type: 'text', text: 'ok' } }
+      }
+    ],
+    nextCursor: 18,
+    complete: false,
+    targetLastSeq: 42
+  }
+
+  it('pins exact camelCase request/result casing and unchanged record payloads', () => {
+    const request = { sessionId: 's-1', afterSeq: 17, limit: 250 }
+    assertConversationHistoryPageRequest(request.afterSeq, request.limit)
+    assertConversationHistoryPage(page, request)
+    expect(CONVERSATION_APPLICATION_ERROR_CODES).toContain('CONVERSATION_HISTORY_PAGING_REQUIRED')
+    expect(page).toEqual({
+      schemaVersion: 1,
+      records: [
+        {
+          schemaVersion: 1,
+          sessionId: 's-1',
+          seq: 18,
+          type: 'message_chunk',
+          recordedAt: 1_766_000_000_018,
+          payload: { role: 'agent', content: { type: 'text', text: 'ok' } }
+        }
+      ],
+      nextCursor: 18,
+      complete: false,
+      targetLastSeq: 42
+    })
+  })
+
+  it.each([
+    0,
+    -1,
+    1.5,
+    MAX_CONVERSATION_HISTORY_PAGE_LIMIT + 1
+  ])('rejects invalid limit %s before request allocation', (limit) => {
+    expect(() => assertConversationHistoryPageRequest(0, limit)).toThrow(
+      ConversationHistoryPageValidationError
+    )
+  })
+
+  it.each([-1, 1.5, Number.POSITIVE_INFINITY])('rejects invalid cursor %s', (afterSeq) => {
+    expect(() => assertConversationHistoryPageRequest(afterSeq, 250)).toThrow(
+      ConversationHistoryPageValidationError
+    )
+  })
+
+  it('rejects cross-session pages, cursor regression, target drift, and invalid completion', () => {
+    expect(() =>
+      assertConversationHistoryPage(page, { sessionId: 's-2', afterSeq: 17, limit: 250 })
+    ).toThrow(/another session/)
+    expect(() =>
+      assertConversationHistoryPage(page, { sessionId: 's-1', afterSeq: 18, limit: 250 })
+    ).toThrow(/did not advance/)
+    expect(() =>
+      assertConversationHistoryPage(page, {
+        sessionId: 's-1',
+        afterSeq: 17,
+        limit: 250,
+        targetLastSeq: 43
+      })
+    ).toThrow(/changed/)
+    expect(() =>
+      assertConversationHistoryPage(
+        { ...page, complete: true },
+        { sessionId: 's-1', afterSeq: 17, limit: 250 }
+      )
+    ).toThrow(/complete flag/)
   })
 })
 

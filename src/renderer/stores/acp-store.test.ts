@@ -106,6 +106,8 @@ import {
   _clearPayloadCacheForTesting,
   getCachedSessionPayload,
   loadSessionIndex,
+  loadSessionPayload,
+  type SessionPayload,
   setCachedSessionPayload
 } from '@/lib/acp-history-persistence'
 import {
@@ -163,6 +165,7 @@ const FRESH = {
   agentOptionsCache: {},
   sessionIndex: [],
   openingHistoryIds: {},
+  historyBackfill: {},
   restoringChatIds: {},
   launchingSessionIds: {},
   discoveredSessions: {},
@@ -206,6 +209,30 @@ function deferred<T>(): {
     reject = rej
   })
   return { promise, resolve, reject }
+}
+
+function closedHistoryPayload(
+  sessionId: string,
+  messages: ChatMessage[],
+  conversationId = CONVERSATION_ID
+): SessionPayload {
+  return {
+    metadata: {
+      id: sessionId,
+      conversationId,
+      agentId: 'stale-agent',
+      agentConfigId: 'cfg-history',
+      title: 'Long history',
+      cwd: '/work',
+      projectId: 'p1',
+      createdAt: 1,
+      lastActivityAt: 2,
+      messageCount: messages.length,
+      lastSeq: messages.at(-1)?.seq ?? 0,
+      status: 'closed'
+    },
+    messages
+  }
 }
 
 function seedSession(sessionId: string, agentId: string, activeTurn = true): void {
@@ -2941,6 +2968,171 @@ describe('acp-store', () => {
     })
     expect(invoke).toHaveBeenNthCalledWith(2, 'acp_kill_agent', { agentId: 'agent-test' })
     expect(useAcpStore.getState().agents['agent-test']).toBeUndefined()
+  })
+
+  it('progressively installs a 50,000-event closed history and keeps it read-only', async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(1_000)
+    try {
+      const sessionId = 's-50k'
+      const messages: ChatMessage[] = Array.from({ length: 50_000 }, (_, index) => ({
+        id: `m-${index + 1}`,
+        role: index % 2 === 0 ? 'user' : 'agent',
+        blocks: [{ type: 'text', text: `record-${index + 1}` }],
+        streaming: false,
+        timestamp: index + 1,
+        seq: index + 1
+      }))
+      const first = closedHistoryPayload(sessionId, messages.slice(0, 250))
+      const complete = closedHistoryPayload(sessionId, messages)
+      const releaseBackfill = deferred<void>()
+      useAcpStore.setState({ sessionIndex: [complete.metadata] })
+      vi.mocked(loadSessionPayload).mockImplementationOnce(async (_id, options) => {
+        await options?.onPage?.(first, {
+          sessionId,
+          pageNumber: 1,
+          pageRecordCount: 250,
+          loadedRecordCount: 250,
+          nextCursor: 250,
+          targetLastSeq: 50_000,
+          complete: false,
+          inFlightBytes: 32_000,
+          resumed: false
+        })
+        await releaseBackfill.promise
+        await options?.onPage?.(complete, {
+          sessionId,
+          pageNumber: 200,
+          pageRecordCount: 250,
+          loadedRecordCount: 50_000,
+          nextCursor: 50_000,
+          targetLastSeq: 50_000,
+          complete: true,
+          inFlightBytes: 32_000,
+          resumed: false
+        })
+        return complete
+      })
+
+      const startedAt = Date.now()
+      const opening = useAcpStore.getState().openHistorySession(sessionId)
+      const firstState = useAcpStore.getState()
+      expect(Date.now() - startedAt).toBeLessThan(1_000)
+      expect(firstState.messages[sessionId]).toHaveLength(250)
+      expect(firstState.historyBackfill[sessionId]).toEqual(
+        expect.objectContaining({ loading: true, loadedRecordCount: 250, nextCursor: 250 })
+      )
+      expect(firstState.openingHistoryIds[sessionId]).toBe(true)
+      expect(firstState.sessions[sessionId].status).toBe('closed')
+      await expect(
+        useAcpStore.getState().sendPrompt(sessionId, 'must stay read-only')
+      ).rejects.toThrow('session is closed')
+      expect(invoke).not.toHaveBeenCalled()
+
+      releaseBackfill.resolve()
+      await opening
+      const completed = useAcpStore.getState()
+      expect(completed.messages[sessionId]).toHaveLength(50_000)
+      expect(completed.messages[sessionId][0].seq).toBe(1)
+      expect(completed.messages[sessionId].at(-1)?.seq).toBe(50_000)
+      expect(completed.historyBackfill[sessionId]).toEqual(
+        expect.objectContaining({
+          loading: false,
+          complete: true,
+          loadedRecordCount: 50_000,
+          nextCursor: 50_000
+        })
+      )
+      expect(completed.sessions[sessionId].status).toBe('closed')
+      expect(invoke).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps the installed prefix visible after transient failure and appends it on retry', async () => {
+    const sessionId = 's-progress-retry'
+    const first = closedHistoryPayload(sessionId, [
+      {
+        id: 'm-1',
+        role: 'user',
+        blocks: [{ type: 'text', text: 'retained' }],
+        streaming: false,
+        timestamp: 1,
+        seq: 1
+      }
+    ])
+    const complete = closedHistoryPayload(sessionId, [
+      ...first.messages,
+      {
+        id: 'm-2',
+        role: 'agent',
+        blocks: [{ type: 'text', text: 'completed' }],
+        streaming: false,
+        timestamp: 2,
+        seq: 2
+      }
+    ])
+    useAcpStore.setState({ sessionIndex: [complete.metadata] })
+    vi.mocked(loadSessionPayload)
+      .mockImplementationOnce(async (_id, options) => {
+        await options?.onPage?.(first, {
+          sessionId,
+          pageNumber: 1,
+          pageRecordCount: 1,
+          loadedRecordCount: 1,
+          nextCursor: 1,
+          targetLastSeq: 2,
+          complete: false,
+          inFlightBytes: 128,
+          resumed: false
+        })
+        throw new AcpTransportError('closed', 'temporary disconnect')
+      })
+      .mockImplementationOnce(async (_id, options) => {
+        await options?.onPage?.(first, {
+          sessionId,
+          pageNumber: 1,
+          pageRecordCount: 0,
+          loadedRecordCount: 1,
+          nextCursor: 1,
+          targetLastSeq: 2,
+          complete: false,
+          inFlightBytes: 0,
+          resumed: true
+        })
+        await options?.onPage?.(complete, {
+          sessionId,
+          pageNumber: 2,
+          pageRecordCount: 1,
+          loadedRecordCount: 2,
+          nextCursor: 2,
+          targetLastSeq: 2,
+          complete: true,
+          inFlightBytes: 128,
+          resumed: false
+        })
+        return complete
+      })
+
+    await expect(useAcpStore.getState().openHistorySession(sessionId)).rejects.toMatchObject({
+      code: 'closed'
+    })
+    expect(useAcpStore.getState().messages[sessionId].map((message) => message.id)).toEqual(['m-1'])
+    expect(useAcpStore.getState().historyBackfill[sessionId]).toEqual(
+      expect.objectContaining({ loading: false, errorCode: 'closed', nextCursor: 1 })
+    )
+
+    await useAcpStore.getState().openHistorySession(sessionId)
+    expect(useAcpStore.getState().messages[sessionId].map((message) => message.id)).toEqual([
+      'm-1',
+      'm-2'
+    ])
+    expect(useAcpStore.getState().historyBackfill[sessionId]).toEqual(
+      expect.objectContaining({ complete: true, loading: false, nextCursor: 2 })
+    )
+    expect(useAcpStore.getState().sessions[sessionId].status).toBe('closed')
+    expect(invoke).not.toHaveBeenCalled()
   })
 
   it('openHistorySession loads the local transcript when no agent is connected (P5)', async () => {

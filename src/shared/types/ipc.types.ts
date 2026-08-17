@@ -20,6 +20,7 @@ import type {
   SessionWorkspaceV1,
   SessionWorkspaceWriteOutcome
 } from './session-workspace.types'
+import type { ConversationHistoryPageV1, GetSessionPayloadPageRequest } from './web-protocol.types'
 import type { WorkspaceManifest, WriteOutcome } from './workspace-manifest.types'
 
 export type IpcResult<T> =
@@ -158,6 +159,14 @@ export type ConversationIpcChannels = {
     conversationId: ConversationId,
     expectedRevision: number
   ) => IpcResult<ConversationLifecycleOutcome>
+}
+
+export type AcpHistoryIpcChannels = {
+  /** Compatibility full-payload command; large histories may return paging-required. */
+  'acp:history:get': (sessionId: string) => IpcResult<unknown | null>
+  'acp:history:get_page': (
+    request: GetSessionPayloadPageRequest
+  ) => IpcResult<ConversationHistoryPageV1>
 }
 
 export type TerminalIpcChannels = {

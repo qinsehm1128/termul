@@ -7,12 +7,17 @@ use std::fmt;
 
 use chrono::{DateTime, Datelike, NaiveDate, SecondsFormat, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 use uuid::Uuid;
 
 pub const CONVERSATION_SCHEMA_VERSION: u32 = 2;
 pub const PROJECT_ATTACHMENT_SCHEMA_VERSION: u32 = 1;
 pub const AGENT_SESSION_BINDING_SCHEMA_VERSION: u32 = 1;
 pub const TERMINAL_RESOURCE_REF_SCHEMA_VERSION: u32 = 1;
+pub const CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION: u32 = 1;
+pub const CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION: u32 = 1;
+pub const MIN_CONVERSATION_HISTORY_PAGE_LIMIT: usize = 1;
+pub const MAX_CONVERSATION_HISTORY_PAGE_LIMIT: usize = 1_000;
 
 const MACOS_EINVAL: i32 = 22;
 const MACOS_ENOTSUP: i32 = 45;
@@ -341,6 +346,136 @@ pub enum ConversationTitleSource {
     LocalAlias,
 }
 
+/// Runtime-neutral ACP history record carried inside bounded Conversation pages. The canonical
+/// repository adapter maps v2 Conversation events into this stable v1 renderer-facing dialect;
+/// opaque session ids remain values only and are never used as filesystem components.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConversationHistoryRecordV1 {
+    pub schema_version: u32,
+    pub session_id: String,
+    pub seq: u64,
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub recorded_at: u64,
+    pub payload: Value,
+}
+
+/// One immutable target-bounded history page shared by Tauri and WebSocket transports.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ConversationHistoryPageV1 {
+    pub schema_version: u32,
+    pub records: Vec<ConversationHistoryRecordV1>,
+    pub next_cursor: u64,
+    pub complete: bool,
+    pub target_last_seq: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConversationHistoryPageValidationError {
+    UnsupportedPageSchema,
+    UnsupportedRecordSchema,
+    InvalidLimit,
+    TooManyRecords,
+    EmptySessionId,
+    SessionMismatch,
+    CursorAheadOfTarget,
+    CursorRegression,
+    CursorBeyondTarget,
+    TargetChanged,
+    CompletionMismatch,
+    RecordSequenceConflict,
+}
+
+impl ConversationHistoryPageValidationError {
+    #[must_use]
+    pub const fn stable_code(self) -> &'static str {
+        "VALIDATION_ERROR"
+    }
+}
+
+impl fmt::Display for ConversationHistoryPageValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let detail = match self {
+            Self::UnsupportedPageSchema => "history page schemaVersion is unsupported",
+            Self::UnsupportedRecordSchema => "history record schemaVersion is unsupported",
+            Self::InvalidLimit => "history page limit must be an integer between 1 and 1000",
+            Self::TooManyRecords => "history page contains more records than requested",
+            Self::EmptySessionId => "history page sessionId must be non-empty",
+            Self::SessionMismatch => "history page belongs to another session",
+            Self::CursorAheadOfTarget => "history page cursor is ahead of targetLastSeq",
+            Self::CursorRegression => "history page nextCursor did not advance",
+            Self::CursorBeyondTarget => "history page nextCursor exceeds targetLastSeq",
+            Self::TargetChanged => "history page targetLastSeq changed during traversal",
+            Self::CompletionMismatch => "history page complete flag disagrees with nextCursor",
+            Self::RecordSequenceConflict => "history page records are not strictly ordered",
+        };
+        formatter.write_str(detail)
+    }
+}
+
+impl std::error::Error for ConversationHistoryPageValidationError {}
+
+impl ConversationHistoryPageV1 {
+    pub fn validate(
+        &self,
+        expected_session_id: &str,
+        after_seq: u64,
+        limit: usize,
+        expected_target_last_seq: Option<u64>,
+    ) -> Result<(), ConversationHistoryPageValidationError> {
+        use ConversationHistoryPageValidationError as ValidationError;
+
+        if self.schema_version != CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION {
+            return Err(ValidationError::UnsupportedPageSchema);
+        }
+        if !(MIN_CONVERSATION_HISTORY_PAGE_LIMIT..=MAX_CONVERSATION_HISTORY_PAGE_LIMIT)
+            .contains(&limit)
+        {
+            return Err(ValidationError::InvalidLimit);
+        }
+        if self.records.len() > limit {
+            return Err(ValidationError::TooManyRecords);
+        }
+        if expected_session_id.trim().is_empty() {
+            return Err(ValidationError::EmptySessionId);
+        }
+        if after_seq > self.target_last_seq {
+            return Err(ValidationError::CursorAheadOfTarget);
+        }
+        if expected_target_last_seq.is_some_and(|target| target != self.target_last_seq) {
+            return Err(ValidationError::TargetChanged);
+        }
+        if self.next_cursor < after_seq
+            || (self.next_cursor == after_seq && after_seq < self.target_last_seq)
+        {
+            return Err(ValidationError::CursorRegression);
+        }
+        if self.next_cursor > self.target_last_seq {
+            return Err(ValidationError::CursorBeyondTarget);
+        }
+        if self.complete != (self.next_cursor == self.target_last_seq) {
+            return Err(ValidationError::CompletionMismatch);
+        }
+
+        let mut previous_seq = after_seq;
+        for record in &self.records {
+            if record.schema_version != CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION {
+                return Err(ValidationError::UnsupportedRecordSchema);
+            }
+            if record.session_id != expected_session_id {
+                return Err(ValidationError::SessionMismatch);
+            }
+            if record.seq <= previous_seq || record.seq > self.next_cursor {
+                return Err(ValidationError::RecordSequenceConflict);
+            }
+            previous_seq = record.seq;
+        }
+        Ok(())
+    }
+}
+
 /// Canonical event-derived history summary exposed to persistence adapters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -536,6 +671,85 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ConversationErrorCode::ConversationDurabilityUnsupported).unwrap(),
             json!("CONVERSATION_DURABILITY_UNSUPPORTED")
+        );
+    }
+
+    #[test]
+    fn conversation_history_page_v1_has_exact_camel_case_wire_contract() {
+        let page = ConversationHistoryPageV1 {
+            schema_version: CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION,
+            records: vec![ConversationHistoryRecordV1 {
+                schema_version: CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
+                session_id: "opaque/session".to_string(),
+                seq: 18,
+                type_: "message_chunk".to_string(),
+                recorded_at: 1_766_000_000_018,
+                payload: json!({"role":"agent","content":{"type":"text","text":"ok"}}),
+            }],
+            next_cursor: 18,
+            complete: false,
+            target_last_seq: 42,
+        };
+        page.validate("opaque/session", 17, 250, None).unwrap();
+        assert_eq!(
+            serde_json::to_value(&page).unwrap(),
+            json!({
+                "schemaVersion": 1,
+                "records": [{
+                    "schemaVersion": 1,
+                    "sessionId": "opaque/session",
+                    "seq": 18,
+                    "type": "message_chunk",
+                    "recordedAt": 1_766_000_000_018_u64,
+                    "payload": {"role":"agent","content":{"type":"text","text":"ok"}}
+                }],
+                "nextCursor": 18,
+                "complete": false,
+                "targetLastSeq": 42
+            })
+        );
+    }
+
+    #[test]
+    fn conversation_history_page_validation_rejects_identity_cursor_limit_and_target_drift() {
+        let mut page = ConversationHistoryPageV1 {
+            schema_version: CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION,
+            records: vec![ConversationHistoryRecordV1 {
+                schema_version: CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
+                session_id: "session-a".to_string(),
+                seq: 18,
+                type_: "user_prompt".to_string(),
+                recorded_at: 18,
+                payload: json!({}),
+            }],
+            next_cursor: 18,
+            complete: false,
+            target_last_seq: 20,
+        };
+        for invalid_limit in [0, MAX_CONVERSATION_HISTORY_PAGE_LIMIT + 1] {
+            let error = page
+                .validate("session-a", 17, invalid_limit, None)
+                .unwrap_err();
+            assert_eq!(error.stable_code(), "VALIDATION_ERROR");
+            assert_eq!(error, ConversationHistoryPageValidationError::InvalidLimit);
+        }
+        assert_eq!(
+            page.validate("session-b", 17, 250, None).unwrap_err(),
+            ConversationHistoryPageValidationError::SessionMismatch
+        );
+        assert_eq!(
+            page.validate("session-a", 18, 250, None).unwrap_err(),
+            ConversationHistoryPageValidationError::CursorRegression
+        );
+        assert_eq!(
+            page.validate("session-a", 17, 250, Some(21))
+                .unwrap_err(),
+            ConversationHistoryPageValidationError::TargetChanged
+        );
+        page.complete = true;
+        assert_eq!(
+            page.validate("session-a", 17, 250, None).unwrap_err(),
+            ConversationHistoryPageValidationError::CompletionMismatch
         );
     }
 

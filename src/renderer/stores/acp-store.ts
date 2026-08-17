@@ -98,12 +98,14 @@ import { AcpConnectionCoordinator, type AcpRecovery } from '@/lib/acp-connection
 import {
   deriveTitle,
   getCachedSessionPayload,
+  type HistoryPageProgress,
   loadSessionIndex as loadSessionIndexFromDisk,
   loadSessionPayload,
   markSessionPayloadPinned,
   maxPayloadSeq,
   restoredToolCalls,
   type SessionIndexEntry,
+  type SessionPayload,
   setCachedSessionPayload,
   unpinSessionPayload
 } from '@/lib/acp-history-persistence'
@@ -166,6 +168,15 @@ export interface AgentOptionsCacheEntry {
   modes: SessionModeState | null
   configOptions: SessionConfigOption[]
   updatedAt: number
+}
+
+export interface HistoryBackfillState {
+  loading: boolean
+  complete: boolean
+  loadedRecordCount: number
+  nextCursor: number
+  targetLastSeq: number
+  errorCode?: string
 }
 
 export interface ChatMessage {
@@ -316,6 +327,8 @@ interface AcpState {
 
   /** Session ids whose `openHistorySession` is in flight (drives reconnect banners). */
   openingHistoryIds: Record<string, true>
+  /** Progressive durable-history page state; installed transcript pages remain visible on error. */
+  historyBackfill: Record<SessionId, HistoryBackfillState>
   /**
    * Session ids whose newly focused chat tab should show the branded restore
    * preload. This clears once usable content is ready, independently of a
@@ -1201,9 +1214,15 @@ function trimLiveWindow(messages: ChatMessage[], sessionId: SessionId): ChatMess
  * Call only after any needed `persistSession` so the last mirror is flushed.
  */
 function dropSessionTranscriptState(
-  state: Pick<AcpState, 'messages' | 'toolCalls' | 'commands' | 'sessionUsage' | 'plans'>,
+  state: Pick<
+    AcpState,
+    'messages' | 'toolCalls' | 'commands' | 'sessionUsage' | 'plans' | 'historyBackfill'
+  >,
   sessionId: SessionId
-): Pick<AcpState, 'messages' | 'toolCalls' | 'commands' | 'sessionUsage' | 'plans'> {
+): Pick<
+  AcpState,
+  'messages' | 'toolCalls' | 'commands' | 'sessionUsage' | 'plans' | 'historyBackfill'
+> {
   // Drop per-session module-level bookkeeping too so a closed/deleted session
   // never leaks a backfill allowance or an in-flight load guard.
   backfillCounts.delete(sessionId)
@@ -1214,7 +1233,8 @@ function dropSessionTranscriptState(
     toolCalls: dropRecordKey(state.toolCalls, sessionId),
     commands: dropRecordKey(state.commands, sessionId),
     sessionUsage: dropRecordKey(state.sessionUsage, sessionId),
-    plans: dropRecordKey(state.plans, sessionId)
+    plans: dropRecordKey(state.plans, sessionId),
+    historyBackfill: dropRecordKey(state.historyBackfill, sessionId)
   }
 }
 
@@ -2355,52 +2375,112 @@ async function openHistorySessionInner(
     })
   }
 
-  const payload = await loadSessionPayload(id)
+  // Preserve controls before the first page callback mutates the session shell.
+  const existingControls = captureReopenControlBaseline(get().sessions, id)
+  const indexMetadata = get().sessionIndex.find((entry) => entry.id === id)
+  let latestPayload: SessionPayload | null = null
+  let installedFirstPage = false
+
+  const installPage = (nextPayload: SessionPayload, progress: HistoryPageProgress): void => {
+    if (deletedMidOpen() || !isCurrentSessionReopen(id, reopenGeneration)) return
+    latestPayload = nextPayload
+    const meta = nextPayload.metadata
+    rebaseSeqCounter(maxPayloadSeq(nextPayload))
+    set((s) => ({
+      sessions: {
+        ...s.sessions,
+        [id]: {
+          id,
+          conversationId: meta.conversationId,
+          agentId: meta.agentId,
+          cwd: meta.cwd,
+          projectId: meta.projectId,
+          status: 'closed',
+          title: meta.title,
+          activeTurn: false,
+          openTurnId: null,
+          modes: existingControls?.modes ?? null,
+          models: existingControls?.models ?? null,
+          configOptions: existingControls?.configOptions ?? [],
+          lastError: null,
+          createdAt: meta.createdAt,
+          replaying: null,
+          worktreePath: meta.worktreePath,
+          worktreeBranch: meta.worktreeBranch
+        }
+      },
+      // Install page one immediately, then replace these arrays atomically with each assembled
+      // prefix. Never clear an installed prefix while a later request is in flight or retrying.
+      messages: { ...s.messages, [id]: nextPayload.messages },
+      toolCalls: { ...s.toolCalls, [id]: restoredToolCalls(nextPayload) },
+      sessionUsage: nextPayload.sessionUsage
+        ? { ...s.sessionUsage, [id]: nextPayload.sessionUsage }
+        : dropRecordKey(s.sessionUsage, id),
+      plans:
+        nextPayload.plan !== undefined
+          ? nextPayload.plan.length > 0
+            ? { ...s.plans, [id]: nextPayload.plan }
+            : dropPlanForSession(s.plans, id)
+          : s.plans,
+      historyBackfill: {
+        ...s.historyBackfill,
+        [id]: {
+          loading: !progress.complete,
+          complete: progress.complete,
+          loadedRecordCount: progress.loadedRecordCount,
+          nextCursor: progress.nextCursor,
+          targetLastSeq: progress.targetLastSeq
+        }
+      }
+    }))
+    if (!installedFirstPage) {
+      installedFirstPage = true
+      onTranscriptInstalled()
+    }
+  }
+
+  let payload: SessionPayload | null
+  try {
+    payload = await loadSessionPayload(id, {
+      metadata: indexMetadata,
+      onPage: installPage
+    })
+  } catch (error) {
+    const code =
+      typeof error === 'object' &&
+      error !== null &&
+      'code' in error &&
+      typeof error.code === 'string'
+        ? error.code
+        : 'TRANSPORT_ERROR'
+    set((s) => {
+      const current = s.historyBackfill[id]
+      if (!current) return {}
+      return {
+        historyBackfill: {
+          ...s.historyBackfill,
+          [id]: { ...current, loading: false, errorCode: code }
+        }
+      }
+    })
+    throw error
+  }
   if (!isCurrentSessionReopen(id, reopenGeneration)) return
   if (!payload) throw new Error(`no persisted history for ${id}`)
+  if (!latestPayload) {
+    installPage(payload, {
+      sessionId: id,
+      pageNumber: 0,
+      pageRecordCount: 0,
+      loadedRecordCount: payload.metadata.lastSeq ?? maxPayloadSeq(payload),
+      nextCursor: payload.metadata.lastSeq ?? maxPayloadSeq(payload),
+      targetLastSeq: payload.metadata.lastSeq ?? maxPayloadSeq(payload),
+      complete: true,
+      inFlightBytes: 0,
+      resumed: true
+    })
+  }
   const meta = payload.metadata
-
-  // Rebase the process-wide seq counter so live events appended after the
-  // restored transcript sort after it (nextSeq() returns > max restored seq).
-  rebaseSeqCounter(maxPayloadSeq(payload))
-
-  // Preserve controls already held by a cached closed session. Persisted
-  // history does not contain them, and optional reopen fields may be omitted.
-  const existingControls = captureReopenControlBaseline(get().sessions, id)
-
-  // Register the session record + local transcript BEFORE any agent work, so
-  // the pane shows the conversation instantly; the (possibly ~30s cold-spawn)
-  // reconnect below then only upgrades the session in place. The persisted
-  // `meta.agentId` may be a stale per-process UUID — remapped after spawn.
-  set((s) => ({
-    sessions: {
-      ...s.sessions,
-      [id]: {
-        id,
-        conversationId: meta.conversationId,
-        agentId: meta.agentId,
-        cwd: meta.cwd,
-        projectId: meta.projectId,
-        status: 'closed',
-        title: meta.title,
-        activeTurn: false,
-        openTurnId: null,
-        modes: existingControls?.modes ?? null,
-        models: existingControls?.models ?? null,
-        configOptions: existingControls?.configOptions ?? [],
-        lastError: null,
-        createdAt: meta.createdAt,
-        replaying: null,
-        worktreePath: meta.worktreePath,
-        worktreeBranch: meta.worktreeBranch
-      }
-    },
-    messages: { ...s.messages, [id]: trimLiveWindow(payload.messages, id) },
-    // Restore the mirrored tool calls so the timeline shows the tool cards
-    // again — without this only thoughts + replies survive a reopen.
-    toolCalls: { ...s.toolCalls, [id]: restoredToolCalls(payload) }
-  }))
-  onTranscriptInstalled()
 
   // Rehydrate the sticky plan from the latest assistant message's
   // `termul-plan` fence (single source of truth). Scans the payload messages
@@ -2939,6 +3019,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
   selectedAgentConfigId: null,
   sessionIndex: [],
   openingHistoryIds: {},
+  historyBackfill: {},
   restoringChatIds: {},
   launchingSessionIds: {},
   discoveredSessions: {},
@@ -5798,8 +5879,10 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     }
     if (dropTranscriptIds.length > 0) {
       set((s) => {
-        let next: Pick<AcpState, 'messages' | 'toolCalls' | 'commands' | 'sessionUsage' | 'plans'> =
-          s
+        let next: Pick<
+          AcpState,
+          'messages' | 'toolCalls' | 'commands' | 'sessionUsage' | 'plans' | 'historyBackfill'
+        > = s
         for (const id of dropTranscriptIds) {
           next = dropSessionTranscriptState(next, id)
         }
@@ -5967,6 +6050,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
         plans: remap(state.plans),
         commands: remap(state.commands),
         sessionUsage: remap(state.sessionUsage),
+        historyBackfill: remap(state.historyBackfill),
         promptQueues: remap(state.promptQueues),
         suppressQueueFlush: remap(state.suppressQueueFlush),
         restoringChatIds: remap(state.restoringChatIds),

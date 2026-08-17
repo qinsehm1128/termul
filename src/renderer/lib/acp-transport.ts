@@ -27,6 +27,9 @@ import {
   type AcpAuthenticateReply,
   type AcpRuntimePolicy,
   type AuthenticatePayload,
+  assertConversationHistoryPage,
+  assertConversationHistoryPageRequest,
+  type ConversationHistoryPageV1,
   type HistoryMode,
   type PersistedSessionSummary,
   type SessionSnapshotEvent,
@@ -187,10 +190,16 @@ export interface AcpTransport {
   historyMode?(): HistoryMode | 'tauri_store'
   listPersistedSessions?(): Promise<PersistedSessionSummary[]>
   openPersistedSession?(sessionId: SessionId, lastSeq?: number): Promise<void>
-  /** Web/remote: fetch the full stored transcript for a session (server mode). */
+  /** Compatibility full read. Production history loading uses getSessionPayloadPage. */
   getSessionPayload?(
     sessionId: SessionId
   ): Promise<import('@/lib/acp-history-persistence').SessionPayload | null>
+  /** Web/remote bounded history page. Calls are serialized per session. */
+  getSessionPayloadPage?(
+    sessionId: SessionId,
+    afterSeq: number,
+    limit: number
+  ): Promise<ConversationHistoryPageV1>
   onEvent<T>(eventName: string, callback: (payload: T) => void): () => void
   /** Web: open socket + placeholder authenticate. No-op on Tauri. */
   connect(): Promise<void>
@@ -524,6 +533,8 @@ export class WsAcpTransport implements AcpTransport {
   /** Coalesces overlapping foreground/pageshow/resume/online health checks. */
   private resumeValidation: Promise<void> | null = null
   private readonly pending = new Map<string, Pending>()
+  /** Completion tails serialize bounded history requests independently per session. */
+  private readonly historyPageRequests = new Map<string, Promise<void>>()
   private readonly listeners = new Map<string, Set<EventListener>>()
   /** Per-session last contiguous delivered seq. */
   private readonly lastSeq = new Map<string, number>()
@@ -841,6 +852,37 @@ export class WsAcpTransport implements AcpTransport {
     await this.connect()
     this.subscribed.add(sessionId)
     await this.request('open_persisted_session', { sessionId, lastSeq })
+  }
+
+  async getSessionPayloadPage(
+    sessionId: SessionId,
+    afterSeq: number,
+    limit: number
+  ): Promise<ConversationHistoryPageV1> {
+    assertConversationHistoryPageRequest(afterSeq, limit)
+    const previous = this.historyPageRequests.get(sessionId)
+    const request = (async () => {
+      if (previous) await previous.catch(() => undefined)
+      const page = await this.request<ConversationHistoryPageV1>('get_session_payload_page', {
+        sessionId,
+        afterSeq,
+        limit
+      })
+      assertConversationHistoryPage(page, { sessionId, afterSeq, limit })
+      return page
+    })()
+    const completion = request.then(
+      () => undefined,
+      () => undefined
+    )
+    this.historyPageRequests.set(sessionId, completion)
+    try {
+      return await request
+    } finally {
+      if (this.historyPageRequests.get(sessionId) === completion) {
+        this.historyPageRequests.delete(sessionId)
+      }
+    }
   }
 
   async getSessionPayload(

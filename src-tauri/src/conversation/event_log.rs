@@ -11,6 +11,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{copy, BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -27,6 +28,9 @@ use crate::conversation::durable_fs::DurableFileSystem;
 
 pub const CONVERSATION_EVENT_SCHEMA_VERSION: u32 = 2;
 pub const SPARSE_OFFSET_STRIDE: u64 = 256;
+/// Immutable sparse-index chunk size. Only the append tail is copied when an overlapping reader
+/// holds the previous [`EventLogScan`] generation.
+pub const SPARSE_INDEX_CHUNK_ENTRIES: usize = 1_024;
 pub const MIN_EVENT_PAGE_LIMIT: usize = 1;
 pub const MAX_EVENT_PAGE_LIMIT: usize = 1_000;
 pub const MESSAGES_FILE: &str = "messages.jsonl";
@@ -217,9 +221,178 @@ pub struct SparseEventOffset {
     pub byte_offset: u64,
 }
 
+/// Append-bounded sparse offsets: full 1024-entry chunks are immutable and shared between scan
+/// generations; only the current tail is copied by [`Clone`]. The fixed chunk size also provides
+/// O(1) logical indexing, allowing one `partition_point` over the complete logical sequence.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SparseOffsetEntries {
+    chunks: Arc<Vec<Arc<Vec<SparseEventOffset>>>>,
+    tail: Vec<SparseEventOffset>,
+}
+
+impl Default for SparseOffsetEntries {
+    fn default() -> Self {
+        Self {
+            chunks: Arc::new(Vec::new()),
+            tail: Vec::new(),
+        }
+    }
+}
+
+impl Clone for SparseOffsetEntries {
+    fn clone(&self) -> Self {
+        let mut tail = if self.tail.is_empty() {
+            Vec::new()
+        } else {
+            Vec::with_capacity(SPARSE_INDEX_CHUNK_ENTRIES)
+        };
+        tail.extend_from_slice(&self.tail);
+        #[cfg(test)]
+        record_sparse_index_clone(
+            self.tail.len(),
+            tail.capacity()
+                .saturating_mul(std::mem::size_of::<SparseEventOffset>()),
+        );
+        Self {
+            chunks: Arc::clone(&self.chunks),
+            tail,
+        }
+    }
+}
+
+impl SparseOffsetEntries {
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.chunks
+            .len()
+            .saturating_mul(SPARSE_INDEX_CHUNK_ENTRIES)
+            .saturating_add(self.tail.len())
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.chunks.is_empty() && self.tail.is_empty()
+    }
+
+    #[must_use]
+    pub fn first(&self) -> Option<&SparseEventOffset> {
+        self.get(0)
+    }
+
+    #[must_use]
+    pub fn get(&self, index: usize) -> Option<&SparseEventOffset> {
+        let sealed_len = self
+            .chunks
+            .len()
+            .saturating_mul(SPARSE_INDEX_CHUNK_ENTRIES);
+        if index < sealed_len {
+            let chunk_index = index / SPARSE_INDEX_CHUNK_ENTRIES;
+            let entry_index = index % SPARSE_INDEX_CHUNK_ENTRIES;
+            self.chunks.get(chunk_index)?.get(entry_index)
+        } else {
+            self.tail.get(index.saturating_sub(sealed_len))
+        }
+    }
+
+    fn push(&mut self, entry: SparseEventOffset) {
+        if self.tail.is_empty() && self.tail.capacity() < SPARSE_INDEX_CHUNK_ENTRIES {
+            self.tail.reserve_exact(SPARSE_INDEX_CHUNK_ENTRIES);
+            #[cfg(test)]
+            record_sparse_index_allocation(
+                SPARSE_INDEX_CHUNK_ENTRIES
+                    .saturating_mul(std::mem::size_of::<SparseEventOffset>()),
+            );
+        }
+        self.tail.push(entry);
+        if self.tail.len() == SPARSE_INDEX_CHUNK_ENTRIES {
+            let sealed = Arc::new(std::mem::take(&mut self.tail));
+            #[cfg(test)]
+            if Arc::strong_count(&self.chunks) > 1 {
+                record_sparse_index_allocation(
+                    self.chunks
+                        .len()
+                        .saturating_mul(std::mem::size_of::<Arc<Vec<SparseEventOffset>>>()),
+                );
+            }
+            Arc::make_mut(&mut self.chunks).push(sealed);
+        }
+    }
+
+    /// Logical equivalent of slice [`partition_point`](slice::partition_point), with deterministic
+    /// comparison instrumentation in tests. Logical indexing is O(1) because every sealed chunk
+    /// has exactly [`SPARSE_INDEX_CHUNK_ENTRIES`] entries.
+    fn partition_point<P>(&self, mut predicate: P) -> usize
+    where
+        P: FnMut(&SparseEventOffset) -> bool,
+    {
+        let mut left = 0usize;
+        let mut size = self.len();
+        while size > 0 {
+            let half = size / 2;
+            let middle = left + half;
+            #[cfg(test)]
+            SPARSE_LOOKUP_COMPARISONS.set(SPARSE_LOOKUP_COMPARISONS.get().saturating_add(1));
+            if predicate(
+                self.get(middle)
+                    .expect("logical sparse-index position must exist"),
+            ) {
+                left = middle + 1;
+                size -= half + 1;
+            } else {
+                size = half;
+            }
+        }
+        left
+    }
+
+    #[must_use]
+    fn anchor_at_or_before(&self, after_seq: u64) -> Option<SparseEventOffset> {
+        let insertion = self.partition_point(|entry| entry.seq <= after_seq);
+        if insertion == 0 {
+            self.first().copied()
+        } else {
+            self.get(insertion - 1).copied()
+        }
+    }
+
+    /// Compatibility iterator used by repository validation tests. Sparse entries are `Copy`, so
+    /// a small requested window does not expose or flatten the chunk storage.
+    pub fn windows(
+        &self,
+        size: usize,
+    ) -> impl Iterator<Item = Vec<SparseEventOffset>> + '_ {
+        assert!(size > 0, "window size must be non-zero");
+        let window_count = self.len().checked_sub(size).map_or(0, |count| count + 1);
+        (0..window_count).map(move |start| {
+            (start..start + size)
+                .map(|index| {
+                    *self
+                        .get(index)
+                        .expect("sparse-index window position must exist")
+                })
+                .collect()
+        })
+    }
+
+    #[cfg(test)]
+    fn get_mut_for_test(&mut self, index: usize) -> Option<&mut SparseEventOffset> {
+        let sealed_len = self
+            .chunks
+            .len()
+            .saturating_mul(SPARSE_INDEX_CHUNK_ENTRIES);
+        if index < sealed_len {
+            let chunk_index = index / SPARSE_INDEX_CHUNK_ENTRIES;
+            let entry_index = index % SPARSE_INDEX_CHUNK_ENTRIES;
+            Arc::make_mut(Arc::make_mut(&mut self.chunks).get_mut(chunk_index)?).get_mut(entry_index)
+        } else {
+            self.tail.get_mut(index.saturating_sub(sealed_len))
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StreamSparseOffsets {
-    pub entries: Vec<SparseEventOffset>,
+    pub entries: SparseOffsetEntries,
     pub event_count: u64,
     pub validated_bytes: u64,
     pub last_seq: u64,
@@ -325,6 +498,28 @@ impl EventLogScan {
 thread_local! {
     static APPLY_EVENT_COUNT: Cell<u64> = const { Cell::new(0) };
     static FULL_MATERIALIZATION_COUNT: Cell<u64> = const { Cell::new(0) };
+    static SPARSE_LOOKUP_COMPARISONS: Cell<usize> = const { Cell::new(0) };
+    static SPARSE_INDEX_COPIED_ENTRIES: Cell<usize> = const { Cell::new(0) };
+    static SPARSE_INDEX_ALLOCATED_BYTES: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+fn record_sparse_index_clone(copied_entries: usize, allocated_bytes: usize) {
+    SPARSE_INDEX_COPIED_ENTRIES.set(
+        SPARSE_INDEX_COPIED_ENTRIES
+            .get()
+            .saturating_add(copied_entries),
+    );
+    record_sparse_index_allocation(allocated_bytes);
+}
+
+#[cfg(test)]
+fn record_sparse_index_allocation(allocated_bytes: usize) {
+    SPARSE_INDEX_ALLOCATED_BYTES.set(
+        SPARSE_INDEX_ALLOCATED_BYTES
+            .get()
+            .saturating_add(allocated_bytes),
+    );
 }
 
 #[cfg(test)]
@@ -336,6 +531,30 @@ pub(crate) fn reset_operation_counters() {
 #[cfg(test)]
 pub(crate) fn operation_counters() -> (u64, u64) {
     (APPLY_EVENT_COUNT.get(), FULL_MATERIALIZATION_COUNT.get())
+}
+
+#[cfg(test)]
+fn reset_sparse_lookup_comparisons() {
+    SPARSE_LOOKUP_COMPARISONS.set(0);
+}
+
+#[cfg(test)]
+fn sparse_lookup_comparisons() -> usize {
+    SPARSE_LOOKUP_COMPARISONS.get()
+}
+
+#[cfg(test)]
+fn reset_sparse_index_clone_metrics() {
+    SPARSE_INDEX_COPIED_ENTRIES.set(0);
+    SPARSE_INDEX_ALLOCATED_BYTES.set(0);
+}
+
+#[cfg(test)]
+fn sparse_index_clone_metrics() -> (usize, usize) {
+    (
+        SPARSE_INDEX_COPIED_ENTRIES.get(),
+        SPARSE_INDEX_ALLOCATED_BYTES.get(),
+    )
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1137,14 +1356,7 @@ pub fn read_event_page(
         if offsets.event_count == 0 {
             continue;
         }
-        let Some(anchor) = offsets
-            .entries
-            .iter()
-            .rev()
-            .find(|entry| entry.seq <= after_seq)
-            .or_else(|| offsets.entries.first())
-            .copied()
-        else {
+        let Some(anchor) = offsets.entries.anchor_at_or_before(after_seq) else {
             return Err(error(
                 ConversationErrorCode::ConversationRecoveryRequired,
                 EventLogErrorKind::CorruptRecord,
@@ -1879,6 +2091,112 @@ mod tests {
     }
 
     #[test]
+    fn chunked_index_append_is_bounded() {
+        let mut scan = EventLogScan::default();
+        for seq in 1..=1_000_000_u64 {
+            let byte_offset = scan.sparse_offsets.messages.validated_bytes;
+            scan.record_appended(
+                ConversationEventStream::Messages,
+                seq,
+                byte_offset,
+                1,
+            );
+        }
+        scan.frontier.last_seq = 1_000_000;
+        assert_eq!(
+            scan.sparse_offsets.messages.entries.len(),
+            1_000_000_usize.div_ceil(SPARSE_OFFSET_STRIDE as usize)
+        );
+
+        let original_generation = Arc::new(scan);
+        let mut writer_generation = Arc::clone(&original_generation);
+        let original_entries = original_generation
+            .sparse_offsets
+            .messages
+            .entries
+            .len();
+        let mut allocated_samples = Vec::with_capacity(10_000);
+        let mut max_copied_entries = 0usize;
+
+        for append_index in 1..=10_000_u64 {
+            // This is the expensive overlap from PERF-RR-006: the reader holds the exact current
+            // generation while the writer publishes the next one through Arc::make_mut.
+            let overlapping_reader = Arc::clone(&writer_generation);
+            reset_sparse_index_clone_metrics();
+            let stream_bytes = writer_generation
+                .sparse_offsets
+                .messages
+                .validated_bytes;
+            let next_seq = 1_000_000 + append_index;
+            let next_generation = Arc::make_mut(&mut writer_generation);
+            next_generation.record_appended(
+                ConversationEventStream::Messages,
+                next_seq,
+                stream_bytes,
+                1,
+            );
+            next_generation.frontier.last_seq = next_seq;
+            let (copied_entries, allocated_bytes) = sparse_index_clone_metrics();
+            max_copied_entries = max_copied_entries.max(copied_entries);
+            allocated_samples.push(allocated_bytes);
+            assert_eq!(overlapping_reader.last_seq(), next_seq - 1);
+        }
+
+        allocated_samples.sort_unstable();
+        let p99_index = (allocated_samples.len() * 99 / 100).min(allocated_samples.len() - 1);
+        let p99_allocated_bytes = allocated_samples[p99_index];
+        assert!(
+            max_copied_entries <= SPARSE_INDEX_CHUNK_ENTRIES,
+            "overlapping append copied {max_copied_entries} sparse entries"
+        );
+        assert!(
+            p99_allocated_bytes <= 256 * 1024,
+            "overlapping append allocated {p99_allocated_bytes} bytes at p99"
+        );
+        assert_eq!(
+            original_generation
+                .sparse_offsets
+                .messages
+                .entries
+                .len(),
+            original_entries,
+            "the held reader generation must remain immutable"
+        );
+    }
+
+    #[test]
+    fn sparse_offset_lookup_is_logarithmic() {
+        let mut entries = SparseOffsetEntries::default();
+        for index in 0..100_000_u64 {
+            entries.push(SparseEventOffset {
+                seq: index.saturating_mul(2).saturating_add(1),
+                byte_offset: index.saturating_mul(64),
+            });
+        }
+        assert_eq!(entries.len(), 100_000);
+
+        let probes = [1_u64, 99_999, 199_999];
+        let mut maximum_comparisons = 0usize;
+        for iteration in 0..10_000_usize {
+            let after_seq = probes[iteration % probes.len()];
+            reset_sparse_lookup_comparisons();
+            let anchor = entries.anchor_at_or_before(after_seq).unwrap();
+            let comparisons = sparse_lookup_comparisons();
+            maximum_comparisons = maximum_comparisons.max(comparisons);
+            assert!(anchor.seq <= after_seq);
+            if let Some(next) = entries.get(
+                entries.partition_point(|entry| entry.seq <= after_seq),
+            ) {
+                assert!(next.seq > after_seq);
+            }
+        }
+        assert!(
+            maximum_comparisons <= 19,
+            "100,000-offset partition_point used {maximum_comparisons} comparisons"
+        );
+    }
+
+    #[test]
     fn replay_merges_all_streams_by_one_global_sequence() {
         let (_temp, directory, id, durable_fs) = fixture();
         for record in [
@@ -1942,7 +2260,13 @@ mod tests {
         }
 
         let mut corrupt_offsets = scan.clone();
-        corrupt_offsets.sparse_offsets.messages.entries[0].byte_offset += 1;
+        corrupt_offsets
+            .sparse_offsets
+            .messages
+            .entries
+            .get_mut_for_test(0)
+            .unwrap()
+            .byte_offset += 1;
         let error = read_event_page(&directory, id, &corrupt_offsets, 0, 17).unwrap_err();
         assert_eq!(
             error.code,

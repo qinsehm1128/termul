@@ -1,5 +1,9 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import type {
+  ConversationHistoryPageV1,
+  ConversationHistoryRecordV1
+} from '@shared/types/web-protocol.types'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('@/lib/log-api', () => ({
@@ -66,8 +70,16 @@ class FakeWebSocket {
   }
   snapshotEvents: unknown[] = []
   snapshotFailureCodes = new Map<string, string>()
-  /** Session payloads served by `get_session_payload`; unknown ids → not_found. */
+  /** Session payloads served by compatibility `get_session_payload`; unknown ids → not_found. */
   sessionPayloads: Record<string, unknown> = {}
+  /** Raw durable records served by bounded `get_session_payload_page`. */
+  sessionHistoryRecords: Record<string, ConversationHistoryRecordV1[]> = {}
+  historyPageFailureCodes = new Map<string, string>()
+  holdHistoryPages = false
+  heldHistoryPageRequests: Array<{
+    id: string
+    payload: { sessionId: string; afterSeq: number; limit: number }
+  }> = []
   reopenOutcome: unknown = {
     modes: {
       currentModeId: 'ask',
@@ -346,12 +358,62 @@ class FakeWebSocket {
       this.emitReply({ id: req.id, ok: true, payload: {} })
       return
     }
+    if (req.type === 'get_session_payload_page') {
+      const payload = req.payload as { sessionId?: string; afterSeq?: number; limit?: number }
+      if (
+        !payload.sessionId ||
+        !Number.isSafeInteger(payload.afterSeq) ||
+        payload.afterSeq! < 0 ||
+        !Number.isSafeInteger(payload.limit) ||
+        payload.limit! < 1 ||
+        payload.limit! > 1_000
+      ) {
+        this.emitReply({
+          id: req.id,
+          ok: false,
+          err: { code: 'VALIDATION_ERROR', message: 'invalid history page request' }
+        })
+        return
+      }
+      const failureCode = this.historyPageFailureCodes.get(payload.sessionId)
+      if (failureCode) {
+        this.emitReply({
+          id: req.id,
+          ok: false,
+          err: { code: failureCode, message: 'history page failed' }
+        })
+        return
+      }
+      const request = {
+        id: req.id,
+        payload: {
+          sessionId: payload.sessionId,
+          afterSeq: payload.afterSeq!,
+          limit: payload.limit!
+        }
+      }
+      if (this.holdHistoryPages) {
+        this.heldHistoryPageRequests.push(request)
+        return
+      }
+      this.replyHistoryPage(request)
+      return
+    }
     if (req.type === 'get_session_payload') {
-      // Standalone history: serve the registered renderer-shaped payload, or
-      // the server's `not_found` reply for absent ids.
+      // Compatibility only. Large transcripts require the bounded page route.
       const payload = req.payload as { sessionId?: string }
       const stored = payload.sessionId ? this.sessionPayloads[payload.sessionId] : undefined
-      if (stored) {
+      const records = payload.sessionId ? this.sessionHistoryRecords[payload.sessionId] : undefined
+      if (records && records.length > 1_000) {
+        this.emitReply({
+          id: req.id,
+          ok: false,
+          err: {
+            code: 'CONVERSATION_HISTORY_PAGING_REQUIRED',
+            message: 'use bounded history pages'
+          }
+        })
+      } else if (stored) {
         this.emitReply({ id: req.id, ok: true, payload: stored })
       } else {
         this.emitReply({
@@ -367,6 +429,34 @@ class FakeWebSocket {
       ok: false,
       err: { code: 'not_implemented', message: `${req.type} stub` }
     })
+  }
+
+  replyHistoryPage(request: {
+    id: string
+    payload: { sessionId: string; afterSeq: number; limit: number }
+  }): void {
+    const records = this.sessionHistoryRecords[request.payload.sessionId]
+    if (!records) {
+      this.emitReply({
+        id: request.id,
+        ok: false,
+        err: { code: 'not_found', message: 'session history not found' }
+      })
+      return
+    }
+    const targetLastSeq = records.at(-1)?.seq ?? 0
+    const pageRecords = records
+      .filter((record) => record.seq > request.payload.afterSeq)
+      .slice(0, request.payload.limit)
+    const nextCursor = pageRecords.at(-1)?.seq ?? targetLastSeq
+    const page: ConversationHistoryPageV1 = {
+      schemaVersion: 1,
+      records: pageRecords,
+      nextCursor,
+      complete: nextCursor === targetLastSeq,
+      targetLastSeq
+    }
+    this.emitReply({ id: request.id, ok: true, payload: page })
   }
 
   close(): void {
@@ -964,6 +1054,139 @@ describe('WsAcpTransport', () => {
     await transport.connect()
     await transport.subscribeSession('s1', 99)
     expect(recoveries).toEqual([{ sessionId: 's1', degraded: true }])
+    transport.dispose()
+  })
+
+  it('getSessionPayloadPage requests exact 250-record pages and advances the cursor without full reads', async () => {
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+    sock.sessionHistoryRecords['s-paged'] = Array.from({ length: 500 }, (_, index) => ({
+      schemaVersion: 1 as const,
+      sessionId: 's-paged',
+      seq: index + 1,
+      type: index % 2 === 0 ? 'message_chunk' : 'tool_call',
+      recordedAt: index + 1,
+      payload: { marker: index + 1 }
+    }))
+
+    const first = await transport.getSessionPayloadPage('s-paged', 0, 250)
+    const second = await transport.getSessionPayloadPage('s-paged', first.nextCursor, 250)
+
+    expect(first.records).toHaveLength(250)
+    expect(first.nextCursor).toBe(250)
+    expect(first.complete).toBe(false)
+    expect(second.records).toHaveLength(250)
+    expect(second.nextCursor).toBe(500)
+    expect(second.complete).toBe(true)
+    const frames = sock.sent.map(
+      (frame) => JSON.parse(frame) as { type: string; payload: Record<string, unknown> }
+    )
+    expect(
+      frames
+        .filter((frame) => frame.type === 'get_session_payload_page')
+        .map(({ type, payload }) => ({ type, payload }))
+    ).toEqual([
+      {
+        type: 'get_session_payload_page',
+        payload: { sessionId: 's-paged', afterSeq: 0, limit: 250 }
+      },
+      {
+        type: 'get_session_payload_page',
+        payload: { sessionId: 's-paged', afterSeq: 250, limit: 250 }
+      }
+    ])
+    expect(frames.some((frame) => frame.type === 'get_session_payload')).toBe(false)
+    transport.dispose()
+  })
+
+  it('serializes page requests so each session has at most one in flight', async () => {
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+    sock.sessionHistoryRecords.serial = [1, 2].map((seq) => ({
+      schemaVersion: 1 as const,
+      sessionId: 'serial',
+      seq,
+      type: 'message_chunk',
+      recordedAt: seq,
+      payload: { marker: seq }
+    }))
+    sock.holdHistoryPages = true
+
+    const first = transport.getSessionPayloadPage('serial', 0, 1)
+    const second = transport.getSessionPayloadPage('serial', 1, 1)
+    await vi.waitFor(() => expect(sock.heldHistoryPageRequests).toHaveLength(1))
+    expect(
+      sock.sent
+        .map((frame) => JSON.parse(frame) as { type: string })
+        .filter((frame) => frame.type === 'get_session_payload_page')
+    ).toHaveLength(1)
+
+    sock.replyHistoryPage(sock.heldHistoryPageRequests.shift()!)
+    await expect(first).resolves.toMatchObject({ nextCursor: 1, complete: false })
+    await vi.waitFor(() => expect(sock.heldHistoryPageRequests).toHaveLength(1))
+    sock.replyHistoryPage(sock.heldHistoryPageRequests.shift()!)
+    await expect(second).resolves.toMatchObject({ nextCursor: 2, complete: true })
+    transport.dispose()
+  })
+
+  it.each([
+    [0, 0],
+    [0, -1],
+    [0, 1.5],
+    [0, 1_001],
+    [-1, 250]
+  ])('rejects invalid history request afterSeq=%s limit=%s before sending', async (afterSeq, limit) => {
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+
+    await expect(transport.getSessionPayloadPage('invalid', afterSeq, limit)).rejects.toMatchObject(
+      {
+        code: 'VALIDATION_ERROR'
+      }
+    )
+    expect(
+      sock.sent.some(
+        (frame) => (JSON.parse(frame) as { type: string }).type === 'get_session_payload_page'
+      )
+    ).toBe(false)
+    transport.dispose()
+  })
+
+  it('preserves stable page and compatibility paging-required errors', async () => {
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+    sock.historyPageFailureCodes.set('page-fail', 'CONVERSATION_HISTORY_PAGING_REQUIRED')
+    await expect(transport.getSessionPayloadPage('page-fail', 0, 250)).rejects.toMatchObject({
+      code: 'CONVERSATION_HISTORY_PAGING_REQUIRED'
+    })
+
+    sock.sessionHistoryRecords.compat = Array.from({ length: 1_001 }, (_, index) => ({
+      schemaVersion: 1 as const,
+      sessionId: 'compat',
+      seq: index + 1,
+      type: 'message_chunk',
+      recordedAt: index + 1,
+      payload: {}
+    }))
+    await expect(transport.getSessionPayload('compat')).rejects.toMatchObject({
+      code: 'CONVERSATION_HISTORY_PAGING_REQUIRED'
+    })
     transport.dispose()
   })
 

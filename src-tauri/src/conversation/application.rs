@@ -6,6 +6,7 @@
 //! the stable application envelope.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -13,7 +14,8 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::conversation::lifecycle::{
-    ConversationLifecycleError, ConversationLifecycleOutcome, ConversationLifecycleService,
+    ConversationLifecycleAction, ConversationLifecycleError, ConversationLifecycleOutcome,
+    ConversationLifecycleService,
 };
 use crate::conversation::migration::{
     MigrationHostMode, MigrationMapV1, MigrationPhase, ReaderPrecedence, RecoveryActionResult,
@@ -152,6 +154,7 @@ pub struct ConversationApplicationService {
     workspace: Arc<SessionWorkspaceService>,
     legacy_index: HashMap<(LegacyConversationSourceKind, String), Vec<ConversationId>>,
     lifecycle: OnceLock<ConversationLifecycleService>,
+    binding_generation: AtomicU64,
     host_kind: ConversationHostKind,
     migration_phase: MigrationPhase,
     reader_precedence: ReaderPrecedence,
@@ -214,6 +217,7 @@ impl ConversationApplicationService {
             workspace,
             legacy_index,
             lifecycle: OnceLock::new(),
+            binding_generation: AtomicU64::new(0),
             host_kind: host_mode.into(),
             migration_phase,
             reader_precedence,
@@ -228,6 +232,31 @@ impl ConversationApplicationService {
     #[must_use]
     pub fn writer(&self) -> Arc<ConversationWriter> {
         Arc::clone(&self.writer)
+    }
+
+    /// Monotonic invalidation token for repository binding indexes and bounded negative caches.
+    /// Bootstrap starts at zero; every committed attach/detach/rebind/suspend/replace outcome
+    /// advances it exactly once. The repository integration in the following task consumes this
+    /// source without inspecting or logging opaque binding values.
+    #[must_use]
+    pub fn binding_generation(&self) -> u64 {
+        self.binding_generation.load(Ordering::Acquire)
+    }
+
+    /// Record the initial canonical `binding_bound` outcome. Creation owns that mutation outside
+    /// this service, so its caller explicitly publishes the same one-step generation advance.
+    pub fn record_binding_attached(
+        &self,
+        conversation_id: ConversationId,
+        previous_revision: u64,
+        revision: u64,
+    ) -> u64 {
+        self.advance_binding_generation(
+            "attach_binding",
+            conversation_id,
+            previous_revision,
+            revision,
+        )
     }
 
     pub fn attach_lifecycle(&self, lifecycle: ConversationLifecycleService) -> Result<()> {
@@ -581,6 +610,10 @@ impl ConversationApplicationService {
                 .map_err(map_lifecycle_error)
         }
         .await;
+        self.advance_binding_generation_for_outcome(
+            ConversationLifecycleAction::DetachBinding,
+            &result,
+        );
         log_result(
             "detach_binding",
             Some(conversation_id),
@@ -606,6 +639,10 @@ impl ConversationApplicationService {
                 .map_err(map_lifecycle_error)
         }
         .await;
+        self.advance_binding_generation_for_outcome(
+            ConversationLifecycleAction::RebindDetachedBinding,
+            &result,
+        );
         log_result(
             "rebind_binding",
             Some(conversation_id),
@@ -631,6 +668,10 @@ impl ConversationApplicationService {
                 .map_err(map_lifecycle_error)
         }
         .await;
+        self.advance_binding_generation_for_outcome(
+            ConversationLifecycleAction::SuspendBinding,
+            &result,
+        );
         log_result(
             "suspend_binding",
             Some(conversation_id),
@@ -657,6 +698,10 @@ impl ConversationApplicationService {
                 .map_err(map_lifecycle_error)
         }
         .await;
+        self.advance_binding_generation_for_outcome(
+            ConversationLifecycleAction::ReplaceBinding,
+            &result,
+        );
         log_result(
             "replace_binding",
             Some(conversation_id),
@@ -691,6 +736,83 @@ impl ConversationApplicationService {
             &result,
         );
         result
+    }
+
+    fn advance_binding_generation_for_outcome(
+        &self,
+        expected_action: ConversationLifecycleAction,
+        result: &Result<ConversationLifecycleOutcome>,
+    ) {
+        let Ok(ConversationLifecycleOutcome::Updated {
+            action,
+            conversation_id,
+            previous_revision,
+            revision,
+            ..
+        }) = result
+        else {
+            return;
+        };
+        if *action != expected_action {
+            log::error!(
+                "[conversation-application] binding generation action mismatch conversation_id={} expected={:?} actual={:?}",
+                conversation_id,
+                expected_action,
+                action
+            );
+            return;
+        }
+        self.advance_binding_generation(
+            "binding_lifecycle",
+            *conversation_id,
+            *previous_revision,
+            *revision,
+        );
+    }
+
+    fn advance_binding_generation(
+        &self,
+        operation: &'static str,
+        conversation_id: ConversationId,
+        previous_revision: u64,
+        revision: u64,
+    ) -> u64 {
+        if previous_revision.checked_add(1) != Some(revision) {
+            log::error!(
+                "[conversation-application] binding generation rejected operation={} conversation_id={} previous_revision={} revision={} code=CONVERSATION_RECOVERY_REQUIRED",
+                operation,
+                conversation_id,
+                previous_revision,
+                revision
+            );
+            return self.binding_generation();
+        }
+        match self.binding_generation.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |generation| generation.checked_add(1),
+        ) {
+            Ok(previous_generation) => {
+                let generation = previous_generation + 1;
+                log::info!(
+                    "[conversation-application] binding generation advanced operation={} conversation_id={} generation={} revision={}",
+                    operation,
+                    conversation_id,
+                    generation,
+                    revision
+                );
+                generation
+            }
+            Err(generation) => {
+                log::error!(
+                    "[conversation-application] binding generation overflow operation={} conversation_id={} generation={} code=CONVERSATION_RECOVERY_REQUIRED",
+                    operation,
+                    conversation_id,
+                    generation
+                );
+                generation
+            }
+        }
     }
 
     fn lifecycle(&self) -> Result<&ConversationLifecycleService> {
@@ -1161,6 +1283,45 @@ mod tests {
         assert_eq!(
             service.host_status().unwrap().state,
             ConversationHostState::Ready
+        );
+    }
+
+    #[tokio::test]
+    async fn binding_generation_advances_once_for_each_canonical_binding_outcome() {
+        let (_temp, service) = service().await;
+        let conversation_id = ConversationId::parse(ID).unwrap();
+        assert_eq!(service.binding_generation(), 0);
+        assert_eq!(service.record_binding_attached(conversation_id, 0, 1), 1);
+
+        for (index, action) in [
+            ConversationLifecycleAction::DetachBinding,
+            ConversationLifecycleAction::RebindDetachedBinding,
+            ConversationLifecycleAction::SuspendBinding,
+            ConversationLifecycleAction::ReplaceBinding,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let previous_revision = index as u64 + 1;
+            let result = Ok(ConversationLifecycleOutcome::Updated {
+                action,
+                conversation_id,
+                previous_revision,
+                revision: previous_revision + 1,
+                workspace_cwd: "/visible/conversation".to_string(),
+                lifecycle_state: ConversationLifecycleState::Ready,
+                current_binding: None,
+                previous_agent_session_id: None,
+            });
+            service.advance_binding_generation_for_outcome(action, &result);
+            assert_eq!(service.binding_generation(), index as u64 + 2);
+        }
+
+        let generation = service.binding_generation();
+        assert_eq!(
+            service.record_binding_attached(conversation_id, 99, 101),
+            generation,
+            "a non-canonical revision jump must not invalidate the binding index"
         );
     }
 

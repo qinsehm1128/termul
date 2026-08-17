@@ -1,11 +1,21 @@
 /** Desktop ACP history persistence boundary. */
 
 import { isConversationId } from '@shared/types/conversation.types'
-import type { PersistedSessionSummary } from '@shared/types/web-protocol.types'
+import {
+  assertConversationHistoryPage,
+  assertConversationHistoryPageRequest,
+  type ConversationHistoryPageV1,
+  type ConversationHistoryRecordV1,
+  type PersistedSessionSummary
+} from '@shared/types/web-protocol.types'
 import { runtimeT } from '@/i18n/runtime'
-import type { ToolCall } from '@/lib/acp-api'
+import type { ContentBlock, PlanEntry, SessionUsage, ToolCall } from '@/lib/acp-api'
 import { acpHistoryApi } from '@/lib/acp-history-api'
-import { getAcpTransport } from '@/lib/acp-transport'
+import {
+  AcpTransportError,
+  getAcpTransport,
+  isTransientAcpTransportError
+} from '@/lib/acp-transport'
 import { persistenceApi } from '@/lib/api'
 import { logFrontendError } from '@/lib/log-api'
 import type { ChatMessage, SessionStatus } from '@/stores/acp-store'
@@ -13,6 +23,8 @@ import type { ChatMessage, SessionStatus } from '@/stores/acp-store'
 export const SESSION_INDEX_KEY = 'acp/sessions/index'
 export const WIPE_MIGRATION_KEY = 'acp/sessions/migrated-v2'
 export const INACTIVE_PAYLOAD_CACHE_BUDGET = 3
+export const RENDERER_HISTORY_PAGE_SIZE = 250
+export const MAX_HISTORY_IN_FLIGHT_BYTES = 4 * 1024 * 1024
 
 export function sessionPayloadKey(id: string): string {
   return `acp/sessions/${id}`
@@ -59,6 +71,39 @@ export interface SessionPayload {
    * bound). Absent on payloads persisted before this field existed.
    */
   toolCalls?: ToolCall[]
+  /** Latest valid durable context-window snapshot. */
+  sessionUsage?: SessionUsage
+  /** Latest durable ACP plan replacement. */
+  plan?: PlanEntry[]
+}
+
+export interface HistoryPageProgress {
+  sessionId: string
+  pageNumber: number
+  pageRecordCount: number
+  loadedRecordCount: number
+  nextCursor: number
+  targetLastSeq: number
+  complete: boolean
+  inFlightBytes: number
+  resumed: boolean
+}
+
+export interface LoadSessionPayloadOptions {
+  /** Store-owned index metadata avoids a redundant list request before page one. */
+  metadata?: SessionIndexEntry
+  /** Awaited before the next request, guaranteeing page one is installed first. */
+  onPage?: (payload: SessionPayload, progress: HistoryPageProgress) => void | Promise<void>
+}
+
+export class ConversationHistoryLoadError extends Error {
+  readonly code: string
+
+  constructor(code: string, message: string) {
+    super(message)
+    this.name = 'ConversationHistoryLoadError'
+    this.code = code
+  }
 }
 
 /**
@@ -207,6 +252,269 @@ export function maxPayloadSeq(payload: Pick<SessionPayload, 'messages' | 'toolCa
 /** Restored tool calls for a payload, tolerant of legacy/corrupt shapes. */
 export function restoredToolCalls(payload: Pick<SessionPayload, 'toolCalls'>): ToolCall[] {
   return normalizedToolCalls(payload.toolCalls)
+}
+
+type JsonObject = Record<string, unknown>
+
+function asJsonObject(value: unknown): JsonObject | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as JsonObject)
+    : null
+}
+
+function asContentBlock(value: unknown): ContentBlock | null {
+  const object = asJsonObject(value)
+  return object && typeof object.type === 'string' ? (object as ContentBlock) : null
+}
+
+function appendHistoryBlock(existing: ContentBlock[], incoming: ContentBlock): ContentBlock[] {
+  if (incoming.type === 'text') {
+    const last = existing.at(-1)
+    if (last?.type === 'text') {
+      return [
+        ...existing.slice(0, -1),
+        { ...last, text: (last.text ?? '') + (incoming.text ?? '') }
+      ]
+    }
+  }
+  return [...existing, incoming]
+}
+
+class ProgressiveHistoryAccumulator {
+  private readonly sessionId: string
+  private readonly baseMetadata: SessionIndexEntry
+  private messages: ChatMessage[] = []
+  private toolCalls: ToolCall[] = []
+  private sessionUsage: SessionUsage | undefined
+  private plan: PlanEntry[] | undefined
+  private planSeen = false
+  private openRole: ChatMessage['role'] | null = null
+  private baselineUsed: number | undefined
+  private cursorValue = 0
+  private targetLastSeqValue: number | undefined
+  private loadedRecordCountValue = 0
+  private pageNumberValue = 0
+
+  constructor(metadata: SessionIndexEntry) {
+    this.sessionId = metadata.id
+    this.baseMetadata = { ...metadata, messageCount: 0, lastSeq: 0 }
+  }
+
+  get cursor(): number {
+    return this.cursorValue
+  }
+
+  get targetLastSeq(): number | undefined {
+    return this.targetLastSeqValue
+  }
+
+  get loadedRecordCount(): number {
+    return this.loadedRecordCountValue
+  }
+
+  get pageNumber(): number {
+    return this.pageNumberValue
+  }
+
+  applyPage(page: ConversationHistoryPageV1, limit: number): void {
+    assertConversationHistoryPage(page, {
+      sessionId: this.sessionId,
+      afterSeq: this.cursorValue,
+      limit,
+      targetLastSeq: this.targetLastSeqValue
+    })
+    for (const record of page.records) this.applyRecord(record)
+    this.cursorValue = page.nextCursor
+    this.targetLastSeqValue = page.targetLastSeq
+    this.loadedRecordCountValue += page.records.length
+    this.pageNumberValue += 1
+  }
+
+  snapshot(): SessionPayload {
+    return {
+      metadata: {
+        ...this.baseMetadata,
+        messageCount: this.messages.length,
+        lastSeq: this.cursorValue
+      },
+      messages: [...this.messages],
+      ...(this.toolCalls.length > 0 ? { toolCalls: [...this.toolCalls] } : {}),
+      ...(this.sessionUsage ? { sessionUsage: { ...this.sessionUsage } } : {}),
+      ...(this.planSeen ? { plan: [...(this.plan ?? [])] } : {})
+    }
+  }
+
+  private applyRecord(record: ConversationHistoryRecordV1): void {
+    const payload = asJsonObject(record.payload)
+    switch (record.type) {
+      case 'user_prompt':
+        this.openRole = null
+        this.pushUserPrompt(record, payload)
+        break
+      case 'message_chunk':
+        this.pushMessageChunk(record, payload)
+        break
+      case 'tool_call':
+        this.openRole = null
+        this.upsertToolCall(record, payload)
+        break
+      case 'tool_call_update':
+        this.updateToolCall(payload)
+        break
+      case 'prompt_complete':
+        this.openRole = null
+        break
+      case 'usage_update':
+        this.updateUsage(record, payload)
+        break
+      case 'plan_update':
+        this.updatePlan(payload)
+        break
+      default:
+        break
+    }
+  }
+
+  private pushUserPrompt(record: ConversationHistoryRecordV1, payload: JsonObject | null): void {
+    const turnId = typeof payload?.turnId === 'string' && payload.turnId ? payload.turnId : null
+    const content = Array.isArray(payload?.content)
+      ? payload.content.map(asContentBlock).filter((block): block is ContentBlock => block !== null)
+      : []
+    this.messages.push({
+      id: turnId ? `turn:${turnId}` : `user:seq-${record.seq}`,
+      role: 'user',
+      blocks: content,
+      streaming: false,
+      timestamp: record.recordedAt,
+      seq: record.seq
+    })
+  }
+
+  private pushMessageChunk(record: ConversationHistoryRecordV1, payload: JsonObject | null): void {
+    const role: ChatMessage['role'] = payload?.role === 'thought' ? 'thought' : 'agent'
+    const content = asContentBlock(payload?.content)
+    if (!content) return
+    if (this.openRole === role) {
+      const last = this.messages.at(-1)
+      if (last) {
+        this.messages = [
+          ...this.messages.slice(0, -1),
+          { ...last, blocks: appendHistoryBlock(last.blocks, content) }
+        ]
+      }
+      return
+    }
+    if (content.type === 'text' && !(content.text ?? '')) return
+    this.openRole = role
+    this.messages.push({
+      id: `snapshot:${role}:${record.seq}`,
+      role,
+      blocks: [content],
+      streaming: false,
+      timestamp: record.recordedAt,
+      seq: record.seq
+    })
+  }
+
+  private upsertToolCall(record: ConversationHistoryRecordV1, payload: JsonObject | null): void {
+    const toolCall = asJsonObject(payload?.toolCall)
+    if (!toolCall || typeof toolCall.toolCallId !== 'string' || !toolCall.toolCallId) return
+    const stamped: ToolCall = {
+      ...(toolCall as ToolCall),
+      timestamp: typeof toolCall.timestamp === 'number' ? toolCall.timestamp : record.recordedAt,
+      seq: typeof toolCall.seq === 'number' ? toolCall.seq : record.seq
+    }
+    const index = this.toolCalls.findIndex((entry) => entry.toolCallId === stamped.toolCallId)
+    if (index === -1) {
+      this.toolCalls = [...this.toolCalls, stamped]
+      return
+    }
+    const previous = this.toolCalls[index]
+    const next = [...this.toolCalls]
+    next[index] = {
+      ...previous,
+      ...stamped,
+      timestamp: previous.timestamp,
+      seq: previous.seq
+    }
+    this.toolCalls = next
+  }
+
+  private updateToolCall(payload: JsonObject | null): void {
+    const update = asJsonObject(payload?.update)
+    if (!update || typeof update.toolCallId !== 'string' || !update.toolCallId) return
+    const index = this.toolCalls.findIndex((entry) => entry.toolCallId === update.toolCallId)
+    if (index === -1) return
+    const previous = this.toolCalls[index]
+    const next = [...this.toolCalls]
+    next[index] = {
+      ...previous,
+      ...(update as ToolCall),
+      timestamp: previous.timestamp,
+      seq: previous.seq
+    }
+    this.toolCalls = next
+  }
+
+  private updateUsage(record: ConversationHistoryRecordV1, payload: JsonObject | null): void {
+    const used = payload?.used
+    const size = payload?.size
+    if (
+      typeof used !== 'number' ||
+      typeof size !== 'number' ||
+      !Number.isFinite(used) ||
+      !Number.isFinite(size) ||
+      used <= 0 ||
+      size <= 0
+    ) {
+      return
+    }
+    this.baselineUsed ??= used
+    const cost = asJsonObject(payload?.cost)
+    this.sessionUsage = {
+      used,
+      size,
+      baselineUsed: this.baselineUsed,
+      ...(typeof cost?.amount === 'number' && typeof cost.currency === 'string'
+        ? { cost: { amount: cost.amount, currency: cost.currency } }
+        : {}),
+      updatedAt: record.recordedAt,
+      source: 'reported'
+    }
+  }
+
+  private updatePlan(payload: JsonObject | null): void {
+    const plan = asJsonObject(payload?.plan)
+    if (!Array.isArray(plan?.entries)) return
+    this.planSeen = true
+    const entries = plan.entries.filter((entry): entry is PlanEntry => {
+      const object = asJsonObject(entry)
+      return object !== null && typeof object.content === 'string'
+    })
+    this.plan = entries.length > 0 ? entries : undefined
+  }
+}
+
+interface PartialHistoryAssembly {
+  mode: 'server' | 'tauri_store'
+  accumulator: ProgressiveHistoryAccumulator
+}
+
+const partialHistoryAssemblies = new Map<string, PartialHistoryAssembly>()
+const historyPageRequestTails = new Map<string, Promise<void>>()
+const historyPageEncoder = new TextEncoder()
+let currentHistoryInFlightBytes = 0
+let peakHistoryInFlightBytes = 0
+
+export function historyPagingMetrics(): { currentBytes: number; peakBytes: number } {
+  return { currentBytes: currentHistoryInFlightBytes, peakBytes: peakHistoryInFlightBytes }
+}
+
+export function _resetHistoryPagingForTesting(): void {
+  partialHistoryAssemblies.clear()
+  historyPageRequestTails.clear()
+  currentHistoryInFlightBytes = 0
+  peakHistoryInFlightBytes = 0
 }
 
 function stablePayload(payload: SessionPayload): string {
@@ -448,6 +756,7 @@ export function queueSessionPayloadDelete(id: string): Promise<void> {
   deletedSessionIds.add(id)
   payloadCache.delete(id)
   pinnedPayloads.delete(id)
+  partialHistoryAssemblies.delete(id)
   return new Promise<void>((resolve, reject) => {
     const existing = pendingHistoryOperations.get(id)
     const waiter = { resolve, reject }
@@ -531,23 +840,205 @@ export function setCachedSessionPayload(id: string, payload: SessionPayload): vo
   touchPayload(id, payload)
 }
 
-export async function loadSessionPayload(id: string): Promise<SessionPayload | null> {
+function historyErrorCode(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null || !('code' in error)) return undefined
+  return typeof error.code === 'string' ? error.code : undefined
+}
+
+function isTransientHistoryError(error: unknown): boolean {
+  if (isTransientAcpTransportError(error)) return true
+  const code = historyErrorCode(error)
+  if (code) {
+    return ['NETWORK_ERROR', 'closed', 'timeout', 'agent_crashed'].includes(code)
+  }
+  // A raw rejected invoke/network Error has no stable application code. Preserve partial pages so
+  // a later user retry resumes at the same cursor instead of blanking or refetching page one.
+  return error instanceof Error
+}
+
+async function historyMetadata(
+  id: string,
+  mode: 'server' | 'tauri_store',
+  options: LoadSessionPayloadOptions
+): Promise<SessionIndexEntry | null> {
+  if (options.metadata) {
+    if (options.metadata.id !== id) {
+      throw new ConversationHistoryLoadError(
+        'VALIDATION_ERROR',
+        `history metadata id ${options.metadata.id} does not match ${id}`
+      )
+    }
+    return options.metadata
+  }
+  if (mode === 'server') {
+    const transport = getAcpTransport()
+    if (!transport.listPersistedSessions) {
+      throw new AcpTransportError(
+        'CONVERSATION_HISTORY_PAGING_REQUIRED',
+        'server history metadata listing is unavailable'
+      )
+    }
+    const summary = (await transport.listPersistedSessions()).find(
+      (candidate) => candidate.sessionId === id
+    )
+    return summary ? fromPersistedSessionSummary(summary) : null
+  }
+  return (await acpHistoryApi.list()).sessions.find((candidate) => candidate.id === id) ?? null
+}
+
+async function requestHistoryPage(
+  id: string,
+  mode: 'server' | 'tauri_store',
+  afterSeq: number,
+  limit: number
+): Promise<ConversationHistoryPageV1> {
+  assertConversationHistoryPageRequest(afterSeq, limit)
+  const previous = historyPageRequestTails.get(id)
+  const request = (async () => {
+    if (previous) await previous.catch(() => undefined)
+    if (mode === 'server') {
+      const transport = getAcpTransport()
+      if (!transport.getSessionPayloadPage) {
+        throw new AcpTransportError(
+          'CONVERSATION_HISTORY_PAGING_REQUIRED',
+          'bounded server history is unavailable'
+        )
+      }
+      return transport.getSessionPayloadPage(id, afterSeq, limit)
+    }
+    return acpHistoryApi.getPage(id, afterSeq, limit)
+  })()
+  const completion = request.then(
+    () => undefined,
+    () => undefined
+  )
+  historyPageRequestTails.set(id, completion)
+  try {
+    return await request
+  } finally {
+    if (historyPageRequestTails.get(id) === completion) historyPageRequestTails.delete(id)
+  }
+}
+
+function historyPageBytes(page: ConversationHistoryPageV1): number {
+  try {
+    return historyPageEncoder.encode(JSON.stringify(page)).byteLength
+  } catch (error) {
+    throw new ConversationHistoryLoadError(
+      'VALIDATION_ERROR',
+      `history page is not serializable: ${String(error)}`
+    )
+  }
+}
+
+export async function loadSessionPayload(
+  id: string,
+  options: LoadSessionPayloadOptions = {}
+): Promise<SessionPayload | null> {
   const transport = getAcpTransport()
-  const mode = transport.historyMode?.()
-  if (mode === 'server' && transport.getSessionPayload) {
-    const payload = await transport.getSessionPayload(id)
-    if (payload) touchPayload(id, payload)
-    return payload
+  const negotiatedMode = transport.historyMode?.()
+  if (negotiatedMode === 'live_only') return null
+  const mode: 'server' | 'tauri_store' = negotiatedMode === 'server' ? 'server' : 'tauri_store'
+
+  const partial = partialHistoryAssemblies.get(id)
+  if (partial && partial.mode !== mode) partialHistoryAssemblies.delete(id)
+  const currentPartial = partial?.mode === mode ? partial : undefined
+  if (mode === 'tauri_store' && !currentPartial) {
+    const cached = payloadCache.get(id)
+    if (cached) {
+      touchPayload(id, cached)
+      await options.onPage?.(cached, {
+        sessionId: id,
+        pageNumber: 0,
+        pageRecordCount: 0,
+        loadedRecordCount: cached.metadata.lastSeq ?? maxPayloadSeq(cached),
+        nextCursor: cached.metadata.lastSeq ?? maxPayloadSeq(cached),
+        targetLastSeq: cached.metadata.lastSeq ?? maxPayloadSeq(cached),
+        complete: true,
+        inFlightBytes: 0,
+        resumed: true
+      })
+      return cached
+    }
   }
-  const cached = payloadCache.get(id)
-  if (cached) {
-    touchPayload(id, cached)
-    return cached
+
+  let assembly = currentPartial
+  if (!assembly) {
+    const metadata = await historyMetadata(id, mode, options)
+    if (!metadata) return null
+    assembly = { mode, accumulator: new ProgressiveHistoryAccumulator(metadata) }
+    partialHistoryAssemblies.set(id, assembly)
+  } else if (assembly.accumulator.cursor > 0 && assembly.accumulator.targetLastSeq !== undefined) {
+    const resumedPayload = assembly.accumulator.snapshot()
+    await options.onPage?.(resumedPayload, {
+      sessionId: id,
+      pageNumber: assembly.accumulator.pageNumber,
+      pageRecordCount: 0,
+      loadedRecordCount: assembly.accumulator.loadedRecordCount,
+      nextCursor: assembly.accumulator.cursor,
+      targetLastSeq: assembly.accumulator.targetLastSeq,
+      complete: false,
+      inFlightBytes: 0,
+      resumed: true
+    })
   }
-  if (mode === 'live_only') return null
-  const payload = await acpHistoryApi.get(id)
-  if (payload) touchPayload(id, payload)
-  return payload
+
+  try {
+    while (true) {
+      const afterSeq = assembly.accumulator.cursor
+      const page = await requestHistoryPage(id, mode, afterSeq, RENDERER_HISTORY_PAGE_SIZE)
+      assertConversationHistoryPage(page, {
+        sessionId: id,
+        afterSeq,
+        limit: RENDERER_HISTORY_PAGE_SIZE,
+        targetLastSeq: assembly.accumulator.targetLastSeq
+      })
+      const inFlightBytes = historyPageBytes(page)
+      if (
+        inFlightBytes > MAX_HISTORY_IN_FLIGHT_BYTES ||
+        currentHistoryInFlightBytes + inFlightBytes > MAX_HISTORY_IN_FLIGHT_BYTES
+      ) {
+        throw new ConversationHistoryLoadError(
+          'CONVERSATION_HISTORY_IN_FLIGHT_LIMIT',
+          'history page exceeds the 4 MiB in-flight budget'
+        )
+      }
+
+      currentHistoryInFlightBytes += inFlightBytes
+      peakHistoryInFlightBytes = Math.max(peakHistoryInFlightBytes, currentHistoryInFlightBytes)
+      try {
+        assembly.accumulator.applyPage(page, RENDERER_HISTORY_PAGE_SIZE)
+        const payload = assembly.accumulator.snapshot()
+        await options.onPage?.(payload, {
+          sessionId: id,
+          pageNumber: assembly.accumulator.pageNumber,
+          pageRecordCount: page.records.length,
+          loadedRecordCount: assembly.accumulator.loadedRecordCount,
+          nextCursor: page.nextCursor,
+          targetLastSeq: page.targetLastSeq,
+          complete: page.complete,
+          inFlightBytes,
+          resumed: false
+        })
+        if (page.complete) {
+          partialHistoryAssemblies.delete(id)
+          touchPayload(id, payload)
+          return payload
+        }
+      } finally {
+        currentHistoryInFlightBytes = Math.max(0, currentHistoryInFlightBytes - inFlightBytes)
+      }
+    }
+  } catch (error) {
+    const transient = isTransientHistoryError(error)
+    if (!transient) partialHistoryAssemblies.delete(id)
+    void logFrontendError({
+      level: transient ? 'warn' : 'error',
+      source: 'acp.historyPaging',
+      message: `History page load failed code=${historyErrorCode(error) ?? 'TRANSPORT_ERROR'} cursor=${assembly.accumulator.cursor} retainedRecords=${assembly.accumulator.loadedRecordCount}`
+    })
+    throw error
+  }
 }
 
 export async function saveSessionPayload(id: string, payload: SessionPayload): Promise<void> {
@@ -562,6 +1053,7 @@ export async function saveSessionPayload(id: string, payload: SessionPayload): P
 export async function deleteSessionPayload(id: string): Promise<void> {
   payloadCache.delete(id)
   pinnedPayloads.delete(id)
+  partialHistoryAssemblies.delete(id)
   const mode = historyMode()
   if (mode === 'server' || mode === 'live_only') return
   await acpHistoryApi.delete(id)
@@ -597,6 +1089,7 @@ export async function flushSessionHistory(): Promise<void> {
 export function _clearPayloadCacheForTesting(): void {
   payloadCache.clear()
   pinnedPayloads.clear()
+  _resetHistoryPagingForTesting()
 }
 
 export async function runHistoryWipeMigration(): Promise<void> {

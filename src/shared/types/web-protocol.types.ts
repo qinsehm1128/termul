@@ -135,6 +135,7 @@ export const WS_REQUEST_TYPES = [
   'list_persisted_sessions',
   'open_persisted_session',
   'get_session_payload',
+  'get_session_payload_page',
   'recover_session_snapshot',
   // R2: lightweight server-authoritative replay cursor (no snapshot payload).
   // Unlike `recover_session_snapshot` (which re-registers a subscription),
@@ -226,7 +227,8 @@ export const CONVERSATION_APPLICATION_ERROR_CODES = [
   'LEGACY_ID_AMBIGUOUS',
   'LEGACY_COMPATIBILITY_READ_ONLY',
   'CONVERSATION_SERVICE_UNAVAILABLE',
-  'ACP_COMPENSATION_FAILED'
+  'ACP_COMPENSATION_FAILED',
+  'CONVERSATION_HISTORY_PAGING_REQUIRED'
 ] as const
 
 export type ConversationApplicationErrorCode = (typeof CONVERSATION_APPLICATION_ERROR_CODES)[number]
@@ -349,6 +351,148 @@ export interface UserPromptEvent {
   sessionId: string
   turnId?: string
   content: unknown[]
+}
+
+export const CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION = 1 as const
+export const CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION = 1 as const
+export const MIN_CONVERSATION_HISTORY_PAGE_LIMIT = 1 as const
+export const MAX_CONVERSATION_HISTORY_PAGE_LIMIT = 1_000 as const
+
+/** Stable renderer-facing event dialect carried in bounded history pages. */
+export interface ConversationHistoryRecordV1 {
+  schemaVersion: typeof CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION
+  sessionId: string
+  seq: number
+  type: string
+  recordedAt: number
+  payload: unknown
+}
+
+/** Exact camelCase page contract shared by Tauri and WebSocket history facades. */
+export interface ConversationHistoryPageV1 {
+  schemaVersion: typeof CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION
+  records: ConversationHistoryRecordV1[]
+  nextCursor: number
+  complete: boolean
+  targetLastSeq: number
+}
+
+export interface GetSessionPayloadPageRequest {
+  sessionId: string
+  afterSeq: number
+  limit: number
+}
+
+export class ConversationHistoryPageValidationError extends Error {
+  readonly code = 'VALIDATION_ERROR'
+
+  constructor(message: string) {
+    super(message)
+    this.name = 'ConversationHistoryPageValidationError'
+  }
+}
+
+function historyValidationFailure(message: string): never {
+  throw new ConversationHistoryPageValidationError(message)
+}
+
+function isHistoryCursor(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0
+}
+
+/** Validate cursor/limit before a transport request or page-sized allocation is created. */
+export function assertConversationHistoryPageRequest(afterSeq: number, limit: number): void {
+  if (!isHistoryCursor(afterSeq)) {
+    historyValidationFailure('history afterSeq must be a non-negative safe integer')
+  }
+  if (
+    !Number.isSafeInteger(limit) ||
+    limit < MIN_CONVERSATION_HISTORY_PAGE_LIMIT ||
+    limit > MAX_CONVERSATION_HISTORY_PAGE_LIMIT
+  ) {
+    historyValidationFailure('history limit must be an integer between 1 and 1000')
+  }
+}
+
+/**
+ * Validate an untrusted page without cloning it. A successful caller may return the exact same
+ * object identity it received from the host.
+ */
+export function assertConversationHistoryPage(
+  page: unknown,
+  expected: {
+    sessionId: string
+    afterSeq: number
+    limit: number
+    targetLastSeq?: number
+  }
+): asserts page is ConversationHistoryPageV1 {
+  assertConversationHistoryPageRequest(expected.afterSeq, expected.limit)
+  if (!expected.sessionId.trim()) historyValidationFailure('history sessionId must be non-empty')
+  if (typeof page !== 'object' || page === null) {
+    historyValidationFailure('history page must be an object')
+  }
+  const candidate = page as Partial<ConversationHistoryPageV1>
+  if (candidate.schemaVersion !== CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION) {
+    historyValidationFailure('history page schemaVersion is unsupported')
+  }
+  if (!Array.isArray(candidate.records))
+    historyValidationFailure('history records must be an array')
+  if (candidate.records.length > expected.limit) {
+    historyValidationFailure('history page contains more records than requested')
+  }
+  if (!isHistoryCursor(candidate.nextCursor) || !isHistoryCursor(candidate.targetLastSeq)) {
+    historyValidationFailure('history page cursors must be non-negative safe integers')
+  }
+  if (expected.afterSeq > candidate.targetLastSeq) {
+    historyValidationFailure('history cursor is ahead of targetLastSeq')
+  }
+  if (expected.targetLastSeq !== undefined && candidate.targetLastSeq !== expected.targetLastSeq) {
+    historyValidationFailure('history targetLastSeq changed during traversal')
+  }
+  if (
+    candidate.nextCursor < expected.afterSeq ||
+    (candidate.nextCursor === expected.afterSeq && expected.afterSeq < candidate.targetLastSeq)
+  ) {
+    historyValidationFailure('history nextCursor did not advance')
+  }
+  if (candidate.nextCursor > candidate.targetLastSeq) {
+    historyValidationFailure('history nextCursor exceeds targetLastSeq')
+  }
+  if (
+    typeof candidate.complete !== 'boolean' ||
+    candidate.complete !== (candidate.nextCursor === candidate.targetLastSeq)
+  ) {
+    historyValidationFailure('history complete flag disagrees with nextCursor')
+  }
+
+  let previousSeq = expected.afterSeq
+  for (const value of candidate.records) {
+    if (typeof value !== 'object' || value === null) {
+      historyValidationFailure('history record must be an object')
+    }
+    const record = value as Partial<ConversationHistoryRecordV1>
+    if (record.schemaVersion !== CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION) {
+      historyValidationFailure('history record schemaVersion is unsupported')
+    }
+    if (record.sessionId !== expected.sessionId) {
+      historyValidationFailure('history page belongs to another session')
+    }
+    if (
+      !isHistoryCursor(record.seq) ||
+      record.seq <= previousSeq ||
+      record.seq > candidate.nextCursor
+    ) {
+      historyValidationFailure('history records are not strictly ordered')
+    }
+    if (!isHistoryCursor(record.recordedAt)) {
+      historyValidationFailure('history recordedAt must be a non-negative safe integer')
+    }
+    if (typeof record.type !== 'string' || record.type.length === 0) {
+      historyValidationFailure('history record type must be non-empty')
+    }
+    previousSeq = record.seq
+  }
 }
 
 /**
