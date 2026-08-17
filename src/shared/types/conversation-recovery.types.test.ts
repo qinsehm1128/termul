@@ -90,6 +90,54 @@ describe('canonical RecoveryAction contract', () => {
     }
   })
 
+  it.each([
+    '00000000-0000-0000-0000-000000000000',
+    '018f7a1c-1b4d-1c8a-1f01-0123456789ab',
+    '018f7a1c-1b4d-4c8a-2f01-0123456789ab',
+    '018f7a1c-1b4d-7c8a-ff01-0123456789ab'
+  ])('accepts Rust-parity canonical ConversationId fixture %s', (conversationId) => {
+    expect(
+      parseResolveRecoveryItemRequest({
+        recoveryId: 'a'.repeat(64),
+        expectedRevision: 1,
+        idempotencyKey: '21aee10a-56b8-4624-a5e7-586c25dc8d1f',
+        action: 'associateConversation',
+        payload: { conversationId }
+      })
+    ).toMatchObject({ payload: { conversationId } })
+  })
+
+  it.each([
+    '018F7A1C-1B4D-7C8A-9F01-0123456789AB',
+    '{018f7a1c-1b4d-7c8a-9f01-0123456789ab}',
+    '018f7a1c1b4d7c8a9f010123456789ab',
+    '018f7a1c-1b4d-7c8a-9f01-0123456789ab/../escape',
+    '../018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+    'not-a-uuid'
+  ])('rejects non-canonical recovery ConversationId %s', (conversationId) => {
+    expect(() =>
+      parseResolveRecoveryItemRequest({
+        recoveryId: 'a'.repeat(64),
+        expectedRevision: 1,
+        idempotencyKey: '21aee10a-56b8-4624-a5e7-586c25dc8d1f',
+        action: 'associateConversation',
+        payload: { conversationId }
+      })
+    ).toThrow('conversationId must be a canonical lowercase-hyphenated UUID')
+  })
+
+  it('keeps the intentionally version-restricted idempotency-key validator separate', () => {
+    expect(() =>
+      parseResolveRecoveryItemRequest({
+        recoveryId: 'a'.repeat(64),
+        expectedRevision: 1,
+        idempotencyKey: '00000000-0000-0000-0000-000000000000',
+        action: 'associateConversation',
+        payload: { conversationId: '00000000-0000-0000-0000-000000000000' }
+      })
+    ).toThrow('idempotencyKey')
+  })
+
   it('rejects snake_case, aliases, missing revision/idempotency, bad UUIDs, and payload drift', () => {
     const invalid: unknown[] = [
       {

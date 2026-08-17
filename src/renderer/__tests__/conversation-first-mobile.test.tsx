@@ -127,22 +127,29 @@ function mobileAggregateOutcome(
   }
 }
 
-const recoveryItem: RecoveryItemV1 = {
-  recoveryId: 'b'.repeat(64),
-  kind: 'ambiguous_workspace_manifest',
-  severity: 'warning',
+const recoveryEvidence = {
   sourcePaths: ['legacy_workspace_manifests/0/phone.json'],
-  conversationIds: [ID],
   sourceSha256: ['e'.repeat(64)],
-  candidateFacts: [],
+  candidateFacts: [{ candidate: 'phone-preserved' }],
   provenance: [
     {
       sourceKind: 'legacy_workspace_manifests',
       relativePath: 'legacy_workspace_manifests/0/phone.json',
       sha256: 'e'.repeat(64),
-      preservedReadOnly: true
+      preservedReadOnly: true as const
     }
-  ],
+  ]
+}
+
+const recoveryItem: RecoveryItemV1 = {
+  recoveryId: 'b'.repeat(64),
+  kind: 'ambiguous_workspace_manifest',
+  severity: 'warning',
+  sourcePaths: [],
+  conversationIds: [ID],
+  sourceSha256: [],
+  candidateFacts: [],
+  provenance: [],
   status: 'unresolved',
   suggestedActions: [
     'inspect',
@@ -486,36 +493,40 @@ describe('Conversation-first responsive phone matrix', () => {
     expect(mockTerminalApi.terminate).not.toHaveBeenCalled()
   })
 
-  it('shows all recovery actions and immutable evidence at 390px', async () => {
-    mockConversationApi.resolveRecovery.mockResolvedValue({
+  it('reveals authenticated recovery evidence from redacted phone status at 390px', async () => {
+    const originalSnapshot = structuredClone(recoveryItem)
+    mockConversationApi.resolveRecovery.mockImplementation(async (request) => ({
       success: true,
       data: {
         recoveryId: recoveryItem.recoveryId,
-        action: 'startEmptyWorkspace',
-        authorization: 'mutation',
-        status: 'resolvedStartedEmpty',
-        recoveryRevision: 4,
-        workspaceRevision: 1,
-        workspaceChanged: true,
-        sourcePaths: recoveryItem.sourcePaths,
-        sourceSha256: recoveryItem.sourceSha256,
-        candidateFacts: recoveryItem.candidateFacts,
-        provenance: recoveryItem.provenance
+        action: request.action,
+        authorization: request.action === 'inspect' ? 'read' : 'mutation',
+        status: request.action === 'inspect' ? 'unresolved' : 'resolvedStartedEmpty',
+        recoveryRevision: request.action === 'inspect' ? 3 : 4,
+        workspaceRevision: request.action === 'startEmptyWorkspace' ? 1 : null,
+        workspaceChanged: request.action === 'startEmptyWorkspace',
+        ...recoveryEvidence
       }
-    })
+    }))
     render(<ConversationRecoveryPanel items={[recoveryItem]} conversationId={ID} embedded />)
     for (const action of recoveryItem.suggestedActions) {
       expect(document.querySelector(`[data-recovery-action="${action}"]`)).toBeVisible()
     }
-    expect(screen.getAllByText(/legacy_workspace_manifests\/0\/phone.json/).length).toBeGreaterThan(
-      0
-    )
-    fireEvent.click(screen.getByRole('button', { name: 'Start empty workspace' }))
+    expect(screen.queryByText(/legacy_workspace_manifests\/0\/phone.json/)).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Inspect preserved source' }))
     await waitFor(() => expect(mockConversationApi.resolveRecovery).toHaveBeenCalledTimes(1))
-    expect(mockConversationApi.resolveRecovery.mock.calls[0][0]).toMatchObject({
-      action: 'startEmptyWorkspace',
+    expect(mockConversationApi.resolveRecovery.mock.calls[0][0]).toEqual({
+      recoveryId: recoveryItem.recoveryId,
       expectedRevision: 3,
-      payload: { conversationId: ID, expectedWorkspaceRevision: null }
+      action: 'inspect',
+      payload: {}
     })
+    expect(
+      (await screen.findAllByText(/legacy_workspace_manifests\/0\/phone.json/)).length
+    ).toBeGreaterThan(0)
+    expect(screen.getAllByText(new RegExp(`sha256:${'e'.repeat(64)}`)).length).toBeGreaterThan(0)
+    expect(screen.getByText('{"candidate":"phone-preserved"}')).toBeVisible()
+    expect(recoveryItem).toEqual(originalSnapshot)
   })
 })

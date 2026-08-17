@@ -1,4 +1,4 @@
-import type { ConversationId } from './conversation.types'
+import { type ConversationId, parseConversationId } from './conversation.types'
 
 export const RECOVERY_ACTIONS = [
   'inspect',
@@ -84,7 +84,8 @@ export type RecoveryAction =
 
 export type ResolveRecoveryItemRequest = RecoveryAction
 
-const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+const idempotencyKeyUuidPattern =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
 
 /** Strict boundary decoder: rejects aliases, snake_case fields, mismatched payloads, and extras. */
 export function parseResolveRecoveryItemRequest(value: unknown): ResolveRecoveryItemRequest {
@@ -99,7 +100,7 @@ export function parseResolveRecoveryItemRequest(value: unknown): ResolveRecovery
   }
   if (!isRecord(value.payload)) throw new TypeError('payload must be an object')
   const idempotencyKey = value.idempotencyKey
-  if (idempotencyKey !== undefined && !isUuid(idempotencyKey)) {
+  if (idempotencyKey !== undefined && !isIdempotencyKeyUuid(idempotencyKey)) {
     throw new TypeError('idempotencyKey must be a canonical UUID')
   }
 
@@ -146,16 +147,25 @@ function rejectExtraKeys(value: Record<string, unknown>, allowed: ReadonlySet<st
   }
 }
 
-function isUuid(value: unknown): value is string {
-  return typeof value === 'string' && uuidPattern.test(value)
+function isIdempotencyKeyUuid(value: unknown): value is string {
+  return typeof value === 'string' && idempotencyKeyUuidPattern.test(value)
 }
 
 function requireMutationKey(value: unknown): asserts value is string {
-  if (!isUuid(value)) throw new TypeError('mutation action requires a UUID idempotencyKey')
+  if (!isIdempotencyKeyUuid(value)) {
+    throw new TypeError('mutation action requires a UUID idempotencyKey')
+  }
 }
 
 function requireConversationId(value: unknown): asserts value is ConversationId {
-  if (!isUuid(value)) throw new TypeError('conversationId must be a canonical UUID')
+  if (typeof value !== 'string') {
+    throw new TypeError('conversationId must be a canonical lowercase-hyphenated UUID')
+  }
+  try {
+    parseConversationId(value)
+  } catch {
+    throw new TypeError('conversationId must be a canonical lowercase-hyphenated UUID')
+  }
 }
 
 export interface RecoveryActionResult {

@@ -1009,8 +1009,9 @@ export default function WorkspaceLayout(): React.JSX.Element {
     [uiZoomLevel, updateAppSetting]
   )
 
-  // Determine if we should show the terminal area (only on workspace dashboard)
-  const isWorkspaceRoute = location.pathname === '/' || location.pathname.startsWith('/c/')
+  // The portable index route owns `/`; terminal workspace chrome is reserved for explicit
+  // Conversation routes so the real WorkspaceDashboard outlet remains reachable on every root.
+  const isWorkspaceRoute = location.pathname.startsWith('/c/')
 
   // Unified tab cycling - cycles through ALL workspace tabs in active pane
   const cycleTab = useCallback(
@@ -1691,7 +1692,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
         <>
           {isWorkspaceRoute ? (
             <>
-              {location.pathname !== '/' && <Outlet />}
+              <Outlet />
               {hiddenConversationTerminals.length > 0 && (
                 <div className="flex shrink-0 items-center gap-2 overflow-x-auto border-b border-border/60 px-2 py-1">
                   <span className="text-xs text-muted-foreground">

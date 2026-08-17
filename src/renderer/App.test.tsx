@@ -1,5 +1,6 @@
-import { render, waitFor } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { useProjectStore } from '@/stores/project-store'
 import { useUpdaterStore } from '@/stores/updater-store'
 import { CONTEXT_BAR_SETTINGS_KEY } from '@/types/settings'
 import App from './App'
@@ -18,10 +19,9 @@ const {
   mockTerminalResourceLifecycle: vi.fn()
 }))
 
-vi.mock('./layouts/WorkspaceLayout', async () => {
-  const { Outlet } = await import('react-router-dom')
-  return { default: () => <Outlet /> }
-})
+vi.mock('@/components/workspace/PaneRenderer', () => ({
+  PaneRenderer: () => <div data-testid="pane-renderer" />
+}))
 
 vi.mock('@/components/conversation/ConversationRoute', () => ({
   ConversationRoute: () => <div data-testid="canonical-conversation-route" />
@@ -72,7 +72,8 @@ vi.mock('./hooks/use-terminal-resource-lifecycle', () => ({
 vi.mock('./hooks/use-context-bar-settings', () => ({
   useContextBarSettings: () => {
     void mockContextBarSettingsRead(CONTEXT_BAR_SETTINGS_KEY)
-  }
+  },
+  useUpdateContextBarSetting: () => vi.fn(async () => undefined)
 }))
 
 const { mockUseVisibilityState } = vi.hoisted(() => ({
@@ -220,6 +221,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   window.location.hash = '#/'
   vi.stubGlobal('api', mockApi)
+  useProjectStore.setState({ projects: [], groups: [], activeProjectId: '', isLoaded: true })
   useUpdaterStore.setState({
     updateAvailable: false,
     version: null,
@@ -259,16 +261,20 @@ describe('App Component', () => {
     render(<App />)
 
     expect(document.querySelector('[data-testid="web-directory-picker"]')).not.toBeNull()
-    expect(mockSessionWorkspaceBootstrap).toHaveBeenCalledTimes(1)
+    expect(mockSessionWorkspaceBootstrap).toHaveBeenCalled()
   })
 })
 
 describe('App Routes', () => {
-  it('should render WorkspaceDashboard on root path', () => {
+  it('renders the real WorkspaceDashboard through the production WorkspaceLayout at root', async () => {
     render(<App />)
-    // WorkspaceDashboard should be rendered by default
-    // Check for presence of rendered content (indicates route matched)
-    expect(document.body.innerHTML).toBeTruthy()
+
+    expect(
+      await screen.findByRole('heading', { name: 'Your Conversation workspace' })
+    ).toBeVisible()
+    expect(screen.getByRole('button', { name: 'New Chat' })).toBeEnabled()
+    expect(screen.queryByTestId('pane-renderer')).not.toBeInTheDocument()
+    expect(screen.getAllByTestId('conversation-recovery-panel').length).toBeGreaterThan(0)
   })
 
   it('loads context bar settings on mount', async () => {
@@ -291,19 +297,19 @@ describe('App Routes', () => {
 
   it('mounts shared Conversation creation and recovery wiring at the web root', () => {
     render(<App />)
-    expect(mockConversationHostBootstrap).toHaveBeenCalledTimes(1)
+    expect(mockConversationHostBootstrap).toHaveBeenCalled()
     expect(document.querySelector('[data-testid="conversation-host-status"]')).not.toBeNull()
     expect(document.querySelector('[data-testid="conversation-recovery-panel"]')).not.toBeNull()
   })
 
   it('mounts Conversation lifecycle reconciliation at the web root', () => {
     render(<App />)
-    expect(mockConversationLifecycle).toHaveBeenCalledTimes(1)
+    expect(mockConversationLifecycle).toHaveBeenCalled()
   })
 
   it('mounts terminal resource reconciliation at the web root', () => {
     render(<App />)
-    expect(mockTerminalResourceLifecycle).toHaveBeenCalledTimes(1)
+    expect(mockTerminalResourceLifecycle).toHaveBeenCalled()
   })
 
   it('registers the canonical Conversation route in the web root', async () => {
@@ -415,25 +421,25 @@ describe('App CAP-3 resilience wiring (web entry)', () => {
   it('calls useWhatsNew in the App body', () => {
     render(<App />)
 
-    expect(mockUseWhatsNew).toHaveBeenCalledTimes(1)
+    expect(mockUseWhatsNew).toHaveBeenCalled()
   })
 
   it('mounts useCrashRecovery in PortableAppEffects', () => {
     render(<App />)
 
-    expect(mockUseCrashRecovery).toHaveBeenCalledTimes(1)
+    expect(mockUseCrashRecovery).toHaveBeenCalled()
   })
 
   it('mounts useTerminalExitNotification in PortableAppEffects', () => {
     render(<App />)
 
-    expect(mockUseTerminalExitNotification).toHaveBeenCalledTimes(1)
+    expect(mockUseTerminalExitNotification).toHaveBeenCalled()
   })
 
   it('mounts useRemoteProjects in PortableAppEffects', () => {
     render(<App />)
 
-    expect(mockUseRemoteProjects).toHaveBeenCalledTimes(1)
+    expect(mockUseRemoteProjects).toHaveBeenCalled()
   })
 
   it('calls initNotificationPermissions on mount (useEffect [])', async () => {

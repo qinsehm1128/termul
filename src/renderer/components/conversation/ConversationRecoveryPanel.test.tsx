@@ -51,6 +51,14 @@ const item: RecoveryItemV1 = {
   associationDecisions: []
 }
 
+const redactedItem: RecoveryItemV1 = {
+  ...item,
+  sourcePaths: [],
+  sourceSha256: [],
+  candidateFacts: [],
+  provenance: []
+}
+
 function resultFor(request: RecoveryAction): RecoveryActionResult {
   const mutation = request.action !== 'inspect'
   return {
@@ -75,7 +83,8 @@ function resultFor(request: RecoveryAction): RecoveryActionResult {
   }
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+  await i18n.changeLanguage('en')
   resolveRecovery.mockReset()
   loadSessionWorkspace.mockReset()
   loadSessionWorkspace.mockResolvedValue(true)
@@ -233,27 +242,68 @@ describe('ConversationRecoveryPanel', () => {
     expect(second.idempotencyKey).toBe(first.idempotencyKey)
   })
 
-  it('keeps original immutable evidence visible even if a response disagrees', async () => {
-    resolveRecovery.mockImplementation(async (request: RecoveryAction) => ({
-      success: true,
-      data: {
-        ...resultFor(request),
-        sourcePaths: ['tampered/path.json'],
-        sourceSha256: ['f'.repeat(64)],
-        provenance: []
-      }
-    }))
-    render(<ConversationRecoveryPanel items={[item]} conversationId={conversationId} />)
+  it('reveals exact authenticated Inspect evidence from a redacted item without mutation', async () => {
+    const originalSnapshot = structuredClone(redactedItem)
+    const originalPaths = redactedItem.sourcePaths
+    const onItemsChange = vi.fn()
+    render(
+      <ConversationRecoveryPanel
+        items={[redactedItem]}
+        conversationId={conversationId}
+        onItemsChange={onItemsChange}
+      />
+    )
 
-    const inspect = document.querySelector<HTMLButtonElement>('[data-recovery-action="inspect"]')
-    if (!inspect) throw new Error('missing inspect action')
-    fireEvent.click(inspect)
-    await screen.findByRole('status')
+    expect(screen.queryByText(/legacy_workspace_manifests\/0\/shared.json/)).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Inspect preserved source' }))
 
-    expect(screen.queryByText('tampered/path.json')).not.toBeInTheDocument()
     expect(
-      screen.getAllByText(/legacy_workspace_manifests\/0\/shared.json/).length
+      (await screen.findAllByText(/legacy_workspace_manifests\/0\/shared.json/)).length
     ).toBeGreaterThan(0)
     expect(screen.getAllByText(new RegExp(`sha256:${checksum}`)).length).toBeGreaterThan(0)
+    expect(screen.getByText('{"candidate":"preserved"}')).toBeInTheDocument()
+    expect(screen.getByText(/preserved read-only/)).toBeInTheDocument()
+    expect(redactedItem).toEqual(originalSnapshot)
+    expect(redactedItem.sourcePaths).toBe(originalPaths)
+    expect(onItemsChange).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['recoveryId', { recoveryId: 'b'.repeat(64) }],
+    ['revision', { recoveryRevision: redactedItem.revision + 1 }]
+  ])('rejects mismatched Inspect %s and renders no authenticated evidence', async (_field, patch) => {
+    const originalSnapshot = structuredClone(redactedItem)
+    resolveRecovery.mockImplementation(async (request: RecoveryAction) => ({
+      success: true,
+      data: { ...resultFor(request), ...patch }
+    }))
+    render(<ConversationRecoveryPanel items={[redactedItem]} conversationId={conversationId} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Inspect preserved source' }))
+
+    expect(await screen.findByRole('alert')).toHaveAttribute(
+      'data-error-code',
+      'CONVERSATION_RECOVERY_FAILED'
+    )
+    expect(screen.queryByText(/legacy_workspace_manifests\/0\/shared.json/)).not.toBeInTheDocument()
+    expect(redactedItem).toEqual(originalSnapshot)
+  })
+
+  it('keeps forbidden Inspect redacted and exposes only the stable application code', async () => {
+    resolveRecovery.mockResolvedValueOnce({
+      success: false,
+      code: 'FORBIDDEN',
+      error: 'remote principal lacks the required capability'
+    })
+    render(<ConversationRecoveryPanel items={[redactedItem]} conversationId={conversationId} />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Inspect preserved source' }))
+
+    expect(await screen.findByRole('alert')).toHaveAttribute('data-error-code', 'FORBIDDEN')
+    expect(screen.queryByText(/legacy_workspace_manifests\/0\/shared.json/)).not.toBeInTheDocument()
+    expect(document.body.textContent).not.toContain(checksum)
+    expect(document.body.textContent).not.toContain(
+      'remote principal lacks the required capability'
+    )
   })
 })

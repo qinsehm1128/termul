@@ -50,7 +50,7 @@ async function parseBody<T>(response: Response): Promise<IpcResult<T>> {
       error?: unknown
       code?: unknown
     }
-    if (response.ok && envelope.success === true) {
+    if (envelope.success === true && Object.prototype.hasOwnProperty.call(envelope, 'data')) {
       return { success: true, data: envelope.data as T }
     }
     if (

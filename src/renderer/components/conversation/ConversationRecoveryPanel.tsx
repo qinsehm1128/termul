@@ -63,6 +63,27 @@ function actionConversationId(
   return preferred ?? item.conversationIds[0] ?? null
 }
 
+function responseMatchesRequest(request: RecoveryAction, result: RecoveryActionResult): boolean {
+  const expectedRevision = request.expectedRevision + (request.action === 'inspect' ? 0 : 1)
+  const expectedAuthorization = request.action === 'inspect' ? 'read' : 'mutation'
+  return (
+    result.recoveryId === request.recoveryId &&
+    result.action === request.action &&
+    result.authorization === expectedAuthorization &&
+    result.recoveryRevision === expectedRevision
+  )
+}
+
+function snapshotInspectedEvidence(result: RecoveryActionResult): RecoveryActionResult {
+  return {
+    ...result,
+    sourcePaths: [...result.sourcePaths],
+    sourceSha256: [...result.sourceSha256],
+    candidateFacts: result.candidateFacts.map((fact) => ({ ...fact })),
+    provenance: result.provenance.map((entry) => ({ ...entry }))
+  }
+}
+
 export function ConversationRecoveryPanel({
   items,
   conversationId,
@@ -75,6 +96,9 @@ export function ConversationRecoveryPanel({
   const setRecoveryItems = useConversationStore((state) => state.setRecoveryItems)
   const sourceItems = items ?? storeItems
   const [results, setResults] = useState<Record<string, RecoveryActionResult | undefined>>({})
+  const [inspectedEvidence, setInspectedEvidence] = useState<
+    Record<string, RecoveryActionResult | undefined>
+  >({})
   const [errors, setErrors] = useState<Record<string, string | undefined>>({})
   const [running, setRunning] = useState<Record<string, RecoveryAction['action'] | undefined>>({})
   const idempotencyKeys = useRef<Record<string, string>>({})
@@ -105,6 +129,9 @@ export function ConversationRecoveryPanel({
     )
     setRunning((current) => ({ ...current, [item.recoveryId]: action }))
     setErrors((current) => ({ ...current, [item.recoveryId]: undefined }))
+    if (action === 'inspect') {
+      setInspectedEvidence((current) => ({ ...current, [item.recoveryId]: undefined }))
+    }
     try {
       const result = await conversationApi.resolveRecovery(request)
       if (!result.success) {
@@ -112,26 +139,48 @@ export function ConversationRecoveryPanel({
         void logFrontendError({
           level: 'warn',
           source: 'conversation-recovery-panel',
-          message: `recoveryId=${item.recoveryId} action=${action} code=${result.code}`
+          message: `recoveryId=${item.recoveryId} revision=${item.revision} action=${action} code=${result.code}`
+        })
+        return
+      }
+      if (!responseMatchesRequest(request, result.data)) {
+        setErrors((current) => ({
+          ...current,
+          [item.recoveryId]: 'CONVERSATION_RECOVERY_FAILED'
+        }))
+        void logFrontendError({
+          level: 'warn',
+          source: 'conversation-recovery-panel',
+          message: `recoveryId=${item.recoveryId} revision=${item.revision} action=${action} code=CONVERSATION_RECOVERY_FAILED outcome=mismatched_response`
         })
         return
       }
       setResults((current) => ({ ...current, [item.recoveryId]: result.data }))
-      const updated = sourceItems.map((candidate) =>
-        candidate.recoveryId === item.recoveryId
-          ? {
-              ...candidate,
-              status: result.data.status,
-              revision: result.data.recoveryRevision
-            }
-          : candidate
-      )
-      if (!items) setRecoveryItems(updated)
-      onItemsChange?.(updated)
+      if (action === 'inspect') {
+        setInspectedEvidence((current) => ({
+          ...current,
+          [item.recoveryId]: snapshotInspectedEvidence(result.data)
+        }))
+      } else {
+        const updated = sourceItems.map((candidate) =>
+          candidate.recoveryId === item.recoveryId
+            ? {
+                ...candidate,
+                status: result.data.status,
+                revision: result.data.recoveryRevision
+              }
+            : candidate
+        )
+        if (!items) setRecoveryItems(updated)
+        onItemsChange?.(updated)
+      }
       if (result.data.workspaceChanged && canonicalId) {
         await loadSessionWorkspace(canonicalId)
       }
     } catch {
+      if (action === 'inspect') {
+        setInspectedEvidence((current) => ({ ...current, [item.recoveryId]: undefined }))
+      }
       setErrors((current) => ({
         ...current,
         [item.recoveryId]: 'CONVERSATION_RECOVERY_FAILED'
@@ -139,7 +188,7 @@ export function ConversationRecoveryPanel({
       void logFrontendError({
         level: 'warn',
         source: 'conversation-recovery-panel',
-        message: `recoveryId=${item.recoveryId} action=${action} code=CONVERSATION_RECOVERY_FAILED`
+        message: `recoveryId=${item.recoveryId} revision=${item.revision} action=${action} code=CONVERSATION_RECOVERY_FAILED`
       })
     } finally {
       setRunning((current) => ({ ...current, [item.recoveryId]: undefined }))
@@ -167,14 +216,21 @@ export function ConversationRecoveryPanel({
       <div className="space-y-3">
         {visibleItems.map((item) => {
           const result = results[item.recoveryId]
+          const inspected = inspectedEvidence[item.recoveryId]
           const errorCode = errors[item.recoveryId]
           const activeAction = running[item.recoveryId]
-          // Preserve the RecoveryItem evidence as the display authority even after an action.
-          // A transport response cannot rewrite the immutable source/provenance presented to users.
-          const immutablePaths = item.sourcePaths
-          const immutableChecksums = item.sourceSha256
-          const immutableProvenance = item.provenance
-          const immutableCandidateFacts = item.candidateFacts
+          const validatedInspection =
+            inspected?.action === 'inspect' &&
+            inspected.recoveryId === item.recoveryId &&
+            inspected.recoveryRevision === item.revision
+              ? inspected
+              : undefined
+          // Host status remains redacted. Only an exact, revision-correlated Inspect result becomes
+          // a separate display authority; the original RecoveryItem is never merged or mutated.
+          const immutablePaths = validatedInspection?.sourcePaths ?? item.sourcePaths
+          const immutableChecksums = validatedInspection?.sourceSha256 ?? item.sourceSha256
+          const immutableProvenance = validatedInspection?.provenance ?? item.provenance
+          const immutableCandidateFacts = validatedInspection?.candidateFacts ?? item.candidateFacts
           const status = result?.status ?? item.status
           return (
             <section

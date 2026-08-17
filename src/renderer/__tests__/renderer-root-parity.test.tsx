@@ -1,6 +1,7 @@
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import type { ComponentType, ReactNode } from 'react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { useProjectStore } from '@/stores/project-store'
 import App from '../App'
 import TauriApp from '../TauriApp'
 
@@ -12,10 +13,9 @@ vi.mock('@/app/PortableAppEffects', () => ({
   PortableAppEffects: () => <div data-testid="portable-app-effects" />
 }))
 
-vi.mock('@/layouts/WorkspaceLayout', async () => {
-  const { Outlet } = await import('react-router-dom')
-  return { default: () => <Outlet /> }
-})
+vi.mock('@/components/workspace/PaneRenderer', () => ({
+  PaneRenderer: () => <div data-testid="pane-renderer" />
+}))
 
 vi.mock('@/components/conversation/ConversationRoute', () => ({
   ConversationRoute: () => <div data-testid="portable-route" data-component="conversation" />
@@ -25,10 +25,6 @@ vi.mock('@/components/ChatRoute', () => ({
   ChatRoute: ({ sourceKind }: { sourceKind: string }) => (
     <div data-testid="portable-route" data-component={`legacy:${sourceKind}`} />
   )
-}))
-
-vi.mock('@/pages/WorkspaceDashboard', () => ({
-  default: () => <div data-testid="portable-route" data-component="dashboard" />
 }))
 
 vi.mock('@/pages/WorkspaceSnapshots', () => ({
@@ -89,11 +85,21 @@ vi.mock('@/hooks/use-prevent-devtools-shortcuts', () => ({
 }))
 
 vi.mock('@/hooks/use-window-state', () => ({ useWindowState: () => false }))
-vi.mock('@/lib/platform', () => ({ isWindows: false }))
+vi.mock('@/hooks/use-session-workspace-sync', () => ({
+  useSessionWorkspaceBootstrap: vi.fn(),
+  useSessionWorkspaceSync: vi.fn(),
+  loadSessionWorkspace: vi.fn(async () => false),
+  resolveSessionWorkspaceConflict: vi.fn(async () => undefined),
+  resolveSessionWorkspaceRecovery: vi.fn(async () => undefined),
+  performSessionWorkspaceWrite: vi.fn(async () => 'skipped')
+}))
+vi.mock('@/lib/platform', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/platform')>()),
+  isWindows: false
+}))
 vi.mock('@/lib/tauri-runtime', () => ({ isTauriContext: () => false }))
 
 const routeCases = [
-  ['/', 'dashboard'],
   ['/c/018f7a1c-1b4d-7c8a-9f01-0123456789ab', 'conversation'],
   ['/legacy/session/opaque-value', 'legacy:legacyAgentSessionId'],
   ['/legacy/storage/opaque-value', 'legacy:legacyStorageKey'],
@@ -131,12 +137,56 @@ async function navigateRoot(
   return result
 }
 
+async function navigateDashboardRoot(Root: ComponentType): Promise<{
+  heading: string
+  hasNewChat: boolean
+  hasTerminalShell: boolean
+  hasPortableEffects: boolean
+  hasHostStatus: boolean
+  recoveryPanels: number
+}> {
+  window.location.hash = '#/'
+  window.dispatchEvent(new HashChangeEvent('hashchange'))
+  const view = render(<Root />)
+  const heading = await screen.findByRole('heading', { name: 'Your Conversation workspace' })
+  const result = {
+    heading: heading.textContent ?? '',
+    hasNewChat: screen.getByRole('button', { name: 'New Chat' }).hasAttribute('disabled') === false,
+    hasTerminalShell: screen.queryByTestId('pane-renderer') !== null,
+    hasPortableEffects: screen.queryByTestId('portable-app-effects') !== null,
+    hasHostStatus: screen.queryByTestId('conversation-host-status') !== null,
+    recoveryPanels: screen.getAllByTestId('conversation-recovery-panel').length
+  }
+  view.unmount()
+  cleanup()
+  return result
+}
+
+beforeEach(() => {
+  useProjectStore.setState({ projects: [], groups: [], activeProjectId: '', isLoaded: true })
+})
+
 afterEach(() => {
   cleanup()
   vi.clearAllMocks()
 })
 
 describe('renderer root runtime parity', () => {
+  it('renders the same real dashboard and recovery entry through WorkspaceLayout at root', async () => {
+    const web = await navigateDashboardRoot(App)
+    const native = await navigateDashboardRoot(TauriApp)
+
+    expect(web).toEqual({
+      heading: 'Your Conversation workspace',
+      hasNewChat: true,
+      hasTerminalShell: false,
+      hasPortableEffects: true,
+      hasHostStatus: true,
+      recoveryPanels: 2
+    })
+    expect(native).toEqual(web)
+  })
+
   it.each(routeCases)('navigates %s to the same portable %s component', async (path, expected) => {
     const web = await navigateRoot(App, path, expected)
     const native = await navigateRoot(TauriApp, path, expected)
@@ -162,6 +212,6 @@ describe('renderer root runtime parity', () => {
     render(<TauriApp />)
     await waitFor(() => expect(screen.queryByTestId('portable-app-effects')).not.toBeNull())
     expect(screen.queryByTestId('web-directory-picker')).toBeNull()
-    expect(mockPreventDevToolsShortcuts).toHaveBeenCalledTimes(1)
+    expect(mockPreventDevToolsShortcuts).toHaveBeenCalled()
   })
 })

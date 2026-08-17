@@ -1,7 +1,8 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TooltipProvider } from '@/components/ui/tooltip'
+import WorkspaceDashboard from '@/pages/WorkspaceDashboard'
 import { useConversationStore } from '@/stores/conversation-store'
 import { useFileExplorerStore } from '@/stores/file-explorer-store'
 import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
@@ -446,7 +447,7 @@ afterEach(() => {
 })
 
 // Helper to render with router
-const renderWithRouter = (initialEntries = ['/']) => {
+const renderWithRouter = (initialEntries = ['/c/018f7a1c-1b4d-7c8a-9f01-0123456789ab']) => {
   return render(
     <TooltipProvider>
       <MemoryRouter initialEntries={initialEntries}>
@@ -457,6 +458,26 @@ const renderWithRouter = (initialEntries = ['/']) => {
 }
 
 describe('WorkspaceLayout - Empty States', () => {
+  it('renders the real dashboard index outlet at root without terminal workspace content', async () => {
+    render(
+      <TooltipProvider>
+        <MemoryRouter initialEntries={['/']}>
+          <Routes>
+            <Route path="/" element={<WorkspaceLayout />}>
+              <Route index element={<WorkspaceDashboard />} />
+            </Route>
+          </Routes>
+        </MemoryRouter>
+      </TooltipProvider>
+    )
+
+    expect(
+      await screen.findByRole('heading', { name: 'Your Conversation workspace' })
+    ).toBeVisible()
+    expect(screen.getByRole('button', { name: 'New Chat' })).toBeEnabled()
+    expect(screen.queryByTestId('pane-renderer')).not.toBeInTheDocument()
+  })
+
   it('renders a full-width macOS titlebar zone above workspace chrome', () => {
     platformState.isMac = true
 

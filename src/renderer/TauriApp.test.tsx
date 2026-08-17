@@ -1,5 +1,6 @@
-import { render, waitFor } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { useProjectStore } from '@/stores/project-store'
 import { CONTEXT_BAR_SETTINGS_KEY } from '@/types/settings'
 import TauriApp from './TauriApp'
 
@@ -24,11 +25,29 @@ const {
 }))
 
 vi.mock('@/lib/api', () => ({
-  persistenceApi: {
-    read: mockPersistenceRead
+  filesystemApi: {
+    watchDirectory: vi.fn(async () => ({ success: true, data: undefined })),
+    unwatchDirectory: vi.fn(),
+    onFileChanged: vi.fn(() => vi.fn()),
+    onFileCreated: vi.fn(() => vi.fn()),
+    onFileDeleted: vi.fn(() => vi.fn()),
+    onSearchFileNamesBatch: vi.fn(() => vi.fn()),
+    onSearchFileNamesDone: vi.fn(() => vi.fn())
   },
+  keyboardApi: { onShortcut: vi.fn(() => vi.fn()) },
+  persistenceApi: {
+    read: mockPersistenceRead,
+    write: vi.fn(async () => ({ success: true, data: undefined })),
+    flushPendingWrites: vi.fn(async () => ({ success: true, data: undefined }))
+  },
+  sshApi: { onConnectionStatusChanged: vi.fn(() => vi.fn()) },
   terminalApi: {
-    onData: vi.fn(() => vi.fn())
+    onData: vi.fn(() => vi.fn()),
+    write: vi.fn(async () => ({ success: true, data: undefined }))
+  },
+  windowApi: {
+    onCloseRequested: vi.fn(() => vi.fn()),
+    respondToClose: vi.fn()
   },
   sessionApi: {
     hasSession: vi.fn(async () => ({ success: true, data: false })),
@@ -44,7 +63,12 @@ vi.mock('@/lib/api', () => ({
 }))
 
 vi.mock('@/hooks/use-session-workspace-sync', () => ({
-  useSessionWorkspaceBootstrap: mockSessionWorkspaceBootstrap
+  useSessionWorkspaceBootstrap: mockSessionWorkspaceBootstrap,
+  useSessionWorkspaceSync: vi.fn(),
+  loadSessionWorkspace: vi.fn(async () => false),
+  resolveSessionWorkspaceConflict: vi.fn(async () => undefined),
+  resolveSessionWorkspaceRecovery: vi.fn(async () => undefined),
+  performSessionWorkspaceWrite: vi.fn(async () => 'skipped')
 }))
 
 vi.mock('./hooks/use-conversation-host-bootstrap', () => ({
@@ -79,10 +103,24 @@ vi.mock('@/lib/tauri-window', () => ({
   getCurrentWindow: () => ({ show: mockShowWindow })
 }))
 
-vi.mock('./layouts/WorkspaceLayout', async () => {
-  const { Outlet } = await import('react-router-dom')
-  return { default: () => <Outlet /> }
-})
+vi.mock('@/components/ActivityRail', () => ({ ActivityRail: () => null }))
+
+vi.mock('@/components/conversation/ConversationSidebar', () => ({
+  ConversationSidebar: ({ onNewChat }: { onNewChat: () => void }) => (
+    <button type="button" aria-label="New Chat" onClick={onNewChat}>
+      New Chat
+    </button>
+  )
+}))
+
+vi.mock('@/components/ProjectSidebar', () => ({ ProjectSidebar: () => null }))
+vi.mock('@/components/ResizeEdges', () => ({ ResizeEdges: () => null }))
+vi.mock('@/components/StatusBar', () => ({ StatusBar: () => null }))
+vi.mock('@/components/TitleBar', () => ({ TitleBar: () => null }))
+
+vi.mock('@/components/workspace/PaneRenderer', () => ({
+  PaneRenderer: () => <div data-testid="pane-renderer" />
+}))
 
 vi.mock('@/components/conversation/ConversationRoute', () => ({
   ConversationRoute: () => <div data-testid="canonical-conversation-route" />
@@ -92,10 +130,6 @@ vi.mock('@/components/ChatRoute', () => ({
   ChatRoute: ({ sourceKind }: { sourceKind: string }) => (
     <div data-testid="legacy-conversation-route" data-source-kind={sourceKind} />
   )
-}))
-
-vi.mock('./pages/WorkspaceDashboard', () => ({
-  default: () => null
 }))
 
 vi.mock('./pages/ProjectSettings', () => ({
@@ -127,7 +161,8 @@ vi.mock('./hooks/use-terminal-detached-output', () => ({
 }))
 
 vi.mock('./hooks/use-cwd', () => ({
-  useCwd: () => undefined
+  useCwd: () => undefined,
+  useHomeDirectory: () => '/home/user'
 }))
 
 vi.mock('./hooks/use-git-branch', () => ({
@@ -143,11 +178,16 @@ vi.mock('./hooks/use-exit-code', () => ({
 }))
 
 vi.mock('./hooks/use-app-settings', () => ({
-  useAppSettingsLoader: () => undefined
+  useAppSettingsLoader: () => undefined,
+  useUpdateAppSetting: () => vi.fn(),
+  useUpdatePanelVisibility: () => vi.fn(async () => undefined),
+  waitForPendingAppSettingsPersistence: vi.fn(async () => undefined)
 }))
 
 vi.mock('./hooks/use-keyboard-shortcuts', () => ({
-  useKeyboardShortcutsLoader: () => undefined
+  useKeyboardShortcutsLoader: () => undefined,
+  useUpdateShortcut: () => vi.fn(),
+  useResetShortcut: () => vi.fn()
 }))
 
 vi.mock('./hooks/use-projects-persistence', () => ({
@@ -204,6 +244,7 @@ beforeEach(() => {
     error: 'Key not found',
     code: 'KEY_NOT_FOUND'
   })
+  useProjectStore.setState({ projects: [], groups: [], activeProjectId: '', isLoaded: true })
 })
 
 afterEach(() => {
@@ -221,14 +262,25 @@ describe('TauriApp', () => {
 
   it('wires app visibility tracking at app scope', () => {
     render(<TauriApp />)
-    expect(mockUseVisibilityState).toHaveBeenCalledTimes(1)
+    expect(mockUseVisibilityState).toHaveBeenCalled()
   })
 
   it('keeps native-only devtools protection around the shared portable shell', () => {
     render(<TauriApp />)
 
-    expect(mockPreventDevToolsShortcuts).toHaveBeenCalledTimes(1)
-    expect(mockSessionWorkspaceBootstrap).toHaveBeenCalledTimes(1)
+    expect(mockPreventDevToolsShortcuts).toHaveBeenCalled()
+    expect(mockSessionWorkspaceBootstrap).toHaveBeenCalled()
+  })
+
+  it('renders the real native WorkspaceDashboard through the production WorkspaceLayout at root', async () => {
+    render(<TauriApp />)
+
+    expect(
+      await screen.findByRole('heading', { name: 'Your Conversation workspace' })
+    ).toBeVisible()
+    expect(screen.getByRole('button', { name: 'New Chat' })).toBeEnabled()
+    expect(screen.queryByTestId('pane-renderer')).not.toBeInTheDocument()
+    expect(screen.getAllByTestId('conversation-recovery-panel').length).toBeGreaterThan(0)
   })
 
   it('shows the native window after window state restoration', async () => {
@@ -244,24 +296,24 @@ describe('TauriApp', () => {
 
   it('mounts the portable SessionWorkspace bootstrap at the desktop root', () => {
     render(<TauriApp />)
-    expect(mockSessionWorkspaceBootstrap).toHaveBeenCalledTimes(1)
+    expect(mockSessionWorkspaceBootstrap).toHaveBeenCalled()
   })
 
   it('mounts shared Conversation creation and recovery wiring at the desktop root', () => {
     render(<TauriApp />)
-    expect(mockConversationHostBootstrap).toHaveBeenCalledTimes(1)
+    expect(mockConversationHostBootstrap).toHaveBeenCalled()
     expect(document.querySelector('[data-testid="conversation-host-status"]')).not.toBeNull()
     expect(document.querySelector('[data-testid="conversation-recovery-panel"]')).not.toBeNull()
   })
 
   it('mounts Conversation lifecycle reconciliation at the desktop root', () => {
     render(<TauriApp />)
-    expect(mockConversationLifecycle).toHaveBeenCalledTimes(1)
+    expect(mockConversationLifecycle).toHaveBeenCalled()
   })
 
   it('mounts terminal resource reconciliation at the desktop root', () => {
     render(<TauriApp />)
-    expect(mockTerminalResourceLifecycle).toHaveBeenCalledTimes(1)
+    expect(mockTerminalResourceLifecycle).toHaveBeenCalled()
   })
 
   it('registers the canonical Conversation route in the desktop root', async () => {

@@ -3,15 +3,19 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::ConnectInfo;
 use axum::http::Request;
 use axum::middleware;
 use axum::routing::{get, post};
-use axum::Extension;
+use axum::{Extension, Router};
 use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 use tower::ServiceExt;
+use url::Url;
 use uuid::Uuid;
 
 use super::conversation_api;
@@ -29,10 +33,13 @@ use crate::conversation::migration::{
 use crate::conversation::{
     AgentBindingResult, AgentLifecycleProviderError, ConversationAgentLifecycle,
     ConversationApplicationService, ConversationCreationService, ConversationId,
-    ConversationLifecycleService, ConversationLocator, ConversationMutation, ConversationReader,
-    ConversationRepository, ConversationWriter, LegacyConversationReader, PreparedConversation,
-    SessionWorkspaceLocator, SessionWorkspaceService, TerminalResourceInspector,
+    ConversationLifecycleService, ConversationLocator, ConversationMutation,
+    ConversationPersistenceAdapter, ConversationReader, ConversationRepository, ConversationWriter,
+    LegacyConversationReader, PreparedConversation, SessionWorkspaceLocator,
+    SessionWorkspaceProjectionState, SessionWorkspaceService, SessionWorkspaceV1,
+    TerminalResourceInspector,
 };
+use crate::web::sink::{AcpEvent, EventSink, WsRelaySink};
 
 const ID: &str = "018f7a1c-1b4d-7c8a-9f01-0123456789ab";
 const BINDING_ID: &str = "33333333-3333-4333-8333-333333333333";
@@ -292,6 +299,175 @@ fn secured_app(state: AppState, authority: Arc<crate::web::RemoteAccessAuthority
         .layer(Extension(authority))
 }
 
+fn production_app(state: AppState, authority: Arc<crate::web::RemoteAccessAuthority>) -> Router {
+    let projects_file = state
+        .projects_file
+        .as_ref()
+        .map(|path| path.as_ref().clone());
+    let project_root = state.project_root.read().clone();
+    super::router::router(
+        state.acp,
+        state.pty,
+        state.terminal_events,
+        state.cwd_tracker,
+        state.git_tracker,
+        state.exit_code_tracker,
+        state.relay,
+        state.registry,
+        state.registry_persistence,
+        projects_file,
+        project_root,
+        state.history_mode,
+        state.conversation,
+        state.workspace_manifest,
+        state.acp_catalog,
+        state.acp_install,
+        authority,
+    )
+}
+
+fn golden_workspace() -> SessionWorkspaceV1 {
+    SessionWorkspaceV1 {
+        schema_version: 1,
+        conversation_id: ConversationId::parse(ID).unwrap(),
+        revision: 0,
+        updated_at_utc: String::new(),
+        update_identity: Some("production-golden".to_string()),
+        topology: None,
+        active_pane_id: None,
+        resources: Vec::new(),
+        projection_state: SessionWorkspaceProjectionState::Native,
+    }
+}
+
+fn conversation_persistence(fixture: &GoldenFixture) -> Arc<ConversationPersistenceAdapter> {
+    let reader = Arc::new(ConversationReader::new(
+        Arc::clone(&fixture.repository),
+        LegacyConversationReader::default(),
+        ReaderPrecedence::ConversationV2Only,
+    ));
+    Arc::new(ConversationPersistenceAdapter::new(
+        Arc::clone(&fixture.writer),
+        reader,
+    ))
+}
+
+async fn websocket_connect(address: SocketAddr, origin: &str) -> BufReader<TcpStream> {
+    let stream = TcpStream::connect(address).await.unwrap();
+    let mut stream = BufReader::new(stream);
+    let request = format!(
+        "GET /ws HTTP/1.1\r\nHost: {address}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nOrigin: {origin}\r\n\r\n"
+    );
+    stream
+        .get_mut()
+        .write_all(request.as_bytes())
+        .await
+        .unwrap();
+    stream.get_mut().flush().await.unwrap();
+
+    let mut headers = Vec::new();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        stream.read_until(b'\n', &mut headers),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    while !headers.ends_with(b"\r\n\r\n") {
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            stream.read_until(b'\n', &mut headers),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    let headers = String::from_utf8(headers).unwrap();
+    assert!(
+        headers.starts_with("HTTP/1.1 101"),
+        "WebSocket upgrade failed: {headers}"
+    );
+    stream
+}
+
+async fn write_websocket_frame(stream: &mut BufReader<TcpStream>, opcode: u8, payload: &[u8]) {
+    let mask = [0x12_u8, 0x34, 0x56, 0x78];
+    let mut frame = vec![0x80 | opcode];
+    match payload.len() {
+        length @ 0..=125 => frame.push(0x80 | length as u8),
+        length @ 126..=65_535 => {
+            frame.push(0x80 | 126);
+            frame.extend_from_slice(&(length as u16).to_be_bytes());
+        }
+        length => {
+            frame.push(0x80 | 127);
+            frame.extend_from_slice(&(length as u64).to_be_bytes());
+        }
+    }
+    frame.extend_from_slice(&mask);
+    frame.extend(
+        payload
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| byte ^ mask[index % mask.len()]),
+    );
+    stream.get_mut().write_all(&frame).await.unwrap();
+    stream.get_mut().flush().await.unwrap();
+}
+
+async fn write_websocket_json(stream: &mut BufReader<TcpStream>, value: &Value) {
+    write_websocket_frame(stream, 0x1, value.to_string().as_bytes()).await;
+}
+
+async fn read_websocket_json(stream: &mut BufReader<TcpStream>) -> Value {
+    loop {
+        let mut prefix = [0_u8; 2];
+        tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut prefix))
+            .await
+            .unwrap()
+            .unwrap();
+        let opcode = prefix[0] & 0x0f;
+        let masked = prefix[1] & 0x80 != 0;
+        let mut length = u64::from(prefix[1] & 0x7f);
+        if length == 126 {
+            let mut extended = [0_u8; 2];
+            stream.read_exact(&mut extended).await.unwrap();
+            length = u64::from(u16::from_be_bytes(extended));
+        } else if length == 127 {
+            let mut extended = [0_u8; 8];
+            stream.read_exact(&mut extended).await.unwrap();
+            length = u64::from_be_bytes(extended);
+        }
+        let mut mask = [0_u8; 4];
+        if masked {
+            stream.read_exact(&mut mask).await.unwrap();
+        }
+        let mut payload = vec![0_u8; usize::try_from(length).unwrap()];
+        stream.read_exact(&mut payload).await.unwrap();
+        if masked {
+            for (index, byte) in payload.iter_mut().enumerate() {
+                *byte ^= mask[index % mask.len()];
+            }
+        }
+        match opcode {
+            0x1 => return serde_json::from_slice(&payload).unwrap(),
+            0x8 => panic!("WebSocket closed before the expected reply"),
+            0x9 => write_websocket_frame(stream, 0xA, &payload).await,
+            0xA => {}
+            other => panic!("unexpected WebSocket opcode {other}"),
+        }
+    }
+}
+
+async fn read_websocket_reply(stream: &mut BufReader<TcpStream>, id: &str) -> Value {
+    loop {
+        let value = read_websocket_json(stream).await;
+        if value.get("id").and_then(Value::as_str) == Some(id) {
+            return value;
+        }
+    }
+}
+
 async fn response_json(response: axum::response::Response) -> Value {
     let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
@@ -362,6 +538,354 @@ fn seed_recovery(repository: &ConversationRepository) -> RecoveryItemV1 {
         )
         .unwrap();
     item
+}
+
+#[tokio::test]
+async fn production_router_redacts_status_and_requires_authenticated_inspect_for_evidence() {
+    const TOKEN: &str = "conversation-production-token";
+    let fixture = fixture().await;
+    let item = seed_recovery(&fixture.repository);
+    let authority = Arc::new(crate::web::RemoteAccessAuthority::for_tests(TOKEN));
+    let app = production_app(fixture.state.clone(), authority);
+
+    let status_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/conversations/host-status")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 3000))))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(status_response.status(), axum::http::StatusCode::OK);
+    let status = response_json(status_response).await;
+    let redacted = &status["data"]["recoveryItems"][0];
+    assert_eq!(redacted["recoveryId"], item.recovery_id);
+    for field in [
+        "sourcePaths",
+        "sourceSha256",
+        "candidateFacts",
+        "provenance",
+    ] {
+        assert_eq!(redacted[field], json!([]), "host status leaked {field}");
+    }
+
+    let inspect_request = json!({
+        "recoveryId":item.recovery_id,
+        "expectedRevision":item.revision,
+        "action":"inspect",
+        "payload":{}
+    });
+    let unauthorized = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/conversation-recovery/resolve")
+                .header("content-type", "application/json")
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 3000))))
+                .body(Body::from(inspect_request.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauthorized.status(), axum::http::StatusCode::UNAUTHORIZED);
+    let unauthorized = response_json(unauthorized).await;
+    assert_eq!(unauthorized["code"], "UNAUTHORIZED");
+    assert!(unauthorized.get("data").is_none());
+    let unauthorized_text = unauthorized.to_string();
+    assert!(!unauthorized_text.contains(&item.source_paths[0]));
+    assert!(!unauthorized_text.contains(&item.source_sha256[0]));
+    assert!(!unauthorized_text.contains("preserved"));
+
+    let inspect = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/conversation-recovery/resolve")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 3000))))
+                .body(Body::from(inspect_request.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inspect.status(), axum::http::StatusCode::OK);
+    let inspect = response_json(inspect).await;
+    assert_eq!(inspect["success"], true);
+    assert_eq!(inspect["data"]["recoveryId"], item.recovery_id);
+    assert_eq!(inspect["data"]["recoveryRevision"], item.revision);
+    assert_eq!(inspect["data"]["authorization"], "read");
+    assert_eq!(inspect["data"]["sourcePaths"], json!(item.source_paths));
+    assert_eq!(inspect["data"]["sourceSha256"], json!(item.source_sha256));
+    assert_eq!(
+        inspect["data"]["candidateFacts"],
+        json!(item.candidate_facts)
+    );
+    assert_eq!(inspect["data"]["provenance"], json!(item.provenance));
+
+    let status_after_inspect = app
+        .oneshot(
+            Request::builder()
+                .uri("/conversations/host-status")
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 3000))))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status_after_inspect = response_json(status_after_inspect).await;
+    for field in [
+        "sourcePaths",
+        "sourceSha256",
+        "candidateFacts",
+        "provenance",
+    ] {
+        assert_eq!(
+            status_after_inspect["data"]["recoveryItems"][0][field],
+            json!([]),
+            "host status leaked {field} after Inspect"
+        );
+    }
+}
+
+#[tokio::test]
+async fn production_router_preserves_workspace_conflict_and_recovery_success_envelopes() {
+    const TOKEN: &str = "workspace-production-token";
+    let workspace_fixture = fixture().await;
+    let authority = Arc::new(crate::web::RemoteAccessAuthority::for_tests(TOKEN));
+    let app = production_app(workspace_fixture.state, authority);
+    let request = json!({"basedRevision":null,"workspace":golden_workspace()});
+
+    let updated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/conversations/{ID}/workspace"))
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(request.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(updated.status(), axum::http::StatusCode::OK);
+    assert_eq!(response_json(updated).await["data"]["status"], "updated");
+
+    let conflict = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/conversations/{ID}/workspace"))
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(request.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(conflict.status(), axum::http::StatusCode::CONFLICT);
+    let conflict = response_json(conflict).await;
+    assert_eq!(conflict["success"], true);
+    assert_eq!(conflict["data"]["status"], "conflict");
+    assert_eq!(conflict["data"]["currentRevision"], 1);
+
+    let recovery_fixture = fixture().await;
+    recovery_fixture
+        .writer
+        .replace_workspace_bytes(
+            ConversationId::parse(ID).unwrap(),
+            b"{not-valid-workspace-json",
+            ConversationMutation::WorkspaceWrite,
+        )
+        .unwrap();
+    let authority = Arc::new(crate::web::RemoteAccessAuthority::for_tests(TOKEN));
+    let recovery_app = production_app(recovery_fixture.state, authority);
+    let recovery = recovery_app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/conversations/{ID}/workspace"))
+                .header("authorization", format!("Bearer {TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(request.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        recovery.status(),
+        axum::http::StatusCode::UNPROCESSABLE_ENTITY
+    );
+    let recovery = response_json(recovery).await;
+    assert_eq!(recovery["success"], true);
+    assert_eq!(recovery["data"]["status"], "recoveryRequired");
+    assert!(recovery["data"]["recoveryItems"][0]["recoveryId"]
+        .as_str()
+        .is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_router_ws_paging_is_authenticated_and_reads_durable_admission() {
+    const TOKEN: &str = "paging-production-token";
+    const SESSION_ID: &str = "opaque/golden/original";
+    let mut fixture = fixture_with_lifecycle().await;
+    let persistence = conversation_persistence(&fixture);
+    let relay = Arc::new(WsRelaySink::with_conversation_persistence(
+        32,
+        Arc::clone(&persistence),
+        None,
+    ));
+
+    let rejected = relay
+        .emit(&AcpEvent {
+            sid: Some("unmapped-session".to_string()),
+            type_: "acp:message_chunk",
+            payload: json!({"ordinal":0}),
+        })
+        .expect_err("unmapped durable admission must fail closed");
+    assert_eq!(
+        rejected.code,
+        crate::web::sink::CONVERSATION_PERSISTENCE_REJECTED
+    );
+    assert!(rejected.durable_rejection);
+    assert_eq!(relay.session_watermark("unmapped-session"), 0);
+
+    for ordinal in 1..=4_u64 {
+        let receipt = relay
+            .emit(&AcpEvent {
+                sid: Some(SESSION_ID.to_string()),
+                type_: "acp:message_chunk",
+                payload: json!({"ordinal":ordinal}),
+            })
+            .expect("mapped durable admission");
+        assert!(receipt.delivered);
+        assert!(receipt.durable_admission);
+        assert_eq!(receipt.session_seq, Some(ordinal + 1));
+    }
+    relay.flush_conversation_persistence().await.unwrap();
+    let expected_page = persistence.history_page(SESSION_ID, 0, 250).unwrap();
+    assert!(expected_page.complete);
+    assert_eq!(
+        expected_page
+            .records
+            .iter()
+            .filter_map(|record| record.payload["ordinal"].as_u64())
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
+
+    fixture.state.relay = Arc::clone(&relay);
+    fixture.state.history_mode = HistoryMode::Server;
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let origin = format!("http://{address}");
+    let authority = Arc::new(crate::web::RemoteAccessAuthority::for_tests(TOKEN));
+    authority
+        .set_public_origin(Url::parse(&origin).unwrap())
+        .unwrap();
+    let app = production_app(fixture.state.clone(), authority);
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut socket = websocket_connect(address, &origin).await;
+    let auth_required = read_websocket_json(&mut socket).await;
+    assert_eq!(auth_required["type"], "auth_required");
+
+    write_websocket_json(
+        &mut socket,
+        &json!({
+            "id":"page-before-auth",
+            "type":"get_session_payload_page",
+            "payload":{"sessionId":SESSION_ID,"afterSeq":0,"limit":250}
+        }),
+    )
+    .await;
+    let denied = read_websocket_reply(&mut socket, "page-before-auth").await;
+    assert_eq!(denied["ok"], false);
+    assert_eq!(denied["err"]["code"], "unauthorized");
+    assert!(denied.get("payload").is_none());
+
+    write_websocket_json(
+        &mut socket,
+        &json!({"id":"auth","type":"authenticate","payload":{"token":TOKEN}}),
+    )
+    .await;
+    let authenticated = read_websocket_reply(&mut socket, "auth").await;
+    assert_eq!(authenticated["ok"], true);
+
+    write_websocket_json(
+        &mut socket,
+        &json!({
+            "id":"page",
+            "type":"get_session_payload_page",
+            "payload":{"sessionId":SESSION_ID,"afterSeq":0,"limit":250}
+        }),
+    )
+    .await;
+    let page = read_websocket_reply(&mut socket, "page").await;
+    assert_eq!(page["ok"], true);
+    assert_eq!(
+        page["payload"],
+        serde_json::to_value(&expected_page).unwrap()
+    );
+
+    write_websocket_json(
+        &mut socket,
+        &json!({
+            "id":"invalid-page",
+            "type":"get_session_payload_page",
+            "payload":{"sessionId":SESSION_ID,"afterSeq":0,"limit":0}
+        }),
+    )
+    .await;
+    let invalid = read_websocket_reply(&mut socket, "invalid-page").await;
+    assert_eq!(invalid["ok"], false);
+    assert_eq!(invalid["err"]["code"], "VALIDATION_ERROR");
+    write_websocket_frame(&mut socket, 0x8, &[]).await;
+
+    server.abort();
+    let _ = server.await;
+    relay.shutdown_conversation_persistence().await.unwrap();
+
+    let private_root = fixture.private_root.clone();
+    let GoldenFixture {
+        _temp,
+        repository,
+        writer,
+        service,
+        state,
+        ..
+    } = fixture;
+    drop(state);
+    drop(service);
+    drop(writer);
+    drop(repository);
+    drop(relay);
+    drop(persistence);
+    let (restarted, _) = ConversationRepository::open(private_root).unwrap();
+    let durable_ordinals = restarted
+        .read_events(ConversationId::parse(ID).unwrap(), 0)
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| event.payload["ordinal"].as_u64())
+        .collect::<Vec<_>>();
+    assert_eq!(durable_ordinals, vec![1, 2, 3, 4]);
+    drop(restarted);
+    drop(_temp);
 }
 
 #[tokio::test]

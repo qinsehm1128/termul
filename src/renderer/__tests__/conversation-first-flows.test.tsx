@@ -162,12 +162,8 @@ function coldTerminalWorkspace(): SessionWorkspaceV1 {
   }
 }
 
-const recoveryItem: RecoveryItemV1 = {
-  recoveryId: 'a'.repeat(64),
-  kind: 'ambiguous_workspace_manifest',
-  severity: 'warning',
+const recoveryEvidence = {
   sourcePaths: ['legacy_workspace_manifests/0/shared.json'],
-  conversationIds: [ID],
   sourceSha256: ['e'.repeat(64)],
   candidateFacts: [{ candidate: 'preserved' }],
   provenance: [
@@ -175,9 +171,20 @@ const recoveryItem: RecoveryItemV1 = {
       sourceKind: 'legacy_workspace_manifests',
       relativePath: 'legacy_workspace_manifests/0/shared.json',
       sha256: 'e'.repeat(64),
-      preservedReadOnly: true
+      preservedReadOnly: true as const
     }
-  ],
+  ]
+}
+
+const recoveryItem: RecoveryItemV1 = {
+  recoveryId: 'a'.repeat(64),
+  kind: 'ambiguous_workspace_manifest',
+  severity: 'warning',
+  sourcePaths: [],
+  conversationIds: [ID],
+  sourceSha256: [],
+  candidateFacts: [],
+  provenance: [],
   status: 'unresolved',
   suggestedActions: [
     'inspect',
@@ -438,7 +445,8 @@ describe('Conversation-first desktop/browser flow matrix', () => {
     expect(useSessionWorkspaceSyncStore.getState().activeConversationId).toBe(ID)
   })
 
-  it('executes exact recovery actions and preserves immutable source evidence', async () => {
+  it('reveals authenticated recovery evidence from redacted browser status before mutation choices', async () => {
+    const originalSnapshot = structuredClone(recoveryItem)
     mockConversationApi.resolveRecovery.mockImplementation(async (request) => ({
       success: true,
       data: {
@@ -449,10 +457,7 @@ describe('Conversation-first desktop/browser flow matrix', () => {
         recoveryRevision: request.action === 'inspect' ? 1 : 2,
         workspaceRevision: null,
         workspaceChanged: false,
-        sourcePaths: ['transport-must-not-replace-source'],
-        sourceSha256: ['f'.repeat(64)],
-        candidateFacts: [],
-        provenance: []
+        ...recoveryEvidence
       }
     }))
     render(<ConversationRecoveryPanel items={[recoveryItem]} conversationId={ID} embedded />)
@@ -460,10 +465,7 @@ describe('Conversation-first desktop/browser flow matrix', () => {
     for (const action of recoveryItem.suggestedActions) {
       expect(document.querySelector(`[data-recovery-action="${action}"]`)).toBeVisible()
     }
-    expect(
-      screen.getAllByText(/legacy_workspace_manifests\/0\/shared.json/).length
-    ).toBeGreaterThan(0)
-    expect(screen.getAllByText(new RegExp(`sha256:${'e'.repeat(64)}`)).length).toBeGreaterThan(0)
+    expect(screen.queryByText(/legacy_workspace_manifests\/0\/shared.json/)).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: 'Inspect preserved source' }))
     await waitFor(() => expect(mockConversationApi.resolveRecovery).toHaveBeenCalledTimes(1))
@@ -474,9 +476,11 @@ describe('Conversation-first desktop/browser flow matrix', () => {
       payload: {}
     })
     expect(
-      screen.getAllByText(/legacy_workspace_manifests\/0\/shared.json/).length
+      (await screen.findAllByText(/legacy_workspace_manifests\/0\/shared.json/)).length
     ).toBeGreaterThan(0)
-    expect(screen.queryByText('transport-must-not-replace-source')).not.toBeInTheDocument()
+    expect(screen.getAllByText(new RegExp(`sha256:${'e'.repeat(64)}`)).length).toBeGreaterThan(0)
+    expect(screen.getByText('{"candidate":"preserved"}')).toBeVisible()
+    expect(recoveryItem).toEqual(originalSnapshot)
   })
 
   it.each([

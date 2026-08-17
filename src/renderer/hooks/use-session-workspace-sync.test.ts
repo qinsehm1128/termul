@@ -441,7 +441,7 @@ describe('Conversation-scoped SessionWorkspace sync', () => {
     expect(getActiveConversationId()).toBe(two)
   })
 
-  it('debounces writes and scopes stale conflicts to the target Conversation', async () => {
+  it('routes a typed HTTP 409 Conflict outcome to Conversation conflict state', async () => {
     vi.useFakeTimers()
     writeMock.mockResolvedValue({
       success: true,
@@ -464,6 +464,7 @@ describe('Conversation-scoped SessionWorkspace sync', () => {
       currentRevision: 6
     })
     expect(useSessionWorkspaceSyncStore.getState().getConflict(two)).toBeNull()
+    expect(logMock).not.toHaveBeenCalled()
     unmount()
   })
 
@@ -544,7 +545,7 @@ describe('Conversation-scoped SessionWorkspace sync', () => {
     )
   })
 
-  it('returns recoveryRequired from a write without advancing revision', async () => {
+  it('routes a typed HTTP 422 RecoveryRequired outcome without a network-error branch', async () => {
     useConversationStore.getState().setActiveConversationId(one)
     useSessionWorkspaceSyncStore.getState().setBasedRevision(one, 4)
     writeMock.mockResolvedValue({
@@ -553,5 +554,6 @@ describe('Conversation-scoped SessionWorkspace sync', () => {
     })
     expect(await performSessionWorkspaceWrite(one)).toBe('recoveryRequired')
     expect(useSessionWorkspaceSyncStore.getState().getBasedRevision(one)).toBe(4)
+    expect(logMock).not.toHaveBeenCalled()
   })
 })

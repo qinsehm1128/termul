@@ -108,7 +108,47 @@ describe('webSessionWorkspaceApi', () => {
     })
   })
 
-  it('maps transport, non-2xx, and JSON failures to NETWORK_ERROR', async () => {
+  it('preserves typed success envelopes for HTTP 409 Conflict and 422 RecoveryRequired', async () => {
+    const conflict = {
+      status: 'conflict' as const,
+      currentRevision: 6,
+      currentUpdatedAtUtc: '2026-08-15T10:00:00.000Z',
+      currentUpdateIdentity: 'browser-b'
+    }
+    const recoveryRequired = {
+      status: 'recoveryRequired' as const,
+      recoveryItems: [
+        {
+          recoveryId: 'a'.repeat(64),
+          kind: 'ambiguous_workspace_manifest' as const,
+          severity: 'warning' as const,
+          sourcePaths: [],
+          conversationIds: [conversationId],
+          sourceSha256: [],
+          candidateFacts: [],
+          provenance: [],
+          status: 'unresolved' as const,
+          suggestedActions: ['inspect'] as const,
+          revision: 7,
+          associationDecisions: []
+        }
+      ]
+    }
+    fetchMock
+      .mockResolvedValueOnce(response({ success: true, data: conflict }, 409))
+      .mockResolvedValueOnce(response({ success: true, data: recoveryRequired }, 422))
+
+    expect(await webSessionWorkspaceApi.writeWorkspace(conversationId, 4, workspace)).toEqual({
+      success: true,
+      data: conflict
+    })
+    expect(await webSessionWorkspaceApi.writeWorkspace(conversationId, 4, workspace)).toEqual({
+      success: true,
+      data: recoveryRequired
+    })
+  })
+
+  it('maps rejected fetch, malformed envelopes, and JSON failures to NETWORK_ERROR', async () => {
     fetchMock.mockRejectedValueOnce(new Error('offline'))
     expect(await webSessionWorkspaceApi.getWorkspace(conversationId)).toMatchObject({
       success: false,
@@ -118,6 +158,12 @@ describe('webSessionWorkspaceApi', () => {
     expect(await webSessionWorkspaceApi.getWorkspace(conversationId)).toEqual({
       success: false,
       error: 'HTTP 500 Error',
+      code: 'NETWORK_ERROR'
+    })
+    fetchMock.mockResolvedValueOnce(response({ success: true }, 409))
+    expect(await webSessionWorkspaceApi.getWorkspace(conversationId)).toEqual({
+      success: false,
+      error: 'HTTP 409 Error',
       code: 'NETWORK_ERROR'
     })
     fetchMock.mockResolvedValueOnce({
