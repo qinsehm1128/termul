@@ -21,6 +21,10 @@ pub mod config;
 pub mod conversation_api;
 pub mod conversation_lifecycle_api;
 pub mod fs_api;
+// Rust 1.95 diagnoses three legacy callback adapters inside this pre-existing
+// module. TASK-004 cannot rewrite that non-owned file, so keep the allowance
+// scoped to `git_api` rather than weakening the crate-wide lint gate.
+#[allow(clippy::redundant_closure)]
 pub mod git_api;
 pub mod install_api;
 pub mod log_api;
@@ -55,6 +59,7 @@ pub use sink::{
 };
 pub use ws::{AppState, HistoryMode, ReliabilityTier, RuntimePolicy, SequencedEvent, WsErrorCode};
 
+use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -77,13 +82,116 @@ pub(crate) fn test_pty_manager() -> Arc<PtyManager> {
     Arc::new(PtyManager::new(events, cwd, git, exit))
 }
 
+pub(crate) const ACP_PRODUCER_STOP_FAILED: &str = "ACP_PRODUCER_STOP_FAILED";
+pub(crate) const CONVERSATION_PERSISTENCE_DRAIN_FAILED: &str =
+    "CONVERSATION_PERSISTENCE_DRAIN_FAILED";
+pub(crate) const CONVERSATION_CATALOG_FLUSH_FAILED: &str = "CONVERSATION_CATALOG_FLUSH_FAILED";
+pub(crate) const ACP_PERSISTENCE_SHUTDOWN_FAILED: &str = "ACP_PERSISTENCE_SHUTDOWN_FAILED";
+
+#[derive(Debug)]
+struct StandaloneShutdownError {
+    codes: Vec<&'static str>,
+}
+
+impl fmt::Display for StandaloneShutdownError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "standalone shutdown failed: {}",
+            self.codes.join(",")
+        )
+    }
+}
+
+impl std::error::Error for StandaloneShutdownError {}
+
+fn record_shutdown_failure(
+    failures: &mut Vec<&'static str>,
+    code: &'static str,
+    phase: &'static str,
+) {
+    error!(
+        target: "termul::web::shutdown",
+        stable_code = code,
+        shutdown_phase = phase,
+        "standalone resource cleanup failed"
+    );
+    failures.push(code);
+}
+
+/// Stop standalone-owned producers, prove both Conversation durability barriers, and only then
+/// release the remaining ACP/PTY resources. Every fallible stage is attempted in deterministic
+/// order; callers receive stable codes without persistence paths or payload material.
+async fn shutdown_standalone_resources_until(
+    acp: &AcpManager,
+    pty: &PtyManager,
+    ws_relay: &WsRelaySink,
+    deadline: tokio::time::Instant,
+) -> Result<(), StandaloneShutdownError> {
+    let mut failures = Vec::new();
+
+    if acp.stop_producers().await.is_err() {
+        record_shutdown_failure(
+            &mut failures,
+            ACP_PRODUCER_STOP_FAILED,
+            "stop_acp_producers",
+        );
+    }
+    if ws_relay
+        .shutdown_conversation_persistence_until(deadline)
+        .await
+        .is_err()
+    {
+        record_shutdown_failure(
+            &mut failures,
+            CONVERSATION_PERSISTENCE_DRAIN_FAILED,
+            "drain_conversation_persistence",
+        );
+    }
+    match ws_relay.flush_catalog_until(deadline).await {
+        Ok(receipt) => info!(
+            target: "termul::web::shutdown",
+            stable_code = "OK",
+            shutdown_phase = "flush_conversation_catalog",
+            requested_generation = receipt.requested_generation,
+            flushed_generation = receipt.flushed_generation,
+            write_count = receipt.write_count,
+            "standalone catalog barrier completed"
+        ),
+        Err(_) => record_shutdown_failure(
+            &mut failures,
+            CONVERSATION_CATALOG_FLUSH_FAILED,
+            "flush_conversation_catalog",
+        ),
+    }
+    if acp.shutdown_persistence().await.is_err() {
+        record_shutdown_failure(
+            &mut failures,
+            ACP_PERSISTENCE_SHUTDOWN_FAILED,
+            "shutdown_acp_persistence",
+        );
+    }
+
+    // PTY cleanup is infallible at this boundary and must run even when every
+    // preceding durability stage failed.
+    pty.kill_all().await;
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(StandaloneShutdownError { codes: failures })
+    }
+}
+
 /// Bind and serve the standalone ACP HTTP server until SIGINT/SIGTERM.
 ///
 /// `ws_relay` is the live [`WsRelaySink`] — passed to both `AcpManager::new`
 /// (as an event sink) and the router (so `/ws` can subscribe clients + replay
-/// cursors). On signal: drains Axum first (graceful shutdown), then kills all
-/// agent subprocesses via [`AcpManager::kill_all`]. Bind failures are returned
-/// to the caller. On serve error, agents are still killed before returning.
+/// cursors). On signal: drains Axum first (graceful shutdown), stops ACP event
+/// producers, drains canonical Conversation persistence and the final catalog
+/// generation under one absolute deadline, then performs remaining ACP/PTY
+/// cleanup. Bind failures and stable shutdown failures are returned to the
+/// caller.
 ///
 /// `registry` is the in-memory [`ProjectRegistry`] the router reads for
 /// `GET /projects` + `switch_project` cwd resolution. The standalone binary
@@ -141,7 +249,7 @@ pub async fn serve(
         cwd_tracker,
         git_tracker,
         exit_code_tracker,
-        ws_relay,
+        Arc::clone(&ws_relay),
         registry,
         registry_persistence,
         projects_file,
@@ -156,27 +264,8 @@ pub async fn serve(
     .await?;
 
     let serve_result = handle.await;
-
-    // Cleanup: always attempt ALL resource cleanup even if one step fails.
-    // PTY cleanup must not be skipped because ACP persistence errored.
-    let mut cleanup_errors: Vec<Box<dyn std::error::Error + Send + Sync>> = Vec::new();
-
-    if let Err(e) = acp.kill_all_checked().await {
-        let e: Box<dyn std::error::Error + Send + Sync> = e.into();
-        log::error!("[termul-server] ACP kill_all failed during shutdown: {e}");
-        cleanup_errors.push(e);
-    }
-    if let Err(e) = acp.shutdown_persistence().await {
-        let e: Box<dyn std::error::Error + Send + Sync> = e.into();
-        log::error!("[termul-server] ACP persistence shutdown failed: {e}");
-        cleanup_errors.push(e);
-    }
-    // PTY cleanup always runs — never skip terminal process-tree kill.
-    pty.kill_all().await;
-
-    if let Some(first) = cleanup_errors.into_iter().next() {
-        return Err(first);
-    }
+    let deadline = tokio::time::Instant::now() + crate::conversation::DEFAULT_DRAIN_TIMEOUT;
+    shutdown_standalone_resources_until(&acp, &pty, &ws_relay, deadline).await?;
 
     match serve_result {
         Ok(()) => {
@@ -346,36 +435,328 @@ async fn shutdown_signal() -> Result<(), std::io::Error> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn standalone_shutdown_owns_resources() {
-        let source = include_str!("mod.rs");
-        let serve_start = source.find("pub async fn serve(").expect("serve exists");
-        let router_start = source[serve_start..]
-            .find("pub async fn serve_router(")
-            .map(|offset| serve_start + offset)
-            .expect("serve_router exists");
-        let serve_body = &source[serve_start..router_start];
-        assert!(
-            serve_body.contains("acp.kill_all_checked().await"),
-            "standalone serve must retain owned ACP cleanup after Axum drain"
-        );
-        assert!(
-            serve_body.contains("pty.kill_all().await"),
-            "standalone serve must retain owned PTY cleanup after Axum drain"
+    use super::*;
+    use crate::conversation::{
+        AgentSessionBinding, AgentSessionBindingState, ConversationCreator, ConversationId,
+        ConversationLifecycleState, ConversationMutation, ConversationPersistenceAdapter,
+        ConversationRecordV2, ConversationRepository, ConversationWriter, CreationPartition,
+        ExecutionTarget, LegacyConversationReader, ReaderPrecedence,
+        AGENT_SESSION_BINDING_SCHEMA_VERSION, CONVERSATION_SCHEMA_VERSION,
+    };
+    use chrono::Utc;
+    use serde_json::json;
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use tokio::sync::oneshot;
+    use uuid::Uuid;
+
+    async fn conversation_relay_fixture(
+        session_id: &str,
+    ) -> (
+        TempDir,
+        Arc<ConversationRepository>,
+        Arc<WsRelaySink>,
+        ConversationId,
+    ) {
+        let temp = tempfile::tempdir().expect("temporary Conversation root");
+        let root = temp
+            .path()
+            .canonicalize()
+            .expect("canonical temporary root");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).expect("workspace directory");
+        let workspace = workspace.canonicalize().expect("canonical workspace");
+        let (repository, report) =
+            ConversationRepository::open(root.join("private")).expect("repository open");
+        assert_eq!(report.valid_conversation_count, 0);
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
+        let conversation_id = ConversationId::new_v4();
+        let created_at = Utc::now();
+        writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: workspace.to_string_lossy().into_owned(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::InitializingAgent,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                },
+                ConversationMutation::CreateConversation,
+            )
+            .await
+            .expect("canonical Conversation create");
+        writer
+            .bind_agent_session(
+                conversation_id,
+                AgentSessionBinding {
+                    schema_version: AGENT_SESSION_BINDING_SCHEMA_VERSION,
+                    binding_id: Uuid::new_v4(),
+                    agent_session_id: session_id.to_string(),
+                    runtime_agent_id: "runtime-web-shutdown".to_string(),
+                    stable_agent_namespace: "config:web-shutdown".to_string(),
+                    execution_cwd: workspace.to_string_lossy().into_owned(),
+                    bound_at_utc: created_at,
+                    state: AgentSessionBindingState::Active,
+                },
+                created_at,
+            )
+            .await
+            .expect("canonical agent-session binding");
+        let reader = Arc::new(crate::conversation::ConversationReader::new(
+            Arc::clone(&repository),
+            LegacyConversationReader::default(),
+            ReaderPrecedence::ConversationV2Only,
+        ));
+        let adapter = Arc::new(ConversationPersistenceAdapter::new(writer, reader));
+        let relay = Arc::new(WsRelaySink::with_conversation_persistence(
+            32, adapter, None,
+        ));
+        (temp, repository, relay, conversation_id)
+    }
+
+    fn server_config(root: &std::path::Path) -> ServerConfig {
+        let project_root = root.canonicalize().expect("canonical project root");
+        let conversation_workspace_root = project_root.join("Termul");
+        std::fs::create_dir_all(&conversation_workspace_root).expect("Conversation workspace root");
+        ServerConfig {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+            event_log_capacity: 32,
+            permission_timeout_secs: 60,
+            permission_reconnect_grace_secs: 15,
+            project_root,
+            projects_file: None,
+            sessions_dir: None,
+            conversation_workspace_root,
+            workspace_manifests_dir: None,
+            acp_catalog_dir: None,
+            remote_access_token_file: None,
+            allowed_origins: Vec::new(),
+        }
+    }
+
+    fn install_test_agent(acp: &AcpManager, agent_id: &crate::acp::AgentId) {
+        let (observed, _receiver) = std::sync::mpsc::sync_channel(1);
+        acp.install_test_agent_for_new_session(agent_id.clone(), observed);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standalone_shutdown_drains_conversation_persistence() {
+        let (_temp, repository, relay, conversation_id) =
+            conversation_relay_fixture("standalone-drain-session").await;
+        repository.reset_catalog_write_counters();
+        relay
+            .emit(&sink::AcpEvent {
+                sid: Some("standalone-drain-session".to_string()),
+                type_: "acp:message_chunk",
+                payload: json!({"ordinal": 1}),
+            })
+            .expect("durable event admission");
+
+        let relay_sink: Arc<dyn EventSink> = relay.clone();
+        let acp = Arc::new(AcpManager::new(vec![relay_sink]));
+        let agent_id = crate::acp::AgentId("standalone-owned-agent".to_string());
+        install_test_agent(&acp, &agent_id);
+        let pty = test_pty_manager();
+        let ordered = relay
+            .ordered_conversation_persistence()
+            .expect("ordered Conversation persistence");
+        assert_eq!(
+            ordered.active_worker_count(),
+            crate::conversation::WRITER_SHARDS
         );
 
+        shutdown_standalone_resources_until(
+            &acp,
+            &pty,
+            &relay,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("standalone shutdown succeeds");
+
+        assert!(
+            acp.stable_agent_namespace(&agent_id).is_err(),
+            "producer stop removes standalone-owned agents"
+        );
+        assert_eq!(ordered.active_worker_count(), 0);
+        assert_eq!(ordered.metrics().pending_records, 0);
+        assert!(
+            repository
+                .read_events(conversation_id, 0)
+                .expect("durable Conversation history")
+                .iter()
+                .any(|event| event.payload["ordinal"] == 1),
+            "accepted relay event crosses the canonical durability frontier"
+        );
+        let catalog = repository.catalog_flush_coordinator();
+        let snapshot = catalog.snapshot();
+        assert!(catalog.flushed_generation() >= snapshot.generation);
+        assert!(repository.catalog_write_count() >= 1);
+
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("async fn shutdown_standalone_resources_until(")
+            .expect("standalone shutdown helper");
+        let end = source[start..]
+            .find("/// Bind and serve the standalone")
+            .map(|offset| start + offset)
+            .expect("standalone shutdown helper boundary");
+        let body = &source[start..end];
+        let ordered_calls = [
+            "acp.stop_producers().await",
+            ".shutdown_conversation_persistence_until(deadline)",
+            ".flush_catalog_until(deadline)",
+            "acp.shutdown_persistence().await",
+            "pty.kill_all().await",
+        ];
+        let positions = ordered_calls.map(|needle| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}"))
+        });
+        assert!(
+            positions.windows(2).all(|pair| pair[0] < pair[1]),
+            "standalone shutdown stages must retain producer/drain/catalog/cleanup order"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn standalone_shutdown_propagates_stable_failures() {
+        let (_temp, repository, relay, _conversation_id) =
+            conversation_relay_fixture("standalone-catalog-failure").await;
+        repository.reset_catalog_write_counters();
+        repository.fail_next_catalog_writes(usize::MAX);
+        relay
+            .emit(&sink::AcpEvent {
+                sid: Some("standalone-catalog-failure".to_string()),
+                type_: "acp:message_chunk",
+                payload: json!({"ordinal": 1}),
+            })
+            .expect("durable event admission");
+        let relay_sink: Arc<dyn EventSink> = relay.clone();
+        let acp = Arc::new(AcpManager::new(vec![relay_sink]));
+        let pty = test_pty_manager();
+
+        let error = shutdown_standalone_resources_until(
+            &acp,
+            &pty,
+            &relay,
+            tokio::time::Instant::now() + Duration::from_millis(50),
+        )
+        .await
+        .expect_err("catalog barrier failure must block clean success");
+        assert!(error.codes.contains(&CONVERSATION_CATALOG_FLUSH_FAILED));
+        assert_eq!(
+            relay
+                .ordered_conversation_persistence()
+                .expect("ordered Conversation persistence")
+                .active_worker_count(),
+            0,
+            "later cleanup still runs after a stable catalog failure"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shared_live_router_remains_non_owning() {
+        let (temp, repository, relay, conversation_id) =
+            conversation_relay_fixture("shared-live-session").await;
+        let relay_sink: Arc<dyn EventSink> = relay.clone();
+        let acp = Arc::new(AcpManager::new(vec![relay_sink]));
+        let agent_id = crate::acp::AgentId("desktop-live-agent".to_string());
+        install_test_agent(&acp, &agent_id);
+        let pty = test_pty_manager();
+        let authority = Arc::new(RemoteAccessAuthority::for_tests("shared-live-test-token"));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+        let (_addr, handle) = serve_router(
+            Arc::clone(&acp),
+            Arc::clone(&pty),
+            pty.terminal_events(),
+            pty.cwd_tracker(),
+            pty.git_tracker(),
+            pty.exit_code_tracker(),
+            Arc::clone(&relay),
+            Arc::new(ProjectRegistry::new()),
+            None,
+            None,
+            server_config(temp.path()),
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            None,
+            None,
+            None,
+            None,
+            authority,
+        )
+        .await
+        .expect("shared-live router starts");
+        shutdown_tx.send(()).expect("signal shared-live shutdown");
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("shared-live router stops")
+            .expect("shared-live serve task joins");
+
+        assert_eq!(
+            acp.stable_agent_namespace(&agent_id)
+                .expect("shared-live agent remains registered"),
+            Some("config:test".to_string())
+        );
+        let ordered = relay
+            .ordered_conversation_persistence()
+            .expect("ordered Conversation persistence");
+        assert_eq!(
+            ordered.active_worker_count(),
+            crate::conversation::WRITER_SHARDS
+        );
+        relay
+            .emit(&sink::AcpEvent {
+                sid: Some("shared-live-session".to_string()),
+                type_: "acp:message_chunk",
+                payload: json!({"ordinal": 2}),
+            })
+            .expect("shared-live relay remains admitting events");
+
+        let source = include_str!("mod.rs");
+        let router_start = source
+            .find("pub async fn serve_router(")
+            .expect("serve_router exists");
         let router_end = source[router_start..]
             .find("/// Build the shutdown-signal future")
             .map(|offset| router_start + offset)
             .expect("serve_router body boundary exists");
         let router_body = &source[router_start..router_end];
-        assert!(
-            !router_body.contains("kill_all_checked"),
-            "desktop shared-live serve_router must not own ACP cleanup"
-        );
-        assert!(
-            !router_body.contains("pty.kill_all().await"),
-            "desktop shared-live serve_router must not own PTY cleanup"
-        );
+        for forbidden in [
+            "stop_producers",
+            "shutdown_conversation_persistence",
+            "flush_catalog_until",
+            "shutdown_persistence",
+            "kill_all",
+            "pty.kill_all",
+        ] {
+            assert!(
+                !router_body.contains(forbidden),
+                "shared-live serve_router must not own {forbidden}"
+            );
+        }
+
+        shutdown_standalone_resources_until(
+            &acp,
+            &pty,
+            &relay,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        )
+        .await
+        .expect("test-owned cleanup succeeds");
+        assert!(repository
+            .read_events(conversation_id, 0)
+            .expect("durable shared-live history")
+            .iter()
+            .any(|event| event.payload["ordinal"] == 2));
     }
 }

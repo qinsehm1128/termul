@@ -10,9 +10,9 @@
 
 use crate::acp::config::{AgentId, SessionId};
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, AvailableCommand, ContentBlock, PermissionOption, Plan,
-    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOptions, SessionMode, SessionModeId, StopReason, ToolCall, ToolCallUpdate,
+    AgentCapabilities, AvailableCommand, ContentBlock, PermissionOption, Plan, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOptions, SessionMode,
+    SessionModeId, StopReason, ToolCall, ToolCallUpdate,
 };
 use serde::Serialize;
 
@@ -24,7 +24,11 @@ use serde::Serialize;
 ///
 /// The ONLY place that still calls `AppHandle::emit` for `acp:*` events is
 /// `crate::web::TauriEventSink::emit` (the desktop's sink). See AC7.
-pub(crate) use crate::web::fan_out;
+///
+/// Re-export the typed receipt/error alongside the function so ACP producers
+/// can stay within the `events::` namespace when they classify durable
+/// admission failures.
+pub(crate) use crate::web::sink::{fan_out, FanOutError, FanOutReceipt};
 
 /// A single selectable model advertised by an ACP agent.
 ///
@@ -113,9 +117,7 @@ pub(crate) fn models_from_config_options(
 /// `configId` is the agent-provided option id (conventionally `"model"` but not
 /// guaranteed). This extracts the real id so `set_model` targets it precisely.
 #[allow(clippy::module_name_repetitions)]
-pub(crate) fn model_config_id_from_options(
-    opts: Option<&[SessionConfigOption]>,
-) -> Option<String> {
+pub(crate) fn model_config_id_from_options(opts: Option<&[SessionConfigOption]>) -> Option<String> {
     let opts = opts?;
     let opt = opts
         .iter()
@@ -553,7 +555,10 @@ mod tests {
         assert_eq!(value["stopReason"], "end_turn");
         // Story 1.8 T3.2: `turnId` is absent when `None` (byte-identical to
         // pre-1.8 desktop payloads — `skip_serializing_if = "Option::is_none"`).
-        assert!(value.get("turnId").is_none(), "turnId must be absent when None");
+        assert!(
+            value.get("turnId").is_none(),
+            "turnId must be absent when None"
+        );
     }
 
     #[test]
@@ -655,7 +660,7 @@ mod tests {
             agent_id: AgentId("a1".to_string()),
             session_id: SessionId::new("sess-1"),
             question_id: "q-7".to_string(),
-            question: "Which approach?" .to_string(),
+            question: "Which approach?".to_string(),
             options: vec![
                 QuestionOption {
                     value: "plan-a".to_string(),
@@ -735,10 +740,13 @@ mod tests {
     #[test]
     fn models_from_config_options_returns_none_without_model_category() {
         // A non-Model-category select option must not populate the picker.
-        let opt =
-            SessionConfigOption::select("mode", "Mode", "build", Vec::<SessionConfigSelectOption>::new()).category(
-                SessionConfigOptionCategory::Mode,
-            );
+        let opt = SessionConfigOption::select(
+            "mode",
+            "Mode",
+            "build",
+            Vec::<SessionConfigSelectOption>::new(),
+        )
+        .category(SessionConfigOptionCategory::Mode);
         assert!(models_from_config_options(Some(&[opt])).is_none());
         assert!(models_from_config_options(None).is_none());
         assert!(models_from_config_options(Some(&[])).is_none());
@@ -754,10 +762,13 @@ mod tests {
             Some("llm_model".to_string())
         );
         // Falls back to None when no Model-category option is advertised.
-        let non_model =
-            SessionConfigOption::select("mode", "Mode", "build", Vec::<SessionConfigSelectOption>::new()).category(
-                SessionConfigOptionCategory::Mode,
-            );
+        let non_model = SessionConfigOption::select(
+            "mode",
+            "Mode",
+            "build",
+            Vec::<SessionConfigSelectOption>::new(),
+        )
+        .category(SessionConfigOptionCategory::Mode);
         assert_eq!(model_config_id_from_options(Some(&[non_model])), None);
     }
 }

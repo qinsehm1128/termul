@@ -27,7 +27,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,7 +39,7 @@ use axum::Extension;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 
 use crate::acp::config::AgentConfig;
@@ -49,7 +49,10 @@ use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub}
 use crate::web::auth::{auth_error_response, RemoteAccessAuthority, RemoteAuthError};
 use crate::web::permissions::{TurnClaim, DEFAULT_PERMISSION_RECONNECT_GRACE};
 use crate::web::project_registry::{ProjectRegistry, ProjectSwitchContext};
-use crate::web::sink::{broadcast_projects_changed, AcpEvent, ClientId, ReplayResult, WsRelaySink};
+use crate::web::sink::{
+    broadcast_projects_changed, AcpEvent, ClientId, ReplayResult, WsRelaySink,
+    CLIENT_OUTBOUND_BYTES, CLIENT_OUTBOUND_RECORDS, RELIABLE_CLIENT_TIMEOUT,
+};
 use crate::web::EventSink;
 
 // ---------------------------------------------------------------------------
@@ -433,11 +436,192 @@ impl RuntimePolicy {
 // ---------------------------------------------------------------------------
 
 /// Outbound frame on a connection's write loop (event or reply).
+#[derive(Debug)]
 enum Outbound {
     /// A sequenced event (server→client push).
     Event(SequencedEvent),
     /// A reply to a client request.
     Reply(WsReply),
+}
+
+struct QueuedOutbound {
+    frame: Option<Outbound>,
+    _record_permit: OwnedSemaphorePermit,
+    _byte_permit: OwnedSemaphorePermit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundSendError {
+    Closed,
+    Full,
+    Oversized,
+    Serialization,
+    Timeout,
+}
+
+#[derive(Clone)]
+struct OutboundSender {
+    tx: mpsc::Sender<QueuedOutbound>,
+    record_budget: Arc<Semaphore>,
+    byte_budget: Arc<Semaphore>,
+    disconnected: Arc<AtomicBool>,
+    disconnect_notify: Arc<Notify>,
+}
+
+struct OutboundReceiver {
+    rx: mpsc::Receiver<QueuedOutbound>,
+    disconnected: Arc<AtomicBool>,
+    disconnect_notify: Arc<Notify>,
+}
+
+fn outbound_channel() -> (OutboundSender, OutboundReceiver) {
+    let record_budget = Arc::new(Semaphore::new(CLIENT_OUTBOUND_RECORDS));
+    let byte_budget = Arc::new(Semaphore::new(CLIENT_OUTBOUND_BYTES));
+    let disconnected = Arc::new(AtomicBool::new(false));
+    let disconnect_notify = Arc::new(Notify::new());
+    let (tx, rx) = mpsc::channel(CLIENT_OUTBOUND_RECORDS);
+    (
+        OutboundSender {
+            tx,
+            record_budget: Arc::clone(&record_budget),
+            byte_budget: Arc::clone(&byte_budget),
+            disconnected: Arc::clone(&disconnected),
+            disconnect_notify: Arc::clone(&disconnect_notify),
+        },
+        OutboundReceiver {
+            rx,
+            disconnected,
+            disconnect_notify,
+        },
+    )
+}
+
+fn outbound_frame_bytes(frame: &Outbound) -> Result<usize, OutboundSendError> {
+    let encoded = match frame {
+        Outbound::Event(event) => serde_json::to_vec(event),
+        Outbound::Reply(reply) => serde_json::to_vec(reply),
+    }
+    .map_err(|_| OutboundSendError::Serialization)?;
+    Ok(encoded.len().max(1))
+}
+
+impl OutboundSender {
+    fn disconnect(&self) {
+        if !self.disconnected.swap(true, Ordering::AcqRel) {
+            self.disconnect_notify.notify_waiters();
+        }
+    }
+
+    fn send(&self, frame: Outbound) -> Result<(), OutboundSendError> {
+        if self.disconnected.load(Ordering::Acquire) {
+            return Err(OutboundSendError::Closed);
+        }
+        let bytes = outbound_frame_bytes(&frame)?;
+        if bytes > CLIENT_OUTBOUND_BYTES {
+            self.disconnect();
+            return Err(OutboundSendError::Oversized);
+        }
+        let record_permit = Arc::clone(&self.record_budget)
+            .try_acquire_owned()
+            .map_err(|_| OutboundSendError::Full)?;
+        let byte_permit = Arc::clone(&self.byte_budget)
+            .try_acquire_many_owned(bytes as u32)
+            .map_err(|_| OutboundSendError::Full)?;
+        self.tx
+            .try_send(QueuedOutbound {
+                frame: Some(frame),
+                _record_permit: record_permit,
+                _byte_permit: byte_permit,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => OutboundSendError::Full,
+                mpsc::error::TrySendError::Closed(_) => OutboundSendError::Closed,
+            })
+    }
+
+    async fn send_event(&self, event: SequencedEvent) -> Result<(), OutboundSendError> {
+        if tier_of(&event.type_) == ReliabilityTier::Lossy {
+            return match self.send(Outbound::Event(event)) {
+                Ok(()) | Err(OutboundSendError::Full) => Ok(()),
+                Err(error) => Err(error),
+            };
+        }
+        if self.disconnected.load(Ordering::Acquire) {
+            return Err(OutboundSendError::Closed);
+        }
+        let frame = Outbound::Event(event);
+        let bytes = outbound_frame_bytes(&frame)?;
+        if bytes > CLIENT_OUTBOUND_BYTES {
+            self.disconnect();
+            return Err(OutboundSendError::Oversized);
+        }
+        let deadline = tokio::time::Instant::now() + RELIABLE_CLIENT_TIMEOUT;
+        let record_permit = match tokio::time::timeout_at(
+            deadline,
+            Arc::clone(&self.record_budget).acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(OutboundSendError::Closed),
+            Err(_) => {
+                self.disconnect();
+                return Err(OutboundSendError::Timeout);
+            }
+        };
+        let byte_permit = match tokio::time::timeout_at(
+            deadline,
+            Arc::clone(&self.byte_budget).acquire_many_owned(bytes as u32),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(OutboundSendError::Closed),
+            Err(_) => {
+                self.disconnect();
+                return Err(OutboundSendError::Timeout);
+            }
+        };
+        let queued = QueuedOutbound {
+            frame: Some(frame),
+            _record_permit: record_permit,
+            _byte_permit: byte_permit,
+        };
+        let result = tokio::time::timeout_at(deadline, self.tx.send(queued)).await;
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(OutboundSendError::Closed),
+            Err(_) => {
+                self.disconnect();
+                Err(OutboundSendError::Timeout)
+            }
+        }
+    }
+}
+
+impl OutboundReceiver {
+    async fn recv_queued(&mut self) -> Option<QueuedOutbound> {
+        self.rx.recv().await
+    }
+
+    #[cfg(test)]
+    async fn recv(&mut self) -> Option<Outbound> {
+        let mut queued = self.rx.recv().await?;
+        queued.frame.take()
+    }
+
+    #[cfg(test)]
+    fn try_recv(&mut self) -> Result<Outbound, mpsc::error::TryRecvError> {
+        let mut queued = self.rx.try_recv()?;
+        Ok(queued
+            .frame
+            .take()
+            .expect("queued outbound frame is consumed exactly once"))
+    }
+
+    fn is_disconnected(&self) -> bool {
+        self.disconnected.load(Ordering::Acquire)
+    }
 }
 
 /// The `auth_required` event type name (relay-level, not from `events.rs`).
@@ -542,7 +726,7 @@ async fn run_relay(
     peer: SocketAddr,
 ) {
     let (mut sink, mut stream) = socket.split();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Outbound>();
+    let (out_tx, mut out_rx) = outbound_channel();
     let relay = Arc::clone(&state.relay);
     // Story 1.8: the ACP manager — the server is the ACP client-of-record; the
     // 10 ACP command handlers (`send_prompt`, `create_session`, …) forward to it.
@@ -607,10 +791,19 @@ async fn run_relay(
         // full interval after connect (a fresh connection needs no keepalive
         // yet and the auth_required frame has just been queued).
         ping.tick().await;
+        let write_disconnect = Arc::clone(&out_rx.disconnect_notify);
         loop {
+            if out_rx.is_disconnected() {
+                break;
+            }
             tokio::select! {
-                frame = out_rx.recv() => {
-                    let Some(frame) = frame else { break };
+                () = write_disconnect.notified() => break,
+                queued = out_rx.recv_queued() => {
+                    let Some(mut queued) = queued else { break };
+                    let frame = queued
+                        .frame
+                        .take()
+                        .expect("queued outbound frame is consumed exactly once");
                     let text = match frame {
                         Outbound::Event(evt) => serde_json::to_string(&evt).unwrap_or_else(|e| {
                             warn!("[ws] failed to serialize event {}: {e}", evt.type_);
@@ -825,7 +1018,7 @@ async fn dispatch_connection_text_with_conversation(
     registry: &Arc<ProjectRegistry>,
     registry_persistence: Option<&Arc<parking_lot::Mutex<FileProjectRegistry>>>,
     projects_file: Option<&PathBuf>,
-    write_tx: &mpsc::UnboundedSender<Outbound>,
+    write_tx: &OutboundSender,
     subscribed_clients: &Arc<tokio::sync::Mutex<Vec<(String, ClientId)>>>,
     current_agent: &mut Option<AgentId>,
     current_session: &Arc<parking_lot::Mutex<Option<SessionId>>>,
@@ -891,7 +1084,7 @@ async fn dispatch_connection_text(
     registry: &Arc<ProjectRegistry>,
     registry_persistence: Option<&Arc<parking_lot::Mutex<FileProjectRegistry>>>,
     projects_file: Option<&PathBuf>,
-    write_tx: &mpsc::UnboundedSender<Outbound>,
+    write_tx: &OutboundSender,
     subscribed_clients: &Arc<tokio::sync::Mutex<Vec<(String, ClientId)>>>,
     current_agent: &mut Option<AgentId>,
     current_session: &Arc<parking_lot::Mutex<Option<SessionId>>>,
@@ -997,7 +1190,7 @@ async fn handle_request(
     registry: &Arc<ProjectRegistry>,
     registry_persistence: Option<&Arc<parking_lot::Mutex<FileProjectRegistry>>>,
     projects_file: Option<&PathBuf>,
-    out_tx: &mpsc::UnboundedSender<Outbound>,
+    out_tx: &OutboundSender,
     subscribed_clients: &mut Vec<(String, ClientId)>,
     current_agent: &mut Option<AgentId>,
     current_session: &Arc<parking_lot::Mutex<Option<SessionId>>>,
@@ -1048,7 +1241,7 @@ async fn handle_request_with_conversation(
     registry: &Arc<ProjectRegistry>,
     registry_persistence: Option<&Arc<parking_lot::Mutex<FileProjectRegistry>>>,
     projects_file: Option<&PathBuf>,
-    out_tx: &mpsc::UnboundedSender<Outbound>,
+    out_tx: &OutboundSender,
     subscribed_clients: &mut Vec<(String, ClientId)>,
     current_agent: &mut Option<AgentId>,
     current_session: &Arc<parking_lot::Mutex<Option<SessionId>>>,
@@ -1194,6 +1387,9 @@ async fn handle_request_with_conversation(
         }
         "get_session_payload" => {
             handle_get_session_payload(id, &req.payload, relay, history_mode).await
+        }
+        "get_session_payload_page" => {
+            handle_get_session_payload_page(id, &req.payload, relay, history_mode).await
         }
         "recover_session_snapshot" => {
             handle_recover_session_snapshot(
@@ -1493,28 +1689,60 @@ async fn handle_get_session_payload(
         }
     };
     if let Some(persistence) = relay.conversation_persistence() {
-        return match persistence.legacy_materialization(&parsed.session_id) {
-            Ok((metadata, records)) => {
-                let payload =
-                    crate::acp::session_payload::materialize_session_payload(&metadata, &records);
-                ok_with_payload(id, &payload)
-            }
-            Err(error) if error.code == "CONVERSATION_NOT_FOUND" => {
-                WsReply::err(id, WsErrorCode::NotFound, "session payload not found")
-            }
-            Err(error) => {
+        let (_, metadata, target_last_seq) =
+            match persistence.history_metadata(&parsed.session_id, "get_session_payload") {
+                Ok(value) => value,
+                Err(error) if error.code == "CONVERSATION_NOT_FOUND" => {
+                    return WsReply::err(id, WsErrorCode::NotFound, "session payload not found")
+                }
+                Err(error) => {
+                    return WsReply::err_with_code(id, error.code, "failed to read session payload")
+                }
+            };
+        let mut accumulator =
+            crate::acp::session_payload::SessionPayloadAccumulator::new(&metadata);
+        let mut cursor = 0u64;
+        let mut materialized_records = 0usize;
+        while cursor < target_last_seq {
+            let remaining = crate::conversation::MAX_COMPAT_HISTORY_RECORDS
+                .saturating_sub(materialized_records);
+            let limit = remaining
+                .saturating_add(1)
+                .clamp(1, crate::conversation::MAX_CONVERSATION_HISTORY_PAGE_LIMIT);
+            let page = match persistence.history_page(&parsed.session_id, cursor, limit) {
+                Ok(page) => page,
+                Err(error) => {
+                    return WsReply::err_with_code(id, error.code, "failed to read session payload")
+                }
+            };
+            if page.records.len() > remaining {
                 tracing::warn!(
                     target: "termul::web::ws",
-                    code = error.code,
-                    "get_session_payload: Conversation materialization failed"
+                    code = crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED,
+                    frontier = cursor,
+                    record_count = materialized_records.saturating_add(page.records.len()),
+                    "get_session_payload compatibility limit reached"
                 );
-                WsReply::err(
+                return WsReply::err_with_code(
                     id,
-                    WsErrorCode::Unsupported,
-                    "failed to read session payload",
-                )
+                    crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED,
+                    "history exceeds the compatibility limit; use bounded pages",
+                );
             }
-        };
+            materialized_records = materialized_records.saturating_add(page.records.len());
+            if let Err(error) = accumulator.push_history_page(&page, limit) {
+                return WsReply::err_with_code(
+                    id,
+                    error.stable_code(),
+                    "invalid canonical history page",
+                );
+            }
+            cursor = page.next_cursor;
+            if page.complete {
+                break;
+            }
+        }
+        return ok_with_payload(id, &accumulator.snapshot());
     }
     match relay.persistence() {
         Some(persistence) => {
@@ -1554,11 +1782,89 @@ async fn handle_get_session_payload(
     }
 }
 
+/// Return one exact bounded canonical history page. Validation happens before repository traversal
+/// or page allocation; all application codes remain transport-identical.
+async fn handle_get_session_payload_page(
+    id: String,
+    payload: &Value,
+    relay: &Arc<WsRelaySink>,
+    history_mode: HistoryMode,
+) -> WsReply {
+    if history_mode != HistoryMode::Server {
+        return WsReply::err(
+            id,
+            WsErrorCode::Unsupported,
+            "persisted history is unavailable",
+        );
+    }
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Request {
+        session_id: String,
+        after_seq: u64,
+        limit: usize,
+    }
+    let request: Request = match serde_json::from_value::<Request>(payload.clone()) {
+        Ok(request)
+            if !request.session_id.trim().is_empty()
+                && (crate::conversation::MIN_CONVERSATION_HISTORY_PAGE_LIMIT
+                    ..=crate::conversation::MAX_CONVERSATION_HISTORY_PAGE_LIMIT)
+                    .contains(&request.limit) =>
+        {
+            request
+        }
+        Ok(_) => {
+            return WsReply::err_with_code(
+                id,
+                "VALIDATION_ERROR",
+                "history sessionId/afterSeq/limit is invalid",
+            )
+        }
+        Err(_) => {
+            return WsReply::err_with_code(
+                id,
+                "VALIDATION_ERROR",
+                "malformed get_session_payload_page payload",
+            )
+        }
+    };
+    let Some(persistence) = relay.conversation_persistence() else {
+        return WsReply::err_with_code(
+            id,
+            crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED,
+            "bounded canonical history is unavailable",
+        );
+    };
+    match persistence.history_page(&request.session_id, request.after_seq, request.limit) {
+        Ok(page) => {
+            tracing::info!(
+                target: "termul::web::ws",
+                cursor_start = request.after_seq,
+                cursor_end = page.next_cursor,
+                record_count = page.records.len(),
+                complete = page.complete,
+                "bounded Conversation history page served"
+            );
+            ok_with_payload(id, &page)
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "termul::web::ws",
+                code = error.code,
+                cursor_start = request.after_seq,
+                limit = request.limit,
+                "bounded Conversation history page rejected"
+            );
+            WsReply::err_with_code(id, error.code, "failed to read history page")
+        }
+    }
+}
+
 async fn handle_recover_session_snapshot(
     id: String,
     payload: &Value,
     relay: &Arc<WsRelaySink>,
-    out_tx: &mpsc::UnboundedSender<Outbound>,
+    out_tx: &OutboundSender,
     subscribed_clients: &mut Vec<(String, ClientId)>,
     history_mode: HistoryMode,
 ) -> WsReply {
@@ -1639,7 +1945,7 @@ async fn handle_recover_session_snapshot(
     let forward_tx = out_tx.clone();
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
-            if forward_tx.send(Outbound::Event(event)).is_err() {
+            if forward_tx.send_event(event).await.is_err() {
                 break;
             }
         }
@@ -1744,7 +2050,7 @@ async fn handle_open_persisted_session(
     id: String,
     payload: &Value,
     relay: &Arc<WsRelaySink>,
-    out_tx: &mpsc::UnboundedSender<Outbound>,
+    out_tx: &OutboundSender,
     subscribed_clients: &mut Vec<(String, ClientId)>,
     history_mode: HistoryMode,
 ) -> WsReply {
@@ -2176,15 +2482,19 @@ async fn handle_conversation_lifecycle(
         }
     };
     match result {
-        Ok(outcome) => {
-            relay.emit(&AcpEvent {
-                sid: None,
-                type_: "conversation_lifecycle",
-                payload: serde_json::to_value(&outcome)
-                    .expect("Conversation lifecycle outcome serializes"),
-            });
-            ok_with_payload(id, &outcome)
-        }
+        Ok(outcome) => match relay.emit(&AcpEvent {
+            sid: None,
+            type_: "conversation_lifecycle",
+            payload: serde_json::to_value(&outcome)
+                .expect("Conversation lifecycle outcome serializes"),
+        }) {
+            Ok(_) => ok_with_payload(id, &outcome),
+            Err(error) => WsReply::err_with_code(
+                id,
+                error.code,
+                "conversation lifecycle event delivery degraded",
+            ),
+        },
         Err(error) => WsReply::err_with_code(id, error.code.as_str(), error.detail),
     }
 }
@@ -2257,15 +2567,19 @@ async fn handle_conversation_lifecycle_with_service(
         }
     };
     match result {
-        Ok(outcome) => {
-            relay.emit(&AcpEvent {
-                sid: None,
-                type_: "conversation_lifecycle",
-                payload: serde_json::to_value(&outcome)
-                    .expect("Conversation lifecycle outcome serializes"),
-            });
-            ok_with_payload(id, &outcome)
-        }
+        Ok(outcome) => match relay.emit(&AcpEvent {
+            sid: None,
+            type_: "conversation_lifecycle",
+            payload: serde_json::to_value(&outcome)
+                .expect("Conversation lifecycle outcome serializes"),
+        }) {
+            Ok(_) => ok_with_payload(id, &outcome),
+            Err(error) => WsReply::err_with_code(
+                id,
+                error.code,
+                "conversation lifecycle event delivery degraded",
+            ),
+        },
         Err(error) => WsReply::err_with_code(id, error.code, error.detail),
     }
 }
@@ -3096,7 +3410,7 @@ async fn run_switch_queue(
     agent_id: AgentId,
     acp: Arc<AcpManager>,
     relay: Arc<WsRelaySink>,
-    out_tx: mpsc::UnboundedSender<Outbound>,
+    out_tx: OutboundSender,
     current_session: Arc<parking_lot::Mutex<Option<SessionId>>>,
     current_conversation: Arc<parking_lot::Mutex<Option<crate::conversation::ConversationId>>>,
     current_project: Arc<parking_lot::Mutex<Option<String>>>,
@@ -3121,12 +3435,14 @@ async fn run_switch_queue(
                 queue.pending.take()
             };
             if let Some(failed) = failed {
-                let _ = out_tx.send(Outbound::Event(project_switch_failed_event(
-                    failed.request_id,
-                    failed.target.project_id,
-                    failed.previous_session_id,
-                    error,
-                )));
+                let _ = out_tx
+                    .send_event(project_switch_failed_event(
+                        failed.request_id,
+                        failed.target.project_id,
+                        failed.previous_session_id,
+                        error,
+                    ))
+                    .await;
             }
             switch_queue.lock().await.worker_running = false;
             return;
@@ -3173,7 +3489,7 @@ async fn run_switch_queue(
                     })
                     .unwrap_or_else(|_| json!({})),
                 );
-                let _ = out_tx.send(Outbound::Event(event));
+                let _ = out_tx.send_event(event).await;
             }
             Ok(SwitchProjectOutcome::Queued { .. }) => {}
             // `execute_project_switch` never returns `Selected` (only
@@ -3181,12 +3497,14 @@ async fn run_switch_queue(
             // exhaustiveness now that the enum has a `Selected` variant.
             Ok(SwitchProjectOutcome::Selected { .. }) => {}
             Err(error) => {
-                let _ = out_tx.send(Outbound::Event(project_switch_failed_event(
-                    pending.request_id,
-                    pending.target.project_id,
-                    pending.previous_session_id,
-                    error,
-                )));
+                let _ = out_tx
+                    .send_event(project_switch_failed_event(
+                        pending.request_id,
+                        pending.target.project_id,
+                        pending.previous_session_id,
+                        error,
+                    ))
+                    .await;
             }
         }
         let mut queue = switch_queue.lock().await;
@@ -3205,7 +3523,7 @@ async fn handle_switch_project(
     acp: &Arc<AcpManager>,
     relay: &Arc<WsRelaySink>,
     registry: &Arc<ProjectRegistry>,
-    out_tx: &mpsc::UnboundedSender<Outbound>,
+    out_tx: &OutboundSender,
     current_agent: &mut Option<AgentId>,
     current_session: &Arc<parking_lot::Mutex<Option<SessionId>>>,
     current_conversation: &Arc<parking_lot::Mutex<Option<crate::conversation::ConversationId>>>,
@@ -3960,7 +4278,7 @@ async fn handle_subscribe(
     id: String,
     payload: &Value,
     relay: &Arc<WsRelaySink>,
-    out_tx: &mpsc::UnboundedSender<Outbound>,
+    out_tx: &OutboundSender,
     subscribed_clients: &mut Vec<(String, ClientId)>,
 ) -> WsReply {
     let parsed: SubscribePayload = match serde_json::from_value(payload.clone()) {
@@ -4011,8 +4329,8 @@ async fn handle_subscribe(
             }
             let forward_tx = out_tx.clone();
             tokio::spawn(async move {
-                while let Some(evt) = rx.recv().await {
-                    if forward_tx.send(Outbound::Event(evt)).is_err() {
+                while let Some(event) = rx.recv().await {
+                    if forward_tx.send_event(event).await.is_err() {
                         break;
                     }
                 }
@@ -4290,7 +4608,7 @@ pub(crate) async fn dispatch_conversation_golden_request(
     let relay = Arc::new(WsRelaySink::new());
     let acp = Arc::new(AcpManager::new(vec![]));
     let registry = Arc::new(ProjectRegistry::new());
-    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let (out_tx, _out_rx) = outbound_channel();
     let mut subscribed_clients = Vec::new();
     let mut current_agent = None;
     let current_session = Arc::new(parking_lot::Mutex::new(None));
@@ -4509,7 +4827,7 @@ mod tests {
         let (release, entered) =
             acp.install_test_agent_with_prompt_gate(AgentId("agent-long".to_string()), sessions);
         let registry = Arc::new(ProjectRegistry::new());
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = outbound_channel();
         let subscriptions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let mut current_agent = None;
         let current_session = Arc::new(parking_lot::Mutex::new(None));
@@ -4636,7 +4954,7 @@ mod tests {
             sessions,
         );
         let registry = Arc::new(ProjectRegistry::new());
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = outbound_channel();
         let subscriptions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let mut current_agent = None;
         let current_session = Arc::new(parking_lot::Mutex::new(None));
@@ -4780,7 +5098,7 @@ mod tests {
         sessions.insert("session-resume".to_string());
         let (release, entered) =
             acp.install_test_agent_with_prompt_gate(AgentId("agent-resume".to_string()), sessions);
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = outbound_channel();
         let subscriptions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent = None;
@@ -4863,7 +5181,7 @@ mod tests {
     ) -> WsReply {
         let relay = Arc::new(WsRelaySink::new());
         let acp = Arc::new(AcpManager::new(vec![]));
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut subs = Vec::new();
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent: Option<AgentId> = None;
@@ -4964,7 +5282,7 @@ mod tests {
     async fn handle_request_without_catalog(text: &str) -> WsReply {
         let relay = Arc::new(WsRelaySink::new());
         let acp = Arc::new(AcpManager::new(vec![]));
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut subs = Vec::new();
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent: Option<AgentId> = None;
@@ -5327,7 +5645,7 @@ mod tests {
         // manager (`vec![]` sinks) returns fast `Err`s for the ACP command
         // methods (no agent spawned) which the handlers map to `WsErrorCode`.
         let acp = Arc::new(AcpManager::new(vec![]));
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut subs = Vec::new();
         // Epic-4 bridge: `handle_request` now also takes the project registry +
         // per-connection agent/session tracking (for `switch_project`). The
@@ -5406,7 +5724,7 @@ mod tests {
         let relay = Arc::new(WsRelaySink::new());
         let acp = Arc::new(AcpManager::new(vec![]));
         let registry = Arc::new(ProjectRegistry::new());
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut subscriptions = Vec::new();
         let mut current_agent = None;
         let current_session = Arc::new(parking_lot::Mutex::new(None));
@@ -5685,7 +6003,7 @@ mod tests {
         let acp = Arc::new(AcpManager::new(vec![]));
         let relay = Arc::new(WsRelaySink::new());
         let registry = Arc::new(ProjectRegistry::new());
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut subs: Vec<(String, ClientId)> = Vec::new();
         let mut current_agent: Option<AgentId> = None;
         let current_session = Arc::new(parking_lot::Mutex::new(None::<SessionId>));
@@ -5874,7 +6192,7 @@ mod tests {
         relay.set_rendezvous(Arc::new(
             crate::web::permissions::PermissionRendezvous::default(),
         ));
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut subs = Vec::new();
         let mut authed = true;
         let registry = Arc::new(ProjectRegistry::new());
@@ -5935,17 +6253,19 @@ mod tests {
                 .map(|id| serde_json::json!({ "optionId": id, "name": id, "kind": "auto" }))
                 .collect(),
         );
-        relay.emit(&AcpEvent {
-            sid: Some(session_id.to_string()),
-            type_: "acp:permission_request",
-            payload: serde_json::json!({
-                "agentId": agent_id,
-                "sessionId": session_id,
-                "requestId": request_id,
-                "toolCall": { "toolCallId": "tc-1" },
-                "options": options_value,
-            }),
-        });
+        relay
+            .emit(&AcpEvent {
+                sid: Some(session_id.to_string()),
+                type_: "acp:permission_request",
+                payload: serde_json::json!({
+                    "agentId": agent_id,
+                    "sessionId": session_id,
+                    "requestId": request_id,
+                    "toolCall": { "toolCallId": "tc-1" },
+                    "options": options_value,
+                }),
+            })
+            .expect("permission request relay admission");
         (relay, subs)
     }
 
@@ -5964,7 +6284,7 @@ mod tests {
     fn handle_respond_permission_wrong_agent_is_permission_denied() {
         let (relay, subs) = relay_with_subscribed_permission("a1", "sess-1", "perm-1", &["allow"]);
         let acp = Arc::new(AcpManager::new(vec![]));
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut authed = true;
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -6007,15 +6327,17 @@ mod tests {
         ));
         let (_other_client, _rx, _replay) = block_on(relay.subscribe("sess-B", None));
         let subs: Vec<(String, ClientId)> = vec![("sess-B".to_string(), ClientId::new())];
-        relay.emit(&AcpEvent {
-            sid: Some("sess-A".to_string()),
-            type_: "acp:permission_request",
-            payload: serde_json::json!({
-                "agentId": "a1", "sessionId": "sess-A", "requestId": "perm-A",
-                "toolCall": { "toolCallId": "tc-1" }, "options": [{ "optionId": "allow" }]
-            }),
-        });
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        relay
+            .emit(&AcpEvent {
+                sid: Some("sess-A".to_string()),
+                type_: "acp:permission_request",
+                payload: serde_json::json!({
+                    "agentId": "a1", "sessionId": "sess-A", "requestId": "perm-A",
+                    "toolCall": { "toolCallId": "tc-1" }, "options": [{ "optionId": "allow" }]
+                }),
+            })
+            .expect("permission request relay admission");
+        let (tx, _rx) = outbound_channel();
         let mut authed = true;
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -6052,7 +6374,7 @@ mod tests {
     fn handle_respond_permission_resolves_then_second_is_stale() {
         let (relay, subs) = relay_with_subscribed_permission("a1", "sess-1", "perm-1", &["allow"]);
         let acp = Arc::new(AcpManager::new(vec![]));
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut authed = true;
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -6108,7 +6430,7 @@ mod tests {
         let (relay, subs) =
             relay_with_subscribed_permission("a1", "sess-1", "perm-1", &["allow", "deny"]);
         let acp = Arc::new(AcpManager::new(vec![]));
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut authed = true;
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -6160,17 +6482,19 @@ mod tests {
                 .map(|v| serde_json::json!({ "value": v, "label": v }))
                 .collect(),
         );
-        relay.emit(&AcpEvent {
-            sid: Some(session_id.to_string()),
-            type_: "acp:question_request",
-            payload: serde_json::json!({
-                "agentId": agent_id,
-                "sessionId": session_id,
-                "questionId": question_id,
-                "question": "Which approach?",
-                "options": options_value,
-            }),
-        });
+        relay
+            .emit(&AcpEvent {
+                sid: Some(session_id.to_string()),
+                type_: "acp:question_request",
+                payload: serde_json::json!({
+                    "agentId": agent_id,
+                    "sessionId": session_id,
+                    "questionId": question_id,
+                    "question": "Which approach?",
+                    "options": options_value,
+                }),
+            })
+            .expect("question request relay admission");
         (relay, subs)
     }
 
@@ -6196,7 +6520,7 @@ mod tests {
             crate::web::permissions::QuestionRendezvous::default(),
         ));
         let acp = Arc::new(AcpManager::new(vec![]));
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut authed = true;
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -6232,7 +6556,7 @@ mod tests {
     fn handle_answer_question_wrong_agent_is_permission_denied() {
         let (relay, subs) = relay_with_subscribed_question("a1", "sess-1", "q-1", &["plan-a"]);
         let acp = Arc::new(AcpManager::new(vec![]));
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut authed = true;
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -6273,15 +6597,17 @@ mod tests {
         ));
         let (_other_client, _rx, _replay) = block_on(relay.subscribe("sess-B", None));
         let subs: Vec<(String, ClientId)> = vec![("sess-B".to_string(), ClientId::new())];
-        relay.emit(&AcpEvent {
-            sid: Some("sess-A".to_string()),
-            type_: "acp:question_request",
-            payload: serde_json::json!({
-                "agentId": "a1", "sessionId": "sess-A", "questionId": "q-A",
-                "question": "Q", "options": [{ "value": "plan-a", "label": "Plan A" }]
-            }),
-        });
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        relay
+            .emit(&AcpEvent {
+                sid: Some("sess-A".to_string()),
+                type_: "acp:question_request",
+                payload: serde_json::json!({
+                    "agentId": "a1", "sessionId": "sess-A", "questionId": "q-A",
+                    "question": "Q", "options": [{ "value": "plan-a", "label": "Plan A" }]
+                }),
+            })
+            .expect("question request relay admission");
+        let (tx, _rx) = outbound_channel();
         let mut authed = true;
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -6317,7 +6643,7 @@ mod tests {
     fn handle_answer_question_resolves_then_second_is_stale() {
         let (relay, subs) = relay_with_subscribed_question("a1", "sess-1", "q-1", &["plan-a"]);
         let acp = Arc::new(AcpManager::new(vec![]));
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut authed = true;
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -6371,7 +6697,7 @@ mod tests {
     fn handle_answer_question_invalid_option_is_permission_denied() {
         let (relay, subs) = relay_with_subscribed_question("a1", "sess-1", "q-1", &["plan-a"]);
         let acp = Arc::new(AcpManager::new(vec![]));
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut authed = true;
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -6416,14 +6742,16 @@ mod tests {
         // means after 3 emits base advances. Use subscribe with huge last_seq gap.
         use crate::web::sink::{AcpEvent, EventSink};
         for i in 1..=3 {
-            relay.emit(&AcpEvent {
-                sid: Some("s1".to_string()),
-                type_: "acp:message_chunk",
-                payload: json!({"i": i}),
-            });
+            relay
+                .emit(&AcpEvent {
+                    sid: Some("s1".to_string()),
+                    type_: "acp:message_chunk",
+                    payload: json!({"i": i}),
+                })
+                .expect("message chunk relay admission");
         }
         // Evicted seq 1; last_seq=0 → next wanted 1 < base → Stale
-        let (tx, mut rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, mut rx) = outbound_channel();
         let mut subs = Vec::new();
         let mut authed = true;
         let registry = Arc::new(ProjectRegistry::new());
@@ -6562,7 +6890,7 @@ mod tests {
             }],
             None,
         );
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut subs = Vec::new();
         let mut authed = true;
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -6621,7 +6949,7 @@ mod tests {
             }],
             Some("p-1".to_string()),
         );
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut subs = Vec::new();
         let mut authed = true;
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -6737,7 +7065,7 @@ mod tests {
             }],
             Some("p-1".to_string()),
         );
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut subs = Vec::new();
         let mut authed = true;
         let mut current_agent: Option<crate::acp::AgentId> = Some(crate::acp::AgentId::new());
@@ -7487,7 +7815,7 @@ mod tests {
         let (_client_a, mut rx_a, _replay_a) = relay.subscribe("sess-a", None).await;
         let (_client_b, mut rx_b, _replay_b) = relay.subscribe("sess-b", None).await;
 
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut subs = Vec::new();
         let mut authed = true;
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -7842,7 +8170,7 @@ mod tests {
             let acp = Arc::new(AcpManager::new(vec![]));
             let relay = Arc::new(WsRelaySink::new());
             let registry = Arc::new(ProjectRegistry::new());
-            let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+            let (tx, _rx) = outbound_channel();
             let mut subscriptions = Vec::new();
             let mut current_agent = None;
             let current_session = Arc::new(parking_lot::Mutex::new(None));

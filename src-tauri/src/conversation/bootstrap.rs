@@ -29,7 +29,7 @@ use crate::conversation::migration::{
     MigrationHostMode, MigrationPhase, ReaderPrecedence,
 };
 use crate::conversation::persistence_adapter::ConversationPersistenceAdapter;
-use crate::conversation::repository::ConversationRepository;
+use crate::conversation::repository::{CatalogFlushCoordinator, ConversationRepository};
 use crate::conversation::session_workspace::SessionWorkspaceService;
 use crate::conversation::write_authority::{ConversationWriteAuthority, ConversationWriter};
 
@@ -75,6 +75,7 @@ impl HostConversationRoots {
 
 pub struct BootstrapOutcome {
     pub repository: Arc<ConversationRepository>,
+    pub catalog_flush: Arc<CatalogFlushCoordinator>,
     pub authority: Arc<ConversationWriteAuthority>,
     pub writer: Arc<ConversationWriter>,
     pub reader: Arc<ConversationReader>,
@@ -264,6 +265,10 @@ impl ConversationBootstrap {
                     source,
                 )
             })?;
+        // The disposable cache coordinator is published only after the authoritative repository
+        // has completed validation/rebuild. Repository and adapter retain this exact Arc for host
+        // shutdown barriers; it never becomes a second writable authority.
+        let catalog_flush = repository.catalog_flush_coordinator();
         let operation_dir = roots
             .state_root
             .join("conversation-migrations")
@@ -420,6 +425,7 @@ impl ConversationBootstrap {
         );
         Ok(BootstrapOutcome {
             repository,
+            catalog_flush,
             authority,
             writer,
             reader,

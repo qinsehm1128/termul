@@ -212,12 +212,23 @@ fn respond(
 ) -> (StatusCode, Json<IpcBody<ConversationLifecycleOutcome>>) {
     match result {
         Ok(outcome) => {
-            state.relay.emit(&AcpEvent {
+            if let Err(error) = state.relay.emit(&AcpEvent {
                 sid: None,
                 type_: "conversation_lifecycle",
                 payload: serde_json::to_value(&outcome)
                     .expect("Conversation lifecycle outcome serializes"),
-            });
+            }) {
+                warn!(
+                    target: "termul::web::conversation_lifecycle_api",
+                    conversation_id = %conversation_id,
+                    code = error.code,
+                    "conversation lifecycle committed but live delivery degraded"
+                );
+                return failure(
+                    error.code.to_string(),
+                    "conversation lifecycle event delivery degraded".to_string(),
+                );
+            }
             (StatusCode::OK, Json(IpcBody::ok(outcome)))
         }
         Err(error) => {

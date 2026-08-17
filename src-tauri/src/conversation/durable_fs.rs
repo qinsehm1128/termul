@@ -12,6 +12,9 @@ use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -156,10 +159,20 @@ impl std::error::Error for DurableFsError {
 
 pub type Result<T> = std::result::Result<T, DurableFsError>;
 
+#[cfg(test)]
+#[derive(Default)]
+struct DurableFsTestState {
+    replace_count: AtomicU64,
+    catalog_replace_count: AtomicU64,
+    fail_catalog_replaces_remaining: AtomicUsize,
+}
+
 /// Shared durable filesystem policy with an optional per-instance crash-test hook.
 #[derive(Clone, Default)]
 pub struct DurableFileSystem {
     crash_injector: Option<Arc<dyn CrashInjector>>,
+    #[cfg(test)]
+    test_state: Arc<DurableFsTestState>,
 }
 
 impl fmt::Debug for DurableFileSystem {
@@ -181,13 +194,61 @@ impl DurableFileSystem {
     pub fn with_crash_injector(crash_injector: Arc<dyn CrashInjector>) -> Self {
         Self {
             crash_injector: Some(crash_injector),
+            #[cfg(test)]
+            test_state: Arc::default(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_replace_counters(&self) {
+        self.test_state.replace_count.store(0, Ordering::Release);
+        self.test_state
+            .catalog_replace_count
+            .store(0, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn catalog_replace_count(&self) -> u64 {
+        self.test_state
+            .catalog_replace_count
+            .load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_catalog_replaces(&self, count: usize) {
+        self.test_state
+            .fail_catalog_replaces_remaining
+            .store(count, Ordering::Release);
     }
 
     /// Replace a file using a same-directory, create-new temp containing the target filename,
     /// process id, and a UUID. Immediate success is reported only after the declared platform
     /// file and namespace durability steps complete.
     pub fn replace_bytes(&self, target: &Path, bytes: &[u8]) -> Result<DurableWriteOutcome> {
+        #[cfg(test)]
+        {
+            self.test_state.replace_count.fetch_add(1, Ordering::AcqRel);
+            if target.file_name().and_then(|name| name.to_str()) == Some("catalog.json") {
+                self.test_state
+                    .catalog_replace_count
+                    .fetch_add(1, Ordering::AcqRel);
+                if self
+                    .test_state
+                    .fail_catalog_replaces_remaining
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    return Err(self.io_error(
+                        "replace_bytes",
+                        "injected_cache_write",
+                        target,
+                        io::Error::other("injected catalog cache-write failure"),
+                    ));
+                }
+            }
+        }
         let parent = target.parent().ok_or_else(|| DurableFsError::InvalidPath {
             path: target.to_path_buf(),
             reason: "target has no parent directory",

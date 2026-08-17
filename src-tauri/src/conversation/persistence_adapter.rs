@@ -4,12 +4,12 @@
 //! resolved through canonical binding history; unmapped events fail closed and never fall back to
 //! a legacy store.
 
-use std::collections::HashMap;
+use std::collections::{HashSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 
 use chrono::Utc;
-use parking_lot::RwLock;
+use parking_lot::Mutex;
 use serde_json::Value;
 
 use crate::acp::session_persistence::{
@@ -17,11 +17,17 @@ use crate::acp::session_persistence::{
     SESSION_SCHEMA_VERSION,
 };
 use crate::conversation::contracts::{
-    AgentSessionBindingState, ConversationId, ConversationLifecycleState, ConversationTitleSource,
+    AgentSessionBinding, AgentSessionBindingState, ConversationHistoryPageV1,
+    ConversationHistoryRecordV1, ConversationId, ConversationLifecycleState,
+    ConversationTitleSource, CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION,
+    CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION, MAX_CONVERSATION_HISTORY_PAGE_LIMIT,
+    MIN_CONVERSATION_HISTORY_PAGE_LIMIT,
 };
-use crate::conversation::event_log::{ConversationEventType, MAX_EVENT_PAGE_LIMIT};
+use crate::conversation::event_log::ConversationEventType;
 use crate::conversation::migration::ConversationReader;
-use crate::conversation::repository::ConversationRepository;
+use crate::conversation::repository::{
+    CatalogFlushError, CatalogFlushReceipt, ConversationRepository,
+};
 use crate::conversation::write_authority::{ConversationMutation, ConversationWriter};
 
 #[derive(Debug)]
@@ -45,43 +51,110 @@ impl std::error::Error for ConversationPersistenceError {}
 
 pub type Result<T> = std::result::Result<T, ConversationPersistenceError>;
 
+pub const MAX_BINDING_MISS_CACHE_ENTRIES: usize = 1024;
+pub const MAX_COMPAT_HISTORY_RECORDS: usize = 1000;
+pub const CONVERSATION_HISTORY_PAGING_REQUIRED: &str = "CONVERSATION_HISTORY_PAGING_REQUIRED";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum BindingLookupKind {
+    Active,
+    History,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct BindingMissKey {
+    kind: BindingLookupKind,
+    agent_session_id: String,
+}
+
+#[derive(Debug, Default)]
+struct BindingMissCache {
+    generation: u64,
+    entries: HashSet<BindingMissKey>,
+    order: VecDeque<BindingMissKey>,
+    evictions: u64,
+}
+
+impl BindingMissCache {
+    fn synchronize_generation(&mut self, generation: u64) {
+        if self.generation != generation {
+            self.generation = generation;
+            self.entries.clear();
+            self.order.clear();
+        }
+    }
+
+    fn contains(&self, key: &BindingMissKey) -> bool {
+        self.entries.contains(key)
+    }
+
+    fn insert(&mut self, key: BindingMissKey) {
+        if !self.entries.insert(key.clone()) {
+            return;
+        }
+        self.order.push_back(key);
+        while self.entries.len() > MAX_BINDING_MISS_CACHE_ENTRIES {
+            if let Some(evicted) = self.order.pop_front() {
+                if self.entries.remove(&evicted) {
+                    self.evictions = self.evictions.saturating_add(1);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BindingMissCacheStats {
+    pub entries: usize,
+    pub generation: u64,
+    pub evictions: u64,
+}
+
 pub struct ConversationPersistenceAdapter {
     writer: Arc<ConversationWriter>,
     repository: Arc<ConversationRepository>,
     reader: Arc<ConversationReader>,
-    bindings: RwLock<HashMap<String, ConversationId>>,
+    binding_misses: Mutex<BindingMissCache>,
 }
 
 impl ConversationPersistenceAdapter {
     #[must_use]
     pub fn new(writer: Arc<ConversationWriter>, reader: Arc<ConversationReader>) -> Self {
-        let adapter = Self {
-            repository: Arc::clone(writer.repository()),
+        let repository = Arc::clone(writer.repository());
+        let generation = repository.binding_generation();
+        Self {
+            repository,
             writer,
             reader,
-            bindings: RwLock::new(HashMap::new()),
-        };
-        adapter.rebuild_binding_index();
-        adapter
-    }
-
-    pub fn rebuild_binding_index(&self) {
-        let mut bindings = HashMap::new();
-        for record in self.repository.list_conversations() {
-            if let Ok(Some(binding)) = self.repository.current_binding(record.conversation_id) {
-                if binding.state == AgentSessionBindingState::Active {
-                    bindings.insert(binding.agent_session_id, record.conversation_id);
-                }
-            }
+            binding_misses: Mutex::new(BindingMissCache {
+                generation,
+                ..BindingMissCache::default()
+            }),
         }
-        *self.bindings.write() = bindings;
     }
 
-    pub fn register_binding(&self, agent_session_id: &str, conversation_id: ConversationId) {
-        self.bindings
-            .write()
-            .insert(agent_session_id.to_string(), conversation_id);
-        log::info!("[conversation-persistence] binding indexed conversation_id={conversation_id}");
+    /// Compatibility hook retained for callers that previously forced a repository rescan.
+    /// Canonical maps are repository-owned now, so this only invalidates bounded misses.
+    pub fn rebuild_binding_index(&self) {
+        let generation = self.repository.binding_generation();
+        self.binding_misses
+            .lock()
+            .synchronize_generation(generation);
+    }
+
+    pub fn register_binding(&self, _agent_session_id: &str, conversation_id: ConversationId) {
+        let generation = self
+            .repository
+            .refresh_binding_index_hint(conversation_id)
+            .unwrap_or_else(|| self.repository.binding_generation());
+        self.binding_misses
+            .lock()
+            .synchronize_generation(generation);
+        log::info!(
+            "[conversation-persistence] binding index observed conversation_id={} generation={}",
+            conversation_id,
+            generation
+        );
     }
 
     #[must_use]
@@ -94,23 +167,7 @@ impl ConversationPersistenceAdapter {
         &self,
         agent_session_id: &str,
     ) -> Option<ConversationId> {
-        if let Some(conversation_id) = self.bindings.read().get(agent_session_id).copied() {
-            let active = self
-                .repository
-                .current_binding(conversation_id)
-                .ok()
-                .flatten()
-                .is_some_and(|binding| {
-                    binding.state == AgentSessionBindingState::Active
-                        && binding.agent_session_id == agent_session_id
-                });
-            if active {
-                return Some(conversation_id);
-            }
-            self.bindings.write().remove(agent_session_id);
-        }
-        self.rebuild_binding_index();
-        self.bindings.read().get(agent_session_id).copied()
+        self.resolve_binding(BindingLookupKind::Active, agent_session_id)
     }
 
     #[must_use]
@@ -126,17 +183,50 @@ impl ConversationPersistenceAdapter {
         &self,
         agent_session_id: &str,
     ) -> Option<ConversationId> {
-        self.repository
-            .list_conversations()
-            .into_iter()
-            .find_map(|record| {
-                self.repository
-                    .current_binding(record.conversation_id)
-                    .ok()
-                    .flatten()
-                    .filter(|binding| binding.agent_session_id == agent_session_id)
-                    .map(|_| record.conversation_id)
-            })
+        self.resolve_binding(BindingLookupKind::History, agent_session_id)
+    }
+
+    fn resolve_binding(
+        &self,
+        kind: BindingLookupKind,
+        agent_session_id: &str,
+    ) -> Option<ConversationId> {
+        let generation = self.repository.binding_generation();
+        let key = BindingMissKey {
+            kind,
+            agent_session_id: agent_session_id.to_string(),
+        };
+        {
+            let mut misses = self.binding_misses.lock();
+            misses.synchronize_generation(generation);
+            if misses.contains(&key) {
+                return None;
+            }
+        }
+        let resolved = match kind {
+            BindingLookupKind::Active => self
+                .repository
+                .conversation_id_for_active_binding(agent_session_id),
+            BindingLookupKind::History => self
+                .repository
+                .conversation_id_for_history_binding(agent_session_id),
+        };
+        if resolved.is_none() {
+            let mut misses = self.binding_misses.lock();
+            misses.synchronize_generation(self.repository.binding_generation());
+            misses.insert(key);
+        }
+        resolved
+    }
+
+    #[must_use]
+    pub fn binding_miss_cache_stats(&self) -> BindingMissCacheStats {
+        let cache = self.binding_misses.lock();
+        BindingMissCacheStats {
+            entries: cache.entries.len(),
+            generation: cache.generation,
+            evictions: cache.evictions,
+        }
     }
 
     pub async fn append_acp_event(
@@ -238,47 +328,127 @@ impl ConversationPersistenceAdapter {
         &self,
         agent_session_id: &str,
     ) -> Result<(SessionMetadata, Vec<PersistedEventRecord>)> {
+        let (conversation_id, metadata, target_last_seq) =
+            self.history_metadata(agent_session_id, "materialize")?;
+        let persisted =
+            self.legacy_events_after(conversation_id, agent_session_id, 0, target_last_seq)?;
+        Ok((metadata, persisted))
+    }
+
+    pub fn history_page(
+        &self,
+        agent_session_id: &str,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<ConversationHistoryPageV1> {
+        if !(MIN_CONVERSATION_HISTORY_PAGE_LIMIT..=MAX_CONVERSATION_HISTORY_PAGE_LIMIT)
+            .contains(&limit)
+        {
+            return Err(error(
+                "VALIDATION_ERROR",
+                "history_page",
+                format!(
+                    "history page limit must be between {MIN_CONVERSATION_HISTORY_PAGE_LIMIT} and {MAX_CONVERSATION_HISTORY_PAGE_LIMIT}"
+                ),
+            ));
+        }
         let conversation_id = self
             .conversation_id_for_history_binding(agent_session_id)
-            .ok_or_else(|| error("CONVERSATION_NOT_FOUND", "materialize", "binding not found"))?;
-        let record = self.reader.get(conversation_id).map_err(|source| {
-            error(
-                "CONVERSATION_READ_FAILED",
-                "materialize",
-                source.to_string(),
-            )
-        })?;
-        let binding = self
-            .repository
-            .current_binding(conversation_id)
-            .map_err(|source| {
-                error(
-                    "CONVERSATION_READ_FAILED",
-                    "materialize_binding",
-                    source.to_string(),
-                )
-            })?
             .ok_or_else(|| {
                 error(
-                    "CONVERSATION_BINDING_NOT_FOUND",
-                    "materialize",
+                    "CONVERSATION_NOT_FOUND",
+                    "history_page",
                     "binding not found",
                 )
             })?;
-        let summary = self
-            .repository
-            .history_summary(conversation_id)
+        let target_last_seq = self
+            .reader
+            .get(conversation_id)
             .map_err(|source| {
                 error(
                     "CONVERSATION_READ_FAILED",
-                    "materialize_summary",
+                    "history_page",
                     source.to_string(),
                 )
-            })?;
-        let persisted =
-            self.legacy_events_after(conversation_id, agent_session_id, 0, record.last_seq)?;
+            })?
+            .last_seq;
+        if after_seq > target_last_seq {
+            return Err(error(
+                "VALIDATION_ERROR",
+                "history_page",
+                "history cursor is ahead of targetLastSeq",
+            ));
+        }
+        let canonical = if after_seq == target_last_seq {
+            Vec::new()
+        } else {
+            self.repository
+                .read_event_page(conversation_id, after_seq, limit)
+                .map_err(|source| {
+                    error(
+                        "CONVERSATION_READ_FAILED",
+                        "history_page",
+                        source.to_string(),
+                    )
+                })?
+                .into_iter()
+                .take_while(|event| event.seq <= target_last_seq)
+                .collect::<Vec<_>>()
+        };
+        let next_cursor = canonical.last().map_or(target_last_seq, |event| event.seq);
+        if after_seq < target_last_seq && next_cursor <= after_seq {
+            return Err(error(
+                "CONVERSATION_READ_FAILED",
+                "history_page",
+                "bounded canonical page did not advance the cursor",
+            ));
+        }
+        let records = canonical
+            .into_iter()
+            .filter_map(|event| {
+                legacy_event_type(event.type_).map(|type_| ConversationHistoryRecordV1 {
+                    schema_version: CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
+                    session_id: agent_session_id.to_string(),
+                    seq: event.seq,
+                    type_: type_.to_string(),
+                    recorded_at: event.recorded_at_utc.timestamp_millis().max(0) as u64,
+                    payload: event.payload,
+                })
+            })
+            .collect::<Vec<_>>();
+        let page = ConversationHistoryPageV1 {
+            schema_version: CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION,
+            records,
+            next_cursor,
+            complete: next_cursor == target_last_seq,
+            target_last_seq,
+        };
+        page.validate(agent_session_id, after_seq, limit, None)
+            .map_err(|source| error(source.stable_code(), "history_page", source.to_string()))?;
+        Ok(page)
+    }
+
+    pub fn history_metadata(
+        &self,
+        agent_session_id: &str,
+        operation: &'static str,
+    ) -> Result<(ConversationId, SessionMetadata, u64)> {
+        let conversation_id = self
+            .conversation_id_for_history_binding(agent_session_id)
+            .ok_or_else(|| error("CONVERSATION_NOT_FOUND", operation, "binding not found"))?;
+        let record = self
+            .reader
+            .get(conversation_id)
+            .map_err(|source| error("CONVERSATION_READ_FAILED", operation, source.to_string()))?;
+        let binding = self.binding_for_session(conversation_id, agent_session_id)?;
+        let summary = self
+            .repository
+            .history_summary(conversation_id)
+            .map_err(|source| error("CONVERSATION_READ_FAILED", operation, source.to_string()))?;
         let created_at = record.created_at_utc.timestamp_millis().max(0) as u64;
+        let target_last_seq = record.last_seq;
         Ok((
+            conversation_id,
             SessionMetadata {
                 schema_version: SESSION_SCHEMA_VERSION,
                 storage_key: conversation_id.to_string(),
@@ -297,7 +467,7 @@ impl ConversationPersistenceAdapter {
                 status: history_status(record.lifecycle_state, binding.state),
                 message_count: summary.message_count,
                 tool_count: summary.tool_count,
-                last_seq: record.last_seq,
+                last_seq: target_last_seq,
                 discovered: false,
                 worktree_path: record
                     .project_attachment
@@ -308,8 +478,47 @@ impl ConversationPersistenceAdapter {
                     .as_ref()
                     .and_then(|attachment| attachment.worktree_branch.clone()),
             },
-            persisted,
+            target_last_seq,
         ))
+    }
+
+    fn binding_for_session(
+        &self,
+        conversation_id: ConversationId,
+        agent_session_id: &str,
+    ) -> Result<AgentSessionBinding> {
+        if let Some(binding) = self
+            .repository
+            .current_binding(conversation_id)
+            .map_err(|source| {
+                error(
+                    "CONVERSATION_READ_FAILED",
+                    "materialize_binding",
+                    source.to_string(),
+                )
+            })?
+            .filter(|binding| binding.agent_session_id == agent_session_id)
+        {
+            return Ok(binding);
+        }
+        self.repository
+            .binding_history(conversation_id)
+            .map_err(|source| {
+                error(
+                    "CONVERSATION_READ_FAILED",
+                    "materialize_binding",
+                    source.to_string(),
+                )
+            })?
+            .into_iter()
+            .find(|binding| binding.agent_session_id == agent_session_id)
+            .ok_or_else(|| {
+                error(
+                    "CONVERSATION_BINDING_NOT_FOUND",
+                    "materialize_binding",
+                    "binding not found",
+                )
+            })
     }
 
     pub fn last_seq(&self, agent_session_id: &str) -> Result<u64> {
@@ -328,6 +537,28 @@ impl ConversationPersistenceAdapter {
             .map_err(|source| error("CONVERSATION_READ_FAILED", "last_seq", source.to_string()))
     }
 
+    pub fn history_last_seq(&self, agent_session_id: &str) -> Result<u64> {
+        let conversation_id = self
+            .conversation_id_for_history_binding(agent_session_id)
+            .ok_or_else(|| {
+                error(
+                    "CONVERSATION_NOT_FOUND",
+                    "history_last_seq",
+                    "binding not found",
+                )
+            })?;
+        self.reader
+            .get(conversation_id)
+            .map(|record| record.last_seq)
+            .map_err(|source| {
+                error(
+                    "CONVERSATION_READ_FAILED",
+                    "history_last_seq",
+                    source.to_string(),
+                )
+            })
+    }
+
     pub fn replay_after(
         &self,
         agent_session_id: &str,
@@ -342,23 +573,13 @@ impl ConversationPersistenceAdapter {
                     "binding not found",
                 )
             })?;
-        let last_seq = self
-            .reader
-            .get(conversation_id)
-            .map_err(|source| {
-                error(
-                    "CONVERSATION_READ_FAILED",
-                    "replay_after",
-                    source.to_string(),
-                )
-            })?
-            .last_seq;
+        let last_seq = self.history_last_seq(agent_session_id)?;
         self.legacy_events_after(conversation_id, agent_session_id, cursor, last_seq)
     }
 
     fn legacy_events_after(
         &self,
-        conversation_id: ConversationId,
+        _conversation_id: ConversationId,
         agent_session_id: &str,
         after_seq: u64,
         target_last_seq: u64,
@@ -366,47 +587,66 @@ impl ConversationPersistenceAdapter {
         let mut cursor = after_seq;
         let mut persisted = Vec::new();
         while cursor < target_last_seq {
-            let page = self
-                .repository
-                .read_event_page(conversation_id, cursor, MAX_EVENT_PAGE_LIMIT)
-                .map_err(|source| {
-                    error(
-                        "CONVERSATION_READ_FAILED",
-                        "materialize_events",
-                        source.to_string(),
-                    )
-                })?;
-            let page = page
-                .into_iter()
-                .take_while(|event| event.seq <= target_last_seq)
-                .collect::<Vec<_>>();
-            let Some(last_seq) = page.last().map(|event| event.seq) else {
+            let remaining = MAX_COMPAT_HISTORY_RECORDS.saturating_sub(persisted.len());
+            let request_limit = remaining.saturating_add(1).clamp(
+                MIN_CONVERSATION_HISTORY_PAGE_LIMIT,
+                MAX_CONVERSATION_HISTORY_PAGE_LIMIT,
+            );
+            let page = self.history_page(agent_session_id, cursor, request_limit)?;
+            if page.target_last_seq != target_last_seq {
                 return Err(error(
                     "CONVERSATION_READ_FAILED",
                     "materialize_events",
-                    format!(
-                        "paged history stopped at seq {cursor} before lastSeq {target_last_seq}"
-                    ),
+                    "history target changed during compatibility traversal",
                 ));
-            };
-            cursor = last_seq;
-            persisted.extend(page.into_iter().filter_map(|event| {
-                legacy_event_type(event.type_).map(|type_| PersistedEventRecord {
-                    schema_version: SESSION_SCHEMA_VERSION,
-                    session_id: agent_session_id.to_string(),
-                    seq: event.seq,
-                    type_: type_.to_string(),
-                    recorded_at: event.recorded_at_utc.timestamp_millis().max(0) as u64,
-                    payload: event.payload,
-                })
+            }
+            if page.records.len() > remaining {
+                log::warn!(
+                    "[conversation-persistence] compatibility paging required code={} frontier={} record_count={}",
+                    CONVERSATION_HISTORY_PAGING_REQUIRED,
+                    cursor,
+                    persisted.len().saturating_add(page.records.len())
+                );
+                return Err(error(
+                    CONVERSATION_HISTORY_PAGING_REQUIRED,
+                    "materialize_events",
+                    "history exceeds the compatibility materialization limit; use bounded pages",
+                ));
+            }
+            persisted.extend(page.records.into_iter().map(|record| PersistedEventRecord {
+                schema_version: SESSION_SCHEMA_VERSION,
+                session_id: record.session_id,
+                seq: record.seq,
+                type_: record.type_,
+                recorded_at: record.recorded_at,
+                payload: record.payload,
             }));
+            if page.next_cursor <= cursor && !page.complete {
+                return Err(error(
+                    "CONVERSATION_READ_FAILED",
+                    "materialize_events",
+                    "history page cursor did not advance",
+                ));
+            }
+            cursor = page.next_cursor;
+            if page.complete {
+                break;
+            }
         }
         Ok(persisted)
     }
 
+    pub async fn flush_catalog_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<CatalogFlushReceipt, CatalogFlushError> {
+        self.repository.flush_catalog_until(deadline).await
+    }
+
     pub async fn flush_all(&self) -> Result<()> {
-        // Repository appends cross their durability boundary before returning; there is no
-        // background writer queue to drain.
+        // Canonical JSON/JSONL appends cross their durability boundary before returning. The
+        // disposable catalog has an explicit host-owned barrier and is intentionally not flushed
+        // on every ordered-writer replay barrier.
         Ok(())
     }
 }
@@ -703,7 +943,10 @@ mod tests {
             adapter.last_seq("opaque/detached").unwrap_err().code,
             "CONVERSATION_BINDING_NOT_FOUND"
         );
-        assert!(!adapter.replay_after("opaque/detached", 0).unwrap().is_empty());
+        assert!(!adapter
+            .replay_after("opaque/detached", 0)
+            .unwrap()
+            .is_empty());
 
         writer
             .rebind_detached_binding(id, created_at)
@@ -733,7 +976,10 @@ mod tests {
             adapter.last_seq("opaque/detached").unwrap_err().code,
             "CONVERSATION_BINDING_NOT_FOUND"
         );
-        assert!(!adapter.replay_after("opaque/detached", 0).unwrap().is_empty());
+        assert!(!adapter
+            .replay_after("opaque/detached", 0)
+            .unwrap()
+            .is_empty());
 
         drop(adapter);
         drop(repository);
@@ -754,7 +1000,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn paged_legacy_materialization_matches_full_wrapper_beyond_1000_events() {
+    async fn history_pages_are_bounded_and_exact() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let private = root.join("private");
@@ -835,15 +1081,134 @@ mod tests {
         let adapter = ConversationPersistenceAdapter::new(writer, reader);
         let full = repository.read_events(id, 0).unwrap();
         assert_eq!(full.len(), 1_051);
-        let (metadata, materialized) = adapter.legacy_materialization("opaque/paged").unwrap();
-        assert_eq!(metadata.last_seq, 1_051);
-        assert_eq!(materialized.len(), 1_050);
-        assert_eq!(materialized.first().unwrap().seq, 2);
-        assert_eq!(materialized.last().unwrap().seq, 1_051);
+        let expected = (2..=1_051_u64).collect::<Vec<_>>();
+        for limit in [1, 17, 250, 1_000] {
+            let mut cursor = 0;
+            let mut observed = Vec::new();
+            loop {
+                let page = adapter
+                    .history_page("opaque/paged", cursor, limit)
+                    .expect("bounded history page");
+                assert_eq!(
+                    page.schema_version,
+                    CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION
+                );
+                assert_eq!(page.target_last_seq, 1_051);
+                assert!(page.records.len() <= limit);
+                assert!(page.next_cursor > cursor || page.complete);
+                observed.extend(page.records.iter().map(|record| record.seq));
+                cursor = page.next_cursor;
+                if page.complete {
+                    break;
+                }
+            }
+            assert_eq!(cursor, 1_051);
+            assert_eq!(observed, expected, "limit {limit} preserves exact order");
+        }
+
+        let error = adapter
+            .legacy_materialization("opaque/paged")
+            .expect_err("compatibility materialization must require paging above 1000 records");
+        assert_eq!(error.code, CONVERSATION_HISTORY_PAGING_REQUIRED);
+        for invalid_limit in [0, 1_001] {
+            assert_eq!(
+                adapter
+                    .history_page("opaque/paged", 0, invalid_limit)
+                    .unwrap_err()
+                    .code,
+                "VALIDATION_ERROR"
+            );
+        }
+        assert_eq!(
+            adapter
+                .history_page("opaque/paged", 1_052, 17)
+                .unwrap_err()
+                .code,
+            "VALIDATION_ERROR"
+        );
         let after = adapter.replay_after("opaque/paged", 1_000).unwrap();
         assert_eq!(after.len(), 51);
         assert_eq!(after.first().unwrap().seq, 1_001);
         assert_eq!(after.last().unwrap().seq, 1_051);
+    }
+
+    #[tokio::test]
+    async fn binding_miss_cache_is_bounded_and_generation_invalidated() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let private = root.join("private");
+        let visible = root.join("visible");
+        std::fs::create_dir_all(&visible).unwrap();
+        let (repository, _) = ConversationRepository::open(private).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
+        let id = ConversationId::parse("44444444-4444-4444-8444-444444444444").unwrap();
+        let created_at = Utc
+            .timestamp_millis_opt(1_766_000_000_000)
+            .single()
+            .unwrap();
+        writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id: id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: visible.to_string_lossy().into_owned(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::InitializingAgent,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                },
+                ConversationMutation::CreateConversation,
+            )
+            .await
+            .unwrap();
+        let reader = Arc::new(crate::conversation::ConversationReader::new(
+            Arc::clone(&repository),
+            crate::conversation::LegacyConversationReader::default(),
+            crate::conversation::ReaderPrecedence::ConversationV2Only,
+        ));
+        let adapter = ConversationPersistenceAdapter::new(Arc::clone(&writer), reader);
+
+        for ordinal in 0..100_000 {
+            let sid = format!("missing-{}", ordinal % 10_000);
+            assert!(adapter.conversation_id_for_active_binding(&sid).is_none());
+        }
+        let bounded = adapter.binding_miss_cache_stats();
+        assert!(bounded.entries <= MAX_BINDING_MISS_CACHE_ENTRIES);
+        assert!(bounded.evictions > 0);
+        assert!(adapter
+            .conversation_id_for_active_binding("late-bound-session")
+            .is_none());
+        let previous_generation = repository.binding_generation();
+
+        writer
+            .bind_agent_session(
+                id,
+                AgentSessionBinding {
+                    schema_version: AGENT_SESSION_BINDING_SCHEMA_VERSION,
+                    binding_id: Uuid::new_v4(),
+                    agent_session_id: "late-bound-session".to_string(),
+                    runtime_agent_id: "runtime".to_string(),
+                    stable_agent_namespace: "stable".to_string(),
+                    execution_cwd: visible.to_string_lossy().into_owned(),
+                    bound_at_utc: created_at,
+                    state: AgentSessionBindingState::Active,
+                },
+                created_at,
+            )
+            .await
+            .unwrap();
+        assert!(repository.binding_generation() > previous_generation);
+        assert_eq!(
+            adapter.conversation_id_for_active_binding("late-bound-session"),
+            Some(id)
+        );
+        let invalidated = adapter.binding_miss_cache_stats();
+        assert_eq!(invalidated.generation, repository.binding_generation());
+        assert_eq!(invalidated.entries, 0);
+        assert_eq!(repository.binding_index_stats().conversation_count, 1);
     }
 
     #[tokio::test]

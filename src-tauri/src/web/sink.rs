@@ -29,7 +29,10 @@
 //! [`TauriEventSink`] (the desktop's sink — intentionally Tauri-aware).
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -65,16 +68,137 @@ pub struct AcpEvent {
     pub payload: Value,
 }
 
+pub const CONVERSATION_PERSISTENCE_REJECTED: &str = "CONVERSATION_PERSISTENCE_REJECTED";
+pub const EVENT_DELIVERY_FAILED: &str = "EVENT_DELIVERY_FAILED";
+pub const EVENT_SERIALIZATION_FAILED: &str = "EVENT_SERIALIZATION_FAILED";
+pub const CLIENT_OUTBOUND_RECORDS: usize = 512;
+pub const CLIENT_OUTBOUND_BYTES: usize = 8 * 1024 * 1024;
+pub const RELIABLE_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
+pub const MAX_RELAY_SESSIONS: usize = 256;
+pub const MAX_RELAY_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventSinkPriority {
+    DurableAdmission,
+    LiveDelivery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventDeliveryReceipt {
+    pub delivered: bool,
+    pub durable_admission: bool,
+    pub session_seq: Option<u64>,
+}
+
+impl EventDeliveryReceipt {
+    #[must_use]
+    pub const fn delivered(session_seq: Option<u64>, durable_admission: bool) -> Self {
+        Self {
+            delivered: true,
+            durable_admission,
+            session_seq,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventSinkError {
+    pub code: &'static str,
+    pub source_code: Option<&'static str>,
+    pub durable_rejection: bool,
+    pub detail: String,
+}
+
+impl EventSinkError {
+    fn persistence_rejected(source_code: &'static str) -> Self {
+        Self {
+            code: CONVERSATION_PERSISTENCE_REJECTED,
+            source_code: Some(source_code),
+            durable_rejection: true,
+            detail: "canonical Conversation persistence rejected event admission".to_string(),
+        }
+    }
+
+    fn serialization_failed() -> Self {
+        Self {
+            code: EVENT_SERIALIZATION_FAILED,
+            source_code: None,
+            durable_rejection: false,
+            detail: "ACP event payload could not be serialized".to_string(),
+        }
+    }
+
+    fn delivery_failed(detail: impl Into<String>) -> Self {
+        Self {
+            code: EVENT_DELIVERY_FAILED,
+            source_code: None,
+            durable_rejection: false,
+            detail: detail.into(),
+        }
+    }
+}
+
+impl fmt::Display for EventSinkError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.detail)
+    }
+}
+
+impl std::error::Error for EventSinkError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FanOutReceipt {
+    pub sink_count: usize,
+    pub delivered_count: usize,
+    pub durable_admission_count: usize,
+    pub session_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FanOutError {
+    pub code: &'static str,
+    pub source_code: Option<&'static str>,
+    pub durable_rejection: bool,
+    pub delivered_count: usize,
+    pub detail: String,
+}
+
+impl FanOutError {
+    #[must_use]
+    pub const fn is_durable_rejection(&self) -> bool {
+        self.durable_rejection
+    }
+
+    #[must_use]
+    pub fn circuit_open(source_code: &'static str) -> Self {
+        Self {
+            code: CONVERSATION_PERSISTENCE_REJECTED,
+            source_code: Some(source_code),
+            durable_rejection: true,
+            delivered_count: 0,
+            detail: "event delivery circuit is open for this session".to_string(),
+        }
+    }
+}
+
+impl fmt::Display for FanOutError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}: {}", self.code, self.detail)
+    }
+}
+
+impl std::error::Error for FanOutError {}
+
 /// Transport-neutral sink for ACP events.
 ///
-/// Object-safe (`dyn EventSink` usable via `Arc<dyn EventSink>`) and `Send +
-/// Sync` so clones can cross from the Tauri command thread into each agent's
-/// dedicated driver thread (see `AcpManager`'s threading model).
+/// Durable-admission sinks run before live-only sinks. A canonical rejection therefore prevents
+/// Tauri, relay history, and subscriber state from observing an event that was never admitted.
 pub trait EventSink: Send + Sync {
-    /// Deliver a single event. Errors must be logged, never propagated — a
-    /// missing renderer (or a wedged WS peer) must never tear down the agent
-    /// driver thread.
-    fn emit(&self, event: &AcpEvent);
+    fn priority(&self) -> EventSinkPriority {
+        EventSinkPriority::LiveDelivery
+    }
+
+    fn emit(&self, event: &AcpEvent) -> Result<EventDeliveryReceipt, EventSinkError>;
 }
 
 /// Desktop sink: forwards events to the Tauri renderer as `acp:*` events.
@@ -97,10 +221,11 @@ impl TauriEventSink {
 }
 
 impl EventSink for TauriEventSink {
-    fn emit(&self, event: &AcpEvent) {
-        if let Err(e) = self.app.emit(event.type_, event.payload.clone()) {
-            log::error!("[acp] failed to emit event {}: {e}", event.type_);
-        }
+    fn emit(&self, event: &AcpEvent) -> Result<EventDeliveryReceipt, EventSinkError> {
+        self.app
+            .emit(event.type_, event.payload.clone())
+            .map_err(|_| EventSinkError::delivery_failed("desktop renderer emission failed"))?;
+        Ok(EventDeliveryReceipt::delivered(None, false))
     }
 }
 
@@ -137,9 +262,12 @@ pub struct WsRelaySink {
     /// are atomic w.r.t. concurrent emits (AC4).
     sessions: Mutex<HashMap<String, SessionState>>,
     /// Per-client subscription: client_id → client state (sender + sessions).
-    clients: Mutex<HashMap<ClientId, ClientSub>>,
+    clients: Arc<Mutex<HashMap<ClientId, ClientSub>>>,
     /// Reverse index: session_id → set of subscribed client_ids.
-    session_subs: Mutex<HashMap<String, HashSet<ClientId>>>,
+    session_subs: Arc<Mutex<HashMap<String, HashSet<ClientId>>>>,
+    /// A rejected durable admission opens a circuit only for the affected opaque session.
+    delivery_circuits: Mutex<HashMap<String, &'static str>>,
+    history_clock: AtomicU64,
     /// Bounded per-session ring capacity (default 4096, AC4).
     event_log_capacity: usize,
     /// Per-client lossy ring capacity (drop-oldest threshold, AC5).
@@ -185,17 +313,147 @@ struct SessionState {
     snapshot_events: Vec<SequencedEvent>,
     /// `seq` of the oldest event currently in the ring (for cursor-gap detect).
     base_seq: u64,
+    retained_bytes: usize,
+    reserved_bytes: usize,
+    last_used: u64,
+}
+
+fn sequenced_event_bytes(event: &SequencedEvent) -> usize {
+    serde_json::to_vec(event)
+        .map_or(usize::MAX, |encoded| encoded.len())
+        .saturating_add(std::mem::size_of::<SequencedEvent>())
+}
+
+fn relay_history_bytes(sessions: &HashMap<String, SessionState>) -> usize {
+    sessions.values().fold(0usize, |total, state| {
+        total
+            .saturating_add(state.retained_bytes)
+            .saturating_add(state.reserved_bytes)
+    })
+}
+
+fn repository_runtime_handle_for_relay() -> tokio::runtime::Handle {
+    tokio::runtime::Handle::try_current()
+        .unwrap_or_else(|_| tauri::async_runtime::handle().inner().clone())
+}
+
+fn session_persistence_error_code(
+    error: &crate::acp::session_persistence::SessionPersistenceError,
+) -> &'static str {
+    use crate::acp::session_persistence::SessionPersistenceError;
+    match error {
+        SessionPersistenceError::Io(_) => "SESSION_PERSISTENCE_IO_FAILED",
+        SessionPersistenceError::Json(_) => "SESSION_PERSISTENCE_SERIALIZATION_FAILED",
+        SessionPersistenceError::UnsupportedVersion { .. } => "SESSION_PERSISTENCE_UNSUPPORTED",
+        SessionPersistenceError::SessionNotFound => "SESSION_PERSISTENCE_NOT_FOUND",
+        SessionPersistenceError::CorruptSession => "SESSION_PERSISTENCE_CORRUPT",
+        SessionPersistenceError::InvalidStorageKey => "SESSION_PERSISTENCE_INVALID_KEY",
+        SessionPersistenceError::QueueFull => "SESSION_PERSISTENCE_QUEUE_FULL",
+        SessionPersistenceError::WriterStopped => "SESSION_PERSISTENCE_WRITER_STOPPED",
+        SessionPersistenceError::PersistenceUnhealthy(_) => "SESSION_PERSISTENCE_UNHEALTHY",
+        SessionPersistenceError::StaleCursor { .. } => "SESSION_PERSISTENCE_STALE_CURSOR",
+    }
+}
+
+#[derive(Debug, Default)]
+struct ClientOutboundBudgetState {
+    records: usize,
+    bytes: usize,
+    max_records: usize,
+    max_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct ClientOutboundBudget {
+    state: Mutex<ClientOutboundBudgetState>,
+}
+
+impl ClientOutboundBudget {
+    fn try_reserve(self: &Arc<Self>, bytes: usize) -> Option<ClientOutboundPermit> {
+        if bytes > CLIENT_OUTBOUND_BYTES {
+            return None;
+        }
+        let mut state = self.state.lock();
+        if state.records >= CLIENT_OUTBOUND_RECORDS
+            || state.bytes.saturating_add(bytes) > CLIENT_OUTBOUND_BYTES
+        {
+            return None;
+        }
+        state.records += 1;
+        state.bytes += bytes;
+        state.max_records = state.max_records.max(state.records);
+        state.max_bytes = state.max_bytes.max(state.bytes);
+        Some(ClientOutboundPermit {
+            budget: Arc::clone(self),
+            bytes,
+        })
+    }
+
+    fn snapshot(&self) -> ClientOutboundStats {
+        let state = self.state.lock();
+        ClientOutboundStats {
+            records: state.records,
+            bytes: state.bytes,
+            max_records: state.max_records,
+            max_bytes: state.max_bytes,
+        }
+    }
+}
+
+struct ClientOutboundPermit {
+    budget: Arc<ClientOutboundBudget>,
+    bytes: usize,
+}
+
+impl Drop for ClientOutboundPermit {
+    fn drop(&mut self) {
+        let mut state = self.budget.state.lock();
+        state.records = state.records.saturating_sub(1);
+        state.bytes = state.bytes.saturating_sub(self.bytes);
+    }
+}
+
+struct QueuedClientEvent {
+    event: Option<SequencedEvent>,
+    _permit: ClientOutboundPermit,
+}
+
+pub struct ClientEventReceiver {
+    inner: mpsc::Receiver<QueuedClientEvent>,
+}
+
+impl ClientEventReceiver {
+    pub async fn recv(&mut self) -> Option<SequencedEvent> {
+        let mut queued = self.inner.recv().await?;
+        queued.event.take()
+    }
+
+    pub fn try_recv(&mut self) -> std::result::Result<SequencedEvent, mpsc::error::TryRecvError> {
+        let mut queued = self.inner.try_recv()?;
+        Ok(queued
+            .event
+            .take()
+            .expect("queued client event is consumed exactly once"))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClientOutboundStats {
+    pub records: usize,
+    pub bytes: usize,
+    pub max_records: usize,
+    pub max_bytes: usize,
 }
 
 /// Per-client subscription state.
 struct ClientSub {
-    /// Outbound channel (reliable + idempotent events). Lossy events are
-    /// buffered in `lossy_ring` and flushed here by the write loop.
-    tx: mpsc::UnboundedSender<SequencedEvent>,
+    tx: mpsc::Sender<QueuedClientEvent>,
+    budget: Arc<ClientOutboundBudget>,
     /// Sessions this client is subscribed to.
     sessions: HashSet<String>,
     /// Bounded buffer for lossy events (drop-oldest when full).
-    lossy_ring: VecDeque<SequencedEvent>,
+    lossy_ring: VecDeque<QueuedClientEvent>,
+    reliable_saturation_generation: u64,
 }
 
 /// Opaque per-connection client id (uuid v4).
@@ -226,6 +484,20 @@ pub enum ReplayResult {
     Stale,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RelayHistoryStats {
+    pub sessions: usize,
+    pub bytes: usize,
+    pub reserved_bytes: usize,
+}
+
+struct HistoryReservation {
+    sid: String,
+    bytes: usize,
+    newly_created: bool,
+    active: bool,
+}
+
 /// Default per-session event-log capacity (AC4).
 pub const DEFAULT_EVENT_LOG_CAPACITY: usize = 4096;
 /// Default per-client lossy ring capacity (drop-oldest threshold).
@@ -244,8 +516,10 @@ impl WsRelaySink {
     pub fn with_capacity(event_log_capacity: usize, lossy_capacity: usize) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
-            clients: Mutex::new(HashMap::new()),
-            session_subs: Mutex::new(HashMap::new()),
+            clients: Arc::new(Mutex::new(HashMap::new())),
+            session_subs: Arc::new(Mutex::new(HashMap::new())),
+            delivery_circuits: Mutex::new(HashMap::new()),
+            history_clock: AtomicU64::new(0),
             event_log_capacity: event_log_capacity.max(1),
             lossy_capacity: lossy_capacity.max(1),
             rendezvous: Mutex::new(None),
@@ -323,6 +597,20 @@ impl WsRelaySink {
         }
     }
 
+    /// Await the canonical ordered-writer frontier under the host's absolute deadline.
+    pub async fn flush_conversation_persistence_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
+        match &self.ordered_conversation_persistence {
+            Some(persistence) => persistence
+                .flush_all_until(deadline)
+                .await
+                .map_err(|error| error.to_string()),
+            None => Ok(()),
+        }
+    }
+
     /// Final host-owned drain for the canonical ordered writers.
     pub async fn shutdown_conversation_persistence(&self) -> Result<(), String> {
         match &self.ordered_conversation_persistence {
@@ -331,6 +619,38 @@ impl WsRelaySink {
                 .await
                 .map_err(|error| error.to_string()),
             None => Ok(()),
+        }
+    }
+
+    /// Final host-owned drain under the same absolute deadline used by catalog shutdown.
+    pub async fn shutdown_conversation_persistence_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), String> {
+        match &self.ordered_conversation_persistence {
+            Some(persistence) => persistence
+                .shutdown_until(deadline)
+                .await
+                .map_err(|error| error.to_string()),
+            None => Ok(()),
+        }
+    }
+
+    /// Flush the latest disposable catalog generation under the host deadline.
+    pub async fn flush_catalog_until(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<crate::conversation::CatalogFlushReceipt, String> {
+        match &self.conversation_persistence {
+            Some(persistence) => persistence
+                .flush_catalog_until(deadline)
+                .await
+                .map_err(|error| error.to_string()),
+            None => Ok(crate::conversation::CatalogFlushReceipt {
+                requested_generation: 0,
+                flushed_generation: 0,
+                write_count: 0,
+            }),
         }
     }
 
@@ -409,17 +729,7 @@ impl WsRelaySink {
     #[must_use]
     pub fn session_watermark(&self, session_id: &str) -> u64 {
         self.sessions.lock().get(session_id).map_or_else(
-            || {
-                self.conversation_persistence
-                    .as_ref()
-                    .and_then(|persistence| persistence.last_seq(session_id).ok())
-                    .or_else(|| {
-                        self.persistence
-                            .as_ref()
-                            .and_then(|persistence| persistence.last_seq(session_id).ok())
-                    })
-                    .unwrap_or(0)
-            },
+            || self.durable_history_frontier(session_id).unwrap_or(0),
             |state| state.last_seq,
         )
     }
@@ -432,96 +742,349 @@ impl WsRelaySink {
             .clone()
     }
 
-    /// Assign seq + append under the sessions lock (atomic w.r.t. concurrent emits).
-    fn assign_and_append(&self, sid: &str, type_: &str, payload: Value) -> SequencedEvent {
-        let mut sessions = self.sessions.lock();
-        let durable_last = if self.conversation_persistence.is_some() {
-            0
+    fn durable_history_frontier(&self, sid: &str) -> Option<u64> {
+        self.conversation_persistence
+            .as_ref()
+            .and_then(|persistence| persistence.history_last_seq(sid).ok())
+            .or_else(|| {
+                self.persistence
+                    .as_ref()
+                    .and_then(|persistence| persistence.last_seq(sid).ok())
+            })
+    }
+
+    fn next_sequenced_event(&self, sid: &str, type_: &str, payload: Value) -> SequencedEvent {
+        let durable_last = self.durable_history_frontier(sid).unwrap_or(0);
+        let last_seq = self
+            .sessions
+            .lock()
+            .get(sid)
+            .map_or(durable_last, |state| state.last_seq.max(durable_last));
+        SequencedEvent::new(
+            Some(sid.to_string()),
+            last_seq.saturating_add(1),
+            type_,
+            payload,
+        )
+    }
+
+    fn circuit_error(&self, sid: &str) -> Option<EventSinkError> {
+        self.delivery_circuits
+            .lock()
+            .get(sid)
+            .copied()
+            .map(EventSinkError::persistence_rejected)
+    }
+
+    fn open_delivery_circuit(&self, sid: &str, source_code: &'static str) {
+        self.delivery_circuits
+            .lock()
+            .entry(sid.to_string())
+            .or_insert(source_code);
+        log::error!(
+            "[conversation-persistence] session delivery circuit opened code={} source_code={}",
+            CONVERSATION_PERSISTENCE_REJECTED,
+            source_code
+        );
+    }
+
+    fn persists_conversation_event(type_: &str) -> bool {
+        matches!(
+            type_,
+            "user_prompt"
+                | "message_chunk"
+                | "prompt_complete"
+                | "tool_call"
+                | "tool_call_update"
+                | "session_info_update"
+                | "local_title_generated"
+        )
+    }
+
+    /// Reserve relay retention, acquire durable admission, then commit the live frontier.
+    /// The per-session submission gate prevents a rejected record from consuming a sequence and
+    /// prevents another producer from observing the reservation as live state.
+    fn admit_session_event(
+        &self,
+        sid: &str,
+        type_: &str,
+        payload: Value,
+    ) -> Result<SequencedEvent, EventSinkError> {
+        if let Some(error) = self.circuit_error(sid) {
+            return Err(error);
+        }
+        let gate = self.persistence_submission_gate(sid);
+        let _submission_guard = gate.lock();
+        if let Some(error) = self.circuit_error(sid) {
+            return Err(error);
+        }
+
+        let sequenced = self.next_sequenced_event(sid, type_, payload);
+        let mut reservation = self.reserve_history(sid, &sequenced)?;
+        let durable_result = if Self::persists_conversation_event(type_) {
+            if let Some(persistence) = &self.ordered_conversation_persistence {
+                persistence
+                    .submit(sid, sequenced.seq, type_, sequenced.payload.clone())
+                    .map_err(|error| (error.code, error.to_string()))
+            } else if let Some(persistence) = &self.persistence {
+                persistence
+                    .enqueue_event(PersistedEventRecord {
+                        schema_version: SESSION_SCHEMA_VERSION,
+                        session_id: sid.to_string(),
+                        seq: sequenced.seq,
+                        type_: type_.to_string(),
+                        recorded_at: now_millis(),
+                        payload: sequenced.payload.clone(),
+                    })
+                    .map_err(|error| (session_persistence_error_code(&error), error.to_string()))
+            } else {
+                Ok(())
+            }
+        } else if let Some(persistence) = &self.persistence {
+            // The pre-cutover store historically retained every relay event. Keep compatibility
+            // reads exact while still rejecting before live commit if its queue refuses admission.
+            persistence
+                .enqueue_event(PersistedEventRecord {
+                    schema_version: SESSION_SCHEMA_VERSION,
+                    session_id: sid.to_string(),
+                    seq: sequenced.seq,
+                    type_: type_.to_string(),
+                    recorded_at: now_millis(),
+                    payload: sequenced.payload.clone(),
+                })
+                .map_err(|error| (session_persistence_error_code(&error), error.to_string()))
         } else {
-            self.persistence
-                .as_ref()
-                .and_then(|persistence| persistence.last_seq(sid).ok())
-                .unwrap_or(0)
+            Ok(())
         };
+
+        if let Err((source_code, _detail)) = durable_result {
+            self.rollback_history(&mut reservation);
+            self.open_delivery_circuit(sid, source_code);
+            return Err(EventSinkError::persistence_rejected(source_code));
+        }
+        if let Err(error) = self.commit_history(&mut reservation, sequenced.clone()) {
+            self.rollback_history(&mut reservation);
+            return Err(error);
+        }
+        Ok(sequenced)
+    }
+
+    fn reserve_history(
+        &self,
+        sid: &str,
+        event: &SequencedEvent,
+    ) -> Result<HistoryReservation, EventSinkError> {
+        let event_bytes = sequenced_event_bytes(event);
+        let multiplier = if self.persistence.is_none() && self.conversation_persistence.is_none() {
+            2
+        } else {
+            1
+        };
+        let bytes = event_bytes.saturating_mul(multiplier);
+        if bytes > MAX_RELAY_BYTES {
+            return Err(EventSinkError::delivery_failed(
+                "relay history record exceeds the process byte budget",
+            ));
+        }
+        let durable_last = self.durable_history_frontier(sid).unwrap_or(0);
+        let mut sessions = self.sessions.lock();
+        let newly_created = !sessions.contains_key(sid);
+        while (newly_created && sessions.len() >= MAX_RELAY_SESSIONS)
+            || relay_history_bytes(&sessions).saturating_add(bytes) > MAX_RELAY_BYTES
+        {
+            let subscriber_counts = self.session_subs.lock();
+            let candidate = sessions
+                .iter()
+                .filter(|(candidate_sid, state)| {
+                    candidate_sid.as_str() != sid
+                        && subscriber_counts
+                            .get(candidate_sid.as_str())
+                            .is_none_or(HashSet::is_empty)
+                        && state.reserved_bytes == 0
+                        && self.session_is_durably_flushed(candidate_sid, state.last_seq)
+                })
+                .min_by_key(|(_, state)| state.last_used)
+                .map(|(candidate_sid, _)| candidate_sid.clone());
+            drop(subscriber_counts);
+            let Some(candidate) = candidate else {
+                log::error!(
+                    "[ws-relay] retention rejected code=RELAY_HISTORY_BUDGET_EXCEEDED session_count={} retained_bytes={}",
+                    sessions.len(),
+                    relay_history_bytes(&sessions)
+                );
+                return Err(EventSinkError::delivery_failed(
+                    "relay history budget is exhausted by non-evictable sessions",
+                ));
+            };
+            sessions.remove(&candidate);
+            log::info!(
+                "[ws-relay] durable history evicted session_count={} retained_bytes={}",
+                sessions.len(),
+                relay_history_bytes(&sessions)
+            );
+        }
+        let last_used = self.history_clock.fetch_add(1, Ordering::AcqRel) + 1;
         let state = sessions
             .entry(sid.to_string())
             .or_insert_with(|| SessionState {
                 last_seq: durable_last,
                 events: VecDeque::new(),
                 snapshot_events: Vec::new(),
-                base_seq: 1,
+                base_seq: durable_last.saturating_add(1),
+                retained_bytes: 0,
+                reserved_bytes: 0,
+                last_used,
             });
-        // Reconcile the cached frontier with the durable frontier before
-        // incrementing. The `set_session_title` MCP tool
-        // (`record_local_title`) writes a durable
-        // `local_title_generated` event directly through
-        // `SessionPersistence::enqueue_event` (advancing durable `last_seq`
-        // past the relay's cached value) BEFORE the synthetic
-        // `session_info_update` reaches the relay. Without this
-        // reconciliation the relay would assign a seq that collides with the
-        // durable record, tripping the fail-closed `record.seq <=
-        // current.last_seq` check in `append_record` on the next durable
-        // enqueue.
-        state.last_seq = state.last_seq.max(durable_last).saturating_add(1);
-        let seq = state.last_seq;
-        let se = SequencedEvent::new(Some(sid.to_string()), seq, type_, payload);
-        if state.events.is_empty() {
-            state.base_seq = seq;
+        state.reserved_bytes = state.reserved_bytes.saturating_add(bytes);
+        state.last_used = last_used;
+        Ok(HistoryReservation {
+            sid: sid.to_string(),
+            bytes,
+            newly_created,
+            active: true,
+        })
+    }
+
+    fn commit_history(
+        &self,
+        reservation: &mut HistoryReservation,
+        event: SequencedEvent,
+    ) -> Result<(), EventSinkError> {
+        let mut sessions = self.sessions.lock();
+        let state = sessions.get_mut(&reservation.sid).ok_or_else(|| {
+            EventSinkError::delivery_failed("relay history reservation disappeared")
+        })?;
+        if event.seq <= state.last_seq {
+            return Err(EventSinkError::delivery_failed(
+                "relay history sequence did not advance",
+            ));
         }
-        state.events.push_back(se.clone());
-        // Desktop shared-live only: maintain a bounded in-memory snapshot for
-        // atomic stale recovery. When persistence is available, do NOT maintain
-        // `snapshot_events` at all — `subscribe_snapshot` rebuilds the snapshot
-        // from durable history instead (avoids unbounded growth).
+        state.reserved_bytes = state.reserved_bytes.saturating_sub(reservation.bytes);
+        state.last_seq = event.seq;
+        if state.events.is_empty() {
+            state.base_seq = event.seq;
+        }
+        state.retained_bytes = state
+            .retained_bytes
+            .saturating_add(sequenced_event_bytes(&event));
+        state.events.push_back(event.clone());
         if self.persistence.is_none() && self.conversation_persistence.is_none() {
-            state.snapshot_events.push(se.clone());
+            state.retained_bytes = state
+                .retained_bytes
+                .saturating_add(sequenced_event_bytes(&event));
+            state.snapshot_events.push(event.clone());
             while state.snapshot_events.len() > self.event_log_capacity {
+                if let Some(evicted) = state.snapshot_events.first() {
+                    state.retained_bytes = state
+                        .retained_bytes
+                        .saturating_sub(sequenced_event_bytes(evicted));
+                }
                 state.snapshot_events.remove(0);
             }
         }
         while state.events.len() > self.event_log_capacity {
-            state.events.pop_front();
+            if let Some(evicted) = state.events.pop_front() {
+                state.retained_bytes = state
+                    .retained_bytes
+                    .saturating_sub(sequenced_event_bytes(&evicted));
+            }
             state.base_seq = state
                 .events
                 .front()
-                .map(|e| e.seq)
-                .unwrap_or(state.base_seq.saturating_add(1));
+                .map(|event| event.seq)
+                .unwrap_or(state.last_seq.saturating_add(1));
         }
-        if self.conversation_persistence.is_none() {
-            if let Some(persistence) = &self.persistence {
-                let record = PersistedEventRecord {
-                    schema_version: SESSION_SCHEMA_VERSION,
-                    session_id: sid.to_string(),
-                    seq,
-                    type_: type_.to_string(),
-                    recorded_at: now_millis(),
-                    payload: se.payload.clone(),
-                };
-                if let Err(error) = persistence.enqueue_event(record) {
-                    warn!("[sessions] persistence queue rejected event for session {sid}: {error}");
-                }
+        reservation.active = false;
+        Ok(())
+    }
+
+    fn rollback_history(&self, reservation: &mut HistoryReservation) {
+        if !reservation.active {
+            return;
+        }
+        let mut sessions = self.sessions.lock();
+        if let Some(state) = sessions.get_mut(&reservation.sid) {
+            state.reserved_bytes = state.reserved_bytes.saturating_sub(reservation.bytes);
+            if reservation.newly_created
+                && state.events.is_empty()
+                && state.snapshot_events.is_empty()
+                && state.reserved_bytes == 0
+            {
+                sessions.remove(&reservation.sid);
             }
         }
-        se
+        reservation.active = false;
     }
 
-    /// Push a lossy event into a client's bounded ring, evicting the oldest
-    /// when over capacity (drop-oldest, AC5).
-    fn push_lossy(&self, sub: &mut ClientSub, se: SequencedEvent) {
-        sub.lossy_ring.push_back(se);
-        while sub.lossy_ring.len() > self.lossy_capacity {
-            sub.lossy_ring.pop_front(); // drop-oldest
+    fn session_is_durably_flushed(&self, sid: &str, last_seq: u64) -> bool {
+        if let Some(ordered) = &self.ordered_conversation_persistence {
+            match ordered.health(sid) {
+                Ok(Some(health)) => health.last_persisted_source_seq >= last_seq,
+                Ok(None) | Err(_) => self
+                    .conversation_persistence
+                    .as_ref()
+                    .and_then(|persistence| persistence.history_last_seq(sid).ok())
+                    .is_some_and(|frontier| frontier >= last_seq),
+            }
+        } else {
+            self.persistence
+                .as_ref()
+                .and_then(|persistence| persistence.last_seq(sid).ok())
+                .is_some_and(|frontier| frontier >= last_seq)
         }
     }
 
-    /// Enqueue an event to a client according to its tier (AC5 + AC6).
-    ///
-    /// Lossy events are pushed into the bounded ring (drop-oldest) then flushed
-    /// to the outbound channel so a pure-lossy stream still reaches subscribers.
-    /// Reliable/idempotent events flush any buffered lossy events first so
-    /// emission order is preserved across tiers. A failed send (peer gone)
-    /// unregisters the client from fan-out.
-    fn enqueue(&self, client_id: ClientId, se: SequencedEvent, tier: ReliabilityTier) {
+    #[must_use]
+    pub fn relay_history_stats(&self) -> RelayHistoryStats {
+        let sessions = self.sessions.lock();
+        RelayHistoryStats {
+            sessions: sessions.len(),
+            bytes: sessions.values().map(|state| state.retained_bytes).sum(),
+            reserved_bytes: sessions.values().map(|state| state.reserved_bytes).sum(),
+        }
+    }
+
+    fn queued_client_event(sub: &ClientSub, event: SequencedEvent) -> Option<QueuedClientEvent> {
+        let bytes = sequenced_event_bytes(&event);
+        let permit = sub.budget.try_reserve(bytes)?;
+        Some(QueuedClientEvent {
+            event: Some(event),
+            _permit: permit,
+        })
+    }
+
+    /// Push a lossy event into a client's bounded ring, evicting oldest lossy records until both
+    /// the record and byte budgets admit the newest value.
+    fn push_lossy(&self, sub: &mut ClientSub, event: SequencedEvent) {
+        while sub.lossy_ring.len() >= self.lossy_capacity {
+            sub.lossy_ring.pop_front();
+            log::warn!(
+                "[ws-relay] lossy record dropped code=CLIENT_OUTBOUND_LOSSY_DROP records={} bytes={}",
+                sub.budget.snapshot().records,
+                sub.budget.snapshot().bytes
+            );
+        }
+        loop {
+            if let Some(queued) = Self::queued_client_event(sub, event.clone()) {
+                sub.lossy_ring.push_back(queued);
+                return;
+            }
+            if sub.lossy_ring.pop_front().is_none() {
+                log::warn!(
+                    "[ws-relay] lossy record rejected code=CLIENT_OUTBOUND_BUDGET records={} bytes={}",
+                    sub.budget.snapshot().records,
+                    sub.budget.snapshot().bytes
+                );
+                return;
+            }
+        }
+    }
+
+    /// Enqueue an event to a client according to its tier. Every stage is bounded to 512 records
+    /// and 8 MiB. Reliable saturation arms an exact five-second disconnect; reconnect replays the
+    /// canonical cursor rather than retaining an unbounded reliable backlog.
+    fn enqueue(&self, client_id: ClientId, event: SequencedEvent, tier: ReliabilityTier) {
+        let mut slow_generation = None;
         let dead_sids = {
             let mut clients = self.clients.lock();
             let Some(sub) = clients.get_mut(&client_id) else {
@@ -529,12 +1092,31 @@ impl WsRelaySink {
             };
             let send_ok = match tier {
                 ReliabilityTier::Lossy => {
-                    self.push_lossy(sub, se);
+                    self.push_lossy(sub, event);
                     self.flush_lossy_sub(sub)
                 }
                 ReliabilityTier::Reliable | ReliabilityTier::Idempotent => {
-                    let flushed_ok = self.flush_lossy_sub(sub);
-                    flushed_ok && sub.tx.send(se).is_ok()
+                    if !self.flush_lossy_sub(sub) {
+                        false
+                    } else if let Some(queued) = Self::queued_client_event(sub, event) {
+                        match sub.tx.try_send(queued) {
+                            Ok(()) => true,
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                if sub.reliable_saturation_generation == 0 {
+                                    sub.reliable_saturation_generation = 1;
+                                    slow_generation = Some(1);
+                                }
+                                true
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => false,
+                        }
+                    } else {
+                        if sub.reliable_saturation_generation == 0 {
+                            sub.reliable_saturation_generation = 1;
+                            slow_generation = Some(1);
+                        }
+                        true
+                    }
                 }
             };
             if send_ok {
@@ -545,9 +1127,48 @@ impl WsRelaySink {
                     .map(|sub| sub.sessions.into_iter().collect::<Vec<_>>())
             }
         };
+        if let Some(generation) = slow_generation {
+            self.schedule_slow_client_disconnect(client_id, generation);
+        }
         if let Some(sids) = dead_sids {
             self.remove_client_from_session_subs(client_id, &sids);
         }
+    }
+
+    fn schedule_slow_client_disconnect(&self, client_id: ClientId, generation: u64) {
+        let clients = Arc::clone(&self.clients);
+        let session_subs = Arc::clone(&self.session_subs);
+        repository_runtime_handle_for_relay().spawn(async move {
+            tokio::time::sleep(RELIABLE_CLIENT_TIMEOUT).await;
+            let sids = {
+                let mut clients = clients.lock();
+                let disconnect = clients.get(&client_id).is_some_and(|sub| {
+                    sub.reliable_saturation_generation == generation
+                });
+                if disconnect {
+                    clients
+                        .remove(&client_id)
+                        .map(|sub| sub.sessions.into_iter().collect::<Vec<_>>())
+                } else {
+                    None
+                }
+            };
+            if let Some(sids) = sids {
+                let mut session_subs = session_subs.lock();
+                for sid in &sids {
+                    if let Some(subscribers) = session_subs.get_mut(sid) {
+                        subscribers.remove(&client_id);
+                        if subscribers.is_empty() {
+                            session_subs.remove(sid);
+                        }
+                    }
+                }
+                log::warn!(
+                    "[ws-relay] reliable slow client disconnected code=CLIENT_OUTBOUND_TIMEOUT duration_ms={}",
+                    RELIABLE_CLIENT_TIMEOUT.as_millis()
+                );
+            }
+        });
     }
 
     /// Remove `client_id` from the reverse index for each session (no `clients` lock).
@@ -578,13 +1199,10 @@ impl WsRelaySink {
         &self,
         sid: &str,
         last_seq: Option<u64>,
-    ) -> (
-        ClientId,
-        mpsc::UnboundedReceiver<SequencedEvent>,
-        ReplayResult,
-    ) {
+    ) -> (ClientId, ClientEventReceiver, ReplayResult) {
         let client_id = ClientId::new();
-        let (tx, rx) = mpsc::unbounded_channel::<SequencedEvent>();
+        let (tx, rx) = mpsc::channel::<QueuedClientEvent>(CLIENT_OUTBOUND_RECORDS);
+        let rx = ClientEventReceiver { inner: rx };
         let Some(cursor) = last_seq else {
             self.register(client_id, sid, tx);
             return (client_id, rx, ReplayResult::Ok(0));
@@ -695,9 +1313,9 @@ impl WsRelaySink {
             self.register(client_id, sid, tx.clone());
             let count = by_seq.len() as u64;
             for event in by_seq.into_values() {
-                if tx.send(event).is_err() {
+                self.enqueue(client_id, event.clone(), tier_of(&event.type_));
+                if !self.clients.lock().contains_key(&client_id) {
                     drop(sessions);
-                    self.unregister_client(client_id);
                     return (client_id, rx, ReplayResult::Stale);
                 }
             }
@@ -717,17 +1335,10 @@ impl WsRelaySink {
     pub async fn subscribe_snapshot(
         &self,
         sid: &str,
-    ) -> Result<
-        (
-            ClientId,
-            mpsc::UnboundedReceiver<SequencedEvent>,
-            Vec<SequencedEvent>,
-            u64,
-        ),
-        String,
-    > {
+    ) -> Result<(ClientId, ClientEventReceiver, Vec<SequencedEvent>, u64), String> {
         let client_id = ClientId::new();
-        let (tx, rx) = mpsc::unbounded_channel::<SequencedEvent>();
+        let (tx, rx) = mpsc::channel::<QueuedClientEvent>(CLIENT_OUTBOUND_RECORDS);
+        let rx = ClientEventReceiver { inner: rx };
         let gate = {
             let mut gates = self.replay_gates.lock().await;
             gates
@@ -807,29 +1418,20 @@ impl WsRelaySink {
         sid: &str,
         payload: Value,
     ) -> Result<SequencedEvent, String> {
-        let event = if let Some(persistence) = &self.ordered_conversation_persistence {
-            let gate = self.persistence_submission_gate(sid);
-            let submission_guard = gate.lock();
-            let event = self.assign_and_append(sid, "user_prompt", payload);
-            persistence
-                .submit(sid, event.seq, "user_prompt", event.payload.clone())
-                .map_err(|error| error.to_string())?;
-            drop(submission_guard);
+        let event = self
+            .admit_session_event(sid, "user_prompt", payload)
+            .map_err(|error| error.code.to_string())?;
+        if let Some(persistence) = &self.ordered_conversation_persistence {
             persistence
                 .flush_all()
                 .await
                 .map_err(|error| error.to_string())?;
-            event
-        } else {
-            let event = self.assign_and_append(sid, "user_prompt", payload);
-            if let Some(persistence) = &self.persistence {
-                persistence
-                    .flush_session(sid)
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
-            event
-        };
+        } else if let Some(persistence) = &self.persistence {
+            persistence
+                .flush_session(sid)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         let targets: Vec<ClientId> = self
             .session_subs
             .lock()
@@ -844,15 +1446,17 @@ impl WsRelaySink {
 
     /// Register a client + its sender under a session and the reverse index.
     /// Lock order: `clients` then `session_subs` (see module lock-order note).
-    fn register(&self, client_id: ClientId, sid: &str, tx: mpsc::UnboundedSender<SequencedEvent>) {
+    fn register(&self, client_id: ClientId, sid: &str, tx: mpsc::Sender<QueuedClientEvent>) {
         {
             let mut clients = self.clients.lock();
             clients.insert(
                 client_id,
                 ClientSub {
                     tx,
+                    budget: Arc::new(ClientOutboundBudget::default()),
                     sessions: HashSet::from([sid.to_string()]),
                     lossy_ring: VecDeque::new(),
+                    reliable_saturation_generation: 0,
                 },
             );
         }
@@ -888,7 +1492,10 @@ impl WsRelaySink {
 
     /// Forget all in-memory relay state for a successfully disposed ephemeral session.
     pub async fn forget_session(&self, sid: &str) {
+        let gate = self.persistence_submission_gate(sid);
+        let _submission_guard = gate.lock();
         self.sessions.lock().remove(sid);
+        self.delivery_circuits.lock().remove(sid);
         let affected_clients = self.session_subs.lock().remove(sid).unwrap_or_default();
         if !affected_clients.is_empty() {
             let mut clients = self.clients.lock();
@@ -902,6 +1509,7 @@ impl WsRelaySink {
             }
         }
         self.turn_watermark.forget_session(sid);
+        drop(_submission_guard);
         self.persistence_submission_gates.lock().remove(sid);
         self.replay_gates.lock().await.remove(sid);
     }
@@ -951,10 +1559,17 @@ impl WsRelaySink {
     /// Flush the lossy ring for a borrowed client sub.
     /// Returns `true` if every event was sent (or the ring was empty).
     fn flush_lossy_sub(&self, sub: &mut ClientSub) -> bool {
-        while let Some(evt) = sub.lossy_ring.pop_front() {
-            if sub.tx.send(evt).is_err() {
-                sub.lossy_ring.clear();
-                return false;
+        while let Some(event) = sub.lossy_ring.pop_front() {
+            match sub.tx.try_send(event) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(event)) => {
+                    sub.lossy_ring.push_front(event);
+                    break;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    sub.lossy_ring.clear();
+                    return false;
+                }
             }
         }
         true
@@ -967,6 +1582,19 @@ impl WsRelaySink {
         if let Some(sub) = clients.get_mut(&client_id) {
             self.push_lossy(sub, se);
         }
+    }
+
+    #[must_use]
+    pub fn client_outbound_stats(&self, client_id: ClientId) -> Option<ClientOutboundStats> {
+        self.clients
+            .lock()
+            .get(&client_id)
+            .map(|sub| sub.budget.snapshot())
+    }
+
+    #[must_use]
+    pub fn has_client(&self, client_id: ClientId) -> bool {
+        self.clients.lock().contains_key(&client_id)
     }
 
     /// Test helper: current lossy-ring length for a client.
@@ -987,47 +1615,21 @@ impl Default for WsRelaySink {
 }
 
 impl EventSink for WsRelaySink {
-    fn emit(&self, event: &AcpEvent) {
+    fn priority(&self) -> EventSinkPriority {
+        if self.ordered_conversation_persistence.is_some() || self.persistence.is_some() {
+            EventSinkPriority::DurableAdmission
+        } else {
+            EventSinkPriority::LiveDelivery
+        }
+    }
+
+    fn emit(&self, event: &AcpEvent) -> Result<EventDeliveryReceipt, EventSinkError> {
         // Strip the `acp:` prefix to get the WS `type` (AC2).
         let type_ = event.type_.strip_prefix("acp:").unwrap_or(event.type_);
         let tier = tier_of(type_);
-
-        match &event.sid {
+        let session_seq = match &event.sid {
             Some(sid) => {
-                // Session-scoped: serialize sequence assignment + ordered submission for this
-                // session only. A saturated writer backpressures the affected ACP producer without
-                // spawning detached tasks or reordering another session.
-                let persists_conversation_event = matches!(
-                    type_,
-                    "message_chunk"
-                        | "prompt_complete"
-                        | "tool_call"
-                        | "tool_call_update"
-                        | "session_info_update"
-                );
-                let se = if persists_conversation_event {
-                    if let Some(persistence) = &self.ordered_conversation_persistence {
-                        let gate = self.persistence_submission_gate(sid);
-                        let _submission_guard = gate.lock();
-                        let sequenced = self.assign_and_append(sid, type_, event.payload.clone());
-                        if let Err(error) =
-                            persistence.submit(sid, sequenced.seq, type_, sequenced.payload.clone())
-                        {
-                            // The ordered writer logs authorized ConversationId context when one is
-                            // available. This boundary log intentionally carries only the stable
-                            // code: never the payload, prompt, credentials, or opaque session id.
-                            log::error!(
-                                "[conversation-persistence] ordered ACP submission rejected code={}",
-                                error.code
-                            );
-                        }
-                        sequenced
-                    } else {
-                        self.assign_and_append(sid, type_, event.payload.clone())
-                    }
-                } else {
-                    self.assign_and_append(sid, type_, event.payload.clone())
-                };
+                let sequenced = self.admit_session_event(sid, type_, event.payload.clone())?;
                 let targets: Vec<ClientId> = self
                     .session_subs
                     .lock()
@@ -1035,41 +1637,31 @@ impl EventSink for WsRelaySink {
                     .map(|set| set.iter().copied().collect())
                     .unwrap_or_default();
                 for client_id in targets {
-                    self.enqueue(client_id, se.clone(), tier);
+                    self.enqueue(client_id, sequenced.clone(), tier);
                 }
+                Some(sequenced.seq)
             }
             None => {
                 // Agent-level: seq=0, sid=null, NOT in any per-session log (AC4).
-                // Delivered to ALL connected clients with ≥1 session.
-                let se = SequencedEvent::new(None, 0, type_, event.payload.clone());
+                let sequenced = SequencedEvent::new(None, 0, type_, event.payload.clone());
                 let targets: Vec<ClientId> = self.clients.lock().keys().copied().collect();
                 for client_id in targets {
-                    self.enqueue(client_id, se.clone(), tier);
+                    self.enqueue(client_id, sequenced.clone(), tier);
                 }
+                None
             }
-        }
+        };
 
-        // Story 1.7: snapshot `permission_request` events into the server-side
-        // rendezvous (if attached). The ticket holds the immutable args (the
-        // `options` array) for TOCTOU re-validation + arms the bounded timeout.
-        // Runs only on the server path (desktop leaves the rendezvous unset).
+        // Register human-input rendezvous only after relay admission succeeds. A rejected durable
+        // event must not leave a permission/question ticket that no client could have observed.
         if type_ == "permission_request" {
             if let Some(rdz) = self.rendezvous() {
-                // Extract the correlation fields from the camelCase payload.
-                // The `PermissionRequestEvent` payload is `{agentId, sessionId,
-                // requestId, toolCall, options}` (events.rs → camelCase wire).
                 let payload = &event.payload;
                 let request_id = payload
                     .get("requestId")
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                // Defensive: a malformed event (no `requestId`) would collide
-                // all such tickets on the empty-string key — skip + warn instead
-                // of registering a degenerate ticket. The `PermissionRequestEvent`
-                // struct always carries a non-empty `request_id` (generated by
-                // `DriverState::register_permission` as `perm-{uuid}`), so this
-                // branch only triggers on a dispatcher bug.
                 if request_id.is_empty() {
                     warn!(
                         "[permissions] dropping permission_request with no requestId (dispatcher bug?)"
@@ -1078,7 +1670,7 @@ impl EventSink for WsRelaySink {
                     let agent_id = payload
                         .get("agentId")
                         .and_then(Value::as_str)
-                        .map(|s| crate::acp::AgentId(s.to_string()))
+                        .map(|value| crate::acp::AgentId(value.to_string()))
                         .unwrap_or_else(|| crate::acp::AgentId("unknown".to_string()));
                     let session_id = payload
                         .get("sessionId")
@@ -1093,10 +1685,6 @@ impl EventSink for WsRelaySink {
                 }
             }
         }
-        // Issue #411: snapshot `question_request` events into the server-side
-        // question rendezvous (if attached). The ticket holds the immutable
-        // args (the `options` array) for TOCTOU re-validation + arms the
-        // bounded timeout. Runs only on the server path.
         if type_ == "question_request" {
             if let Some(rdz) = self.question_rendezvous() {
                 let payload = &event.payload;
@@ -1113,7 +1701,7 @@ impl EventSink for WsRelaySink {
                     let agent_id = payload
                         .get("agentId")
                         .and_then(Value::as_str)
-                        .map(|s| crate::acp::AgentId(s.to_string()))
+                        .map(|value| crate::acp::AgentId(value.to_string()))
                         .unwrap_or_else(|| crate::acp::AgentId("unknown".to_string()));
                     let session_id = payload
                         .get("sessionId")
@@ -1129,14 +1717,6 @@ impl EventSink for WsRelaySink {
             }
         }
 
-        // CAP-2: history is now host-owned. When a session is created,
-        // finalized, or its title metadata changes at the host (regardless of
-        // which client drove it), notify every connected client so sidebars
-        // refetch the host index instead of depending on a desktop renderer
-        // save. `session_info_update` covers agent-supplied titles;
-        // `local_title_generated` covers background title generation. Only
-        // fires when durable persistence is attached (live-only mode has
-        // nothing to refetch).
         if self.has_persisted_history()
             && matches!(
                 type_,
@@ -1148,6 +1728,11 @@ impl EventSink for WsRelaySink {
         {
             self.notify_history_changed();
         }
+
+        Ok(EventDeliveryReceipt::delivered(
+            session_seq,
+            self.priority() == EventSinkPriority::DurableAdmission,
+        ))
     }
 }
 
@@ -1186,25 +1771,65 @@ pub fn fan_out<P: Serialize>(
     sid: Option<&str>,
     type_: &'static str,
     payload: &P,
-) {
+) -> Result<FanOutReceipt, FanOutError> {
     if sinks.is_empty() {
-        return;
+        return Ok(FanOutReceipt {
+            sink_count: 0,
+            delivered_count: 0,
+            durable_admission_count: 0,
+            session_seq: None,
+        });
     }
-    let payload = match serde_json::to_value(payload) {
-        Ok(v) => v,
-        Err(e) => {
-            log::error!("[acp] skipping {type_} event: payload failed to serialize: {e}");
-            return;
+    let payload = serde_json::to_value(payload).map_err(|error| {
+        log::error!("[acp] skipping {type_} event: payload failed to serialize: {error}");
+        let error = EventSinkError::serialization_failed();
+        FanOutError {
+            code: error.code,
+            source_code: error.source_code,
+            durable_rejection: error.durable_rejection,
+            delivered_count: 0,
+            detail: error.detail,
         }
-    };
+    })?;
     let event = AcpEvent {
         sid: sid.map(str::to_string),
         type_,
         payload,
     };
-    for sink in sinks {
-        sink.emit(&event);
+    let mut delivered_count = 0usize;
+    let mut durable_admission_count = 0usize;
+    let mut session_seq = None;
+    for priority in [
+        EventSinkPriority::DurableAdmission,
+        EventSinkPriority::LiveDelivery,
+    ] {
+        for sink in sinks.iter().filter(|sink| sink.priority() == priority) {
+            match sink.emit(&event) {
+                Ok(receipt) => {
+                    delivered_count += usize::from(receipt.delivered);
+                    durable_admission_count += usize::from(receipt.durable_admission);
+                    if receipt.session_seq.is_some() {
+                        session_seq = receipt.session_seq;
+                    }
+                }
+                Err(error) => {
+                    return Err(FanOutError {
+                        code: error.code,
+                        source_code: error.source_code,
+                        durable_rejection: error.durable_rejection,
+                        delivered_count,
+                        detail: error.detail,
+                    });
+                }
+            }
+        }
     }
+    Ok(FanOutReceipt {
+        sink_count: sinks.len(),
+        delivered_count,
+        durable_admission_count,
+        session_seq,
+    })
 }
 
 /// Broadcast a `projects_changed` agent-level event to every connected client.
@@ -1235,7 +1860,12 @@ pub fn broadcast_projects_changed(relay: &Arc<WsRelaySink>, default_project_id: 
     // `Arc<dyn EventSink>` then happens at the vec push.
     let relay_arc: Arc<WsRelaySink> = Arc::clone(relay);
     let sinks: Vec<Arc<dyn EventSink>> = vec![relay_arc];
-    fan_out(&sinks, None, "acp:projects_changed", &payload);
+    if let Err(error) = fan_out(&sinks, None, "acp:projects_changed", &payload) {
+        log::warn!(
+            "[ws-relay] projects_changed delivery degraded code={}",
+            error.code
+        );
+    }
 }
 
 /// Broadcast a `chat_history_changed` agent-level event to every connected
@@ -1251,7 +1881,12 @@ pub fn broadcast_chat_history_changed(relay: &Arc<WsRelaySink>) {
     let payload = serde_json::json!({});
     let relay_arc: Arc<WsRelaySink> = Arc::clone(relay);
     let sinks: Vec<Arc<dyn EventSink>> = vec![relay_arc];
-    fan_out(&sinks, None, "acp:chat_history_changed", &payload);
+    if let Err(error) = fan_out(&sinks, None, "acp:chat_history_changed", &payload) {
+        log::warn!(
+            "[ws-relay] chat_history_changed delivery degraded code={}",
+            error.code
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1268,12 +1903,10 @@ mod tests {
 
     /// Drain a receiver into a Vec in arrival order (test helper for the live
     /// relay API — replaces the old `WsRelaySink::drain` recorder).
-    fn drain_rx(
-        rx: &mut tokio::sync::mpsc::UnboundedReceiver<SequencedEvent>,
-    ) -> Vec<SequencedEvent> {
+    fn drain_rx(rx: &mut ClientEventReceiver) -> Vec<SequencedEvent> {
         let mut out = Vec::new();
-        while let Ok(evt) = rx.try_recv() {
-            out.push(evt);
+        while let Ok(event) = rx.try_recv() {
+            out.push(event);
         }
         out
     }
@@ -1298,6 +1931,176 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_rejection_does_not_advance_live_frontier() {
+        struct CapturingLiveSink {
+            seen: Mutex<Vec<AcpEvent>>,
+        }
+
+        impl EventSink for CapturingLiveSink {
+            fn emit(&self, event: &AcpEvent) -> Result<EventDeliveryReceipt, EventSinkError> {
+                self.seen.lock().push(event.clone());
+                Ok(EventDeliveryReceipt::delivered(None, false))
+            }
+        }
+
+        let (root, repository, adapter, _conversation_id) =
+            conversation_fixture("durable-rejection", "mapped-session").await;
+        let relay = Arc::new(WsRelaySink::with_conversation_persistence(
+            16, adapter, None,
+        ));
+        let live = Arc::new(CapturingLiveSink {
+            seen: Mutex::new(Vec::new()),
+        });
+        let (_client, mut rx, replay) = relay.subscribe("unmapped-session", None).await;
+        assert_eq!(replay, ReplayResult::Ok(0));
+        let sinks: Vec<Arc<dyn EventSink>> = vec![live.clone(), relay.clone()];
+        let before = relay
+            .ordered_conversation_persistence()
+            .expect("ordered Conversation persistence")
+            .metrics();
+
+        let error = fan_out(
+            &sinks,
+            Some("unmapped-session"),
+            "acp:message_chunk",
+            &TestPayload::new("agent", "unmapped-session", "rejected"),
+        )
+        .expect_err("unmapped durable admission must fail closed");
+
+        assert_eq!(error.code, CONVERSATION_PERSISTENCE_REJECTED);
+        assert!(error.is_durable_rejection());
+        assert_eq!(error.delivered_count, 0);
+        assert_eq!(relay.session_watermark("unmapped-session"), 0);
+        assert!(drain_rx(&mut rx).is_empty());
+        assert!(live.seen.lock().is_empty());
+        let after = relay
+            .ordered_conversation_persistence()
+            .expect("ordered Conversation persistence")
+            .metrics();
+        assert_eq!(after.pending_records, before.pending_records);
+        assert_eq!(after.pending_bytes, before.pending_bytes);
+        assert_eq!(relay.relay_history_stats().reserved_bytes, 0);
+
+        relay
+            .shutdown_conversation_persistence()
+            .await
+            .expect("ordered persistence shutdown");
+        drop(relay);
+        drop(repository);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn production_slow_client_is_bounded() {
+        let relay = Arc::new(WsRelaySink::new());
+        let (client, _rx, replay) = relay.subscribe("slow-client-session", None).await;
+        assert_eq!(replay, ReplayResult::Ok(0));
+        let sinks: Vec<Arc<dyn EventSink>> = vec![relay.clone()];
+
+        for ordinal in 0..=CLIENT_OUTBOUND_RECORDS {
+            fan_out(
+                &sinks,
+                Some("slow-client-session"),
+                "acp:permission_request",
+                &TestPayload::new(
+                    "agent",
+                    "slow-client-session",
+                    &format!("reliable-{ordinal}"),
+                ),
+            )
+            .expect("reliable relay admission remains bounded");
+        }
+
+        let stats = relay
+            .client_outbound_stats(client)
+            .expect("slow client remains registered until timeout");
+        assert!(stats.records <= CLIENT_OUTBOUND_RECORDS);
+        assert!(stats.bytes <= CLIENT_OUTBOUND_BYTES);
+        assert!(stats.max_records <= CLIENT_OUTBOUND_RECORDS);
+        assert!(stats.max_bytes <= CLIENT_OUTBOUND_BYTES);
+        assert!(relay.has_client(client));
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(RELIABLE_CLIENT_TIMEOUT).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !relay.has_client(client),
+            "reliable saturation disconnects at the five-second deadline"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn global_history_lru_is_byte_and_session_bounded() {
+        let root = temp_dir("global-history-lru");
+        let cwd = root.join("cwd");
+        std::fs::create_dir_all(&cwd).expect("session cwd");
+        let persistence = SessionPersistence::open(root.join("sessions"))
+            .await
+            .expect("legacy persistence open");
+        for ordinal in 0..=MAX_RELAY_SESSIONS {
+            persistence
+                .register_session(SessionRegistration {
+                    session_id: format!("lru-session-{ordinal}"),
+                    stable_agent_namespace: None,
+                    runtime_agent_id: None,
+                    project_id: None,
+                    cwd: cwd.clone(),
+                    ..Default::default()
+                })
+                .await
+                .expect("session registration");
+        }
+        let relay = Arc::new(WsRelaySink::with_persistence(1, persistence.clone()));
+        let sinks: Vec<Arc<dyn EventSink>> = vec![relay.clone()];
+        for ordinal in 0..MAX_RELAY_SESSIONS {
+            let sid = format!("lru-session-{ordinal}");
+            fan_out(
+                &sinks,
+                Some(&sid),
+                "acp:tool_call",
+                &TestPayload::new("agent", &sid, "durable"),
+            )
+            .expect("durable history admission");
+        }
+        persistence
+            .flush_all()
+            .await
+            .expect("durable frontier flush");
+
+        let newest = format!("lru-session-{MAX_RELAY_SESSIONS}");
+        fan_out(
+            &sinks,
+            Some(&newest),
+            "acp:tool_call",
+            &TestPayload::new("agent", &newest, "evicts-oldest"),
+        )
+        .expect("LRU admission after durable eviction");
+        persistence.flush_all().await.expect("newest durable flush");
+
+        let stats = relay.relay_history_stats();
+        assert!(stats.sessions <= MAX_RELAY_SESSIONS);
+        assert!(stats.bytes <= MAX_RELAY_BYTES);
+        assert_eq!(stats.reserved_bytes, 0);
+        let (_client, mut replay_rx, replay) = relay.subscribe("lru-session-0", Some(0)).await;
+        assert_eq!(replay, ReplayResult::Ok(1));
+        let replayed = replay_rx
+            .recv()
+            .await
+            .expect("canonical replay after eviction");
+        assert_eq!(replayed.seq, 1);
+        assert_eq!(replayed.type_, "tool_call");
+        assert_eq!(replayed.payload["agentId"], "agent");
+        assert_eq!(replayed.payload["sessionId"], "lru-session-0");
+
+        persistence
+            .shutdown()
+            .await
+            .expect("legacy persistence shutdown");
+        drop(relay);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[tokio::test]
     async fn forget_session_removes_relay_subscription_and_replay_state() {
         let ws = Arc::new(WsRelaySink::new());
@@ -1308,7 +2111,8 @@ mod tests {
             Some("temp"),
             "acp:message_chunk",
             &TestPayload::new("a1", "temp", "secret"),
-        );
+        )
+        .expect("message chunk fan-out");
         ws.turn_watermark().mark_seen("temp", "turn-1");
         assert_eq!(ws.session_watermark("temp"), 1);
         assert_eq!(ws.session_subscriber_count("temp"), 1);
@@ -1338,19 +2142,22 @@ mod tests {
             Some("sess-1"),
             "acp:message_chunk",
             &TestPayload::new("a1", "sess-1", "first"),
-        );
+        )
+        .expect("first message fan-out");
         fan_out(
             &sinks,
             Some("sess-1"),
             "acp:message_chunk",
             &TestPayload::new("a1", "sess-1", "second"),
-        );
+        )
+        .expect("second message fan-out");
         fan_out(
             &sinks,
             None,
             "acp:agent_disconnected",
             &TestPayload::new("a1", "sess-1", "third"),
-        );
+        )
+        .expect("agent disconnect fan-out");
 
         // Lossy events are pushed + flushed to the channel on enqueue (AC5/AC6),
         // so an explicit flush is a no-op here; reliable agent_disconnected is last.
@@ -1396,8 +2203,9 @@ mod tests {
             seen: Mutex<Vec<AcpEvent>>,
         }
         impl EventSink for CapturingSink {
-            fn emit(&self, event: &AcpEvent) {
+            fn emit(&self, event: &AcpEvent) -> Result<EventDeliveryReceipt, EventSinkError> {
                 self.seen.lock().push(event.clone());
+                Ok(EventDeliveryReceipt::delivered(None, false))
             }
         }
 
@@ -1415,7 +2223,8 @@ mod tests {
             Some("sess-7"),
             "acp:tool_call",
             &TestPayload::new("a2", "sess-7", "hello"),
-        );
+        )
+        .expect("tool-call fan-out");
 
         let tauri_view = tauri_stand_in.seen.lock().drain(..).collect::<Vec<_>>();
         let ws_view = drain_rx(&mut rx);
@@ -1443,7 +2252,8 @@ mod tests {
             Some("sess-x"),
             "acp:message_chunk",
             &TestPayload::new("a", "sess-x", "m"),
-        );
+        )
+        .expect("empty fan-out is a successful no-op");
         // No panic, no assertion needed beyond reaching this point.
     }
 
@@ -1459,7 +2269,8 @@ mod tests {
             Some("sess-d"),
             "acp:message_chunk",
             &TestPayload::new("a", "sess-d", "m1"),
-        );
+        )
+        .expect("first incremental fan-out");
         // Lossy events are flushed to the channel on enqueue.
         assert_eq!(ws.lossy_ring_len_for_test(client), 0);
         let first = drain_rx(&mut rx);
@@ -1475,7 +2286,8 @@ mod tests {
             Some("sess-d"),
             "acp:message_chunk",
             &TestPayload::new("a", "sess-d", "m2"),
-        );
+        )
+        .expect("second incremental fan-out");
         let second = drain_rx(&mut rx);
         assert_eq!(second.len(), 1, "a new emit must produce a new event");
         assert_eq!(second[0].seq, 2);
@@ -1505,12 +2317,14 @@ mod tests {
         let ws = Arc::new(WsRelaySink::new());
         let (_client, mut rx, _replay) = ws.subscribe("sess-nan", None).await;
         let sinks: Vec<Arc<dyn EventSink>> = vec![ws.clone()];
-        fan_out(
+        let error = fan_out(
             &sinks,
             Some("sess-nan"),
             "acp:usage_update",
             &AlwaysFailsPayload,
-        );
+        )
+        .expect_err("serialization failure must be surfaced");
+        assert_eq!(error.code, EVENT_SERIALIZATION_FAILED);
         assert!(
             drain_rx(&mut rx).is_empty(),
             "serialization failure must not emit a null payload"
@@ -1543,7 +2357,8 @@ mod tests {
             optional_field: None,
         };
         let direct = serde_json::to_value(&payload).unwrap();
-        fan_out(&sinks, Some("sess-skip"), "acp:session_created", &payload);
+        fan_out(&sinks, Some("sess-skip"), "acp:session_created", &payload)
+            .expect("skip-serialization fan-out");
         let recorded = drain_rx(&mut rx);
         assert_eq!(recorded.len(), 1);
         assert_eq!(
@@ -1582,7 +2397,8 @@ mod tests {
                 Some("sess-evict"),
                 "acp:tool_call",
                 &TestPayload::new("a1", "sess-evict", msg),
-            );
+            )
+            .expect("eviction fan-out");
         }
         // Cursor pointing at evicted seq 0 must be stale (base_seq is now 2;
         // next wanted seq 1 was evicted).
@@ -1644,7 +2460,8 @@ mod tests {
                 Some("sess-durable"),
                 "acp:tool_call",
                 &TestPayload::new("a", "sess-durable", &index.to_string()),
-            );
+            )
+            .expect("initial durable replay fan-out");
         }
         persistence.flush_session("sess-durable").await.unwrap();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
@@ -1664,7 +2481,8 @@ mod tests {
                 Some("sess-durable"),
                 "acp:tool_call",
                 &TestPayload::new("a", "sess-durable", &index.to_string()),
-            );
+            )
+            .expect("concurrent durable replay fan-out");
         }
         hook.release();
         let (_client, mut rx, replay) = subscribe.await.unwrap();
@@ -1679,7 +2497,8 @@ mod tests {
             Some("sess-durable"),
             "acp:tool_call",
             &TestPayload::new("a", "sess-durable", "live"),
-        );
+        )
+        .expect("post-replay live fan-out");
         assert_eq!(rx.recv().await.unwrap().seq, 9);
         persistence.shutdown().await.unwrap();
         let _ = std::fs::remove_dir_all(root);
@@ -1695,13 +2514,15 @@ mod tests {
             Some("sess-rp"),
             "acp:tool_call",
             &TestPayload::new("a1", "sess-rp", "one"),
-        );
+        )
+        .expect("first replay fan-out");
         fan_out(
             &sinks,
             Some("sess-rp"),
             "acp:tool_call",
             &TestPayload::new("a1", "sess-rp", "two"),
-        );
+        )
+        .expect("second replay fan-out");
 
         let (_c, mut rx, replay) = ws.subscribe("sess-rp", Some(1)).await;
         assert_eq!(replay, ReplayResult::Ok(1));
@@ -1715,7 +2536,8 @@ mod tests {
             Some("sess-rp"),
             "acp:tool_call",
             &TestPayload::new("a1", "sess-rp", "three"),
-        );
+        )
+        .expect("live replay fan-out");
         let live = drain_rx(&mut rx);
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].seq, 3);
@@ -1768,7 +2590,8 @@ mod tests {
             Some("sess-rel"),
             "acp:permission_request",
             &TestPayload::new("a1", "sess-rel", "must-arrive"),
-        );
+        )
+        .expect("reliable permission fan-out");
         let drained = drain_rx(&mut rx);
         assert!(
             drained.iter().any(|e| e.type_ == "permission_request"),
@@ -1792,13 +2615,15 @@ mod tests {
             Some("sess-a"),
             "acp:tool_call",
             &TestPayload::new("a1", "sess-a", "only-a"),
-        );
+        )
+        .expect("session A fan-out");
         fan_out(
             &sinks,
             Some("sess-b"),
             "acp:tool_call",
             &TestPayload::new("a1", "sess-b", "only-b"),
-        );
+        )
+        .expect("session B fan-out");
         let a = drain_rx(&mut rx_a);
         let b = drain_rx(&mut rx_b);
         assert_eq!(a.len(), 1);
@@ -1886,11 +2711,13 @@ mod tests {
         let (_client, mut rx, _replay) = relay.subscribe("sess-1", None).await;
 
         for type_ in ["acp:session_created", "acp:session_closed"] {
-            relay.emit(&AcpEvent {
-                sid: Some("sess-1".to_string()),
-                type_,
-                payload: json!({"agentId": "a-1", "sessionId": "sess-1"}),
-            });
+            relay
+                .emit(&AcpEvent {
+                    sid: Some("sess-1".to_string()),
+                    type_,
+                    payload: json!({"agentId": "a-1", "sessionId": "sess-1"}),
+                })
+                .expect("session lifecycle relay admission");
         }
 
         let drained = drain_rx(&mut rx);
@@ -1913,11 +2740,13 @@ mod tests {
         let relay = Arc::new(WsRelaySink::new());
         let (_client, mut rx, _replay) = relay.subscribe("sess-1", None).await;
 
-        relay.emit(&AcpEvent {
-            sid: Some("sess-1".to_string()),
-            type_: "acp:session_closed",
-            payload: json!({"agentId": "a-1", "sessionId": "sess-1"}),
-        });
+        relay
+            .emit(&AcpEvent {
+                sid: Some("sess-1".to_string()),
+                type_: "acp:session_closed",
+                payload: json!({"agentId": "a-1", "sessionId": "sess-1"}),
+            })
+            .expect("live-only session close relay admission");
 
         let drained = drain_rx(&mut rx);
         assert!(
@@ -1964,7 +2793,8 @@ mod tests {
             Some("sess-coll"),
             "acp:tool_call",
             &TestPayload::new("a", "sess-coll", "first"),
-        );
+        )
+        .expect("initial sequence fan-out");
         // Flush so the async durable writer processes the enqueued event
         // before we assert on `last_seq`.
         persistence.flush_session("sess-coll").await.unwrap();
@@ -1995,7 +2825,8 @@ mod tests {
             Some("sess-coll"),
             "acp:session_info_update",
             &TestPayload::new("a", "sess-coll", "title-sync"),
-        );
+        )
+        .expect("reconciled sequence fan-out");
         // Flush so the async durable writer processes the enqueued event
         // before we assert on `last_seq`.
         persistence.flush_session("sess-coll").await.unwrap();
@@ -2118,11 +2949,13 @@ mod tests {
             .map(|ordinal| json!({"ordinal": ordinal, "text": format!("event-{ordinal}")}))
             .collect::<Vec<_>>();
         for (index, payload) in expected_payloads.iter().enumerate() {
-            relay.emit(&AcpEvent {
-                sid: Some("opaque-ordered-session".to_string()),
-                type_: event_types[index % event_types.len()],
-                payload: payload.clone(),
-            });
+            relay
+                .emit(&AcpEvent {
+                    sid: Some("opaque-ordered-session".to_string()),
+                    type_: event_types[index % event_types.len()],
+                    payload: payload.clone(),
+                })
+                .expect("ordered Conversation relay admission");
         }
         relay.flush_conversation_persistence().await.unwrap();
         let durable_payloads = repository
@@ -2167,11 +3000,13 @@ mod tests {
             16, adapter, None,
         ));
         for ordinal in 1..=40_u64 {
-            relay.emit(&AcpEvent {
-                sid: Some("opaque-drain-session".to_string()),
-                type_: "acp:message_chunk",
-                payload: json!({"ordinal": ordinal}),
-            });
+            relay
+                .emit(&AcpEvent {
+                    sid: Some("opaque-drain-session".to_string()),
+                    type_: "acp:message_chunk",
+                    payload: json!({"ordinal": ordinal}),
+                })
+                .expect("bounded drain relay admission");
             let pending = relay
                 .ordered_conversation_persistence()
                 .unwrap()
@@ -2237,11 +3072,13 @@ mod tests {
         let (_client, mut rx, _replay) = relay.subscribe("sess-title", None).await;
 
         for type_ in ["acp:session_info_update", "acp:local_title_generated"] {
-            relay.emit(&AcpEvent {
-                sid: Some("sess-title".to_string()),
-                type_,
-                payload: json!({"agentId": "a-1", "sessionId": "sess-title", "title": "T"}),
-            });
+            relay
+                .emit(&AcpEvent {
+                    sid: Some("sess-title".to_string()),
+                    type_,
+                    payload: json!({"agentId": "a-1", "sessionId": "sess-title", "title": "T"}),
+                })
+                .expect("title metadata relay admission");
         }
 
         let drained = drain_rx(&mut rx);

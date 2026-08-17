@@ -5,23 +5,26 @@
 //! serialized by a per-Conversation async mutex, and `catalog.json` is rewritten last as a
 //! disposable deterministic cache.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex as ParkingMutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard};
+use tokio::sync::{Mutex as TokioMutex, Notify, OwnedMutexGuard};
+use tokio::time::Instant as TokioInstant;
 use uuid::Uuid;
 
 use crate::conversation::catalog::{
     rebuild_catalog, AcceptedCanonicalConversation, CatalogRecoveryIssue, ConversationCatalog,
-    ConversationProvenanceFileV1, CATALOG_FILE, CONVERSATION_METADATA_FILE, PROVENANCE_FILE,
+    ConversationCatalogSnapshot, ConversationProvenanceFileV1, CATALOG_FILE,
+    CONVERSATION_METADATA_FILE, PROVENANCE_FILE,
 };
 use crate::conversation::contracts::{
     AgentSessionBinding, AgentSessionBindingState, ConversationErrorCode,
@@ -117,12 +120,448 @@ struct ConversationState {
     provenance: Option<ConversationProvenanceFileV1>,
 }
 
+pub const CATALOG_FLUSH_DEBOUNCE: Duration = Duration::from_millis(100);
+pub const CATALOG_FLUSH_MAX_DELAY: Duration = Duration::from_secs(1);
+pub const CATALOG_FLUSH_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogFlushReceipt {
+    pub requested_generation: u64,
+    pub flushed_generation: u64,
+    pub write_count: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CatalogFlushError {
+    pub code: &'static str,
+    pub generation: u64,
+    pub detail: String,
+}
+
+impl fmt::Display for CatalogFlushError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} while flushing catalog generation {}: {}",
+            self.code, self.generation, self.detail
+        )
+    }
+}
+
+impl std::error::Error for CatalogFlushError {}
+
 struct CatalogCacheState {
     catalog: ConversationCatalog,
-    dirty: bool,
-    generation: u64,
-    flush_count: u64,
+    first_dirty_at: Option<Instant>,
+    last_dirty_at: Option<Instant>,
+    flushed_generation: u64,
+    write_count: u64,
     last_conversation_id: Option<ConversationId>,
+}
+
+/// Coalesces disposable `catalog.json` snapshots without blocking canonical mutations.
+///
+/// Each mutation updates one in-memory entry, advances a generation, and schedules one weakly
+/// owned task. The task waits for 100 ms of quiet but never later than one second after the first
+/// dirty generation. Replacement runs on Tokio's blocking pool and retries without clearing a
+/// newer generation. A host barrier can flush the latest generation under one absolute deadline.
+pub struct CatalogFlushCoordinator {
+    state: ParkingMutex<CatalogCacheState>,
+    flush_lock: TokioMutex<()>,
+    durable_fs: DurableFileSystem,
+    path: PathBuf,
+    scheduled: AtomicBool,
+    wake: Notify,
+}
+
+impl CatalogFlushCoordinator {
+    fn new(
+        catalog: ConversationCatalog,
+        durable_fs: DurableFileSystem,
+        path: PathBuf,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            state: ParkingMutex::new(CatalogCacheState {
+                catalog,
+                first_dirty_at: None,
+                last_dirty_at: None,
+                flushed_generation: 0,
+                write_count: 0,
+                last_conversation_id: None,
+            }),
+            flush_lock: TokioMutex::new(()),
+            durable_fs,
+            path,
+            scheduled: AtomicBool::new(false),
+            wake: Notify::new(),
+        })
+    }
+
+    fn upsert(
+        self: &Arc<Self>,
+        record: &ConversationRecordV2,
+        frontier: &ConversationFrontier,
+    ) -> u64 {
+        let now = Instant::now();
+        let generation = {
+            let mut state = self.state.lock();
+            let generation = state.catalog.upsert(record, frontier);
+            state.first_dirty_at.get_or_insert(now);
+            state.last_dirty_at = Some(now);
+            state.last_conversation_id = Some(record.conversation_id);
+            generation
+        };
+        self.wake.notify_waiters();
+        self.schedule();
+        generation
+    }
+
+    fn schedule(self: &Arc<Self>) {
+        if self
+            .scheduled
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        repository_runtime_handle().spawn(async move {
+            Self::run_scheduled(weak).await;
+        });
+    }
+
+    async fn run_scheduled(weak: Weak<Self>) {
+        loop {
+            let Some(coordinator) = weak.upgrade() else {
+                return;
+            };
+            let due = {
+                let state = coordinator.state.lock();
+                let Some(first_dirty_at) = state.first_dirty_at else {
+                    coordinator.scheduled.store(false, Ordering::Release);
+                    return;
+                };
+                let last_dirty_at = state.last_dirty_at.unwrap_or(first_dirty_at);
+                (last_dirty_at + CATALOG_FLUSH_DEBOUNCE)
+                    .min(first_dirty_at + CATALOG_FLUSH_MAX_DELAY)
+            };
+            let due = TokioInstant::from_std(due);
+            tokio::select! {
+                () = tokio::time::sleep_until(due) => {}
+                () = coordinator.wake.notified() => continue,
+            }
+
+            if let Err(error) = coordinator.flush_once(None).await {
+                log::warn!(
+                    "[conversation-repository] catalog cache retry code={} generation={} duration_ms=0",
+                    error.code,
+                    error.generation
+                );
+                tokio::time::sleep(CATALOG_FLUSH_RETRY_DELAY).await;
+                continue;
+            }
+
+            let dirty = {
+                let state = coordinator.state.lock();
+                state.flushed_generation < state.catalog.generation()
+            };
+            if dirty {
+                continue;
+            }
+            coordinator.scheduled.store(false, Ordering::Release);
+            let raced_dirty = {
+                let state = coordinator.state.lock();
+                state.flushed_generation < state.catalog.generation()
+            };
+            if raced_dirty {
+                coordinator.schedule();
+            }
+            return;
+        }
+    }
+
+    async fn flush_once(
+        &self,
+        deadline: Option<TokioInstant>,
+    ) -> std::result::Result<CatalogFlushReceipt, CatalogFlushError> {
+        let _guard = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, self.flush_lock.lock())
+                .await
+                .map_err(|_| self.deadline_error())?,
+            None => self.flush_lock.lock().await,
+        };
+        let snapshot = {
+            let state = self.state.lock();
+            let snapshot = state.catalog.snapshot();
+            if state.flushed_generation >= snapshot.generation {
+                return Ok(CatalogFlushReceipt {
+                    requested_generation: snapshot.generation,
+                    flushed_generation: state.flushed_generation,
+                    write_count: state.write_count,
+                });
+            }
+            snapshot
+        };
+        let started = Instant::now();
+        let durable_fs = self.durable_fs.clone();
+        let path = self.path.clone();
+        let bytes = snapshot.bytes.clone();
+        let write = tokio::task::spawn_blocking(move || durable_fs.replace_bytes(&path, &bytes));
+        let outcome = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline, write)
+                .await
+                .map_err(|_| self.deadline_error())?,
+            None => write.await,
+        }
+        .map_err(|_| CatalogFlushError {
+            code: "CONVERSATION_CATALOG_WRITE_FAILED",
+            generation: snapshot.generation,
+            detail: "catalog cache writer task failed".to_string(),
+        })?
+        .map_err(|_| CatalogFlushError {
+            code: "CONVERSATION_CATALOG_WRITE_FAILED",
+            generation: snapshot.generation,
+            detail: "catalog cache replacement failed".to_string(),
+        })?;
+        let _ = outcome;
+
+        let receipt = {
+            let mut state = self.state.lock();
+            state.write_count = state.write_count.saturating_add(1);
+            state.flushed_generation = state.flushed_generation.max(snapshot.generation);
+            if state.catalog.generation() == snapshot.generation {
+                state.first_dirty_at = None;
+                state.last_dirty_at = None;
+            }
+            CatalogFlushReceipt {
+                requested_generation: snapshot.generation,
+                flushed_generation: state.flushed_generation,
+                write_count: state.write_count,
+            }
+        };
+        log::info!(
+            "[conversation-repository] catalog flush complete generation={} entry_count={} write_count={} duration_ms={}",
+            snapshot.generation,
+            snapshot.entry_count,
+            receipt.write_count,
+            started.elapsed().as_millis()
+        );
+        Ok(receipt)
+    }
+
+    pub async fn flush_until(
+        &self,
+        deadline: TokioInstant,
+    ) -> std::result::Result<CatalogFlushReceipt, CatalogFlushError> {
+        let mut last_error = None;
+        loop {
+            if TokioInstant::now() >= deadline {
+                return Err(last_error.unwrap_or_else(|| self.deadline_error()));
+            }
+            match self.flush_once(Some(deadline)).await {
+                Ok(receipt) => {
+                    let current_generation = self.state.lock().catalog.generation();
+                    if receipt.flushed_generation >= current_generation {
+                        return Ok(CatalogFlushReceipt {
+                            requested_generation: current_generation,
+                            ..receipt
+                        });
+                    }
+                }
+                Err(error) if error.code == "CONVERSATION_CATALOG_FLUSH_DEADLINE" => {
+                    return Err(error);
+                }
+                Err(error) => last_error = Some(error),
+            }
+            let retry_at = (TokioInstant::now() + CATALOG_FLUSH_RETRY_DELAY).min(deadline);
+            tokio::time::sleep_until(retry_at).await;
+        }
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> ConversationCatalogSnapshot {
+        self.state.lock().catalog.snapshot()
+    }
+
+    #[must_use]
+    pub fn flushed_generation(&self) -> u64 {
+        self.state.lock().flushed_generation
+    }
+
+    #[must_use]
+    pub fn write_count(&self) -> u64 {
+        self.state.lock().write_count
+    }
+
+    fn deadline_error(&self) -> CatalogFlushError {
+        CatalogFlushError {
+            code: "CONVERSATION_CATALOG_FLUSH_DEADLINE",
+            generation: self.state.lock().catalog.generation(),
+            detail: "catalog cache flush exceeded the host deadline".to_string(),
+        }
+    }
+
+    #[cfg(test)]
+    fn reset_write_counters(&self) {
+        self.durable_fs.reset_replace_counters();
+        self.state.lock().write_count = 0;
+    }
+
+    #[cfg(test)]
+    fn durable_catalog_write_count(&self) -> u64 {
+        self.durable_fs.catalog_replace_count()
+    }
+
+    #[cfg(test)]
+    fn fail_next_writes(&self, count: usize) {
+        self.durable_fs.fail_next_catalog_replaces(count);
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ConversationBindingKeys {
+    active: Option<String>,
+    history: HashSet<String>,
+}
+
+#[derive(Debug, Default)]
+struct RepositoryBindingIndex {
+    active_owners: HashMap<String, HashSet<ConversationId>>,
+    history_owners: HashMap<String, HashSet<ConversationId>>,
+    by_conversation: HashMap<ConversationId, ConversationBindingKeys>,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepositoryBindingIndexStats {
+    pub active_binding_count: usize,
+    pub history_binding_count: usize,
+    pub conversation_count: usize,
+    pub generation: u64,
+}
+
+impl RepositoryBindingIndex {
+    fn from_states(states: &HashMap<ConversationId, ConversationState>) -> Self {
+        let mut index = Self::default();
+        for (conversation_id, state) in states {
+            let keys = binding_keys(state);
+            index.install(*conversation_id, keys, false);
+        }
+        index.generation = 0;
+        index
+    }
+
+    fn refresh(&mut self, conversation_id: ConversationId, keys: ConversationBindingKeys) -> u64 {
+        if self.by_conversation.get(&conversation_id) == Some(&keys) {
+            return self.generation;
+        }
+        self.remove(conversation_id);
+        self.install(conversation_id, keys, true)
+    }
+
+    fn remove(&mut self, conversation_id: ConversationId) {
+        let Some(previous) = self.by_conversation.remove(&conversation_id) else {
+            return;
+        };
+        if let Some(active) = previous.active {
+            remove_owner(&mut self.active_owners, &active, conversation_id);
+        }
+        for history in previous.history {
+            remove_owner(&mut self.history_owners, &history, conversation_id);
+        }
+    }
+
+    fn install(
+        &mut self,
+        conversation_id: ConversationId,
+        keys: ConversationBindingKeys,
+        advance_generation: bool,
+    ) -> u64 {
+        if let Some(active) = keys.active.as_ref() {
+            self.active_owners
+                .entry(active.clone())
+                .or_default()
+                .insert(conversation_id);
+        }
+        for history in &keys.history {
+            self.history_owners
+                .entry(history.clone())
+                .or_default()
+                .insert(conversation_id);
+        }
+        self.by_conversation.insert(conversation_id, keys);
+        if advance_generation {
+            self.generation = self.generation.saturating_add(1);
+        }
+        self.generation
+    }
+
+    fn resolve_active(&self, agent_session_id: &str) -> Option<ConversationId> {
+        unique_owner(self.active_owners.get(agent_session_id))
+    }
+
+    fn resolve_history(&self, agent_session_id: &str) -> Option<ConversationId> {
+        unique_owner(self.history_owners.get(agent_session_id))
+    }
+
+    fn stats(&self) -> RepositoryBindingIndexStats {
+        RepositoryBindingIndexStats {
+            active_binding_count: self
+                .active_owners
+                .values()
+                .filter(|owners| owners.len() == 1)
+                .count(),
+            history_binding_count: self
+                .history_owners
+                .values()
+                .filter(|owners| owners.len() == 1)
+                .count(),
+            conversation_count: self.by_conversation.len(),
+            generation: self.generation,
+        }
+    }
+}
+
+fn binding_keys(state: &ConversationState) -> ConversationBindingKeys {
+    let mut history = state
+        .scan
+        .frontier
+        .binding
+        .history
+        .iter()
+        .map(|binding| binding.agent_session_id.clone())
+        .collect::<HashSet<_>>();
+    let active = state
+        .scan
+        .frontier
+        .binding
+        .current
+        .as_ref()
+        .and_then(|binding| {
+            history.insert(binding.agent_session_id.clone());
+            (binding.state == AgentSessionBindingState::Active
+                && state.record.lifecycle_state == ConversationLifecycleState::Ready)
+                .then(|| binding.agent_session_id.clone())
+        });
+    ConversationBindingKeys { active, history }
+}
+
+fn unique_owner(owners: Option<&HashSet<ConversationId>>) -> Option<ConversationId> {
+    let owners = owners?;
+    (owners.len() == 1).then(|| *owners.iter().next().expect("owner length checked"))
+}
+
+fn remove_owner(
+    owners: &mut HashMap<String, HashSet<ConversationId>>,
+    agent_session_id: &str,
+    conversation_id: ConversationId,
+) {
+    if let Some(conversations) = owners.get_mut(agent_session_id) {
+        conversations.remove(&conversation_id);
+        if conversations.is_empty() {
+            owners.remove(agent_session_id);
+        }
+    }
 }
 
 pub const ACTIVE_TAIL_CACHE_MAX_CONVERSATIONS: usize = 8;
@@ -360,8 +799,8 @@ pub struct ConversationRepository {
     recovery_items: ParkingMutex<Vec<RepositoryRecoveryItem>>,
     conversation_locks: ParkingMutex<HashMap<ConversationId, Arc<TokioMutex<()>>>>,
     active_tail_cache: ParkingMutex<ActiveTailCache>,
-    catalog: ParkingMutex<CatalogCacheState>,
-    catalog_lock: TokioMutex<()>,
+    binding_index: ParkingMutex<RepositoryBindingIndex>,
+    catalog_flush: Arc<CatalogFlushCoordinator>,
     bootstrap_scanned_event_count: u64,
     bootstrap_sparse_index_entry_count: usize,
     bootstrap_duration_ms: u64,
@@ -519,11 +958,14 @@ impl ConversationRepository {
                 )
             })
             .collect::<HashMap<_, _>>();
+        let binding_index = RepositoryBindingIndex::from_states(&states);
         let recovery_by_id = recovery_items
             .iter()
             .filter(|item| item.requires_action)
             .filter_map(|item| item.conversation_id.map(|id| (id, item.clone())))
             .collect::<HashMap<_, _>>();
+        let catalog_flush =
+            CatalogFlushCoordinator::new(catalog, durable_fs.clone(), catalog_path.clone());
         let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         let report = RepositoryOpenReport {
             valid_conversation_count: states.len(),
@@ -543,14 +985,8 @@ impl ConversationRepository {
             recovery_items: ParkingMutex::new(recovery_items),
             conversation_locks: ParkingMutex::new(HashMap::new()),
             active_tail_cache: ParkingMutex::new(ActiveTailCache::default()),
-            catalog: ParkingMutex::new(CatalogCacheState {
-                catalog,
-                dirty: false,
-                generation: 0,
-                flush_count: 0,
-                last_conversation_id: None,
-            }),
-            catalog_lock: TokioMutex::new(()),
+            binding_index: ParkingMutex::new(binding_index),
+            catalog_flush,
             bootstrap_scanned_event_count: report.scanned_event_count,
             bootstrap_sparse_index_entry_count: report.sparse_index_entry_count,
             bootstrap_duration_ms: report.duration_ms,
@@ -698,6 +1134,63 @@ impl ConversationRepository {
         self.active_tail_cache.lock().stats()
     }
 
+    #[must_use]
+    pub fn catalog_flush_coordinator(&self) -> Arc<CatalogFlushCoordinator> {
+        Arc::clone(&self.catalog_flush)
+    }
+
+    pub async fn flush_catalog_until(
+        &self,
+        deadline: TokioInstant,
+    ) -> std::result::Result<CatalogFlushReceipt, CatalogFlushError> {
+        self.catalog_flush.flush_until(deadline).await
+    }
+
+    #[must_use]
+    pub fn binding_generation(&self) -> u64 {
+        self.binding_index.lock().generation
+    }
+
+    #[must_use]
+    pub fn binding_index_stats(&self) -> RepositoryBindingIndexStats {
+        self.binding_index.lock().stats()
+    }
+
+    #[must_use]
+    pub fn conversation_id_for_active_binding(
+        &self,
+        agent_session_id: &str,
+    ) -> Option<ConversationId> {
+        self.binding_index.lock().resolve_active(agent_session_id)
+    }
+
+    #[must_use]
+    pub fn conversation_id_for_history_binding(
+        &self,
+        agent_session_id: &str,
+    ) -> Option<ConversationId> {
+        self.binding_index.lock().resolve_history(agent_session_id)
+    }
+
+    pub fn refresh_binding_index_hint(&self, conversation_id: ConversationId) -> Option<u64> {
+        self.refresh_binding_index_for_conversation(conversation_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_catalog_write_counters(&self) {
+        self.catalog_flush.reset_write_counters();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn catalog_write_count(&self) -> u64 {
+        self.catalog_flush.durable_catalog_write_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_catalog_writes(&self, count: usize) {
+        self.catalog_flush.fail_next_writes(count);
+    }
+
     #[cfg(test)]
     pub(crate) fn event_log_scan(
         &self,
@@ -771,8 +1264,8 @@ impl ConversationRepository {
             provenance: None,
         };
         self.states.lock().insert(record.conversation_id, state);
+        drop(_guard);
         self.mark_catalog_entry_dirty(record.conversation_id);
-        self.flush_catalog_best_effort().await;
         log::info!(
             "[conversation-repository] conversation created conversation_id={}",
             record.conversation_id
@@ -846,8 +1339,9 @@ impl ConversationRepository {
             .get_mut(&conversation_id)
             .expect("per-Conversation lock preserves state")
             .record = record.clone();
+        self.refresh_binding_index_for_conversation(conversation_id);
+        drop(_guard);
         self.mark_catalog_entry_dirty(conversation_id);
-        self.flush_catalog_best_effort().await;
         Ok(record)
     }
 
@@ -861,9 +1355,10 @@ impl ConversationRepository {
     ) -> Result<ConversationEventRecordV2> {
         self.validate_write_permit(permit, conversation_id, "append_event")?;
         let lock = self.conversation_lock(conversation_id);
-        let _guard = lock.lock().await;
+        let guard = lock.lock().await;
         let event = self.append_event_locked(conversation_id, recorded_at_utc, type_, payload)?;
-        self.flush_catalog_best_effort().await;
+        drop(guard);
+        self.mark_catalog_entry_dirty(conversation_id);
         Ok(event)
     }
 
@@ -1104,9 +1599,10 @@ impl ConversationRepository {
         recorded_at_utc: DateTime<Utc>,
     ) -> Result<ConversationEventRecordV2> {
         self.validate_write_permit(permit, conversation_id, "detach_agent_binding")?;
-        let _guard = self.lifecycle_lock(conversation_id).await;
+        let guard = self.lifecycle_lock(conversation_id).await;
         let event = self.detach_agent_binding_locked(permit, conversation_id, recorded_at_utc)?;
-        self.flush_catalog_best_effort().await;
+        drop(guard);
+        self.mark_catalog_entry_dirty(conversation_id);
         Ok(event)
     }
 
@@ -1118,10 +1614,11 @@ impl ConversationRepository {
         recorded_at_utc: DateTime<Utc>,
     ) -> Result<ConversationEventRecordV2> {
         self.validate_write_permit(permit, conversation_id, "rebind_detached_binding")?;
-        let _guard = self.lifecycle_lock(conversation_id).await;
+        let guard = self.lifecycle_lock(conversation_id).await;
         let event =
             self.rebind_detached_binding_locked(permit, conversation_id, recorded_at_utc)?;
-        self.flush_catalog_best_effort().await;
+        drop(guard);
+        self.mark_catalog_entry_dirty(conversation_id);
         Ok(event)
     }
 
@@ -1139,9 +1636,10 @@ impl ConversationRepository {
         if !provider_confirmed {
             return Ok(None);
         }
-        let _guard = self.lifecycle_lock(conversation_id).await;
+        let guard = self.lifecycle_lock(conversation_id).await;
         let event = self.suspend_agent_binding_locked(permit, conversation_id, recorded_at_utc)?;
-        self.flush_catalog_best_effort().await;
+        drop(guard);
+        self.mark_catalog_entry_dirty(conversation_id);
         Ok(Some(event))
     }
 
@@ -1153,10 +1651,11 @@ impl ConversationRepository {
         recorded_at_utc: DateTime<Utc>,
     ) -> Result<ConversationEventRecordV2> {
         self.validate_write_permit(permit, conversation_id, "replace_agent_binding")?;
-        let _guard = self.lifecycle_lock(conversation_id).await;
+        let guard = self.lifecycle_lock(conversation_id).await;
         let event =
             self.replace_agent_binding_locked(permit, conversation_id, binding, recorded_at_utc)?;
-        self.flush_catalog_best_effort().await;
+        drop(guard);
+        self.mark_catalog_entry_dirty(conversation_id);
         Ok(event)
     }
 
@@ -1338,7 +1837,14 @@ impl ConversationRepository {
         conversation_id: ConversationId,
     ) -> Result<()> {
         self.validate_write_permit(permit, conversation_id, "refresh_lifecycle_catalog")?;
-        self.flush_catalog_best_effort().await;
+        let snapshot = self.catalog_entry_snapshot(conversation_id);
+        let coordinator = Arc::clone(&self.catalog_flush);
+        repository_runtime_handle().spawn(async move {
+            tokio::task::yield_now().await;
+            if let Some((record, frontier)) = snapshot {
+                coordinator.upsert(&record, &frontier);
+            }
+        });
         Ok(())
     }
 
@@ -1470,7 +1976,8 @@ impl ConversationRepository {
             )?,
         )?;
         let after = self.aggregate_after(&before, "attach_project")?;
-        self.flush_catalog_best_effort().await;
+        drop(_guard);
+        self.mark_catalog_entry_dirty(conversation_id);
         log::info!(
             "[conversation-repository] aggregate mutation operation=attach_project conversation_id={} previous_revision={} revision={} code=OK",
             conversation_id,
@@ -1531,7 +2038,8 @@ impl ConversationRepository {
             )?,
         )?;
         let after = self.aggregate_after(&before, "detach_project")?;
-        self.flush_catalog_best_effort().await;
+        drop(_guard);
+        self.mark_catalog_entry_dirty(conversation_id);
         log::info!(
             "[conversation-repository] aggregate mutation operation=detach_project conversation_id={} previous_revision={} revision={} code=OK",
             conversation_id,
@@ -1591,7 +2099,8 @@ impl ConversationRepository {
             )?,
         )?;
         let after = self.aggregate_after(&before, "update_execution_target")?;
-        self.flush_catalog_best_effort().await;
+        drop(_guard);
+        self.mark_catalog_entry_dirty(conversation_id);
         log::info!(
             "[conversation-repository] aggregate mutation operation=update_execution_target conversation_id={} previous_revision={} revision={} target_kind={} code=OK",
             conversation_id,
@@ -1741,9 +2250,10 @@ impl ConversationRepository {
         conversation_id: ConversationId,
     ) -> Result<ConversationRecordV2> {
         self.validate_write_permit(permit, conversation_id, "mark_deleted")?;
-        let _guard = self.lifecycle_lock(conversation_id).await;
+        let guard = self.lifecycle_lock(conversation_id).await;
         let record = self.tombstone_conversation_locked(permit, conversation_id)?;
-        self.flush_catalog_best_effort().await;
+        drop(guard);
+        self.mark_catalog_entry_dirty(conversation_id);
         Ok(record)
     }
 
@@ -1770,7 +2280,7 @@ impl ConversationRepository {
             .get_mut(&conversation_id)
             .expect("per-Conversation lock preserves state")
             .record = record.clone();
-        self.mark_catalog_entry_dirty(conversation_id);
+        self.refresh_binding_index_for_conversation(conversation_id);
         log::info!(
             "[conversation-repository] conversation deletion tombstoned conversation_id={}",
             conversation_id
@@ -1800,6 +2310,7 @@ impl ConversationRepository {
             .get_mut(&conversation_id)
             .expect("per-Conversation lock preserves state")
             .record = record.clone();
+        self.refresh_binding_index_for_conversation(conversation_id);
         self.mark_catalog_entry_dirty(conversation_id);
         if let Err(error) = self.persist_record_metadata(&record, "lifecycle_recovery") {
             log::error!(
@@ -1968,7 +2479,16 @@ impl ConversationRepository {
         // The append is already authoritative. Retain its compact frontier even if metadata
         // materialization fails, preventing a duplicate seq in the same process.
         self.active_tail_cache.lock().invalidate(conversation_id);
-        self.mark_catalog_entry_dirty(conversation_id);
+        if matches!(
+            event.type_,
+            ConversationEventType::BindingBound
+                | ConversationEventType::BindingDetached
+                | ConversationEventType::BindingRebound
+                | ConversationEventType::BindingSuspended
+                | ConversationEventType::BindingReplaced
+        ) {
+            self.refresh_binding_index_for_conversation(conversation_id);
+        }
         self.persist_record_metadata(&persisted_record, "append_event")?;
         Ok(event)
     }
@@ -2065,67 +2585,41 @@ impl ConversationRepository {
         )
     }
 
-    fn mark_catalog_entry_dirty(&self, conversation_id: ConversationId) {
-        let states = self.states.lock();
-        let Some(state) = states.get(&conversation_id) else {
-            return;
-        };
-        let mut cache = self.catalog.lock();
-        cache.catalog.upsert(&state.record, &state.scan.frontier);
-        cache.dirty = true;
-        cache.generation = cache.generation.wrapping_add(1);
-        cache.last_conversation_id = Some(conversation_id);
+    fn catalog_entry_snapshot(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Option<(ConversationRecordV2, ConversationFrontier)> {
+        self.states
+            .lock()
+            .get(&conversation_id)
+            .map(|state| (state.record.clone(), state.scan.frontier.clone()))
     }
 
-    async fn flush_catalog_best_effort(&self) {
-        // Give concurrent mutations one scheduling turn to join this cache write. Every caller
-        // awaits the same lock, so the last caller still observes a completed flush.
-        tokio::task::yield_now().await;
-        let _guard = self.catalog_lock.lock().await;
-        let (bytes, generation, conversation_id, entry_count) = {
-            let cache = self.catalog.lock();
-            if !cache.dirty {
-                return;
-            }
-            (
-                cache.catalog.deterministic_bytes(),
-                cache.generation,
-                cache.last_conversation_id,
-                cache.catalog.len(),
-            )
+    fn mark_catalog_entry_dirty(&self, conversation_id: ConversationId) {
+        let Some((record, frontier)) = self.catalog_entry_snapshot(conversation_id) else {
+            return;
         };
-        let started_at = Instant::now();
-        let path = self.locator.root().join(CATALOG_FILE);
-        match self.durable_fs.replace_bytes(&path, &bytes) {
-            Ok(_) => {
-                let mut cache = self.catalog.lock();
-                cache.flush_count = cache.flush_count.saturating_add(1);
-                let flush_count = cache.flush_count;
-                if cache.generation == generation {
-                    cache.dirty = false;
-                }
-                log::info!(
-                    "[conversation-repository] catalog flush complete conversation_id={} entry_count={} flush_count={} duration_ms={}",
-                    conversation_id
-                        .map(|id| id.to_string())
-                        .unwrap_or_else(|| "coalesced".to_string()),
-                    entry_count,
-                    flush_count,
-                    started_at.elapsed().as_millis()
-                );
-            }
-            Err(error) => {
-                log::warn!(
-                    "[conversation-repository] coalesced cache write failure conversation_id={} entry_count={} error={}",
-                    conversation_id
-                        .map(|id| id.to_string())
-                        .unwrap_or_else(|| "coalesced".to_string()),
-                    entry_count,
-                    error
-                );
-            }
-        }
+        self.catalog_flush.upsert(&record, &frontier);
     }
+
+    fn refresh_binding_index_for_conversation(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Option<u64> {
+        let keys = self.states.lock().get(&conversation_id).map(binding_keys)?;
+        let generation = self.binding_index.lock().refresh(conversation_id, keys);
+        log::info!(
+            "[conversation-repository] binding index refreshed conversation_id={} generation={}",
+            conversation_id,
+            generation
+        );
+        Some(generation)
+    }
+}
+
+fn repository_runtime_handle() -> tokio::runtime::Handle {
+    tokio::runtime::Handle::try_current()
+        .unwrap_or_else(|_| tauri::async_runtime::handle().inner().clone())
 }
 
 fn immutable_identity(
@@ -2731,6 +3225,10 @@ mod tests {
             .create_conversation(ready, ConversationMutation::CreateConversation)
             .await
             .unwrap();
+        repository
+            .flush_catalog_until(TokioInstant::now() + Duration::from_secs(2))
+            .await
+            .expect("initial catalog generation flush");
         let catalog_path = repository.root().join(CATALOG_FILE);
         let expected = fs::read(&catalog_path).unwrap();
         fs::remove_file(&catalog_path).unwrap();
@@ -2833,6 +3331,54 @@ mod tests {
                 .unwrap()
                 .message_count,
             3
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_flush_is_async_and_coalesced() {
+        let (_temp, repository, writer) = fixture();
+        writer
+            .create_conversation(record(), ConversationMutation::CreateConversation)
+            .await
+            .unwrap();
+        repository
+            .flush_catalog_until(TokioInstant::now() + Duration::from_secs(2))
+            .await
+            .expect("initial catalog flush");
+        repository.reset_catalog_write_counters();
+
+        let coordinator = repository.catalog_flush_coordinator();
+        let (record, frontier) = repository
+            .catalog_entry_snapshot(ConversationId::parse(ID).unwrap())
+            .expect("catalog entry snapshot");
+        let flush_guard = coordinator.flush_lock.lock().await;
+        for _ in 0..10_000 {
+            coordinator.upsert(&record, &frontier);
+        }
+        assert_eq!(
+            repository.catalog_write_count(),
+            0,
+            "ordinary mutations must not replace catalog.json synchronously"
+        );
+        let requested_generation = coordinator.snapshot().generation;
+        drop(flush_guard);
+
+        let receipt = repository
+            .flush_catalog_until(TokioInstant::now() + Duration::from_secs(2))
+            .await
+            .expect("coalesced catalog flush");
+        assert_eq!(receipt.requested_generation, requested_generation);
+        assert!(receipt.flushed_generation >= requested_generation);
+        assert_eq!(repository.catalog_write_count(), 1);
+
+        let rebuilt = rebuild_catalog(&repository.locator, &repository.durable_fs)
+            .expect("authoritative catalog rebuild")
+            .catalog
+            .deterministic_bytes();
+        assert_eq!(coordinator.snapshot().bytes, rebuilt);
+        assert_eq!(
+            fs::read(repository.root().join(CATALOG_FILE)).unwrap(),
+            rebuilt
         );
     }
 

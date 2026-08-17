@@ -49,8 +49,8 @@ use crate::acp::client;
 use crate::acp::config::{AgentConfig, AgentId, SessionId};
 use crate::acp::events::{
     self, AgentCrashedEvent, AgentDisconnectedEvent, AgentErrorEvent, AgentSpawnedEvent,
-    AuthMethodInfo, ConfigOptionsUpdateEvent, PromptCompleteEvent, SessionClosedEvent,
-    SessionCreatedEvent, SessionInfoUpdateEvent, SessionModelState,
+    AuthMethodInfo, ConfigOptionsUpdateEvent, FanOutError, FanOutReceipt, PromptCompleteEvent,
+    SessionClosedEvent, SessionCreatedEvent, SessionInfoUpdateEvent, SessionModelState,
 };
 use crate::acp::session::DriverState;
 use crate::acp::session_persistence::{
@@ -63,6 +63,7 @@ use crate::conversation::{
     PreparedConversation, ProjectAttachment, ACP_COMPENSATION_FAILED,
     PROJECT_ATTACHMENT_SCHEMA_VERSION,
 };
+use crate::web::sink::CONVERSATION_PERSISTENCE_REJECTED;
 use crate::web::EventSink;
 
 /// How long to wait for the agent to answer `initialize` before treating the
@@ -798,6 +799,45 @@ struct AgentEntry {
 type ReplacementGateSender = watch::Sender<Option<Result<(), String>>>;
 
 type ReplacementGates = HashMap<String, ReplacementGateSender>;
+type SessionDeliveryCircuits = Arc<Mutex<HashMap<String, &'static str>>>;
+
+fn fan_out_session<P: Serialize>(
+    sinks: &[Arc<dyn EventSink>],
+    circuits: &SessionDeliveryCircuits,
+    session_id: &str,
+    type_: &'static str,
+    payload: &P,
+) -> Result<FanOutReceipt, FanOutError> {
+    if let Some(source_code) = circuits.lock().get(session_id).copied() {
+        return Err(FanOutError::circuit_open(source_code));
+    }
+    let result = events::fan_out(sinks, Some(session_id), type_, payload);
+    if let Err(error) = &result {
+        if error.is_durable_rejection() {
+            circuits.lock().entry(session_id.to_string()).or_insert(
+                error
+                    .source_code
+                    .unwrap_or(CONVERSATION_PERSISTENCE_REJECTED),
+            );
+            log::error!(
+                "[acp] session delivery circuit opened code={} source_code={}",
+                error.code,
+                error.source_code.unwrap_or("UNKNOWN")
+            );
+        }
+    }
+    result
+}
+
+fn log_delivery_error(operation: &'static str, error: &FanOutError) {
+    log::warn!(
+        "[acp] event delivery degraded operation={} code={} source_code={} delivered_count={}",
+        operation,
+        error.code,
+        error.source_code.unwrap_or("NONE"),
+        error.delivered_count
+    );
+}
 
 pub struct AcpManager {
     sinks: Vec<Arc<dyn EventSink>>,
@@ -877,7 +917,11 @@ pub(crate) async fn record_local_title(
         Some(event.session_id.0.as_str()),
         events::EVENT_SESSION_INFO_UPDATE,
         &event,
-    );
+    )
+    .map_err(|error| {
+        log_delivery_error("record_local_title", &error);
+        error.code.to_string()
+    })?;
     log::info!(
         "[acp-title] title persisted and broadcast for session {session_id} (seq={next_seq}, title_len={} chars)",
         title.chars().count()
@@ -1148,7 +1192,10 @@ impl AcpManager {
         // `agent_spawned` is agent-level (no session yet) → sid = None. The event
         // stays for observers; the spawn response is now the authoritative source
         // of capabilities + authMethods + stableNamespace.
-        events::fan_out(&self.sinks, None, events::EVENT_AGENT_SPAWNED, &event);
+        if let Err(error) = events::fan_out(&self.sinks, None, events::EVENT_AGENT_SPAWNED, &event)
+        {
+            log_delivery_error("agent_spawned", &error);
+        }
 
         // Log success at the host boundary with the agent id and auth-method ids
         // (never credentials). One line per spawn so a missing method list or an
@@ -1893,8 +1940,10 @@ impl AcpManager {
         Ok(())
     }
 
-    /// Kill all agents and surface join/persistence durability failures.
-    pub async fn kill_all_checked(&self) -> Result<(), String> {
+    /// Stop every ACP producer and join its driver before any host persistence drain begins.
+    /// This method intentionally does not flush a store; standalone shutdown composes it ahead of
+    /// relay and catalog barriers under one outer deadline.
+    pub async fn stop_producers(&self) -> Result<(), String> {
         let entries: Vec<(AgentId, AgentEntry)> = {
             let mut agents = self.agents.lock();
             agents.drain().collect()
@@ -1909,19 +1958,10 @@ impl AcpManager {
                 handles.push(handle);
             }
         }
-
         if handles.is_empty() {
-            if let Some(persistence) = &self.persistence {
-                persistence
-                    .flush_all()
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
             return Ok(());
         }
 
-        // Bounded join across all threads so app exit can't hang on one stuck
-        // agent. We join concurrently and cap the total wait at JOIN_TIMEOUT.
         let join_all = tokio::task::spawn_blocking(move || {
             for handle in handles {
                 let _ = handle.join();
@@ -1931,6 +1971,12 @@ impl AcpManager {
             .await
             .map_err(|_| format!("agent shutdown exceeded {JOIN_TIMEOUT:?}"))?
             .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Kill all agents and surface join/persistence durability failures.
+    pub async fn kill_all_checked(&self) -> Result<(), String> {
+        self.stop_producers().await?;
         if let Some(persistence) = &self.persistence {
             persistence
                 .flush_all()
@@ -2118,13 +2164,20 @@ impl AcpManager {
                                     stop_reason,
                                     turn_id,
                                 };
-                                events::fan_out(
+                                match events::fan_out(
                                     &prompt_sinks,
                                     Some(&session_id.0),
                                     events::EVENT_PROMPT_COMPLETE,
                                     &event,
-                                );
-                                let _ = reply.send(Ok(stop_reason));
+                                ) {
+                                    Ok(_) => {
+                                        let _ = reply.send(Ok(stop_reason));
+                                    }
+                                    Err(error) => {
+                                        log_delivery_error("test_prompt_complete", &error);
+                                        let _ = reply.send(Err(error.code.to_string()));
+                                    }
+                                }
                             });
                             released = true;
                         } else {
@@ -2493,12 +2546,14 @@ fn run_agent(
                 agent_id: agent_id.clone(),
                 session_id: SessionId::new(session),
             };
-            events::fan_out(
+            if let Err(error) = events::fan_out(
                 &sinks,
                 Some(event.session_id.0.as_str()),
                 events::EVENT_SESSION_CLOSED,
                 &event,
-            );
+            ) {
+                log_delivery_error("session_closed", &error);
+            }
         }
 
         if let Err(message) = result {
@@ -2511,7 +2566,10 @@ fn run_agent(
                 session_id: None,
                 message: message.clone(),
             };
-            events::fan_out(&sinks, None, events::EVENT_AGENT_CRASHED, &crashed);
+            if let Err(error) = events::fan_out(&sinks, None, events::EVENT_AGENT_CRASHED, &crashed)
+            {
+                log_delivery_error("agent_crashed", &error);
+            }
 
             let event = AgentErrorEvent {
                 agent_id: agent_id.clone(),
@@ -2519,12 +2577,17 @@ fn run_agent(
                 message,
             };
             // Teardown error is agent-level (no session) → sid = None.
-            events::fan_out(&sinks, None, events::EVENT_AGENT_ERROR, &event);
+            if let Err(error) = events::fan_out(&sinks, None, events::EVENT_AGENT_ERROR, &event) {
+                log_delivery_error("agent_error", &error);
+            }
         }
 
         let event = AgentDisconnectedEvent { agent_id };
         // Agent-level lifecycle event → sid = None.
-        events::fan_out(&sinks, None, events::EVENT_AGENT_DISCONNECTED, &event);
+        if let Err(error) = events::fan_out(&sinks, None, events::EVENT_AGENT_DISCONNECTED, &event)
+        {
+            log_delivery_error("agent_disconnected", &error);
+        }
     }
 }
 
@@ -2580,11 +2643,13 @@ async fn drive_connection(
 
     // Per-handler clones (handlers must be `Send` and may be called repeatedly).
     // Each handler gets its own clone of the sink fan-out; `Arc` clones are
-    // cheap and `Vec::clone` is N Arc clones (N is tiny: 1 sink in desktop mode
-    // today, 2 once Story 1.10 adds the shared-live WS sink).
+    // cheap and `Vec::clone` is N Arc clones. A durable rejection opens only
+    // the affected session's producer circuit; other sessions on this agent remain live.
+    let delivery_circuits: SessionDeliveryCircuits = Arc::new(Mutex::new(HashMap::new()));
     let notif_sinks = sinks.clone();
     let notif_agent_id = agent_id.clone();
     let notif_state = driver_state.clone();
+    let notif_circuits = Arc::clone(&delivery_circuits);
     // AD-8: capture persistence into the notification closure so the host can
     // gate `session_info_update` fan-out on `title_source`. When a background
     // title (`BackgroundGenerated`) or a future local alias (`LocalAlias`) owns
@@ -2594,9 +2659,11 @@ async fn drive_connection(
     let perm_sinks = sinks.clone();
     let perm_agent_id = agent_id.clone();
     let perm_state = driver_state.clone();
+    let perm_circuits = Arc::clone(&delivery_circuits);
     let question_sinks = sinks.clone();
     let question_agent_id = agent_id.clone();
     let question_state = driver_state.clone();
+    let question_circuits = Arc::clone(&delivery_circuits);
     let read_state = driver_state.clone();
     let write_state = driver_state.clone();
 
@@ -2621,6 +2688,7 @@ async fn drive_connection(
 
     // Clones moved into the command loop (`main_fn`).
     let loop_sinks = sinks.clone();
+    let loop_delivery_circuits = Arc::clone(&delivery_circuits);
     let loop_host_plan_server = host_plan_server;
     let loop_agent_id = agent_id.clone();
     let loop_state = driver_state.clone();
@@ -2633,6 +2701,13 @@ async fn drive_connection(
         .on_receive_notification(
             async move |notification: agent_client_protocol::schema::v1::SessionNotification, _cx| {
                 let session_id = notification.session_id.0.to_string();
+                if notif_circuits.lock().contains_key(&session_id) {
+                    log::debug!(
+                        "[acp] dropped update for circuit-broken session code={}",
+                        CONVERSATION_PERSISTENCE_REJECTED
+                    );
+                    return Ok(());
+                }
                 // Any inbound session/update is agent activity — nudge the
                 // active turn's idle deadline so a streaming turn never hits
                 // the idle timeout. Best-effort: a no-op when no turn is
@@ -2675,7 +2750,18 @@ async fn drive_connection(
                     );
                     return Ok(());
                 }
-                client::emit_session_update(&notif_sinks, &notif_agent_id, notification);
+                if let Err(error) =
+                    client::emit_session_update(&notif_sinks, &notif_agent_id, notification)
+                {
+                    if error.is_durable_rejection() {
+                        notif_circuits.lock().insert(
+                            session_id.clone(),
+                            error.source_code.unwrap_or(CONVERSATION_PERSISTENCE_REJECTED),
+                        );
+                        notif_state.lock().signal_cancel(&session_id);
+                    }
+                    log_delivery_error("session_update", &error);
+                }
                 Ok(())
             },
             agent_client_protocol::on_receive_notification!(),
@@ -2716,12 +2802,20 @@ async fn drive_connection(
                     tool_call,
                     options,
                 };
-                events::fan_out(
+                if let Err(error) = fan_out_session(
                     &perm_sinks,
-                    Some(event.session_id.0.as_str()),
+                    &perm_circuits,
+                    event.session_id.0.as_str(),
                     events::EVENT_PERMISSION_REQUEST,
                     &event,
-                );
+                ) {
+                    if let Some(permission) = perm_state.lock().take_permission(&event.request_id) {
+                        let _ = permission.responder.respond(RequestPermissionResponse::new(
+                            RequestPermissionOutcome::Cancelled,
+                        ));
+                    }
+                    log_delivery_error("permission_request", &error);
+                }
                 Ok(())
             },
             agent_client_protocol::on_receive_request!(),
@@ -2763,12 +2857,21 @@ async fn drive_connection(
                         })
                         .collect(),
                 };
-                events::fan_out(
+                if let Err(error) = fan_out_session(
                     &question_sinks,
-                    Some(event.session_id.0.as_str()),
+                    &question_circuits,
+                    event.session_id.0.as_str(),
                     events::EVENT_QUESTION_REQUEST,
                     &event,
-                );
+                ) {
+                    if let Some(question) = question_state.lock().take_question(&event.question_id) {
+                        let _ = question.responder.respond(serde_json::json!({
+                            "questionId": event.question_id,
+                            "cancelled": true,
+                        }));
+                    }
+                    log_delivery_error("question_request", &error);
+                }
                 Ok(())
             },
             agent_client_protocol::on_receive_request!(),
@@ -2988,6 +3091,7 @@ async fn drive_connection(
                 command_rx,
                 init_tx,
                 loop_sinks,
+                loop_delivery_circuits,
                 loop_host_plan_server,
                 loop_agent_id,
                 loop_state,
@@ -3015,6 +3119,7 @@ async fn run_command_loop(
     mut command_rx: mpsc::UnboundedReceiver<AcpCommand>,
     init_tx: oneshot::Sender<Result<InitOutcome, String>>,
     sinks: Vec<Arc<dyn EventSink>>,
+    delivery_circuits: SessionDeliveryCircuits,
     host_plan_server: Arc<crate::acp::host_mcp::parent::HostPlanServer>,
     agent_id: AgentId,
     driver_state: Arc<Mutex<DriverState>>,
@@ -3102,6 +3207,7 @@ async fn run_command_loop(
                 let req_cx = cx.clone();
                 let close_cx = cx.clone();
                 let req_sinks = sinks.clone();
+                let req_delivery_circuits = Arc::clone(&delivery_circuits);
                 let req_agent_id = agent_id.clone();
                 let req_state = driver_state.clone();
                 let req_persistence = persistence.clone();
@@ -3348,12 +3454,15 @@ async fn run_command_loop(
                                 ),
                                 config_options: response.config_options,
                             };
-                            events::fan_out(
+                            if let Err(error) = fan_out_session(
                                 &req_sinks,
-                                Some(event.session_id.0.as_str()),
+                                &req_delivery_circuits,
+                                event.session_id.0.as_str(),
                                 events::EVENT_SESSION_CREATED,
                                 &event,
-                            );
+                            ) {
+                                log_delivery_error("session_created", &error);
+                            }
                         }
                         Ok(Err(e)) => send_reply(&task_slot, Err(e.to_string())),
                         Err(_) => {
@@ -3545,6 +3654,7 @@ async fn run_command_loop(
                 let task_slot = slot.clone();
                 let turn_cx = cx.clone();
                 let turn_sinks = sinks.clone();
+                let turn_delivery_circuits = Arc::clone(&delivery_circuits);
                 let turn_agent_id = agent_id.clone();
                 let turn_plan_server = host_plan_server.clone();
                 let turn_state = driver_state.clone();
@@ -3643,12 +3753,17 @@ async fn run_command_loop(
                                 stop_reason,
                                 turn_id: turn_turn_id.clone(),
                             };
-                            events::fan_out(
+                            if let Err(error) = fan_out_session(
                                 &turn_sinks,
-                                Some(event.session_id.0.as_str()),
+                                &turn_delivery_circuits,
+                                event.session_id.0.as_str(),
                                 events::EVENT_PROMPT_COMPLETE,
                                 &event,
-                            );
+                            ) {
+                                log_delivery_error("prompt_complete", &error);
+                                send_reply(&task_slot, Err(error.code.to_string()));
+                                return Ok(());
+                            }
                             if !is_ephemeral {
                                 if let Some(persistence) = &turn_persistence {
                                     if let Err(error) =
@@ -3673,12 +3788,17 @@ async fn run_command_loop(
                                 message: message.clone(),
                             };
                             // Turn-scoped error → sid is the session id.
-                            events::fan_out(
-                                &turn_sinks,
-                                event.session_id.as_ref().map(|s| s.0.as_str()),
-                                events::EVENT_AGENT_ERROR,
-                                &event,
-                            );
+                            if let Some(session_id) = event.session_id.as_ref() {
+                                if let Err(error) = fan_out_session(
+                                    &turn_sinks,
+                                    &turn_delivery_circuits,
+                                    session_id.0.as_str(),
+                                    events::EVENT_AGENT_ERROR,
+                                    &event,
+                                ) {
+                                    log_delivery_error("turn_agent_error", &error);
+                                }
+                            }
                             if !is_ephemeral {
                                 if let Some(persistence) = &turn_persistence {
                                     if let Some(session_id) = event.session_id.as_ref() {
@@ -3908,6 +4028,7 @@ async fn run_command_loop(
                 let task_slot = slot.clone();
                 let req_cx = cx.clone();
                 let req_sinks = sinks.clone();
+                let req_delivery_circuits = Arc::clone(&delivery_circuits);
                 let req_agent_id = agent_id.clone();
                 let req_state = driver_state.clone();
                 spawn_request(&cx, slot, async move {
@@ -3933,13 +4054,19 @@ async fn run_command_loop(
                                 session_id,
                                 config_options: response.config_options.clone(),
                             };
-                            events::fan_out(
+                            match fan_out_session(
                                 &req_sinks,
-                                Some(event.session_id.0.as_str()),
+                                &req_delivery_circuits,
+                                event.session_id.0.as_str(),
                                 events::EVENT_CONFIG_OPTIONS_UPDATE,
                                 &event,
-                            );
-                            send_reply(&task_slot, Ok(()));
+                            ) {
+                                Ok(_) => send_reply(&task_slot, Ok(())),
+                                Err(error) => {
+                                    log_delivery_error("set_model", &error);
+                                    send_reply(&task_slot, Err(error.code.to_string()));
+                                }
+                            }
                         }
                         Err(e) => send_reply(&task_slot, Err(e.to_string())),
                     }
@@ -3956,6 +4083,7 @@ async fn run_command_loop(
                 let task_slot = slot.clone();
                 let req_cx = cx.clone();
                 let req_sinks = sinks.clone();
+                let req_delivery_circuits = Arc::clone(&delivery_circuits);
                 let req_agent_id = agent_id.clone();
                 let req_state = driver_state.clone();
                 spawn_request(&cx, slot, async move {
@@ -3980,13 +4108,19 @@ async fn run_command_loop(
                                 session_id,
                                 config_options: response.config_options.clone(),
                             };
-                            events::fan_out(
+                            match fan_out_session(
                                 &req_sinks,
-                                Some(event.session_id.0.as_str()),
+                                &req_delivery_circuits,
+                                event.session_id.0.as_str(),
                                 events::EVENT_CONFIG_OPTIONS_UPDATE,
                                 &event,
-                            );
-                            send_reply(&task_slot, Ok(response.config_options));
+                            ) {
+                                Ok(_) => send_reply(&task_slot, Ok(response.config_options)),
+                                Err(error) => {
+                                    log_delivery_error("set_config_option", &error);
+                                    send_reply(&task_slot, Err(error.code.to_string()));
+                                }
+                            }
                         }
                         Err(e) => send_reply(&task_slot, Err(e.to_string())),
                     }

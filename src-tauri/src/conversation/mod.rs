@@ -35,17 +35,21 @@ pub use bootstrap::{
 pub use catalog::{
     rebuild_catalog, AcceptedCanonicalConversation, CatalogError, CatalogRebuildResult,
     CatalogRecoveryIssue, ConversationCatalogEntryV1, ConversationCatalogFileV1,
-    ConversationProvenanceFileV1, ConversationProvenanceSourceV1, CATALOG_FILE,
+    ConversationCatalogSnapshot, ConversationProvenanceFileV1, ConversationProvenanceSourceV1,
+    CATALOG_FILE,
     CATALOG_SCHEMA_VERSION, CONVERSATION_METADATA_FILE, EMPTY_CATALOG_GENERATED_AT_UTC,
     PROVENANCE_FILE, PROVENANCE_SCHEMA_VERSION,
 };
 pub use contracts::{
     format_created_at_utc, parse_created_at_utc, AgentSessionBinding, AgentSessionBindingState,
-    ConversationCreator, ConversationErrorCode, ConversationId, ConversationIdPathError,
-    ConversationLifecycleState, ConversationRecordV2, CreatedAtUtcError, CreationPartition,
-    ExecutionTarget, ProjectAttachment, TerminalResourceRef, AGENT_SESSION_BINDING_SCHEMA_VERSION,
-    CONVERSATION_SCHEMA_VERSION, PROJECT_ATTACHMENT_SCHEMA_VERSION,
-    TERMINAL_RESOURCE_REF_SCHEMA_VERSION,
+    ConversationCreator, ConversationErrorCode, ConversationHistoryPageV1,
+    ConversationHistoryPageValidationError, ConversationHistoryRecordV1, ConversationId,
+    ConversationIdPathError, ConversationLifecycleState, ConversationRecordV2, CreatedAtUtcError,
+    CreationPartition, ExecutionTarget, ProjectAttachment, TerminalResourceRef,
+    AGENT_SESSION_BINDING_SCHEMA_VERSION, CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION,
+    CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION, CONVERSATION_SCHEMA_VERSION,
+    MAX_CONVERSATION_HISTORY_PAGE_LIMIT, MIN_CONVERSATION_HISTORY_PAGE_LIMIT,
+    PROJECT_ATTACHMENT_SCHEMA_VERSION, TERMINAL_RESOURCE_REF_SCHEMA_VERSION,
 };
 pub use creation::{
     AgentBindingResult, AgentCompensationFailure, AgentCreationFailure, Clock,
@@ -91,12 +95,20 @@ pub use migration::{
     ObservationEvidenceV1, ReaderPrecedence, StepReceiptV1,
 };
 pub use ordered_persistence::{
-    OrderedConversationPersistence, OrderedPersistenceHealth, QUEUE_CAPACITY,
+    OrderedConversationPersistence, OrderedPersistenceHealth, OrderedPersistenceMetrics,
+    DEFAULT_DRAIN_TIMEOUT, GLOBAL_PENDING_BYTES, GLOBAL_PENDING_RECORDS,
+    PER_SESSION_PENDING_RECORDS, QUEUE_CAPACITY, WRITER_SHARDS,
 };
-pub use persistence_adapter::{ConversationPersistenceAdapter, ConversationPersistenceError};
+pub use persistence_adapter::{
+    BindingMissCacheStats, ConversationPersistenceAdapter, ConversationPersistenceError,
+    CONVERSATION_HISTORY_PAGING_REQUIRED, MAX_BINDING_MISS_CACHE_ENTRIES,
+    MAX_COMPAT_HISTORY_RECORDS,
+};
 pub use repository::{
+    CatalogFlushCoordinator, CatalogFlushError, CatalogFlushReceipt,
     ConversationAggregateMutationRecord, ConversationMetadataUpdate, ConversationRepository,
-    RepositoryError, RepositoryOpenReport, RepositoryRecoveryItem, RepositoryRecoveryKind,
+    RepositoryBindingIndexStats, RepositoryError, RepositoryOpenReport, RepositoryRecoveryItem,
+    RepositoryRecoveryKind, CATALOG_FLUSH_DEBOUNCE, CATALOG_FLUSH_MAX_DELAY,
 };
 pub use session_workspace::{
     SessionWorkspaceError, SessionWorkspaceErrorCode, SessionWorkspaceLeafNode,

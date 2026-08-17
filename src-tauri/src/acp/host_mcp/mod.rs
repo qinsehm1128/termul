@@ -32,7 +32,7 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
 use crate::acp::config::{AgentId, SessionId};
-use crate::acp::events::{self, PlanUpdateEvent};
+use crate::acp::events::{self, FanOutError, FanOutReceipt, PlanUpdateEvent};
 use crate::web::EventSink;
 
 /// The hidden subcommand flag the child detects in argv (passed as the sole
@@ -221,7 +221,7 @@ pub fn emit_plan_update(
     agent_id: &AgentId,
     session_id: &SessionId,
     entries: Vec<PlanEntry>,
-) {
+) -> Result<FanOutReceipt, FanOutError> {
     let plan = Plan::new(entries);
     let event = PlanUpdateEvent {
         agent_id: agent_id.clone(),
@@ -233,13 +233,13 @@ pub fn emit_plan_update(
         Some(session_id.0.as_str()),
         events::EVENT_PLAN_UPDATE,
         &event,
-    );
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::web::sink::AcpEvent;
+    use crate::web::sink::{AcpEvent, EventDeliveryReceipt, EventSinkError};
     use serde_json::Value;
     use std::sync::Mutex as StdMutex;
 
@@ -250,10 +250,11 @@ mod tests {
     }
 
     impl EventSink for CapturingSink {
-        fn emit(&self, event: &AcpEvent) {
+        fn emit(&self, event: &AcpEvent) -> Result<EventDeliveryReceipt, EventSinkError> {
             let type_ = event.type_.to_string();
             let payload = event.payload.clone();
             self.events.lock().unwrap().push((type_, payload));
+            Ok(EventDeliveryReceipt::delivered(None, false))
         }
     }
 
@@ -327,7 +328,7 @@ mod tests {
             },
         ];
         let entries = map_todos_to_plan_entries(&todos);
-        emit_plan_update(&sinks, &agent_id, &session_id, entries);
+        emit_plan_update(&sinks, &agent_id, &session_id, entries).unwrap();
 
         let captured = sink.events.lock().unwrap();
         assert_eq!(captured.len(), 1);
@@ -347,7 +348,7 @@ mod tests {
         let sink = Arc::new(CapturingSink::default());
         let sinks: Vec<Arc<dyn EventSink>> = vec![sink.clone()];
         let (agent_id, session_id) = make_ids();
-        emit_plan_update(&sinks, &agent_id, &session_id, vec![]);
+        emit_plan_update(&sinks, &agent_id, &session_id, vec![]).unwrap();
 
         let captured = sink.events.lock().unwrap();
         assert_eq!(captured.len(), 1);

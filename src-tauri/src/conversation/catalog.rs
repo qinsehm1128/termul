@@ -70,20 +70,38 @@ impl ConversationCatalogFileV1 {
     }
 }
 
+/// Stable immutable view handed to the asynchronous cache writer.
+///
+/// The generation and upsert counter are process-local instrumentation only; neither is serialized
+/// into `catalog.json`, so rollback and rebuild bytes remain unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationCatalogSnapshot {
+    pub generation: u64,
+    pub upsert_count: u64,
+    pub entry_count: usize,
+    pub bytes: Vec<u8>,
+}
+
 /// In-memory disposable cache updated from validated Conversation frontiers.
 #[derive(Debug, Clone)]
 pub struct ConversationCatalog {
     file: ConversationCatalogFileV1,
+    generation: u64,
+    upsert_count: u64,
 }
 
 impl ConversationCatalog {
     #[must_use]
     pub fn from_file(file: ConversationCatalogFileV1) -> Self {
-        Self { file }
+        Self {
+            file,
+            generation: 0,
+            upsert_count: 0,
+        }
     }
 
-    /// Insert or replace exactly one canonical entry and recompute deterministic cache metadata.
-    pub fn upsert(&mut self, record: &ConversationRecordV2, frontier: &ConversationFrontier) {
+    /// Insert or replace exactly one canonical entry and advance the local dirty generation.
+    pub fn upsert(&mut self, record: &ConversationRecordV2, frontier: &ConversationFrontier) -> u64 {
         let entry = entry_from_frontier(record, frontier);
         self.file.generated_at_utc = self
             .file
@@ -100,6 +118,29 @@ impl ConversationCatalog {
             Ok(index) => self.file.conversations[index] = entry,
             Err(index) => self.file.conversations.insert(index, entry),
         }
+        self.generation = self.generation.saturating_add(1);
+        self.upsert_count = self.upsert_count.saturating_add(1);
+        self.generation
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> ConversationCatalogSnapshot {
+        ConversationCatalogSnapshot {
+            generation: self.generation,
+            upsert_count: self.upsert_count,
+            entry_count: self.file.conversations.len(),
+            bytes: self.file.deterministic_bytes(),
+        }
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub const fn upsert_count(&self) -> u64 {
+        self.upsert_count
     }
 
     #[must_use]
