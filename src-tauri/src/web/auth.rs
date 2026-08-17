@@ -1031,6 +1031,11 @@ mod tests {
 
     const TOKEN: &str = "test-remote-access-token";
 
+    // tracing callsite registration is process-global; prevent shared middleware
+    // callsites from racing the scoped capture during first registration.
+    static BOUNDARY_LOG_TEST_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
+
     #[derive(Clone, Default)]
     struct LogBuffer(Arc<StdMutex<Vec<u8>>>);
 
@@ -1223,6 +1228,7 @@ mod tests {
 
     #[tokio::test]
     async fn protected_http_rejects_missing_wrong_and_oversized_credentials_without_body_leak() {
+        let _boundary_log_test_guard = BOUNDARY_LOG_TEST_LOCK.lock().await;
         let oversized = format!("Bearer {}", "x".repeat(MAX_TOKEN_BYTES + 1));
         for authorization in [None, Some("Bearer wrong"), Some(oversized.as_str())] {
             let app = protected_test_router(Arc::new(authority()));
@@ -1239,6 +1245,7 @@ mod tests {
 
     #[tokio::test]
     async fn loopback_proxy_without_credential_cannot_reach_lifecycle_or_workspace_mutations() {
+        let _boundary_log_test_guard = BOUNDARY_LOG_TEST_LOCK.lock().await;
         let reached = Arc::new(AtomicUsize::new(0));
         let handler_reached = Arc::clone(&reached);
         let authority = Arc::new(authority());
@@ -1293,6 +1300,7 @@ mod tests {
 
     #[tokio::test]
     async fn protected_http_accepts_bearer_and_rate_limits_sixth_failure() {
+        let _boundary_log_test_guard = BOUNDARY_LOG_TEST_LOCK.lock().await;
         let authority = Arc::new(authority());
         let app = protected_test_router(Arc::clone(&authority));
         let accepted = app
@@ -1319,6 +1327,7 @@ mod tests {
 
     #[tokio::test]
     async fn captured_boundary_log_uses_static_class_without_path_identifier_or_credential() {
+        let _boundary_log_test_guard = BOUNDARY_LOG_TEST_LOCK.lock().await;
         let logs = LogBuffer::default();
         let subscriber = tracing_subscriber::fmt()
             .without_time()
