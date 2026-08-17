@@ -10,7 +10,12 @@ import {
   type ConversationRecordV2,
   type ExecutionTarget,
   isConversationId,
+  parseAgentSessionBinding,
+  parseConversationAggregateMutationOutcome,
   parseConversationId,
+  parseConversationRecordV2,
+  parseExecutionTarget,
+  parseProjectAttachment,
   TERMINAL_RESOURCE_REF_SCHEMA_VERSION,
   type TerminalResourceRef
 } from './conversation.types'
@@ -171,5 +176,75 @@ describe('Conversation runtime-neutral wire contracts', () => {
     expect(serialized).not.toContain('homeProject')
     expect(serialized).not.toContain('defaultProject')
     expect(serialized).not.toContain('hiddenProject')
+  })
+
+  it('parses exact Conversation records and aggregate outcomes without accepting drift', () => {
+    expect(parseConversationRecordV2(projectlessConversation)).toBe(projectlessConversation)
+    expect(parseAgentSessionBinding(opaqueBinding)).toBe(opaqueBinding)
+    const attachment = {
+      schemaVersion: 1 as const,
+      projectId: 'project-1',
+      attachedAtUtc: '2026-08-15T10:00:00.000Z',
+      projectPathSnapshot: '/projects/termul',
+      worktreePath: null,
+      worktreeBranch: null
+    }
+    expect(parseProjectAttachment(attachment)).toBe(attachment)
+    expect(parseExecutionTarget({ kind: 'workspace' })).toEqual({ kind: 'workspace' })
+
+    const identity = {
+      conversationId: canonicalConversationId,
+      createdAtUtc: projectlessConversation.createdAtUtc,
+      creationPartition: projectlessConversation.creationPartition,
+      workspaceCwd: projectlessConversation.workspaceCwd
+    }
+    const aggregate = {
+      status: 'updated' as const,
+      action: 'attachProject' as const,
+      conversationId: canonicalConversationId,
+      previousRevision: 0,
+      revision: 1,
+      identityBefore: identity,
+      identityAfter: { ...identity },
+      projectAttachment: attachment,
+      executionTarget: { kind: 'workspace' as const },
+      conversation: {
+        ...projectlessConversation,
+        projectAttachment: attachment,
+        lifecycleState: 'ready' as const,
+        lastSeq: 1
+      }
+    }
+    expect(parseConversationAggregateMutationOutcome(aggregate)).toBe(aggregate)
+
+    const invalidRecords: unknown[] = [
+      { ...projectlessConversation, schemaVersion: 1 },
+      { ...projectlessConversation, conversationId: 'not-a-uuid' },
+      { ...projectlessConversation, createdAtUtc: '2026-08-15T09:45:15Z' },
+      {
+        ...projectlessConversation,
+        creationPartition: { ...projectlessConversation.creationPartition, path: '2026/08/14' }
+      },
+      { ...projectlessConversation, lifecycleState: 'unknown' },
+      { ...projectlessConversation, lastSeq: -1 },
+      { ...projectlessConversation, projectAttachment: { ...attachment, extra: true } },
+      { ...projectlessConversation, executionTarget: { kind: 'workspace', projectId: 'hidden' } },
+      { ...projectlessConversation, extra: true }
+    ]
+    for (const value of invalidRecords) expect(() => parseConversationRecordV2(value)).toThrow()
+
+    expect(() =>
+      parseConversationAggregateMutationOutcome({
+        ...aggregate,
+        identityAfter: { ...identity, workspaceCwd: '/changed' }
+      })
+    ).toThrow(/identity/)
+    expect(() =>
+      parseConversationAggregateMutationOutcome({
+        ...aggregate,
+        conversation: { ...aggregate.conversation, lastSeq: 2 }
+      })
+    ).toThrow()
+    expect(() => parseConversationAggregateMutationOutcome({ ...aggregate, extra: true })).toThrow()
   })
 })

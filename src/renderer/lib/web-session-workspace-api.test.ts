@@ -8,6 +8,7 @@ const { fetchMock, runtimeMock } = vi.hoisted(() => ({
 vi.mock('./tauri-runtime', () => ({ isTauriContext: runtimeMock }))
 
 import type { SessionWorkspaceV1 } from '@shared/types/session-workspace.types'
+import { HTTP_IPC_NETWORK_ERROR_MESSAGE } from './http-ipc-result'
 import { webSessionWorkspaceApi } from './web-session-workspace-api'
 
 const conversationId = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
@@ -157,13 +158,13 @@ describe('webSessionWorkspaceApi', () => {
     fetchMock.mockResolvedValueOnce(response({}, 500))
     expect(await webSessionWorkspaceApi.getWorkspace(conversationId)).toEqual({
       success: false,
-      error: 'HTTP 500 Error',
+      error: HTTP_IPC_NETWORK_ERROR_MESSAGE,
       code: 'NETWORK_ERROR'
     })
     fetchMock.mockResolvedValueOnce(response({ success: true }, 409))
     expect(await webSessionWorkspaceApi.getWorkspace(conversationId)).toEqual({
       success: false,
-      error: 'HTTP 409 Error',
+      error: HTTP_IPC_NETWORK_ERROR_MESSAGE,
       code: 'NETWORK_ERROR'
     })
     fetchMock.mockResolvedValueOnce({
@@ -174,6 +175,41 @@ describe('webSessionWorkspaceApi', () => {
     } as Response)
     expect(await webSessionWorkspaceApi.getWorkspace(conversationId)).toMatchObject({
       success: false,
+      code: 'NETWORK_ERROR'
+    })
+  })
+
+  it('rejects malformed exact envelopes and wrong workspace domain tags consistently', async () => {
+    const malformed = [
+      { success: true, data: { status: 'updated', revision: 1, updatedAtUtc: 'x' } },
+      { success: true, data: { status: 'missing', conversationId, extra: true } },
+      { success: true, data: { status: 'loaded', workspace: { ...workspace, claim: 'secret' } } },
+      { success: true, data: { status: 'recoveryRequired', recoveryItems: [{}] } },
+      { success: false, error: 'bad', code: 'E', extra: true }
+    ]
+    for (const body of malformed) {
+      fetchMock.mockResolvedValueOnce(response(body, 422))
+      await expect(webSessionWorkspaceApi.getWorkspace(conversationId)).resolves.toEqual({
+        success: false,
+        error: HTTP_IPC_NETWORK_ERROR_MESSAGE,
+        code: 'NETWORK_ERROR'
+      })
+    }
+
+    fetchMock.mockResolvedValueOnce(
+      response(
+        {
+          success: true,
+          data: { status: 'conflict', currentRevision: 0, currentUpdatedAtUtc: '' }
+        },
+        409
+      )
+    )
+    await expect(
+      webSessionWorkspaceApi.writeWorkspace(conversationId, 0, workspace)
+    ).resolves.toEqual({
+      success: false,
+      error: HTTP_IPC_NETWORK_ERROR_MESSAGE,
       code: 'NETWORK_ERROR'
     })
   })

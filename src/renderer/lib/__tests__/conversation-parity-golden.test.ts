@@ -184,6 +184,107 @@ describe('Conversation production transport golden parity', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
+  it('uses one exact HTTP envelope policy across core, workspace, recovery, and lifecycle domains', async () => {
+    _setAcpTransportForTests({
+      onEvent: vi.fn(() => vi.fn()),
+      dispose: vi.fn()
+    } as unknown as AcpTransport)
+    const lifecycle = createConversationLifecycleApi('web')
+    const lifecycleOutcome = {
+      status: 'updated' as const,
+      action: 'detachBinding' as const,
+      conversationId: ID,
+      previousRevision: 1,
+      revision: 2,
+      workspaceCwd: '/visible/conversation',
+      lifecycleState: 'ready' as const,
+      currentBinding: {
+        schemaVersion: 1 as const,
+        bindingId: 'b2832b54-2ca4-4db4-93fd-f93bf6793114',
+        agentSessionId: 'opaque/session',
+        runtimeAgentId: 'agent-runtime',
+        stableAgentNamespace: 'config:test',
+        executionCwd: '/visible/conversation',
+        boundAtUtc: '2026-08-15T09:45:16.000Z',
+        state: 'detached' as const
+      }
+    }
+    const domains = [
+      {
+        successData: [],
+        invoke: () => webConversationApi.listConversations()
+      },
+      {
+        successData: { status: 'missing' as const, conversationId: ID },
+        invoke: () => webSessionWorkspaceApi.getWorkspace(ID)
+      },
+      {
+        successData: lifecycleOutcome,
+        invoke: () => lifecycle.detachBinding(ID, 1)
+      }
+    ] as const
+
+    for (const status of [200, 409, 422, 500]) {
+      for (const domain of domains) {
+        vi.stubGlobal(
+          'fetch',
+          vi.fn(async () => response({ success: true, data: domain.successData }, status))
+        )
+        await expect(domain.invoke()).resolves.toEqual(
+          domain === domains[2] ? domain.successData : { success: true, data: domain.successData }
+        )
+
+        const applicationFailure = {
+          success: false as const,
+          code: 'FORBIDDEN',
+          error: 'stable failure'
+        }
+        vi.stubGlobal(
+          'fetch',
+          vi.fn(async () => response(applicationFailure, status))
+        )
+        if (domain === domains[2]) {
+          await expect(domain.invoke()).rejects.toMatchObject({
+            name: 'ConversationLifecycleApiError',
+            code: 'FORBIDDEN',
+            message: 'stable failure'
+          })
+        } else {
+          await expect(domain.invoke()).resolves.toEqual(applicationFailure)
+        }
+      }
+    }
+
+    const malformedDomains = [
+      {
+        body: { success: true, data: [{}] },
+        invoke: () => webConversationApi.listConversations()
+      },
+      {
+        body: { success: true, data: { status: 'missing', conversationId: ID, extra: true } },
+        invoke: () => webSessionWorkspaceApi.getWorkspace(ID)
+      },
+      {
+        body: { success: true, data: { ...lifecycleOutcome, extra: true } },
+        invoke: () => lifecycle.detachBinding(ID, 1)
+      }
+    ] as const
+    for (const [index, domain] of malformedDomains.entries()) {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => response(domain.body, 422))
+      )
+      if (index === 2) {
+        await expect(domain.invoke()).rejects.toMatchObject({ code: 'NETWORK_ERROR' })
+      } else {
+        await expect(domain.invoke()).resolves.toMatchObject({
+          success: false,
+          code: 'NETWORK_ERROR'
+        })
+      }
+    }
+  })
+
   it('pins aggregate mutation commands and authenticated HTTP routes with identical outcomes', async () => {
     const attached = aggregateOutcome('attachProject', 4, attachment, { kind: 'workspace' })
     const target = {

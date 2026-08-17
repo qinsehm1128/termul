@@ -1,6 +1,9 @@
 import { describe, expect, expectTypeOf, it } from 'vitest'
 import type { ResolveRecoveryItemRequest } from './conversation-recovery.types'
 import {
+  parseSessionWorkspaceLoadOutcome,
+  parseSessionWorkspaceV1,
+  parseSessionWorkspaceWriteOutcome,
   SESSION_WORKSPACE_SCHEMA_VERSION,
   type SessionWorkspaceLoadOutcome,
   type SessionWorkspaceV1,
@@ -72,6 +75,90 @@ describe('SessionWorkspace contract', () => {
       'conflict',
       'recoveryRequired'
     ])
+  })
+
+  it('parses exact workspace outcomes and rejects topology, identity, and raw terminal drift', () => {
+    const value = workspace()
+    expect(parseSessionWorkspaceV1(value)).toBe(value)
+    const missing = { status: 'missing' as const, conversationId }
+    expect(parseSessionWorkspaceLoadOutcome(missing)).toBe(missing)
+    const loaded = { status: 'loaded' as const, workspace: value }
+    expect(parseSessionWorkspaceLoadOutcome(loaded)).toBe(loaded)
+    const conflict = {
+      status: 'conflict' as const,
+      currentRevision: 5,
+      currentUpdatedAtUtc: '2026-08-15T10:00:01.000Z',
+      currentUpdateIdentity: 'renderer-two'
+    }
+    expect(parseSessionWorkspaceWriteOutcome(conflict)).toBe(conflict)
+    const recoveryRequired = { status: 'recoveryRequired' as const, recoveryItems: [] }
+    expect(parseSessionWorkspaceWriteOutcome(recoveryRequired)).toBe(recoveryRequired)
+
+    const invalid: unknown[] = [
+      { ...value, extra: true },
+      {
+        ...value,
+        topology: {
+          type: 'split',
+          id: 'root',
+          direction: 'horizontal',
+          children: [value.topology, { ...value.topology, id: 'leaf-two' }],
+          sizes: [1]
+        }
+      },
+      {
+        ...value,
+        topology: {
+          type: 'split',
+          id: 'root',
+          direction: 'horizontal',
+          children: [value.topology, value.topology],
+          sizes: [1, 1]
+        }
+      },
+      {
+        ...value,
+        resources: [
+          {
+            kind: 'terminal',
+            terminalId: 'terminal-one',
+            conversationId: '11111111-1111-4111-8111-111111111111'
+          }
+        ]
+      },
+      {
+        ...value,
+        resources: [
+          {
+            kind: 'terminal',
+            terminalId: 'terminal-one',
+            conversationId,
+            claim: 'raw-secret'
+          }
+        ]
+      },
+      {
+        ...value,
+        resources: [
+          {
+            kind: 'terminal',
+            terminalId: 'terminal-one',
+            conversationId,
+            envVars: { SECRET: 'value' }
+          }
+        ]
+      },
+      { status: 'conflict', currentRevision: 0, currentUpdatedAtUtc: '' },
+      { status: 'updated', revision: 1, updatedAtUtc: '', extra: true },
+      { status: 'recoveryRequired', recoveryItems: {}, extra: true }
+    ]
+    for (const candidate of invalid) {
+      const parse =
+        typeof candidate === 'object' && candidate !== null && 'schemaVersion' in candidate
+          ? parseSessionWorkspaceV1
+          : parseSessionWorkspaceWriteOutcome
+      expect(() => parse(candidate)).toThrow()
+    }
   })
 
   it('imports the exact shared recovery request contract', () => {

@@ -1,6 +1,8 @@
 import { describe, expect, expectTypeOf, it } from 'vitest'
 
 import {
+  parseRecoveryActionResult,
+  parseRecoveryItemV1,
   parseResolveRecoveryItemRequest,
   RECOVERY_ACTION_FIXTURES,
   RECOVERY_ACTION_FIXTURES_JSON,
@@ -200,6 +202,56 @@ describe('canonical RecoveryAction contract', () => {
     ]
 
     for (const value of invalid) expect(() => parseResolveRecoveryItemRequest(value)).toThrow()
+  })
+
+  it('parses exact recovery results and rejects mutable or sensitive evidence fields', () => {
+    for (const fixture of RECOVERY_ACTION_FIXTURES) {
+      expect(parseRecoveryActionResult(fixture.result)).toBe(fixture.result)
+    }
+    const item = {
+      recoveryId: 'a'.repeat(64),
+      kind: 'ambiguous_workspace_manifest' as const,
+      severity: 'warning' as const,
+      sourcePaths: ['legacy_workspace_manifests/0/project.json'],
+      conversationIds: ['018f7a1c-1b4d-7c8a-9f01-0123456789ab'],
+      sourceSha256: ['e'.repeat(64)],
+      candidateFacts: [{ candidate: 'preserved' }],
+      provenance: [
+        {
+          sourceKind: 'legacy_workspace_manifests',
+          relativePath: 'legacy_workspace_manifests/0/project.json',
+          sha256: 'e'.repeat(64),
+          preservedReadOnly: true as const
+        }
+      ],
+      status: 'unresolved' as const,
+      suggestedActions: ['inspect'] as const,
+      revision: 1,
+      associationDecisions: []
+    }
+    expect(parseRecoveryItemV1(item)).toBe(item)
+
+    const inspected = RECOVERY_ACTION_FIXTURES[0].result
+    const invalidResults: unknown[] = [
+      { ...inspected, extra: true },
+      { ...inspected, authorization: 'mutation' },
+      { ...inspected, status: 'resolvedAssociated' },
+      { ...inspected, workspaceChanged: true },
+      { ...inspected, sourceSha256: ['not-a-digest'] },
+      { ...inspected, candidateFacts: [{ claim: 'raw-secret' }] },
+      { ...inspected, candidateFacts: [{ nested: { environment: { SECRET: 'value' } } }] },
+      {
+        ...inspected,
+        provenance: [{ ...inspected.provenance[0], unknownEvidence: true }]
+      },
+      {
+        ...inspected,
+        provenance: [{ ...inspected.provenance[0], preservedReadOnly: false }]
+      }
+    ]
+    for (const value of invalidResults) expect(() => parseRecoveryActionResult(value)).toThrow()
+    expect(() => parseRecoveryItemV1({ ...item, unexpected: true })).toThrow()
+    expect(() => parseRecoveryItemV1({ ...item, candidateFacts: [{ token: 'secret' }] })).toThrow()
   })
 
   it('keeps source provenance readonly in items and results', () => {

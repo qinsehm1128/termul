@@ -1,18 +1,20 @@
 import { type ConversationId, parseConversationId } from '@shared/types/conversation.types'
-import type {
-  AcpCompensationFailure,
-  ConversationLifecycleApi,
-  ConversationLifecycleErrorCode,
-  ConversationLifecycleOutcome,
-  ConversationReplacementRequest
+import {
+  type AcpCompensationFailure,
+  type ConversationLifecycleApi,
+  type ConversationLifecycleErrorCode,
+  type ConversationLifecycleOutcome,
+  type ConversationReplacementRequest,
+  parseConversationLifecycleOutcome,
+  parseConversationReplacementRequest
 } from '@shared/types/conversation-lifecycle.types'
-import type { IpcResult } from '@shared/types/ipc.types'
+import { decodeIpcResult, type IpcResult } from '@shared/types/ipc.types'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { HTTP_IPC_NETWORK_ERROR_MESSAGE, requestHttpIpcResult } from '@/lib/http-ipc-result'
 import { AcpTransportError, getAcpTransport, remoteAccessHeaders } from './acp-transport'
 import { isTauriContext } from './tauri-runtime'
 
-type IpcBody<T> = { success: true; data?: T } | { success: false; error: string; code: string }
 type ConversationLifecycleRuntime = 'tauri' | 'web'
 
 function parseCompensationFailure(message: string): AcpCompensationFailure | null {
@@ -71,7 +73,14 @@ function assertRequest(
       'expectedRevision must be a non-negative safe integer'
     )
   }
-  if (request && request.conversationId !== conversationId) invalidConversationId()
+  if (request) {
+    try {
+      parseConversationReplacementRequest(request)
+    } catch {
+      throw new ConversationLifecycleApiError('VALIDATION_ERROR', 'replacement request is invalid')
+    }
+    if (request.conversationId !== conversationId) invalidConversationId()
+  }
 }
 
 function unwrap<T>(result: IpcResult<T>): T {
@@ -89,11 +98,14 @@ async function tauriMutation(
   request?: ConversationReplacementRequest
 ): Promise<ConversationLifecycleOutcome> {
   assertRequest(conversationId, expectedRevision, request)
-  const result = await invoke<IpcResult<ConversationLifecycleOutcome>>(command, {
-    conversationId,
-    expectedRevision,
-    ...(request ? { request } : {})
-  })
+  const result = decodeIpcResult(
+    await invoke<unknown>(command, {
+      conversationId,
+      expectedRevision,
+      ...(request ? { request } : {})
+    }),
+    parseConversationLifecycleOutcome
+  )
   return unwrap(result)
 }
 
@@ -108,35 +120,16 @@ async function httpMutation(
   expectedRevision: number,
   request?: ConversationReplacementRequest
 ): Promise<ConversationLifecycleOutcome> {
-  const response = await fetch(
+  const result = await requestHttpIpcResult(
     `${serverBase()}/conversations/${encodeURIComponent(conversationId)}/lifecycle/${action}`,
     {
       method: 'POST',
       headers: remoteAccessHeaders({ 'content-type': 'application/json' }),
       body: JSON.stringify({ expectedRevision, ...(request ? { request } : {}) })
-    }
+    },
+    parseConversationLifecycleOutcome
   )
-  if (!response.ok) {
-    let body: IpcBody<ConversationLifecycleOutcome> | null = null
-    try {
-      body = (await response.json()) as IpcBody<ConversationLifecycleOutcome>
-    } catch {
-      // Preserve the generic network failure when the response has no application envelope.
-    }
-    if (body && !body.success) {
-      throw new ConversationLifecycleApiError(
-        body.code as ConversationLifecycleErrorCode,
-        body.error
-      )
-    }
-    throw new ConversationLifecycleApiError(
-      'NETWORK_ERROR',
-      `HTTP ${response.status} ${response.statusText}`
-    )
-  }
-  const body = (await response.json()) as IpcBody<ConversationLifecycleOutcome>
-  if (body.success) return body.data as ConversationLifecycleOutcome
-  throw new ConversationLifecycleApiError(body.code as ConversationLifecycleErrorCode, body.error)
+  return unwrap(result)
 }
 
 async function webMutation(
@@ -149,11 +142,8 @@ async function webMutation(
   try {
     const transport = getAcpTransport()
     if (transport.conversationLifecycle) {
-      return await transport.conversationLifecycle(
-        action,
-        conversationId,
-        expectedRevision,
-        request
+      return parseConversationLifecycleOutcome(
+        await transport.conversationLifecycle(action, conversationId, expectedRevision, request)
       )
     }
     return await httpMutation(action, conversationId, expectedRevision, request)
@@ -165,10 +155,7 @@ async function webMutation(
         error.message
       )
     }
-    throw new ConversationLifecycleApiError(
-      'NETWORK_ERROR',
-      error instanceof Error ? error.message : String(error)
-    )
+    throw new ConversationLifecycleApiError('NETWORK_ERROR', HTTP_IPC_NETWORK_ERROR_MESSAGE)
   }
 }
 

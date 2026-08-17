@@ -1,13 +1,18 @@
-import type {
-  ConversationAggregateMutationOutcome,
-  ConversationId,
-  ConversationRecordV2,
-  ExecutionTarget,
-  ProjectAttachment
+import {
+  type ConversationAggregateMutationOutcome,
+  type ConversationId,
+  type ConversationRecordV2,
+  type ExecutionTarget,
+  type ProjectAttachment,
+  parseConversationId,
+  parseConversationRecordV2
 } from './conversation.types'
-import type { RecoveryItemV1 } from './conversation-recovery.types'
+import { parseRecoveryItemV1, type RecoveryItemV1 } from './conversation-recovery.types'
 import type { IpcResult } from './ipc.types'
-import type { SessionWorkspaceLoadOutcome } from './session-workspace.types'
+import {
+  parseSessionWorkspaceLoadOutcome,
+  type SessionWorkspaceLoadOutcome
+} from './session-workspace.types'
 
 export type {
   RecoveryAction,
@@ -106,4 +111,133 @@ export interface ConversationApi {
     executionTarget: ExecutionTarget
   ): Promise<IpcResult<ConversationAggregateMutationOutcome>>
   subscribeHostStatus(listener: () => void): () => void
+}
+
+type RuntimeRecord = Record<string, unknown>
+
+function runtimeRecord(value: unknown, label: string): RuntimeRecord {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new TypeError(`${label} must be an object`)
+  }
+  return value as RuntimeRecord
+}
+
+function exactKeys(value: RuntimeRecord, required: readonly string[]): void {
+  const allowed = new Set(required)
+  if (
+    Object.keys(value).some((key) => !allowed.has(key)) ||
+    required.some((key) => !Object.prototype.hasOwnProperty.call(value, key))
+  ) {
+    throw new TypeError('conversation API payload has missing or unknown fields')
+  }
+}
+
+function nonEmptyString(value: unknown, label: string): string {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new TypeError(`${label} must be a non-empty string`)
+  }
+  return value
+}
+
+function nonNegativeInteger(value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 0) {
+    throw new TypeError(`${label} must be a non-negative safe integer`)
+  }
+  return Number(value)
+}
+
+/** Validate the exact Conversation host-status payload without cloning it. */
+export function parseConversationHostStatus(value: unknown): ConversationHostStatus {
+  const candidate = runtimeRecord(value, 'conversationHostStatus')
+  exactKeys(candidate, [
+    'hostKind',
+    'state',
+    'code',
+    'migrationPhase',
+    'readerPrecedence',
+    'recoveryItemCount',
+    'recoveryItems'
+  ])
+  if (!['desktop', 'standalone'].includes(String(candidate.hostKind))) {
+    throw new TypeError('conversationHostStatus hostKind is invalid')
+  }
+  if (!['ready', 'migrating', 'hybrid', 'recovery', 'error'].includes(String(candidate.state))) {
+    throw new TypeError('conversationHostStatus state is invalid')
+  }
+  nonEmptyString(candidate.code, 'conversationHostStatus.code')
+  if (
+    ![
+      'detected',
+      'quiescing',
+      'inventoried',
+      'staging',
+      'verifying',
+      'cutoverPending',
+      'committed',
+      'observationWindow',
+      'rollbackPending',
+      'rolledBack',
+      'finalized'
+    ].includes(String(candidate.migrationPhase))
+  ) {
+    throw new TypeError('conversationHostStatus migrationPhase is invalid')
+  }
+  if (
+    !['legacyOnly', 'conversationV2First', 'hybridLegacyFirst', 'conversationV2Only'].includes(
+      String(candidate.readerPrecedence)
+    )
+  ) {
+    throw new TypeError('conversationHostStatus readerPrecedence is invalid')
+  }
+  const recoveryItemCount = nonNegativeInteger(
+    candidate.recoveryItemCount,
+    'conversationHostStatus.recoveryItemCount'
+  )
+  if (!Array.isArray(candidate.recoveryItems)) {
+    throw new TypeError('conversationHostStatus recoveryItems must be an array')
+  }
+  for (const item of candidate.recoveryItems) parseRecoveryItemV1(item)
+  if (candidate.recoveryItems.length !== recoveryItemCount) {
+    throw new TypeError('conversationHostStatus recoveryItemCount does not match recoveryItems')
+  }
+  return value as ConversationHostStatus
+}
+
+/** Validate an exact list response without cloning the array or its records. */
+export function parseConversationRecordV2Array(value: unknown): ConversationRecordV2[] {
+  if (!Array.isArray(value)) throw new TypeError('conversation list must be an array')
+  for (const record of value) parseConversationRecordV2(record)
+  return value as ConversationRecordV2[]
+}
+
+/** Validate the exact Conversation open payload without cloning it. */
+export function parseConversationOpenOutcome(value: unknown): ConversationOpenOutcome {
+  const candidate = runtimeRecord(value, 'conversationOpenOutcome')
+  exactKeys(candidate, ['conversation', 'workspace'])
+  const conversation = parseConversationRecordV2(candidate.conversation)
+  const workspace = parseSessionWorkspaceLoadOutcome(candidate.workspace)
+  if ('conversationId' in workspace && workspace.conversationId !== conversation.conversationId) {
+    throw new TypeError('Conversation open workspace belongs to another Conversation')
+  }
+  if (
+    workspace.status === 'loaded' &&
+    workspace.workspace.conversationId !== conversation.conversationId
+  ) {
+    throw new TypeError('Conversation open workspace belongs to another Conversation')
+  }
+  return value as ConversationOpenOutcome
+}
+
+/** Validate an exact legacy resolution and canonical route without cloning it. */
+export function parseLegacyConversationResolution(value: unknown): LegacyConversationResolution {
+  const candidate = runtimeRecord(value, 'legacyConversationResolution')
+  exactKeys(candidate, ['conversationId', 'canonicalRoute'])
+  if (typeof candidate.conversationId !== 'string') {
+    throw new TypeError('legacy resolution conversationId is invalid')
+  }
+  const conversationId = parseConversationId(candidate.conversationId)
+  if (candidate.canonicalRoute !== `#/c/${conversationId}`) {
+    throw new TypeError('legacy resolution canonicalRoute is invalid')
+  }
+  return value as LegacyConversationResolution
 }

@@ -27,6 +27,50 @@ export type IpcResult<T> =
   | { success: true; data: T }
   | { success: false; error: string; code: string }
 
+export type IpcDataDecoder<T> = (value: unknown) => T
+
+/**
+ * Decode the exact runtime-neutral application envelope used by Tauri and HTTP.
+ *
+ * Only `{ success: true, data }` and `{ success: false, error, code }` are accepted. The supplied
+ * domain decoder runs exactly once for success data; valid objects are returned by identity when
+ * the decoder preserves the data identity.
+ */
+export function decodeIpcResult<T>(value: unknown, decodeData: IpcDataDecoder<T>): IpcResult<T> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new TypeError('IPC result must be an object')
+  }
+  const candidate = value as Record<string, unknown>
+  const keys = Object.keys(candidate)
+  if (candidate.success === true) {
+    if (
+      keys.length !== 2 ||
+      !Object.prototype.hasOwnProperty.call(candidate, 'success') ||
+      !Object.prototype.hasOwnProperty.call(candidate, 'data')
+    ) {
+      throw new TypeError('IPC success envelope must contain exactly success and data')
+    }
+    const data = decodeData(candidate.data)
+    return data === candidate.data ? (value as IpcResult<T>) : { success: true, data }
+  }
+  if (candidate.success === false) {
+    if (
+      keys.length !== 3 ||
+      !Object.prototype.hasOwnProperty.call(candidate, 'success') ||
+      !Object.prototype.hasOwnProperty.call(candidate, 'error') ||
+      !Object.prototype.hasOwnProperty.call(candidate, 'code') ||
+      typeof candidate.error !== 'string' ||
+      candidate.error.trim().length === 0 ||
+      typeof candidate.code !== 'string' ||
+      candidate.code.trim().length === 0
+    ) {
+      throw new TypeError('IPC failure envelope must contain exact non-empty error and code')
+    }
+    return value as IpcResult<T>
+  }
+  throw new TypeError('IPC result success must be a boolean discriminator')
+}
+
 // Terminal spawn options
 export interface TerminalSpawnOptions {
   shell?: string

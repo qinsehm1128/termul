@@ -182,6 +182,241 @@ export interface RecoveryActionResult {
   readonly provenance: readonly RecoveryProvenanceV1[]
 }
 
+const recoveryIdPattern = /^[0-9a-f]{64}$/
+const sha256Pattern = /^[0-9a-f]{64}$/
+const forbiddenEvidenceKey =
+  /^(?:claim|claims|credential|credentials|token|tokens|env|envVars|environment|terminalIo|terminalOutput)$/i
+
+function exactResponseKeys(
+  value: Record<string, unknown>,
+  required: readonly string[],
+  label: string
+): void {
+  const allowed = new Set(required)
+  if (
+    Object.keys(value).some((key) => !allowed.has(key)) ||
+    required.some((key) => !Object.prototype.hasOwnProperty.call(value, key))
+  ) {
+    throw new TypeError(`${label} has missing or unknown fields`)
+  }
+}
+
+function responseString(value: unknown, label: string): string {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new TypeError(`${label} must be a non-empty string`)
+  }
+  return value
+}
+
+function positiveInteger(value: unknown, label: string): number {
+  if (!Number.isSafeInteger(value) || Number(value) < 1) {
+    throw new TypeError(`${label} must be a positive safe integer`)
+  }
+  return Number(value)
+}
+
+function parseRecoveryId(value: unknown): string {
+  const recoveryId = responseString(value, 'recoveryId')
+  if (!recoveryIdPattern.test(recoveryId))
+    throw new TypeError('recoveryId must be lowercase SHA-256')
+  return recoveryId
+}
+
+function parseStringList(value: unknown, label: string): readonly string[] {
+  if (!Array.isArray(value)) throw new TypeError(`${label} must be an array`)
+  for (const item of value) responseString(item, `${label} item`)
+  return value as string[]
+}
+
+function parseSha256List(value: unknown): readonly string[] {
+  const values = parseStringList(value, 'sourceSha256')
+  if (values.some((item) => !sha256Pattern.test(item))) {
+    throw new TypeError('sourceSha256 contains an invalid digest')
+  }
+  return values
+}
+
+function validateEvidenceValue(value: unknown, depth = 0): void {
+  if (depth > 32) throw new TypeError('recovery evidence nesting is too deep')
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return
+  if (typeof value === 'number' && Number.isFinite(value)) return
+  if (Array.isArray(value)) {
+    if (value.length > 4096) throw new TypeError('recovery evidence array is too large')
+    for (const item of value) validateEvidenceValue(item, depth + 1)
+    return
+  }
+  if (!isRecord(value)) throw new TypeError('recovery evidence must be JSON data')
+  const keys = Object.keys(value)
+  if (keys.length > 256) throw new TypeError('recovery evidence object is too large')
+  for (const [key, item] of Object.entries(value)) {
+    if (forbiddenEvidenceKey.test(key)) {
+      throw new TypeError('recovery evidence contains a forbidden sensitive field')
+    }
+    validateEvidenceValue(item, depth + 1)
+  }
+}
+
+function parseCandidateFacts(value: unknown): readonly Readonly<Record<string, unknown>>[] {
+  if (!Array.isArray(value)) throw new TypeError('candidateFacts must be an array')
+  for (const fact of value) {
+    if (!isRecord(fact)) throw new TypeError('candidateFacts entries must be objects')
+    validateEvidenceValue(fact)
+  }
+  return value as Readonly<Record<string, unknown>>[]
+}
+
+function parseRecoveryProvenance(value: unknown): RecoveryProvenanceV1 {
+  if (!isRecord(value)) throw new TypeError('recovery provenance must be an object')
+  exactResponseKeys(
+    value,
+    ['sourceKind', 'relativePath', 'sha256', 'preservedReadOnly'],
+    'recovery provenance'
+  )
+  responseString(value.sourceKind, 'recovery provenance sourceKind')
+  responseString(value.relativePath, 'recovery provenance relativePath')
+  if (typeof value.sha256 !== 'string' || !sha256Pattern.test(value.sha256)) {
+    throw new TypeError('recovery provenance sha256 is invalid')
+  }
+  if (value.preservedReadOnly !== true) {
+    throw new TypeError('recovery provenance must remain read-only')
+  }
+  return value as unknown as RecoveryProvenanceV1
+}
+
+function parseRecoveryProvenanceList(value: unknown): readonly RecoveryProvenanceV1[] {
+  if (!Array.isArray(value)) throw new TypeError('provenance must be an array')
+  for (const item of value) parseRecoveryProvenance(item)
+  return value as RecoveryProvenanceV1[]
+}
+
+/** Validate one exact RecoveryItem response, including redacted empty evidence arrays. */
+export function parseRecoveryItemV1(value: unknown): RecoveryItemV1 {
+  if (!isRecord(value)) throw new TypeError('recovery item must be an object')
+  exactResponseKeys(
+    value,
+    [
+      'recoveryId',
+      'kind',
+      'severity',
+      'sourcePaths',
+      'conversationIds',
+      'sourceSha256',
+      'candidateFacts',
+      'provenance',
+      'status',
+      'suggestedActions',
+      'revision',
+      'associationDecisions'
+    ],
+    'recovery item'
+  )
+  parseRecoveryId(value.recoveryId)
+  if (
+    ![
+      'ambiguous_workspace_manifest',
+      'identifier_collision',
+      'invalid_created_at',
+      'corrupt_source',
+      'conflicting_worktree_provenance',
+      'conflicting_session_metadata'
+    ].includes(String(value.kind))
+  ) {
+    throw new TypeError('recovery item kind is invalid')
+  }
+  if (!['warning', 'blocking'].includes(String(value.severity))) {
+    throw new TypeError('recovery item severity is invalid')
+  }
+  parseStringList(value.sourcePaths, 'sourcePaths')
+  if (!Array.isArray(value.conversationIds)) {
+    throw new TypeError('conversationIds must be an array')
+  }
+  for (const conversationId of value.conversationIds) requireConversationId(conversationId)
+  parseSha256List(value.sourceSha256)
+  parseCandidateFacts(value.candidateFacts)
+  parseRecoveryProvenanceList(value.provenance)
+  if (
+    !['unresolved', 'resolvedAssociated', 'resolvedStartedEmpty', 'dismissedPreserved'].includes(
+      String(value.status)
+    )
+  ) {
+    throw new TypeError('recovery item status is invalid')
+  }
+  if (!Array.isArray(value.suggestedActions)) {
+    throw new TypeError('suggestedActions must be an array')
+  }
+  for (const action of value.suggestedActions) {
+    if (!RECOVERY_ACTIONS.includes(action as RecoveryActionName)) {
+      throw new TypeError('suggestedActions contains an invalid action')
+    }
+  }
+  positiveInteger(value.revision, 'recovery item revision')
+  if (!Array.isArray(value.associationDecisions)) {
+    throw new TypeError('associationDecisions must be an array')
+  }
+  for (const conversationId of value.associationDecisions) requireConversationId(conversationId)
+  return value as unknown as RecoveryItemV1
+}
+
+/** Validate one exact recovery action result without cloning immutable evidence. */
+export function parseRecoveryActionResult(value: unknown): RecoveryActionResult {
+  if (!isRecord(value)) throw new TypeError('recovery result must be an object')
+  exactResponseKeys(
+    value,
+    [
+      'recoveryId',
+      'action',
+      'authorization',
+      'status',
+      'recoveryRevision',
+      'workspaceRevision',
+      'workspaceChanged',
+      'sourcePaths',
+      'sourceSha256',
+      'candidateFacts',
+      'provenance'
+    ],
+    'recovery result'
+  )
+  parseRecoveryId(value.recoveryId)
+  if (!RECOVERY_ACTIONS.includes(value.action as RecoveryActionName)) {
+    throw new TypeError('recovery result action is invalid')
+  }
+  const action = value.action as RecoveryActionName
+  const expectedAuthorization: RecoveryAuthorizationClass =
+    action === 'inspect' ? 'read' : 'mutation'
+  if (value.authorization !== expectedAuthorization) {
+    throw new TypeError('recovery result authorization does not match action')
+  }
+  const expectedStatus: Record<RecoveryActionName, RecoveryStatus> = {
+    inspect: 'unresolved',
+    associateConversation: 'resolvedAssociated',
+    startEmptyWorkspace: 'resolvedStartedEmpty',
+    dismissPreservedSource: 'dismissedPreserved'
+  }
+  if (value.status !== expectedStatus[action]) {
+    throw new TypeError('recovery result status does not match action')
+  }
+  positiveInteger(value.recoveryRevision, 'recoveryRevision')
+  if (value.workspaceRevision !== null) {
+    positiveInteger(value.workspaceRevision, 'workspaceRevision')
+  }
+  if (typeof value.workspaceChanged !== 'boolean') {
+    throw new TypeError('workspaceChanged must be a boolean')
+  }
+  if (action === 'startEmptyWorkspace') {
+    if (!value.workspaceChanged || value.workspaceRevision === null) {
+      throw new TypeError('startEmptyWorkspace must report the new workspace revision')
+    }
+  } else if (value.workspaceChanged || value.workspaceRevision !== null) {
+    throw new TypeError('non-workspace recovery actions cannot change the workspace')
+  }
+  parseStringList(value.sourcePaths, 'sourcePaths')
+  parseSha256List(value.sourceSha256)
+  parseCandidateFacts(value.candidateFacts)
+  parseRecoveryProvenanceList(value.provenance)
+  return value as unknown as RecoveryActionResult
+}
+
 /** One canonical JSON fixture set consumed by both TypeScript and Rust tests. */
 export const RECOVERY_ACTION_FIXTURES_JSON = `[
   {
