@@ -24,7 +24,7 @@ use termul_manager_lib::server_update::{
     restart_binary, restore_previous, UpdateChannel, UpdateOptions, UpdateOutcome,
     SERVER_PLATFORM_KEY,
 };
-use termul_manager_lib::web::config::ParseCliError;
+use termul_manager_lib::web::config::{ParseCliError, REMOTE_AUTH_CONFIGURATION_REQUIRED};
 use termul_manager_lib::web::{
     seed_from_file, serve, PermissionRendezvous, ProjectRegistry, QuestionRendezvous,
     RemoteAccessAuthority, ServerConfig, WsRelaySink,
@@ -35,6 +35,24 @@ use termul_manager_lib::{
 };
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
+
+fn provision_standalone_authority(
+    cfg: &ServerConfig,
+) -> Result<Arc<RemoteAccessAuthority>, &'static str> {
+    let token_file = cfg
+        .remote_access_token_file
+        .as_deref()
+        .ok_or(REMOTE_AUTH_CONFIGURATION_REQUIRED)?;
+    if cfg.allowed_origins.is_empty() {
+        return Err(REMOTE_AUTH_CONFIGURATION_REQUIRED);
+    }
+    let authority =
+        RemoteAccessAuthority::from_token_file(token_file).map_err(|error| error.code())?;
+    authority
+        .set_allowed_origins(cfg.allowed_origins.clone())
+        .map_err(|error| error.code())?;
+    Ok(Arc::new(authority))
+}
 
 fn main() -> ExitCode {
     let raw_args: Vec<String> = std::env::args().skip(1).collect();
@@ -90,35 +108,21 @@ fn main() -> ExitCode {
     }
 
     // Provision standalone remote-access policy before opening any application
-    // store, manager, PTY, listener, or router. Non-loopback configuration was
-    // already rejected by `ServerConfig::from_args` when either the token file
-    // or Origin allow-list was omitted; file ownership/permissions and contents
-    // are validated here. Credential bytes are never logged.
-    let authority = match cfg.remote_access_token_file.as_deref() {
-        Some(path) => match RemoteAccessAuthority::from_token_file(path) {
-            Ok(authority) => authority,
-            Err(error) => {
-                error!(
-                    target: "termul::web::auth",
-                    stable_code = error.code(),
-                    "standalone remote-access authority provisioning failed"
-                );
-                return ExitCode::from(1);
-            }
-        },
-        None => RemoteAccessAuthority::unconfigured(),
-    };
-    if !cfg.allowed_origins.is_empty() {
-        if let Err(error) = authority.set_allowed_origins(cfg.allowed_origins.clone()) {
+    // store, manager, PTY, listener, or router. `ServerConfig::from_args`
+    // rejects incomplete configuration for every bind mode; this defensive
+    // boundary also refuses a manually constructed incomplete config. Token
+    // bytes and digests are never logged.
+    let authority = match provision_standalone_authority(&cfg) {
+        Ok(authority) => authority,
+        Err(stable_code) => {
             error!(
                 target: "termul::web::auth",
-                stable_code = error.code(),
-                "standalone remote-access Origin policy rejected"
+                stable_code,
+                "standalone remote-access authority provisioning failed"
             );
             return ExitCode::from(1);
         }
-    }
-    let authority = Arc::new(authority);
+    };
 
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
@@ -596,6 +600,77 @@ mod conversation_maintenance_tests {
             .unwrap_err()
             .contains("requires --conversation-migration-control finalize"));
     }
+
+    #[test]
+    fn default_standalone_args_fail_closed_before_bootstrap_admission() {
+        let error = ServerConfig::from_args(Vec::<&str>::new()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains(REMOTE_AUTH_CONFIGURATION_REQUIRED));
+
+        let source = include_str!("server_main.rs");
+        let admission = source
+            .find("provision_standalone_authority(&cfg)")
+            .expect("standalone authority admission call");
+        let bootstrap = source
+            .find("ConversationBootstrap::run")
+            .expect("Conversation bootstrap call");
+        assert!(admission < bootstrap);
+    }
+
+    #[tokio::test]
+    async fn explicit_token_file_and_origin_admit_an_authenticated_request() {
+        const TOKEN: &str = "standalone-operator-test-token";
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("remote-access-token");
+        std::fs::write(&token_path, TOKEN).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let token_path = token_path.to_string_lossy().into_owned();
+        let cfg = ServerConfig::from_args([
+            "--remote-access-token-file",
+            token_path.as_str(),
+            "--allowed-origin",
+            "https://standalone.example.test",
+        ])
+        .unwrap();
+        let authority = provision_standalone_authority(&cfg).unwrap();
+        assert!(authority.verify_bearer(TOKEN).is_ok());
+        assert!(authority
+            .verify_origin(Some(&axum::http::HeaderValue::from_static(
+                "https://standalone.example.test",
+            )))
+            .is_ok());
+
+        use tower::ServiceExt;
+        let app = axum::Router::new()
+            .route("/projects", axum::routing::get(|| async { "admitted" }))
+            .layer(axum::middleware::from_fn(
+                termul_manager_lib::web::auth::capability_middleware,
+            ))
+            .layer(axum::Extension(
+                termul_manager_lib::web::auth::RemoteRouteClass::Project,
+            ))
+            .layer(axum::Extension(authority));
+        let response = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/projects")
+                    .header(axum::http::header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        40123,
+                    ))))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+    }
 }
 
 fn init_tracing() {
@@ -819,8 +894,8 @@ fn usage() -> &'static str {
         --conversation-workspace-root PATH  Visible Conversation workspaces (default: $TERMUL_CONVERSATION_WORKSPACE_ROOT or <project-root>/Termul)\n\
         --workspace-manifests-dir PATH  Legacy workspace-manifests input root (default: <state dir>/workspace-manifests)\n\
         --acp-catalog-dir PATH      ACP catalog root (default: <state dir>/acp-catalog)\n\
-        --remote-access-token-file PATH  Operator-owned bearer token file (required for --host 0.0.0.0)\n\
-        --allowed-origin ORIGIN     Allowed browser Origin; repeatable (required for --host 0.0.0.0)\n\
+        --remote-access-token-file PATH  Operator-owned bearer token file (required)\n\
+        --allowed-origin ORIGIN     Allowed browser Origin; repeatable (at least one required)\n\
         --conversation-migration-control ACTION  Durably schedule rollback, reapply, or finalize\n\
                                      for the next bootstrap, then exit without opening stores,\n\
                                      managers, PTYs, listeners, or routes.\n\

@@ -32,6 +32,10 @@ const MAX_TOKEN_BYTES: usize = 512;
 const FAILURE_WINDOW: Duration = Duration::from_secs(60);
 const FAILURE_LIMIT: u32 = 5;
 const LOCKOUT: Duration = Duration::from_secs(60);
+const FAILURE_STATE_TTL: Duration = Duration::from_secs(60);
+
+/// Process-wide bound for retained unauthenticated failure state.
+pub const MAX_AUTH_FAILURE_STATES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoteAuthoritySource {
@@ -54,6 +58,7 @@ impl RemoteAuthoritySource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RemoteCapability {
+    Connect,
     Read,
     Mutate,
     RecoveryInspect,
@@ -62,6 +67,7 @@ pub enum RemoteCapability {
 impl RemoteCapability {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Connect => "connect",
             Self::Read => "read",
             Self::Mutate => "mutate",
             Self::RecoveryInspect => "recovery_inspect",
@@ -69,15 +75,121 @@ impl RemoteCapability {
     }
 }
 
+/// Identifier-free route metadata attached by `web::router`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RemoteRouteClass {
+    Health,
+    AcpWebSocket,
+    TerminalWebSocket,
+    Project,
+    Mcp,
+    Filesystem,
+    Git,
+    Search,
+    Skill,
+    FrontendLog,
+    Workspace,
+    Conversation,
+    Recovery,
+    AcpCatalog,
+    AcpInstall,
+    Worktree,
+}
+
+impl RemoteRouteClass {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Health => "health",
+            Self::AcpWebSocket => "acp_ws",
+            Self::TerminalWebSocket => "terminal_ws",
+            Self::Project => "project",
+            Self::Mcp => "mcp",
+            Self::Filesystem => "filesystem",
+            Self::Git => "git",
+            Self::Search => "search",
+            Self::Skill => "skill",
+            Self::FrontendLog => "frontend_log",
+            Self::Workspace => "workspace",
+            Self::Conversation => "conversation",
+            Self::Recovery => "recovery",
+            Self::AcpCatalog => "acp_catalog",
+            Self::AcpInstall => "acp_install",
+            Self::Worktree => "worktree",
+        }
+    }
+
+    fn capability(self, method: &Method) -> Option<RemoteCapability> {
+        match self {
+            Self::Health => None,
+            Self::AcpWebSocket => Some(RemoteCapability::Connect),
+            Self::TerminalWebSocket => Some(RemoteCapability::Mutate),
+            Self::Recovery => Some(RemoteCapability::RecoveryInspect),
+            _ if *method == Method::GET => Some(RemoteCapability::Read),
+            _ => Some(RemoteCapability::Mutate),
+        }
+    }
+
+    fn requires_http_bearer(self) -> bool {
+        !matches!(self, Self::Health | Self::AcpWebSocket)
+    }
+
+    /// Compatibility fallback for focused routers outside `web::router`.
+    /// Production routes attach the enum directly and never log this path.
+    fn from_path(path: &str) -> Option<Self> {
+        if path == "/health" {
+            Some(Self::Health)
+        } else if path == "/ws" {
+            Some(Self::AcpWebSocket)
+        } else if path == "/terminal/ws" {
+            Some(Self::TerminalWebSocket)
+        } else if path == "/projects" || path.starts_with("/projects/") {
+            Some(Self::Project)
+        } else if path == "/mcp-servers" || path.starts_with("/mcp-servers/") {
+            Some(Self::Mcp)
+        } else if path.starts_with("/fs/") || path == "/shells" {
+            Some(Self::Filesystem)
+        } else if path.starts_with("/git/") {
+            Some(Self::Git)
+        } else if path.starts_with("/search/") {
+            Some(Self::Search)
+        } else if path == "/skills" || path.starts_with("/skills/") {
+            Some(Self::Skill)
+        } else if path.starts_with("/log/") {
+            Some(Self::FrontendLog)
+        } else if path.starts_with("/workspace/") {
+            Some(Self::Workspace)
+        } else if path.starts_with("/conversation-recovery/") {
+            Some(Self::Recovery)
+        } else if path == "/conversations" || path.starts_with("/conversations/") {
+            Some(Self::Conversation)
+        } else if path == "/acp/catalog" || path.starts_with("/acp/catalog/") {
+            Some(Self::AcpCatalog)
+        } else if path == "/acp/install" {
+            Some(Self::AcpInstall)
+        } else if path.starts_with("/worktree/") {
+            Some(Self::Worktree)
+        } else {
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemotePrincipal {
     authority_source: RemoteAuthoritySource,
+    generation: u64,
 }
 
 impl RemotePrincipal {
     #[must_use]
     pub fn authority_source(&self) -> RemoteAuthoritySource {
         self.authority_source
+    }
+
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 }
 
@@ -133,27 +245,132 @@ impl std::fmt::Display for RemoteAuthError {
 
 impl std::error::Error for RemoteAuthError {}
 
+/// One desktop credential generation. The host owns this lease and the raw
+/// bearer; the authority retains only the generation metadata and digest.
+pub struct DesktopCredentialLease {
+    generation: u64,
+    bearer: String,
+}
+
+impl DesktopCredentialLease {
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub(crate) fn bearer(&self) -> &str {
+        &self.bearer
+    }
+}
+
+struct CredentialState {
+    generation: u64,
+    digest: Option<[u8; 32]>,
+    source: RemoteAuthoritySource,
+    desktop_keyring_account: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FailureKey {
+    peer: IpAddr,
+    generation: u64,
+}
+
 #[derive(Debug, Clone)]
 struct FailureState {
     window_started: Instant,
     failures: u32,
     locked_until: Option<Instant>,
+    last_touched: Instant,
+    lru_order: u64,
+}
+
+#[derive(Default)]
+struct FailureLimiter {
+    states: HashMap<FailureKey, FailureState>,
+    next_lru_order: u64,
+}
+
+impl FailureLimiter {
+    fn prune_expired(&mut self, now: Instant) {
+        self.states.retain(|_, state| {
+            now.saturating_duration_since(state.last_touched) < FAILURE_STATE_TTL
+        });
+    }
+
+    fn next_lru_order(&mut self) -> u64 {
+        self.next_lru_order = self.next_lru_order.saturating_add(1);
+        self.next_lru_order
+    }
+
+    fn evict_lru_if_full(&mut self) {
+        if self.states.len() < MAX_AUTH_FAILURE_STATES {
+            return;
+        }
+        if let Some(oldest) = self
+            .states
+            .iter()
+            .min_by_key(|(_, state)| state.lru_order)
+            .map(|(key, _)| *key)
+        {
+            self.states.remove(&oldest);
+        }
+    }
+
+    fn record_failure(&mut self, key: FailureKey, now: Instant) -> RemoteAuthError {
+        self.prune_expired(now);
+        if !self.states.contains_key(&key) {
+            self.evict_lru_if_full();
+        }
+        let lru_order = self.next_lru_order();
+        let state = self.states.entry(key).or_insert(FailureState {
+            window_started: now,
+            failures: 0,
+            locked_until: None,
+            last_touched: now,
+            lru_order,
+        });
+        state.last_touched = now;
+        state.lru_order = lru_order;
+        if now.saturating_duration_since(state.window_started) >= FAILURE_WINDOW {
+            state.window_started = now;
+            state.failures = 0;
+            state.locked_until = None;
+        }
+        if state.locked_until.is_some_and(|until| until > now) {
+            return RemoteAuthError::RateLimited;
+        }
+        state.failures = state.failures.saturating_add(1);
+        if state.failures > FAILURE_LIMIT {
+            state.locked_until = Some(now + LOCKOUT);
+            RemoteAuthError::RateLimited
+        } else {
+            RemoteAuthError::InvalidCredential
+        }
+    }
+
+    fn len_at(&mut self, now: Instant) -> usize {
+        self.prune_expired(now);
+        self.states.len()
+    }
 }
 
 /// Host-owned remote-access credential and policy authority.
 pub struct RemoteAccessAuthority {
-    credential_digest: RwLock<Option<[u8; 32]>>,
+    credential: RwLock<CredentialState>,
     allowed_origins: RwLock<HashSet<String>>,
-    failures: Mutex<HashMap<IpAddr, FailureState>>,
-    source: RwLock<RemoteAuthoritySource>,
+    failures: Mutex<FailureLimiter>,
 }
 
 impl std::fmt::Debug for RemoteAccessAuthority {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let credential = self.credential.read();
         formatter
             .debug_struct("RemoteAccessAuthority")
-            .field("source", &*self.source.read())
-            .field("configured", &self.credential_digest.read().is_some())
+            .field("source", &credential.source)
+            .field("generation", &credential.generation)
+            .field("configured", &credential.digest.is_some())
             .field("allowed_origin_count", &self.allowed_origins.read().len())
             .finish_non_exhaustive()
     }
@@ -163,10 +380,14 @@ impl RemoteAccessAuthority {
     #[must_use]
     pub fn unconfigured() -> Self {
         Self {
-            credential_digest: RwLock::new(None),
+            credential: RwLock::new(CredentialState {
+                generation: 0,
+                digest: None,
+                source: RemoteAuthoritySource::Unconfigured,
+                desktop_keyring_account: None,
+            }),
             allowed_origins: RwLock::new(HashSet::new()),
-            failures: Mutex::new(HashMap::new()),
-            source: RwLock::new(RemoteAuthoritySource::Unconfigured),
+            failures: Mutex::new(FailureLimiter::default()),
         }
     }
 
@@ -221,10 +442,15 @@ impl RemoteAccessAuthority {
                 "remote access authority provisioning failed"
             );
         })?;
-        let authority = Self::from_token(&token, RemoteAuthoritySource::DesktopKeyring);
+        let authority = Self::from_token(
+            &token,
+            RemoteAuthoritySource::DesktopKeyring,
+            Some(keyring_account.to_string()),
+        );
         info!(
             target: "termul::web::auth",
             authority_source = RemoteAuthoritySource::DesktopKeyring.as_str(),
+            generation = 1_u64,
             provisioned = issued,
             "remote access authority ready"
         );
@@ -263,7 +489,7 @@ impl RemoteAccessAuthority {
                 "remote access authority provisioning failed"
             );
         })?;
-        let authority = Self::from_token(token, RemoteAuthoritySource::OperatorTokenFile);
+        let authority = Self::from_token(token, RemoteAuthoritySource::OperatorTokenFile, None);
         info!(
             target: "termul::web::auth",
             authority_source = RemoteAuthoritySource::OperatorTokenFile.as_str(),
@@ -272,18 +498,107 @@ impl RemoteAccessAuthority {
         Ok(authority)
     }
 
-    fn from_token(token: &str, source: RemoteAuthoritySource) -> Self {
+    fn from_token(
+        token: &str,
+        source: RemoteAuthoritySource,
+        desktop_keyring_account: Option<String>,
+    ) -> Self {
         Self {
-            credential_digest: RwLock::new(Some(digest(token.as_bytes()))),
+            credential: RwLock::new(CredentialState {
+                generation: 1,
+                digest: Some(digest(token.as_bytes())),
+                source,
+                desktop_keyring_account,
+            }),
             allowed_origins: RwLock::new(HashSet::new()),
-            failures: Mutex::new(HashMap::new()),
-            source: RwLock::new(source),
+            failures: Mutex::new(FailureLimiter::default()),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn for_tests(token: &str) -> Self {
-        Self::from_token(token, RemoteAuthoritySource::Test)
+        Self::from_token(token, RemoteAuthoritySource::Test, None)
+    }
+
+    /// Generate and install a fresh desktop bearer generation. The raw bearer
+    /// is returned exactly once in the host-owned lease; only its digest and
+    /// monotonically increasing generation remain in the authority.
+    pub fn rotate_desktop_credential(&self) -> Result<DesktopCredentialLease, RemoteAuthError> {
+        let bearer = generate_token().inspect_err(|error| {
+            error!(
+                target: "termul::web::auth",
+                operation = "rotate_credential",
+                stable_code = error.code(),
+                "remote access credential rotation failed"
+            );
+        })?;
+        let mut credential = self.credential.write();
+        let generation = credential
+            .generation
+            .checked_add(1)
+            .ok_or(RemoteAuthError::Provisioning)?;
+        match credential.source {
+            RemoteAuthoritySource::DesktopKeyring => {
+                let account = credential
+                    .desktop_keyring_account
+                    .as_deref()
+                    .ok_or(RemoteAuthError::Provisioning)?;
+                crate::secure_storage::keyring_set(account, &bearer).map_err(|_| {
+                    error!(
+                        target: "termul::web::auth",
+                        authority_source = RemoteAuthoritySource::DesktopKeyring.as_str(),
+                        operation = "rotate_keyring_set",
+                        stable_code = RemoteAuthError::Provisioning.code(),
+                        "remote access credential rotation failed"
+                    );
+                    RemoteAuthError::Provisioning
+                })?;
+            }
+            RemoteAuthoritySource::Test => {}
+            RemoteAuthoritySource::OperatorTokenFile | RemoteAuthoritySource::Unconfigured => {
+                return Err(RemoteAuthError::Provisioning);
+            }
+        }
+        credential.generation = generation;
+        credential.digest = Some(digest(bearer.as_bytes()));
+        let source = credential.source;
+        drop(credential);
+        self.allowed_origins.write().clear();
+        *self.failures.lock() = FailureLimiter::default();
+        info!(
+            target: "termul::web::auth",
+            authority_source = source.as_str(),
+            generation,
+            lifecycle_phase = "rotate",
+            stable_code = "OK",
+            "remote access credential generation rotated"
+        );
+        Ok(DesktopCredentialLease { generation, bearer })
+    }
+
+    /// Invalidate only the named generation. A stale compensation path cannot
+    /// clear a newer generation that won a lifecycle race.
+    pub fn invalidate_generation(&self, generation: u64) {
+        let invalidated = {
+            let mut credential = self.credential.write();
+            if credential.generation == generation && credential.digest.is_some() {
+                credential.digest = None;
+                true
+            } else {
+                false
+            }
+        };
+        if invalidated {
+            self.allowed_origins.write().clear();
+            *self.failures.lock() = FailureLimiter::default();
+            warn!(
+                target: "termul::web::auth",
+                generation,
+                lifecycle_phase = "invalidate",
+                stable_code = "GENERATION_INVALIDATED",
+                "remote access credential generation invalidated"
+            );
+        }
     }
 
     /// Replace the credential digest without retaining the raw credential.
@@ -293,19 +608,31 @@ impl RemoteAccessAuthority {
         source: RemoteAuthoritySource,
     ) -> Result<(), RemoteAuthError> {
         validate_token(token)?;
-        *self.credential_digest.write() = Some(digest(token.as_bytes()));
-        *self.source.write() = source;
-        self.failures.lock().clear();
+        let mut credential = self.credential.write();
+        credential.generation = credential
+            .generation
+            .checked_add(1)
+            .ok_or(RemoteAuthError::Provisioning)?;
+        credential.digest = Some(digest(token.as_bytes()));
+        credential.source = source;
+        if source != RemoteAuthoritySource::DesktopKeyring {
+            credential.desktop_keyring_account = None;
+        }
+        drop(credential);
+        *self.failures.lock() = FailureLimiter::default();
         Ok(())
     }
 
     pub fn set_public_origin(&self, origin: Url) -> Result<(), RemoteAuthError> {
         let normalized = normalize_origin(&origin)?;
-        self.allowed_origins.write().insert(normalized.clone());
+        self.allowed_origins.write().insert(normalized);
+        let generation = self.credential.read().generation;
         info!(
             target: "termul::web::auth",
-            normalized_origin = %normalized,
-            "remote access Origin registered"
+            generation,
+            lifecycle_phase = "register_origin",
+            stable_code = "OK",
+            "remote access Origin policy updated"
         );
         Ok(())
     }
@@ -327,16 +654,21 @@ impl RemoteAccessAuthority {
 
     pub fn verify_bearer(&self, token: &str) -> Result<RemotePrincipal, RemoteAuthError> {
         validate_token(token).map_err(|_| RemoteAuthError::InvalidCredential)?;
-        let expected = self
-            .credential_digest
-            .read()
-            .as_ref()
-            .copied()
-            .ok_or(RemoteAuthError::Unconfigured)?;
+        let credential = self.credential.read();
+        let expected = match credential.digest {
+            Some(expected) => expected,
+            None if credential.generation > 0
+                && credential.source != RemoteAuthoritySource::Unconfigured =>
+            {
+                return Err(RemoteAuthError::InvalidCredential);
+            }
+            None => return Err(RemoteAuthError::Unconfigured),
+        };
         let candidate = digest(token.as_bytes());
         if bool::from(expected.ct_eq(&candidate)) {
             Ok(RemotePrincipal {
-                authority_source: *self.source.read(),
+                authority_source: credential.source,
+                generation: credential.generation,
             })
         } else {
             Err(RemoteAuthError::InvalidCredential)
@@ -357,12 +689,17 @@ impl RemoteAccessAuthority {
         principal: &RemotePrincipal,
         capability: RemoteCapability,
     ) -> Result<(), RemoteAuthError> {
-        if principal.authority_source != *self.source.read()
+        let credential = self.credential.read();
+        if credential.digest.is_none()
+            || principal.generation != credential.generation
+            || principal.authority_source != credential.source
             || principal.authority_source == RemoteAuthoritySource::Unconfigured
         {
             warn!(
                 target: "termul::web::auth",
+                generation = principal.generation,
                 capability = capability.as_str(),
+                stable_code = RemoteAuthError::Forbidden.code(),
                 "remote capability rejected"
             );
             return Err(RemoteAuthError::Forbidden);
@@ -388,16 +725,37 @@ impl RemoteAccessAuthority {
         token: &str,
         peer: IpAddr,
     ) -> Result<RemotePrincipal, RemoteAuthError> {
-        self.check_rate_limit(peer)?;
+        self.verify_bearer_for_peer_at(token, peer, Instant::now())
+    }
+
+    fn verify_bearer_for_peer_at(
+        &self,
+        token: &str,
+        peer: IpAddr,
+        now: Instant,
+    ) -> Result<RemotePrincipal, RemoteAuthError> {
+        // Always verify the current credential before consulting failure state.
+        // A forged burst through one shared loopback proxy therefore cannot
+        // lock out a caller that presents the correct generation bearer.
         match self.verify_bearer(token) {
-            Ok(principal) => {
-                self.failures.lock().remove(&peer);
-                Ok(principal)
-            }
+            Ok(principal) => Ok(principal),
             Err(error) => {
-                let reported = self.record_failure(peer).err().unwrap_or(error);
+                let generation = {
+                    let credential = self.credential.read();
+                    if credential.generation == 0
+                        || credential.source == RemoteAuthoritySource::Unconfigured
+                    {
+                        return Err(error);
+                    }
+                    credential.generation
+                };
+                let reported = self
+                    .failures
+                    .lock()
+                    .record_failure(FailureKey { peer, generation }, now);
                 warn!(
                     target: "termul::web::auth",
+                    generation,
                     auth_class = "bearer",
                     stable_code = reported.code(),
                     "remote authentication failed"
@@ -407,40 +765,15 @@ impl RemoteAccessAuthority {
         }
     }
 
-    fn check_rate_limit(&self, peer: IpAddr) -> Result<(), RemoteAuthError> {
-        let now = Instant::now();
-        let mut failures = self.failures.lock();
-        if let Some(state) = failures.get_mut(&peer) {
-            if state.locked_until.is_some_and(|until| until > now) {
-                return Err(RemoteAuthError::RateLimited);
-            }
-            if now.duration_since(state.window_started) >= FAILURE_WINDOW {
-                failures.remove(&peer);
-            }
-        }
-        Ok(())
+    /// Number of retained unauthenticated failure states after TTL cleanup.
+    #[must_use]
+    pub fn failure_state_count(&self) -> usize {
+        self.failures.lock().len_at(Instant::now())
     }
 
-    fn record_failure(&self, peer: IpAddr) -> Result<(), RemoteAuthError> {
-        let now = Instant::now();
-        let mut failures = self.failures.lock();
-        let state = failures.entry(peer).or_insert(FailureState {
-            window_started: now,
-            failures: 0,
-            locked_until: None,
-        });
-        if now.duration_since(state.window_started) >= FAILURE_WINDOW {
-            state.window_started = now;
-            state.failures = 0;
-            state.locked_until = None;
-        }
-        state.failures = state.failures.saturating_add(1);
-        if state.failures > FAILURE_LIMIT {
-            state.locked_until = Some(now + LOCKOUT);
-            Err(RemoteAuthError::RateLimited)
-        } else {
-            Ok(())
-        }
+    #[cfg(test)]
+    fn failure_state_count_at(&self, now: Instant) -> usize {
+        self.failures.lock().len_at(now)
     }
 }
 
@@ -527,11 +860,42 @@ pub async fn capability_middleware(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    let Some(capability) = protected_capability(request.method(), request.uri().path()) else {
+    let route_class = request
+        .extensions()
+        .get::<RemoteRouteClass>()
+        .copied()
+        .or_else(|| RemoteRouteClass::from_path(request.uri().path()));
+    let Some(route_class) = route_class else {
+        return next.run(request).await;
+    };
+    let method = request.method().clone();
+    let Some(capability) = route_class.capability(&method) else {
         return next.run(request).await;
     };
     let started = Instant::now();
-    let request_type = format!("{} {}", request.method(), request.uri().path());
+
+    // ACP WebSocket bearer authentication occurs in its first protocol frame;
+    // this HTTP boundary records only identifier-free route metadata.
+    if !route_class.requires_http_bearer() {
+        let response = next.run(request).await;
+        let stable_code = if response.status().is_success()
+            || response.status() == StatusCode::SWITCHING_PROTOCOLS
+        {
+            "OK"
+        } else {
+            "APPLICATION_ERROR"
+        };
+        log_boundary_outcome(
+            &method,
+            route_class,
+            capability,
+            stable_code,
+            response.status(),
+            started.elapsed(),
+        );
+        return response;
+    }
+
     let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -547,7 +911,8 @@ pub async fn capability_middleware(
             .err()
             .unwrap_or(RemoteAuthError::InvalidCredential);
         log_boundary_outcome(
-            &request_type,
+            &method,
+            route_class,
             capability,
             error.code(),
             error.status(),
@@ -559,7 +924,8 @@ pub async fn capability_middleware(
         Ok(principal) => principal,
         Err(error) => {
             log_boundary_outcome(
-                &request_type,
+                &method,
+                route_class,
                 capability,
                 error.code(),
                 error.status(),
@@ -570,7 +936,8 @@ pub async fn capability_middleware(
     };
     if let Err(error) = authority.authorize(&principal, capability) {
         log_boundary_outcome(
-            &request_type,
+            &method,
+            route_class,
             capability,
             error.code(),
             error.status(),
@@ -586,7 +953,8 @@ pub async fn capability_middleware(
         "APPLICATION_ERROR"
     };
     log_boundary_outcome(
-        &request_type,
+        &method,
+        route_class,
         capability,
         stable_code,
         response.status(),
@@ -596,7 +964,8 @@ pub async fn capability_middleware(
 }
 
 fn log_boundary_outcome(
-    request_type: &str,
+    method: &Method,
+    route_class: RemoteRouteClass,
     capability: RemoteCapability,
     stable_code: &str,
     status: StatusCode,
@@ -605,8 +974,8 @@ fn log_boundary_outcome(
     if status.is_client_error() || status.is_server_error() {
         warn!(
             target: "termul::web::auth",
-            request_type,
-            auth_class = "bearer",
+            method = method.as_str(),
+            route_class = route_class.as_str(),
             capability = capability.as_str(),
             stable_code,
             http_status = status.as_u16(),
@@ -616,48 +985,14 @@ fn log_boundary_outcome(
     } else {
         info!(
             target: "termul::web::auth",
-            request_type,
-            auth_class = "bearer",
+            method = method.as_str(),
+            route_class = route_class.as_str(),
             capability = capability.as_str(),
             stable_code,
             http_status = status.as_u16(),
             duration_ms = duration.as_millis(),
             "remote boundary request completed"
         );
-    }
-}
-
-fn protected_capability(method: &Method, path: &str) -> Option<RemoteCapability> {
-    if path == "/ws" || path == "/health" {
-        return None;
-    }
-    let protected = [
-        "/projects",
-        "/mcp-servers",
-        "/fs/",
-        "/git/",
-        "/search/",
-        "/skills",
-        "/log/",
-        "/shells",
-        "/workspace/",
-        "/conversations",
-        "/conversation-recovery/",
-        "/acp/",
-        "/worktree/",
-        "/terminal/ws",
-    ]
-    .iter()
-    .any(|prefix| path == *prefix || path.starts_with(prefix));
-    if !protected {
-        return None;
-    }
-    if path.starts_with("/conversation-recovery/") {
-        Some(RemoteCapability::RecoveryInspect)
-    } else if *method == Method::GET {
-        Some(RemoteCapability::Read)
-    } else {
-        Some(RemoteCapability::Mutate)
     }
 }
 
@@ -688,10 +1023,43 @@ pub fn status_for_code(code: &str) -> StatusCode {
 mod tests {
     use super::*;
     use axum::routing::{get, post};
+    use std::io::Write;
+    use std::net::Ipv6Addr;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
     use tower::ServiceExt;
 
     const TOKEN: &str = "test-remote-access-token";
+
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<StdMutex<Vec<u8>>>);
+
+    struct LogWriter(Arc<StdMutex<Vec<u8>>>);
+
+    impl Write for LogWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for LogBuffer {
+        type Writer = LogWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            LogWriter(Arc::clone(&self.0))
+        }
+    }
+
+    impl LogBuffer {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+    }
 
     fn authority() -> RemoteAccessAuthority {
         let authority = RemoteAccessAuthority::for_tests(TOKEN);
@@ -747,9 +1115,9 @@ mod tests {
     }
 
     #[test]
-    fn sixth_failed_attempt_is_rate_limited() {
+    fn forged_proxy_failures_rate_limit_invalid_tokens_but_never_the_valid_bearer() {
         let authority = authority();
-        let peer = IpAddr::from([192, 0, 2, 10]);
+        let peer = IpAddr::from([127, 0, 0, 1]);
         for _ in 0..FAILURE_LIMIT {
             assert_eq!(
                 authority.verify_bearer_for_peer("wrong", peer).unwrap_err(),
@@ -760,9 +1128,52 @@ mod tests {
             authority.verify_bearer_for_peer("wrong", peer).unwrap_err(),
             RemoteAuthError::RateLimited
         );
+        assert!(authority.verify_bearer_for_peer(TOKEN, peer).is_ok());
         assert_eq!(
-            authority.verify_bearer_for_peer(TOKEN, peer).unwrap_err(),
+            authority.verify_bearer_for_peer("wrong", peer).unwrap_err(),
             RemoteAuthError::RateLimited
+        );
+    }
+
+    #[test]
+    fn desktop_generation_rotation_invalidates_stale_bearers() {
+        let authority = authority();
+        let first = authority.rotate_desktop_credential().unwrap();
+        let first_bearer = first.bearer().to_string();
+        assert!(authority.verify_bearer(&first_bearer).is_ok());
+        authority.invalidate_generation(first.generation());
+        assert_eq!(
+            authority.verify_bearer(&first_bearer).unwrap_err(),
+            RemoteAuthError::InvalidCredential
+        );
+
+        let second = authority.rotate_desktop_credential().unwrap();
+        assert!(second.generation() > first.generation());
+        assert_ne!(second.bearer(), first_bearer);
+        assert_eq!(
+            authority.verify_bearer(&first_bearer).unwrap_err(),
+            RemoteAuthError::InvalidCredential
+        );
+        assert!(authority.verify_bearer(second.bearer()).is_ok());
+    }
+
+    #[test]
+    fn failure_state_is_ttl_lru_bounded_under_high_cardinality_attack() {
+        let authority = authority();
+        let now = Instant::now();
+        for index in 0_u128..10_000 {
+            let peer = IpAddr::V6(Ipv6Addr::from(index + 1));
+            assert_eq!(
+                authority
+                    .verify_bearer_for_peer_at("wrong", peer, now)
+                    .unwrap_err(),
+                RemoteAuthError::InvalidCredential
+            );
+        }
+        assert!(authority.failure_state_count_at(now) <= MAX_AUTH_FAILURE_STATES);
+        assert_eq!(
+            authority.failure_state_count_at(now + FAILURE_STATE_TTL + Duration::from_secs(1)),
+            0
         );
     }
 
@@ -796,6 +1207,7 @@ mod tests {
                 get(|| async { "sensitive-workspace-path" }),
             )
             .layer(axum::middleware::from_fn(capability_middleware))
+            .layer(Extension(RemoteRouteClass::Conversation))
             .layer(Extension(authority))
     }
 
@@ -855,6 +1267,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn(capability_middleware))
+            .layer(Extension(RemoteRouteClass::Conversation))
             .layer(Extension(authority));
 
         for uri in [
@@ -902,6 +1315,70 @@ mod tests {
             };
             assert_eq!(response.status(), expected, "attempt {attempt}");
         }
+    }
+
+    #[tokio::test]
+    async fn captured_boundary_log_uses_static_class_without_path_identifier_or_credential() {
+        let logs = LogBuffer::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(logs.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let authority = Arc::new(authority());
+        let app = axum::Router::new()
+            .route(
+                "/conversations/{conversationId}/lifecycle/detach",
+                post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .layer(axum::middleware::from_fn(capability_middleware))
+            .layer(Extension(RemoteRouteClass::Conversation))
+            .layer(Extension(authority));
+        let supplied_path = "/conversations/supplied-conversation-id/lifecycle/detach";
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(supplied_path)
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 43123))))
+                    .body(Body::from("supplied-sensitive-payload"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let output = logs.text();
+        assert!(output.contains("route_class"));
+        assert!(output.contains("conversation"));
+        assert!(output.contains("capability"));
+        assert!(!output.contains(supplied_path));
+        assert!(!output.contains("supplied-conversation-id"));
+        assert!(!output.contains(TOKEN));
+        assert!(!output.contains("supplied-sensitive-payload"));
+    }
+
+    #[test]
+    fn route_classes_and_boundary_logging_are_identifier_free() {
+        for (path, expected) in [
+            (
+                "/conversations/conversation-secret/lifecycle/detach",
+                RemoteRouteClass::Conversation,
+            ),
+            ("/projects/default", RemoteRouteClass::Project),
+            ("/worktree/remove", RemoteRouteClass::Worktree),
+            ("/conversation-recovery/resolve", RemoteRouteClass::Recovery),
+            ("/ws", RemoteRouteClass::AcpWebSocket),
+            ("/terminal/ws", RemoteRouteClass::TerminalWebSocket),
+        ] {
+            assert_eq!(RemoteRouteClass::from_path(path), Some(expected));
+            assert!(!expected.as_str().contains("secret"));
+            assert!(!expected.as_str().contains('/'));
+        }
+        let source = include_str!("auth.rs");
+        assert!(!source.contains(&["request_type", " = format!"].concat()));
+        assert!(!source.contains(&["request_type", ","].concat()));
     }
 
     #[test]

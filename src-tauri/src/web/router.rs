@@ -22,7 +22,7 @@ use crate::acp::{
 };
 use crate::pty::PtyManager;
 use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub};
-use crate::web::auth::{capability_middleware, RemoteAccessAuthority};
+use crate::web::auth::{capability_middleware, RemoteAccessAuthority, RemoteRouteClass};
 use crate::web::catalog_api;
 use crate::web::conversation_api;
 use crate::web::conversation_lifecycle_api;
@@ -44,6 +44,197 @@ use crate::web::worktree_api;
 use crate::web::ws::{ws_upgrade, AppState, HistoryMode};
 
 use super::assets;
+
+fn classified_routes(routes: Router<AppState>, route_class: RemoteRouteClass) -> Router<AppState> {
+    routes
+        .layer(middleware::from_fn(capability_middleware))
+        .layer(Extension(route_class))
+}
+
+/// Canonical API route registry. Each boundary is assigned an identifier-free
+/// static class before authentication/logging middleware runs.
+fn api_routes() -> Router<AppState> {
+    classified_routes(
+        Router::<AppState>::new().route("/health", get(health_check)),
+        RemoteRouteClass::Health,
+    )
+    .merge(classified_routes(
+        Router::<AppState>::new().route("/ws", get(ws_upgrade)),
+        RemoteRouteClass::AcpWebSocket,
+    ))
+    .merge(classified_routes(
+        Router::<AppState>::new().route("/terminal/ws", get(terminal_ws_upgrade)),
+        RemoteRouteClass::TerminalWebSocket,
+    ))
+    .merge(classified_routes(
+        Router::<AppState>::new()
+            .route("/projects", get(projects_api::list))
+            .route("/projects/default", post(projects_api::set_default_project)),
+        RemoteRouteClass::Project,
+    ))
+    .merge(classified_routes(
+        Router::<AppState>::new()
+            .route(
+                "/mcp-servers",
+                get(mcp_servers_api::get).put(mcp_servers_api::put),
+            )
+            .route("/mcp-servers/probe", post(mcp_probe_api::probe)),
+        RemoteRouteClass::Mcp,
+    ))
+    .merge(classified_routes(
+        Router::<AppState>::new()
+            .route("/fs/mkdir", post(fs_api::mkdir))
+            .route("/fs/write", post(fs_api::write))
+            .route("/fs/ls", get(fs_api::ls))
+            .route("/fs/browse", get(fs_api::browse))
+            .route("/fs/read", get(fs_api::read))
+            .route("/fs/info", get(fs_api::info))
+            .route("/fs/delete", post(fs_api::delete))
+            .route("/fs/rename", post(fs_api::rename))
+            .route("/fs/copy", post(fs_api::copy))
+            .route("/shells", get(fs_api::shells)),
+        RemoteRouteClass::Filesystem,
+    ))
+    .merge(classified_routes(
+        Router::<AppState>::new()
+            .route("/git/init", post(fs_api::git_init))
+            .route("/git/status", post(git_api::get_status))
+            .route("/git/diff", post(git_api::get_diff))
+            .route("/git/stage", post(git_api::stage))
+            .route("/git/unstage", post(git_api::unstage))
+            .route("/git/discard", post(git_api::discard))
+            .route("/git/log", post(git_api::get_log))
+            .route("/git/commit", post(git_api::commit))
+            .route("/git/push", post(git_api::push))
+            .route("/git/commit-context", post(git_api::get_commit_context))
+            .route("/git/checkout-branch", post(git_api::checkout_branch))
+            .route("/git/create-branch", post(git_api::create_branch))
+            .route("/git/stash-save", post(git_api::stash_save))
+            .route("/git/stash-list", get(git_api::stash_list))
+            .route("/git/stash-apply", post(git_api::stash_apply))
+            .route("/git/stash-pop", post(git_api::stash_pop))
+            .route("/git/stash-drop", post(git_api::stash_drop))
+            .route("/git/branch-list", get(git_api::branch_list))
+            .route("/git/branch-switch", post(git_api::branch_switch))
+            .route("/git/branch-create", post(git_api::branch_create)),
+        RemoteRouteClass::Git,
+    ))
+    .merge(classified_routes(
+        Router::<AppState>::new()
+            .route("/search/rg-info", get(search_api::rg_info))
+            .route("/search/content", post(search_api::content))
+            .route("/search/cancel", post(search_api::cancel)),
+        RemoteRouteClass::Search,
+    ))
+    .merge(classified_routes(
+        Router::<AppState>::new()
+            .route("/skills", get(skills_api::list))
+            .route("/skills/{name}", get(skills_api::read)),
+        RemoteRouteClass::Skill,
+    ))
+    .merge(classified_routes(
+        Router::<AppState>::new().route("/log/frontend-error", post(log_api::frontend_error)),
+        RemoteRouteClass::FrontendLog,
+    ))
+    .merge(classified_routes(
+        Router::<AppState>::new()
+            .route("/workspace/{projectId}", get(workspace_api::get))
+            .route("/workspace/{projectId}/write", post(workspace_api::write))
+            .route("/workspace/{projectId}/delete", post(workspace_api::delete)),
+        RemoteRouteClass::Workspace,
+    ))
+    .merge(classified_routes(
+        Router::<AppState>::new()
+            .route(
+                "/conversations/host-status",
+                get(conversation_api::host_status),
+            )
+            .route("/conversations", get(conversation_api::list))
+            .route(
+                "/conversations/resolve-legacy",
+                post(conversation_api::resolve_legacy),
+            )
+            .route(
+                "/conversations/{conversationId}",
+                get(conversation_api::get),
+            )
+            .route(
+                "/conversations/{conversationId}/open",
+                post(conversation_api::open),
+            )
+            .route(
+                "/conversations/{conversationId}/attach-project",
+                post(conversation_api::attach_project),
+            )
+            .route(
+                "/conversations/{conversationId}/detach-project",
+                post(conversation_api::detach_project),
+            )
+            .route(
+                "/conversations/{conversationId}/execution-target",
+                post(conversation_api::update_execution_target),
+            )
+            .route(
+                "/conversations/{conversationId}/workspace",
+                get(session_workspace_api::get).post(session_workspace_api::write),
+            )
+            .route(
+                "/conversations/{conversationId}/lifecycle/detach",
+                post(conversation_lifecycle_api::detach),
+            )
+            .route(
+                "/conversations/{conversationId}/lifecycle/rebind",
+                post(conversation_lifecycle_api::rebind),
+            )
+            .route(
+                "/conversations/{conversationId}/lifecycle/suspend",
+                post(conversation_lifecycle_api::suspend),
+            )
+            .route(
+                "/conversations/{conversationId}/lifecycle/replace",
+                post(conversation_lifecycle_api::replace),
+            )
+            .route(
+                "/conversations/{conversationId}/lifecycle/delete",
+                post(conversation_lifecycle_api::delete),
+            ),
+        RemoteRouteClass::Conversation,
+    ))
+    .merge(classified_routes(
+        Router::<AppState>::new().route(
+            "/conversation-recovery/resolve",
+            post(conversation_api::resolve_recovery),
+        ),
+        RemoteRouteClass::Recovery,
+    ))
+    .merge(classified_routes(
+        Router::<AppState>::new()
+            .route("/acp/catalog", get(catalog_api::list))
+            .route("/acp/catalog/opt-in", post(catalog_api::set_opt_in)),
+        RemoteRouteClass::AcpCatalog,
+    ))
+    .merge(classified_routes(
+        Router::<AppState>::new().route("/acp/install", post(install_api::install)),
+        RemoteRouteClass::AcpInstall,
+    ))
+    .merge(classified_routes(
+        Router::<AppState>::new()
+            .route("/worktree/list", post(worktree_api::list))
+            .route("/worktree/create", post(worktree_api::create))
+            .route("/worktree/remove", post(worktree_api::remove))
+            .route("/worktree/branches", get(worktree_api::branches))
+            .route("/worktree/check-dirty", get(worktree_api::check_dirty))
+            .route(
+                "/worktree/resolve-base-branch",
+                post(worktree_api::resolve_base_branch),
+            )
+            .route(
+                "/worktree/copy-include-files",
+                post(worktree_api::copy_include_files),
+            ),
+        RemoteRouteClass::Worktree,
+    ))
+}
 
 /// Build the ACP web-server Axum router (serves the web client + WS + health).
 ///
@@ -86,175 +277,7 @@ pub fn router(
     authority: Arc<RemoteAccessAuthority>,
 ) -> Router {
     acp.set_pty_manager(&pty);
-    let mut r = Router::new()
-        .route("/health", get(health_check))
-        .route("/ws", get(ws_upgrade))
-        .route("/terminal/ws", get(terminal_ws_upgrade))
-        // Project list mirror (Epic-4 bridge): the web client reads the
-        // desktop's non-archived + archived projects here. Registered AHEAD of
-        // the static fallback so the SPA mount cannot shadow it.
-        .route("/projects", get(projects_api::list))
-        // Explicit host-default change (Epic 7 — cross-client workspace
-        // continuity). Mirrors the `set_default_project` WS request + the
-        // `set_host_default_project` Tauri command (transport parity).
-        .route("/projects/default", post(projects_api::set_default_project))
-        .route(
-            "/mcp-servers",
-            get(mcp_servers_api::get).put(mcp_servers_api::put),
-        )
-        // On-demand MCP client probe (web parity): runs on the termul-server
-        // host where stdio commands execute. Mirrors the `acp_probe_mcp_server`
-        // Tauri command; returns the same `IpcBody<ProbeResult>` shape.
-        .route("/mcp-servers/probe", post(mcp_probe_api::probe))
-        // Project-creation fs/git/shell routes (Story: Web/remote project
-        // creation). Registered AHEAD of the static fallback so `/health` +
-        // `/ws` keep priority and the SPA fallback cannot shadow them.
-        .route("/fs/mkdir", post(fs_api::mkdir))
-        .route("/fs/write", post(fs_api::write))
-        .route("/fs/ls", get(fs_api::ls))
-        .route("/fs/browse", get(fs_api::browse))
-        .route("/fs/read", get(fs_api::read))
-        .route("/fs/info", get(fs_api::info))
-        .route("/fs/delete", post(fs_api::delete))
-        .route("/fs/rename", post(fs_api::rename))
-        .route("/fs/copy", post(fs_api::copy))
-        .route("/git/init", post(fs_api::git_init))
-        // Git web routes (CAP-1: Web & Mobile 1:1 Parity). Each mirrors a
-        // desktop `#[tauri::command] git_*` handler; see `web/git_api.rs`.
-        // Registered AHEAD of the static fallback so the SPA mount cannot
-        // shadow them. Write routes are loopback-guarded inside the handler.
-        .route("/git/status", post(git_api::get_status))
-        .route("/git/diff", post(git_api::get_diff))
-        .route("/git/stage", post(git_api::stage))
-        .route("/git/unstage", post(git_api::unstage))
-        .route("/git/discard", post(git_api::discard))
-        .route("/git/log", post(git_api::get_log))
-        .route("/git/commit", post(git_api::commit))
-        .route("/git/push", post(git_api::push))
-        .route("/git/commit-context", post(git_api::get_commit_context))
-        .route("/git/checkout-branch", post(git_api::checkout_branch))
-        .route("/git/create-branch", post(git_api::create_branch))
-        .route("/git/stash-save", post(git_api::stash_save))
-        .route("/git/stash-list", get(git_api::stash_list))
-        .route("/git/stash-apply", post(git_api::stash_apply))
-        .route("/git/stash-pop", post(git_api::stash_pop))
-        .route("/git/stash-drop", post(git_api::stash_drop))
-        .route("/git/branch-list", get(git_api::branch_list))
-        .route("/git/branch-switch", post(git_api::branch_switch))
-        .route("/git/branch-create", post(git_api::branch_create))
-        // Search web routes (CAP-2: Web & Mobile 1:1 Parity). Each mirrors a
-        // desktop `#[tauri::command] search_*` handler; see `web/search_api.rs`.
-        .route("/search/rg-info", get(search_api::rg_info))
-        .route("/search/content", post(search_api::content))
-        .route("/search/cancel", post(search_api::cancel))
-        // Skills web routes (CAP-2): `GET /skills` + `GET /skills/:name`.
-        .route("/skills", get(skills_api::list))
-        .route("/skills/{name}", get(skills_api::read))
-        // Frontend error forwarding (CAP-2): `POST /log/frontend-error`.
-        // Loopback-only (enforced inside the handler).
-        .route("/log/frontend-error", post(log_api::frontend_error))
-        .route("/shells", get(fs_api::shells))
-        // Workspace manifest web routes (CAP-5: Web & Mobile 1:1 Parity).
-        // Each mirrors a desktop `#[tauri::command] workspace_manifest_*`
-        // handler; see `web/workspace_api.rs`. Registered AHEAD of the static
-        // fallback so the SPA mount cannot shadow them. Write + delete are
-        // loopback-guarded inside the handler.
-        .route("/workspace/{projectId}", get(workspace_api::get))
-        .route("/workspace/{projectId}/write", post(workspace_api::write))
-        .route("/workspace/{projectId}/delete", post(workspace_api::delete))
-        .route(
-            "/conversations/host-status",
-            get(conversation_api::host_status),
-        )
-        .route("/conversations", get(conversation_api::list))
-        .route(
-            "/conversations/resolve-legacy",
-            post(conversation_api::resolve_legacy),
-        )
-        .route(
-            "/conversations/{conversationId}",
-            get(conversation_api::get),
-        )
-        .route(
-            "/conversations/{conversationId}/open",
-            post(conversation_api::open),
-        )
-        .route(
-            "/conversations/{conversationId}/attach-project",
-            post(conversation_api::attach_project),
-        )
-        .route(
-            "/conversations/{conversationId}/detach-project",
-            post(conversation_api::detach_project),
-        )
-        .route(
-            "/conversations/{conversationId}/execution-target",
-            post(conversation_api::update_execution_target),
-        )
-        .route(
-            "/conversations/{conversationId}/workspace",
-            get(session_workspace_api::get).post(session_workspace_api::write),
-        )
-        .route(
-            "/conversation-recovery/resolve",
-            post(conversation_api::resolve_recovery),
-        )
-        .route(
-            "/conversations/{conversationId}/lifecycle/detach",
-            post(conversation_lifecycle_api::detach),
-        )
-        .route(
-            "/conversations/{conversationId}/lifecycle/rebind",
-            post(conversation_lifecycle_api::rebind),
-        )
-        .route(
-            "/conversations/{conversationId}/lifecycle/suspend",
-            post(conversation_lifecycle_api::suspend),
-        )
-        .route(
-            "/conversations/{conversationId}/lifecycle/replace",
-            post(conversation_lifecycle_api::replace),
-        )
-        .route(
-            "/conversations/{conversationId}/lifecycle/delete",
-            post(conversation_lifecycle_api::delete),
-        )
-        // ACP catalog web routes (CAP-6: Web & Mobile 1:1 Parity). Each
-        // mirrors a desktop `#[tauri::command] acp_*_catalog` handler; see
-        // `web/catalog_api.rs`. Registered AHEAD of the static fallback so
-        // the SPA mount cannot shadow them. The read `GET` is open (read-only
-        // host introspection, mirrors `GET /projects`); the `POST` opt-in
-        // mirrors `set_default_project` posture (any connected client until
-        // Epic 2).
-        .route("/acp/catalog", get(catalog_api::list))
-        .route("/acp/catalog/opt-in", post(catalog_api::set_opt_in))
-        // ACP install web route (CAP-6 / Story 9: verified-atomic install).
-        // Mirrors the desktop `#[tauri::command] acp_install_agent` handler;
-        // see `web/install_api.rs`. Registered AHEAD of the static fallback so
-        // the SPA mount cannot shadow it. The request is `{ agentId }` only;
-        // the host resolves everything from the trusted catalog.
-        .route("/acp/install", post(install_api::install))
-        // Worktree web routes (CAP — Web worktree parity). Each mirrors a
-        // desktop `#[tauri::command] worktree_*` handler; see
-        // `web/worktree_api.rs`. Registered AHEAD of the static fallback so the
-        // SPA mount cannot shadow them. Write routes (`create`/`remove`/
-        // `copy-include-files`) are loopback-guarded inside the handler; read
-        // routes (`list`/`branches`/`check-dirty`/`resolve-base-branch`)
-        // enforce containment only. Only the 7 launch-flow routes ship here;
-        // the 8 advanced ops are deferred (see deferred-work.md).
-        .route("/worktree/list", post(worktree_api::list))
-        .route("/worktree/create", post(worktree_api::create))
-        .route("/worktree/remove", post(worktree_api::remove))
-        .route("/worktree/branches", get(worktree_api::branches))
-        .route("/worktree/check-dirty", get(worktree_api::check_dirty))
-        .route(
-            "/worktree/resolve-base-branch",
-            post(worktree_api::resolve_base_branch),
-        )
-        .route(
-            "/worktree/copy-include-files",
-            post(worktree_api::copy_include_files),
-        );
+    let mut r = api_routes();
     // Static fallback: disk ServeDir in dev (dist-web/ on disk) or the embedded
     // bundle in release. `/health` + `/ws` are registered above so the static
     // mount cannot shadow them (Story 1.3 AC1).
@@ -289,7 +312,6 @@ pub fn router(
         acp_install,
         project_root: project_root_handle,
     })
-    .layer(middleware::from_fn(capability_middleware))
     .layer(Extension(authority))
 }
 
@@ -314,129 +336,7 @@ pub fn router_with_static(
     project_root: PathBuf,
 ) -> Router {
     acp.set_pty_manager(&pty);
-    Router::new()
-        .route("/health", get(health_check))
-        .route("/ws", get(ws_upgrade))
-        .route("/terminal/ws", get(terminal_ws_upgrade))
-        .route("/projects", get(projects_api::list))
-        .route("/projects/default", post(projects_api::set_default_project))
-        .route(
-            "/mcp-servers",
-            get(mcp_servers_api::get).put(mcp_servers_api::put),
-        )
-        .route("/mcp-servers/probe", post(mcp_probe_api::probe))
-        .route("/fs/mkdir", post(fs_api::mkdir))
-        .route("/fs/write", post(fs_api::write))
-        .route("/fs/ls", get(fs_api::ls))
-        .route("/fs/browse", get(fs_api::browse))
-        .route("/fs/read", get(fs_api::read))
-        .route("/fs/info", get(fs_api::info))
-        .route("/fs/delete", post(fs_api::delete))
-        .route("/fs/rename", post(fs_api::rename))
-        .route("/fs/copy", post(fs_api::copy))
-        .route("/git/init", post(fs_api::git_init))
-        .route("/git/status", post(git_api::get_status))
-        .route("/git/diff", post(git_api::get_diff))
-        .route("/git/stage", post(git_api::stage))
-        .route("/git/unstage", post(git_api::unstage))
-        .route("/git/discard", post(git_api::discard))
-        .route("/git/log", post(git_api::get_log))
-        .route("/git/commit", post(git_api::commit))
-        .route("/git/push", post(git_api::push))
-        .route("/git/commit-context", post(git_api::get_commit_context))
-        .route("/git/checkout-branch", post(git_api::checkout_branch))
-        .route("/git/create-branch", post(git_api::create_branch))
-        .route("/git/stash-save", post(git_api::stash_save))
-        .route("/git/stash-list", get(git_api::stash_list))
-        .route("/git/stash-apply", post(git_api::stash_apply))
-        .route("/git/stash-pop", post(git_api::stash_pop))
-        .route("/git/stash-drop", post(git_api::stash_drop))
-        .route("/git/branch-list", get(git_api::branch_list))
-        .route("/git/branch-switch", post(git_api::branch_switch))
-        .route("/git/branch-create", post(git_api::branch_create))
-        .route("/search/rg-info", get(search_api::rg_info))
-        .route("/search/content", post(search_api::content))
-        .route("/search/cancel", post(search_api::cancel))
-        .route("/skills", get(skills_api::list))
-        .route("/skills/{name}", get(skills_api::read))
-        .route("/log/frontend-error", post(log_api::frontend_error))
-        .route("/shells", get(fs_api::shells))
-        .route("/workspace/{projectId}", get(workspace_api::get))
-        .route("/workspace/{projectId}/write", post(workspace_api::write))
-        .route("/workspace/{projectId}/delete", post(workspace_api::delete))
-        .route(
-            "/conversations/host-status",
-            get(conversation_api::host_status),
-        )
-        .route("/conversations", get(conversation_api::list))
-        .route(
-            "/conversations/resolve-legacy",
-            post(conversation_api::resolve_legacy),
-        )
-        .route(
-            "/conversations/{conversationId}",
-            get(conversation_api::get),
-        )
-        .route(
-            "/conversations/{conversationId}/open",
-            post(conversation_api::open),
-        )
-        .route(
-            "/conversations/{conversationId}/attach-project",
-            post(conversation_api::attach_project),
-        )
-        .route(
-            "/conversations/{conversationId}/detach-project",
-            post(conversation_api::detach_project),
-        )
-        .route(
-            "/conversations/{conversationId}/execution-target",
-            post(conversation_api::update_execution_target),
-        )
-        .route(
-            "/conversations/{conversationId}/workspace",
-            get(session_workspace_api::get).post(session_workspace_api::write),
-        )
-        .route(
-            "/conversation-recovery/resolve",
-            post(conversation_api::resolve_recovery),
-        )
-        .route(
-            "/conversations/{conversationId}/lifecycle/detach",
-            post(conversation_lifecycle_api::detach),
-        )
-        .route(
-            "/conversations/{conversationId}/lifecycle/rebind",
-            post(conversation_lifecycle_api::rebind),
-        )
-        .route(
-            "/conversations/{conversationId}/lifecycle/suspend",
-            post(conversation_lifecycle_api::suspend),
-        )
-        .route(
-            "/conversations/{conversationId}/lifecycle/replace",
-            post(conversation_lifecycle_api::replace),
-        )
-        .route(
-            "/conversations/{conversationId}/lifecycle/delete",
-            post(conversation_lifecycle_api::delete),
-        )
-        .route("/acp/catalog", get(catalog_api::list))
-        .route("/acp/catalog/opt-in", post(catalog_api::set_opt_in))
-        .route("/acp/install", post(install_api::install))
-        .route("/worktree/list", post(worktree_api::list))
-        .route("/worktree/create", post(worktree_api::create))
-        .route("/worktree/remove", post(worktree_api::remove))
-        .route("/worktree/branches", get(worktree_api::branches))
-        .route("/worktree/check-dirty", get(worktree_api::check_dirty))
-        .route(
-            "/worktree/resolve-base-branch",
-            post(worktree_api::resolve_base_branch),
-        )
-        .route(
-            "/worktree/copy-include-files",
-            post(worktree_api::copy_include_files),
-        )
+    api_routes()
         .fallback_service(assets::static_service_from(static_dir))
         // CAP-1: same RwLock wrap + handle registration as `router`.
         .with_state({
@@ -461,7 +361,6 @@ pub fn router_with_static(
                 project_root: project_root_handle,
             }
         })
-        .layer(middleware::from_fn(capability_middleware))
         .layer(Extension(Arc::new(RemoteAccessAuthority::unconfigured())))
 }
 

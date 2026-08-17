@@ -60,6 +60,7 @@ import { syncProjects } from '@/lib/api'
 import { useRemoteStatus } from '@/stores/remote-status-store'
 
 const RAW_CREDENTIAL = 'secret-bootstrap-credential'
+const NEXT_RAW_CREDENTIAL = 'rotated-bootstrap-credential'
 const RUNNING: RemoteStatus = {
   running: true,
   url: 'http://127.0.0.1:5123',
@@ -68,6 +69,22 @@ const RUNNING: RemoteStatus = {
   bindHost: '127.0.0.1',
   tunnelUrl: 'https://foo-bar.trycloudflare.com',
   accessUrl: `https://foo-bar.trycloudflare.com/#access_token=${RAW_CREDENTIAL}`
+}
+const STOPPED: RemoteStatus = {
+  running: false,
+  url: null,
+  port: null,
+  bindMode: null,
+  bindHost: null,
+  tunnelUrl: null,
+  accessUrl: null
+}
+const RUNNING_AGAIN: RemoteStatus = {
+  ...RUNNING,
+  port: 6124,
+  url: 'http://127.0.0.1:6124',
+  tunnelUrl: 'https://new-generation.trycloudflare.com',
+  accessUrl: `https://new-generation.trycloudflare.com/#access_token=${NEXT_RAW_CREDENTIAL}`
 }
 const clipboardWrite = vi.fn(async () => undefined)
 
@@ -129,6 +146,49 @@ describe('RemoteAccessPopover', () => {
     expect(screen.queryByText('Listen on')).toBeNull()
     expect(screen.queryByText('Open in browser')).toBeNull()
     expect(await screen.findByText('Copied')).toBeDefined()
+  })
+
+  it('removes the stale access URL on stop and exposes only the rotated URL after restart', async () => {
+    vi.mocked(useRemoteStatus).mockReturnValue(RUNNING)
+    stopMock.mockResolvedValueOnce({ success: true, data: STOPPED })
+    startMock.mockResolvedValueOnce({ success: true, data: RUNNING_AGAIN })
+    const view = renderPopover()
+    let toggle = await openPopover()
+
+    expect(screen.getByTestId('qr').getAttribute('data-value')).toBe(RUNNING.accessUrl)
+    await fireEvent.click(toggle)
+    await waitFor(() => expect(stopMock).toHaveBeenCalledTimes(1))
+    expect(setStatus).toHaveBeenLastCalledWith(STOPPED)
+
+    vi.mocked(useRemoteStatus).mockReturnValue(STOPPED)
+    view.rerender(
+      <TooltipProvider>
+        <RemoteAccessPopover />
+      </TooltipProvider>
+    )
+    expect(screen.queryByTestId('qr')).toBeNull()
+    expect(document.body.textContent).not.toContain(RAW_CREDENTIAL)
+
+    toggle = screen.getByRole('switch')
+    await fireEvent.click(toggle)
+    await waitFor(() => expect(startMock).toHaveBeenCalledTimes(1))
+    expect(setStatus).toHaveBeenLastCalledWith(RUNNING_AGAIN)
+
+    vi.mocked(useRemoteStatus).mockReturnValue(RUNNING_AGAIN)
+    view.rerender(
+      <TooltipProvider>
+        <RemoteAccessPopover />
+      </TooltipProvider>
+    )
+    const rotatedQr = screen.getByTestId('qr')
+    expect(rotatedQr.getAttribute('data-value')).toBe(RUNNING_AGAIN.accessUrl)
+    expect(rotatedQr.getAttribute('data-value')).not.toBe(RUNNING.accessUrl)
+    expect(document.body.textContent).not.toContain(RAW_CREDENTIAL)
+    expect(document.body.textContent).not.toContain(NEXT_RAW_CREDENTIAL)
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Copy tunnel link' }))
+    await waitFor(() => expect(clipboardWrite).toHaveBeenLastCalledWith(RUNNING_AGAIN.accessUrl))
+    expect(clipboardWrite).not.toHaveBeenCalledWith(RUNNING.accessUrl)
   })
 
   it('does not fall back to an uncredentialed tunnel URL when accessUrl is explicitly absent', async () => {

@@ -10,6 +10,9 @@ use std::path::{Path, PathBuf};
 
 use url::Url;
 
+pub const MAX_EVENT_LOG_CAPACITY: usize = 16_384;
+pub const REMOTE_AUTH_CONFIGURATION_REQUIRED: &str = "REMOTE_AUTH_CONFIGURATION_REQUIRED";
+
 /// Resolve the default project-root boundary for the fs_api routes (PR-S4).
 ///
 /// Prefers `$TERMUL_PROJECT_ROOT` when set; otherwise falls back to the
@@ -153,7 +156,8 @@ impl BindMode {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
-    /// Per-session event-log capacity (bounded ring; AC4). Default 4096.
+    /// Per-session event-log capacity (bounded ring; AC4). Default 4096;
+    /// validated to `1..=MAX_EVENT_LOG_CAPACITY` before host admission.
     pub event_log_capacity: usize,
     /// Permission-rendezvous timeout in seconds (Story 1.7 / FR14). On expiry
     /// the pending permission resolves as deny (`Cancelled`). Default 60.
@@ -371,10 +375,11 @@ impl ServerConfig {
                             value.as_ref()
                         ))
                     })?;
-                    if parsed == 0 {
-                        return Err(ParseCliError::Message(
-                            "invalid --event-log-capacity '0': use a positive integer".into(),
-                        ));
+                    if !(1..=MAX_EVENT_LOG_CAPACITY).contains(&parsed) {
+                        return Err(ParseCliError::Message(format!(
+                            "invalid --event-log-capacity '{}': use 1-{MAX_EVENT_LOG_CAPACITY}",
+                            value.as_ref()
+                        )));
                     }
                     event_log_capacity = parsed;
                 }
@@ -593,13 +598,11 @@ impl ServerConfig {
             })
             .unwrap_or_else(|| project_root.join("Termul"));
 
-        if BindMode::parse(&host) == Some(BindMode::All)
-            && (remote_access_token_file.is_none() || allowed_origins.is_empty())
-        {
-            return Err(ParseCliError::Message(
-                "non-loopback --host requires --remote-access-token-file and at least one --allowed-origin"
-                    .into(),
-            ));
+        if remote_access_token_file.is_none() || allowed_origins.is_empty() {
+            return Err(ParseCliError::Message(format!(
+                "{REMOTE_AUTH_CONFIGURATION_REQUIRED}: standalone service requires \
+                 --remote-access-token-file and at least one --allowed-origin"
+            )));
         }
 
         Ok(Self {
@@ -710,6 +713,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(p);
     }
 
+    fn configured_args(extra: &[&str]) -> Vec<String> {
+        extra
+            .iter()
+            .copied()
+            .chain([
+                "--remote-access-token-file",
+                "operator-token",
+                "--allowed-origin",
+                "https://termul.example.test",
+            ])
+            .map(str::to_string)
+            .collect()
+    }
+
     #[test]
     fn bind_mode_parse_and_addrs() {
         assert_eq!(BindMode::parse("localhost"), Some(BindMode::Localhost));
@@ -769,8 +786,19 @@ mod tests {
     }
 
     #[test]
-    fn from_args_defaults() {
-        let cfg = ServerConfig::from_args(Vec::<&str>::new()).expect("defaults");
+    fn from_args_defaults_fail_closed_without_remote_auth_config() {
+        let error = ServerConfig::from_args(Vec::<&str>::new())
+            .expect_err("default standalone admission must fail closed");
+        assert!(error
+            .to_string()
+            .contains(REMOTE_AUTH_CONFIGURATION_REQUIRED));
+        assert!(error.to_string().contains("--remote-access-token-file"));
+        assert!(error.to_string().contains("--allowed-origin"));
+    }
+
+    #[test]
+    fn from_args_with_required_auth_uses_runtime_defaults() {
+        let cfg = ServerConfig::from_args(configured_args(&[])).expect("authenticated defaults");
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, 8080);
         assert_eq!(
@@ -785,10 +813,6 @@ mod tests {
             cfg.permission_reconnect_grace_secs, 15,
             "default reconnect grace is 15s"
         );
-        // PR-S4: project_root defaults to $HOME / $USERPROFILE when the env var
-        // is unset. The CI hosts in this repo all set $HOME, so the resolved
-        // value should be non-empty. We don't assert an exact path because the
-        // test environment may differ across platforms.
         assert!(
             !cfg.project_root.as_os_str().is_empty(),
             "default project_root should resolve from $HOME when $TERMUL_PROJECT_ROOT is unset"
@@ -796,11 +820,19 @@ mod tests {
     }
 
     #[test]
-    fn from_args_rejects_non_loopback_without_remote_auth_config() {
-        let error = ServerConfig::from_args(["--host", "0.0.0.0", "--port", "9090"])
-            .expect_err("non-loopback admission must fail closed");
-        assert!(error.to_string().contains("--remote-access-token-file"));
-        assert!(error.to_string().contains("--allowed-origin"));
+    fn from_args_rejects_every_bind_mode_without_remote_auth_config() {
+        for args in [
+            vec!["--host", "127.0.0.1", "--port", "9090"],
+            vec!["--host", "0.0.0.0", "--port", "9090"],
+        ] {
+            let error = ServerConfig::from_args(args)
+                .expect_err("standalone admission must fail closed for every bind mode");
+            assert!(error
+                .to_string()
+                .contains(REMOTE_AUTH_CONFIGURATION_REQUIRED));
+            assert!(error.to_string().contains("--remote-access-token-file"));
+            assert!(error.to_string().contains("--allowed-origin"));
+        }
     }
 
     #[test]
@@ -854,11 +886,20 @@ mod tests {
 
     #[test]
     fn from_args_accepts_event_log_capacity() {
-        let cfg = ServerConfig::from_args(["--event-log-capacity", "1024"]).expect("parse");
+        let cfg = ServerConfig::from_args(configured_args(&["--event-log-capacity", "1024"]))
+            .expect("parse");
         assert_eq!(cfg.event_log_capacity, 1024);
         // The other defaults stay intact.
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, 8080);
+    }
+
+    #[test]
+    fn from_args_accepts_max_event_log_capacity() {
+        let max = MAX_EVENT_LOG_CAPACITY.to_string();
+        let cfg = ServerConfig::from_args(configured_args(&["--event-log-capacity", &max]))
+            .expect("maximum bounded capacity must be admitted");
+        assert_eq!(cfg.event_log_capacity, MAX_EVENT_LOG_CAPACITY);
     }
 
     #[test]
@@ -867,6 +908,14 @@ mod tests {
             ServerConfig::from_args(["--event-log-capacity", "0"]),
             Err(ParseCliError::Message(_))
         ));
+    }
+
+    #[test]
+    fn from_args_rejects_event_log_capacity_above_maximum() {
+        let over = (MAX_EVENT_LOG_CAPACITY + 1).to_string();
+        let error = ServerConfig::from_args(["--event-log-capacity", over.as_str()])
+            .expect_err("oversized relay capacity must fail before admission");
+        assert!(error.to_string().contains("1-16384"));
     }
 
     #[test]
@@ -887,7 +936,8 @@ mod tests {
 
     #[test]
     fn from_args_accepts_permission_timeout() {
-        let cfg = ServerConfig::from_args(["--permission-timeout", "30"]).expect("parse");
+        let cfg = ServerConfig::from_args(configured_args(&["--permission-timeout", "30"]))
+            .expect("parse");
         assert_eq!(cfg.permission_timeout_secs, 30);
         // Other defaults stay intact.
         assert_eq!(cfg.host, "127.0.0.1");
@@ -897,7 +947,8 @@ mod tests {
 
     #[test]
     fn from_args_accepts_permission_reconnect_grace() {
-        let cfg = ServerConfig::from_args(["--permission-reconnect-grace", "20"]).expect("parse");
+        let cfg = ServerConfig::from_args(configured_args(&["--permission-reconnect-grace", "20"]))
+            .expect("parse");
         assert_eq!(cfg.permission_reconnect_grace_secs, 20);
     }
 
@@ -954,10 +1005,10 @@ mod tests {
 
     #[test]
     fn from_args_accepts_conversation_workspace_root() {
-        let cfg = ServerConfig::from_args([
+        let cfg = ServerConfig::from_args(configured_args(&[
             "--conversation-workspace-root",
             "/var/lib/termul/conversation-workspaces",
-        ])
+        ]))
         .expect("parse");
         assert_eq!(
             cfg.conversation_workspace_root,
@@ -983,9 +1034,11 @@ mod tests {
 
     #[test]
     fn from_args_accepts_workspace_manifests_dir() {
-        let cfg =
-            ServerConfig::from_args(["--workspace-manifests-dir", "/var/lib/termul/manifests"])
-                .expect("parse");
+        let cfg = ServerConfig::from_args(configured_args(&[
+            "--workspace-manifests-dir",
+            "/var/lib/termul/manifests",
+        ]))
+        .expect("parse");
         assert_eq!(
             cfg.workspace_manifests_dir,
             Some(PathBuf::from("/var/lib/termul/manifests"))
