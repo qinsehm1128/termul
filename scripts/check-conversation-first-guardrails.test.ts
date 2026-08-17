@@ -7,61 +7,72 @@ import {
   stripRustTestCode
 } from './check-conversation-first-guardrails'
 
+const hooks = [
+  'useTerminalAutoSave',
+  'useSessionWorkspaceBootstrap',
+  'useConversationHostBootstrap',
+  'useConversationLifecycle',
+  'useTerminalResourceLifecycle',
+  'useTerminalRestore',
+  'useCrashRecovery',
+  'useTerminalDetachedOutput',
+  'useCwd',
+  'useGitBranch',
+  'useGitStatus',
+  'useExitCode',
+  'useContextBarSettings',
+  'useAppSettingsLoader',
+  'useAppliedLanguageSync',
+  'useAppliedColorThemeSync',
+  'useAppliedUiZoomSync',
+  'useKeyboardShortcutsLoader',
+  'useProjectsLoader',
+  'useProjectsAutoSave',
+  'useMenuUpdaterListener',
+  'useUpdateCheck',
+  'useUpdateToast',
+  'useVisibilityState',
+  'useTerminalExitNotification',
+  'useRemoteProjects',
+  'useAcpListeners',
+  'useAcpAgents',
+  'useAcpHistory',
+  'useAcpSessionResume',
+  'useAcpMcp',
+  'usePreventFileDropNavigation',
+  'usePreventNativeContextMenu'
+]
+
 function root(): string {
   return `
-import { PortableAppEffects } from '@/app/PortableAppEffects'
-import { createPortableRouter } from '@/app/portable-router'
-const router = createPortableRouter()
-const effects = <PortableAppEffects />
-const status = <ConversationHostStatus />
-const recovery = <ConversationRecoveryPanel />
+import { PortableAppEffects as Effects } from '@/app/PortableAppEffects'
+import { createPortableRouter as buildRouter } from '@/app/portable-router'
+import { ConversationHostStatus as Status } from '@/components/conversation/ConversationHostStatus'
+import { ConversationRecoveryPanel as Recovery } from '@/components/conversation/ConversationRecoveryPanel'
+const makeRouter = buildRouter
+const router = makeRouter()
+export default function Root() {
+  return <><Effects /><Status /><Recovery /></>
+}
 `
 }
 
 function portableEffects(): string {
   return `
+${hooks.map((hook) => `import { ${hook} as ${hook}Alias } from '@/hooks/${hook}'`).join('\n')}
+import { initNotificationPermissions as initializeNotifications } from '@/lib/tauri-notification-api'
 export function PortableAppEffects() {
-  useTerminalAutoSave()
-  useSessionWorkspaceBootstrap()
-  useConversationHostBootstrap()
-  useConversationLifecycle()
-  useTerminalResourceLifecycle()
-  useTerminalRestore()
-  useCrashRecovery()
-  useTerminalDetachedOutput()
-  useCwd()
-  useGitBranch()
-  useGitStatus()
-  useExitCode()
-  useContextBarSettings()
-  useAppSettingsLoader()
-  useAppliedLanguageSync()
-  useAppliedColorThemeSync()
-  useAppliedUiZoomSync()
-  useKeyboardShortcutsLoader()
-  useProjectsLoader()
-  useProjectsAutoSave()
-  useMenuUpdaterListener()
-  useUpdateCheck()
-  useUpdateToast()
-  useVisibilityState()
-  useTerminalExitNotification()
-  useRemoteProjects()
-  useAcpListeners()
-  useAcpAgents()
-  useAcpHistory()
-  useAcpSessionResume()
-  useAcpMcp()
-  usePreventFileDropNavigation()
-  usePreventNativeContextMenu()
-  initNotificationPermissions()
+${hooks.map((hook) => `  ${hook}Alias()`).join('\n')}
+  initializeNotifications()
+  return null
 }
 `
 }
 
 function portableRouter(): string {
   return `
-export const portableRouteObjects = [
+import { createHashRouter } from 'react-router-dom'
+export const portableRouteObjects = [{ children: [
   { path: 'c/:conversationId' },
   { path: 'legacy/session/:legacyValue' },
   { path: 'legacy/storage/:legacyValue' },
@@ -69,438 +80,209 @@ export const portableRouteObjects = [
   { path: 'snapshots' },
   { path: 'settings' },
   { path: 'preferences' }
-]
-export function createPortableRouter() {}
+]}]
+export function createPortableRouter() { return createHashRouter(portableRouteObjects) }
 `
 }
 
-const repositoryMutators = [
-  'replace_workspace_bytes',
-  'create_conversation',
-  'update_metadata',
-  'append_event',
-  'bind_agent_session',
-  'detach_agent_binding',
-  'rebind_detached_binding',
-  'suspend_agent_binding',
-  'replace_agent_binding',
-  'refresh_lifecycle_catalog',
-  'append_project_attachment',
-  'detach_project_attachment',
-  'attach_project_cas',
-  'detach_project_cas',
-  'update_execution_target_cas',
-  'write_provenance',
-  'sync_conversation',
-  'mark_deleted',
-  'tombstone_conversation_locked',
-  'mark_lifecycle_recovery_required_locked',
-  'clear_recovery_item'
-]
-
-function lockedWorkflow(): string {
+function workflow(extra = ''): string {
   return `
 jobs:
   conversation-native-durability:
-    matrix:
-      include:
-        - platform: linux
-        - platform: macos
-        - platform: windows
+    strategy:
+      matrix:
+        include:
+          - platform: linux
+          - platform: macos
+          - platform: windows
     steps:
-      - run: cargo metadata --locked --format-version 1
       - run: cargo test --locked conversation::native_durability_tests
-      - run: cargo check --locked --all-targets
-      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --test conversation_first_guardrails
+  standalone-server-build:
+    steps:
       - run: cargo build --locked --bin termul-server --features standalone-server
       - run: cargo clippy --locked --bin termul-server --features standalone-server -- -D warnings
-`
+${extra}`
 }
 
-function authenticatedAdapter(): string {
+function parserAdapter(): string {
   return `
-fn handler(
-  Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
-  Extension(principal): Extension<RemotePrincipal>,
-) { authority.authorize(&principal, RemoteCapability::Mutate); }
-`
-}
-
-function sharedParserAdapter(): string {
-  return `
-import { isConversationId } from '@shared/types/conversation.types'
-export const valid = isConversationId(value)
+import { isConversationId as validConversationId } from '@shared/types/conversation.types'
+export const valid = validConversationId(value)
 `
 }
 
 function validSources(): Record<string, string> {
-  const repository = `
-pub struct ConversationRepository;
-${repositoryMutators
-  .map((mutator) => `pub(crate) fn ${mutator}(permit: &RepositoryWritePermit) { let _ = permit; }`)
-  .join('\n')}
-`
   return {
-    '.github/workflows/pr-validation.yml': lockedWorkflow(),
-    'src-tauri/src/conversation/application.rs': 'pub struct ConversationApplicationService;',
-    'src-tauri/src/conversation/bootstrap.rs': 'pub struct BootstrapOutcome;',
-    'src-tauri/src/conversation/repository.rs': repository,
-    'src-tauri/src/conversation/session_workspace.rs': `
-pub struct SessionWorkspaceV1 {
-  pub conversation_id: ConversationId,
-  pub revision: u64,
-}
-pub enum SessionWorkspaceLoadOutcome { Missing }
-`,
-    'src-tauri/src/conversation/write_authority.rs': `
-pub struct ConversationWriteAuthority;
-pub struct ConversationWriter;
-pub(crate) struct RepositoryWritePermit;
-pub(crate) struct MigrationWriter;
-const PRECEDENCE: ReaderPrecedence = ReaderPrecedence::HybridLegacyFirst;
-const ERROR: ConversationErrorCode = ConversationErrorCode::LegacyCompatibilityReadOnly;
-#[cfg(test)]
-pub(crate) fn for_test() {}
-`,
-    'src-tauri/src/pty/manager.rs': `
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct TerminalSpawnIntentV1 { conversation_id: ConversationId }
-`,
-    'src-tauri/src/remote/host.rs': `
-enum CredentialSource {
-  Desktop,
-  #[cfg(test)]
-  Test(String),
-}
-async fn start() { serve_router().await; }
-#[cfg(test)]
-mod tests { const TEXT: &str = "kill_all is forbidden"; }
-`,
-    'src-tauri/src/web/auth.rs': `
-use subtle::ConstantTimeEq;
-enum RemoteCapability { Read, Mutate, RecoveryInspect }
-fn verify_bearer_for_peer() {}
-fn verify_origin() {}
-fn capability_middleware() {
-  let _ = RemoteCapability::Read;
-  let _ = RemoteCapability::Mutate;
-  let _ = RemoteCapability::RecoveryInspect;
-  let protected = ["/conversations", "/conversation-recovery/", "/terminal/ws"];
-}
-`,
-    'src-tauri/src/web/conversation_api.rs': authenticatedAdapter(),
-    'src-tauri/src/web/conversation_lifecycle_api.rs': authenticatedAdapter(),
-    'src-tauri/src/web/mod.rs': `
-pub async fn serve() {
-  acp.kill_all_checked().await;
-  pty.kill_all().await;
-}
-pub async fn serve_router() { build_router(); }
-async fn shutdown_signal_future() {}
-`,
-    'src-tauri/src/web/router.rs': `
-fn router() {
-  Router::new()
-    .layer(middleware::from_fn(capability_middleware))
-    .layer(Extension(authority));
-}
-`,
-    'src-tauri/src/web/session_workspace_api.rs': authenticatedAdapter(),
-    'src-tauri/src/web/terminal_ws.rs': `
-use crate::pty::manager::TerminalSpawnIntentV1;
-fn dispatch(payload: Value) {
-  let _: TerminalSpawnIntentV1 = serde_json::from_value(payload).unwrap();
-}
-#[cfg(test)]
-use crate::pty::manager::SpawnOptions;
-#[cfg(test)]
-mod tests { fn accepts_raw_for_local_fixture() { let _ = SpawnOptions::default(); } }
-`,
-    'src-tauri/src/web/ws.rs': `
-fn upgrade(origin: Origin) { authority.verify_origin(origin); }
-fn authenticate(payload: Payload, peer: Peer) {
-  authority.verify_bearer_for_peer(&payload.token, peer.ip());
-  *authed = true;
-}
-`,
+    '.github/workflows/pr-validation.yml': workflow(),
+    '.github/workflows/other.yaml':
+      'jobs:\n  check:\n    steps:\n      - run: cargo check --locked --all-targets\n',
     'src/renderer/App.tsx': root(),
     'src/renderer/TauriApp.tsx': root(),
     'src/renderer/app/PortableAppEffects.tsx': portableEffects(),
     'src/renderer/app/portable-router.tsx': portableRouter(),
-    'src/renderer/components/mobile/MobileChatShell.tsx': 'export function MobileChatShell() {}',
-    'src/renderer/hooks/use-session-workspace-sync.ts': 'export function sync() {}',
-    'src/renderer/layouts/WorkspaceLayout.tsx': `
-const closeTerminalViewByRecordId = async () => closeTerminalView('terminal')
-const requestTerminateTerminal = () => terminateTerminalResource('terminal')
+    'src/renderer/lib/acp-history-persistence.ts': `
+import { isConversationId } from '@shared/types/conversation.types'
+import { acpHistoryApi as history } from '@/lib/acp-history-api'
+const ok = isConversationId(id)
+export async function page(mode: string) {
+  if (mode === 'server') return transport.getSessionPayloadPage(id, 0, 250)
+  return history.getPage(id, 0, 250)
+}
 `,
-    'src/renderer/lib/acp-history-persistence.ts': sharedParserAdapter(),
-    'src/renderer/lib/acp-transport.ts': `
-function getRemoteAccessCredential() { return memoryCredential }
-const payload = { token: getRemoteAccessCredential() }
-`,
+    'src/renderer/lib/conversation-lifecycle-api.ts': parserAdapter(),
+    'src/renderer/lib/tauri-conversation-api.ts': parserAdapter(),
+    'src/renderer/lib/tauri-session-workspace-api.ts': parserAdapter(),
+    'src/renderer/lib/web-conversation-api.ts': parserAdapter(),
+    'src/renderer/lib/web-session-workspace-api.ts': parserAdapter(),
     'src/renderer/lib/conversation-api.ts': `
-const delegates = {
-  sessionWorkspaceApi,
-  conversationLifecycleApi,
-  tauriConversationApi,
-  webConversationApi,
-  createConversationFacadeApi
-}
+import { sessionWorkspaceApi } from './session-workspace-api'
+import { conversationLifecycleApi } from './conversation-lifecycle-api'
+import { tauriConversationApi } from './tauri-conversation-api'
+import { webConversationApi } from './web-conversation-api'
+export const conversationApi = { sessionWorkspaceApi, conversationLifecycleApi, tauriConversationApi, webConversationApi }
 `,
-    'src/renderer/lib/conversation-lifecycle-api.ts': sharedParserAdapter(),
-    'src/renderer/lib/router-navigate.ts': 'export function navigate() {}',
-    'src/renderer/lib/tauri-conversation-api.ts': sharedParserAdapter(),
-    'src/renderer/lib/tauri-session-workspace-api.ts': sharedParserAdapter(),
-    'src/renderer/lib/web-conversation-api.ts': sharedParserAdapter(),
-    'src/renderer/lib/web-session-workspace-api.ts': sharedParserAdapter(),
-    'src/renderer/stores/conversation-store.ts': 'export const conversationStore = {}',
-    'src/renderer/stores/project-store.ts': 'export function selectProject() {}',
-    'src/shared/types/conversation-api.types.ts': `
-export interface ConversationApi {
-  listConversations(): Promise<void>
-}
-`,
-    'src/shared/types/conversation.types.ts': `
-export function isConversationId(value: string): boolean { return value.length > 0 }
+    'src/renderer/lib/acp-transport.ts': `
+import { getRemoteAccessCredential as credential } from './remote-access-credential'
+export const payload = { token: credential() }
 `,
     'src/shared/types/session-workspace.types.ts': `
-export interface SessionWorkspaceV1 {
-  conversationId: ConversationId
-  revision: number
-}
+export interface SessionWorkspaceV1 { conversationId: string; revision: number }
 `,
     'src/shared/types/web-terminal-protocol.types.ts': `
-export interface TerminalSpawnIntentV1 {
-  conversationId: ConversationId
-  cwdSource: 'workspace' | 'executionTarget'
-  cols: number
-  rows: number
-}
+export interface TerminalSpawnIntentV1 { conversationId: string; cols: number; rows: number }
 `
   }
 }
 
-function rules(sources: GuardSources): string[] {
-  return checkConversationFirstGuardrails(sources).map((item) => item.rule)
+function findings(sources: GuardSources, rule: string) {
+  return checkConversationFirstGuardrails(sources).filter((item) => item.rule === rule)
 }
 
-describe('Conversation-first structural guardrails', () => {
-  it('strips line and block comments without losing actionable line numbers', () => {
-    const source = `const live = true\n// terminalApi.terminate('comment')\n/*\nkill_all()\n*/\nconst end = true`
-    const stripped = stripComments(source)
-    expect(stripped).not.toContain("terminalApi.terminate('comment')")
-    expect(stripped).not.toContain('kill_all()')
-    expect(stripped.split('\n')).toHaveLength(source.split('\n').length)
-  })
-
-  it('removes Rust cfg(test) imports and modules without hiding production lines', () => {
-    const source = `fn production() {}\n#[cfg(test)]\nuse crate::SpawnOptions;\n#[cfg(test)]\nmod tests { fn raw() { SpawnOptions::default(); } }`
-    const stripped = stripRustTestCode(source)
-    expect(stripped).toContain('fn production() {}')
-    expect(stripped).not.toContain('SpawnOptions')
-    expect(stripped.split('\n')).toHaveLength(source.split('\n').length)
-  })
-
-  it('accepts the locked architecture and explicit terminate-only path', () => {
+describe('Conversation-first semantic guardrails', () => {
+  it('accepts imported aliases and structural JSX/calls/routes', () => {
     expect(checkConversationFirstGuardrails(validSources())).toEqual([])
   })
 
-  it('does not let cfg(test) repository fixtures satisfy production write admission', () => {
+  it('ignores comments and string decoys but rejects a missing real root node', () => {
     const sources = validSources()
-    sources['src-tauri/src/conversation/repository.rs'] = sources[
-      'src-tauri/src/conversation/repository.rs'
-    ]
-      .replace(
-        'pub(crate) fn append_event(permit: &RepositoryWritePermit) { let _ = permit; }',
-        'pub(crate) fn append_event() {}'
-      )
-      .concat(`
-#[cfg(test)]
-mod tests {
-  pub(crate) fn append_event(permit: &RepositoryWritePermit) { let _ = permit; }
-}
-`)
-
-    expect(
-      checkConversationFirstGuardrails(sources).some(
-        (item) => item.rule === 'write-admission' && item.message.includes('mutator append_event')
-      )
-    ).toBe(true)
+    sources['src/renderer/App.tsx'] = root().replace(
+      '<Effects />',
+      '{/* <Effects /> */}{"<PortableAppEffects />"}'
+    )
+    const result = findings(sources, 'root-parity')
+    expect(result.some((item) => item.file === 'src/renderer/App.tsx')).toBe(true)
   })
 
-  it('returns process-compatible exit semantics with sanitized file:line failures', () => {
+  it('detects renamed teardown aliases inside a moved navigation helper with exact evidence', () => {
+    const sources = validSources()
+    sources['src/renderer/moved/navigation-owner.ts'] = `
+import { terminalApi } from '@/lib/terminal-api'
+const dispose = terminalApi.terminate
+export function selectProject() { return dispose('pty') }
+`
+    const result = findings(sources, 'navigation-preserves-pty')
+    expect(result).toHaveLength(1)
+    expect(result[0]).toMatchObject({ file: 'src/renderer/moved/navigation-owner.ts' })
+    expect(result[0].line).toBeGreaterThan(0)
+  })
+
+  it('detects one-hop helper indirection without being spoofed by comments', () => {
+    const sources = validSources()
+    sources['src/renderer/moved/project-navigation.ts'] = `
+const stop = () => terminalApi.terminate('pty')
+export function switchProject() { return stop() }
+// terminalApi.terminate('comment')
+const decoy = "terminalApi.terminate('string')"
+`
+    expect(findings(sources, 'navigation-preserves-pty')).toHaveLength(1)
+  })
+
+  it('discovers a newly added workflow path and reports its job/step and line', () => {
+    const sources = validSources()
+    sources['.github/workflows/new-active.yaml'] = `
+jobs:
+  fresh:
+    steps:
+      - name: unlocked
+        run: cargo check --all-targets
+`
+    const result = findings(sources, 'locked-rust-ci')
+    expect(result).toHaveLength(1)
+    expect(result[0]).toMatchObject({ file: '.github/workflows/new-active.yaml' })
+    expect(result[0].message).toContain('job=fresh')
+    expect(result[0].line).toBeGreaterThan(0)
+
+    sources['.github/workflows/new-active.yaml'] = sources[
+      '.github/workflows/new-active.yaml'
+    ].replace('cargo check', 'cargo check --locked')
+    expect(findings(sources, 'locked-rust-ci')).toEqual([])
+  })
+
+  it('checks multiline YAML run scalars semantically', () => {
+    const sources = validSources()
+    sources['.github/workflows/folded.yml'] = `
+jobs:
+  build:
+    steps:
+      - run: >
+          cargo build --release --bin termul-server
+          --features standalone-server
+`
+    expect(findings(sources, 'locked-rust-ci')).toHaveLength(1)
+  })
+
+  it('requires the real history paging facades, not token-shaped text', () => {
+    const sources = validSources()
+    sources['src/renderer/lib/acp-history-persistence.ts'] = `
+import { isConversationId } from '@shared/types/conversation.types'
+import { acpHistoryApi } from '@/lib/acp-history-api'
+const ok = isConversationId(id)
+// acpHistoryApi.getPage(id, 0, 250)
+const decoy = 'getSessionPayloadPage'
+`
+    expect(findings(sources, 'history-paging-facade')).toHaveLength(2)
+  })
+
+  it('rejects raw remote spawn fields and placeholder credentials as AST nodes', () => {
+    const sources = validSources()
+    sources['src/shared/types/web-terminal-protocol.types.ts'] = `
+export interface TerminalSpawnIntentV1 { conversationId: string; shell?: string }
+`
+    sources['src/renderer/lib/acp-transport.ts'] = `
+function getRemoteAccessCredential() { return memory }
+const payload = { token: 'dev' }
+`
+    expect(findings(sources, 'remote-terminal-intent')).toHaveLength(1)
+    expect(findings(sources, 'authenticated-remote-access')).toHaveLength(2)
+  })
+
+  it('retains process-compatible sanitized file:line output', () => {
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined)
     const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
     expect(main(validSources())).toBe(0)
-
-    const invalid = validSources()
-    invalid['src-tauri/src/web/terminal_ws.rs'] = `fn run() { let raw = SpawnOptions::default(); }`
-    expect(main(invalid)).toBe(1)
+    const sources = validSources()
+    sources['.github/workflows/new-active.yaml'] =
+      'jobs:\n  x:\n    steps:\n      - run: cargo test\n'
+    expect(main(sources)).toBe(1)
     expect(error).toHaveBeenCalledWith(
-      expect.stringMatching(/^src-tauri\/src\/web\/terminal_ws\.rs:\d+ \[remote-terminal-intent\]/)
+      expect.stringMatching(/^\.github\/workflows\/new-active\.yaml:\d+ \[locked-rust-ci\]/)
     )
-
     log.mockRestore()
     error.mockRestore()
   })
 
-  it.each([
-    [
-      'sole-writer',
-      'src-tauri/src/conversation/session_workspace.rs',
-      `std::fs::write(path.join("workspace.json"), bytes);`
-    ],
-    [
-      'legacy-read-only',
-      'src/renderer/hooks/use-session-workspace-sync.ts',
-      `workspaceManifestApi.writeManifest(projectId, value)`
-    ],
-    [
-      'workspace-identity',
-      'src/shared/types/session-workspace.types.ts',
-      `export interface SessionWorkspaceV1 {\n  projectId: string\n}\n`
-    ],
-    [
-      'raw-claim',
-      'src/shared/types/session-workspace.types.ts',
-      `export interface SessionWorkspaceV1 {\n  claim: string\n}\n`
-    ],
-    [
-      'navigation-preserves-pty',
-      'src/renderer/stores/project-store.ts',
-      `terminalApi.terminate('terminal-one')`
-    ],
-    [
-      'root-parity',
-      'src/renderer/App.tsx',
-      root().replace("import { PortableAppEffects } from '@/app/PortableAppEffects'\n", '')
-    ],
-    [
-      'root-parity',
-      'src/renderer/app/PortableAppEffects.tsx',
-      portableEffects().replace('  useAcpMcp()\n', '')
-    ],
-    [
-      'desktop-shared-live-ownership',
-      'src-tauri/src/remote/host.rs',
-      `async fn start() { serve_router().await; acp.kill_all(); }`
-    ],
-    [
-      'standalone-owns-shutdown',
-      'src-tauri/src/web/mod.rs',
-      `pub async fn serve() { pty.kill_all().await; }\npub async fn serve_router() {}\nasync fn shutdown_signal_future() {}`
-    ],
-    [
-      'authenticated-remote-access',
-      'src/renderer/lib/acp-transport.ts',
-      `function getRemoteAccessCredential() { return 'ignored' }\nconst payload = { token: 'dev' }`
-    ],
-    [
-      'capability-not-peer-ip',
-      'src-tauri/src/web/conversation_lifecycle_api.rs',
-      `${authenticatedAdapter()}\nfn bypass(peer: Peer) { if peer.ip().is_loopback() { mutate(); } }`
-    ],
-    [
-      'anonymous-exposure',
-      'src-tauri/src/web/auth.rs',
-      validSources()['src-tauri/src/web/auth.rs'].replace('"/conversations", ', '')
-    ],
-    [
-      'remote-terminal-intent',
-      'src-tauri/src/web/terminal_ws.rs',
-      `use crate::pty::manager::TerminalSpawnIntentV1;\nfn run() { let raw = SpawnOptions::default(); }`
-    ],
-    [
-      'host-service-graph',
-      'src-tauri/src/conversation/application.rs',
-      `fn open() { ConversationRepository::lookup_single_open(); }`
-    ],
-    [
-      'write-admission',
-      'src-tauri/src/conversation/repository.rs',
-      validSources()['src-tauri/src/conversation/repository.rs'].replace(
-        'pub(crate) fn append_event(permit: &RepositoryWritePermit)',
-        'pub(crate) fn append_event()'
-      )
-    ],
-    [
-      'shared-conversation-id-parser',
-      'src/renderer/lib/conversation-lifecycle-api.ts',
-      `const canonicalUuid = /^[0-9a-f]{8}-[0-9a-f-]+$/`
-    ],
-    [
-      'facade-transport-ownership',
-      'src/shared/types/conversation-api.types.ts',
-      `export interface ConversationApi {\n  getWorkspace(): Promise<void>\n}`
-    ],
-    [
-      'locked-rust-ci',
-      '.github/workflows/pr-validation.yml',
-      lockedWorkflow().replace('cargo check --locked', 'cargo check')
-    ],
-    [
-      'native-ci-wiring',
-      '.github/workflows/pr-validation.yml',
-      lockedWorkflow().replace('        - platform: windows\n', '')
-    ]
-  ])('reports %s violations with exact file:line evidence', (rule, file, replacement) => {
-    const sources = validSources()
-    sources[file] = replacement
-    const findings = checkConversationFirstGuardrails(sources).filter((item) => item.rule === rule)
-    expect(findings.length).toBeGreaterThan(0)
-    expect(findings[0]).toMatchObject({ rule, file })
-    expect(findings[0].line).toBeGreaterThan(0)
-    expect(`${findings[0].file}:${findings[0].line}`).toMatch(/:\d+$/)
-  })
+  it('keeps compatibility stripping helpers line-stable', () => {
+    const source = `const live = true\n// kill_all()\n/* terminate() */\nconst end = true`
+    const stripped = stripComments(source)
+    expect(stripped).not.toContain('kill_all')
+    expect(stripped).not.toContain('terminate')
+    expect(stripped.split('\n')).toHaveLength(source.split('\n').length)
 
-  it('reports a root that duplicates portable effects with exact file:line evidence', () => {
-    const sources = validSources()
-    sources['src/renderer/TauriApp.tsx'] += `
-function AppEffects() {
-  useGitStatus()
-}
-`
-
-    const findings = checkConversationFirstGuardrails(sources).filter(
-      (item) => item.rule === 'root-parity' && item.file === 'src/renderer/TauriApp.tsx'
-    )
-
-    expect(
-      findings.some((item) => item.message.includes('redeclare portable application effects'))
-    ).toBe(true)
-    expect(findings.some((item) => item.message.includes('duplicate portable effect hooks'))).toBe(
-      true
-    )
-    expect(findings.every((item) => item.line > 0)).toBe(true)
-  })
-
-  it('reports a root that duplicates portable routes with exact file:line evidence', () => {
-    const sources = validSources()
-    sources['src/renderer/App.tsx'] += `
-const duplicateRouter = createHashRouter([
-  { path: 'settings' }
-])
-`
-
-    const findings = checkConversationFirstGuardrails(sources).filter(
-      (item) => item.rule === 'root-parity' && item.file === 'src/renderer/App.tsx'
-    )
-
-    expect(
-      findings.some((item) => item.message.includes('redeclare the portable route table'))
-    ).toBe(true)
-    expect(findings.some((item) => item.message.includes('duplicate a portable route'))).toBe(true)
-    expect(findings.every((item) => item.line > 0)).toBe(true)
-  })
-
-  it('does not treat forbidden words in comments as live code', () => {
-    const sources = validSources()
-    sources['src/renderer/stores/project-store.ts'] = `
-// terminalApi.terminate('comment only')
-/* kill_all(); workspaceManifestApi.writeManifest() */
-export function selectProject() {}
-`
-    expect(rules(sources)).not.toContain('navigation-preserves-pty')
-    expect(rules(sources)).not.toContain('legacy-read-only')
+    const rust = `fn live() {}\n#[cfg(test)]\nmod tests { fn kill_all() {} }`
+    const production = stripRustTestCode(rust)
+    expect(production).toContain('fn live() {}')
+    expect(production).not.toContain('kill_all')
+    expect(production.split('\n')).toHaveLength(rust.split('\n').length)
   })
 })

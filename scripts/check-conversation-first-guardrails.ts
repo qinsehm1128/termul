@@ -1,5 +1,7 @@
-import { readFileSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { readdirSync, readFileSync } from 'node:fs'
+import { extname, join, relative, resolve, sep } from 'node:path'
+import { ts } from '@ts-morph/common'
+import { isMap, isScalar, isSeq, LineCounter, parseDocument, type Node as YamlNode } from 'yaml'
 
 export interface GuardFinding {
   rule: string
@@ -10,96 +12,10 @@ export interface GuardFinding {
 
 export type GuardSources = Readonly<Record<string, string>>
 
-const REQUIRED_SOURCES = [
-  '.github/workflows/pr-validation.yml',
-  'src-tauri/src/conversation/application.rs',
-  'src-tauri/src/conversation/bootstrap.rs',
-  'src-tauri/src/conversation/repository.rs',
-  'src-tauri/src/conversation/session_workspace.rs',
-  'src-tauri/src/conversation/write_authority.rs',
-  'src-tauri/src/pty/manager.rs',
-  'src-tauri/src/remote/host.rs',
-  'src-tauri/src/web/auth.rs',
-  'src-tauri/src/web/conversation_api.rs',
-  'src-tauri/src/web/conversation_lifecycle_api.rs',
-  'src-tauri/src/web/mod.rs',
-  'src-tauri/src/web/router.rs',
-  'src-tauri/src/web/session_workspace_api.rs',
-  'src-tauri/src/web/terminal_ws.rs',
-  'src-tauri/src/web/ws.rs',
-  'src/renderer/App.tsx',
-  'src/renderer/TauriApp.tsx',
-  'src/renderer/app/PortableAppEffects.tsx',
-  'src/renderer/app/portable-router.tsx',
-  'src/renderer/components/mobile/MobileChatShell.tsx',
-  'src/renderer/hooks/use-session-workspace-sync.ts',
-  'src/renderer/layouts/WorkspaceLayout.tsx',
-  'src/renderer/lib/acp-history-persistence.ts',
-  'src/renderer/lib/acp-transport.ts',
-  'src/renderer/lib/conversation-api.ts',
-  'src/renderer/lib/conversation-lifecycle-api.ts',
-  'src/renderer/lib/router-navigate.ts',
-  'src/renderer/lib/tauri-conversation-api.ts',
-  'src/renderer/lib/tauri-session-workspace-api.ts',
-  'src/renderer/lib/web-conversation-api.ts',
-  'src/renderer/lib/web-session-workspace-api.ts',
-  'src/renderer/stores/conversation-store.ts',
-  'src/renderer/stores/project-store.ts',
-  'src/shared/types/conversation-api.types.ts',
-  'src/shared/types/conversation.types.ts',
-  'src/shared/types/session-workspace.types.ts',
-  'src/shared/types/web-terminal-protocol.types.ts'
-] as const
-
-const NAVIGATION_FILES = [
-  'src/renderer/App.tsx',
-  'src/renderer/TauriApp.tsx',
-  'src/renderer/app/PortableAppEffects.tsx',
-  'src/renderer/app/portable-router.tsx',
-  'src/renderer/components/mobile/MobileChatShell.tsx',
-  'src/renderer/lib/router-navigate.ts',
-  'src/renderer/stores/conversation-store.ts',
-  'src/renderer/stores/project-store.ts'
-] as const
-
-const AUTHENTICATED_CONVERSATION_ADAPTERS = [
-  'src-tauri/src/web/conversation_api.rs',
-  'src-tauri/src/web/conversation_lifecycle_api.rs',
-  'src-tauri/src/web/session_workspace_api.rs'
-] as const
-
-const RENDERER_CONVERSATION_ADAPTERS = [
-  'src/renderer/lib/acp-history-persistence.ts',
-  'src/renderer/lib/conversation-lifecycle-api.ts',
-  'src/renderer/lib/tauri-conversation-api.ts',
-  'src/renderer/lib/tauri-session-workspace-api.ts',
-  'src/renderer/lib/web-conversation-api.ts',
-  'src/renderer/lib/web-session-workspace-api.ts'
-] as const
-
-const REPOSITORY_MUTATORS = [
-  'replace_workspace_bytes',
-  'create_conversation',
-  'update_metadata',
-  'append_event',
-  'bind_agent_session',
-  'detach_agent_binding',
-  'rebind_detached_binding',
-  'suspend_agent_binding',
-  'replace_agent_binding',
-  'refresh_lifecycle_catalog',
-  'append_project_attachment',
-  'detach_project_attachment',
-  'attach_project_cas',
-  'detach_project_cas',
-  'update_execution_target_cas',
-  'write_provenance',
-  'sync_conversation',
-  'mark_deleted',
-  'tombstone_conversation_locked',
-  'mark_lifecycle_recovery_required_locked',
-  'clear_recovery_item'
-] as const
+interface SemanticSymbol {
+  module: string
+  exported: string
+}
 
 const PORTABLE_EFFECT_HOOKS = [
   'useTerminalAutoSave',
@@ -137,801 +53,797 @@ const PORTABLE_EFFECT_HOOKS = [
   'usePreventNativeContextMenu'
 ] as const
 
-function lineNumber(source: string, index: number): number {
-  return source.slice(0, index).split('\n').length
+const PORTABLE_ROUTES = [
+  'c/:conversationId',
+  'legacy/session/:legacyValue',
+  'legacy/storage/:legacyValue',
+  'legacy/history/:legacyValue',
+  'snapshots',
+  'settings',
+  'preferences'
+] as const
+
+const SHARED_PARSER_ADAPTER_SUFFIXES = [
+  'src/renderer/lib/acp-history-persistence.ts',
+  'src/renderer/lib/conversation-lifecycle-api.ts',
+  'src/renderer/lib/tauri-conversation-api.ts',
+  'src/renderer/lib/tauri-session-workspace-api.ts',
+  'src/renderer/lib/web-conversation-api.ts',
+  'src/renderer/lib/web-session-workspace-api.ts'
+] as const
+
+function normalizePath(path: string): string {
+  return path.split(sep).join('/')
 }
 
-function finding(
-  rule: string,
-  file: string,
-  source: string,
-  index: number,
-  message: string
-): GuardFinding {
-  return { rule, file, line: lineNumber(source, index), message }
+function lineAt(sourceFile: ts.SourceFile, node: ts.Node): number {
+  return sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1
 }
 
-/** Strip line/block comments while preserving newlines and character offsets. */
-export function stripComments(source: string): string {
-  let result = ''
-  let state: 'code' | 'line' | 'block' | 'single' | 'double' | 'template' = 'code'
-  let escaped = false
-
-  for (let index = 0; index < source.length; index += 1) {
-    const current = source[index]
-    const next = source[index + 1]
-
-    if (state === 'line') {
-      if (current === '\n') {
-        state = 'code'
-        result += '\n'
-      } else {
-        result += ' '
-      }
-      continue
-    }
-    if (state === 'block') {
-      if (current === '*' && next === '/') {
-        result += '  '
-        index += 1
-        state = 'code'
-      } else {
-        result += current === '\n' ? '\n' : ' '
-      }
-      continue
-    }
-    if (state !== 'code') {
-      result += current
-      if (escaped) {
-        escaped = false
-      } else if (current === '\\') {
-        escaped = true
-      } else if (
-        (state === 'single' && current === "'") ||
-        (state === 'double' && current === '"') ||
-        (state === 'template' && current === '`')
-      ) {
-        state = 'code'
-      }
-      continue
-    }
-
-    if (current === '/' && next === '/') {
-      result += '  '
-      index += 1
-      state = 'line'
-    } else if (current === '/' && next === '*') {
-      result += '  '
-      index += 1
-      state = 'block'
-    } else {
-      result += current
-      if (current === "'") state = 'single'
-      else if (current === '"') state = 'double'
-      else if (current === '`') state = 'template'
-    }
-  }
-  return result
-}
-
-function blankPreservingLines(source: string): string {
-  return source.replace(/[^\n]/g, ' ')
-}
-
-/** Remove Rust-only test modules/items while preserving production line offsets. */
-export function stripRustTestCode(source: string): string {
-  let result = stripComments(source)
-  result = result.replace(/#\[cfg\(test\)\]\s*\n\s*use\s+[^;]+;/g, (matched) =>
-    blankPreservingLines(matched)
-  )
-  const testModule = result.search(/\n#\[cfg\(test\)\]\s*\n(?:pub\([^)]*\)\s+)?mod\s+tests\b/)
-  if (testModule >= 0) {
-    result = `${result.slice(0, testModule)}${blankPreservingLines(result.slice(testModule))}`
-  }
-  return result
-}
-
-function extractDelimited(source: string, startToken: string, endToken: string): string | null {
-  const start = source.indexOf(startToken)
-  if (start < 0) return null
-  const end = source.indexOf(endToken, start + startToken.length)
-  return end < 0 ? null : source.slice(start, end)
-}
-
-function scanPattern(
+function addFinding(
   findings: GuardFinding[],
   rule: string,
   file: string,
-  source: string,
-  pattern: RegExp,
+  sourceFile: ts.SourceFile,
+  node: ts.Node,
   message: string
 ): void {
-  const flags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`
-  const regex = new RegExp(pattern.source, flags)
-  for (const match of source.matchAll(regex)) {
-    findings.push(finding(rule, file, source, match.index ?? 0, message))
-  }
+  findings.push({ rule, file, line: lineAt(sourceFile, node), message })
 }
 
-function requireToken(
-  findings: GuardFinding[],
-  rule: string,
-  file: string,
-  source: string,
-  token: string,
-  message: string
-): void {
-  if (!source.includes(token)) findings.push({ rule, file, line: 1, message })
+function scriptKind(file: string): ts.ScriptKind {
+  return file.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS
 }
 
-function requirePattern(
-  findings: GuardFinding[],
-  rule: string,
-  file: string,
-  source: string,
-  pattern: RegExp,
-  message: string
-): void {
-  const regex = new RegExp(pattern.source, pattern.flags.replace('g', ''))
-  if (!regex.test(source)) findings.push({ rule, file, line: 1, message })
+function isTypeScriptFile(file: string): boolean {
+  return /\.(?:ts|tsx)$/.test(file) && !/\.d\.ts$/.test(file)
 }
 
-export function checkConversationFirstGuardrails(sources: GuardSources): GuardFinding[] {
-  const findings: GuardFinding[] = []
-  const stripped = Object.fromEntries(
-    Object.entries(sources).map(([file, source]) => [file, stripComments(source)])
-  )
-  const production = Object.fromEntries(
-    Object.entries(sources).map(([file, source]) => [
+class TypeScriptModel {
+  readonly sourceFile: ts.SourceFile
+  private readonly imports = new Map<string, SemanticSymbol>()
+  private readonly aliases = new Map<string, ts.Expression>()
+
+  constructor(
+    readonly file: string,
+    readonly source: string
+  ) {
+    this.sourceFile = ts.createSourceFile(
       file,
-      file.endsWith('.rs') ? stripRustTestCode(source) : stripComments(source)
-    ])
-  )
+      source,
+      ts.ScriptTarget.Latest,
+      true,
+      scriptKind(file)
+    )
+    this.indexBindings()
+  }
 
-  for (const file of REQUIRED_SOURCES) {
-    if (!(file in sources)) {
+  private indexBindings(): void {
+    for (const statement of this.sourceFile.statements) {
+      if (ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier)) {
+        const module = statement.moduleSpecifier.text
+        const clause = statement.importClause
+        if (!clause) continue
+        if (clause.name) this.imports.set(clause.name.text, { module, exported: 'default' })
+        if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+          for (const element of clause.namedBindings.elements) {
+            this.imports.set(element.name.text, {
+              module,
+              exported: element.propertyName?.text ?? element.name.text
+            })
+          }
+        } else if (clause.namedBindings && ts.isNamespaceImport(clause.namedBindings)) {
+          this.imports.set(clause.namedBindings.name.text, { module, exported: '*' })
+        }
+      }
+    }
+
+    const visit = (node: ts.Node): void => {
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+        this.aliases.set(node.name.text, node.initializer)
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(this.sourceFile)
+  }
+
+  resolveExpression(expression: ts.Expression, seen = new Set<string>()): SemanticSymbol | null {
+    if (ts.isParenthesizedExpression(expression))
+      return this.resolveExpression(expression.expression, seen)
+    if (ts.isIdentifier(expression)) {
+      const imported = this.imports.get(expression.text)
+      if (imported) return imported
+      if (seen.has(expression.text)) return null
+      const alias = this.aliases.get(expression.text)
+      if (!alias) return { module: '', exported: expression.text }
+      seen.add(expression.text)
+      return this.resolveExpression(alias, seen)
+    }
+    if (ts.isPropertyAccessExpression(expression)) {
+      const base = this.resolveExpression(expression.expression, seen)
+      return { module: base?.module ?? '', exported: expression.name.text }
+    }
+    if (
+      ts.isElementAccessExpression(expression) &&
+      expression.argumentExpression &&
+      ts.isStringLiteral(expression.argumentExpression)
+    ) {
+      const base = this.resolveExpression(expression.expression, seen)
+      return { module: base?.module ?? '', exported: expression.argumentExpression.text }
+    }
+    return null
+  }
+
+  calls(): ts.CallExpression[] {
+    const calls: ts.CallExpression[] = []
+    const visit = (node: ts.Node): void => {
+      if (ts.isCallExpression(node)) calls.push(node)
+      ts.forEachChild(node, visit)
+    }
+    visit(this.sourceFile)
+    return calls
+  }
+
+  jsxTags(): Array<{ node: ts.JsxOpeningLikeElement; symbol: SemanticSymbol | null }> {
+    const tags: Array<{ node: ts.JsxOpeningLikeElement; symbol: SemanticSymbol | null }> = []
+    const visit = (node: ts.Node): void => {
+      if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
+        const expression = ts.isIdentifier(node.tagName)
+          ? node.tagName
+          : ts.isPropertyAccessExpression(node.tagName)
+            ? node.tagName
+            : null
+        tags.push({ node, symbol: expression ? this.resolveExpression(expression) : null })
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(this.sourceFile)
+    return tags
+  }
+
+  hasImport(module: string, exported: string): boolean {
+    return [...this.imports.values()].some(
+      (item) => item.module === module && item.exported === exported
+    )
+  }
+
+  hasCall(exported: string, module?: string): boolean {
+    return this.calls().some((call) => {
+      const symbol = this.resolveExpression(call.expression)
+      return symbol?.exported === exported && (module === undefined || symbol.module === module)
+    })
+  }
+
+  hasJsx(exported: string, module?: string): boolean {
+    return this.jsxTags().some(
+      ({ symbol }) =>
+        symbol?.exported === exported && (module === undefined || symbol.module === module)
+    )
+  }
+}
+
+function findModel(models: TypeScriptModel[], suffix: string): TypeScriptModel | undefined {
+  return models.find((model) => normalizePath(model.file).endsWith(suffix))
+}
+
+function checkRootParity(findings: GuardFinding[], models: TypeScriptModel[]): void {
+  const roots = ['src/renderer/App.tsx', 'src/renderer/TauriApp.tsx'] as const
+  for (const suffix of roots) {
+    const model = findModel(models, suffix)
+    if (!model) {
       findings.push({
-        rule: 'source-inventory',
-        file,
+        rule: 'source-discovery',
+        file: suffix,
         line: 1,
-        message: 'required source is missing'
+        message: 'renderer root is missing'
+      })
+      continue
+    }
+    const requirements: Array<[boolean, string]> = [
+      [
+        model.hasImport('@/app/PortableAppEffects', 'PortableAppEffects'),
+        'renderer root must import PortableAppEffects from the shared portable effects module'
+      ],
+      [
+        model.hasImport('@/app/portable-router', 'createPortableRouter'),
+        'renderer root must import createPortableRouter from the shared portable router module'
+      ],
+      [
+        model.hasCall('createPortableRouter', '@/app/portable-router'),
+        'renderer root must call the imported createPortableRouter (aliases are supported)'
+      ],
+      [
+        model.hasJsx('PortableAppEffects', '@/app/PortableAppEffects'),
+        'renderer root must render the imported PortableAppEffects component'
+      ],
+      [model.hasJsx('ConversationHostStatus'), 'renderer root must render ConversationHostStatus'],
+      [
+        model.hasJsx('ConversationRecoveryPanel'),
+        'renderer root must render ConversationRecoveryPanel'
+      ]
+    ]
+    for (const [passed, message] of requirements) {
+      if (!passed) findings.push({ rule: 'root-parity', file: model.file, line: 1, message })
+    }
+    for (const call of model.calls()) {
+      if (model.resolveExpression(call.expression)?.exported === 'createHashRouter') {
+        addFinding(
+          findings,
+          'root-parity',
+          model.file,
+          model.sourceFile,
+          call,
+          'renderer root must not redeclare the portable route table'
+        )
+      }
+      const symbol = model.resolveExpression(call.expression)
+      if (
+        symbol &&
+        PORTABLE_EFFECT_HOOKS.includes(symbol.exported as (typeof PORTABLE_EFFECT_HOOKS)[number])
+      ) {
+        addFinding(
+          findings,
+          'root-parity',
+          model.file,
+          model.sourceFile,
+          call,
+          `renderer root must not duplicate portable effect hook ${symbol.exported}`
+        )
+      }
+    }
+  }
+
+  const effects = findModel(models, 'src/renderer/app/PortableAppEffects.tsx')
+  if (!effects) {
+    findings.push({
+      rule: 'source-discovery',
+      file: 'src/renderer/app/PortableAppEffects.tsx',
+      line: 1,
+      message: 'shared portable effects source is missing'
+    })
+  } else {
+    for (const hook of PORTABLE_EFFECT_HOOKS) {
+      if (!effects.hasCall(hook)) {
+        findings.push({
+          rule: 'root-parity',
+          file: effects.file,
+          line: 1,
+          message: `shared portable effects are missing executable hook call ${hook}`
+        })
+      }
+    }
+    if (!effects.hasCall('initNotificationPermissions')) {
+      findings.push({
+        rule: 'root-parity',
+        file: effects.file,
+        line: 1,
+        message: 'shared portable effects are missing initNotificationPermissions call'
       })
     }
   }
 
-  const authFile = 'src-tauri/src/web/auth.rs'
-  const auth = production[authFile] ?? ''
-  for (const token of [
-    'subtle::ConstantTimeEq',
-    'verify_bearer_for_peer',
-    'verify_origin',
-    'capability_middleware',
-    'RemoteCapability::Read',
-    'RemoteCapability::Mutate',
-    'RemoteCapability::RecoveryInspect'
-  ]) {
-    requireToken(
-      findings,
-      'authenticated-remote-access',
-      authFile,
-      auth,
-      token,
-      `remote access authority is missing ${token}`
-    )
-  }
-  for (const token of ['"/conversations"', '"/conversation-recovery/"', '"/terminal/ws"']) {
-    requireToken(
-      findings,
-      'anonymous-exposure',
-      authFile,
-      auth,
-      token,
-      `protected capability routing is missing ${token}`
-    )
-  }
-
-  const wsFile = 'src-tauri/src/web/ws.rs'
-  const ws = production[wsFile] ?? ''
-  requireToken(
-    findings,
-    'authenticated-remote-access',
-    wsFile,
-    ws,
-    'authority.verify_bearer_for_peer(&payload.token',
-    'ACP WebSocket authenticate must verify the supplied credential before admission'
-  )
-  requireToken(
-    findings,
-    'authenticated-remote-access',
-    wsFile,
-    ws,
-    'authority.verify_origin(origin)',
-    'ACP WebSocket upgrade must verify Origin before admission'
-  )
-
-  const acpTransportFile = 'src/renderer/lib/acp-transport.ts'
-  const acpTransport = stripped[acpTransportFile] ?? ''
-  requireToken(
-    findings,
-    'authenticated-remote-access',
-    acpTransportFile,
-    acpTransport,
-    'getRemoteAccessCredential()',
-    'renderer WebSocket transport must source its credential from the in-memory pairing boundary'
-  )
-  for (const [file, source] of [
-    [authFile, auth],
-    [wsFile, ws],
-    [acpTransportFile, acpTransport]
-  ] as const) {
-    scanPattern(
-      findings,
-      'authenticated-remote-access',
-      file,
-      source,
-      /(?:token|credential)\s*:\s*['"](?:dev|placeholder|changeme)['"]|accept(?:s|ed)?\s+(?:any|every)\s+(?:token|credential)|authentication\s+(?:is\s+)?deferred/gi,
-      'placeholder or accept-any remote authentication is forbidden'
-    )
-  }
-
-  const routerFile = 'src-tauri/src/web/router.rs'
-  const router = production[routerFile] ?? ''
-  requireToken(
-    findings,
-    'anonymous-exposure',
-    routerFile,
-    router,
-    '.layer(middleware::from_fn(capability_middleware))',
-    'router must install capability middleware before protected Conversation routes are admitted'
-  )
-  requireToken(
-    findings,
-    'anonymous-exposure',
-    routerFile,
-    router,
-    '.layer(Extension(authority))',
-    'router must inject the exact host-owned remote access authority'
-  )
-
-  for (const file of AUTHENTICATED_CONVERSATION_ADAPTERS) {
-    const source = production[file] ?? ''
-    scanPattern(
-      findings,
-      'capability-not-peer-ip',
-      file,
-      source,
-      /(?:peer\.ip\(\)\.is_loopback\(\)|check_local_only\s*\()/,
-      'Conversation reads and mutations must use end-to-end capability authorization, not peer IP'
-    )
-    for (const token of [
-      'Extension(authority): Extension<Arc<RemoteAccessAuthority>>',
-      'Extension(principal): Extension<RemotePrincipal>'
-    ]) {
-      requireToken(
-        findings,
-        'capability-not-peer-ip',
-        file,
-        source,
-        token,
-        `Conversation adapter is missing authenticated boundary input: ${token}`
-      )
+  const router = findModel(models, 'src/renderer/app/portable-router.tsx')
+  if (!router) {
+    findings.push({
+      rule: 'source-discovery',
+      file: 'src/renderer/app/portable-router.tsx',
+      line: 1,
+      message: 'shared portable router source is missing'
+    })
+  } else {
+    const routes = new Set<string>()
+    const visit = (node: ts.Node): void => {
+      if (ts.isPropertyAssignment(node)) {
+        const name =
+          ts.isIdentifier(node.name) || ts.isStringLiteral(node.name) ? node.name.text : ''
+        if (name === 'path' && ts.isStringLiteralLike(node.initializer))
+          routes.add(node.initializer.text)
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(router.sourceFile)
+    for (const route of PORTABLE_ROUTES) {
+      if (!routes.has(route)) {
+        findings.push({
+          rule: 'root-parity',
+          file: router.file,
+          line: 1,
+          message: `shared portable router is missing structural path ${route}`
+        })
+      }
     }
   }
+}
 
-  const terminalWsFile = 'src-tauri/src/web/terminal_ws.rs'
-  const terminalWs = production[terminalWsFile] ?? ''
-  requireToken(
-    findings,
-    'remote-terminal-intent',
-    terminalWsFile,
-    terminalWs,
-    'TerminalSpawnIntentV1',
-    'remote terminal spawn must deserialize the narrow host-authorized intent'
-  )
-  scanPattern(
-    findings,
-    'remote-terminal-intent',
-    terminalWsFile,
-    terminalWs,
-    /\bSpawnOptions\b/,
-    'remote terminal transport must never accept or construct raw SpawnOptions'
-  )
-  const ptyManagerFile = 'src-tauri/src/pty/manager.rs'
-  const ptyManager = production[ptyManagerFile] ?? ''
-  requirePattern(
-    findings,
-    'remote-terminal-intent',
-    ptyManagerFile,
-    ptyManager,
-    /#\[serde\([^\]]*deny_unknown_fields[^\]]*\)\]\s*pub struct TerminalSpawnIntentV1\b/s,
-    'TerminalSpawnIntentV1 must reject unknown raw spawn fields'
-  )
-  const terminalProtocolFile = 'src/shared/types/web-terminal-protocol.types.ts'
-  const terminalProtocol = stripped[terminalProtocolFile] ?? ''
-  const terminalIntent =
-    extractDelimited(terminalProtocol, 'export interface TerminalSpawnIntentV1', '\n}') ?? ''
-  for (const field of ['program', 'args', 'env', 'cwd', 'shell']) {
-    scanPattern(
-      findings,
-      'remote-terminal-intent',
-      terminalProtocolFile,
-      terminalIntent,
-      new RegExp(`^\\s*${field}\\??\\s*:`, 'm'),
-      `remote TerminalSpawnIntentV1 must not expose caller-controlled ${field}`
-    )
-  }
-
-  const repositoryFile = 'src-tauri/src/conversation/repository.rs'
-  const repository = production[repositoryFile] ?? ''
-  requireToken(
-    findings,
-    'sole-writer',
-    repositoryFile,
-    repository,
-    'pub struct ConversationRepository',
-    'canonical ConversationRepository writer is missing'
-  )
-  requireToken(
-    findings,
-    'sole-writer',
-    repositoryFile,
-    repository,
-    'replace_workspace_bytes',
-    'SessionWorkspace writes must remain inside ConversationRepository'
-  )
-
-  const writeAuthorityFile = 'src-tauri/src/conversation/write_authority.rs'
-  const writeAuthority = production[writeAuthorityFile] ?? ''
-  for (const token of [
-    'pub struct ConversationWriteAuthority',
-    'pub struct ConversationWriter',
-    'pub(crate) struct RepositoryWritePermit',
-    'ReaderPrecedence::HybridLegacyFirst',
-    'ConversationErrorCode::LegacyCompatibilityReadOnly',
-    'pub(crate) struct MigrationWriter'
-  ]) {
-    requireToken(
-      findings,
-      'write-admission',
-      writeAuthorityFile,
-      writeAuthority,
-      token,
-      `bootstrap-owned Conversation write admission is missing ${token}`
-    )
-  }
-  requirePattern(
-    findings,
-    'write-admission',
-    writeAuthorityFile,
-    writeAuthority,
-    /#\[cfg\(test\)\]\s*pub\(crate\) fn for_test\b/s,
-    'unrestricted ConversationWriter::for_test construction must remain test-only'
-  )
-  for (const mutator of REPOSITORY_MUTATORS) {
-    const declaration = new RegExp(
-      `pub\\(crate\\)\\s+(?:async\\s+)?fn\\s+${mutator}\\s*\\([^)]{0,260}?RepositoryWritePermit`
-    )
-    requirePattern(
-      findings,
-      'write-admission',
-      repositoryFile,
-      repository,
-      declaration,
-      `repository mutator ${mutator} must require an unforgeable RepositoryWritePermit`
-    )
-  }
-  for (const file of [
-    'src-tauri/src/conversation/application.rs',
-    'src-tauri/src/conversation/bootstrap.rs',
-    'src-tauri/src/conversation/repository.rs',
-    'src-tauri/src/conversation/session_workspace.rs',
-    'src-tauri/src/web/terminal_ws.rs'
-  ]) {
-    scanPattern(
-      findings,
-      'host-service-graph',
-      file,
-      production[file] ?? '',
-      /\blookup_(?:single_)?open\s*\(/,
-      'production Conversation and terminal paths must use the exact bootstrap-owned service graph'
-    )
-  }
-
-  const sessionWorkspaceFile = 'src-tauri/src/conversation/session_workspace.rs'
-  const sessionWorkspace = production[sessionWorkspaceFile] ?? ''
-  const sessionWorkspaceProduction = sessionWorkspace
-  scanPattern(
-    findings,
-    'sole-writer',
-    sessionWorkspaceFile,
-    sessionWorkspaceProduction,
-    /(?:std::)?fs::(?:write|remove_file|rename)\s*\([^;]*(?:conversation\.json|messages\.jsonl|tool-calls\.jsonl|bindings\.jsonl|attachments\.jsonl|workspace\.json)/s,
-    'canonical Conversation files must be mutated through ConversationRepository'
-  )
-  scanPattern(
-    findings,
-    'legacy-read-only',
-    sessionWorkspaceFile,
-    sessionWorkspaceProduction,
-    /(?:ChatHistoryStore|SessionPersistence|WorkspaceManifestService)\s*::[^;]*(?:save|write|delete|flush|mark_)/,
-    'legacy stores are compatibility readers, not live writers'
-  )
-
-  const workspaceTypesFile = 'src/shared/types/session-workspace.types.ts'
-  const workspaceTypes = stripped[workspaceTypesFile] ?? ''
-  const workspaceInterface =
-    extractDelimited(workspaceTypes, 'export interface SessionWorkspaceV1', '\n}') ?? workspaceTypes
-  scanPattern(
-    findings,
-    'workspace-identity',
-    workspaceTypesFile,
-    workspaceInterface,
-    /^\s*(?:projectId|sessionId)\??\s*:/m,
-    'SessionWorkspace must be keyed only by conversationId'
-  )
-  scanPattern(
-    findings,
-    'raw-claim',
-    workspaceTypesFile,
-    workspaceTypes,
-    /^\s*(?:claim|rawClaim|env|envVars|credentials|terminalOutput)\??\s*:/m,
-    'raw claims, environment, credentials, and terminal output must not be persisted'
-  )
-
-  const rustWorkspaceBody =
-    extractDelimited(
-      sessionWorkspace,
-      'pub struct SessionWorkspaceV1',
-      'pub enum SessionWorkspaceLoadOutcome'
-    ) ?? sessionWorkspace
-  scanPattern(
-    findings,
-    'workspace-identity',
-    sessionWorkspaceFile,
-    rustWorkspaceBody,
-    /^\s*pub\s+(?:project_id|session_id)\s*:/m,
-    'SessionWorkspaceV1 must be keyed only by conversation_id'
-  )
-  scanPattern(
-    findings,
-    'raw-claim',
-    sessionWorkspaceFile,
-    rustWorkspaceBody,
-    /^\s*pub\s+(?:claim|raw_claim|env|env_vars|credentials|terminal_output)\s*:/m,
-    'raw claim or secret-bearing terminal state must not be persisted'
-  )
-
-  for (const file of NAVIGATION_FILES) {
-    const source = stripped[file] ?? ''
-    scanPattern(
-      findings,
-      'navigation-preserves-pty',
-      file,
-      source,
-      /(?:terminalApi\.)?(?:terminate|kill|forceKill)\s*\(|terminateTerminalResource\s*\(|kill_all\s*\(/,
-      'navigation, view-close, root unmount, project switch, and shared UI must not terminate PTYs'
-    )
-  }
-  const workspaceLayoutFile = 'src/renderer/layouts/WorkspaceLayout.tsx'
-  const workspaceLayout = stripped[workspaceLayoutFile] ?? ''
-  const closeViewBody =
-    extractDelimited(
-      workspaceLayout,
-      'const closeTerminalViewByRecordId',
-      'const requestTerminateTerminal'
-    ) ?? workspaceLayout
-  scanPattern(
-    findings,
-    'navigation-preserves-pty',
-    workspaceLayoutFile,
-    closeViewBody,
-    /(?:terminalApi\.)?(?:terminate|kill|forceKill)\s*\(|terminateTerminalResource\s*\(|kill_all\s*\(/,
-    'terminal view-close must not terminate the PTY resource'
-  )
-
-  for (const file of [
-    'src/renderer/stores/conversation-store.ts',
-    'src/renderer/hooks/use-session-workspace-sync.ts'
-  ]) {
-    const source = stripped[file] ?? ''
-    scanPattern(
-      findings,
-      'legacy-read-only',
-      file,
-      source,
-      /workspaceManifestApi\.(?:writeManifest|deleteManifest)|(?:save|delete)HistorySession\s*\(/,
-      'Conversation-first renderer paths must not write legacy stores'
-    )
-  }
-
-  for (const file of RENDERER_CONVERSATION_ADAPTERS) {
-    const source = stripped[file] ?? ''
-    requirePattern(
-      findings,
-      'shared-conversation-id-parser',
-      file,
-      source,
-      /\b(?:isConversationId|parseConversationId)\b/,
-      'renderer Conversation adapter must use the shared Rust-compatible ConversationId parser'
-    )
-    scanPattern(
-      findings,
-      'shared-conversation-id-parser',
-      file,
-      source,
-      /\b(?:canonicalUuid|canonicalConversationIdPattern)\b|\/\^\[0-9a-f\]\{8\}[^/]+\$\//,
-      'renderer Conversation adapter must not own a local UUID validator'
-    )
-  }
-
-  const coreConversationTypesFile = 'src/shared/types/conversation-api.types.ts'
-  const coreConversationTypes = stripped[coreConversationTypesFile] ?? ''
-  const coreConversationInterface =
-    extractDelimited(coreConversationTypes, 'export interface ConversationApi', '\n}') ?? ''
-  for (const method of [
-    'getWorkspace',
-    'writeWorkspace',
-    'resolveRecovery',
-    'detachBinding',
-    'rebindDetachedBinding',
-    'suspendBinding',
-    'replaceBinding',
-    'deleteConversation'
-  ]) {
-    scanPattern(
-      findings,
-      'facade-transport-ownership',
-      coreConversationTypesFile,
-      coreConversationInterface,
-      new RegExp(`\\b${method}\\s*\\(`),
-      `core ConversationApi must not duplicate specialized facade method ${method}`
-    )
-  }
-  for (const file of [
-    'src/renderer/lib/tauri-conversation-api.ts',
-    'src/renderer/lib/web-conversation-api.ts'
-  ]) {
-    const source = stripped[file] ?? ''
-    for (const method of [
-      'getWorkspace',
-      'writeWorkspace',
-      'resolveRecovery',
-      'detachBinding',
-      'rebindDetachedBinding',
-      'suspendBinding',
-      'replaceBinding',
-      'deleteConversation'
-    ]) {
-      scanPattern(
-        findings,
-        'facade-transport-ownership',
-        file,
-        source,
-        new RegExp(`\\b${method}\\s*(?:\\(|:)`),
-        `core Conversation transport must not duplicate specialized method ${method}`
-      )
-    }
-  }
-  const conversationFacadeFile = 'src/renderer/lib/conversation-api.ts'
-  const conversationFacade = stripped[conversationFacadeFile] ?? ''
-  for (const token of [
-    'sessionWorkspaceApi',
-    'conversationLifecycleApi',
-    'tauriConversationApi',
-    'webConversationApi',
-    'createConversationFacadeApi'
-  ]) {
-    requireToken(
-      findings,
-      'facade-transport-ownership',
-      conversationFacadeFile,
-      conversationFacade,
-      token,
-      `compatibility facade is missing zero-logic delegation through ${token}`
-    )
-  }
-  scanPattern(
-    findings,
-    'facade-transport-ownership',
-    conversationFacadeFile,
-    conversationFacade,
-    /\binvoke\s*\(|\bfetch\s*\(|new\s+WebSocket\s*\(/,
-    'compatibility Conversation facade must not own Tauri, HTTP, or WebSocket transport logic'
-  )
-
-  const portableEffectsFile = 'src/renderer/app/PortableAppEffects.tsx'
-  const portableEffects = stripped[portableEffectsFile] ?? ''
-  for (const token of [
-    ...PORTABLE_EFFECT_HOOKS.map((hook) => `${hook}()`),
-    'initNotificationPermissions()'
-  ]) {
-    requireToken(
-      findings,
-      'root-parity',
-      portableEffectsFile,
-      portableEffects,
-      token,
-      `shared portable effects are missing Conversation wiring: ${token}`
-    )
-  }
-
-  const portableRouterFile = 'src/renderer/app/portable-router.tsx'
-  const portableRouter = stripped[portableRouterFile] ?? ''
-  for (const token of [
-    "path: 'c/:conversationId'",
-    "path: 'legacy/session/:legacyValue'",
-    "path: 'legacy/storage/:legacyValue'",
-    "path: 'legacy/history/:legacyValue'",
-    "path: 'snapshots'",
-    "path: 'settings'",
-    "path: 'preferences'"
-  ]) {
-    requireToken(
-      findings,
-      'root-parity',
-      portableRouterFile,
-      portableRouter,
-      token,
-      `shared portable router is missing route: ${token}`
-    )
-  }
-
-  const rootRequirements = [
-    "import { PortableAppEffects } from '@/app/PortableAppEffects'",
-    "import { createPortableRouter } from '@/app/portable-router'",
-    'createPortableRouter()',
-    '<PortableAppEffects />',
-    '<ConversationHostStatus />',
-    '<ConversationRecoveryPanel />'
-  ]
-  const duplicatedRootPatterns = [
-    {
-      pattern: /function\s+(?:AppEffects|PortableAppEffects)\s*\(/,
-      message: 'renderer root must not redeclare portable application effects'
-    },
-    {
-      pattern: /createHashRouter\s*\(/,
-      message: 'renderer root must not redeclare the portable route table'
-    },
-    {
-      pattern:
-        /path:\s*['"](?:c\/:conversationId|legacy\/(?:session|storage|history)\/:legacyValue|snapshots|settings|preferences)['"]/,
-      message: 'renderer root must not duplicate a portable route declaration'
-    },
-    {
-      pattern: new RegExp(
-        `(?:${PORTABLE_EFFECT_HOOKS.join('|')}|initNotificationPermissions)\\s*\\(`
-      ),
-      message: 'renderer root must not duplicate portable effect hooks'
-    }
-  ]
-  for (const file of ['src/renderer/App.tsx', 'src/renderer/TauriApp.tsx']) {
-    const source = stripped[file] ?? ''
-    for (const token of rootRequirements) {
-      requireToken(
-        findings,
-        'root-parity',
-        file,
-        source,
-        token,
-        `renderer root is missing shared portable wiring: ${token}`
-      )
-    }
-    for (const duplicate of duplicatedRootPatterns) {
-      scanPattern(findings, 'root-parity', file, source, duplicate.pattern, duplicate.message)
-    }
-  }
-
-  const remoteFile = 'src-tauri/src/remote/host.rs'
-  // Inline cfg(test) enum variants and constructor branches are valid production-file
-  // structure. stripRustTestCode removes only test imports and the terminal test module.
-  const remoteProduction = production[remoteFile] ?? ''
-  scanPattern(
-    findings,
-    'desktop-shared-live-ownership',
-    remoteFile,
-    remoteProduction,
-    /(?:kill_all_checked|pty\.kill_all|acp\.kill_all)\s*\(/,
-    'desktop shared-live stop must drain serve_router without owning ACP/PTY shutdown'
-  )
-  requireToken(
-    findings,
-    'desktop-shared-live-ownership',
-    remoteFile,
-    remoteProduction,
-    'serve_router(',
-    'desktop shared-live must call the non-owning serve_router path'
-  )
-
-  const webFile = 'src-tauri/src/web/mod.rs'
-  const web = production[webFile] ?? ''
-  const serveBody = extractDelimited(web, 'pub async fn serve(', 'pub async fn serve_router(') ?? ''
-  requireToken(
-    findings,
-    'standalone-owns-shutdown',
-    webFile,
-    serveBody,
-    'acp.kill_all_checked().await',
-    'standalone serve must retain owned ACP shutdown'
-  )
-  requireToken(
-    findings,
-    'standalone-owns-shutdown',
-    webFile,
-    serveBody,
-    'pty.kill_all().await',
-    'standalone serve must retain owned PTY shutdown'
-  )
-  const routerBody =
-    extractDelimited(web, 'pub async fn serve_router(', 'async fn shutdown_signal_future') ?? ''
-  scanPattern(
-    findings,
-    'desktop-shared-live-ownership',
-    webFile,
-    routerBody,
-    /kill_all(?:_checked)?\s*\(/,
-    'serve_router must never own ACP or PTY shutdown'
-  )
-
-  const workflowFile = '.github/workflows/pr-validation.yml'
-  const workflow = sources[workflowFile] ?? ''
-  workflow.split('\n').forEach((line, index) => {
+function ownerFunctionName(node: ts.Node): string {
+  let owner: ts.Node | undefined = node
+  while (owner) {
+    if (ts.isFunctionDeclaration(owner) && owner.name) return owner.name.text
     if (
-      !line.trimStart().startsWith('#') &&
-      /\bcargo\s+(?:metadata|check|test|clippy|build)\b/.test(line) &&
-      !line.includes('--locked')
+      (ts.isArrowFunction(owner) || ts.isFunctionExpression(owner)) &&
+      owner.parent &&
+      ts.isVariableDeclaration(owner.parent) &&
+      ts.isIdentifier(owner.parent.name)
+    ) {
+      return owner.parent.name.text
+    }
+    owner = owner.parent
+  }
+  return ''
+}
+
+function checkNavigationAndLegacy(findings: GuardFinding[], models: TypeScriptModel[]): void {
+  const navigationName =
+    /(?:navigate|selectProject|switchProject|closeTerminalView|PortableAppEffects|App|TauriApp)/i
+  const forbiddenTeardown = new Set([
+    'terminate',
+    'kill',
+    'forceKill',
+    'kill_all',
+    'terminateTerminalResource'
+  ])
+  const legacyWrites = new Set([
+    'writeManifest',
+    'deleteManifest',
+    'saveHistorySession',
+    'deleteHistorySession'
+  ])
+
+  for (const model of models.filter((item) => item.file.startsWith('src/renderer/'))) {
+    const calls = model.calls()
+    const calledByOwner = new Map<string, Set<string>>()
+    for (const call of calls) {
+      const owner = ownerFunctionName(call)
+      const symbol = model.resolveExpression(call.expression)
+      const calledName =
+        symbol?.exported ?? (ts.isIdentifier(call.expression) ? call.expression.text : '')
+      if (!owner || !calledName) continue
+      const called = calledByOwner.get(owner) ?? new Set<string>()
+      called.add(calledName)
+      calledByOwner.set(owner, called)
+    }
+
+    for (const call of calls) {
+      const symbol = model.resolveExpression(call.expression)
+      if (!symbol) continue
+      if (
+        legacyWrites.has(symbol.exported) &&
+        /(?:conversation-store|session-workspace-sync)/.test(model.file)
+      ) {
+        addFinding(
+          findings,
+          'legacy-read-only',
+          model.file,
+          model.sourceFile,
+          call,
+          'Conversation-first renderer paths must not mutate legacy stores'
+        )
+      }
+      if (!forbiddenTeardown.has(symbol.exported)) continue
+      const ownerName = ownerFunctionName(call)
+      const calledFromNavigation = [...calledByOwner.entries()].some(
+        ([caller, callees]) => navigationName.test(caller) && callees.has(ownerName)
+      )
+      const rootFile = /(?:^|\/)(?:App|TauriApp)\.tsx$/.test(model.file)
+      if (rootFile || navigationName.test(ownerName) || calledFromNavigation) {
+        addFinding(
+          findings,
+          'navigation-preserves-pty',
+          model.file,
+          model.sourceFile,
+          call,
+          `navigation helper ${ownerName || '<module>'} must not call ${symbol.exported}`
+        )
+      }
+    }
+  }
+}
+
+function interfaceMembers(model: TypeScriptModel, name: string): Set<string> {
+  const members = new Set<string>()
+  for (const statement of model.sourceFile.statements) {
+    if (!ts.isInterfaceDeclaration(statement) || statement.name.text !== name) continue
+    for (const member of statement.members) {
+      if ('name' in member && member.name) {
+        if (ts.isIdentifier(member.name) || ts.isStringLiteral(member.name))
+          members.add(member.name.text)
+      }
+    }
+  }
+  return members
+}
+
+function checkTypeContracts(findings: GuardFinding[], models: TypeScriptModel[]): void {
+  const workspace = findModel(models, 'src/shared/types/session-workspace.types.ts')
+  if (workspace) {
+    const members = interfaceMembers(workspace, 'SessionWorkspaceV1')
+    for (const field of ['projectId', 'sessionId']) {
+      if (members.has(field)) {
+        findings.push({
+          rule: 'workspace-identity',
+          file: workspace.file,
+          line: 1,
+          message: `SessionWorkspaceV1 must not persist ${field}`
+        })
+      }
+    }
+    for (const field of ['claim', 'rawClaim', 'env', 'envVars', 'credentials', 'terminalOutput']) {
+      if (members.has(field)) {
+        findings.push({
+          rule: 'raw-claim',
+          file: workspace.file,
+          line: 1,
+          message: `SessionWorkspaceV1 must not persist secret-bearing field ${field}`
+        })
+      }
+    }
+  }
+
+  const terminal = findModel(models, 'src/shared/types/web-terminal-protocol.types.ts')
+  if (terminal) {
+    const members = interfaceMembers(terminal, 'TerminalSpawnIntentV1')
+    for (const field of ['program', 'args', 'env', 'cwd', 'shell']) {
+      if (members.has(field)) {
+        findings.push({
+          rule: 'remote-terminal-intent',
+          file: terminal.file,
+          line: 1,
+          message: `remote TerminalSpawnIntentV1 must not expose caller-controlled ${field}`
+        })
+      }
+    }
+  }
+}
+
+function checkFacades(findings: GuardFinding[], models: TypeScriptModel[]): void {
+  for (const suffix of SHARED_PARSER_ADAPTER_SUFFIXES) {
+    const model = findModel(models, suffix)
+    if (!model) continue
+    const parserImported =
+      model.hasImport('@shared/types/conversation.types', 'isConversationId') ||
+      model.hasImport('@shared/types/conversation.types', 'parseConversationId')
+    const parserCalled = model.hasCall('isConversationId') || model.hasCall('parseConversationId')
+    if (!parserImported || !parserCalled) {
+      findings.push({
+        rule: 'shared-conversation-id-parser',
+        file: model.file,
+        line: 1,
+        message:
+          'renderer Conversation adapter must import and call the shared ConversationId parser'
+      })
+    }
+  }
+
+  const facade = findModel(models, 'src/renderer/lib/conversation-api.ts')
+  if (facade) {
+    for (const forbidden of ['invoke', 'fetch', 'WebSocket']) {
+      for (const call of facade.calls()) {
+        if (facade.resolveExpression(call.expression)?.exported === forbidden) {
+          addFinding(
+            findings,
+            'facade-transport-ownership',
+            facade.file,
+            facade.sourceFile,
+            call,
+            `compatibility Conversation facade must not own ${forbidden} transport logic`
+          )
+        }
+      }
+    }
+    for (const delegate of [
+      'sessionWorkspaceApi',
+      'conversationLifecycleApi',
+      'tauriConversationApi',
+      'webConversationApi'
+    ]) {
+      if (
+        ![...facade.sourceFile.statements].some((statement) => {
+          if (!ts.isImportDeclaration(statement) || !statement.importClause?.namedBindings)
+            return false
+          if (!ts.isNamedImports(statement.importClause.namedBindings)) return false
+          return statement.importClause.namedBindings.elements.some(
+            (element) => (element.propertyName?.text ?? element.name.text) === delegate
+          )
+        })
+      ) {
+        findings.push({
+          rule: 'facade-transport-ownership',
+          file: facade.file,
+          line: 1,
+          message: `compatibility facade must import production delegate ${delegate}`
+        })
+      }
+    }
+  }
+
+  const history = findModel(models, 'src/renderer/lib/acp-history-persistence.ts')
+  if (history) {
+    if (
+      !history.hasImport('@/lib/acp-history-api', 'acpHistoryApi') ||
+      !history.hasCall('getPage')
     ) {
       findings.push({
-        rule: 'locked-rust-ci',
-        file: workflowFile,
-        line: index + 1,
-        message: 'every CI cargo metadata/check/test/clippy/build command must use --locked'
+        rule: 'history-paging-facade',
+        file: history.file,
+        line: 1,
+        message: 'desktop history paging must call acpHistoryApi.getPage through the real facade'
       })
     }
-  })
-  for (const token of [
-    'conversation-native-durability:',
-    'platform: linux',
-    'platform: macos',
-    'platform: windows',
+    if (!history.hasCall('getSessionPayloadPage')) {
+      findings.push({
+        rule: 'history-paging-facade',
+        file: history.file,
+        line: 1,
+        message: 'server history paging must call transport.getSessionPayloadPage'
+      })
+    }
+  }
+}
+
+function checkRendererCredential(findings: GuardFinding[], models: TypeScriptModel[]): void {
+  const transport = findModel(models, 'src/renderer/lib/acp-transport.ts')
+  if (!transport) return
+  if (!transport.hasCall('getRemoteAccessCredential')) {
+    findings.push({
+      rule: 'authenticated-remote-access',
+      file: transport.file,
+      line: 1,
+      message: 'renderer WebSocket transport must call the in-memory credential boundary'
+    })
+  }
+  const visit = (node: ts.Node): void => {
+    if (ts.isPropertyAssignment(node)) {
+      const name = ts.isIdentifier(node.name) || ts.isStringLiteral(node.name) ? node.name.text : ''
+      if (
+        (name === 'token' || name === 'credential') &&
+        ts.isStringLiteralLike(node.initializer) &&
+        ['dev', 'placeholder', 'changeme'].includes(node.initializer.text.toLowerCase())
+      ) {
+        addFinding(
+          findings,
+          'authenticated-remote-access',
+          transport.file,
+          transport.sourceFile,
+          node,
+          'placeholder remote authentication credential is forbidden'
+        )
+      }
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(transport.sourceFile)
+}
+
+interface WorkflowRun {
+  command: string
+  line: number
+  job: string
+  step: string
+}
+
+function workflowRuns(file: string, source: string, findings: GuardFinding[]): WorkflowRun[] {
+  const counter = new LineCounter()
+  const document = parseDocument(source, { lineCounter: counter })
+  if (document.errors.length > 0) {
+    findings.push({
+      rule: 'workflow-yaml',
+      file,
+      line: 1,
+      message: `workflow YAML parse failed: ${document.errors[0]?.message ?? 'unknown parse error'}`
+    })
+    return []
+  }
+  const runs: WorkflowRun[] = []
+  const walk = (node: YamlNode | null | undefined, path: string[]): void => {
+    if (!node) return
+    if (isMap(node)) {
+      for (const pair of node.items) {
+        const key = isScalar(pair.key) ? String(pair.key.value) : '<key>'
+        if (key === 'run' && isScalar(pair.value) && typeof pair.value.value === 'string') {
+          const position = pair.value.range
+            ? counter.linePos(pair.value.range[0])
+            : { line: 1, col: 1 }
+          const jobIndex = path.indexOf('jobs')
+          const stepsIndex = path.lastIndexOf('steps')
+          runs.push({
+            command: pair.value.value,
+            line: position.line,
+            job: jobIndex >= 0 ? (path[jobIndex + 1] ?? '<job>') : '<job>',
+            step: stepsIndex >= 0 ? (path[stepsIndex + 1] ?? '<step>') : '<step>'
+          })
+        }
+        walk(pair.value as YamlNode | null, [...path, key])
+      }
+    } else if (isSeq(node)) {
+      for (const [index, item] of node.items.entries()) {
+        walk(item as YamlNode | null, [...path, String(index)])
+      }
+    }
+  }
+  walk(document.contents as YamlNode | null, [])
+  return runs
+}
+
+function cargoCommandSegments(command: string): string[] {
+  const joined = command.replace(/\\\r?\n/g, ' ')
+  return joined
+    .split(/\r?\n|&&|;/)
+    .map((segment) => segment.trim())
+    .filter(Boolean)
+}
+
+function checkWorkflows(findings: GuardFinding[], sources: GuardSources): void {
+  const workflows = Object.entries(sources).filter(([file]) =>
+    /^\.github\/workflows\/.*\.(?:yml|yaml)$/.test(normalizePath(file))
+  )
+  if (workflows.length === 0) {
+    findings.push({
+      rule: 'source-discovery',
+      file: '.github/workflows',
+      line: 1,
+      message: 'no active workflow YAML files were discovered'
+    })
+    return
+  }
+
+  for (const [file, source] of workflows) {
+    for (const run of workflowRuns(file, source, findings)) {
+      for (const segment of cargoCommandSegments(run.command)) {
+        const match = segment.match(/\bcargo\s+(metadata|check|test|clippy|build)\b/)
+        if (!match || /(?:^|\s)--locked(?:\s|$)/.test(segment)) continue
+        findings.push({
+          rule: 'locked-rust-ci',
+          file,
+          line: run.line,
+          message: `job=${run.job} step=${run.step} cargo ${match[1]} command must use --locked`
+        })
+      }
+    }
+  }
+
+  const validation = workflows.find(([file]) => file.endsWith('/pr-validation.yml'))
+  if (!validation) {
+    findings.push({
+      rule: 'native-ci-wiring',
+      file: '.github/workflows/pr-validation.yml',
+      line: 1,
+      message: 'PR validation workflow is missing'
+    })
+    return
+  }
+  const [file, source] = validation
+  const document = parseDocument(source)
+  const data = document.toJS() as {
+    jobs?: Record<string, { strategy?: { matrix?: unknown }; steps?: Array<{ run?: string }> }>
+  }
+  const jobs = data.jobs ?? {}
+  const durability = jobs['conversation-native-durability']
+  const durabilityJson = JSON.stringify(durability?.strategy?.matrix ?? {})
+  for (const platform of ['linux', 'macos', 'windows']) {
+    if (!durabilityJson.includes(platform)) {
+      findings.push({
+        rule: 'native-ci-wiring',
+        file,
+        line: 1,
+        message: `locked native durability matrix is missing ${platform}`
+      })
+    }
+  }
+  const commands = Object.values(jobs)
+    .flatMap((job) => job.steps ?? [])
+    .map((step) => step.run ?? '')
+  for (const required of [
     'cargo test --locked conversation::native_durability_tests',
+    'cargo test --locked --test conversation_first_guardrails',
     'cargo build --locked --bin termul-server --features standalone-server',
     'cargo clippy --locked --bin termul-server --features standalone-server -- -D warnings'
   ]) {
-    requireToken(
-      findings,
-      'native-ci-wiring',
-      workflowFile,
-      workflow,
-      token,
-      `Conversation native/standalone CI wiring is missing ${token}`
-    )
+    if (!commands.some((command) => command.includes(required))) {
+      findings.push({
+        rule: 'native-ci-wiring',
+        file,
+        line: 1,
+        message: `locked native/semantic CI wiring is missing ${required}`
+      })
+    }
   }
+}
 
+/** Compatibility helper retained for callers; semantic checks use compiler AST nodes. */
+export function stripComments(source: string): string {
+  const scanner = ts.createScanner(
+    ts.ScriptTarget.Latest,
+    false,
+    ts.LanguageVariant.Standard,
+    source
+  )
+  let result = ''
+  let position = 0
+  for (let token = scanner.scan(); token !== ts.SyntaxKind.EndOfFileToken; token = scanner.scan()) {
+    const start = scanner.getTokenPos()
+    const end = scanner.getTextPos()
+    result += source.slice(position, start)
+    if (
+      token === ts.SyntaxKind.SingleLineCommentTrivia ||
+      token === ts.SyntaxKind.MultiLineCommentTrivia
+    ) {
+      result += source.slice(start, end).replace(/[^\n]/g, ' ')
+    } else {
+      result += source.slice(start, end)
+    }
+    position = end
+  }
+  return result + source.slice(position)
+}
+
+/** Compatibility helper retained for legacy tests; Rust enforcement lives in the syn guard. */
+export function stripRustTestCode(source: string): string {
+  return source.replace(/#\[cfg\(test\)\][\s\S]*$/m, (matched) => matched.replace(/[^\n]/g, ' '))
+}
+
+export function checkConversationFirstGuardrails(sources: GuardSources): GuardFinding[] {
+  const models = Object.entries(sources)
+    .filter(([file]) => isTypeScriptFile(file))
+    .map(([file, source]) => new TypeScriptModel(normalizePath(file), source))
+  const findings: GuardFinding[] = []
+  checkRootParity(findings, models)
+  checkNavigationAndLegacy(findings, models)
+  checkTypeContracts(findings, models)
+  checkFacades(findings, models)
+  checkRendererCredential(findings, models)
+  checkWorkflows(findings, sources)
   return findings.sort(
     (left, right) =>
       left.file.localeCompare(right.file) ||
       left.line - right.line ||
-      left.rule.localeCompare(right.rule)
+      left.rule.localeCompare(right.rule) ||
+      left.message.localeCompare(right.message)
   )
 }
 
+function walkFiles(root: string, directory: string, accept: (path: string) => boolean): string[] {
+  const absolute = resolve(root, directory)
+  const files: string[] = []
+  for (const entry of readdirSync(absolute, { withFileTypes: true })) {
+    const path = join(absolute, entry.name)
+    if (entry.isDirectory())
+      files.push(...walkFiles(root, normalizePath(relative(root, path)), accept))
+    else if (entry.isFile() && accept(path)) files.push(normalizePath(relative(root, path)))
+  }
+  return files
+}
+
 export function loadRepositorySources(root = process.cwd()): GuardSources {
+  const sourceFiles = [
+    ...walkFiles(
+      root,
+      'src/renderer',
+      (path) => ['.ts', '.tsx'].includes(extname(path)) && !path.endsWith('.d.ts')
+    ),
+    ...walkFiles(
+      root,
+      'src/shared',
+      (path) => ['.ts', '.tsx'].includes(extname(path)) && !path.endsWith('.d.ts')
+    ),
+    ...walkFiles(root, '.github/workflows', (path) => ['.yml', '.yaml'].includes(extname(path)))
+  ].sort()
   return Object.fromEntries(
-    REQUIRED_SOURCES.map((file) => [file, readFileSync(resolve(root, file), 'utf8')])
+    sourceFiles.map((file) => [file, readFileSync(resolve(root, file), 'utf8')])
   )
 }
 
 export function main(sources: GuardSources = loadRepositorySources()): number {
   const findings = checkConversationFirstGuardrails(sources)
   if (findings.length === 0) {
-    console.log(`Conversation-first guardrails passed (${REQUIRED_SOURCES.length} sources)`)
+    console.log(
+      `Conversation-first semantic guardrails passed (${Object.keys(sources).length} discovered sources)`
+    )
     return 0
   }
   for (const item of findings) {
     console.error(`${item.file}:${item.line} [${item.rule}] ${item.message}`)
   }
-  console.error(`Conversation-first guardrails failed with ${findings.length} finding(s)`)
+  console.error(`Conversation-first semantic guardrails failed with ${findings.length} finding(s)`)
   return 1
 }
 

@@ -16,13 +16,6 @@ import { useWhatsNew } from '@/hooks/use-whats-new'
 import { isWindows } from '@/lib/platform'
 import { isTauriContext } from '@/lib/tauri-runtime'
 
-// Compatibility evidence for the pre-existing source checklist. Executable portable
-// definitions live only in the shared modules and guardrails strip these comments:
-// path: 'c/:conversationId'; path: 'legacy/session/:legacyValue';
-// path: 'legacy/storage/:legacyValue'; path: 'legacy/history/:legacyValue'.
-// useSessionWorkspaceBootstrap(); useConversationHostBootstrap();
-// useConversationLifecycle(); useTerminalResourceLifecycle(); usePreventNativeContextMenu().
-
 // PRODUCTION GUARDRAIL: This branch targets xterm 6.1-beta (the line VS Code
 // ships in production). The 6.1 beta track includes memory leak fixes
 // (IntersectionObserver retention, dispose-registration gaps) and TUI stability

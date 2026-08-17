@@ -293,6 +293,10 @@ jobs:
       - name: Assert dist-web/index.html exists
         run: test -f dist-web/index.html && test -s dist-web/index.html
 
+      - name: Conversation-first semantic Rust guard
+        working-directory: src-tauri
+        run: cargo test --locked --test conversation_first_guardrails
+
       - name: Cargo check
         working-directory: src-tauri
         run: cargo check --locked --all-targets

@@ -305,7 +305,7 @@ jobs:
         env:
           TAURI_SIGNING_PUBLIC_KEY: ${{ secrets.TAURI_SIGNING_PUBLIC_KEY }}
         run: >
-          cargo build --release --bin termul-server
+          cargo build --locked --release --bin termul-server
           --features standalone-server
 
       - name: Locate termul-server binary

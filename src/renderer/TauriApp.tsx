@@ -16,13 +16,6 @@ import { useWhatsNew } from '@/hooks/use-whats-new'
 import { useWindowState } from '@/hooks/use-window-state'
 import { getCurrentWindow } from '@/lib/tauri-window'
 
-// Compatibility evidence for the pre-existing source checklist. Executable portable
-// definitions live only in the shared modules and guardrails strip these comments:
-// path: 'c/:conversationId'; path: 'legacy/session/:legacyValue';
-// path: 'legacy/storage/:legacyValue'; path: 'legacy/history/:legacyValue'.
-// useSessionWorkspaceBootstrap(); useConversationHostBootstrap();
-// useConversationLifecycle(); useTerminalResourceLifecycle(); usePreventNativeContextMenu().
-
 const queryClient = new QueryClient()
 const router = createPortableRouter()
 

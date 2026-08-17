@@ -19,6 +19,7 @@
 
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { ts } from '@ts-morph/common'
 import { describe, expect, it } from 'vitest'
 
 // Type definitions for our test data
@@ -62,6 +63,110 @@ function fileContains(relativePath: string, pattern: RegExp): boolean {
   if (!existsSync(absolutePath)) return false
   const content = readFileSync(absolutePath, 'utf-8')
   return pattern.test(content)
+}
+
+interface ImportedSymbol {
+  module: string
+  exported: string
+}
+
+function parseTypeScript(path: string): ts.SourceFile {
+  const content = readFileSync(path, 'utf-8')
+  return ts.createSourceFile(
+    path,
+    content,
+    ts.ScriptTarget.Latest,
+    true,
+    path.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS
+  )
+}
+
+function importedSymbols(sourceFile: ts.SourceFile): Map<string, ImportedSymbol> {
+  const imports = new Map<string, ImportedSymbol>()
+  for (const statement of sourceFile.statements) {
+    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier))
+      continue
+    const module = statement.moduleSpecifier.text
+    const bindings = statement.importClause?.namedBindings
+    if (bindings && ts.isNamedImports(bindings)) {
+      for (const element of bindings.elements) {
+        imports.set(element.name.text, {
+          module,
+          exported: element.propertyName?.text ?? element.name.text
+        })
+      }
+    }
+  }
+  return imports
+}
+
+function hasImportedCall(
+  sourceFile: ts.SourceFile,
+  module: string,
+  exported: string,
+  member?: string
+): boolean {
+  const imports = importedSymbols(sourceFile)
+  let found = false
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node)) {
+      if (ts.isIdentifier(node.expression)) {
+        const symbol = imports.get(node.expression.text)
+        if (symbol?.module === module && symbol.exported === exported && member === undefined) {
+          found = true
+        }
+      } else if (ts.isPropertyAccessExpression(node.expression)) {
+        const receiver = node.expression.expression
+        if (ts.isIdentifier(receiver)) {
+          const symbol = imports.get(receiver.text)
+          if (
+            symbol?.module === module &&
+            symbol.exported === exported &&
+            node.expression.name.text === member
+          ) {
+            found = true
+          }
+        }
+      }
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(sourceFile)
+  return found
+}
+
+function hasImportedJsx(sourceFile: ts.SourceFile, module: string, exported: string): boolean {
+  const imports = importedSymbols(sourceFile)
+  let found = false
+  const visit = (node: ts.Node): void => {
+    if (
+      (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) &&
+      ts.isIdentifier(node.tagName)
+    ) {
+      const symbol = imports.get(node.tagName.text)
+      if (symbol?.module === module && symbol.exported === exported) found = true
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(sourceFile)
+  return found
+}
+
+function hasCallNamed(sourceFile: ts.SourceFile, name: string): boolean {
+  let found = false
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node)) {
+      const called = ts.isIdentifier(node.expression)
+        ? node.expression.text
+        : ts.isPropertyAccessExpression(node.expression)
+          ? node.expression.name.text
+          : ''
+      if (called === name) found = true
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(sourceFile)
+  return found
 }
 
 /**
@@ -367,46 +472,64 @@ describe('Parity Checklist Automation', () => {
     })
 
     it('pins one portable route/effect source consumed by both roots', () => {
-      const app = readFileSync(join(LIB_DIR, '..', 'App.tsx'), 'utf-8')
-      const tauri = readFileSync(join(LIB_DIR, '..', 'TauriApp.tsx'), 'utf-8')
-      const portableRouter = readFileSync(
-        join(LIB_DIR, '..', 'app', 'portable-router.tsx'),
-        'utf-8'
-      )
-      const portableEffects = readFileSync(
-        join(LIB_DIR, '..', 'app', 'PortableAppEffects.tsx'),
-        'utf-8'
-      )
+      const app = parseTypeScript(join(LIB_DIR, '..', 'App.tsx'))
+      const tauri = parseTypeScript(join(LIB_DIR, '..', 'TauriApp.tsx'))
+      const portableRouter = parseTypeScript(join(LIB_DIR, '..', 'app', 'portable-router.tsx'))
+      const portableEffects = parseTypeScript(join(LIB_DIR, '..', 'app', 'PortableAppEffects.tsx'))
 
       for (const root of [app, tauri]) {
-        expect(root).toContain("from '@/app/PortableAppEffects'")
-        expect(root).toContain("from '@/app/portable-router'")
-        expect(root).toContain('createPortableRouter()')
-        expect(root).toContain('<PortableAppEffects />')
-        expect(root).toContain('<ConversationHostStatus />')
-        expect(root).toContain('<ConversationRecoveryPanel />')
-        expect(root).not.toMatch(/createHashRouter\s*\(/)
+        expect(hasImportedCall(root, '@/app/portable-router', 'createPortableRouter')).toBe(true)
+        expect(hasImportedJsx(root, '@/app/PortableAppEffects', 'PortableAppEffects')).toBe(true)
+        expect(
+          hasImportedJsx(
+            root,
+            '@/components/conversation/ConversationHostStatus',
+            'ConversationHostStatus'
+          )
+        ).toBe(true)
+        expect(
+          hasImportedJsx(
+            root,
+            '@/components/conversation/ConversationRecoveryPanel',
+            'ConversationRecoveryPanel'
+          )
+        ).toBe(true)
+        expect(hasCallNamed(root, 'createHashRouter')).toBe(false)
       }
+
+      const routes = new Set<string>()
+      const collectRoutes = (node: ts.Node): void => {
+        if (
+          ts.isPropertyAssignment(node) &&
+          (ts.isIdentifier(node.name) || ts.isStringLiteral(node.name)) &&
+          node.name.text === 'path' &&
+          ts.isStringLiteralLike(node.initializer)
+        ) {
+          routes.add(node.initializer.text)
+        }
+        ts.forEachChild(node, collectRoutes)
+      }
+      collectRoutes(portableRouter)
       for (const route of [
-        "path: 'c/:conversationId'",
-        "path: 'legacy/session/:legacyValue'",
-        "path: 'legacy/storage/:legacyValue'",
-        "path: 'legacy/history/:legacyValue'",
-        "path: 'snapshots'",
-        "path: 'settings'",
-        "path: 'preferences'"
+        'c/:conversationId',
+        'legacy/session/:legacyValue',
+        'legacy/storage/:legacyValue',
+        'legacy/history/:legacyValue',
+        'snapshots',
+        'settings',
+        'preferences'
       ]) {
-        expect(portableRouter, `portable router missing ${route}`).toContain(route)
+        expect(routes, `portable router missing ${route}`).toContain(route)
       }
       for (const hook of [
-        'useSessionWorkspaceBootstrap()',
-        'useConversationHostBootstrap()',
-        'useConversationLifecycle()',
-        'useTerminalResourceLifecycle()',
-        'useTerminalRestore()',
-        'usePreventNativeContextMenu()'
+        'useSessionWorkspaceBootstrap',
+        'useConversationHostBootstrap',
+        'useConversationLifecycle',
+        'useTerminalResourceLifecycle',
+        'useTerminalRestore',
+        'usePreventNativeContextMenu'
       ]) {
-        expect(portableEffects, `portable effects missing ${hook}`).toContain(hook)
+        expect(hasCallNamed(portableEffects, hook), `portable effects missing ${hook}()`).toBe(true)
       }
     })
   })
@@ -1006,13 +1129,22 @@ describe('Parity Checklist Automation', () => {
     const ProtoTypes = join(LIB_DIR, '..', '..', 'shared', 'types', 'web-protocol.types.ts')
     const WsRust = join(LIB_DIR, '..', '..', '..', 'src-tauri', 'src', 'web', 'ws.rs')
 
-    it('acp-history-api.ts exists + calls the host (invoke), never localStorage', () => {
+    it('acp-history-api.ts calls the host through executable invoke nodes, including paging', () => {
       expect(existsSync(HistoryFacade), 'acp-history-api.ts should exist').toBe(true)
+      const facade = parseTypeScript(HistoryFacade)
+      expect(hasCallNamed(facade, 'invoke')).toBe(true)
+      expect(hasCallNamed(facade, 'invokeHistory')).toBe(true)
+      expect(hasCallNamed(facade, 'assertConversationHistoryPage')).toBe(true)
       const content = readFileSync(HistoryFacade, 'utf-8')
-      expect(content).toMatch(/invoke/) // desktop → host Tauri command
-      expect(content).toMatch(/acp_history_list/)
-      expect(content).toMatch(/acp_history_get/)
-      expect(content).not.toMatch(/localStorage(?:\.|\[)/) // host is the authority
+      expect(content).not.toMatch(/localStorage(?:\.|\[)/)
+    })
+
+    it('production history loading calls the desktop and server paging facades as AST nodes', () => {
+      const persistence = parseTypeScript(join(LIB_DIR, 'acp-history-persistence.ts'))
+      expect(
+        hasImportedCall(persistence, '@/lib/acp-history-api', 'acpHistoryApi', 'getPage')
+      ).toBe(true)
+      expect(hasCallNamed(persistence, 'getSessionPayloadPage')).toBe(true)
     })
 
     it('web-protocol.types.ts declares the WS request types list_sessions + get_session_payload', () => {
@@ -1499,28 +1631,31 @@ describe('Parity Checklist Automation', () => {
 
     it('TauriApp.tsx wraps root in GlobalContextMenu + mounts the devtools blocker + native-context-menu defense', () => {
       expect(existsSync(TauriApp), 'TauriApp.tsx should exist').toBe(true)
-      const content = readFileSync(TauriApp, 'utf-8')
-      expect(content).toMatch(/GlobalContextMenu/)
-      expect(content).toMatch(/usePreventDevToolsShortcuts/)
-      // P4: the native-context-menu preventDefault hook is re-added as
-      // defense-in-depth (usePreventNativeContextMenu) alongside
-      // <GlobalContextMenu> so portaled overlays don't show the native menu.
-      expect(content).toMatch(/usePreventNativeContextMenu/)
-      // The old hook name must be gone (renamed).
-      expect(content).not.toMatch(/usePreventDefaultContextMenu/)
+      const root = parseTypeScript(TauriApp)
+      const effects = parseTypeScript(join(LIB_DIR, '..', 'app', 'PortableAppEffects.tsx'))
+      expect(hasImportedJsx(root, '@/components/GlobalContextMenu', 'GlobalContextMenu')).toBe(true)
+      expect(
+        hasImportedCall(
+          root,
+          '@/hooks/use-prevent-devtools-shortcuts',
+          'usePreventDevToolsShortcuts'
+        )
+      ).toBe(true)
+      expect(hasCallNamed(effects, 'usePreventNativeContextMenu')).toBe(true)
+      expect(hasCallNamed(effects, 'usePreventDefaultContextMenu')).toBe(false)
     })
 
     it('App.tsx wraps root in GlobalContextMenu + mounts native-context-menu defense (no devtools blocker)', () => {
       expect(existsSync(WebApp), 'App.tsx should exist').toBe(true)
-      const content = readFileSync(WebApp, 'utf-8')
-      expect(content).toMatch(/GlobalContextMenu/)
-      // P4: web also mounts the native-context-menu defense (portal regression).
-      expect(content).toMatch(/usePreventNativeContextMenu/)
-      // Web parity: NO devtools blocker (browser cannot block its own devtools).
-      // Assert no import of the hook (the dashed import path), not the camelCase
-      // name — App.tsx's comment mentions the hook by name for documentation.
-      expect(content).not.toMatch(/from\s+['"]@\/hooks\/use-prevent-devtools-shortcuts['"]/)
-      expect(content).not.toMatch(/usePreventDevToolsShortcuts\(\)/)
+      const root = parseTypeScript(WebApp)
+      const effects = parseTypeScript(join(LIB_DIR, '..', 'app', 'PortableAppEffects.tsx'))
+      expect(hasImportedJsx(root, '@/components/GlobalContextMenu', 'GlobalContextMenu')).toBe(true)
+      expect(hasImportedJsx(root, '@/app/PortableAppEffects', 'PortableAppEffects')).toBe(true)
+      expect(hasCallNamed(effects, 'usePreventNativeContextMenu')).toBe(true)
+      expect(
+        importedSymbols(root).has('usePreventDevToolsShortcuts') ||
+          hasCallNamed(root, 'usePreventDevToolsShortcuts')
+      ).toBe(false)
     })
 
     it('commands.rs cfg-gates browser_tab_open_devtools (debug real, release Err stub)', () => {
