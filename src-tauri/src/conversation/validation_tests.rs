@@ -501,6 +501,11 @@ async fn ready_aggregate_mutations_preserve_identity_workspace_and_revision_cas(
 async fn repository_catalog_workspace_and_application_recovery_matrix() {
     let fixture = fixture().await;
     let catalog_path = fixture.repository.root().join("catalog.json");
+    fixture
+        .repository
+        .flush_catalog_until(tokio::time::Instant::now() + std::time::Duration::from_secs(2))
+        .await
+        .unwrap();
     let canonical_catalog = std::fs::read(&catalog_path).unwrap();
     std::fs::write(&catalog_path, b"not-json").unwrap();
     let (reopened, report) =

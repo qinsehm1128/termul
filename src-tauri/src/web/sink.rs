@@ -2704,7 +2704,20 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&root).unwrap();
+        let cwd = root.join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
         let persistence = SessionPersistence::open(root.join("sessions"))
+            .await
+            .unwrap();
+        persistence
+            .register_session(SessionRegistration {
+                session_id: "sess-1".to_string(),
+                stable_agent_namespace: None,
+                runtime_agent_id: None,
+                project_id: None,
+                cwd,
+                ..Default::default()
+            })
             .await
             .unwrap();
         let relay = Arc::new(WsRelaySink::with_persistence(8, persistence.clone()));
@@ -2958,6 +2971,13 @@ mod tests {
                 .expect("ordered Conversation relay admission");
         }
         relay.flush_conversation_persistence().await.unwrap();
+        let ordered = relay.ordered_conversation_persistence().unwrap();
+        assert!(ordered.health("opaque-ordered-session").unwrap().is_none());
+        assert_eq!(ordered.metrics().pending_records, 0);
+        assert_eq!(
+            ordered.active_worker_count(),
+            crate::conversation::WRITER_SHARDS
+        );
         let durable_payloads = repository
             .read_events(conversation_id, 0)
             .unwrap()
@@ -2966,16 +2986,9 @@ mod tests {
             .map(|event| event.payload)
             .collect::<Vec<_>>();
         assert_eq!(durable_payloads, expected_payloads);
-        let health = relay
-            .ordered_conversation_persistence()
-            .unwrap()
-            .health("opaque-ordered-session")
-            .unwrap()
-            .unwrap();
-        assert_eq!(health.pending_count, 0);
-        assert_eq!(health.last_accepted_source_seq, 100);
-        assert_eq!(health.last_persisted_source_seq, 100);
         relay.shutdown_conversation_persistence().await.unwrap();
+        assert_eq!(ordered.active_worker_count(), 0);
+        assert_eq!(ordered.metrics().pending_records, 0);
         drop(relay);
         drop(repository);
         let (restarted_repository, _) =
@@ -3017,17 +3030,10 @@ mod tests {
             assert!(pending <= crate::conversation::QUEUE_CAPACITY);
         }
         relay.shutdown_conversation_persistence().await.unwrap();
-        let health = relay
-            .ordered_conversation_persistence()
-            .unwrap()
-            .health("opaque-drain-session")
-            .unwrap()
-            .unwrap();
-        assert_eq!(health.pending_count, 0);
-        assert_eq!(
-            health.last_persisted_source_seq,
-            health.last_accepted_source_seq
-        );
+        let ordered = relay.ordered_conversation_persistence().unwrap();
+        assert!(ordered.health("opaque-drain-session").unwrap().is_none());
+        assert_eq!(ordered.active_worker_count(), 0);
+        assert_eq!(ordered.metrics().pending_records, 0);
         let durable = repository
             .read_events(conversation_id, 0)
             .unwrap()

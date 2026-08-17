@@ -625,7 +625,7 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test(start_paused = true)]
     async fn standalone_shutdown_propagates_stable_failures() {
         let (_temp, repository, relay, _conversation_id) =
             conversation_relay_fixture("standalone-catalog-failure").await;
@@ -651,6 +651,7 @@ mod tests {
         .await
         .expect_err("catalog barrier failure must block clean success");
         assert!(error.codes.contains(&CONVERSATION_CATALOG_FLUSH_FAILED));
+        assert!(!error.codes.contains(&CONVERSATION_PERSISTENCE_DRAIN_FAILED));
         assert_eq!(
             relay
                 .ordered_conversation_persistence()
