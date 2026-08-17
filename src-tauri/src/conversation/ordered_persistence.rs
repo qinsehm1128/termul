@@ -1,100 +1,84 @@
-//! Bounded, source-sequenced ACP persistence workers.
+//! Globally bounded, source-sequenced Conversation persistence.
 //!
-//! Live relay sequence assignment remains in `web::sink`. This module accepts that exact source
-//! sequence, resolves the opaque agent session through the canonical binding index before any
-//! worker is allocated, and serializes durable appends through one retained worker per active
-//! agent session. Source sequences are validation metadata only; the repository continues to own
-//! its canonical per-Conversation sequence.
+//! Opaque ACP session bindings are resolved before admission. Accepted records are charged against
+//! per-session, process-wide record, and serialized-byte budgets, then routed to one of eight
+//! shared Tokio workers. A barrier uses one absolute deadline for control delivery,
+//! acknowledgement, adapter flush, and worker join.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant as StdInstant};
 
 use parking_lot::{Condvar, Mutex};
+use serde::Serialize;
 use serde_json::Value;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
 
 use crate::conversation::{
     ConversationId, ConversationPersistenceAdapter, ConversationPersistenceError,
 };
 
-/// Maximum accepted-but-not-yet-persisted records for one agent session.
-pub const QUEUE_CAPACITY: usize = 256;
-const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-// A production flush is a durability barrier, not an interactive latency budget. Keep it bounded,
-// but allow heavily loaded hosts and full-suite CI enough time to drain accepted records without
-// reporting a false durability failure. Focused backpressure tests use shorter injected timeouts.
-const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Fixed number of shared ordered writer tasks.
+pub const WRITER_SHARDS: usize = 8;
+/// Maximum accepted-but-not-yet-persisted records for one opaque session.
+pub const PER_SESSION_PENDING_RECORDS: usize = 256;
+/// Maximum accepted-but-not-yet-persisted records across the coordinator.
+pub const GLOBAL_PENDING_RECORDS: usize = 4096;
+/// Maximum serialized bytes held by accepted records across the coordinator.
+pub const GLOBAL_PENDING_BYTES: usize = 16 * 1024 * 1024;
+/// Default absolute budget for a complete flush or shutdown attempt.
+pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Compatibility alias retained for existing callers.
+pub const QUEUE_CAPACITY: usize = PER_SESSION_PENDING_RECORDS;
+
+// One barrier may sit behind every admitted record in a single shard.
+const SHARD_CHANNEL_CAPACITY: usize = GLOBAL_PENDING_RECORDS + 1;
 
 const SOURCE_SEQUENCE_INVALID: &str = "CONVERSATION_SOURCE_SEQUENCE_INVALID";
 const WRITER_UNHEALTHY: &str = "CONVERSATION_PERSISTENCE_UNHEALTHY";
 const WRITER_QUEUE_CLOSED: &str = "CONVERSATION_PERSISTENCE_QUEUE_CLOSED";
+const WRITER_QUEUE_SATURATED: &str = "CONVERSATION_PERSISTENCE_QUEUE_SATURATED";
+const WRITER_BYTES_SATURATED: &str = "CONVERSATION_PERSISTENCE_BYTES_SATURATED";
+const WRITER_RECORD_TOO_LARGE: &str = "CONVERSATION_PERSISTENCE_RECORD_TOO_LARGE";
+const WRITER_SERIALIZATION_FAILED: &str = "CONVERSATION_PERSISTENCE_SERIALIZATION_FAILED";
 const WRITER_DRAIN_TIMEOUT: &str = "CONVERSATION_PERSISTENCE_DRAIN_TIMEOUT";
+const WRITER_FRONTIER_MISMATCH: &str = "CONVERSATION_PERSISTENCE_FRONTIER_MISMATCH";
 const WRITER_SHUT_DOWN: &str = "CONVERSATION_PERSISTENCE_SHUT_DOWN";
 
-/// Secret-safe health snapshot for one ordered writer.
+/// Secret-safe health snapshot for one mapped session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderedPersistenceHealth {
     pub conversation_id: ConversationId,
     pub pending_count: usize,
+    pub pending_bytes: usize,
     pub last_accepted_source_seq: u64,
     pub last_persisted_source_seq: u64,
     pub last_error_code: Option<&'static str>,
     pub running: bool,
 }
 
-struct HealthState {
-    snapshot: OrderedPersistenceHealth,
-}
-
-struct WorkerShared {
-    health: Mutex<HealthState>,
-    capacity_available: Condvar,
-}
-
-impl WorkerShared {
-    fn new(conversation_id: ConversationId) -> Self {
-        Self {
-            health: Mutex::new(HealthState {
-                snapshot: OrderedPersistenceHealth {
-                    conversation_id,
-                    pending_count: 0,
-                    last_accepted_source_seq: 0,
-                    last_persisted_source_seq: 0,
-                    last_error_code: None,
-                    running: true,
-                },
-            }),
-            capacity_available: Condvar::new(),
-        }
-    }
-
-    fn snapshot(&self) -> OrderedPersistenceHealth {
-        self.health.lock().snapshot.clone()
-    }
-
-    fn fail(&self, code: &'static str) {
-        self.health.lock().snapshot.last_error_code = Some(code);
-        self.capacity_available.notify_all();
-    }
-
-    fn finish_record(&self, persisted_source_seq: Option<u64>) {
-        let mut health = self.health.lock();
-        if let Some(source_seq) = persisted_source_seq {
-            health.snapshot.last_persisted_source_seq = source_seq;
-        }
-        health.snapshot.pending_count = health.snapshot.pending_count.saturating_sub(1);
-        drop(health);
-        self.capacity_available.notify_all();
-    }
+/// Secret-safe quantitative coordinator snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrderedPersistenceMetrics {
+    pub active_writer_tasks: usize,
+    pub retained_sessions: usize,
+    pub pending_records: usize,
+    pub pending_bytes: usize,
+    pub max_pending_records: usize,
+    pub max_pending_bytes: usize,
+    pub max_per_session_pending_records: usize,
 }
 
 type AppendFuture<'a> = Pin<
     Box<dyn Future<Output = std::result::Result<u64, ConversationPersistenceError>> + Send + 'a>,
+>;
+type FlushFuture<'a> = Pin<
+    Box<dyn Future<Output = std::result::Result<(), ConversationPersistenceError>> + Send + 'a>,
 >;
 
 trait PersistenceTarget: Send + Sync + 'static {
@@ -106,6 +90,8 @@ trait PersistenceTarget: Send + Sync + 'static {
         event_type: &'a str,
         payload: Value,
     ) -> AppendFuture<'a>;
+
+    fn flush(&self) -> FlushFuture<'_>;
 }
 
 struct AdapterTarget {
@@ -128,83 +114,327 @@ impl PersistenceTarget for AdapterTarget {
                 .append_acp_event(agent_session_id, event_type, payload),
         )
     }
+
+    fn flush(&self) -> FlushFuture<'_> {
+        Box::pin(self.adapter.flush_all())
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SerializedRecordCharge<'a> {
+    event_type: &'a str,
+    payload: &'a Value,
+}
+
+struct SessionState {
+    conversation_id: ConversationId,
+    shard: usize,
+    pending_records: usize,
+    pending_bytes: usize,
+    accepted_frontier: u64,
+    persisted_frontier: u64,
+    last_error_code: Option<&'static str>,
+}
+
+#[derive(Default)]
+struct CoordinatorState {
+    sessions: HashMap<String, SessionState>,
+    pending_records: usize,
+    pending_bytes: usize,
+    max_pending_records: usize,
+    max_pending_bytes: usize,
+    max_per_session_pending_records: usize,
+    barrier_active: bool,
+}
+
+struct CoordinatorShared {
+    target: Arc<dyn PersistenceTarget>,
+    state: Mutex<CoordinatorState>,
+    capacity_available: Condvar,
+    shutting_down: AtomicBool,
+    active_writer_tasks: AtomicUsize,
+}
+
+impl CoordinatorShared {
+    fn metrics(&self) -> OrderedPersistenceMetrics {
+        let state = self.state.lock();
+        OrderedPersistenceMetrics {
+            active_writer_tasks: self.active_writer_tasks.load(Ordering::Acquire),
+            retained_sessions: state.sessions.len(),
+            pending_records: state.pending_records,
+            pending_bytes: state.pending_bytes,
+            max_pending_records: state.max_pending_records,
+            max_pending_bytes: state.max_pending_bytes,
+            max_per_session_pending_records: state.max_per_session_pending_records,
+        }
+    }
+
+    fn fatal_session_error(&self, session_key: &str) -> Option<&'static str> {
+        self.state
+            .lock()
+            .sessions
+            .get(session_key)
+            .and_then(|session| session.last_error_code)
+            .filter(|code| *code != SOURCE_SEQUENCE_INVALID)
+    }
+
+    fn finish_record(
+        &self,
+        session_key: &str,
+        source_seq: u64,
+        charged_bytes: usize,
+        result: std::result::Result<(), &'static str>,
+    ) {
+        let mut state = self.state.lock();
+        state.pending_records = state.pending_records.saturating_sub(1);
+        state.pending_bytes = state.pending_bytes.saturating_sub(charged_bytes);
+        if let Some(session) = state.sessions.get_mut(session_key) {
+            session.pending_records = session.pending_records.saturating_sub(1);
+            session.pending_bytes = session.pending_bytes.saturating_sub(charged_bytes);
+            match result {
+                Ok(()) if source_seq > session.persisted_frontier => {
+                    session.persisted_frontier = source_seq;
+                }
+                Ok(()) => {
+                    session.last_error_code = Some(WRITER_FRONTIER_MISMATCH);
+                }
+                Err(code) => {
+                    session.last_error_code.get_or_insert(code);
+                }
+            }
+        }
+        drop(state);
+        self.capacity_available.notify_all();
+    }
+
+    fn observe_barrier(&self, targets: &[BarrierTarget]) -> BarrierAck {
+        let state = self.state.lock();
+        let mut error_code = None;
+        for target in targets {
+            match state.sessions.get(&target.session_key) {
+                Some(session) if session.last_error_code.is_some() => {
+                    error_code.get_or_insert(WRITER_UNHEALTHY);
+                }
+                Some(session) if session.persisted_frontier >= target.target_source_seq => {}
+                _ => {
+                    error_code.get_or_insert(WRITER_FRONTIER_MISMATCH);
+                }
+            }
+        }
+        BarrierAck {
+            observed: targets.to_vec(),
+            error_code,
+        }
+    }
+
+    fn reap_observed(&self, observed: &[BarrierTarget]) {
+        let mut state = self.state.lock();
+        for target in observed {
+            let removable = state
+                .sessions
+                .get(&target.session_key)
+                .is_some_and(|session| {
+                    session.last_error_code.is_none()
+                        && session.pending_records == 0
+                        && session.pending_bytes == 0
+                        && session.accepted_frontier == target.target_source_seq
+                        && session.persisted_frontier == target.target_source_seq
+                });
+            if removable {
+                state.sessions.remove(&target.session_key);
+            }
+        }
+    }
+}
+
+struct AdmissionPermit {
+    shared: Arc<CoordinatorShared>,
+    session_key: String,
+    source_seq: u64,
+    charged_bytes: usize,
+    released: bool,
+}
+
+impl AdmissionPermit {
+    fn complete(mut self, result: std::result::Result<(), &'static str>) {
+        self.released = true;
+        self.shared.finish_record(
+            &self.session_key,
+            self.source_seq,
+            self.charged_bytes,
+            result,
+        );
+    }
+
+    fn disarm(&mut self) {
+        self.released = true;
+    }
+}
+
+impl Drop for AdmissionPermit {
+    fn drop(&mut self) {
+        if !self.released {
+            self.shared.finish_record(
+                &self.session_key,
+                self.source_seq,
+                self.charged_bytes,
+                Err(WRITER_QUEUE_CLOSED),
+            );
+        }
+    }
 }
 
 struct RecordCommand {
     agent_session_id: String,
-    source_seq: u64,
     event_type: String,
     payload: Value,
+    permit: AdmissionPermit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BarrierTarget {
+    session_key: String,
+    target_source_seq: u64,
 }
 
 struct BarrierAck {
-    target_source_seq: u64,
-    result: std::result::Result<(), &'static str>,
+    observed: Vec<BarrierTarget>,
+    error_code: Option<&'static str>,
 }
 
 enum WorkerCommand {
     Record(RecordCommand),
     Barrier {
-        target_source_seq: u64,
-        reply: SyncSender<BarrierAck>,
+        targets: Vec<BarrierTarget>,
+        reply: oneshot::Sender<BarrierAck>,
     },
     Shutdown,
 }
 
-#[derive(Clone)]
-struct WorkerControl {
-    sender: SyncSender<WorkerCommand>,
-    shared: Arc<WorkerShared>,
-    submit_lock: Arc<Mutex<()>>,
+struct WorkerTaskGuard {
+    shared: Arc<CoordinatorShared>,
 }
 
-struct WorkerEntry {
-    control: WorkerControl,
-    join_handle: Option<JoinHandle<()>>,
+impl Drop for WorkerTaskGuard {
+    fn drop(&mut self) {
+        self.shared
+            .active_writer_tasks
+            .fetch_sub(1, Ordering::AcqRel);
+        self.shared.capacity_available.notify_all();
+    }
 }
 
-/// One bounded ordered persistence coordinator shared by every relay using an adapter.
-///
-/// `submit` is intentionally synchronous because [`crate::web::EventSink::emit`] is synchronous.
-/// Once a session reaches [`QUEUE_CAPACITY`] accepted records, only producers for that session
-/// block until its retained worker crosses a durability boundary.
+struct ShardControl {
+    sender: mpsc::Sender<WorkerCommand>,
+    join_handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+struct SubmissionPause {
+    shared: Arc<CoordinatorShared>,
+    active: bool,
+}
+
+impl SubmissionPause {
+    fn begin(shared: Arc<CoordinatorShared>) -> (Self, Vec<Vec<BarrierTarget>>) {
+        let mut state = shared.state.lock();
+        state.barrier_active = true;
+        let mut targets = (0..WRITER_SHARDS).map(|_| Vec::new()).collect::<Vec<_>>();
+        for (session_key, session) in &state.sessions {
+            targets[session.shard].push(BarrierTarget {
+                session_key: session_key.clone(),
+                target_source_seq: session.accepted_frontier,
+            });
+        }
+        for shard_targets in &mut targets {
+            shard_targets.sort_by(|left, right| left.session_key.cmp(&right.session_key));
+        }
+        drop(state);
+        (
+            Self {
+                shared,
+                active: true,
+            },
+            targets,
+        )
+    }
+
+    fn resume(&mut self) {
+        if self.active {
+            self.shared.state.lock().barrier_active = false;
+            self.active = false;
+            self.shared.capacity_available.notify_all();
+        }
+    }
+}
+
+impl Drop for SubmissionPause {
+    fn drop(&mut self) {
+        self.resume();
+    }
+}
+
+/// One globally bounded ordered persistence coordinator shared by every relay using an adapter.
 pub struct OrderedConversationPersistence {
-    target: Arc<dyn PersistenceTarget>,
-    workers: Mutex<HashMap<String, WorkerEntry>>,
-    shutting_down: AtomicBool,
-    idle_timeout: Duration,
+    shared: Arc<CoordinatorShared>,
+    shards: Vec<ShardControl>,
+    lifecycle_lock: tokio::sync::Mutex<()>,
     drain_timeout: Duration,
 }
 
 impl OrderedConversationPersistence {
     #[must_use]
     pub fn new(adapter: Arc<ConversationPersistenceAdapter>) -> Self {
-        Self::with_target(
-            Arc::new(AdapterTarget { adapter }),
-            DEFAULT_IDLE_TIMEOUT,
-            DEFAULT_DRAIN_TIMEOUT,
-        )
+        Self::with_target(Arc::new(AdapterTarget { adapter }), DEFAULT_DRAIN_TIMEOUT)
     }
 
-    fn with_target(
+    fn with_target(target: Arc<dyn PersistenceTarget>, drain_timeout: Duration) -> Self {
+        Self::with_target_and_handle(target, drain_timeout, coordinator_runtime_handle())
+    }
+
+    fn with_target_and_handle(
         target: Arc<dyn PersistenceTarget>,
-        idle_timeout: Duration,
         drain_timeout: Duration,
+        runtime: tokio::runtime::Handle,
     ) -> Self {
-        Self {
+        let shared = Arc::new(CoordinatorShared {
             target,
-            workers: Mutex::new(HashMap::new()),
+            state: Mutex::new(CoordinatorState::default()),
+            capacity_available: Condvar::new(),
             shutting_down: AtomicBool::new(false),
-            idle_timeout,
+            active_writer_tasks: AtomicUsize::new(0),
+        });
+        let mut shards = Vec::with_capacity(WRITER_SHARDS);
+        for shard_index in 0..WRITER_SHARDS {
+            let (sender, receiver) = mpsc::channel(SHARD_CHANNEL_CAPACITY);
+            shared.active_writer_tasks.fetch_add(1, Ordering::AcqRel);
+            let guard = WorkerTaskGuard {
+                shared: Arc::clone(&shared),
+            };
+            let join_handle =
+                runtime.spawn(run_shard(shard_index, receiver, Arc::clone(&shared), guard));
+            shards.push(ShardControl {
+                sender,
+                join_handle: Mutex::new(Some(join_handle)),
+            });
+        }
+        log::info!(
+            "[conversation-persistence] coordinator ready workers={} pending_records=0 pending_bytes=0 frontier=0 elapsed_ms=0",
+            WRITER_SHARDS
+        );
+        Self {
+            shared,
+            shards,
+            lifecycle_lock: tokio::sync::Mutex::new(()),
             drain_timeout,
         }
     }
 
-    /// Accept one relay event for ordered persistence.
+    /// Accept one source-sequenced relay event for ordered persistence.
     ///
-    /// Binding resolution happens before worker creation. Zero, duplicate, or decreasing source
-    /// sequences fail closed before append. Error details never contain the opaque session id or
-    /// payload.
+    /// Binding resolution and serialization occur before any session state or budget is allocated.
+    /// Record-count saturation backpressures the synchronous producer without runtime polling;
+    /// byte saturation rejects before queue acceptance.
     pub fn submit(
         &self,
         agent_session_id: &str,
@@ -212,7 +442,7 @@ impl OrderedConversationPersistence {
         event_type: &str,
         payload: Value,
     ) -> Result<(), ConversationPersistenceError> {
-        if self.shutting_down.load(Ordering::Acquire) {
+        if self.shared.shutting_down.load(Ordering::Acquire) {
             return Err(persistence_error(
                 WRITER_SHUT_DOWN,
                 "ordered_submit",
@@ -226,734 +456,624 @@ impl OrderedConversationPersistence {
                 "source sequence must be greater than zero",
             ));
         }
-        let conversation_id = self.target.resolve(agent_session_id).ok_or_else(|| {
-            persistence_error(
-                "CONVERSATION_BINDING_NOT_FOUND",
-                "ordered_submit",
-                "opaque agent session id has no canonical Conversation binding",
-            )
-        })?;
 
-        let mut command = Some(RecordCommand {
-            agent_session_id: agent_session_id.to_string(),
-            source_seq,
-            event_type: event_type.to_string(),
-            payload,
-        });
-        // An idle worker can retire in the narrow interval between lookup and send. Retry once
-        // after joining/replacing that retained handle; a second disconnect is a stable failure.
-        'submit_attempts: for attempt in 0..=1 {
-            let control = self.ensure_worker(agent_session_id, conversation_id)?;
-            let submit_guard = control.submit_lock.lock();
-            let wait_started = Instant::now();
-            {
-                let mut health = control.shared.health.lock();
-                if self.shutting_down.load(Ordering::Acquire) {
+        let conversation_id = self
+            .shared
+            .target
+            .resolve(agent_session_id)
+            .ok_or_else(|| {
+                persistence_error(
+                    "CONVERSATION_BINDING_NOT_FOUND",
+                    "ordered_submit",
+                    "opaque agent session id has no canonical Conversation binding",
+                )
+            })?;
+        let charged_bytes = serialized_record_bytes(event_type, &payload)?;
+        if charged_bytes > GLOBAL_PENDING_BYTES {
+            return Err(persistence_error(
+                WRITER_RECORD_TOO_LARGE,
+                "ordered_submit",
+                format!(
+                    "serialized record bytes {charged_bytes} exceed global byte limit {GLOBAL_PENDING_BYTES}"
+                ),
+            ));
+        }
+
+        let shard = shard_for(agent_session_id);
+        let mut saturation_logged = false;
+        let mut state = self.shared.state.lock();
+        loop {
+            if self.shared.shutting_down.load(Ordering::Acquire) {
+                return Err(persistence_error(
+                    WRITER_SHUT_DOWN,
+                    "ordered_submit",
+                    "ordered persistence is shutting down",
+                ));
+            }
+            if state.barrier_active {
+                self.shared.capacity_available.wait(&mut state);
+                continue;
+            }
+
+            if let Some(session) = state.sessions.get(agent_session_id) {
+                if session.conversation_id != conversation_id {
                     return Err(persistence_error(
-                        WRITER_SHUT_DOWN,
+                        "CONVERSATION_BINDING_CONFLICT",
                         "ordered_submit",
-                        "ordered persistence is shutting down",
+                        "agent session binding changed while ordered state was retained",
                     ));
                 }
-                if !health.snapshot.running {
-                    drop(health);
-                    drop(submit_guard);
-                    self.restart_worker(agent_session_id, conversation_id)?;
-                    continue 'submit_attempts;
-                }
-                if let Some(code) = health.snapshot.last_error_code {
-                    let (reported_code, detail) = if code == SOURCE_SEQUENCE_INVALID {
-                        (
-                            SOURCE_SEQUENCE_INVALID,
-                            "source sequence validation previously failed".to_string(),
-                        )
+                if let Some(code) = session.last_error_code {
+                    let reported_code = if code == SOURCE_SEQUENCE_INVALID {
+                        SOURCE_SEQUENCE_INVALID
                     } else {
-                        (
-                            WRITER_UNHEALTHY,
-                            format!("ordered writer is unhealthy ({code})"),
-                        )
+                        WRITER_UNHEALTHY
                     };
-                    return Err(persistence_error(reported_code, "ordered_submit", detail));
+                    return Err(persistence_error(
+                        reported_code,
+                        "ordered_submit",
+                        format!("ordered persistence circuit is open ({code})"),
+                    ));
                 }
-                if source_seq <= health.snapshot.last_accepted_source_seq {
-                    health.snapshot.last_error_code = Some(SOURCE_SEQUENCE_INVALID);
-                    let accepted = health.snapshot.last_accepted_source_seq;
-                    drop(health);
-                    control.shared.capacity_available.notify_all();
+                if source_seq <= session.accepted_frontier {
+                    let accepted = session.accepted_frontier;
+                    state
+                        .sessions
+                        .get_mut(agent_session_id)
+                        .expect("session was read while state lock was held")
+                        .last_error_code = Some(SOURCE_SEQUENCE_INVALID);
+                    self.shared.capacity_available.notify_all();
                     log::error!(
-                        "[conversation-persistence] source sequence violation code={} conversation_id={}",
+                        "[conversation-persistence] frontier mismatch code={} pending_records={} pending_bytes={}",
                         SOURCE_SEQUENCE_INVALID,
-                        conversation_id
+                        state.pending_records,
+                        state.pending_bytes
                     );
                     return Err(persistence_error(
                         SOURCE_SEQUENCE_INVALID,
                         "ordered_submit",
                         format!(
-                            "source sequence must be strictly increasing; last accepted frontier is {accepted}"
+                            "source sequence must be strictly increasing; accepted frontier is {accepted}"
                         ),
                     ));
                 }
-                while health.snapshot.pending_count >= QUEUE_CAPACITY {
-                    if self.shutting_down.load(Ordering::Acquire) {
-                        return Err(persistence_error(
-                            WRITER_SHUT_DOWN,
-                            "ordered_submit",
-                            "ordered persistence is shutting down",
-                        ));
-                    }
-                    control.shared.capacity_available.wait(&mut health);
-                    if let Some(code) = health.snapshot.last_error_code {
-                        let reported_code = if code == SOURCE_SEQUENCE_INVALID {
-                            SOURCE_SEQUENCE_INVALID
-                        } else {
-                            WRITER_UNHEALTHY
-                        };
-                        return Err(persistence_error(
-                            reported_code,
-                            "ordered_submit",
-                            format!("ordered writer is unhealthy ({code})"),
-                        ));
-                    }
-                    if !health.snapshot.running {
-                        drop(health);
-                        drop(submit_guard);
-                        self.restart_worker(agent_session_id, conversation_id)?;
-                        continue 'submit_attempts;
-                    }
-                }
-                health.snapshot.pending_count += 1;
-                health.snapshot.last_accepted_source_seq = source_seq;
-            }
-            let waited = wait_started.elapsed();
-            if !waited.is_zero() && waited >= Duration::from_millis(1) {
-                log::warn!(
-                    "[conversation-persistence] bounded writer backpressure conversation_id={} duration_ms={}",
-                    conversation_id,
-                    waited.as_millis()
-                );
             }
 
-            let record = command.take().expect("record command is sent once");
-            match control.sender.send(WorkerCommand::Record(record)) {
+            let session_pending = state
+                .sessions
+                .get(agent_session_id)
+                .map_or(0, |session| session.pending_records);
+            if state.pending_bytes.saturating_add(charged_bytes) > GLOBAL_PENDING_BYTES {
+                log::warn!(
+                    "[conversation-persistence] admission saturated code={} pending_records={} pending_bytes={}",
+                    WRITER_BYTES_SATURATED,
+                    state.pending_records,
+                    state.pending_bytes
+                );
+                return Err(persistence_error(
+                    WRITER_BYTES_SATURATED,
+                    "ordered_submit",
+                    format!(
+                        "serialized record bytes {charged_bytes} exceed remaining global byte budget {}",
+                        GLOBAL_PENDING_BYTES.saturating_sub(state.pending_bytes)
+                    ),
+                ));
+            }
+            if session_pending >= PER_SESSION_PENDING_RECORDS
+                || state.pending_records >= GLOBAL_PENDING_RECORDS
+            {
+                if !saturation_logged {
+                    log::warn!(
+                        "[conversation-persistence] admission saturated code={} pending_records={} pending_bytes={}",
+                        WRITER_QUEUE_SATURATED,
+                        state.pending_records,
+                        state.pending_bytes
+                    );
+                    saturation_logged = true;
+                }
+                self.shared.capacity_available.wait(&mut state);
+                continue;
+            }
+
+            let previous_frontier = state
+                .sessions
+                .get(agent_session_id)
+                .map_or(0, |session| session.accepted_frontier);
+            let newly_created = !state.sessions.contains_key(agent_session_id);
+            state.pending_records += 1;
+            state.pending_bytes += charged_bytes;
+            state.max_pending_records = state.max_pending_records.max(state.pending_records);
+            state.max_pending_bytes = state.max_pending_bytes.max(state.pending_bytes);
+            let session_pending_after = {
+                let session = state
+                    .sessions
+                    .entry(agent_session_id.to_string())
+                    .or_insert(SessionState {
+                        conversation_id,
+                        shard,
+                        pending_records: 0,
+                        pending_bytes: 0,
+                        accepted_frontier: 0,
+                        persisted_frontier: 0,
+                        last_error_code: None,
+                    });
+                session.pending_records += 1;
+                session.pending_bytes += charged_bytes;
+                session.accepted_frontier = source_seq;
+                session.pending_records
+            };
+            state.max_per_session_pending_records = state
+                .max_per_session_pending_records
+                .max(session_pending_after);
+
+            let permit = AdmissionPermit {
+                shared: Arc::clone(&self.shared),
+                session_key: agent_session_id.to_string(),
+                source_seq,
+                charged_bytes,
+                released: false,
+            };
+            let command = WorkerCommand::Record(RecordCommand {
+                agent_session_id: agent_session_id.to_string(),
+                event_type: event_type.to_string(),
+                payload,
+                permit,
+            });
+            match self.shards[shard].sender.try_send(command) {
                 Ok(()) => return Ok(()),
                 Err(send_error) => {
-                    let WorkerCommand::Record(record) = send_error.0 else {
-                        unreachable!("submit only sends records")
+                    let (mut command, code, detail) = match send_error {
+                        mpsc::error::TrySendError::Full(command) => (
+                            command,
+                            WRITER_QUEUE_SATURATED,
+                            "ordered shard queue is saturated",
+                        ),
+                        mpsc::error::TrySendError::Closed(command) => (
+                            command,
+                            WRITER_QUEUE_CLOSED,
+                            "ordered shard queue is closed",
+                        ),
                     };
-                    command = Some(record);
-                    let mut health = control.shared.health.lock();
-                    health.snapshot.pending_count = health.snapshot.pending_count.saturating_sub(1);
-                    health.snapshot.last_accepted_source_seq =
-                        health.snapshot.last_persisted_source_seq;
-                    health.snapshot.running = false;
-                    drop(health);
-                    control.shared.capacity_available.notify_all();
-                    if attempt == 0 {
-                        self.restart_worker(agent_session_id, conversation_id)?;
-                        continue 'submit_attempts;
-                    }
-                    control.shared.fail(WRITER_QUEUE_CLOSED);
-                    log::error!(
-                        "[conversation-persistence] writer queue closed code={} conversation_id={}",
-                        WRITER_QUEUE_CLOSED,
-                        conversation_id
+                    disarm_record_command(&mut command);
+                    rollback_admission(
+                        &mut state,
+                        agent_session_id,
+                        previous_frontier,
+                        charged_bytes,
+                        newly_created,
                     );
-                    return Err(persistence_error(
-                        WRITER_QUEUE_CLOSED,
-                        "ordered_submit",
-                        "ordered writer queue is closed",
-                    ));
+                    self.shared.capacity_available.notify_all();
+                    log::error!(
+                        "[conversation-persistence] enqueue failed code={} pending_records={} pending_bytes={}",
+                        code,
+                        state.pending_records,
+                        state.pending_bytes
+                    );
+                    return Err(persistence_error(code, "ordered_submit", detail));
                 }
             }
         }
-        unreachable!("submit retry loop returns")
     }
 
-    /// Health for a mapped agent session. No worker is created by this query.
+    /// Health for a mapped session. No session state or byte budget is created by this query.
     pub fn health(
         &self,
         agent_session_id: &str,
     ) -> Result<Option<OrderedPersistenceHealth>, ConversationPersistenceError> {
-        let conversation_id = self.target.resolve(agent_session_id).ok_or_else(|| {
-            persistence_error(
-                "CONVERSATION_BINDING_NOT_FOUND",
-                "ordered_health",
-                "opaque agent session id has no canonical Conversation binding",
-            )
-        })?;
-        Ok(self
-            .workers
-            .lock()
-            .get(agent_session_id)
-            .map(|entry| entry.control.shared.snapshot())
-            .filter(|health| health.conversation_id == conversation_id))
+        let conversation_id = self
+            .shared
+            .target
+            .resolve(agent_session_id)
+            .ok_or_else(|| {
+                persistence_error(
+                    "CONVERSATION_BINDING_NOT_FOUND",
+                    "ordered_health",
+                    "opaque agent session id has no canonical Conversation binding",
+                )
+            })?;
+        let state = self.shared.state.lock();
+        Ok(state.sessions.get(agent_session_id).and_then(|session| {
+            (session.conversation_id == conversation_id).then_some(OrderedPersistenceHealth {
+                conversation_id,
+                pending_count: session.pending_records,
+                pending_bytes: session.pending_bytes,
+                last_accepted_source_seq: session.accepted_frontier,
+                last_persisted_source_seq: session.persisted_frontier,
+                last_error_code: session.last_error_code,
+                running: !self.shared.shutting_down.load(Ordering::Acquire)
+                    && self.shared.active_writer_tasks.load(Ordering::Acquire) > 0,
+            })
+        }))
     }
 
-    /// Number of retained session entries. Finished idle workers keep their health and handle until
-    /// the next submit/flush/shutdown reaps them, so diagnostics never lose an error frontier.
+    /// Number of retained per-session frontier/circuit entries.
     #[must_use]
     pub fn retained_worker_count(&self) -> usize {
-        self.workers.lock().len()
+        self.shared.state.lock().sessions.len()
     }
 
-    /// Number of workers currently running (idle-retired entries are excluded).
+    /// Number of fixed shared Tokio writer tasks that have not exited.
     #[must_use]
     pub fn active_worker_count(&self) -> usize {
-        self.workers
-            .lock()
-            .values()
-            .filter(|entry| entry.control.shared.snapshot().running)
-            .count()
+        self.shared.active_writer_tasks.load(Ordering::Acquire)
     }
 
-    /// Enqueue a barrier behind all records accepted before this call and await every worker.
+    /// Secret-safe current and high-water resource accounting.
+    #[must_use]
+    pub fn metrics(&self) -> OrderedPersistenceMetrics {
+        self.shared.metrics()
+    }
+
+    /// Flush using the default single absolute deadline.
     pub async fn flush_all(&self) -> Result<(), ConversationPersistenceError> {
-        let started = Instant::now();
-        let controls = self.worker_controls();
-        let mut barriers = Vec::with_capacity(controls.len());
-        let mut first_error = None;
-        for control in controls {
-            let _submit_guard = control.submit_lock.lock();
-            let health = control.shared.snapshot();
-            if !health.running {
-                if health.pending_count == 0
-                    && health.last_persisted_source_seq == health.last_accepted_source_seq
-                    && health.last_error_code.is_none()
-                {
-                    continue;
+        self.flush_all_until(Instant::now() + self.drain_timeout)
+            .await
+    }
+
+    /// Await every accepted frontier and the adapter flush under one absolute deadline.
+    pub async fn flush_all_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), ConversationPersistenceError> {
+        let started = StdInstant::now();
+        let lifecycle_guard = tokio::time::timeout_at(deadline, self.lifecycle_lock.lock())
+            .await
+            .map_err(|_| deadline_error("ordered_flush_all", "timed out acquiring flush gate"))?;
+        let result = self.flush_until_locked(deadline).await;
+        drop(lifecycle_guard);
+        self.log_boundary_result("flush", started, result.as_ref().err());
+        result
+    }
+
+    /// Shutdown using the default single absolute deadline.
+    pub async fn shutdown(&self) -> Result<(), ConversationPersistenceError> {
+        self.shutdown_until(Instant::now() + self.drain_timeout)
+            .await
+    }
+
+    /// Stop admission, flush, signal all shards, and join them under one absolute deadline.
+    pub async fn shutdown_until(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), ConversationPersistenceError> {
+        let started = StdInstant::now();
+        let lifecycle_guard = tokio::time::timeout_at(deadline, self.lifecycle_lock.lock())
+            .await
+            .map_err(|_| deadline_error("ordered_shutdown", "timed out acquiring shutdown gate"))?;
+        self.shared.shutting_down.store(true, Ordering::Release);
+        self.shared.capacity_available.notify_all();
+
+        let mut first_error = self.flush_until_locked(deadline).await.err();
+        for shard in &self.shards {
+            match tokio::time::timeout_at(deadline, shard.sender.send(WorkerCommand::Shutdown))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    first_error.get_or_insert_with(|| {
+                        persistence_error(
+                            WRITER_QUEUE_CLOSED,
+                            "ordered_shutdown",
+                            "ordered shard closed before shutdown receipt",
+                        )
+                    });
                 }
-                let error = health.last_error_code.map_or_else(
-                    || {
+                Err(_) => {
+                    first_error.get_or_insert_with(|| {
+                        deadline_error(
+                            "ordered_shutdown",
+                            "timed out enqueueing ordered shard shutdown",
+                        )
+                    });
+                }
+            }
+        }
+
+        for shard in &self.shards {
+            let Some(mut handle) = shard.join_handle.lock().take() else {
+                continue;
+            };
+            match tokio::time::timeout_at(deadline, &mut handle).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    first_error.get_or_insert_with(|| {
+                        persistence_error(
+                            WRITER_QUEUE_CLOSED,
+                            "ordered_shutdown",
+                            "ordered shard join failed",
+                        )
+                    });
+                }
+                Err(_) => {
+                    handle.abort();
+                    first_error.get_or_insert_with(|| {
+                        deadline_error(
+                            "ordered_shutdown",
+                            "timed out joining ordered persistence shards",
+                        )
+                    });
+                }
+            }
+        }
+        drop(lifecycle_guard);
+        let result = first_error.map_or(Ok(()), Err);
+        self.log_boundary_result("shutdown", started, result.as_ref().err());
+        result
+    }
+
+    async fn flush_until_locked(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), ConversationPersistenceError> {
+        let (mut submission_pause, targets_by_shard) =
+            SubmissionPause::begin(Arc::clone(&self.shared));
+        let mut acknowledgements = Vec::with_capacity(WRITER_SHARDS);
+        let mut first_error = None;
+
+        for (shard, targets) in self.shards.iter().zip(targets_by_shard) {
+            let (reply, receiver) = oneshot::channel();
+            let command = WorkerCommand::Barrier { targets, reply };
+            match tokio::time::timeout_at(deadline, shard.sender.send(command)).await {
+                Ok(Ok(())) => acknowledgements.push(receiver),
+                Ok(Err(_)) => {
+                    first_error.get_or_insert_with(|| {
                         persistence_error(
                             WRITER_QUEUE_CLOSED,
                             "ordered_flush_all",
-                            "ordered writer stopped before reaching its accepted frontier",
+                            "ordered shard closed before barrier enqueue",
                         )
-                    },
-                    |code| {
-                        persistence_error(
-                            WRITER_UNHEALTHY,
+                    });
+                }
+                Err(_) => {
+                    first_error.get_or_insert_with(|| {
+                        deadline_error(
                             "ordered_flush_all",
-                            format!("ordered writer is unhealthy ({code})"),
+                            "timed out enqueueing ordered shard barrier",
                         )
-                    },
-                );
-                first_error.get_or_insert(error);
-                continue;
+                    });
+                }
             }
-            let (reply, receiver) = mpsc::sync_channel(1);
-            if let Err(error) = self.send_control_bounded(
-                &control.sender,
-                WorkerCommand::Barrier {
-                    target_source_seq: health.last_accepted_source_seq,
-                    reply,
-                },
-                health.conversation_id,
-            ) {
-                first_error.get_or_insert(error);
-                continue;
+        }
+        submission_pause.resume();
+
+        let mut observed = Vec::new();
+        for receiver in acknowledgements {
+            match tokio::time::timeout_at(deadline, receiver).await {
+                Ok(Ok(acknowledgement)) => {
+                    if let Some(code) = acknowledgement.error_code {
+                        first_error.get_or_insert_with(|| {
+                            persistence_error(
+                                code,
+                                "ordered_flush_all",
+                                "ordered shard did not observe its accepted frontier",
+                            )
+                        });
+                    } else {
+                        observed.extend(acknowledgement.observed);
+                    }
+                }
+                Ok(Err(_)) => {
+                    first_error.get_or_insert_with(|| {
+                        persistence_error(
+                            WRITER_QUEUE_CLOSED,
+                            "ordered_flush_all",
+                            "ordered shard dropped its barrier acknowledgement",
+                        )
+                    });
+                }
+                Err(_) => {
+                    first_error.get_or_insert_with(|| {
+                        deadline_error(
+                            "ordered_flush_all",
+                            "timed out awaiting ordered shard barrier",
+                        )
+                    });
+                }
             }
-            barriers.push((
-                health.conversation_id,
-                health.last_accepted_source_seq,
-                receiver,
-            ));
         }
 
-        let timeout = self.drain_timeout;
-        let acknowledgements = tokio::task::spawn_blocking(move || {
-            let deadline = Instant::now() + timeout;
-            barriers
-                .into_iter()
-                .map(|(conversation_id, target, receiver)| {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    receiver.recv_timeout(remaining).map_or_else(
-                        |_| {
-                            Err(persistence_error(
-                                WRITER_DRAIN_TIMEOUT,
-                                "ordered_flush_all",
-                                "timed out waiting for ordered writer barrier",
-                            ))
-                        },
-                        |acknowledgement| Ok((conversation_id, target, acknowledgement)),
-                    )
-                })
-                .collect::<Vec<_>>()
-        })
-        .await
-        .map_err(|_| {
-            persistence_error(
-                WRITER_QUEUE_CLOSED,
-                "ordered_flush_all",
-                "ordered writer barrier waiter failed",
-            )
-        })?;
-
-        for acknowledgement in acknowledgements {
-            let (conversation_id, target, acknowledgement) = match acknowledgement {
-                Ok(acknowledgement) => acknowledgement,
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                    continue;
-                }
-            };
-            if let Err(code) = acknowledgement.result {
+        match tokio::time::timeout_at(deadline, self.shared.target.flush()).await {
+            Ok(Ok(())) => {
+                self.shared.reap_observed(&observed);
+            }
+            Ok(Err(error)) => {
                 first_error.get_or_insert_with(|| {
                     persistence_error(
                         WRITER_UNHEALTHY,
                         "ordered_flush_all",
-                        format!("ordered writer barrier failed ({code})"),
+                        format!("persistence adapter flush failed ({})", error.code),
                     )
                 });
-                continue;
             }
-            if acknowledgement.target_source_seq != target {
+            Err(_) => {
                 first_error.get_or_insert_with(|| {
-                    persistence_error(
-                        WRITER_QUEUE_CLOSED,
+                    deadline_error(
                         "ordered_flush_all",
-                        "ordered writer acknowledged the wrong source frontier",
+                        "timed out awaiting persistence adapter flush",
                     )
                 });
-                continue;
             }
-            log::info!(
-                "[conversation-persistence] writer flush conversation_id={} pending_count=0 last_accepted_source_seq={} last_persisted_source_seq={} duration_ms={}",
-                conversation_id,
-                target,
-                target,
-                started.elapsed().as_millis()
-            );
         }
-        self.reap_finished_workers();
+
         first_error.map_or(Ok(()), Err)
     }
 
-    /// Stop accepting records, flush every accepted record, and retain any timed-out handle so a
-    /// host can report an unhealthy shutdown rather than claiming a successful drain.
-    pub async fn shutdown(&self) -> Result<(), ConversationPersistenceError> {
-        self.shutting_down.store(true, Ordering::Release);
-        for control in self.worker_controls() {
-            control.shared.capacity_available.notify_all();
-        }
-        let flush_result = self.flush_all().await;
-        let controls = self.worker_controls();
-        for control in controls {
-            let health = control.shared.snapshot();
-            if health.running {
-                let _submit_guard = control.submit_lock.lock();
-                let _ = self.send_control_bounded(
-                    &control.sender,
-                    WorkerCommand::Shutdown,
-                    health.conversation_id,
-                );
-            }
-        }
-
-        let deadline = tokio::time::Instant::now() + self.drain_timeout;
-        loop {
-            self.reap_finished_workers();
-            if self.active_worker_count() == 0 {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(persistence_error(
-                    WRITER_DRAIN_TIMEOUT,
-                    "ordered_shutdown",
-                    "timed out joining ordered persistence workers",
-                ));
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        flush_result
-    }
-
-    fn worker_controls(&self) -> Vec<WorkerControl> {
-        self.workers
+    fn log_boundary_result(
+        &self,
+        operation: &'static str,
+        started: StdInstant,
+        error: Option<&ConversationPersistenceError>,
+    ) {
+        let metrics = self.metrics();
+        let frontier = self
+            .shared
+            .state
             .lock()
+            .sessions
             .values()
-            .map(|entry| entry.control.clone())
-            .collect()
-    }
-
-    fn ensure_worker(
-        &self,
-        agent_session_id: &str,
-        conversation_id: ConversationId,
-    ) -> Result<WorkerControl, ConversationPersistenceError> {
-        let mut workers = self.workers.lock();
-        if let Some(entry) = workers.get_mut(agent_session_id) {
-            if entry.control.shared.snapshot().conversation_id != conversation_id {
-                return Err(persistence_error(
-                    "CONVERSATION_BINDING_CONFLICT",
-                    "ordered_submit",
-                    "agent session binding changed while an ordered writer was retained",
-                ));
-            }
-            let running = entry.control.shared.snapshot().running;
-            let finished = entry
-                .join_handle
-                .as_ref()
-                .is_some_and(std::thread::JoinHandle::is_finished);
-            if !running || finished || entry.join_handle.is_none() {
-                if let Some(handle) = entry.join_handle.take() {
-                    let _ = handle.join();
-                }
-                let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
-                entry.control.sender = sender;
-                entry.control.shared.health.lock().snapshot.running = true;
-                entry.join_handle = Some(spawn_worker(
-                    Arc::clone(&self.target),
-                    Arc::clone(&entry.control.shared),
-                    Arc::clone(&entry.control.submit_lock),
-                    receiver,
-                    self.idle_timeout,
-                )?);
-            }
-            return Ok(entry.control.clone());
-        }
-
-        let shared = Arc::new(WorkerShared::new(conversation_id));
-        let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
-        let control = WorkerControl {
-            sender,
-            shared: Arc::clone(&shared),
-            submit_lock: Arc::new(Mutex::new(())),
-        };
-        let handle = spawn_worker(
-            Arc::clone(&self.target),
-            shared,
-            Arc::clone(&control.submit_lock),
-            receiver,
-            self.idle_timeout,
-        )?;
-        workers.insert(
-            agent_session_id.to_string(),
-            WorkerEntry {
-                control: control.clone(),
-                join_handle: Some(handle),
-            },
-        );
-        Ok(control)
-    }
-
-    fn restart_worker(
-        &self,
-        agent_session_id: &str,
-        conversation_id: ConversationId,
-    ) -> Result<(), ConversationPersistenceError> {
-        let mut workers = self.workers.lock();
-        let Some(entry) = workers.get_mut(agent_session_id) else {
-            return Ok(());
-        };
-        if let Some(handle) = entry.join_handle.take() {
-            let _ = handle.join();
-        }
-        let (sender, receiver) = mpsc::sync_channel(QUEUE_CAPACITY);
-        entry.control.sender = sender;
-        {
-            let mut health = entry.control.shared.health.lock();
-            health.snapshot.conversation_id = conversation_id;
-            health.snapshot.running = true;
-        }
-        entry.join_handle = Some(spawn_worker(
-            Arc::clone(&self.target),
-            Arc::clone(&entry.control.shared),
-            Arc::clone(&entry.control.submit_lock),
-            receiver,
-            self.idle_timeout,
-        )?);
-        Ok(())
-    }
-
-    fn send_control_bounded(
-        &self,
-        sender: &SyncSender<WorkerCommand>,
-        mut command: WorkerCommand,
-        conversation_id: ConversationId,
-    ) -> Result<(), ConversationPersistenceError> {
-        let deadline = Instant::now() + self.drain_timeout;
-        loop {
-            match sender.try_send(command) {
-                Ok(()) => return Ok(()),
-                Err(TrySendError::Full(returned)) if Instant::now() < deadline => {
-                    command = returned;
-                    std::thread::yield_now();
-                }
-                Err(TrySendError::Full(_)) => {
-                    log::error!(
-                        "[conversation-persistence] drain timeout code={} conversation_id={}",
-                        WRITER_DRAIN_TIMEOUT,
-                        conversation_id
-                    );
-                    return Err(persistence_error(
-                        WRITER_DRAIN_TIMEOUT,
-                        "ordered_control",
-                        "timed out enqueueing ordered writer control message",
-                    ));
-                }
-                Err(TrySendError::Disconnected(_)) => {
-                    return Err(persistence_error(
-                        WRITER_QUEUE_CLOSED,
-                        "ordered_control",
-                        "ordered writer queue is closed",
-                    ));
-                }
-            }
-        }
-    }
-
-    fn reap_finished_workers(&self) {
-        let mut workers = self.workers.lock();
-        for entry in workers.values_mut() {
-            if entry
-                .join_handle
-                .as_ref()
-                .is_some_and(std::thread::JoinHandle::is_finished)
-            {
-                if let Some(handle) = entry.join_handle.take() {
-                    let _ = handle.join();
-                }
-            }
+            .map(|session| session.persisted_frontier)
+            .max()
+            .unwrap_or(0);
+        if let Some(error) = error {
+            log::error!(
+                "[conversation-persistence] boundary failed operation={} code={} workers={} pending_records={} pending_bytes={} frontier={} elapsed_ms={}",
+                operation,
+                error.code,
+                metrics.active_writer_tasks,
+                metrics.pending_records,
+                metrics.pending_bytes,
+                frontier,
+                started.elapsed().as_millis()
+            );
+        } else {
+            log::info!(
+                "[conversation-persistence] boundary complete operation={} workers={} pending_records={} pending_bytes={} frontier={} elapsed_ms={}",
+                operation,
+                metrics.active_writer_tasks,
+                metrics.pending_records,
+                metrics.pending_bytes,
+                frontier,
+                started.elapsed().as_millis()
+            );
         }
     }
 }
 
 impl Drop for OrderedConversationPersistence {
     fn drop(&mut self) {
-        if self.shutting_down.swap(true, Ordering::AcqRel) && self.active_worker_count() == 0 {
-            return;
-        }
-        let deadline = Instant::now() + self.drain_timeout;
-        let controls = self.worker_controls();
-        let mut barriers = Vec::new();
-        for control in &controls {
-            control.shared.capacity_available.notify_all();
-            let _submit_guard = control.submit_lock.lock();
-            let health = control.shared.snapshot();
-            if !health.running || health.last_error_code.is_some() {
-                continue;
-            }
-            let (reply, receiver) = mpsc::sync_channel(1);
-            match self.send_control_bounded(
-                &control.sender,
-                WorkerCommand::Barrier {
-                    target_source_seq: health.last_accepted_source_seq,
-                    reply,
-                },
-                health.conversation_id,
-            ) {
-                Ok(()) => barriers.push((health.conversation_id, receiver)),
-                Err(error) => log::error!(
-                    "[conversation-persistence] drop drain failed code={} conversation_id={}",
-                    error.code,
-                    health.conversation_id
-                ),
+        self.shared.shutting_down.store(true, Ordering::Release);
+        self.shared.state.lock().barrier_active = false;
+        self.shared.capacity_available.notify_all();
+        for shard in &self.shards {
+            let _ = shard.sender.try_send(WorkerCommand::Shutdown);
+            if let Some(handle) = shard.join_handle.lock().take() {
+                handle.abort();
             }
         }
-        for (conversation_id, receiver) in barriers {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            match receiver.recv_timeout(remaining) {
-                Ok(BarrierAck { result: Ok(()), .. }) => {}
-                Ok(BarrierAck {
-                    result: Err(code), ..
-                }) => log::error!(
-                    "[conversation-persistence] drop drain failed code={} conversation_id={}",
-                    code,
-                    conversation_id
-                ),
-                Err(_) => log::error!(
-                    "[conversation-persistence] drop drain failed code={} conversation_id={}",
-                    WRITER_DRAIN_TIMEOUT,
-                    conversation_id
-                ),
-            }
-        }
-        for control in controls {
-            let health = control.shared.snapshot();
-            if health.running {
-                let _ = self.send_control_bounded(
-                    &control.sender,
-                    WorkerCommand::Shutdown,
-                    health.conversation_id,
-                );
-            }
-        }
-        while Instant::now() < deadline {
-            self.reap_finished_workers();
-            if self.active_worker_count() == 0 {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        for entry in self.workers.get_mut().values() {
-            let health = entry.control.shared.snapshot();
-            if health.running {
-                log::error!(
-                    "[conversation-persistence] drop join failed code={} conversation_id={}",
-                    WRITER_DRAIN_TIMEOUT,
-                    health.conversation_id
-                );
-            }
+        let metrics = self.metrics();
+        if metrics.pending_records > 0 {
+            log::error!(
+                "[conversation-persistence] drop aborted pending work code={} workers={} pending_records={} pending_bytes={}",
+                WRITER_QUEUE_CLOSED,
+                metrics.active_writer_tasks,
+                metrics.pending_records,
+                metrics.pending_bytes
+            );
         }
     }
 }
 
-fn spawn_worker(
-    target: Arc<dyn PersistenceTarget>,
-    shared: Arc<WorkerShared>,
-    submit_lock: Arc<Mutex<()>>,
-    receiver: Receiver<WorkerCommand>,
-    idle_timeout: Duration,
-) -> Result<JoinHandle<()>, ConversationPersistenceError> {
-    let conversation_id = shared.snapshot().conversation_id;
-    std::thread::Builder::new()
-        .name(format!("conversation-writer-{conversation_id}"))
-        .spawn(move || run_worker(target, shared, submit_lock, receiver, idle_timeout))
-        .map_err(|_| {
-            persistence_error(
-                WRITER_QUEUE_CLOSED,
-                "ordered_worker_start",
-                "failed to start ordered persistence worker",
-            )
-        })
-}
-
-fn run_worker(
-    target: Arc<dyn PersistenceTarget>,
-    shared: Arc<WorkerShared>,
-    submit_lock: Arc<Mutex<()>>,
-    receiver: Receiver<WorkerCommand>,
-    idle_timeout: Duration,
+async fn run_shard(
+    _shard_index: usize,
+    mut receiver: mpsc::Receiver<WorkerCommand>,
+    shared: Arc<CoordinatorShared>,
+    _guard: WorkerTaskGuard,
 ) {
-    let conversation_id = shared.snapshot().conversation_id;
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(_) => {
-            shared.fail(WRITER_QUEUE_CLOSED);
-            shared.health.lock().snapshot.running = false;
-            return;
-        }
-    };
-    log::info!(
-        "[conversation-persistence] writer start conversation_id={} pending_count={} last_accepted_source_seq={} last_persisted_source_seq={}",
-        conversation_id,
-        shared.snapshot().pending_count,
-        shared.snapshot().last_accepted_source_seq,
-        shared.snapshot().last_persisted_source_seq
-    );
-
-    loop {
-        let command = match receiver.recv_timeout(idle_timeout) {
-            Ok(command) => command,
-            Err(RecvTimeoutError::Disconnected) => break,
-            Err(RecvTimeoutError::Timeout) => {
-                // Retirement is serialized with both record and barrier submission. Re-check the
-                // receiver after acquiring the gate so a command sent concurrently with the
-                // timeout cannot be stranded behind a worker that has already decided to exit.
-                let retirement_guard = submit_lock.lock();
-                match receiver.try_recv() {
-                    Ok(command) => {
-                        drop(retirement_guard);
-                        command
-                    }
-                    Err(TryRecvError::Disconnected) => break,
-                    Err(TryRecvError::Empty) => {
-                        let mut health = shared.health.lock();
-                        if health.snapshot.pending_count == 0 {
-                            health.snapshot.running = false;
-                            let last_accepted_source_seq = health.snapshot.last_accepted_source_seq;
-                            let last_persisted_source_seq =
-                                health.snapshot.last_persisted_source_seq;
-                            drop(health);
-                            drop(retirement_guard);
-                            log::info!(
-                                "[conversation-persistence] writer idle stop conversation_id={} pending_count=0 last_accepted_source_seq={} last_persisted_source_seq={}",
-                                conversation_id,
-                                last_accepted_source_seq,
-                                last_persisted_source_seq
-                            );
-                            shared.capacity_available.notify_all();
-                            return;
-                        }
-                        drop(health);
-                        drop(retirement_guard);
-                        continue;
-                    }
-                }
-            }
-        };
-
+    while let Some(command) = receiver.recv().await {
         match command {
             WorkerCommand::Record(record) => {
-                let health = shared.snapshot();
-                // A rejected duplicate/decreasing submission is not itself an accepted record:
-                // drain records that were already accepted before the violation. Repository or
-                // worker failures remain fatal and prevent later queued appends.
-                if health
-                    .last_error_code
-                    .is_some_and(|code| code != SOURCE_SEQUENCE_INVALID)
+                let RecordCommand {
+                    agent_session_id,
+                    event_type,
+                    payload,
+                    permit,
+                } = record;
+                if let Some(code) = shared.fatal_session_error(&agent_session_id) {
+                    permit.complete(Err(code));
+                    continue;
+                }
+                match shared
+                    .target
+                    .append(&agent_session_id, &event_type, payload)
+                    .await
                 {
-                    shared.finish_record(None);
-                    continue;
-                }
-                if record.source_seq <= health.last_persisted_source_seq {
-                    shared.fail(SOURCE_SEQUENCE_INVALID);
-                    shared.finish_record(None);
-                    log::error!(
-                        "[conversation-persistence] source sequence violation code={} conversation_id={}",
-                        SOURCE_SEQUENCE_INVALID,
-                        conversation_id
-                    );
-                    continue;
-                }
-                match runtime.block_on(target.append(
-                    &record.agent_session_id,
-                    &record.event_type,
-                    record.payload,
-                )) {
-                    Ok(_) => shared.finish_record(Some(record.source_seq)),
+                    Ok(_) => permit.complete(Ok(())),
                     Err(error) => {
-                        shared.fail(error.code);
-                        shared.finish_record(None);
+                        let code = error.code;
+                        permit.complete(Err(code));
+                        let metrics = shared.metrics();
                         log::error!(
-                            "[conversation-persistence] append failure code={} conversation_id={}",
-                            error.code,
-                            conversation_id
+                            "[conversation-persistence] append failed code={} workers={} pending_records={} pending_bytes={}",
+                            code,
+                            metrics.active_writer_tasks,
+                            metrics.pending_records,
+                            metrics.pending_bytes
                         );
                     }
                 }
             }
-            WorkerCommand::Barrier {
-                target_source_seq,
-                reply,
-            } => {
-                let health = shared.snapshot();
-                let result = health.last_error_code.map_or_else(
-                    || {
-                        if health.pending_count == 0
-                            && health.last_persisted_source_seq >= target_source_seq
-                        {
-                            Ok(())
-                        } else {
-                            Err(WRITER_QUEUE_CLOSED)
-                        }
-                    },
-                    Err,
-                );
-                let _ = reply.send(BarrierAck {
-                    target_source_seq,
-                    result,
-                });
+            WorkerCommand::Barrier { targets, reply } => {
+                let _ = reply.send(shared.observe_barrier(&targets));
             }
             WorkerCommand::Shutdown => break,
         }
     }
-    shared.health.lock().snapshot.running = false;
-    shared.capacity_available.notify_all();
+}
+
+fn coordinator_runtime_handle() -> tokio::runtime::Handle {
+    tokio::runtime::Handle::try_current()
+        .unwrap_or_else(|_| tauri::async_runtime::handle().inner().clone())
+}
+
+fn shard_for(agent_session_id: &str) -> usize {
+    let hash = agent_session_id
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    hash as usize % WRITER_SHARDS
+}
+
+fn serialized_record_bytes(
+    event_type: &str,
+    payload: &Value,
+) -> Result<usize, ConversationPersistenceError> {
+    serde_json::to_vec(&SerializedRecordCharge {
+        event_type,
+        payload,
+    })
+    .map(|bytes| bytes.len())
+    .map_err(|_| {
+        persistence_error(
+            WRITER_SERIALIZATION_FAILED,
+            "ordered_submit",
+            "record could not be serialized for admission accounting",
+        )
+    })
+}
+
+fn disarm_record_command(command: &mut WorkerCommand) {
+    if let WorkerCommand::Record(record) = command {
+        record.permit.disarm();
+    }
+}
+
+fn rollback_admission(
+    state: &mut CoordinatorState,
+    session_key: &str,
+    previous_frontier: u64,
+    charged_bytes: usize,
+    newly_created: bool,
+) {
+    state.pending_records = state.pending_records.saturating_sub(1);
+    state.pending_bytes = state.pending_bytes.saturating_sub(charged_bytes);
+    if let Some(session) = state.sessions.get_mut(session_key) {
+        session.pending_records = session.pending_records.saturating_sub(1);
+        session.pending_bytes = session.pending_bytes.saturating_sub(charged_bytes);
+        session.accepted_frontier = previous_frontier;
+    }
+    if newly_created
+        && state
+            .sessions
+            .get(session_key)
+            .is_some_and(|session| session.pending_records == 0)
+    {
+        state.sessions.remove(session_key);
+    }
+}
+
+fn deadline_error(operation: &'static str, detail: &'static str) -> ConversationPersistenceError {
+    persistence_error(WRITER_DRAIN_TIMEOUT, operation, detail)
 }
 
 fn persistence_error(
@@ -972,9 +1092,7 @@ fn persistence_error(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
-
-    const CONVERSATION_A: &str = "11111111-1111-4111-8111-111111111111";
-    const CONVERSATION_B: &str = "22222222-2222-4222-8222-222222222222";
+    use tokio::sync::Notify;
 
     type RecordedEvent = (u64, String, Value);
     type RecordedSessions = HashMap<String, Vec<RecordedEvent>>;
@@ -983,41 +1101,44 @@ mod tests {
         mappings: HashMap<String, ConversationId>,
         records: Mutex<RecordedSessions>,
         append_count: AtomicUsize,
-        blocked: AtomicBool,
-        release: (Mutex<bool>, Condvar),
+        stall_appends: bool,
+        released: AtomicBool,
+        release: Notify,
         fail_after: Option<usize>,
     }
 
     impl FakeTarget {
-        fn new() -> Self {
+        fn with_sessions(session_count: usize) -> Self {
+            let mappings = (0..session_count)
+                .map(|index| {
+                    let id = format!("00000000-0000-4000-8000-{:012x}", index + 1);
+                    (
+                        format!("opaque-{index}"),
+                        ConversationId::parse(&id).unwrap(),
+                    )
+                })
+                .collect();
             Self {
-                mappings: HashMap::from([
-                    (
-                        "opaque-a".to_string(),
-                        ConversationId::parse(CONVERSATION_A).unwrap(),
-                    ),
-                    (
-                        "opaque-b".to_string(),
-                        ConversationId::parse(CONVERSATION_B).unwrap(),
-                    ),
-                ]),
+                mappings,
                 records: Mutex::new(HashMap::new()),
                 append_count: AtomicUsize::new(0),
-                blocked: AtomicBool::new(false),
-                release: (Mutex::new(false), Condvar::new()),
+                stall_appends: false,
+                released: AtomicBool::new(false),
+                release: Notify::new(),
                 fail_after: None,
             }
         }
 
-        fn blocked() -> Self {
-            let target = Self::new();
-            target.blocked.store(true, Ordering::Release);
-            target
+        fn stalled(session_count: usize) -> Self {
+            Self {
+                stall_appends: true,
+                ..Self::with_sessions(session_count)
+            }
         }
 
         fn release(&self) {
-            *self.release.0.lock() = true;
-            self.release.1.notify_all();
+            self.released.store(true, Ordering::Release);
+            self.release.notify_waiters();
         }
     }
 
@@ -1033,18 +1154,15 @@ mod tests {
             payload: Value,
         ) -> AppendFuture<'a> {
             Box::pin(async move {
-                if self.blocked.load(Ordering::Acquire) {
-                    let mut released = self.release.0.lock();
-                    while !*released {
-                        self.release.1.wait(&mut released);
-                    }
+                while self.stall_appends && !self.released.load(Ordering::Acquire) {
+                    self.release.notified().await;
                 }
                 let count = self.append_count.fetch_add(1, Ordering::AcqRel) + 1;
                 if self.fail_after.is_some_and(|limit| count > limit) {
                     return Err(persistence_error(
                         "CONVERSATION_EVENT_APPEND_FAILED",
                         "fake_append",
-                        "injected failure containing prompt=do-not-log token=do-not-log",
+                        "injected sensitive detail",
                     ));
                 }
                 let source_seq = payload["sourceSeq"].as_u64().unwrap();
@@ -1056,135 +1174,248 @@ mod tests {
                 Ok(count as u64)
             })
         }
+
+        fn flush(&self) -> FlushFuture<'_> {
+            Box::pin(async { Ok(()) })
+        }
     }
 
     fn ordered(target: Arc<FakeTarget>) -> OrderedConversationPersistence {
-        OrderedConversationPersistence::with_target(
-            target,
-            Duration::from_millis(50),
-            Duration::from_secs(3),
-        )
+        OrderedConversationPersistence::with_target(target, Duration::from_secs(3))
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn ten_thousand_events_remain_ordered_per_session_with_two_retained_workers() {
-        let target = Arc::new(FakeTarget::new());
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn global_worker_budget_is_bounded() {
+        const SESSION_COUNT: usize = 128;
+        const RECORD_COUNT: usize = 10_000;
+
+        let target = Arc::new(FakeTarget::with_sessions(SESSION_COUNT));
         let persistence = ordered(Arc::clone(&target));
-        for source_seq in 1..=5_000 {
-            for session in ["opaque-a", "opaque-b"] {
-                let event_type = match source_seq % 5 {
-                    0 => "message_chunk",
-                    1 => "tool_call",
-                    2 => "tool_call_update",
-                    3 => "prompt_complete",
-                    _ => "session_info_update",
-                };
-                persistence
-                    .submit(
-                        session,
-                        source_seq,
-                        event_type,
-                        serde_json::json!({"sourceSeq": source_seq, "body": source_seq}),
-                    )
-                    .unwrap();
-            }
+        assert_eq!(persistence.active_worker_count(), WRITER_SHARDS);
+
+        for ordinal in 0..RECORD_COUNT {
+            let session_index = ordinal % SESSION_COUNT;
+            let source_seq = (ordinal / SESSION_COUNT + 1) as u64;
+            persistence
+                .submit(
+                    &format!("opaque-{session_index}"),
+                    source_seq,
+                    "message_chunk",
+                    serde_json::json!({"sourceSeq": source_seq, "ordinal": ordinal}),
+                )
+                .unwrap();
+            let metrics = persistence.metrics();
+            assert!(metrics.active_writer_tasks <= WRITER_SHARDS);
+            assert!(metrics.pending_records <= GLOBAL_PENDING_RECORDS);
+            assert!(metrics.pending_bytes <= GLOBAL_PENDING_BYTES);
+            assert!(metrics.max_per_session_pending_records <= PER_SESSION_PENDING_RECORDS);
         }
+
         persistence.flush_all().await.unwrap();
-        assert_eq!(persistence.retained_worker_count(), 2);
+        let metrics = persistence.metrics();
+        assert_eq!(metrics.pending_records, 0);
+        assert_eq!(metrics.pending_bytes, 0);
+        assert_eq!(metrics.retained_sessions, 0);
+        assert!(metrics.max_pending_records <= GLOBAL_PENDING_RECORDS);
+        assert!(metrics.max_pending_bytes <= GLOBAL_PENDING_BYTES);
+        assert!(metrics.max_per_session_pending_records <= PER_SESSION_PENDING_RECORDS);
+
         {
             let records = target.records.lock();
-            for session in ["opaque-a", "opaque-b"] {
-                let durable = &records[session];
-                assert_eq!(durable.len(), 5_000);
+            for session_index in 0..SESSION_COUNT {
+                let session = format!("opaque-{session_index}");
+                let durable = &records[&session];
                 assert_eq!(
                     durable.iter().map(|record| record.0).collect::<Vec<_>>(),
-                    (1..=5_000).collect::<Vec<_>>()
+                    (1..=durable.len() as u64).collect::<Vec<_>>()
                 );
             }
         }
         persistence.shutdown().await.unwrap();
+        assert_eq!(persistence.active_worker_count(), 0);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn bounded_backpressure_caps_accepted_backlog_and_shutdown_drains() {
-        let target = Arc::new(FakeTarget::blocked());
-        let persistence = Arc::new(ordered(Arc::clone(&target)));
-        for source_seq in 1..=QUEUE_CAPACITY as u64 {
+    #[tokio::test(start_paused = true)]
+    async fn one_outer_deadline_keeps_runtime_responsive() {
+        const SESSION_COUNT: usize = 128;
+        let target = Arc::new(FakeTarget::stalled(SESSION_COUNT));
+        let persistence = ordered(Arc::clone(&target));
+        for session_index in 0..SESSION_COUNT {
             persistence
                 .submit(
-                    "opaque-a",
-                    source_seq,
+                    &format!("opaque-{session_index}"),
+                    1,
                     "message_chunk",
-                    serde_json::json!({"sourceSeq": source_seq}),
+                    serde_json::json!({"sourceSeq": 1}),
                 )
                 .unwrap();
         }
-        assert_eq!(
+
+        let heartbeat_ticks = Arc::new(AtomicUsize::new(0));
+        let heartbeat_counter = Arc::clone(&heartbeat_ticks);
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                heartbeat_counter.fetch_add(1, Ordering::AcqRel);
+            }
+        });
+        let started = Instant::now();
+        let deadline = started + DEFAULT_DRAIN_TIMEOUT;
+        let error = persistence.shutdown_until(deadline).await.unwrap_err();
+        let elapsed = Instant::now().duration_since(started);
+        heartbeat.abort();
+
+        assert_eq!(error.code, WRITER_DRAIN_TIMEOUT);
+        assert!(elapsed <= Duration::from_secs(31));
+        let expected_ticks = (elapsed.as_millis() / 50) as usize;
+        assert!(heartbeat_ticks.load(Ordering::Acquire) + 1 >= expected_ticks);
+        assert!(heartbeat_ticks.load(Ordering::Acquire) > 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn ten_thousand_completed_sessions_are_reaped_after_frontier_observation() {
+        const SESSION_COUNT: usize = 10_000;
+        let target = Arc::new(FakeTarget::with_sessions(SESSION_COUNT));
+        let persistence = ordered(Arc::clone(&target));
+        for session_index in 0..SESSION_COUNT {
             persistence
-                .health("opaque-a")
-                .unwrap()
-                .unwrap()
-                .pending_count,
-            QUEUE_CAPACITY
-        );
-        let submitted = Arc::new(AtomicBool::new(false));
-        let producer_persistence = Arc::clone(&persistence);
-        let producer_submitted = Arc::clone(&submitted);
-        let producer = std::thread::spawn(move || {
-            producer_persistence
                 .submit(
-                    "opaque-a",
-                    QUEUE_CAPACITY as u64 + 1,
+                    &format!("opaque-{session_index}"),
+                    1,
                     "prompt_complete",
-                    serde_json::json!({"sourceSeq": QUEUE_CAPACITY as u64 + 1}),
+                    serde_json::json!({"sourceSeq": 1}),
                 )
                 .unwrap();
-            producer_submitted.store(true, Ordering::Release);
-        });
-        std::thread::sleep(Duration::from_millis(30));
-        assert!(!submitted.load(Ordering::Acquire));
-        assert_eq!(
-            persistence
-                .health("opaque-a")
-                .unwrap()
-                .unwrap()
-                .pending_count,
-            QUEUE_CAPACITY
-        );
-        target.release();
-        producer.join().unwrap();
-        assert!(submitted.load(Ordering::Acquire));
+        }
+        persistence.flush_all().await.unwrap();
+        assert_eq!(persistence.retained_worker_count(), 0);
+        assert!(persistence.health("opaque-0").unwrap().is_none());
+
+        persistence
+            .submit(
+                "opaque-0",
+                2,
+                "prompt_complete",
+                serde_json::json!({"sourceSeq": 2}),
+            )
+            .unwrap();
+        persistence.flush_all().await.unwrap();
+        assert_eq!(persistence.retained_worker_count(), 0);
         persistence.shutdown().await.unwrap();
-        let health = persistence.health("opaque-a").unwrap().unwrap();
-        assert_eq!(health.pending_count, 0);
-        assert_eq!(
-            health.last_persisted_source_seq,
-            health.last_accepted_source_seq
-        );
-        assert_eq!(target.records.lock()["opaque-a"].len(), QUEUE_CAPACITY + 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn malformed_duplicate_decreasing_and_unmapped_submissions_fail_before_append() {
-        let target = Arc::new(FakeTarget::new());
+    async fn unmapped_and_byte_saturated_records_fail_before_admission() {
+        let target = Arc::new(FakeTarget::stalled(2));
         let persistence = ordered(Arc::clone(&target));
-        assert_eq!(
-            persistence
-                .submit("opaque-a", 0, "message_chunk", Value::Null)
-                .unwrap_err()
-                .code,
-            SOURCE_SEQUENCE_INVALID
-        );
-        assert_eq!(persistence.retained_worker_count(), 0);
-        let unmapped_error = persistence
-            .submit("unmapped-secret", 1, "message_chunk", Value::Null)
+        let baseline = persistence.metrics();
+
+        let unmapped = persistence
+            .submit(
+                "unmapped-sensitive-binding",
+                1,
+                "message_chunk",
+                serde_json::json!({"sourceSeq": 1, "prompt": "never expose"}),
+            )
             .unwrap_err();
-        assert_eq!(unmapped_error.code, "CONVERSATION_BINDING_NOT_FOUND");
-        assert!(!unmapped_error.to_string().contains("unmapped-secret"));
-        assert_eq!(persistence.retained_worker_count(), 0);
+        assert_eq!(unmapped.code, "CONVERSATION_BINDING_NOT_FOUND");
+        assert!(!unmapped.to_string().contains("unmapped-sensitive-binding"));
+        assert!(!unmapped.to_string().contains("never expose"));
+        assert_eq!(persistence.metrics(), baseline);
+
+        let first_blob = "a".repeat(8 * 1024 * 1024);
         persistence
             .submit(
-                "opaque-a",
+                "opaque-0",
+                1,
+                "message_chunk",
+                serde_json::json!({"sourceSeq": 1, "body": first_blob}),
+            )
+            .unwrap();
+        let after_first = persistence.metrics();
+        let second_blob = "b".repeat(9 * 1024 * 1024);
+        let saturated = persistence
+            .submit(
+                "opaque-1",
+                1,
+                "message_chunk",
+                serde_json::json!({"sourceSeq": 1, "body": second_blob, "credential": "never expose"}),
+            )
+            .unwrap_err();
+        assert_eq!(saturated.code, WRITER_BYTES_SATURATED);
+        assert!(!saturated.to_string().contains("credential"));
+        assert!(!saturated.to_string().contains("never expose"));
+        assert_eq!(persistence.metrics(), after_first);
+
+        target.release();
+        persistence.flush_all().await.unwrap();
+        persistence.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oversized_record_is_rejected_without_allocating_session_state() {
+        let target = Arc::new(FakeTarget::with_sessions(1));
+        let persistence = ordered(Arc::clone(&target));
+        let payload = serde_json::json!({
+            "sourceSeq": 1,
+            "body": "x".repeat(GLOBAL_PENDING_BYTES + 1),
+        });
+        let error = persistence
+            .submit("opaque-0", 1, "message_chunk", payload)
+            .unwrap_err();
+        assert_eq!(error.code, WRITER_RECORD_TOO_LARGE);
+        let metrics = persistence.metrics();
+        assert_eq!(metrics.pending_records, 0);
+        assert_eq!(metrics.pending_bytes, 0);
+        assert_eq!(metrics.retained_sessions, 0);
+        persistence.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn circuit_failure_receipts_remain_secret_safe() {
+        let target = Arc::new(FakeTarget {
+            fail_after: Some(1),
+            ..FakeTarget::with_sessions(1)
+        });
+        let persistence = ordered(Arc::clone(&target));
+        for source_seq in 1..=2 {
+            persistence
+                .submit(
+                    "opaque-0",
+                    source_seq,
+                    "message_chunk",
+                    serde_json::json!({
+                        "sourceSeq": source_seq,
+                        "prompt": "do-not-log",
+                        "terminalIo": "do-not-log",
+                        "path": "/sensitive/path"
+                    }),
+                )
+                .unwrap();
+        }
+        let error = persistence.flush_all().await.unwrap_err();
+        assert_eq!(error.code, WRITER_UNHEALTHY);
+        for forbidden in ["do-not-log", "opaque-0", "/sensitive/path"] {
+            assert!(!error.to_string().contains(forbidden));
+        }
+        let health = persistence.health("opaque-0").unwrap().unwrap();
+        assert_eq!(
+            health.last_error_code,
+            Some("CONVERSATION_EVENT_APPEND_FAILED")
+        );
+        assert_eq!(health.last_accepted_source_seq, 2);
+        assert_eq!(health.last_persisted_source_seq, 1);
+        assert_eq!(health.pending_count, 0);
+        assert!(persistence.shutdown().await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn duplicate_and_decreasing_sequences_open_a_retained_circuit() {
+        let target = Arc::new(FakeTarget::with_sessions(1));
+        let persistence = ordered(Arc::clone(&target));
+        persistence
+            .submit(
+                "opaque-0",
                 2,
                 "message_chunk",
                 serde_json::json!({"sourceSeq": 2}),
@@ -1193,87 +1424,19 @@ mod tests {
         for invalid in [2, 1] {
             let error = persistence
                 .submit(
-                    "opaque-a",
+                    "opaque-0",
                     invalid,
                     "message_chunk",
-                    serde_json::json!({"sourceSeq": invalid, "secret": "never-log"}),
+                    serde_json::json!({"sourceSeq": invalid, "prompt": "never expose"}),
                 )
                 .unwrap_err();
             assert_eq!(error.code, SOURCE_SEQUENCE_INVALID);
-            assert!(!error.to_string().contains("never-log"));
-            assert!(!error.to_string().contains("opaque-a"));
+            assert!(!error.to_string().contains("never expose"));
+            assert!(!error.to_string().contains("opaque-0"));
         }
-        persistence.flush_all().await.unwrap_err();
+        assert!(persistence.flush_all().await.is_err());
         assert_eq!(target.append_count.load(Ordering::Acquire), 1);
-        let _ = persistence.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn append_failure_is_stable_and_flush_never_claims_success() {
-        let target = Arc::new(FakeTarget {
-            fail_after: Some(1),
-            ..FakeTarget::new()
-        });
-        let persistence = ordered(Arc::clone(&target));
-        for source_seq in 1..=2 {
-            persistence
-                .submit(
-                    "opaque-a",
-                    source_seq,
-                    "message_chunk",
-                    serde_json::json!({"sourceSeq": source_seq, "prompt": "do-not-log"}),
-                )
-                .unwrap();
-        }
-        let error = persistence.flush_all().await.unwrap_err();
-        assert_eq!(error.code, WRITER_UNHEALTHY);
-        assert!(!error.to_string().contains("do-not-log"));
-        assert!(!error.to_string().contains("opaque-a"));
-        let health = persistence.health("opaque-a").unwrap().unwrap();
-        assert_eq!(
-            health.last_error_code,
-            Some("CONVERSATION_EVENT_APPEND_FAILED")
-        );
-        assert_eq!(health.last_accepted_source_seq, 2);
-        assert_eq!(health.last_persisted_source_seq, 1);
-        let shutdown_error = persistence.shutdown().await.unwrap_err();
-        assert_eq!(shutdown_error.code, WRITER_UNHEALTHY);
-        assert!(!shutdown_error.to_string().contains("do-not-log"));
-        assert!(!shutdown_error.to_string().contains("opaque-a"));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn idle_workers_retire_only_after_their_queue_is_drained() {
-        let target = Arc::new(FakeTarget::new());
-        let persistence = ordered(Arc::clone(&target));
-        persistence
-            .submit(
-                "opaque-a",
-                1,
-                "message_chunk",
-                serde_json::json!({"sourceSeq": 1}),
-            )
-            .unwrap();
-        persistence.flush_all().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        assert_eq!(persistence.active_worker_count(), 0);
-        let health = persistence.health("opaque-a").unwrap().unwrap();
-        assert_eq!(health.pending_count, 0);
-        assert_eq!(health.last_accepted_source_seq, 1);
-        assert_eq!(health.last_persisted_source_seq, 1);
-        persistence
-            .submit(
-                "opaque-a",
-                2,
-                "prompt_complete",
-                serde_json::json!({"sourceSeq": 2}),
-            )
-            .unwrap();
-        persistence.flush_all().await.unwrap();
-        assert_eq!(target.records.lock()["opaque-a"].len(), 2);
-        let restarted_health = persistence.health("opaque-a").unwrap().unwrap();
-        assert_eq!(restarted_health.last_accepted_source_seq, 2);
-        assert_eq!(restarted_health.last_persisted_source_seq, 2);
-        persistence.shutdown().await.unwrap();
+        assert_eq!(persistence.retained_worker_count(), 1);
+        assert!(persistence.shutdown().await.is_err());
     }
 }
