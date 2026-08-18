@@ -1148,15 +1148,65 @@ pub struct TurnWatermarkStats {
     pub seen_turns: usize,
 }
 
+const MAX_TURN_IDS_PER_SESSION: usize = 1024;
+const TURN_ID_TTL_SECS: u64 = 3600;
+
+#[derive(Debug, Default)]
+struct TimedTurnSet {
+    items: HashMap<String, std::time::Instant>,
+}
+
+impl TimedTurnSet {
+    fn prune(&mut self, now: std::time::Instant) {
+        self.items
+            .retain(|_, opened| now.duration_since(*opened).as_secs() < TURN_ID_TTL_SECS);
+    }
+
+    fn insert(&mut self, turn_id: String) -> bool {
+        let now = std::time::Instant::now();
+        self.prune(now);
+        if self.items.len() >= MAX_TURN_IDS_PER_SESSION && !self.items.contains_key(&turn_id) {
+            if let Some(oldest) = self
+                .items
+                .iter()
+                .min_by_key(|(_, opened)| *opened)
+                .map(|(key, _)| key.clone())
+            {
+                self.items.remove(&oldest);
+            }
+        }
+        self.items.insert(turn_id, now).is_none()
+    }
+
+    fn contains(&mut self, turn_id: &str) -> bool {
+        self.prune(std::time::Instant::now());
+        self.items.contains_key(turn_id)
+    }
+
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn first_id(&self) -> Option<String> {
+        self.items.keys().next().cloned()
+    }
+
+    fn extend<I: IntoIterator<Item = String>>(&mut self, turn_ids: I) {
+        for turn_id in turn_ids {
+            self.insert(turn_id);
+        }
+    }
+}
+
 pub struct TurnWatermark {
     /// `session_id → completed turn ids` reconstructed from durable history and
     /// updated on live completion.
-    completed: Mutex<HashMap<String, std::collections::HashSet<String>>>,
+    completed: Mutex<HashMap<String, TimedTurnSet>>,
     /// `session_id → currently claimed turn id` (empty string for clients that
     /// omit turnId). Claiming is atomic with duplicate/busy rejection.
     in_flight: Mutex<HashMap<String, String>>,
     /// `session_id → set of seen turn-ids` (idempotent event dedup).
-    seen: Mutex<HashMap<String, std::collections::HashSet<String>>>,
+    seen: Mutex<HashMap<String, TimedTurnSet>>,
 }
 
 impl TurnWatermark {
@@ -1186,7 +1236,7 @@ impl TurnWatermark {
     pub fn is_seen(&self, session_id: &str, turn_id: &str) -> bool {
         self.seen
             .lock()
-            .get(session_id)
+            .get_mut(session_id)
             .is_some_and(|set| set.contains(turn_id))
     }
 
@@ -1219,7 +1269,7 @@ impl TurnWatermark {
         self.completed
             .lock()
             .get(session_id)
-            .and_then(|ids| ids.iter().next().cloned())
+            .and_then(TimedTurnSet::first_id)
     }
 
     /// Atomically claim the session turn before persistence. Rejects an already
@@ -1263,7 +1313,7 @@ impl TurnWatermark {
     pub fn is_completed(&self, session_id: &str, turn_id: &str) -> bool {
         self.completed
             .lock()
-            .get(session_id)
+            .get_mut(session_id)
             .is_some_and(|ids| ids.contains(turn_id))
     }
 
@@ -1275,10 +1325,10 @@ impl TurnWatermark {
         let seen = self.seen.lock();
         TurnWatermarkStats {
             completed_sessions: completed.len(),
-            completed_turns: completed.values().map(std::collections::HashSet::len).sum(),
+            completed_turns: completed.values().map(TimedTurnSet::len).sum(),
             in_flight_sessions: in_flight.len(),
             seen_sessions: seen.len(),
-            seen_turns: seen.values().map(std::collections::HashSet::len).sum(),
+            seen_turns: seen.values().map(TimedTurnSet::len).sum(),
         }
     }
 

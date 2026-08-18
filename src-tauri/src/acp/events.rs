@@ -197,6 +197,19 @@ pub fn fan_out_ticket<P: Serialize>(
     type_: &'static str,
     payload: &P,
 ) -> Result<DeliveryTicket, DeliveryError> {
+    if crate::conversation::contracts::encoded_json_len_bounded(
+        payload,
+        crate::conversation::MAX_CONVERSATION_RECORD_BYTES,
+    )
+    .is_none()
+    {
+        return Err(DeliveryError {
+            code: crate::web::sink::EVENT_DELIVERY_FAILED,
+            source_code: Some("CONVERSATION_RECORD_TOO_LARGE"),
+            class: DeliveryFailureClass::Fatal,
+            delivered_count: 0,
+        });
+    }
     fan_out(sinks, session_id, type_, payload)
         .map(|receipt| DeliveryTicket::admitted(session_id, receipt))
         .map_err(map_fan_out_error)

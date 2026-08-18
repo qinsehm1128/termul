@@ -320,10 +320,19 @@ struct SessionState {
     last_used: u64,
 }
 
-fn sequenced_event_bytes(event: &SequencedEvent) -> usize {
-    serde_json::to_vec(event)
-        .map_or(usize::MAX, |encoded| encoded.len())
-        .saturating_add(std::mem::size_of::<SequencedEvent>())
+fn sequenced_event_bytes(event: &SequencedEvent) -> Result<usize, EventSinkError> {
+    crate::conversation::contracts::encoded_json_len_bounded(
+        event,
+        crate::conversation::MAX_CONVERSATION_RECORD_BYTES,
+    )
+    .map(|encoded| encoded.saturating_add(std::mem::size_of::<SequencedEvent>()))
+    .ok_or_else(|| {
+        EventSinkError::delivery_failed("relay history record exceeds the 262144-byte host bound")
+    })
+}
+
+fn sequenced_event_bytes_len(event: &SequencedEvent) -> usize {
+    sequenced_event_bytes(event).unwrap_or(usize::MAX)
 }
 
 fn relay_history_bytes(sessions: &HashMap<String, SessionState>) -> usize {
@@ -778,17 +787,10 @@ impl WsRelaySink {
 
     fn next_sequenced_event(&self, sid: &str, type_: &str, payload: Value) -> SequencedEvent {
         let durable_last = self.durable_history_frontier(sid).unwrap_or(0);
-        let last_seq = self
-            .sessions
-            .lock()
-            .get(sid)
-            .map_or(durable_last, |state| state.last_seq.max(durable_last));
-        SequencedEvent::new(
-            Some(sid.to_string()),
-            last_seq.saturating_add(1),
-            type_,
-            payload,
-        )
+        let ticket = crate::conversation::CanonicalSequenceTicket::from_allocated_seq(
+            durable_last.saturating_add(1),
+        );
+        SequencedEvent::new(Some(sid.to_string()), ticket.seq, type_, payload)
     }
 
     fn circuit_error(&self, sid: &str) -> Option<EventSinkError> {
@@ -817,6 +819,7 @@ impl WsRelaySink {
             "CONVERSATION_PERSISTENCE_BYTES_SATURATED"
                 | "CONVERSATION_PERSISTENCE_QUEUE_SATURATED"
                 | "SESSION_PERSISTENCE_QUEUE_FULL"
+                | "CONVERSATION_CONFLICT"
         )
     }
 
@@ -838,7 +841,7 @@ impl WsRelaySink {
             return Err(error);
         }
 
-        let sequenced = self.next_sequenced_event(sid, type_, payload);
+        let mut sequenced = self.next_sequenced_event(sid, type_, payload);
         let mut reservation = self.reserve_history(sid, &sequenced)?;
         let durable_result: Result<Option<u64>, (&'static str, String)> =
             if let Some(persistence) = &self.ordered_conversation_persistence {
@@ -867,14 +870,15 @@ impl WsRelaySink {
 
         match durable_result {
             Ok(Some(canonical_seq)) if canonical_seq != sequenced.seq => {
-                self.rollback_history(&mut reservation);
-                self.open_delivery_circuit(
-                    sid,
-                    "CONVERSATION_PERSISTENCE_FRONTIER_MISMATCH",
+                sequenced = SequencedEvent::new(
+                    Some(sid.to_string()),
+                    crate::conversation::CanonicalSequenceTicket::from_allocated_seq(
+                        canonical_seq,
+                    )
+                    .seq,
+                    type_,
+                    sequenced.payload.clone(),
                 );
-                return Err(EventSinkError::persistence_rejected(
-                    "CONVERSATION_PERSISTENCE_FRONTIER_MISMATCH",
-                ));
             }
             Ok(_) => {}
             Err((source_code, _detail)) => {
@@ -897,7 +901,7 @@ impl WsRelaySink {
         sid: &str,
         event: &SequencedEvent,
     ) -> Result<HistoryReservation, EventSinkError> {
-        let event_bytes = sequenced_event_bytes(event);
+        let event_bytes = sequenced_event_bytes(event)?;
         let multiplier = if self.persistence.is_none() && self.conversation_persistence.is_none() {
             2
         } else {
@@ -910,10 +914,14 @@ impl WsRelaySink {
             ));
         }
         let durable_last = self.durable_history_frontier(sid).unwrap_or(0);
+        let auxiliary_bytes = self.auxiliary_charged_bytes();
         let mut sessions = self.sessions.lock();
         let newly_created = !sessions.contains_key(sid);
         while (newly_created && sessions.len() >= MAX_RELAY_SESSIONS)
-            || relay_history_bytes(&sessions).saturating_add(bytes) > MAX_RELAY_BYTES
+            || relay_history_bytes(&sessions)
+                .saturating_add(bytes)
+                .saturating_add(auxiliary_bytes)
+                > MAX_RELAY_BYTES
         {
             let subscriber_counts = self.session_subs.lock();
             let candidate = sessions
@@ -943,9 +951,10 @@ impl WsRelaySink {
             let retained_sessions = sessions.len();
             let retained_bytes = relay_history_bytes(&sessions);
             drop(sessions);
-            self.retire_auxiliary(&candidate)?;
+            // Payload-cache eviction only. Semantic circuits/watermarks stay until
+            // confirmed close/delete/dispose.
             log::info!(
-                "[ws-relay] durable history evicted and retired session_count={} retained_bytes={}",
+                "[ws-relay] durable history payload evicted session_count={} retained_bytes={}",
                 retained_sessions,
                 retained_bytes
             );
@@ -994,18 +1003,18 @@ impl WsRelaySink {
         }
         state.retained_bytes = state
             .retained_bytes
-            .saturating_add(sequenced_event_bytes(&event));
+            .saturating_add(sequenced_event_bytes_len(&event));
         state.events.push_back(event.clone());
         if self.persistence.is_none() && self.conversation_persistence.is_none() {
             state.retained_bytes = state
                 .retained_bytes
-                .saturating_add(sequenced_event_bytes(&event));
+                .saturating_add(sequenced_event_bytes_len(&event));
             state.snapshot_events.push(event.clone());
             while state.snapshot_events.len() > self.event_log_capacity {
                 if let Some(evicted) = state.snapshot_events.first() {
                     state.retained_bytes = state
                         .retained_bytes
-                        .saturating_sub(sequenced_event_bytes(evicted));
+                        .saturating_sub(sequenced_event_bytes_len(evicted));
                 }
                 state.snapshot_events.remove(0);
             }
@@ -1014,7 +1023,7 @@ impl WsRelaySink {
             if let Some(evicted) = state.events.pop_front() {
                 state.retained_bytes = state
                     .retained_bytes
-                    .saturating_sub(sequenced_event_bytes(&evicted));
+                    .saturating_sub(sequenced_event_bytes_len(&evicted));
             }
             state.base_seq = state
                 .events
@@ -1072,6 +1081,27 @@ impl WsRelaySink {
         }
     }
 
+    fn auxiliary_charged_bytes(&self) -> usize {
+        let circuit_bytes = self
+            .delivery_circuits
+            .lock()
+            .len()
+            .saturating_mul(std::mem::size_of::<String>().saturating_add(std::mem::size_of::<&'static str>()));
+        let watermark = self.turn_watermark.stats();
+        let watermark_bytes = watermark
+            .seen_turns
+            .saturating_add(watermark.completed_turns)
+            .saturating_mul(std::mem::size_of::<String>());
+        let ordered_bytes = self
+            .ordered_conversation_persistence
+            .as_ref()
+            .map_or(0, |ordered| ordered.retained_worker_count())
+            .saturating_mul(std::mem::size_of::<crate::conversation::ConversationId>());
+        circuit_bytes
+            .saturating_add(watermark_bytes)
+            .saturating_add(ordered_bytes)
+    }
+
     #[must_use]
     pub fn auxiliary_stats(&self) -> RelayAuxiliaryStats {
         let relay_sessions = self.sessions.lock().len();
@@ -1100,8 +1130,7 @@ impl WsRelaySink {
     }
 
     fn queued_client_event(sub: &ClientSub, event: SequencedEvent) -> Option<QueuedClientEvent> {
-        let bytes = sequenced_event_bytes(&event);
-        let permit = sub.budget.try_reserve(bytes)?;
+        let permit = sub.budget.try_reserve(sequenced_event_bytes_len(&event))?;
         Some(QueuedClientEvent {
             event: Some(event),
             _permit: permit,
@@ -1610,6 +1639,15 @@ impl WsRelaySink {
     /// session. Admitted ordered work is observed first; canonical Conversation JSON/JSONL is
     /// deliberately untouched. Repeated calls are successful no-ops.
     pub async fn retire_session(&self, sid: &str) -> Result<(), String> {
+        {
+            let _submission_guard = self.persistence_submission_gate(sid).lock();
+        }
+        if let Some(ordered) = &self.ordered_conversation_persistence {
+            ordered
+                .retire_session_async(sid)
+                .await
+                .map_err(|error| error.code.to_string())?;
+        }
         let _submission_guard = self.persistence_submission_gate(sid).lock();
         self.retire_auxiliary(sid)
             .map_err(|error| error.code.to_string())?;
@@ -1737,6 +1775,16 @@ impl EventSink for WsRelaySink {
         let tier = tier_of(type_);
         let session_seq = match &event.sid {
             Some(sid) => {
+                if crate::conversation::contracts::encoded_json_len_bounded(
+                    &event.payload,
+                    crate::conversation::MAX_CONVERSATION_RECORD_BYTES,
+                )
+                .is_none()
+                {
+                    return Err(EventSinkError::delivery_failed(
+                        "relay history record exceeds the 262144-byte host bound",
+                    ));
+                }
                 let sequenced = self.admit_session_event(sid, type_, event.payload.clone())?;
                 let targets: Vec<ClientId> = self
                     .session_subs
@@ -1886,6 +1934,23 @@ pub fn fan_out<P: Serialize>(
             delivered_count: 0,
             durable_admission_count: 0,
             session_seq: None,
+        });
+    }
+    if crate::conversation::contracts::encoded_json_len_bounded(
+        payload,
+        crate::conversation::MAX_CONVERSATION_RECORD_BYTES,
+    )
+    .is_none()
+    {
+        let error = EventSinkError::delivery_failed(
+            "relay history record exceeds the 262144-byte host bound",
+        );
+        return Err(FanOutError {
+            code: error.code,
+            source_code: error.source_code,
+            durable_rejection: error.durable_rejection,
+            delivered_count: 0,
+            detail: error.detail,
         });
     }
     let payload = serde_json::to_value(payload).map_err(|error| {
@@ -2246,8 +2311,14 @@ mod tests {
         assert_eq!(replayed.type_, "tool_call");
         assert_eq!(replayed.payload["agentId"], "agent");
         assert_eq!(replayed.payload["sessionId"], "lru-session-0");
-        assert!(!relay.turn_watermark().is_seen("lru-session-0", "turn-0"));
-        assert!(!relay.delivery_circuits.lock().contains_key("lru-session-0"));
+        assert!(
+            relay.turn_watermark().is_seen("lru-session-0", "turn-0"),
+            "LRU payload eviction must not semantically retire watermarks"
+        );
+        assert!(
+            relay.delivery_circuits.lock().contains_key("lru-session-0"),
+            "LRU payload eviction must not semantically retire circuits"
+        );
         assert_eq!(relay.auxiliary_stats().submission_gate_stripes, SESSION_GATE_STRIPES);
         assert_eq!(relay.auxiliary_stats().replay_gate_stripes, SESSION_GATE_STRIPES);
         relay.retire_session("lru-session-0").await.unwrap();
@@ -3260,5 +3331,104 @@ mod tests {
         );
         persistence.shutdown().await.unwrap();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn emit_rejects_oversized_event_before_payload_clone() {
+        let relay = WsRelaySink::new();
+        let oversized = "x".repeat(crate::conversation::MAX_CONVERSATION_RECORD_BYTES + 8);
+        let error = relay
+            .emit(&AcpEvent {
+                sid: Some("oversize".to_string()),
+                type_: "acp:message_chunk",
+                payload: json!({ "pad": oversized }),
+            })
+            .expect_err("oversized payload must reject before live clone");
+        assert_eq!(error.code, EVENT_DELIVERY_FAILED);
+        assert!(relay.sessions.lock().is_empty());
+    }
+
+    #[test]
+    fn reserve_history_rejects_at_262144_before_unbounded_serialize() {
+        let relay = WsRelaySink::new();
+        let oversized = SequencedEvent::new(
+            Some("oversize".to_string()),
+            1,
+            "message_chunk",
+            json!({ "pad": "y".repeat(crate::conversation::MAX_CONVERSATION_RECORD_BYTES + 8) }),
+        );
+        let error = match relay.reserve_history("oversize", &oversized) {
+            Ok(_) => panic!("reserve must reject at 262144"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, EVENT_DELIVERY_FAILED);
+        assert!(relay.sessions.lock().is_empty());
+    }
+
+    #[test]
+    fn next_sequenced_event_consumes_repository_ticket_seq() {
+        let relay = WsRelaySink::new();
+        {
+            let mut sessions = relay.sessions.lock();
+            sessions.insert(
+                "ticket-sid".to_string(),
+                SessionState {
+                    last_seq: 9,
+                    events: VecDeque::new(),
+                    snapshot_events: Vec::new(),
+                    base_seq: 1,
+                    retained_bytes: 0,
+                    reserved_bytes: 0,
+                    last_used: 1,
+                },
+            );
+        }
+        let event = relay.next_sequenced_event("ticket-sid", "message_chunk", json!({}));
+        assert_eq!(
+            event.seq,
+            crate::conversation::CanonicalSequenceTicket::from_allocated_seq(1).seq,
+            "next_sequenced_event must consume the repository ticket, not relay last_seq+1"
+        );
+        assert_ne!(event.seq, 10);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lru_payload_eviction_does_not_retire_recreated_session_semantics() {
+        let relay = Arc::new(WsRelaySink::new());
+        relay.turn_watermark().mark_seen("keep-semantics", "turn-a");
+        relay
+            .delivery_circuits
+            .lock()
+            .insert("keep-semantics".to_string(), "TEST_FATAL");
+        {
+            let mut sessions = relay.sessions.lock();
+            sessions.insert(
+                "keep-semantics".to_string(),
+                SessionState {
+                    last_seq: 1,
+                    events: VecDeque::new(),
+                    snapshot_events: Vec::new(),
+                    base_seq: 1,
+                    retained_bytes: 0,
+                    reserved_bytes: 0,
+                    last_used: 1,
+                },
+            );
+        }
+        let event = SequencedEvent::new(
+            Some("other".to_string()),
+            1,
+            "message_chunk",
+            json!({ "ok": true }),
+        );
+        let _ = relay.reserve_history("other", &event);
+        assert!(
+            relay.turn_watermark().is_seen("keep-semantics", "turn-a"),
+            "recreated/active session semantics survive payload eviction"
+        );
+        assert!(relay
+            .delivery_circuits
+            .lock()
+            .contains_key("keep-semantics"));
     }
 }

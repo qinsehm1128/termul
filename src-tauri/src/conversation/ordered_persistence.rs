@@ -33,6 +33,10 @@ pub const PER_SESSION_PENDING_RECORDS: usize = 256;
 pub const GLOBAL_PENDING_RECORDS: usize = 4096;
 /// Maximum serialized bytes held by accepted records across the coordinator.
 pub const GLOBAL_PENDING_BYTES: usize = 16 * 1024 * 1024;
+/// Failure-only ordered error sessions retained after a circuit opens.
+const MAX_ORDERED_ERROR_SESSIONS: usize = 256;
+/// Idle ordered-error entries expire after this many seconds.
+const ORDERED_ERROR_TTL_SECS: u64 = 900;
 /// Default absolute budget for a complete flush or shutdown attempt.
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Compatibility alias retained for existing callers.
@@ -153,6 +157,27 @@ struct SessionState {
     accepted_frontier: u64,
     persisted_frontier: u64,
     last_error_code: Option<&'static str>,
+    last_error_at: Option<StdInstant>,
+}
+
+impl SessionState {
+    fn is_idle_error(&self) -> bool {
+        self.last_error_code.is_some()
+            && self.pending_records == 0
+            && self.pending_bytes == 0
+    }
+
+    fn record_error(&mut self, code: &'static str) {
+        if self.last_error_code.is_none() {
+            self.last_error_code = Some(code);
+            self.last_error_at = Some(StdInstant::now());
+        }
+    }
+
+    fn set_error(&mut self, code: &'static str) {
+        self.last_error_code = Some(code);
+        self.last_error_at = Some(StdInstant::now());
+    }
 }
 
 #[derive(Default)]
@@ -164,6 +189,41 @@ struct CoordinatorState {
     max_pending_bytes: usize,
     max_per_session_pending_records: usize,
     barrier_active: bool,
+}
+
+impl CoordinatorState {
+    fn prune_ordered_errors(&mut self, now: StdInstant) {
+        let ttl = Duration::from_secs(ORDERED_ERROR_TTL_SECS);
+        let before = self.sessions.len();
+        self.sessions.retain(|_, session| {
+            !(session.is_idle_error()
+                && session
+                    .last_error_at
+                    .is_some_and(|opened| now.duration_since(opened) >= ttl))
+        });
+        let mut idle_errors: Vec<(String, StdInstant)> = self
+            .sessions
+            .iter()
+            .filter_map(|(key, session)| {
+                session
+                    .is_idle_error()
+                    .then_some((key.clone(), session.last_error_at.unwrap_or(now)))
+            })
+            .collect();
+        if idle_errors.len() > MAX_ORDERED_ERROR_SESSIONS {
+            idle_errors.sort_unstable_by_key(|(_, opened)| *opened);
+            let overflow = idle_errors.len() - MAX_ORDERED_ERROR_SESSIONS;
+            for (key, _) in idle_errors.into_iter().take(overflow) {
+                self.sessions.remove(&key);
+            }
+        }
+        if self.sessions.len() < before {
+            log::info!(
+                "[conversation-persistence] ordered error bound applied session_count={}",
+                self.sessions.len()
+            );
+        }
+    }
 }
 
 #[derive(Default)]
@@ -279,8 +339,9 @@ impl CoordinatorShared {
     }
 
     fn fatal_session_error(&self, session_key: &str) -> Option<&'static str> {
-        self.state
-            .lock()
+        let mut state = self.state.lock();
+        state.prune_ordered_errors(StdInstant::now());
+        state
             .sessions
             .get(session_key)
             .and_then(|session| session.last_error_code)
@@ -311,13 +372,14 @@ impl CoordinatorShared {
                     session.persisted_frontier = source_seq;
                 }
                 Ok(_) => {
-                    session.last_error_code = Some(WRITER_FRONTIER_MISMATCH);
+                    session.set_error(WRITER_FRONTIER_MISMATCH);
                 }
                 Err(code) => {
-                    session.last_error_code.get_or_insert(code);
+                    session.record_error(code);
                 }
             }
         }
+        state.prune_ordered_errors(StdInstant::now());
         drop(state);
         completion.complete(result);
         self.capacity_available.notify_all();
@@ -620,6 +682,7 @@ impl OrderedConversationPersistence {
                 ));
             }
 
+            state.prune_ordered_errors(StdInstant::now());
             if let Some(session) = state.sessions.get(agent_session_id) {
                 if session.conversation_id != conversation_id {
                     return Err(persistence_error(
@@ -646,7 +709,8 @@ impl OrderedConversationPersistence {
                         .sessions
                         .get_mut(agent_session_id)
                         .expect("session was read while state lock was held")
-                        .last_error_code = Some(SOURCE_SEQUENCE_INVALID);
+                        .set_error(SOURCE_SEQUENCE_INVALID);
+                    state.prune_ordered_errors(StdInstant::now());
                     shared.capacity_available.notify_all();
                     log::error!(
                         "[conversation-persistence] frontier mismatch code={} pending_records={} pending_bytes={}",
@@ -729,6 +793,7 @@ impl OrderedConversationPersistence {
                     accepted_frontier: 0,
                     persisted_frontier: source_seq.saturating_sub(1),
                     last_error_code: None,
+                    last_error_at: None,
                 });
             session.pending_records += 1;
             session.pending_bytes += charged_bytes;
@@ -797,13 +862,22 @@ impl OrderedConversationPersistence {
 
     /// Wait for admitted work for one session, then remove its idle or errored frontier/health.
     /// Canonical Conversation JSON/JSONL is never touched. Repeated retirement is a success no-op.
+    /// The Condvar wait never runs on a Tokio worker; callers use the async ticket.
     pub fn retire_session(
         &self,
         agent_session_id: &str,
     ) -> Result<(), ConversationPersistenceError> {
-        let deadline = StdInstant::now() + self.drain_timeout;
+        self.retire_session_until(StdInstant::now() + self.drain_timeout, agent_session_id)
+    }
+
+    fn retire_session_until(
+        &self,
+        deadline: StdInstant,
+        agent_session_id: &str,
+    ) -> Result<(), ConversationPersistenceError> {
         let shared = &self.core.shared;
         let mut state = shared.state.lock();
+        state.prune_ordered_errors(StdInstant::now());
         loop {
             let pending = state
                 .sessions
@@ -831,6 +905,27 @@ impl OrderedConversationPersistence {
         }
     }
 
+    /// Async retirement ticket. Never parks a Tokio worker on Condvar::wait_for.
+    pub async fn retire_session_async(
+        &self,
+        agent_session_id: &str,
+    ) -> Result<(), ConversationPersistenceError> {
+        let coordinator = Self {
+            core: Arc::clone(&self.core),
+            drain_timeout: self.drain_timeout,
+        };
+        let session_id = agent_session_id.to_string();
+        tokio::task::spawn_blocking(move || coordinator.retire_session(&session_id))
+            .await
+            .map_err(|_| {
+                persistence_error(
+                    CONVERSATION_PERSISTENCE_COMMIT_INDETERMINATE,
+                    "ordered_retire_session",
+                    "retirement acknowledgement task failed",
+                )
+            })?
+    }
+
     /// Health for a mapped session. No session state or byte budget is created by this query.
     pub fn health(
         &self,
@@ -848,7 +943,8 @@ impl OrderedConversationPersistence {
                     "opaque agent session id has no canonical Conversation binding",
                 )
             })?;
-        let state = self.core.shared.state.lock();
+        let mut state = self.core.shared.state.lock();
+        state.prune_ordered_errors(StdInstant::now());
         Ok(state.sessions.get(agent_session_id).and_then(|session| {
             (session.conversation_id == conversation_id).then_some(OrderedPersistenceHealth {
                 conversation_id,
@@ -871,7 +967,9 @@ impl OrderedConversationPersistence {
     /// Number of retained per-session frontier/circuit entries.
     #[must_use]
     pub fn retained_worker_count(&self) -> usize {
-        self.core.shared.state.lock().sessions.len()
+        let mut state = self.core.shared.state.lock();
+        state.prune_ordered_errors(StdInstant::now());
+        state.sessions.len()
     }
 
     /// Number of fixed shared Tokio writer tasks that have not exited.
@@ -1245,16 +1343,18 @@ fn serialized_record_bytes(
     event_type: &str,
     payload: &Value,
 ) -> Result<usize, ConversationPersistenceError> {
-    serde_json::to_vec(&SerializedRecordCharge {
-        event_type,
-        payload,
-    })
-    .map(|bytes| bytes.len())
-    .map_err(|_| {
+    crate::conversation::contracts::encoded_json_len_bounded(
+        &SerializedRecordCharge {
+            event_type,
+            payload,
+        },
+        crate::conversation::MAX_CONVERSATION_RECORD_BYTES,
+    )
+    .ok_or_else(|| {
         persistence_error(
             WRITER_SERIALIZATION_FAILED,
             "ordered_submit",
-            "record could not be serialized for admission accounting",
+            "record exceeds the 262144-byte host bound",
         )
     })
 }
@@ -1691,6 +1791,22 @@ mod tests {
         assert_eq!(target.append_count.load(Ordering::Acquire), 1);
         assert_eq!(persistence.retained_worker_count(), 1);
         persistence.retire_session("opaque-0").unwrap();
+        assert_eq!(persistence.retained_worker_count(), 0);
+        persistence.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retire_session_is_async_and_does_not_block_runtime_worker() {
+        let target = Arc::new(FakeTarget::with_sessions(1));
+        let persistence = ordered(Arc::clone(&target));
+        let started = std::time::Instant::now();
+        let retire = persistence.retire_session_async("opaque-0");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        retire.await.unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "async retire must not park the runtime on Condvar::wait_for"
+        );
         assert_eq!(persistence.retained_worker_count(), 0);
         persistence.shutdown().await.unwrap();
     }

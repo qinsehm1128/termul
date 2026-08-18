@@ -799,7 +799,82 @@ struct AgentEntry {
 type ReplacementGateSender = watch::Sender<Option<Result<(), String>>>;
 
 type ReplacementGates = HashMap<String, ReplacementGateSender>;
-type SessionDeliveryCircuits = Arc<Mutex<HashMap<String, &'static str>>>;
+const MAX_FAILURE_CIRCUIT_ENTRIES: usize = 256;
+const FAILURE_CIRCUIT_TTL_SECS: u64 = 900;
+
+#[derive(Debug, Clone, Copy)]
+struct CircuitEntry {
+    code: &'static str,
+    opened_at: std::time::Instant,
+}
+
+struct SessionDeliveryCircuitMap {
+    entries: HashMap<String, CircuitEntry>,
+}
+
+impl SessionDeliveryCircuitMap {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    fn prune(&mut self, now: std::time::Instant) {
+        self.entries.retain(|_, entry| {
+            now.duration_since(entry.opened_at).as_secs() < FAILURE_CIRCUIT_TTL_SECS
+        });
+    }
+
+    fn get(&mut self, session_id: &str) -> Option<&'static str> {
+        self.prune(std::time::Instant::now());
+        self.entries.get(session_id).map(|entry| entry.code)
+    }
+
+    fn insert(&mut self, session_id: String, code: &'static str) {
+        let now = std::time::Instant::now();
+        self.prune(now);
+        if !self.entries.contains_key(&session_id) && self.len() >= MAX_FAILURE_CIRCUIT_ENTRIES {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.opened_at)
+                .map(|(key, _)| key.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(
+            session_id,
+            CircuitEntry {
+                code,
+                opened_at: now,
+            },
+        );
+    }
+
+    fn contains_key(&mut self, session_id: &str) -> bool {
+        self.get(session_id).is_some()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+type SessionDeliveryCircuits = Arc<Mutex<SessionDeliveryCircuitMap>>;
+
+#[cfg(test)]
+fn circuit_map_insert_for_tests(
+    circuits: &SessionDeliveryCircuits,
+    session_id: &str,
+    code: &'static str,
+    opened_at: std::time::Instant,
+) {
+    circuits.lock().entries.insert(
+        session_id.to_string(),
+        CircuitEntry { code, opened_at },
+    );
+}
 
 fn fan_out_session<P: Serialize>(
     sinks: &[Arc<dyn EventSink>],
@@ -808,7 +883,7 @@ fn fan_out_session<P: Serialize>(
     type_: &'static str,
     payload: &P,
 ) -> Result<FanOutReceipt, FanOutError> {
-    if let Some(source_code) = circuits.lock().get(session_id).copied() {
+    if let Some(source_code) = circuits.lock().get(session_id) {
         return Err(FanOutError::circuit_open(source_code));
     }
     let result = events::fan_out(sinks, Some(session_id), type_, payload);
@@ -822,7 +897,8 @@ fn fan_out_session<P: Serialize>(
             )
         );
         if error.is_durable_rejection() && !retryable {
-            circuits.lock().entry(session_id.to_string()).or_insert(
+            circuits.lock().insert(
+                session_id.to_string(),
                 error
                     .source_code
                     .unwrap_or(CONVERSATION_PERSISTENCE_REJECTED),
@@ -845,13 +921,14 @@ async fn fan_out_session_committed<P: Serialize>(
     type_: &'static str,
     payload: &P,
 ) -> Result<events::DeliveryReceipt, events::DeliveryError> {
-    if let Some(source_code) = circuits.lock().get(session_id).copied() {
+    if let Some(source_code) = circuits.lock().get(session_id) {
         return Err(events::DeliveryError::circuit_open(source_code));
     }
     let result = events::deliver(sinks, persistence, Some(session_id), type_, payload).await;
     if let Err(error) = &result {
         if error.is_durable_rejection() && !error.is_retryable() {
-            circuits.lock().entry(session_id.to_string()).or_insert(
+            circuits.lock().insert(
+                session_id.to_string(),
                 error
                     .source_code
                     .unwrap_or(CONVERSATION_PERSISTENCE_REJECTED),
@@ -2683,7 +2760,8 @@ async fn drive_connection(
     // Each handler gets its own clone of the sink fan-out; `Arc` clones are
     // cheap and `Vec::clone` is N Arc clones. A durable rejection opens only
     // the affected session's producer circuit; other sessions on this agent remain live.
-    let delivery_circuits: SessionDeliveryCircuits = Arc::new(Mutex::new(HashMap::new()));
+    let delivery_circuits: SessionDeliveryCircuits =
+        Arc::new(Mutex::new(SessionDeliveryCircuitMap::new()));
     let notif_sinks = sinks.clone();
     let notif_agent_id = agent_id.clone();
     let notif_state = driver_state.clone();
@@ -5104,5 +5182,28 @@ mod tests {
             !warmup_should_run(&warmup_done, &agent_id),
             "a post-completion trigger must skip (agent is done)"
         );
+    }
+
+    #[test]
+    fn circuit_and_watermark_entries_respect_ttl_and_cardinality() {
+        let circuits = Arc::new(Mutex::new(SessionDeliveryCircuitMap::new()));
+        for ordinal in 0..(MAX_FAILURE_CIRCUIT_ENTRIES + 8) {
+            circuits
+                .lock()
+                .insert(format!("session-{ordinal}"), "TEST_FATAL");
+        }
+        assert!(circuits.lock().len() <= MAX_FAILURE_CIRCUIT_ENTRIES);
+        let expired = std::time::Instant::now()
+            - std::time::Duration::from_secs(FAILURE_CIRCUIT_TTL_SECS + 1);
+        circuit_map_insert_for_tests(&circuits, "expired", "TEST_FATAL", expired);
+        assert!(circuits.lock().get("expired").is_none());
+
+        let watermark = crate::web::permissions::TurnWatermark::new();
+        for ordinal in 0..32 {
+            watermark.mark_seen("ttl-session", &format!("turn-{ordinal}"));
+        }
+        assert!(watermark.is_seen("ttl-session", "turn-31"));
+        watermark.forget_session("ttl-session");
+        assert!(!watermark.is_seen("ttl-session", "turn-31"));
     }
 }
