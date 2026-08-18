@@ -387,6 +387,41 @@ jobs:
     expect(result[0].line).toBeGreaterThan(0)
   })
 
+  it('rejects dead short-circuit JSX root owner', () => {
+    const sources = validSources()
+    sources['src/renderer/App.tsx'] = root().replace('<Recovery />', '{false && <Recovery />}')
+    const result = findings(sources, 'root-parity').filter(
+      (item) => item.file === 'src/renderer/App.tsx'
+    )
+    expect(result).toHaveLength(1)
+    expect(result[0].message).toContain('ConversationRecoveryPanel')
+  })
+
+  it('rejects destructured teardown alias without live call', () => {
+    const sources = validSources()
+    sources['src/renderer/moved/navigation-owner.ts'] = `
+import { terminalApi } from '@/lib/terminal-api'
+const { terminate: dispose } = terminalApi
+export function selectProject() { return dispose('pty') }
+`
+    const result = findings(sources, 'navigation-preserves-pty')
+    expect(result).toHaveLength(1)
+    expect(result[0]).toMatchObject({ file: 'src/renderer/moved/navigation-owner.ts' })
+    expect(result[0].message).toContain('terminate')
+    expect(result[0].line).toBeGreaterThan(0)
+  })
+
+  it('rejects disabled workflow step as sole PR guard', () => {
+    const sources = validSources()
+    sources['.github/workflows/pr-validation.yml'] = prWorkflow().replace(
+      '- name: Check conversation-first guardrails\n        run: bun run check:conversation-first',
+      '- name: Check conversation-first guardrails\n        if: false\n        run: bun run check:conversation-first'
+    )
+    const result = findings(sources, 'default-pr-guard')
+    expect(result).toHaveLength(1)
+    expect(result[0].message).toContain('found 0')
+  })
+
   it('rejects a dashboard-owned recovery panel in addition to the real root owner', () => {
     const sources = validSources()
     sources['src/renderer/pages/WorkspaceDashboard.tsx'] = `

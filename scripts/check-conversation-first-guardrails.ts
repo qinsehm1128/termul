@@ -50,6 +50,8 @@ interface WorkflowStep {
   args?: string
   argsPresent: boolean
   argsScalar: boolean
+  disabled: boolean
+  condition?: string
 }
 
 interface ParsedWorkflow {
@@ -250,18 +252,85 @@ function functionIsExported(node: ts.FunctionLikeDeclaration): boolean {
   return false
 }
 
-function constantBoolean(expression: ts.Expression): boolean | undefined {
+function constantBoolean(
+  expression: ts.Expression,
+  seen = new Set<ts.Expression>()
+): boolean | undefined {
+  if (seen.has(expression)) return undefined
+  seen.add(expression)
   if (expression.kind === ts.SyntaxKind.TrueKeyword) return true
   if (expression.kind === ts.SyntaxKind.FalseKeyword) return false
-  if (ts.isParenthesizedExpression(expression)) return constantBoolean(expression.expression)
+  if (ts.isParenthesizedExpression(expression)) return constantBoolean(expression.expression, seen)
+  if (ts.isAsExpression(expression) || ts.isTypeAssertionExpression(expression))
+    return constantBoolean(expression.expression, seen)
   if (
     ts.isPrefixUnaryExpression(expression) &&
     expression.operator === ts.SyntaxKind.ExclamationToken
   ) {
-    const value = constantBoolean(expression.operand)
+    const value = constantBoolean(expression.operand, seen)
     return value === undefined ? undefined : !value
   }
+  if (ts.isBinaryExpression(expression)) {
+    const left = constantBoolean(expression.left, seen)
+    const right = constantBoolean(expression.right, seen)
+    if (expression.operatorToken.kind === ts.SyntaxKind.AmpersandAmpersandToken) {
+      if (left === false || right === false) return false
+      if (left === true && right === true) return true
+      return undefined
+    }
+    if (expression.operatorToken.kind === ts.SyntaxKind.BarBarToken) {
+      if (left === true || right === true) return true
+      if (left === false && right === false) return false
+      return undefined
+    }
+    if (expression.operatorToken.kind === ts.SyntaxKind.QuestionQuestionToken) {
+      return left === undefined ? right : left
+    }
+  }
+  if (ts.isIdentifier(expression)) {
+    const initializer = constInitializerForIdentifier(expression)
+    if (initializer) return constantBoolean(initializer, seen)
+  }
   return undefined
+}
+
+function bindingElementExportedName(element: ts.BindingElement): string | undefined {
+  if (element.propertyName) {
+    if (ts.isIdentifier(element.propertyName) || ts.isStringLiteral(element.propertyName)) {
+      return element.propertyName.text
+    }
+    return undefined
+  }
+  return ts.isIdentifier(element.name) ? element.name.text : undefined
+}
+
+function bindingPatternInitializer(node: ts.Node): ts.Expression | undefined {
+  for (let current: ts.Node | undefined = node.parent; current; current = current.parent) {
+    if (ts.isVariableDeclaration(current) && current.initializer) return current.initializer
+    if (ts.isParameter(current) && current.initializer) return current.initializer
+  }
+  return undefined
+}
+
+function constInitializerForIdentifier(identifier: ts.Identifier): ts.Expression | undefined {
+  const sourceFile = identifier.getSourceFile()
+  let found: ts.Expression | undefined
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isVariableDeclaration(node) &&
+      node.initializer &&
+      ts.isIdentifier(node.name) &&
+      node.name.text === identifier.text &&
+      node.parent &&
+      ts.isVariableDeclarationList(node.parent) &&
+      (node.parent.flags & ts.NodeFlags.Const) !== 0
+    ) {
+      found = node.initializer
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(sourceFile)
+  return found
 }
 
 function containsNode(container: ts.Node, candidate: ts.Node): boolean {
@@ -271,6 +340,24 @@ function containsNode(container: ts.Node, candidate: ts.Node): boolean {
 function isStaticallyDead(node: ts.Node): boolean {
   let child: ts.Node = node
   for (let parent = node.parent; parent; child = parent, parent = parent.parent) {
+    if (ts.isBinaryExpression(parent)) {
+      const operator = parent.operatorToken.kind
+      const left = constantBoolean(parent.left)
+      if (
+        operator === ts.SyntaxKind.AmpersandAmpersandToken &&
+        left === false &&
+        containsNode(parent.right, child)
+      ) {
+        return true
+      }
+      if (
+        operator === ts.SyntaxKind.BarBarToken &&
+        left === true &&
+        containsNode(parent.right, child)
+      ) {
+        return true
+      }
+    }
     if (ts.isIfStatement(parent)) {
       const value = constantBoolean(parent.expression)
       if (value === false && containsNode(parent.thenStatement, child)) return true
@@ -502,6 +589,13 @@ class TypeScriptProject {
         const key = this.nodeFunctionKeys.get(declaration)
         if (key) return key
       }
+      if (ts.isBindingElement(declaration)) {
+        const initializer = bindingPatternInitializer(declaration)
+        if (initializer && ts.isExpression(initializer)) {
+          const key = this.targetFunctionKey(initializer)
+          if (key) return key
+        }
+      }
       if (ts.isVariableDeclaration(declaration) && declaration.initializer) {
         if (isFunctionNode(declaration.initializer)) {
           const key = this.nodeFunctionKeys.get(declaration.initializer)
@@ -670,6 +764,14 @@ class TypeScriptModel {
     for (const declaration of symbol.declarations ?? []) {
       const imported = this.importSemantic(declaration)
       if (imported) return imported
+      if (ts.isBindingElement(declaration)) {
+        const exported = bindingElementExportedName(declaration)
+        const initializer = bindingPatternInitializer(declaration)
+        if (exported && initializer) {
+          const base = this.resolveExpression(initializer, seen)
+          return { module: base?.module ?? this.file, exported }
+        }
+      }
       if (ts.isVariableDeclaration(declaration) && declaration.initializer) {
         const resolved = this.resolveExpression(declaration.initializer, seen)
         if (resolved) return resolved
@@ -1198,6 +1300,28 @@ function yamlLine(node: YamlNode | null | undefined, counter: LineCounter): numb
   return node?.range ? counter.linePos(node.range[0]).line : 1
 }
 
+function constantWorkflowCondition(value: unknown): boolean | undefined {
+  if (value === false) return false
+  if (value === true) return true
+  if (typeof value !== 'string') return undefined
+  const trimmed = value.trim()
+  if (trimmed === 'false' || trimmed === '${{ false }}' || trimmed === '${{false}}') return false
+  if (trimmed === 'true' || trimmed === '${{ true }}' || trimmed === '${{true}}') return true
+  return undefined
+}
+
+function yamlCondition(node: YamlNode | null | undefined): {
+  text?: string
+  disabled: boolean
+} {
+  if (!isScalar(node)) return { disabled: false }
+  const text =
+    typeof node.value === 'string' || typeof node.value === 'boolean'
+      ? String(node.value)
+      : undefined
+  return { text, disabled: constantWorkflowCondition(node.value) === false }
+}
+
 function parseWorkflow(
   file: string,
   source: string,
@@ -1229,6 +1353,9 @@ function parseWorkflow(
     for (const jobPair of jobsNode.items) {
       const job = isScalar(jobPair.key) ? String(jobPair.key.value) : '<job>'
       if (!isMap(jobPair.value)) continue
+      const jobCondition = yamlCondition(
+        mapPair(jobPair.value, 'if')?.value as YamlNode | null | undefined
+      )
       const stepsNode = mapPair(jobPair.value, 'steps')?.value
       if (!isSeq(stepsNode)) continue
       for (const [index, item] of stepsNode.items.entries()) {
@@ -1241,6 +1368,9 @@ function parseWorkflow(
           | YamlNode
           | null
           | undefined
+        const stepCondition = yamlCondition(
+          mapPair(item, 'if')?.value as YamlNode | null | undefined
+        )
         steps.push({
           job,
           index,
@@ -1253,7 +1383,9 @@ function parseWorkflow(
           usesScalar: isScalar(usesNode) && typeof usesNode.value === 'string',
           args: scalarText(argsNode),
           argsPresent: argsNode !== undefined,
-          argsScalar: isScalar(argsNode) && typeof argsNode.value === 'string'
+          argsScalar: isScalar(argsNode) && typeof argsNode.value === 'string',
+          disabled: jobCondition.disabled || stepCondition.disabled,
+          condition: stepCondition.text ?? jobCondition.text
         })
       }
     }
@@ -1299,7 +1431,7 @@ function stepDisplay(step: WorkflowStep): string {
 function checkCargoRuns(findings: GuardFinding[], workflows: ParsedWorkflow[]): void {
   for (const workflow of workflows) {
     for (const step of workflow.steps) {
-      if (!step.runScalar || step.run === undefined) continue
+      if (step.disabled || !step.runScalar || step.run === undefined) continue
       for (const occurrence of cargoOccurrences(step.run)) {
         if (invocationIsLocked(occurrence.invocation)) continue
         findings.push({
@@ -1315,7 +1447,7 @@ function checkCargoRuns(findings: GuardFinding[], workflows: ParsedWorkflow[]): 
 
 function checkDefaultPrGuard(findings: GuardFinding[], validation: ParsedWorkflow): void {
   const named = validation.steps.filter(
-    (step) => step.nameScalar && step.name === PR_GUARD_STEP_NAME
+    (step) => !step.disabled && step.nameScalar && step.name === PR_GUARD_STEP_NAME
   )
   if (named.length !== 1) {
     findings.push({
@@ -1360,7 +1492,7 @@ function checkNativeCi(findings: GuardFinding[], validation: ParsedWorkflow): vo
 
   const exactRuns = new Set(
     validation.steps.flatMap((step) =>
-      step.runScalar && step.run !== undefined
+      !step.disabled && step.runScalar && step.run !== undefined
         ? step.run
             .split(/\r?\n/)
             .map((line) => line.trim())
@@ -1385,7 +1517,9 @@ function checkNativeCi(findings: GuardFinding[], validation: ParsedWorkflow): vo
     }
   }
 
-  const windowsSteps = validation.steps.filter((step) => step.job === 'rust-windows-check')
+  const windowsSteps = validation.steps.filter(
+    (step) => !step.disabled && step.job === 'rust-windows-check'
+  )
   if (!windowsSteps.some((step) => step.runScalar && step.run === WINDOWS_TOKEN_SECURITY_RUN)) {
     findings.push({
       rule: 'native-ci-wiring',

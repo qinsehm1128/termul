@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("sync-stamped-root-lock.py").resolve()
@@ -159,6 +160,48 @@ class SyncStampedRootLockTests(unittest.TestCase):
             self.assertEqual(synced.returncode, 0, synced.stderr)
             self.assertEqual(metadata.returncode, 0, metadata.stderr)
             self.assertIn('"version":"1.2.3"', metadata.stdout)
+
+    def _load_sync_module(self):
+        spec = importlib.util.spec_from_file_location("sync_stamped_root_lock", SCRIPT)
+        if spec is None or spec.loader is None:
+            raise RuntimeError("unable to load sync-stamped-root-lock.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_atomic_replace_succeeds_when_windows_directory_flush_unsupported(self) -> None:
+        module = self._load_sync_module()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "Cargo.lock"
+            path.write_bytes(b"version = 4\n")
+            unsupported = OSError(errno.EACCES, "denied")
+            unsupported.winerror = 5
+            with mock.patch.object(module.os, "name", "nt"), mock.patch.object(
+                module,
+                "_flush_windows_directory",
+                side_effect=unsupported,
+            ):
+                module.atomic_replace(path, b"version = 5\n")
+            self.assertEqual(path.read_bytes(), b"version = 5\n")
+
+    def test_unix_directory_fsync_still_used_on_posix(self) -> None:
+        module = self._load_sync_module()
+        if module.os.name == "nt":
+            self.skipTest("posix directory fsync contract")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "Cargo.lock"
+            path.write_bytes(b"version = 4\n")
+            opened: list[int] = []
+            real_open = module.os.open
+
+            def tracking_open(target, flags, *args, **kwargs):
+                opened.append(flags)
+                return real_open(target, flags, *args, **kwargs)
+
+            with mock.patch.object(module.os, "open", side_effect=tracking_open):
+                module.atomic_replace(path, b"version = 5\n")
+            self.assertIn(module.os.O_RDONLY, opened)
+            self.assertEqual(path.read_bytes(), b"version = 5\n")
 
 
 if __name__ == "__main__":

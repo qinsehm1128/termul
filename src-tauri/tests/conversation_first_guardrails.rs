@@ -4,8 +4,9 @@ use std::path::{Path, PathBuf};
 
 use syn::visit::{self, Visit};
 use syn::{
-    Attribute, Expr, ExprCall, ExprMethodCall, ExprStruct, FnArg, ImplItem, Item, ItemFn, ItemImpl,
-    ItemMod, ItemUse, Type, UseTree, Visibility,
+    Attribute, BinOp, Expr, ExprCall, ExprIf, ExprMethodCall, ExprStruct, ExprWhile, FnArg,
+    ImplItem, Item, ItemFn, ItemImpl, ItemMod, ItemUse, Lit, Local, Pat, Type, UnOp, UseTree,
+    Visibility,
 };
 
 const REPOSITORY_MUTATORS: &[&str] = &[
@@ -79,8 +80,16 @@ struct ModuleInfo {
 struct MethodUse {
     method: String,
     receiver: String,
+    receiver_type: String,
     argument_names: HashSet<String>,
 }
+
+const PROTECTED_AUTHORIZE_TYPES: &[&str] = &[
+    "ConversationWriteAuthority",
+    "ConversationWriter",
+    "RemoteAccessAuthority",
+];
+const PROTECTED_AUTHORIZE_RECEIVERS: &[&str] = &["authority", "writer", "self"];
 
 fn is_cfg_test(attributes: &[Attribute]) -> bool {
     attributes.iter().any(|attribute| {
@@ -130,6 +139,61 @@ fn type_names(ty: &Type, names: &mut HashSet<String>) {
     }
 }
 
+fn primary_type_name(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Path(path) => last_path_ident(&path.path),
+        Type::Reference(reference) => primary_type_name(&reference.elem),
+        Type::Paren(paren) => primary_type_name(&paren.elem),
+        Type::Group(group) => primary_type_name(&group.elem),
+        Type::Ptr(pointer) => primary_type_name(&pointer.elem),
+        _ => None,
+    }
+}
+
+fn canonicalize_name(aliases: &HashMap<String, String>, name: &str) -> String {
+    let mut current = name.to_string();
+    let mut seen = HashSet::new();
+    while let Some(next) = aliases.get(&current) {
+        if !seen.insert(current.clone()) || next == &current {
+            break;
+        }
+        current = next.clone();
+    }
+    current
+}
+
+fn constant_bool(expression: &Expr) -> Option<bool> {
+    match expression {
+        Expr::Lit(literal) => match &literal.lit {
+            Lit::Bool(value) => Some(value.value),
+            _ => None,
+        },
+        Expr::Paren(paren) => constant_bool(&paren.expr),
+        Expr::Group(group) => constant_bool(&group.expr),
+        Expr::Unary(unary) if matches!(unary.op, UnOp::Not(_)) => {
+            constant_bool(&unary.expr).map(|value| !value)
+        }
+        Expr::Binary(binary) => {
+            let left = constant_bool(&binary.left);
+            let right = constant_bool(&binary.right);
+            match binary.op {
+                BinOp::And(_) => match (left, right) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                },
+                BinOp::Or(_) => match (left, right) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 fn expression_name(expression: &Expr) -> String {
     match expression {
         Expr::Path(path) => last_path_ident(&path.path).unwrap_or_default(),
@@ -169,6 +233,7 @@ fn flatten_use(tree: &UseTree, prefix: &mut Vec<String>, aliases: &mut HashMap<S
 struct CallCollector<'a> {
     aliases: &'a HashMap<String, String>,
     info: FunctionInfo,
+    local_types: HashMap<String, String>,
     string_literals: Vec<String>,
 }
 
@@ -207,10 +272,17 @@ impl<'ast> Visit<'ast> for CallCollector<'_> {
 
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
         let method = node.method.to_string();
+        let receiver = expression_name(&node.receiver);
+        let receiver_type = self
+            .local_types
+            .get(&receiver)
+            .cloned()
+            .unwrap_or_default();
         self.info.methods.insert(method.clone());
         self.info.method_uses.push(MethodUse {
             method,
-            receiver: expression_name(&node.receiver),
+            receiver,
+            receiver_type,
             argument_names: node
                 .args
                 .iter()
@@ -219,6 +291,43 @@ impl<'ast> Visit<'ast> for CallCollector<'_> {
                 .collect(),
         });
         visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_expr_if(&mut self, node: &'ast ExprIf) {
+        self.visit_expr(&node.cond);
+        match constant_bool(&node.cond) {
+            Some(false) => {
+                if let Some((_, else_branch)) = &node.else_branch {
+                    self.visit_expr(else_branch);
+                }
+            }
+            Some(true) => {
+                self.visit_block(&node.then_branch);
+            }
+            None => visit::visit_expr_if(self, node),
+        }
+    }
+
+    fn visit_expr_while(&mut self, node: &'ast ExprWhile) {
+        self.visit_expr(&node.cond);
+        if constant_bool(&node.cond) == Some(false) {
+            return;
+        }
+        visit::visit_expr_while(self, node);
+    }
+
+    fn visit_local(&mut self, node: &'ast Local) {
+        if let Pat::Type(pat_ty) = &node.pat {
+            if let Pat::Ident(ident) = pat_ty.pat.as_ref() {
+                if let Some(name) = primary_type_name(&pat_ty.ty) {
+                    self.local_types.insert(
+                        ident.ident.to_string(),
+                        canonicalize_name(self.aliases, &name),
+                    );
+                }
+            }
+        }
+        visit::visit_local(self, node);
     }
 
     fn visit_expr_struct(&mut self, node: &'ast ExprStruct) {
@@ -278,11 +387,20 @@ impl ModuleCollector {
                 production_entry: Self::is_production_entry(&function.vis),
                 ..FunctionInfo::default()
             },
+            local_types: HashMap::new(),
             string_literals: Vec::new(),
         };
         for argument in &function.sig.inputs {
             if let FnArg::Typed(typed) = argument {
                 type_names(&typed.ty, &mut collector.info.parameter_types);
+                if let Pat::Ident(ident) = typed.pat.as_ref() {
+                    if let Some(name) = primary_type_name(&typed.ty) {
+                        collector.local_types.insert(
+                            ident.ident.to_string(),
+                            canonicalize_name(&self.info.aliases, &name),
+                        );
+                    }
+                }
             }
         }
         collector.info.parameter_types =
@@ -336,8 +454,25 @@ impl ModuleCollector {
                     production_entry: Self::is_production_entry(&method.vis),
                     ..FunctionInfo::default()
                 },
+                local_types: HashMap::new(),
                 string_literals: Vec::new(),
             };
+            collector.local_types.insert(
+                "self".to_string(),
+                canonicalize_name(&self.info.aliases, &implementation_name),
+            );
+            for argument in &method.sig.inputs {
+                if let FnArg::Typed(typed) = argument {
+                    if let Pat::Ident(ident) = typed.pat.as_ref() {
+                        if let Some(name) = primary_type_name(&typed.ty) {
+                            collector.local_types.insert(
+                                ident.ident.to_string(),
+                                canonicalize_name(&self.info.aliases, &name),
+                            );
+                        }
+                    }
+                }
+            }
             collector.info.parameter_types = self
                 .info
                 .impl_methods
@@ -364,10 +499,21 @@ impl ModuleCollector {
 
 impl<'ast> Visit<'ast> for ModuleCollector {
     fn visit_file(&mut self, node: &'ast syn::File) {
-        // Imports must be indexed before functions so renamed uses resolve deterministically.
+        // Imports and type aliases must be indexed before functions so receivers resolve.
         for item in &node.items {
             if let Item::Use(import) = item {
                 self.visit_item_use(import);
+            }
+        }
+        for item in &node.items {
+            if let Item::Type(alias) = item {
+                if is_cfg_test(&alias.attrs) {
+                    continue;
+                }
+                if let Some(name) = primary_type_name(&alias.ty) {
+                    let canonical = canonicalize_name(&self.info.aliases, &name);
+                    self.info.aliases.insert(alias.ident.to_string(), canonical);
+                }
             }
         }
         for item in &node.items {
@@ -404,10 +550,25 @@ impl<'ast> Visit<'ast> for ModuleCollector {
         }
         if let Some((_, items)) = &node.content {
             for item in items {
+                if let Item::Use(import) = item {
+                    self.visit_item_use(import);
+                }
+            }
+            for item in items {
+                if let Item::Type(alias) = item {
+                    if is_cfg_test(&alias.attrs) {
+                        continue;
+                    }
+                    if let Some(name) = primary_type_name(&alias.ty) {
+                        let canonical = canonicalize_name(&self.info.aliases, &name);
+                        self.info.aliases.insert(alias.ident.to_string(), canonical);
+                    }
+                }
+            }
+            for item in items {
                 match item {
                     Item::Fn(function) => self.collect_function(function),
                     Item::Impl(implementation) => self.collect_impl(implementation),
-                    Item::Use(import) => self.visit_item_use(import),
                     _ => {}
                 }
             }
@@ -560,6 +721,27 @@ fn reachable_has_any_method(module: &ModuleInfo, entry: &str, expected: &HashSet
         })
 }
 
+fn authorize_is_protected(module: &ModuleInfo, usage: &MethodUse) -> bool {
+    if usage.method != "authorize" {
+        return false;
+    }
+    let resolved = if usage.receiver_type.is_empty() {
+        String::new()
+    } else {
+        canonicalize_name(&module.aliases, &usage.receiver_type)
+    };
+    if !resolved.is_empty() {
+        return PROTECTED_AUTHORIZE_TYPES.contains(&resolved.as_str());
+    }
+    PROTECTED_AUTHORIZE_RECEIVERS.contains(&usage.receiver.as_str())
+}
+
+fn reachable_has_protected_authorize(module: &ModuleInfo, entry: &str) -> bool {
+    reachable_method_uses(module, entry)
+        .into_iter()
+        .any(|usage| authorize_is_protected(module, usage))
+}
+
 fn check_repository(modules: &[ModuleInfo], findings: &mut Vec<Finding>) {
     let Some(repository) = module_by_suffix(modules, "conversation/repository.rs") else {
         findings.push(Finding {
@@ -614,7 +796,7 @@ fn check_repository(modules: &[ModuleInfo], findings: &mut Vec<Finding>) {
             if repository_mutations.is_empty() {
                 continue;
             }
-            if !reachable_has_any_method(module, &entry, &HashSet::from(["authorize"]))
+            if !reachable_has_protected_authorize(module, &entry)
                 && reported.insert((entry.clone(), "authorize"))
             {
                 findings.push(Finding {
@@ -720,7 +902,7 @@ fn check_authentication(modules: &[ModuleInfo], findings: &mut Vec<Finding>) {
             });
         }
         for entry in protected_entries {
-            if !reachable_has_any_method(module, &entry, &HashSet::from(["authorize"])) {
+            if !reachable_has_protected_authorize(module, &entry) {
                 findings.push(Finding {
                     rule: "capability-auth",
                     file: module.file.clone(),
@@ -1081,4 +1263,64 @@ pub fn stop() {}
                 .message
                 .contains("must call the non-owning serve_router path")
     }));
+}
+
+fn capability_router() -> ModuleInfo {
+    fixture(
+        "src/web/router.rs",
+        r#"
+fn classified_routes(_authority: RemoteAccessAuthority) { from_fn(capability_middleware); }
+"#,
+    )
+}
+
+fn capability_findings(module: ModuleInfo) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    check_authentication(&[capability_router(), module], &mut findings);
+    findings
+        .into_iter()
+        .filter(|finding| {
+            finding.rule == "capability-auth"
+                && finding
+                    .message
+                    .contains("does not reach capability authorize")
+        })
+        .collect()
+}
+
+#[test]
+fn rejects_unrelated_receiver_authorize() {
+    let findings = capability_findings(fixture(
+        "src/web/moved_unrelated.rs",
+        r#"
+use crate::web::auth::{RemoteAccessAuthority as Authority, RemoteCapability, RemotePrincipal as Principal};
+pub fn handler(authority: &Authority, principal: &Principal) { other.authorize(principal, RemoteCapability::Mutate); let _ = authority; }
+"#,
+    ));
+    assert_eq!(findings.len(), 1);
+}
+
+#[test]
+fn rejects_statically_dead_authorize_branch() {
+    let findings = capability_findings(fixture(
+        "src/web/moved_dead_branch.rs",
+        r#"
+use crate::web::auth::{RemoteAccessAuthority as Authority, RemoteCapability, RemotePrincipal as Principal};
+pub fn handler(authority: &Authority, principal: &Principal) { let _ = RemoteCapability::Mutate; if false { authority.authorize(principal, RemoteCapability::Mutate); } }
+"#,
+    ));
+    assert_eq!(findings.len(), 1);
+}
+
+#[test]
+fn rejects_type_alias_obscuring_protected_receiver() {
+    let findings = capability_findings(fixture(
+        "src/web/moved_alias.rs",
+        r#"
+use crate::web::auth::{RemoteAccessAuthority, RemoteCapability, RemotePrincipal as Principal};
+type Authority = Unrelated;
+pub fn handler(authority: &Authority, principal: &Principal, _mark: &RemoteAccessAuthority) { authority.authorize(principal, RemoteCapability::Mutate); }
+"#,
+    ));
+    assert_eq!(findings.len(), 1);
 }
