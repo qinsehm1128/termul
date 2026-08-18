@@ -687,6 +687,8 @@ mod conversation_maintenance_tests {
 }
 
 fn init_tracing() {
+    // Standalone composition already captures both `tracing` and `log`.
+    // Host shutdown uses one absolute Instant deadline in `web::serve`.
     // `try_init` installs tracing's LogTracer bridge as well as the subscriber,
     // so shared `log` facade events are durable in standalone composition.
     let _ = tracing_subscriber::fmt()

@@ -94,6 +94,9 @@ pub(crate) const PTY_CLEANUP_FAILED: &str = "PTY_CLEANUP_FAILED";
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct StandaloneShutdownReceipt {
     pty_shutdown: crate::pty::manager::PtyShutdownReceipt,
+    connections_active: u64,
+    connections_failed: u64,
+    connections_timed_out: u64,
 }
 
 #[derive(Debug)]
@@ -106,12 +109,15 @@ impl fmt::Display for StandaloneShutdownError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "standalone shutdown failed: {} (pty attempted={} succeeded={} failed={} in_flight={})",
+            "standalone shutdown failed: {} (pty attempted={} succeeded={} failed={} in_flight={} connections active={} failed={} timed_out={})",
             self.codes.join(","),
             self.receipt.pty_shutdown.attempted,
             self.receipt.pty_shutdown.succeeded,
             self.receipt.pty_shutdown.failed,
-            self.receipt.pty_shutdown.in_flight
+            self.receipt.pty_shutdown.in_flight,
+            self.receipt.connections_active,
+            self.receipt.connections_failed,
+            self.receipt.connections_timed_out
         )
     }
 }
@@ -143,12 +149,33 @@ async fn shutdown_standalone_resources_until(
 ) -> Result<StandaloneShutdownReceipt, StandaloneShutdownError> {
     let mut failures = Vec::new();
 
-    if acp.stop_producers().await.is_err() {
-        record_shutdown_failure(
+    crate::host_admission::HostAdmission::global().close();
+    crate::host_admission::HostAdmission::global()
+        .drain_until(deadline)
+        .await;
+    let registry = crate::web::upgraded_connections::UpgradedConnectionRegistry::global();
+    registry.stop_admission();
+    let _ = registry.revoke_generations();
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let connection_receipt = registry.join_all(remaining).await;
+    info!(
+        target: "termul::web::shutdown",
+        stable_code = "OK",
+        shutdown_phase = "join_upgraded_connections",
+        active = connection_receipt.active,
+        failed = connection_receipt.failed,
+        timed_out = connection_receipt.timed_out,
+        cancelled = connection_receipt.cancelled,
+        "upgraded connections joined under host deadline"
+    );
+
+    match tokio::time::timeout_at(deadline, acp.stop_producers()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) | Err(_) => record_shutdown_failure(
             &mut failures,
             ACP_PRODUCER_STOP_FAILED,
             "stop_acp_producers",
-        );
+        ),
     }
     if ws_relay
         .shutdown_conversation_persistence_until(deadline)
@@ -177,12 +204,13 @@ async fn shutdown_standalone_resources_until(
             "flush_conversation_catalog",
         ),
     }
-    if acp.shutdown_persistence().await.is_err() {
-        record_shutdown_failure(
+    match tokio::time::timeout_at(deadline, acp.shutdown_persistence()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) | Err(_) => record_shutdown_failure(
             &mut failures,
             ACP_PERSISTENCE_SHUTDOWN_FAILED,
             "shutdown_acp_persistence",
-        );
+        ),
     }
 
     // The same absolute host deadline bounds every PTY job. All <=30 resources are scheduled
@@ -203,15 +231,23 @@ async fn shutdown_standalone_resources_until(
         record_shutdown_failure(&mut failures, PTY_CLEANUP_FAILED, "cleanup_ptys");
     }
 
-    let receipt = StandaloneShutdownReceipt { pty_shutdown };
-    if failures.is_empty() {
+    let receipt = StandaloneShutdownReceipt {
+        pty_shutdown,
+        connections_active: connection_receipt.active,
+        connections_failed: connection_receipt.failed,
+        connections_timed_out: connection_receipt.timed_out,
+    };
+    let result = if failures.is_empty() {
         Ok(receipt)
     } else {
         Err(StandaloneShutdownError {
             codes: failures,
             receipt,
         })
-    }
+    };
+    #[cfg(test)]
+    crate::host_admission::HostAdmission::global().reopen_for_tests();
+    result
 }
 
 /// Bind and serve the standalone ACP HTTP server until SIGINT/SIGTERM.
@@ -883,5 +919,56 @@ mod tests {
             .expect("durable shared-live history")
             .iter()
             .any(|event| event.payload["ordinal"] == 2));
+    }
+
+    #[tokio::test]
+    async fn shutdown_joins_upgraded_connections_under_host_deadline() {
+        let registry = crate::web::upgraded_connections::UpgradedConnectionRegistry::global();
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        });
+        let _ = registry.register(
+            crate::web::upgraded_connections::UpgradedConnectionKind::Acp,
+            Some(handle),
+        );
+        let pty = test_pty_manager();
+        let acp = Arc::new(AcpManager::new(vec![]));
+        let relay = Arc::new(WsRelaySink::new());
+        let result = shutdown_standalone_resources_until(
+            &acp,
+            &pty,
+            &relay,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .await;
+        let receipt = match result {
+            Ok(receipt) => receipt,
+            Err(error) => error.receipt,
+        };
+        assert_eq!(receipt.connections_active, 0);
+    }
+
+    #[tokio::test]
+    async fn stop_producers_and_legacy_persistence_honor_absolute_deadline() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("async fn shutdown_standalone_resources_until(")
+            .expect("shutdown helper exists");
+        let body = &source[start..];
+        assert!(body.contains("timeout_at(deadline, acp.stop_producers())"));
+        assert!(body.contains("timeout_at(deadline, acp.shutdown_persistence())"));
+        assert!(body.contains("join_all(remaining)"));
+        let pty = test_pty_manager();
+        let acp = Arc::new(AcpManager::new(vec![]));
+        let relay = Arc::new(WsRelaySink::new());
+        let started = tokio::time::Instant::now();
+        let _ = shutdown_standalone_resources_until(
+            &acp,
+            &pty,
+            &relay,
+            started + Duration::from_millis(50),
+        )
+        .await;
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

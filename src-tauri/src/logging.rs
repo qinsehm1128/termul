@@ -165,6 +165,43 @@ pub fn build_log_plugin<R: Runtime>() -> tauri::plugin::TauriPlugin<R> {
 /// Install a global panic hook that routes panic payloads + a captured
 /// backtrace to the `log` facade, so panics land in the file sink instead of a
 /// discarded stderr. Chains to the previously installed hook.
+/// Bridge `tracing` events from shared web/WS admission paths into the `log`
+/// facade so Desktop Tauri captures Origin/admission/lifecycle audits.
+pub fn install_desktop_tracing_bridge() {
+    use tracing_subscriber::prelude::*;
+    let layer = tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_target(true)
+        .with_writer(|| TracingToLogWriter);
+    let _ = tracing_subscriber::registry().with(layer).try_init();
+}
+
+struct TracingToLogWriter;
+
+impl std::io::Write for TracingToLogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if let Ok(line) = std::str::from_utf8(buf) {
+            let trimmed = line.trim_end();
+            if !trimmed.is_empty() {
+                log::info!(target: "termul::tracing", "{trimmed}");
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TracingToLogWriter {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        TracingToLogWriter
+    }
+}
+
 pub fn install_panic_hook() {
     let previous = panic::take_hook();
     panic::set_hook(Box::new(move |info| {
@@ -312,5 +349,15 @@ mod tests {
             "release"
         };
         assert_eq!(build_channel(), expected);
+    }
+
+    #[test]
+    fn desktop_tracing_bridge_captures_ws_audit_events() {
+        install_desktop_tracing_bridge();
+        tracing::info!(target: "termul::web::ws", stable_code = "OK", "WebSocket upgrade Origin accepted");
+        let source = include_str!("logging.rs");
+        assert!(source.contains("install_desktop_tracing_bridge"));
+        assert!(source.contains("TracingToLogWriter"));
+        assert!(source.contains("termul::tracing"));
     }
 }

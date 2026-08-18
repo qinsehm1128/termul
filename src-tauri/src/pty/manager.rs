@@ -953,8 +953,11 @@ impl CleanupDriver for SystemCleanupDriver {
     fn kill(
         &self,
         child: &mut dyn Child,
-        _deadline: Instant,
+        deadline: Instant,
     ) -> Result<(), TerminalCleanupFailureReason> {
+        if Instant::now() >= deadline {
+            return Err(TerminalCleanupFailureReason::DeadlineExceeded);
+        }
         child
             .kill()
             .map_err(|_| TerminalCleanupFailureReason::Error)
@@ -963,8 +966,11 @@ impl CleanupDriver for SystemCleanupDriver {
     fn try_wait(
         &self,
         child: &mut dyn Child,
-        _deadline: Instant,
+        deadline: Instant,
     ) -> Result<Option<portable_pty::ExitStatus>, TerminalCleanupFailureReason> {
+        if Instant::now() >= deadline {
+            return Err(TerminalCleanupFailureReason::DeadlineExceeded);
+        }
         child
             .try_wait()
             .map_err(|_| TerminalCleanupFailureReason::Error)
@@ -974,11 +980,17 @@ impl CleanupDriver for SystemCleanupDriver {
         &self,
         _stage: TerminalCleanupStage,
         handle: &mut Option<std::thread::JoinHandle<()>>,
-        _deadline: Instant,
+        deadline: Instant,
     ) -> Result<(), TerminalCleanupFailureReason> {
         let Some(handle) = handle.take() else {
             return Ok(());
         };
+        if Instant::now() >= deadline {
+            // Dropping the JoinHandle detaches the thread so unresolved
+            // spawn_blocking/cleanup work cannot stall Tokio teardown.
+            drop(handle);
+            return Err(TerminalCleanupFailureReason::DeadlineExceeded);
+        }
         handle
             .join()
             .map_err(|_| TerminalCleanupFailureReason::ThreadPanicked)
@@ -1630,6 +1642,9 @@ impl PtyManager {
         options: SpawnOptions,
         on_data: Option<Channel<Response>>,
     ) -> Result<SpawnedTerminal, String> {
+        if crate::host_admission::HostAdmission::global().check().is_err() {
+            return Err(crate::host_admission::HOST_SHUTTING_DOWN.to_string());
+        }
         // Start orphan detection on first spawn (lazy initialization)
         self.start_orphan_detection();
 
@@ -4908,4 +4923,20 @@ mod tests {
     // 1. Compile-time check: kill() is now async and returns impl Future
     // 2. Existing orphan cleanup code at line 403-406 demonstrates the pattern
     // 3. Manual testing during development
+
+    #[test]
+    fn system_cleanup_driver_cannot_block_runtime_after_deadline() {
+        let driver = SystemCleanupDriver;
+        let started = Instant::now();
+        let mut handle = Some(std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }));
+        let result = driver.join_thread(
+            TerminalCleanupStage::ReaderJoin,
+            &mut handle,
+            Instant::now() - std::time::Duration::from_secs(1),
+        );
+        assert_eq!(result, Err(TerminalCleanupFailureReason::DeadlineExceeded));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
 }

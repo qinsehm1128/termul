@@ -85,18 +85,15 @@ pub async fn get(
         Ok(manifest) => {
             debug!(
                 target: "termul::web::workspace_api",
-                project_id = %project_id,
                 revision = manifest.as_ref().map_or(0, |m| m.revision),
-                "get: loaded manifest"
+                "operation=workspace_get stable_code=OK"
             );
             (StatusCode::OK, Json(IpcBody::ok(manifest)))
         }
         Err(error) => {
             warn!(
                 target: "termul::web::workspace_api",
-                project_id = %project_id,
-                error = %error,
-                "get: host load failed"
+                "operation=workspace_get stable_code=WORKSPACE_MANIFEST_GET_FAILED"
             );
             (
                 StatusCode::OK,
@@ -145,9 +142,7 @@ pub async fn write(
         Err(error) => {
             warn!(
                 target: "termul::web::workspace_api",
-                project_id = %project_id,
-                error = %error,
-                "write: payload validation failed (deny_unknown_fields or malformed JSON)"
+                "operation=workspace_write stable_code=VALIDATION_ERROR"
             );
             return (
                 StatusCode::OK,
@@ -179,9 +174,7 @@ pub async fn write(
         Err(error) => {
             warn!(
                 target: "termul::web::workspace_api",
-                project_id = %project_id,
-                error = %error,
-                "write: host write failed"
+                "operation=workspace_write stable_code=WORKSPACE_MANIFEST_WRITE_FAILED"
             );
             (
                 StatusCode::OK,
@@ -215,9 +208,7 @@ pub async fn delete(
         Err(error) => {
             warn!(
                 target: "termul::web::workspace_api",
-                project_id = %project_id,
-                error = %error,
-                "delete: host delete failed"
+                "operation=workspace_delete stable_code=WORKSPACE_MANIFEST_DELETE_FAILED"
             );
             (
                 StatusCode::OK,

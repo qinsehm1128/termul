@@ -53,9 +53,9 @@ fn validate_project_path(path: &str) -> Result<PathBuf, String> {
     let path_buf = PathBuf::from(path);
 
     // Canonicalize to resolve symlinks and relative paths
-    let canonical = path_buf.canonicalize().map_err(|e| {
-        log::warn!("[Security] Path validation failed for '{}': {}", path, e);
-        format!("Invalid or inaccessible path: {}", e)
+    let canonical = path_buf.canonicalize().map_err(|_| {
+        log::warn!("[Security] operation=validate_project_path stable_code=PATH_VALIDATION_FAILED");
+        "Invalid or inaccessible path".to_string()
     })?;
 
     // On Windows, `canonicalize()` returns a verbatim (`\\?\…`) path. That prefix
@@ -65,13 +65,25 @@ fn validate_project_path(path: &str) -> Result<PathBuf, String> {
     let canonical_str = canonical.to_string_lossy();
     let simplified = path_validation::strip_verbatim_prefix(&canonical_str).into_owned();
 
-    log::debug!("[Security] Path validated: {} -> {}", path, simplified);
+    log::debug!("[Security] operation=validate_project_path stable_code=OK");
     Ok(PathBuf::from(simplified))
 }
 
 /// Macro to validate a path and convert it to a String, returning early with an IpcResult error if validation fails.
+pub(crate) fn require_host_admission<T>() -> Result<(), IpcResult<T>> {
+    crate::host_admission::HostAdmission::global()
+        .check()
+        .map_err(|code| IpcResult::error("host is shutting down", code))
+}
+
 macro_rules! validate_and_stringify {
-    ($path:expr) => {
+    ($path:expr) => {{
+        if crate::host_admission::HostAdmission::global().check().is_err() {
+            return Ok(IpcResult::error(
+                "host is shutting down",
+                crate::host_admission::HOST_SHUTTING_DOWN,
+            ));
+        }
         match validate_project_path($path) {
             Ok(validated) => match validated.to_str() {
                 Some(s) => s.to_string(),
@@ -84,7 +96,7 @@ macro_rules! validate_and_stringify {
             },
             Err(e) => return Ok(IpcResult::error(e, "PATH_VALIDATION_FAILED")),
         }
-    };
+    }};
 }
 
 /// IPC Result pattern
@@ -384,6 +396,9 @@ async fn terminal_spawn_resource_impl(
     pty_manager: &Arc<PtyManager>,
     workspace: &Arc<crate::conversation::SessionWorkspaceService>,
 ) -> IpcResult<SpawnedTerminal> {
+    if let Err(error) = require_host_admission() {
+        return error;
+    }
     let is_ephemeral_ssh = options.kind.as_deref() == Some("ssh");
     let conversation_id = if is_ephemeral_ssh {
         None
@@ -641,6 +656,9 @@ pub async fn terminal_attach(
     on_data: Channel<Response>,
     pty_manager: State<'_, Arc<PtyManager>>,
 ) -> Result<IpcResult<TerminalAttachResult>, String> {
+    if let Err(error) = require_host_admission() {
+        return Ok(error);
+    }
     // Capture the generation BEFORE verifying (TOCTOU-safe ordering): if a
     // rotate/revoke lands between capture and verify, verify fails (the
     // credential was invalidated) and we reject; if it lands after verify, the
@@ -734,6 +752,7 @@ pub async fn terminal_attach(
             }
         }
     });
+    crate::host_admission::HostAdmission::global().track_abort(handle.abort_handle());
 
     if !handle.is_finished() {
         let mut forwarders = lock_forwarders();
@@ -3629,11 +3648,11 @@ pub async fn ssh_create_askpass(password: String) -> Result<IpcResult<String>, S
     // ensuring secrets don't persist on disk if the helper is never invoked.
     let cleanup_script = script_path.clone();
     let cleanup_password = password_path.clone();
-    tokio::spawn(async move {
+    crate::host_admission::HostAdmission::global().track(tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         let _ = std::fs::remove_file(&cleanup_password);
         let _ = std::fs::remove_file(&cleanup_script);
-    });
+    }));
 
     // Path includes the OS temp dir (often the username); keep it out of the
     // user-attachable info log (issue #244 AC#6). Full path stays at debug.
@@ -4197,6 +4216,95 @@ pub async fn acp_history_list(
     }))
 }
 
+const ACP_HISTORY_COMPAT_ENCODED_BYTE_CEILING: usize = 4_194_304;
+
+fn charge_acp_history_encoded_bytes(
+    current: usize,
+    record: &impl serde::Serialize,
+) -> Result<usize, &'static str> {
+    let added = crate::conversation::contracts::encoded_json_len_bounded(
+        record,
+        crate::conversation::MAX_CONVERSATION_RECORD_BYTES,
+    )
+    .ok_or("CONVERSATION_RECORD_TOO_LARGE")?;
+    let total = current.saturating_add(added);
+    if total > ACP_HISTORY_COMPAT_ENCODED_BYTE_CEILING {
+        Err(crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED)
+    } else {
+        Ok(total)
+    }
+}
+
+fn materialize_acp_history_with_ceiling(
+    persistence: &crate::conversation::ConversationPersistenceAdapter,
+    session_id: &str,
+) -> Result<
+    (
+        crate::acp::session_persistence::SessionMetadata,
+        Vec<crate::acp::session_persistence::PersistedEventRecord>,
+    ),
+    crate::conversation::ConversationPersistenceError,
+> {
+    let (_conversation_id, metadata, target_last_seq) =
+        persistence.history_metadata(session_id, "acp_history_get")?;
+    let mut cursor = 0u64;
+    let mut records = Vec::new();
+    let mut encoded_bytes = 0usize;
+    while cursor < target_last_seq {
+        let remaining =
+            crate::conversation::MAX_COMPAT_HISTORY_RECORDS.saturating_sub(records.len());
+        let limit = remaining.saturating_add(1).clamp(
+            crate::conversation::MIN_CONVERSATION_HISTORY_PAGE_LIMIT,
+            crate::conversation::MAX_CONVERSATION_HISTORY_PAGE_LIMIT,
+        );
+        let page = persistence.history_page_at(
+            session_id,
+            cursor,
+            limit,
+            Some(target_last_seq),
+        )?;
+        if page.records.len() > remaining {
+            return Err(crate::conversation::ConversationPersistenceError {
+                code: crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED,
+                operation: "acp_history_get",
+                detail: "history exceeds the compatibility materialization limit; use bounded pages"
+                    .to_string(),
+            });
+        }
+        for record in &page.records {
+            encoded_bytes = charge_acp_history_encoded_bytes(encoded_bytes, record).map_err(
+                |code| crate::conversation::ConversationPersistenceError {
+                    code,
+                    operation: "acp_history_get",
+                    detail: "history exceeds the 4194304-byte compatibility ceiling".to_string(),
+                },
+            )?;
+        }
+        records.extend(page.records.into_iter().map(|record| {
+            crate::acp::session_persistence::PersistedEventRecord {
+                schema_version: record.schema_version,
+                session_id: record.session_id,
+                seq: record.seq,
+                type_: record.type_,
+                recorded_at: record.recorded_at,
+                payload: record.payload,
+            }
+        }));
+        if page.next_cursor <= cursor && !page.complete {
+            return Err(crate::conversation::ConversationPersistenceError {
+                code: "CONVERSATION_READ_FAILED",
+                operation: "acp_history_get",
+                detail: "history page cursor did not advance".to_string(),
+            });
+        }
+        cursor = page.next_cursor;
+        if page.complete {
+            break;
+        }
+    }
+    Ok((metadata, records))
+}
+
 fn acp_history_get_inner(
     session_id: &str,
     host: &HostHistoryStore,
@@ -4204,7 +4312,7 @@ fn acp_history_get_inner(
     let Some(persistence) = &host.conversation else {
         return IpcResult::success(None);
     };
-    match persistence.legacy_materialization(session_id) {
+    match materialize_acp_history_with_ceiling(persistence, session_id) {
         Ok((metadata, records)) => {
             let payload =
                 crate::acp::session_payload::materialize_session_payload(&metadata, &records);
@@ -4220,9 +4328,9 @@ fn acp_history_get_inner(
         Err(error) => {
             if error.code == crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED {
                 log::warn!(
-                    "[acp-history] compatibility paging required code={} session_id={}",
+                    "[acp-history] compatibility paging required code={} encoded_ceiling={}",
                     error.code,
-                    sanitize_log_field(session_id)
+                    ACP_HISTORY_COMPAT_ENCODED_BYTE_CEILING
                 );
             }
             IpcResult::error("failed to read Conversation history", error.code)
@@ -4239,7 +4347,20 @@ pub async fn acp_history_get(
         "[acp-history] get start session_id={}",
         sanitize_log_field(&session_id)
     );
-    Ok(acp_history_get_inner(&session_id, host.inner()))
+    let persistence = host.inner().conversation.clone();
+    let legacy_read_only = host.inner().legacy_read_only.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        acp_history_get_inner(
+            &session_id,
+            &HostHistoryStore {
+                conversation: persistence,
+                legacy_read_only,
+            },
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(result)
 }
 
 async fn acp_history_get_page_inner(
@@ -4933,6 +5054,9 @@ pub(crate) async fn conversation_open_inner(
     service: &crate::conversation::ConversationApplicationService,
     conversation_id: &str,
 ) -> IpcResult<crate::conversation::ConversationOpenOutcome> {
+    if let Err(error) = require_host_admission() {
+        return error;
+    }
     let conversation_id = match parse_conversation_id(conversation_id) {
         Ok(value) => value,
         Err(error) => return error,
@@ -5004,6 +5128,9 @@ pub async fn session_workspace_write(
     workspace: serde_json::Value,
     service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
 ) -> Result<IpcResult<crate::conversation::SessionWorkspaceWriteOutcome>, String> {
+    if let Err(error) = require_host_admission() {
+        return Ok(error);
+    }
     let conversation_id = match parse_conversation_id(&conversation_id) {
         Ok(value) => value,
         Err(error) => return Ok(error),
@@ -5068,6 +5195,9 @@ pub(crate) async fn conversation_attach_project_inner(
     expected_revision: u64,
     attachment: serde_json::Value,
 ) -> IpcResult<crate::conversation::ConversationAggregateMutationOutcome> {
+    if let Err(error) = require_host_admission() {
+        return error;
+    }
     let conversation_id = match parse_conversation_id(conversation_id) {
         Ok(value) => value,
         Err(error) => return error,
@@ -5117,6 +5247,9 @@ pub(crate) async fn conversation_detach_project_inner(
     conversation_id: &str,
     expected_revision: u64,
 ) -> IpcResult<crate::conversation::ConversationAggregateMutationOutcome> {
+    if let Err(error) = require_host_admission() {
+        return error;
+    }
     let conversation_id = match parse_conversation_id(conversation_id) {
         Ok(value) => value,
         Err(error) => return error,
@@ -5152,6 +5285,9 @@ pub(crate) async fn conversation_update_execution_target_inner(
     expected_revision: u64,
     execution_target: serde_json::Value,
 ) -> IpcResult<crate::conversation::ConversationAggregateMutationOutcome> {
+    if let Err(error) = require_host_admission() {
+        return error;
+    }
     let conversation_id = match parse_conversation_id(conversation_id) {
         Ok(value) => value,
         Err(error) => return error,
@@ -5326,6 +5462,9 @@ async fn conversation_delete_with_retirement(
     conversation_id: crate::conversation::ConversationId,
     expected_revision: u64,
 ) -> IpcResult<crate::conversation::ConversationLifecycleOutcome> {
+    if let Err(error) = require_host_admission() {
+        return error;
+    }
     let current_session_id = match service
         .writer()
         .repository()
@@ -5548,6 +5687,9 @@ pub async fn workspace_manifest_write(
     manifest: serde_json::Value,
     store: State<'_, HostWorkspaceManifestStore>,
 ) -> Result<IpcResult<crate::acp::WriteOutcome>, String> {
+    if let Err(error) = require_host_admission() {
+        return Ok(error);
+    }
     let log_project_id = sanitize_log_field(&project_id);
     log::info!(
         "[workspace-manifest] write start project_id={} based_revision={:?}",
@@ -5610,6 +5752,9 @@ pub async fn workspace_manifest_delete(
     project_id: String,
     store: State<'_, HostWorkspaceManifestStore>,
 ) -> Result<IpcResult<()>, String> {
+    if let Err(error) = require_host_admission() {
+        return Ok(error);
+    }
     let log_project_id = sanitize_log_field(&project_id);
     log::info!(
         "[workspace-manifest] delete start project_id={}",
@@ -6567,6 +6712,33 @@ mod tests {
             search_id: "search-1".to_string(),
         };
         assert_eq!(req.search_id, "search-1");
+    }
+
+    #[test]
+    fn late_tauri_mutator_returns_host_shutting_down() {
+        crate::host_admission::HostAdmission::global().close();
+        let err = require_host_admission::<()>().expect_err("closed admission rejects mutators");
+        assert_eq!(err.code.as_deref(), Some(crate::host_admission::HOST_SHUTTING_DOWN));
+        crate::host_admission::HostAdmission::global().reopen_for_tests();
+        assert!(require_host_admission::<()>().is_ok());
+    }
+
+    #[test]
+    fn validate_project_path_logs_no_raw_path_or_identifier() {
+        let source = include_str!("commands.rs");
+        let start = source
+            .find("fn validate_project_path(path: &str)")
+            .expect("validator exists");
+        let end = source[start..]
+            .find("pub(crate) fn require_host_admission")
+            .map(|offset| start + offset)
+            .unwrap_or(start + 1600);
+        let body = &source[start..end];
+        assert!(body.contains("stable_code=PATH_VALIDATION_FAILED"));
+        assert!(body.contains("stable_code=OK"));
+        assert!(!body.contains("Path validation failed for '{}'"));
+        assert!(!body.contains("Path validated: {} -> {}"));
+        let _ = validate_project_path("/definitely-missing-termul-path-xyz");
     }
 }
 

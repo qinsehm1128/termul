@@ -6,6 +6,7 @@ mod agent_registry;
 mod browser_tab_manager;
 mod commands;
 pub mod conversation;
+mod host_admission;
 mod logging;
 mod migrations;
 mod path_validation;
@@ -1265,7 +1266,10 @@ pub(crate) async fn stop_desktop_producers_and_drain(
 ) -> DesktopExitDurabilityOutcome {
     let mut outcome = DesktopExitDurabilityOutcome::default();
     let producer_stop_failed = match acp_manager {
-        Some(acp_manager) => acp_manager.stop_producers().await.is_err(),
+        Some(acp_manager) => match tokio::time::timeout_at(deadline, acp_manager.stop_producers()).await {
+            Ok(Ok(())) => false,
+            Ok(Err(_)) | Err(_) => true,
+        },
         None => true,
     };
     if producer_stop_failed {
@@ -1343,6 +1347,7 @@ pub fn run() {
     // Install the panic hook before anything can panic so Rust panics are
     // captured to the log file with a backtrace (issue #244).
     logging::install_panic_hook();
+    logging::install_desktop_tracing_bridge();
 
     let builder = tauri::Builder::default();
 
@@ -2110,6 +2115,7 @@ pub fn run() {
             {
                 return;
             }
+            crate::host_admission::HostAdmission::global().close();
 
             let browser_tab_manager = app_handle
                 .try_state::<Arc<browser_tab_manager::BrowserTabManager>>()
@@ -2133,14 +2139,34 @@ pub fn run() {
 
             // The run callback may execute outside a Tokio reactor; Tauri owns this runtime.
             tauri::async_runtime::spawn(async move {
+                let deadline = tokio::time::Instant::now()
+                    + crate::conversation::DEFAULT_DRAIN_TIMEOUT;
+                crate::host_admission::HostAdmission::global()
+                    .drain_until(deadline)
+                    .await;
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let connection_receipt =
+                    crate::web::upgraded_connections::UpgradedConnectionRegistry::global()
+                        .join_all(remaining)
+                        .await;
+                log::info!(
+                    "[desktop-exit] shutdown_phase=join_upgraded_connections stable_code=OK active={} failed={} timed_out={}",
+                    connection_receipt.active,
+                    connection_receipt.failed,
+                    connection_receipt.timed_out
+                );
+
                 // Close remote ingress before producer stop. Shared-live remains non-owning and
                 // its stop path never drains Desktop-global Conversation persistence.
                 if let Some(remote_state) = remote_state {
-                    let _ = remote_state.stop().await;
+                    match tokio::time::timeout_at(deadline, remote_state.stop()).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(_)) | Err(_) => log::error!(
+                            "[desktop-exit] shutdown_phase=stop_remote stable_code=REMOTE_STOP_TIMEOUT result=FAILED"
+                        ),
+                    }
                 }
 
-                let deadline = tokio::time::Instant::now()
-                    + crate::conversation::DEFAULT_DRAIN_TIMEOUT;
                 let mut durability = stop_desktop_producers_and_drain(
                     acp_manager.as_deref(),
                     ws_relay.as_deref(),
@@ -2149,7 +2175,14 @@ pub fn run() {
                 .await;
 
                 if let Some(ssh_manager) = ssh_manager {
-                    ssh_manager.shutdown().await;
+                    if tokio::time::timeout_at(deadline, ssh_manager.shutdown())
+                        .await
+                        .is_err()
+                    {
+                        log::error!(
+                            "[desktop-exit] shutdown_phase=shutdown_ssh stable_code=REMOTE_STAGE_TIMEOUT result=FAILED"
+                        );
+                    }
                 }
                 if let Some(pty_manager) = pty_manager {
                     let receipt = pty_manager.kill_all_until(deadline).await;
@@ -2181,12 +2214,15 @@ pub fn run() {
                 let mut clean_exit = durability.clean_success();
 
                 if let Some(acp_manager) = acp_manager {
-                    if acp_manager.shutdown_persistence().await.is_err() {
-                        log::error!(
-                            "[desktop-exit] shutdown_phase=shutdown_acp_persistence stable_code={} result=FAILED",
-                            crate::web::ACP_PERSISTENCE_SHUTDOWN_FAILED
-                        );
-                        clean_exit = false;
+                    match tokio::time::timeout_at(deadline, acp_manager.shutdown_persistence()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) | Err(_) => {
+                            log::error!(
+                                "[desktop-exit] shutdown_phase=shutdown_acp_persistence stable_code={} result=FAILED",
+                                crate::web::ACP_PERSISTENCE_SHUTDOWN_FAILED
+                            );
+                            clean_exit = false;
+                        }
                     }
                 }
                 if let Some(browser_tab_manager) = browser_tab_manager {
