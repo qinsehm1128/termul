@@ -4,6 +4,10 @@
 //! caller's expected revision with canonical `ConversationRecordV2.lastSeq` while holding the
 //! repository's per-Conversation lock. PTYs are inspected only as delete blockers and are never
 //! terminated here.
+//!
+//! Title, attach, detach, target, and binding mutations consume the repository's in-lock
+//! canonical sequence allocator (`append_event` / `append_event_locked`) and never open a second
+//! ordering lane. A reserved relay cursor that races one of these writers must reconcile.
 
 use std::fmt;
 use std::future::Future;

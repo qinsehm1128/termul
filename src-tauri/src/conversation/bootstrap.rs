@@ -206,6 +206,9 @@ impl ConversationBootstrap {
                 callbacks: &mut callbacks,
             })
             .map_err(|source| bootstrap_error(source.code.as_str(), "recover_and_run", source))?;
+        // Maintenance scheduling holds the kernel-backed control lock across
+        // load/validate/modify/durable-replace. Consume pending intents on that
+        // path before mutable stores or network admission are published.
         let control_service = ConversationMigrationControlService::new(&roots.state_root)
             .map_err(|source| bootstrap_error(source.code.as_str(), "create_control", source))?;
         let mut control_request_ids = Vec::new();

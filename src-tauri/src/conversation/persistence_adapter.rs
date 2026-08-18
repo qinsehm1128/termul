@@ -280,6 +280,18 @@ impl ConversationPersistenceAdapter {
             )
             .await
             .map_err(|source| map_append_error("append_ordered_event", source))?;
+        // event.seq is the repository-allocated ticket sequence. Never trust a
+        // stale reserved source_seq when it differs.
+        if event.seq != source_seq {
+            return Err(error(
+                "CONVERSATION_CONFLICT",
+                "append_ordered_event",
+                format!(
+                    "reserved source seq {source_seq} differs from allocated seq {}",
+                    event.seq
+                ),
+            ));
+        }
         Ok(event.seq)
     }
 
@@ -757,30 +769,31 @@ impl ConversationPersistenceAdapter {
         let frontier = self
             .repository
             .conversation_frontier(conversation_id)
-            .map_err(|source| {
-                error(
-                    "CONVERSATION_READ_FAILED",
-                    "latest_durable_plan",
-                    source.to_string(),
-                )
-            })?;
-        let Some(payload) = frontier.latest_plan else {
+            .map_err(|source| map_frontier_read_error("latest_durable_plan", source))?;
+        let Some(payload) = frontier.latest_plan_arc() else {
             return Ok(None);
         };
+        crate::conversation::usage_plan::validate_plan_update(payload.as_ref()).map_err(|_| {
+            error(
+                "CONVERSATION_RECOVERY_REQUIRED",
+                "latest_durable_plan",
+                "canonical plan payload failed typed schema",
+            )
+        })?;
         let entries = payload
             .get("plan")
             .and_then(|plan| plan.get("entries"))
             .cloned()
             .ok_or_else(|| {
                 error(
-                    "CONVERSATION_READ_FAILED",
+                    "CONVERSATION_RECOVERY_REQUIRED",
                     "latest_durable_plan",
                     "canonical plan payload is malformed",
                 )
             })?;
         serde_json::from_value(entries).map(Some).map_err(|_| {
             error(
-                "CONVERSATION_READ_FAILED",
+                "CONVERSATION_RECOVERY_REQUIRED",
                 "latest_durable_plan",
                 "canonical plan entries could not be decoded",
             )
@@ -797,16 +810,21 @@ impl ConversationPersistenceAdapter {
                     "binding not found",
                 )
             })?;
-        self.repository
+        let frontier = self
+            .repository
             .conversation_frontier(conversation_id)
-            .map(|frontier| frontier.latest_usage)
-            .map_err(|source| {
-                error(
-                    "CONVERSATION_READ_FAILED",
-                    "latest_durable_usage",
-                    source.to_string(),
-                )
-            })
+            .map_err(|source| map_frontier_read_error("latest_durable_usage", source))?;
+        let Some(payload) = frontier.latest_usage_arc() else {
+            return Ok(None);
+        };
+        crate::conversation::usage_plan::validate_usage_update(payload.as_ref()).map_err(|_| {
+            error(
+                "CONVERSATION_RECOVERY_REQUIRED",
+                "latest_durable_usage",
+                "canonical usage payload failed typed schema",
+            )
+        })?;
+        Ok(Some((*payload).clone()))
     }
 
     /// Await an admitted relay cursor becoming canonical. Polling reads only the in-memory
@@ -902,6 +920,20 @@ fn repository_read_code(source: &crate::conversation::repository::RepositoryErro
     }
 }
 
+fn map_frontier_read_error(
+    operation: &'static str,
+    source: crate::conversation::repository::RepositoryError,
+) -> ConversationPersistenceError {
+    let code = match source.code {
+        crate::conversation::contracts::ConversationErrorCode::ConversationRecoveryRequired
+        | crate::conversation::contracts::ConversationErrorCode::ConversationCorrupt => {
+            "CONVERSATION_RECOVERY_REQUIRED"
+        }
+        _ => "CONVERSATION_READ_FAILED",
+    };
+    error(code, operation, source.to_string())
+}
+
 fn map_append_error(
     operation: &'static str,
     source: crate::conversation::repository::RepositoryError,
@@ -914,7 +946,10 @@ fn map_append_error(
             "CONVERSATION_RECORD_TOO_LARGE"
         }
         crate::conversation::contracts::ConversationErrorCode::ConversationConflict => {
-            "CONVERSATION_SOURCE_SEQUENCE_INVALID"
+            "CONVERSATION_CONFLICT"
+        }
+        crate::conversation::contracts::ConversationErrorCode::ConversationRecoveryRequired => {
+            "CONVERSATION_RECOVERY_REQUIRED"
         }
         _ => "CONVERSATION_EVENT_APPEND_FAILED",
     };

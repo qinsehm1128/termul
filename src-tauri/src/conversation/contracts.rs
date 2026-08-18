@@ -11,6 +11,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use uuid::Uuid;
 
+pub use crate::conversation::usage_plan::{
+    PlanBodyV1, PlanEntryV1, PlanUpdateV1, UsageCostV1, UsagePlanSchemaError, UsageUpdateV1,
+};
+
 pub const CONVERSATION_SCHEMA_VERSION: u32 = 2;
 pub const PROJECT_ATTACHMENT_SCHEMA_VERSION: u32 = 1;
 pub const AGENT_SESSION_BINDING_SCHEMA_VERSION: u32 = 1;

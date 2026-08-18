@@ -22,9 +22,9 @@ use tokio::time::Instant as TokioInstant;
 use uuid::Uuid;
 
 use crate::conversation::catalog::{
-    rebuild_catalog, AcceptedCanonicalConversation, CatalogRecoveryIssue, ConversationCatalog,
-    ConversationCatalogSnapshot, ConversationProvenanceFileV1, CATALOG_FILE,
-    CONVERSATION_METADATA_FILE, PROVENANCE_FILE,
+    rebuild_catalog, AcceptedCanonicalConversation, CatalogRecoveryIssue, CatalogReplaceAck,
+    CatalogReplaceFence, ConversationCatalog, ConversationCatalogSnapshot,
+    ConversationProvenanceFileV1, CATALOG_FILE, CONVERSATION_METADATA_FILE, PROVENANCE_FILE,
 };
 #[cfg(test)]
 use crate::conversation::catalog::{CatalogAdmissionMetrics, ConversationCatalogGeneration};
@@ -164,6 +164,25 @@ impl fmt::Display for CatalogFlushError {
 
 impl std::error::Error for CatalogFlushError {}
 
+/// Repository-allocated canonical sequence. `event.seq` on the durability path
+/// IS the ticket sequence consumed by ordered persistence (TASK-003).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CanonicalSequenceTicket {
+    pub seq: u64,
+}
+
+impl CanonicalSequenceTicket {
+    #[must_use]
+    pub const fn from_allocated_seq(seq: u64) -> Self {
+        Self { seq }
+    }
+
+    #[must_use]
+    pub fn from_event(event: &ConversationEventRecordV2) -> Self {
+        Self { seq: event.seq }
+    }
+}
+
 struct CatalogCacheState {
     catalog: ConversationCatalog,
     first_dirty_at: Option<Instant>,
@@ -186,9 +205,14 @@ pub struct CatalogFlushCoordinator {
     path: PathBuf,
     scheduled: AtomicBool,
     wake: Notify,
+    replace_fence: Arc<CatalogReplaceFence>,
+    in_flight_replace: ParkingMutex<Option<tokio::task::JoinHandle<CatalogReplaceOutcome>>>,
     #[cfg(test)]
     fail_serializations_remaining: std::sync::atomic::AtomicUsize,
 }
+
+type CatalogReplaceOutcome =
+    std::result::Result<CatalogReplaceAck, crate::conversation::durable_fs::DurableFsError>;
 
 impl CatalogFlushCoordinator {
     fn new(
@@ -210,6 +234,8 @@ impl CatalogFlushCoordinator {
             path,
             scheduled: AtomicBool::new(false),
             wake: Notify::new(),
+            replace_fence: Arc::new(CatalogReplaceFence::new()),
+            in_flight_replace: ParkingMutex::new(None),
             #[cfg(test)]
             fail_serializations_remaining: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -220,17 +246,23 @@ impl CatalogFlushCoordinator {
         record: &ConversationRecordV2,
         frontier: &ConversationFrontier,
     ) -> u64 {
-        let now = Instant::now();
-        let generation = {
-            let mut state = self.state.lock();
-            let generation = state.catalog.upsert(record, frontier);
-            state.first_dirty_at.get_or_insert(now);
-            state.last_dirty_at = Some(now);
-            state.last_conversation_id = Some(record.conversation_id);
-            generation
-        };
+        let generation = self.admit_generation(record, frontier);
         self.wake.notify_waiters();
         self.schedule();
+        generation
+    }
+
+    fn admit_generation(
+        &self,
+        record: &ConversationRecordV2,
+        frontier: &ConversationFrontier,
+    ) -> u64 {
+        let now = Instant::now();
+        let mut state = self.state.lock();
+        let generation = state.catalog.upsert(record, frontier);
+        state.first_dirty_at.get_or_insert(now);
+        state.last_dirty_at = Some(now);
+        state.last_conversation_id = Some(record.conversation_id);
         generation
     }
 
@@ -361,13 +393,24 @@ impl CatalogFlushCoordinator {
             )
         })?;
 
+        self.reap_finished_replace().await;
         let durable_fs = self.durable_fs.clone();
         let path = self.path.clone();
-        let replace = tokio::task::spawn_blocking(move || durable_fs.replace_bytes(&path, &bytes));
-        match deadline {
-            Some(deadline) => tokio::time::timeout_at(deadline, replace)
-                .await
-                .map_err(|_| self.deadline_error())?,
+        let fence = Arc::clone(&self.replace_fence);
+        let replace_generation = generation.generation;
+        let mut replace = tokio::task::spawn_blocking(move || {
+            fence.replace_generation(&durable_fs, &path, replace_generation, &bytes)
+        });
+        let ack = match deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, &mut replace).await {
+                Ok(joined) => joined,
+                Err(_) => {
+                    // Keep the in-flight replace fenced. timeout_at must not let
+                    // an abandoned older generation overwrite a newer disk write.
+                    *self.in_flight_replace.lock() = Some(replace);
+                    return Err(self.deadline_error());
+                }
+            },
             None => replace.await,
         }
         .map_err(|_| {
@@ -384,11 +427,25 @@ impl CatalogFlushCoordinator {
                 "catalog atomic replacement failed",
             )
         })?;
+        if !ack.committed {
+            let receipt = {
+                let state = self.state.lock();
+                CatalogFlushReceipt {
+                    requested_generation: generation.generation,
+                    flushed_generation: state.flushed_generation.max(ack.committed_generation),
+                    write_count: state.write_count,
+                }
+            };
+            return Ok(receipt);
+        }
 
         let receipt = {
             let mut state = self.state.lock();
             state.write_count = state.write_count.saturating_add(1);
-            state.flushed_generation = state.flushed_generation.max(generation.generation);
+            state.flushed_generation = state
+                .flushed_generation
+                .max(ack.committed_generation)
+                .max(generation.generation);
             if state.catalog.generation() == generation.generation {
                 state.first_dirty_at = None;
                 state.last_dirty_at = None;
@@ -465,6 +522,19 @@ impl CatalogFlushCoordinator {
         }
     }
 
+    async fn reap_finished_replace(&self) {
+        let finished = {
+            let mut parked = self.in_flight_replace.lock();
+            match parked.as_ref() {
+                Some(handle) if handle.is_finished() => parked.take(),
+                _ => None,
+            }
+        };
+        if let Some(handle) = finished {
+            let _ = handle.await;
+        }
+    }
+
     fn flush_error(
         &self,
         stage: CatalogFlushFailureStage,
@@ -506,7 +576,7 @@ impl CatalogFlushCoordinator {
         record: &ConversationRecordV2,
         frontier: &ConversationFrontier,
     ) -> u64 {
-        self.upsert(record, frontier)
+        self.admit_generation(record, frontier)
     }
 
     #[cfg(test)]
@@ -540,6 +610,34 @@ impl CatalogFlushCoordinator {
         &self,
     ) -> std::result::Result<CatalogFlushReceipt, CatalogFlushError> {
         self.flush_once(None).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn flush_once_until_for_test(
+        &self,
+        deadline: TokioInstant,
+    ) -> std::result::Result<CatalogFlushReceipt, CatalogFlushError> {
+        self.flush_once(Some(deadline)).await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stall_catalog_replace(&self, generation: u64) {
+        self.replace_fence.stall_generation(generation);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_catalog_replace_stall(&self) {
+        self.replace_fence.release_stall();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_catalog_replace_stall(&self, timeout: Duration) -> bool {
+        self.replace_fence.wait_until_stalled(timeout)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_written_catalog_generation(&self) -> u64 {
+        self.replace_fence.last_written_generation()
     }
 }
 
@@ -1504,9 +1602,10 @@ impl ConversationRepository {
         Ok(event)
     }
 
-    /// Append one coordinator-owned event only when the caller's source cursor is exactly the
-    /// canonical next sequence. The check and append share the per-Conversation lock, preventing
-    /// any second ordering lane from consuming or aliasing the cursor.
+    /// Append one coordinator-owned event. The canonical sequence is allocated inside the
+    /// per-Conversation lock by [`Self::append_event_locked`]. A stale reserved `expected_seq`
+    /// returns retryable [`ConversationErrorCode::ConversationConflict`] so the caller can
+    /// re-reserve; it never maps to sequence-invalid, frontier-mismatch, or recovery-required.
     pub(crate) async fn append_ordered_event(
         self: &Arc<Self>,
         permit: &RepositoryWritePermit,
@@ -1525,24 +1624,18 @@ impl ConversationRepository {
             .get(&conversation_id)
             .map(|state| state.record.last_seq)
             .ok_or_else(|| not_found("append_ordered_event", conversation_id))?;
-        let next = current.checked_add(1).ok_or_else(|| {
-            repository_error(
-                ConversationErrorCode::ConversationRecoveryRequired,
-                "append_ordered_event",
-                Some(conversation_id),
-                "canonical sequence overflow".to_string(),
-            )
-        })?;
-        if expected_seq != next {
+        let allocated = next_canonical_seq(current, conversation_id, "append_ordered_event")?;
+        if expected_seq != allocated {
             return Err(repository_error(
                 ConversationErrorCode::ConversationConflict,
                 "append_ordered_event",
                 Some(conversation_id),
-                format!("expected canonical seq {expected_seq}, next seq is {next}"),
+                format!("stale reserved seq {expected_seq}, allocated next is {allocated}"),
             ));
         }
         let event = self.append_event_locked(conversation_id, recorded_at_utc, type_, payload)?;
-        debug_assert_eq!(event.seq, expected_seq);
+        debug_assert_eq!(event.seq, allocated);
+        debug_assert_eq!(CanonicalSequenceTicket::from_event(&event).seq, event.seq);
         drop(guard);
         self.mark_catalog_entry_dirty(conversation_id);
         Ok(event)
@@ -2532,6 +2625,8 @@ impl ConversationRepository {
         Ok(record)
     }
 
+    /// Sole in-lock canonical sequence allocator. Lifecycle title/attach/detach/target/binding
+    /// writers and ordered relay appends all consume this lane.
     fn append_event_locked(
         &self,
         conversation_id: ConversationId,
@@ -2593,14 +2688,7 @@ impl ConversationRepository {
                 "metadata lastSeq does not match the validated frontier".to_string(),
             ));
         }
-        let seq = record.last_seq.checked_add(1).ok_or_else(|| {
-            repository_error(
-                ConversationErrorCode::ConversationRecoveryRequired,
-                "append_event",
-                Some(conversation_id),
-                "global sequence overflow".to_string(),
-            )
-        })?;
+        let seq = next_canonical_seq(record.last_seq, conversation_id, "append_event")?;
         let event = ConversationEventRecordV2 {
             schema_version: CONVERSATION_EVENT_SCHEMA_VERSION,
             conversation_id,
@@ -3274,6 +3362,21 @@ fn not_found(operation: &'static str, conversation_id: ConversationId) -> Reposi
     )
 }
 
+fn next_canonical_seq(
+    last_seq: u64,
+    conversation_id: ConversationId,
+    operation: &'static str,
+) -> Result<u64> {
+    last_seq.checked_add(1).ok_or_else(|| {
+        repository_error(
+            ConversationErrorCode::ConversationRecoveryRequired,
+            operation,
+            Some(conversation_id),
+            "canonical sequence overflow".to_string(),
+        )
+    })
+}
+
 fn repository_error(
     code: ConversationErrorCode,
     operation: &'static str,
@@ -3328,7 +3431,10 @@ fn durability_error(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::conversation::catalog::{ConversationCatalogFileV1, CATALOG_SCHEMA_VERSION};
+    use crate::conversation::catalog::{
+        ConversationCatalog, ConversationCatalogFileV1, CATALOG_SCHEMA_VERSION,
+        EMPTY_CATALOG_GENERATED_AT_UTC,
+    };
     use crate::conversation::contracts::{
         parse_created_at_utc, ConversationCreator, CreationPartition,
         PROJECT_ATTACHMENT_SCHEMA_VERSION,
@@ -3981,5 +4087,242 @@ mod tests {
             item.code == ConversationErrorCode::ConversationRecoveryRequired && item.requires_action
         }));
         assert_eq!(fs::read(messages).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn allocate_canonical_sequence_inside_repository_lock_returns_ticket_seq() {
+        let (_temp, repository, writer) = fixture();
+        writer
+            .create_conversation(record(), ConversationMutation::CreateConversation)
+            .await
+            .unwrap();
+        let conversation_id = ConversationId::parse(ID).unwrap();
+        let permit = writer
+            .authorize(conversation_id, ConversationMutation::AcpEventAppend)
+            .unwrap();
+        let first = repository
+            .append_ordered_event(
+                &permit,
+                conversation_id,
+                1,
+                time(20),
+                ConversationEventType::MessageChunk,
+                json!({"structural":"first"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.seq, 1);
+        assert_eq!(CanonicalSequenceTicket::from_event(&first).seq, first.seq);
+        assert_eq!(
+            repository
+                .get_conversation(conversation_id)
+                .unwrap()
+                .last_seq,
+            1
+        );
+        let second = repository
+            .append_ordered_event(
+                &permit,
+                conversation_id,
+                2,
+                time(21),
+                ConversationEventType::MessageChunk,
+                json!({"structural":"second"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.seq, 2);
+        assert_eq!(CanonicalSequenceTicket::from_event(&second).seq, second.seq);
+        assert_eq!(
+            repository
+                .get_conversation(conversation_id)
+                .unwrap()
+                .last_seq,
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_append_racing_reserved_relay_seq_reconciles_instead_of_corruption() {
+        let (_temp, repository, writer) = fixture();
+        writer
+            .create_conversation(record(), ConversationMutation::CreateConversation)
+            .await
+            .unwrap();
+        let conversation_id = ConversationId::parse(ID).unwrap();
+        let reserved_relay_seq = 1;
+        let lifecycle = writer
+            .append_event(
+                conversation_id,
+                time(20),
+                ConversationEventType::LocalTitleGenerated,
+                json!({"title":"lifecycle"}),
+                ConversationMutation::AcpEventAppend,
+            )
+            .await
+            .unwrap();
+        assert_eq!(lifecycle.seq, reserved_relay_seq);
+        assert_eq!(
+            repository
+                .get_conversation(conversation_id)
+                .unwrap()
+                .last_seq,
+            1
+        );
+        let permit = writer
+            .authorize(conversation_id, ConversationMutation::AcpEventAppend)
+            .unwrap();
+        let raced = repository
+            .append_ordered_event(
+                &permit,
+                conversation_id,
+                reserved_relay_seq,
+                time(21),
+                ConversationEventType::MessageChunk,
+                json!({"structural":"stale-reservation"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(raced.code, ConversationErrorCode::ConversationConflict);
+        assert_ne!(raced.stable_code(), "CONVERSATION_SOURCE_SEQUENCE_INVALID");
+        assert_ne!(
+            raced.stable_code(),
+            "CONVERSATION_PERSISTENCE_FRONTIER_MISMATCH"
+        );
+        assert_ne!(
+            raced.code,
+            ConversationErrorCode::ConversationRecoveryRequired
+        );
+        assert_eq!(
+            repository
+                .get_conversation(conversation_id)
+                .unwrap()
+                .last_seq,
+            1
+        );
+        let reconciled = repository
+            .append_ordered_event(
+                &permit,
+                conversation_id,
+                2,
+                time(22),
+                ConversationEventType::MessageChunk,
+                json!({"structural":"reconciled"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reconciled.seq, 2);
+        assert_eq!(
+            repository
+                .get_conversation(conversation_id)
+                .unwrap()
+                .last_seq,
+            2
+        );
+        let page = repository.read_event_page(conversation_id, 0, 17).unwrap();
+        let seqs: Vec<u64> = page.iter().map(|event| event.seq).collect();
+        assert_eq!(seqs, vec![1, 2]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timed_out_catalog_replace_cannot_commit_stale_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let catalog_path = temp.path().canonicalize().unwrap().join(CATALOG_FILE);
+        let coordinator = CatalogFlushCoordinator::new_for_test(
+            ConversationCatalog::from_file(ConversationCatalogFileV1 {
+                schema_version: CATALOG_SCHEMA_VERSION,
+                generated_at_utc: EMPTY_CATALOG_GENERATED_AT_UTC.to_string(),
+                conversations: Vec::new(),
+            }),
+            DurableFileSystem::new(),
+            catalog_path.clone(),
+        );
+        let mut first = record();
+        first.last_seq = 1;
+        let frontier_g = ConversationFrontier {
+            last_seq: 1,
+            ..ConversationFrontier::default()
+        };
+        let generation_g = coordinator.admit_for_test(&first, &frontier_g);
+        coordinator.stall_catalog_replace(generation_g);
+        let stalled = Arc::clone(&coordinator);
+        let stale_deadline = TokioInstant::now() + Duration::from_millis(250);
+        let stale_flush =
+            tokio::spawn(async move { stalled.flush_once_until_for_test(stale_deadline).await });
+        assert!(
+            coordinator.wait_for_catalog_replace_stall(Duration::from_secs(2)),
+            "generation G replace must enter the fence stall"
+        );
+        tokio::time::sleep_until(stale_deadline + Duration::from_millis(50)).await;
+        let mut newer = first.clone();
+        newer.last_seq = 2;
+        let frontier_h = ConversationFrontier {
+            last_seq: 2,
+            ..ConversationFrontier::default()
+        };
+        let generation_h = coordinator.admit_for_test(&newer, &frontier_h);
+        assert!(generation_h > generation_g);
+        let flushed = coordinator.flush_once_for_test().await.unwrap();
+        assert_eq!(flushed.flushed_generation, generation_h);
+        assert_eq!(coordinator.flushed_generation(), generation_h);
+        coordinator.release_catalog_replace_stall();
+        let stale = stale_flush.await.unwrap();
+        assert!(
+            stale.is_err(),
+            "generation G flush must time out while stalled"
+        );
+        assert_eq!(coordinator.flushed_generation(), generation_h);
+        assert_eq!(coordinator.last_written_catalog_generation(), generation_h);
+        let on_disk: ConversationCatalogFileV1 =
+            serde_json::from_slice(&fs::read(&catalog_path).unwrap()).unwrap();
+        assert_eq!(on_disk.conversations[0].last_seq, 2);
+    }
+
+    #[test]
+    fn frontier_clone_with_max_plan_usage_stays_within_262144_p99() {
+        // Measurement (RR3-PERF-006): latest_usage/latest_plan are Option<Arc<Value>>.
+        // Cloning ConversationFrontier increments Arc refcounts and does not deep-copy the
+        // 262144-byte JSON trees. Additional allocation per clone is therefore two Arc
+        // pointer slots (size_of::<Arc<Value>>() each). p99 of those samples must stay
+        // <= MAX_CONVERSATION_RECORD_BYTES (262144). Pointer equality proves the trees
+        // were not cloned.
+        const SAMPLES: usize = 10_000;
+        let usage_blob = "u".repeat(MAX_CONVERSATION_RECORD_BYTES);
+        let plan_blob = "p".repeat(MAX_CONVERSATION_RECORD_BYTES);
+        let frontier = ConversationFrontier {
+            latest_usage: Some(Arc::new(json!({"pad": usage_blob}))),
+            latest_plan: Some(Arc::new(json!({"pad": plan_blob}))),
+            ..ConversationFrontier::default()
+        };
+        let mut samples = Vec::with_capacity(SAMPLES);
+        let mut clones = Vec::with_capacity(SAMPLES);
+        for _ in 0..SAMPLES {
+            let cloned = frontier.clone();
+            assert!(
+                Arc::ptr_eq(
+                    frontier.latest_usage.as_ref().unwrap(),
+                    cloned.latest_usage.as_ref().unwrap()
+                ),
+                "usage replacement must be an Arc pointer clone"
+            );
+            assert!(
+                Arc::ptr_eq(
+                    frontier.latest_plan.as_ref().unwrap(),
+                    cloned.latest_plan.as_ref().unwrap()
+                ),
+                "plan replacement must be an Arc pointer clone"
+            );
+            let additional =
+                std::mem::size_of::<std::sync::Arc<serde_json::Value>>().saturating_mul(2);
+            samples.push(additional);
+            clones.push(cloned);
+        }
+        samples.sort_unstable();
+        let p99 = samples[samples.len() * 99 / 100];
+        assert!(
+            p99 <= MAX_CONVERSATION_RECORD_BYTES,
+            "frontier clone additional allocation p99 was {p99} bytes"
+        );
+        assert_eq!(clones.len(), SAMPLES);
     }
 }

@@ -19,6 +19,9 @@ use crate::conversation::durable_fs::{DirectoryPermissions, DurableFileSystem};
 use super::{MigrationError, MigrationErrorCode, Result};
 
 pub const MIGRATION_LOCK_FILE: &str = "conversation-layout-v2.lock";
+/// Kernel-backed exclusive lock for migration-maintenance.json load/modify/replace.
+/// Process death releases the lock even when `Drop` cannot run.
+pub const MIGRATION_CONTROL_LOCK_FILE: &str = "conversation-layout-v2-maintenance.lock";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -198,6 +201,122 @@ impl Drop for HostMigrationLockGuard {
             self.acquired_at.elapsed().as_millis()
         );
     }
+}
+
+/// Host-migration-lock compatible control lock held across maintenance
+/// load/validate/modify/durable-replace. Exclusivity is kernel `fs2` on a
+/// permanent file under `conversation-migrations/`.
+#[derive(Debug, Clone)]
+pub struct MigrationControlLock {
+    lock_path: PathBuf,
+}
+
+impl MigrationControlLock {
+    pub fn new(host_state_root: &Path) -> Result<Self> {
+        let canonical_host_root = host_state_root.canonicalize().map_err(|error| {
+            MigrationError::new(
+                MigrationErrorCode::MigrationLockInvalid,
+                "prepare_control_lock",
+                format!("host-state root cannot be canonicalized: {error}"),
+            )
+        })?;
+        let migration_dir = canonical_host_root.join("conversation-migrations");
+        DurableFileSystem::new()
+            .create_dir_durable(&migration_dir, DirectoryPermissions::PrivateOwnerOnly)
+            .map_err(|error| {
+                MigrationError::new(
+                    MigrationErrorCode::MigrationDurabilityFailed,
+                    "prepare_control_lock",
+                    error.to_string(),
+                )
+            })?;
+        Ok(Self {
+            lock_path: migration_dir.join(MIGRATION_CONTROL_LOCK_FILE),
+        })
+    }
+
+    /// Blocking exclusive lock so concurrent processes serialize rather than
+    /// silently last-writer-wins.
+    pub fn acquire(&self) -> Result<MigrationControlLockGuard> {
+        acquire_control_lock(&self.lock_path, true)
+    }
+
+    /// Non-blocking exclusive lock compatible with [`HostMigrationLock::acquire`].
+    pub fn try_acquire(&self) -> Result<MigrationControlLockGuard> {
+        acquire_control_lock(&self.lock_path, false)
+    }
+}
+
+#[derive(Debug)]
+pub struct MigrationControlLockGuard {
+    file: File,
+    acquired_at: Instant,
+}
+
+impl Drop for MigrationControlLockGuard {
+    fn drop(&mut self) {
+        if let Err(error) = FileExt::unlock(&self.file) {
+            log::error!(
+                "[conversation-migration] control lock release failed pid={} error={}",
+                std::process::id(),
+                error
+            );
+            return;
+        }
+        log::info!(
+            "[conversation-migration] control lock released pid={} duration_ms={}",
+            std::process::id(),
+            self.acquired_at.elapsed().as_millis()
+        );
+    }
+}
+
+fn acquire_control_lock(lock_path: &Path, blocking: bool) -> Result<MigrationControlLockGuard> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(lock_path).map_err(|error| {
+        MigrationError::new(
+            MigrationErrorCode::MigrationLockInvalid,
+            "open_control_lock",
+            error.to_string(),
+        )
+    })?;
+    let lock_result = if blocking {
+        FileExt::lock_exclusive(&file)
+    } else {
+        FileExt::try_lock_exclusive(&file)
+    };
+    if let Err(error) = lock_result {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            log::warn!(
+                "[conversation-migration] control lock contention pid={}",
+                std::process::id()
+            );
+            return Err(MigrationError::new(
+                MigrationErrorCode::MigrationInProgress,
+                "acquire_control_lock",
+                "another process owns the kernel maintenance control lock",
+            ));
+        }
+        return Err(MigrationError::new(
+            MigrationErrorCode::MigrationLockInvalid,
+            "acquire_control_lock",
+            error.to_string(),
+        ));
+    }
+    log::info!(
+        "[conversation-migration] control lock acquired pid={}",
+        std::process::id()
+    );
+    Ok(MigrationControlLockGuard {
+        file,
+        acquired_at: Instant::now(),
+    })
 }
 
 fn host_root_digest(root: &Path) -> String {

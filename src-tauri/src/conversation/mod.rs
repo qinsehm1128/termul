@@ -14,6 +14,7 @@ pub mod ordered_persistence;
 pub mod persistence_adapter;
 pub mod repository;
 pub mod session_workspace;
+pub mod usage_plan;
 pub mod workspace_projection;
 pub mod write_authority;
 
@@ -34,10 +35,10 @@ pub use bootstrap::{
 };
 pub use catalog::{
     rebuild_catalog, AcceptedCanonicalConversation, CatalogAdmissionMetrics, CatalogError,
-    CatalogRebuildResult, CatalogRecoveryIssue, ConversationCatalogEntryV1,
-    ConversationCatalogFileV1, ConversationCatalogGeneration, ConversationCatalogSnapshot,
-    ConversationProvenanceFileV1, ConversationProvenanceSourceV1, CATALOG_CHUNK_ENTRIES,
-    CATALOG_FILE, CATALOG_SCHEMA_VERSION, CONVERSATION_METADATA_FILE,
+    CatalogRebuildResult, CatalogRecoveryIssue, CatalogReplaceAck, CatalogReplaceFence,
+    ConversationCatalogEntryV1, ConversationCatalogFileV1, ConversationCatalogGeneration,
+    ConversationCatalogSnapshot, ConversationProvenanceFileV1, ConversationProvenanceSourceV1,
+    CATALOG_CHUNK_ENTRIES, CATALOG_FILE, CATALOG_SCHEMA_VERSION, CONVERSATION_METADATA_FILE,
     EMPTY_CATALOG_GENERATED_AT_UTC, PROVENANCE_FILE, PROVENANCE_SCHEMA_VERSION,
 };
 pub use contracts::{
@@ -83,6 +84,9 @@ pub use locator::{
     bounded_scan, BoundedScan, ConversationLocator, LocatedConversation, LocatorError,
     SessionWorkspaceLocator, MAX_CONVERSATIONS_PER_SCAN, MAX_DIRECTORY_ENTRIES_PER_LEVEL,
 };
+pub use migration::lock::{
+    MigrationControlLock, MigrationControlLockGuard, MIGRATION_CONTROL_LOCK_FILE,
+};
 pub use migration::{
     advance_phase, recover_cutover, ActiveLayout, ApprovalReceiptV1, BootstrapObservationReceiptV1,
     CompatibilityError, ConversationLayoutDescriptorV1, ConversationMigrationControlService,
@@ -106,10 +110,11 @@ pub use persistence_adapter::{
     DEFAULT_DELIVERY_COMMIT_TIMEOUT, MAX_BINDING_MISS_CACHE_ENTRIES, MAX_COMPAT_HISTORY_RECORDS,
 };
 pub use repository::{
-    CatalogFlushCoordinator, CatalogFlushError, CatalogFlushFailureStage, CatalogFlushReceipt,
-    ConversationAggregateMutationRecord, ConversationMetadataUpdate, ConversationRepository,
-    RepositoryBindingIndexStats, RepositoryError, RepositoryOpenReport, RepositoryRecoveryItem,
-    RepositoryRecoveryKind, CATALOG_FLUSH_DEBOUNCE, CATALOG_FLUSH_MAX_DELAY,
+    CanonicalSequenceTicket, CatalogFlushCoordinator, CatalogFlushError, CatalogFlushFailureStage,
+    CatalogFlushReceipt, ConversationAggregateMutationRecord, ConversationMetadataUpdate,
+    ConversationRepository, RepositoryBindingIndexStats, RepositoryError, RepositoryOpenReport,
+    RepositoryRecoveryItem, RepositoryRecoveryKind, CATALOG_FLUSH_DEBOUNCE,
+    CATALOG_FLUSH_MAX_DELAY,
 };
 pub use session_workspace::{
     SessionWorkspaceError, SessionWorkspaceErrorCode, SessionWorkspaceLeafNode,
@@ -118,6 +123,10 @@ pub use session_workspace::{
     SessionWorkspaceSplitNode, SessionWorkspaceV1, SessionWorkspaceWriteOutcome,
     TerminalResourceDescriptor, TerminalResourceRollbackFailure, SESSION_WORKSPACE_SCHEMA_VERSION,
     TERMINAL_RESOURCE_ROLLBACK_FAILED, TERMINAL_TERMINATE_FAILED,
+};
+pub use usage_plan::{
+    validate_plan_update, validate_usage_update, PlanBodyV1, PlanEntryV1, PlanUpdateV1,
+    UsageCostV1, UsagePlanSchemaError, UsageUpdateV1,
 };
 pub use workspace_projection::{
     LegacyWorkspaceProjector, WorkspaceProjectionOutcome, WorkspaceProjectionReceiptV1,

@@ -16,6 +16,7 @@ use uuid::Uuid;
 use crate::conversation::durable_fs::{DirectoryPermissions, DurableFileSystem};
 
 use super::journal::ApprovalReceiptV1;
+use super::lock::{MigrationControlLock, MigrationControlLockGuard};
 use super::{MigrationError, MigrationErrorCode, MigrationPhase, MigrationReport, Result};
 
 pub const MIGRATION_MAINTENANCE_FILE: &str = "conversation-layout-v2-maintenance.json";
@@ -142,6 +143,7 @@ pub struct ConversationMigrationControlService {
     state_path: PathBuf,
     durable_fs: DurableFileSystem,
     request_gate: Mutex<()>,
+    control_lock: MigrationControlLock,
 }
 
 impl ConversationMigrationControlService {
@@ -169,7 +171,12 @@ impl ConversationMigrationControlService {
             migration_dir,
             durable_fs,
             request_gate: Mutex::new(()),
+            control_lock: MigrationControlLock::new(&canonical_host_root)?,
         })
+    }
+
+    fn acquire_control_lock(&self) -> Result<MigrationControlLockGuard> {
+        self.control_lock.acquire()
     }
 
     pub fn request(
@@ -177,6 +184,7 @@ impl ConversationMigrationControlService {
         request: MigrationMaintenanceRequestV1,
     ) -> Result<MigrationMaintenanceScheduleReceiptV1> {
         request.validate()?;
+        let _control_lock = self.acquire_control_lock()?;
         let _request_gate = self
             .request_gate
             .lock()
@@ -214,6 +222,7 @@ impl ConversationMigrationControlService {
     }
 
     pub fn pending(&self) -> Result<Option<MigrationMaintenanceRequestV1>> {
+        let _control_lock = self.acquire_control_lock()?;
         let _request_gate = self
             .request_gate
             .lock()
@@ -227,6 +236,7 @@ impl ConversationMigrationControlService {
         report: &MigrationReport,
         completed_at_utc: DateTime<Utc>,
     ) -> Result<()> {
+        let _control_lock = self.acquire_control_lock()?;
         let _request_gate = self
             .request_gate
             .lock()

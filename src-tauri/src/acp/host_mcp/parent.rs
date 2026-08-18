@@ -239,10 +239,14 @@ impl HostPlanServer {
             match persistence.latest_durable_plan(real_session_id) {
                 Ok(Some(entries)) => self.plan_store.set(real_session_id, entries),
                 Ok(None) => {}
-                Err(error) => log::warn!(
-                    "[host-mcp] durable plan hydration failed code={}",
-                    error.code
-                ),
+                Err(error) => {
+                    let code = if error.code == "CONVERSATION_READ_FAILED" {
+                        "CONVERSATION_RECOVERY_REQUIRED"
+                    } else {
+                        error.code
+                    };
+                    log::error!("[host-mcp] durable plan hydration failed code={code}");
+                }
             }
         }
     }

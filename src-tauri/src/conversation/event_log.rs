@@ -276,18 +276,36 @@ pub struct ConversationSummaryFrontier {
     pub tool_count: u64,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConversationFrontier {
     pub binding: BindingMaterialization,
     pub attachment: AttachmentMaterialization,
     pub execution_target: Option<ExecutionTarget>,
     pub summary: ConversationSummaryFrontier,
-    /// Latest full canonical usage replacement. Absent means no usage update has ever committed.
-    pub latest_usage: Option<Value>,
-    /// Latest full canonical plan replacement. An empty `entries` array is a durable clear.
-    pub latest_plan: Option<Value>,
+    /// Latest full canonical usage replacement stored as an immutable Arc so
+    /// overlap clones are pointer clones. Absent means no usage update has ever committed.
+    pub latest_usage: Option<Arc<Value>>,
+    /// Latest full canonical plan replacement stored as an immutable Arc.
+    /// An empty `entries` array is a durable clear.
+    pub latest_plan: Option<Arc<Value>>,
     pub lifecycle_state: Option<ConversationLifecycleState>,
     pub last_seq: u64,
+}
+
+impl Eq for ConversationFrontier {}
+
+impl ConversationFrontier {
+    /// Cheap accessor that clones the Arc, not the JSON tree.
+    #[must_use]
+    pub fn latest_usage_arc(&self) -> Option<Arc<Value>> {
+        self.latest_usage.clone()
+    }
+
+    /// Cheap accessor that clones the Arc, not the JSON tree.
+    #[must_use]
+    pub fn latest_plan_arc(&self) -> Option<Arc<Value>> {
+        self.latest_plan.clone()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2049,8 +2067,34 @@ fn apply_durable_replacements(
     path: &Path,
 ) -> Result<()> {
     match record.type_ {
-        ConversationEventType::UsageUpdate => frontier.latest_usage = Some(record.payload.clone()),
-        ConversationEventType::PlanUpdate => frontier.latest_plan = Some(record.payload.clone()),
+        ConversationEventType::UsageUpdate => {
+            crate::conversation::usage_plan::validate_usage_update(&record.payload).map_err(
+                |_| {
+                    error(
+                        ConversationErrorCode::ConversationRecoveryRequired,
+                        EventLogErrorKind::CorruptRecord,
+                        record.conversation_id,
+                        path,
+                        format!("usage_update failed typed schema at seq {}", record.seq),
+                    )
+                },
+            )?;
+            frontier.latest_usage = Some(Arc::new(record.payload.clone()));
+        }
+        ConversationEventType::PlanUpdate => {
+            crate::conversation::usage_plan::validate_plan_update(&record.payload).map_err(
+                |_| {
+                    error(
+                        ConversationErrorCode::ConversationRecoveryRequired,
+                        EventLogErrorKind::CorruptRecord,
+                        record.conversation_id,
+                        path,
+                        format!("plan_update failed typed schema at seq {}", record.seq),
+                    )
+                },
+            )?;
+            frontier.latest_plan = Some(Arc::new(record.payload.clone()));
+        }
         ConversationEventType::RelayCursorAdvanced if !matches!(&record.payload, Value::Object(object) if object.is_empty()) =>
         {
             return Err(error(
@@ -2934,5 +2978,67 @@ mod tests {
                 .kind,
             EventLogErrorKind::ConversationMismatch
         );
+    }
+
+    #[test]
+    fn malformed_usage_update_replay_moves_conversation_to_recovery_required() {
+        let (_temp, directory, id, durable_fs) = fixture();
+        append(
+            &durable_fs,
+            &directory,
+            &record(1, ConversationEventType::MessageChunk),
+        );
+        let mut malformed = record(2, ConversationEventType::UsageUpdate);
+        malformed.payload = json!({"notUsage":true});
+        append(&durable_fs, &directory, &malformed);
+        let error = replay_conversation(&directory, id, &durable_fs).unwrap_err();
+        assert_eq!(
+            error.code,
+            ConversationErrorCode::ConversationRecoveryRequired
+        );
+        assert_eq!(error.kind, EventLogErrorKind::CorruptRecord);
+        assert_eq!(error.stable_code(), "CONVERSATION_RECOVERY_REQUIRED");
+
+        let mut frontier = ConversationFrontier::default();
+        apply_event(
+            &mut frontier,
+            &record(1, ConversationEventType::MessageChunk),
+        )
+        .unwrap();
+        let rejected = apply_event(&mut frontier, &malformed).unwrap_err();
+        assert_eq!(rejected.kind, EventLogErrorKind::CorruptRecord);
+        assert!(frontier.latest_usage.is_none());
+        assert_eq!(frontier.last_seq, 1);
+    }
+
+    #[test]
+    fn malformed_plan_update_replay_moves_conversation_to_recovery_required() {
+        let (_temp, directory, id, durable_fs) = fixture();
+        append(
+            &durable_fs,
+            &directory,
+            &record(1, ConversationEventType::MessageChunk),
+        );
+        let mut malformed = record(2, ConversationEventType::PlanUpdate);
+        malformed.payload = json!({"plan":"not-an-object"});
+        append(&durable_fs, &directory, &malformed);
+        let error = replay_conversation(&directory, id, &durable_fs).unwrap_err();
+        assert_eq!(
+            error.code,
+            ConversationErrorCode::ConversationRecoveryRequired
+        );
+        assert_eq!(error.kind, EventLogErrorKind::CorruptRecord);
+        assert_eq!(error.stable_code(), "CONVERSATION_RECOVERY_REQUIRED");
+
+        let mut frontier = ConversationFrontier::default();
+        apply_event(
+            &mut frontier,
+            &record(1, ConversationEventType::MessageChunk),
+        )
+        .unwrap();
+        let rejected = apply_event(&mut frontier, &malformed).unwrap_err();
+        assert_eq!(rejected.kind, EventLogErrorKind::CorruptRecord);
+        assert!(frontier.latest_plan.is_none());
+        assert_eq!(frontier.last_seq, 1);
     }
 }

@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -20,7 +21,7 @@ use crate::conversation::contracts::{
     format_created_at_utc, ConversationErrorCode, ConversationId, ConversationLifecycleState,
     ConversationRecordV2, ConversationTitleSource, CreationPartition, CONVERSATION_SCHEMA_VERSION,
 };
-use crate::conversation::durable_fs::DurableFileSystem;
+use crate::conversation::durable_fs::{DurableFileSystem, DurableFsError};
 use crate::conversation::event_log::{
     scan_event_log, ConversationFrontier, EventLogRepairWarning, EventLogScan,
 };
@@ -37,6 +38,195 @@ pub const EMPTY_CATALOG_GENERATED_AT_UTC: &str = "1970-01-01T00:00:00.000Z";
 pub const PROVENANCE_SCHEMA_VERSION: u32 = 1;
 /// Immutable catalog chunk size used by mutation admission and frozen generations.
 pub const CATALOG_CHUNK_ENTRIES: usize = 1_024;
+
+/// Generation-tagged acknowledgement from a catalog.json replace.
+///
+/// A stale generation is refused when a newer generation has already been
+/// committed. `committed` is false in that case and `committed_generation`
+/// reports the generation that remains on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogReplaceAck {
+    pub requested_generation: u64,
+    pub committed_generation: u64,
+    pub committed: bool,
+}
+
+/// Serializes catalog.json replacements so a timed-out older replace cannot
+/// overwrite a newer flushed generation.
+#[derive(Debug)]
+pub struct CatalogReplaceFence {
+    last_written_generation: AtomicU64,
+    write_lock: std::sync::Mutex<()>,
+    #[cfg(test)]
+    stall: std::sync::Mutex<Option<CatalogReplaceStall>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct CatalogReplaceStall {
+    generation: u64,
+    released: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    entered: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl Default for CatalogReplaceFence {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CatalogReplaceFence {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            last_written_generation: AtomicU64::new(0),
+            write_lock: std::sync::Mutex::new(()),
+            #[cfg(test)]
+            stall: std::sync::Mutex::new(None),
+        }
+    }
+
+    #[must_use]
+    pub fn last_written_generation(&self) -> u64 {
+        self.last_written_generation.load(Ordering::Acquire)
+    }
+
+    /// Replace `catalog.json` only when `generation` is strictly newer than the
+    /// last committed generation. The serializer lock is not held across a test
+    /// stall so a newer generation can commit first and fence the stale write.
+    pub fn replace_generation(
+        &self,
+        durable_fs: &DurableFileSystem,
+        path: &Path,
+        generation: u64,
+        bytes: &[u8],
+    ) -> std::result::Result<CatalogReplaceAck, DurableFsError> {
+        {
+            let _guard = self
+                .write_lock
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let last = self.last_written_generation.load(Ordering::Acquire);
+            if generation <= last {
+                return Ok(CatalogReplaceAck {
+                    requested_generation: generation,
+                    committed_generation: last,
+                    committed: false,
+                });
+            }
+        }
+
+        #[cfg(test)]
+        self.wait_if_stalled(generation);
+
+        let _guard = self
+            .write_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let last = self.last_written_generation.load(Ordering::Acquire);
+        if generation <= last {
+            return Ok(CatalogReplaceAck {
+                requested_generation: generation,
+                committed_generation: last,
+                committed: false,
+            });
+        }
+        durable_fs.replace_bytes(path, bytes)?;
+        self.last_written_generation
+            .store(generation, Ordering::Release);
+        Ok(CatalogReplaceAck {
+            requested_generation: generation,
+            committed_generation: generation,
+            committed: true,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stall_generation(&self, generation: u64) {
+        let released = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let entered = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        *self
+            .stall
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(CatalogReplaceStall {
+            generation,
+            released,
+            entered,
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn release_stall(&self) {
+        let stall = self
+            .stall
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(stall) = stall {
+            let (lock, condvar) = &*stall.released;
+            let mut released = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *released = true;
+            condvar.notify_all();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_until_stalled(&self, timeout: std::time::Duration) -> bool {
+        let stall = self
+            .stall
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(stall) = stall else {
+            return false;
+        };
+        let (lock, condvar) = &*stall.entered;
+        let started = std::time::Instant::now();
+        let mut entered = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*entered {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return false;
+            }
+            let (guard, wait_result) = condvar
+                .wait_timeout(entered, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            entered = guard;
+            if wait_result.timed_out() && !*entered {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(test)]
+    fn wait_if_stalled(&self, generation: u64) {
+        let stall = self
+            .stall
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let Some(stall) = stall else {
+            return;
+        };
+        if stall.generation != generation {
+            return;
+        }
+        {
+            let (lock, condvar) = &*stall.entered;
+            let mut entered = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *entered = true;
+            condvar.notify_all();
+        }
+        let (lock, condvar) = &*stall.released;
+        let mut released = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*released {
+            released = condvar
+                .wait(released)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
