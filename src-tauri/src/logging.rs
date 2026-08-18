@@ -172,7 +172,7 @@ pub fn install_desktop_tracing_bridge() {
     let layer = tracing_subscriber::fmt::layer()
         .with_ansi(false)
         .with_target(true)
-        .with_writer(|| TracingToLogWriter);
+        .with_writer(TracingToLogWriter);
     let _ = tracing_subscriber::registry().with(layer).try_init();
 }
 
@@ -180,13 +180,23 @@ struct TracingToLogWriter;
 
 impl std::io::Write for TracingToLogWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if let Ok(line) = std::str::from_utf8(buf) {
-            let trimmed = line.trim_end();
-            if !trimmed.is_empty() {
-                log::info!(target: "termul::tracing", "{trimmed}");
-            }
+        thread_local! {
+            static EMITTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
         }
-        Ok(buf.len())
+        if EMITTING.with(|flag| flag.replace(true)) {
+            return Ok(buf.len());
+        }
+        let result = (|| {
+            if let Ok(line) = std::str::from_utf8(buf) {
+                let trimmed = line.trim_end();
+                if !trimmed.is_empty() {
+                    log::info!(target: "termul::tracing", "{trimmed}");
+                }
+            }
+            Ok(buf.len())
+        })();
+        EMITTING.with(|flag| flag.set(false));
+        result
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
