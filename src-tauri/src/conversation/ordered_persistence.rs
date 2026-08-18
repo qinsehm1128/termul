@@ -169,6 +169,9 @@ impl SessionState {
     }
 
     fn record_error(&mut self, code: &'static str) {
+        if code == "CONVERSATION_CONFLICT" {
+            return;
+        }
         if self.last_error_code.is_none() {
             self.last_error_code = Some(code);
             self.last_error_at = Some(StdInstant::now());
@@ -352,14 +355,13 @@ impl CoordinatorShared {
     fn finish_record(
         &self,
         session_key: &str,
-        source_seq: u64,
+        _source_seq: u64,
         charged_bytes: usize,
         completion: &TicketCompletion,
         append_result: std::result::Result<u64, &'static str>,
     ) {
         let result = match append_result {
-            Ok(canonical_seq) if canonical_seq == source_seq => Ok(canonical_seq),
-            Ok(_) => Err(WRITER_FRONTIER_MISMATCH),
+            Ok(canonical_seq) => Ok(canonical_seq),
             Err(code) => Err(code),
         };
         let mut state = self.state.lock();
@@ -369,11 +371,13 @@ impl CoordinatorShared {
             session.pending_records = session.pending_records.saturating_sub(1);
             session.pending_bytes = session.pending_bytes.saturating_sub(charged_bytes);
             match result {
-                Ok(_) if source_seq > session.persisted_frontier => {
-                    session.persisted_frontier = source_seq;
-                }
-                Ok(_) => {
-                    session.set_error(WRITER_FRONTIER_MISMATCH);
+                Ok(canonical_seq) => {
+                    if canonical_seq > session.persisted_frontier {
+                        session.persisted_frontier = canonical_seq;
+                    }
+                    if canonical_seq > session.accepted_frontier {
+                        session.accepted_frontier = canonical_seq;
+                    }
                 }
                 Err(code) => {
                     session.record_error(code);
@@ -693,16 +697,18 @@ impl OrderedConversationPersistence {
                     ));
                 }
                 if let Some(code) = session.last_error_code {
-                    let reported_code = if code == SOURCE_SEQUENCE_INVALID {
-                        SOURCE_SEQUENCE_INVALID
-                    } else {
-                        WRITER_UNHEALTHY
-                    };
-                    return Err(persistence_error(
-                        reported_code,
-                        "ordered_submit",
-                        format!("ordered persistence circuit is open ({code})"),
-                    ));
+                    if code != "CONVERSATION_CONFLICT" {
+                        let reported_code = if code == SOURCE_SEQUENCE_INVALID {
+                            SOURCE_SEQUENCE_INVALID
+                        } else {
+                            WRITER_UNHEALTHY
+                        };
+                        return Err(persistence_error(
+                            reported_code,
+                            "ordered_submit",
+                            format!("ordered persistence circuit is open ({code})"),
+                        ));
+                    }
                 }
                 if source_seq <= session.accepted_frontier {
                     let accepted = session.accepted_frontier;
@@ -1473,6 +1479,7 @@ mod tests {
         released: AtomicBool,
         release: Notify,
         fail_after: Option<usize>,
+        fail_once_code: Option<&'static str>,
     }
 
     impl FakeTarget {
@@ -1494,6 +1501,7 @@ mod tests {
                 released: AtomicBool::new(false),
                 release: Notify::new(),
                 fail_after: None,
+                fail_once_code: None,
             }
         }
 
@@ -1527,6 +1535,15 @@ mod tests {
                     self.release.notified().await;
                 }
                 let count = self.append_count.fetch_add(1, Ordering::AcqRel) + 1;
+                if let Some(code) = self.fail_once_code {
+                    if count == 1 {
+                        return Err(persistence_error(
+                            code,
+                            "fake_append",
+                            "injected conflict",
+                        ));
+                    }
+                }
                 if self.fail_after.is_some_and(|limit| count > limit) {
                     return Err(persistence_error(
                         "CONVERSATION_EVENT_APPEND_FAILED",
@@ -1869,4 +1886,37 @@ mod tests {
         assert_eq!(persistence.retained_worker_count(), 0);
         persistence.shutdown().await.unwrap();
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conversation_conflict_does_not_latch_last_error_or_writer_unhealthy() {
+        let target = Arc::new(FakeTarget {
+            fail_once_code: Some("CONVERSATION_CONFLICT"),
+            ..FakeTarget::with_sessions(1)
+        });
+        let persistence = ordered(Arc::clone(&target));
+        let first = persistence
+            .submit(
+                "opaque-0",
+                1,
+                "message_chunk",
+                serde_json::json!({"body":"race"}),
+            )
+            .unwrap();
+        let err = first.committed().await.unwrap_err();
+        assert_eq!(err.code, "CONVERSATION_CONFLICT");
+        let health = persistence.health("opaque-0").unwrap().unwrap();
+        assert_eq!(health.last_error_code, None);
+        let second = persistence
+            .submit(
+                "opaque-0",
+                2,
+                "message_chunk",
+                serde_json::json!({"body":"retry"}),
+            )
+            .unwrap();
+        assert_eq!(second.committed().await.unwrap(), 2);
+        let health = persistence.health("opaque-0").unwrap().unwrap();
+        assert_eq!(health.last_error_code, None);
+        persistence.shutdown().await.unwrap();
+    }
+
 }

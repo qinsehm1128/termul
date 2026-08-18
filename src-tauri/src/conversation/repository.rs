@@ -1604,8 +1604,7 @@ impl ConversationRepository {
 
     /// Append one coordinator-owned event. The canonical sequence is allocated inside the
     /// per-Conversation lock by [`Self::append_event_locked`]. A stale reserved `expected_seq`
-    /// returns retryable [`ConversationErrorCode::ConversationConflict`] so the caller can
-    /// re-reserve; it never maps to sequence-invalid, frontier-mismatch, or recovery-required.
+    /// is ignored: callers must consume the returned [`CanonicalSequenceTicket`] / `event.seq`.
     pub(crate) async fn append_ordered_event(
         self: &Arc<Self>,
         permit: &RepositoryWritePermit,
@@ -1625,14 +1624,7 @@ impl ConversationRepository {
             .map(|state| state.record.last_seq)
             .ok_or_else(|| not_found("append_ordered_event", conversation_id))?;
         let allocated = next_canonical_seq(current, conversation_id, "append_ordered_event")?;
-        if expected_seq != allocated {
-            return Err(repository_error(
-                ConversationErrorCode::ConversationConflict,
-                "append_ordered_event",
-                Some(conversation_id),
-                format!("stale reserved seq {expected_seq}, allocated next is {allocated}"),
-            ));
-        }
+        let _ = expected_seq;
         let event = self.append_event_locked(conversation_id, recorded_at_utc, type_, payload)?;
         debug_assert_eq!(event.seq, allocated);
         debug_assert_eq!(CanonicalSequenceTicket::from_event(&event).seq, event.seq);
@@ -4090,6 +4082,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn append_ordered_event_allocates_canonical_seq_inside_conversation_lock() {
+        let (_temp, repository, writer) = fixture();
+        writer
+            .create_conversation(record(), ConversationMutation::CreateConversation)
+            .await
+            .unwrap();
+        let conversation_id = ConversationId::parse(ID).unwrap();
+        let permit = writer
+            .authorize(conversation_id, ConversationMutation::AcpEventAppend)
+            .unwrap();
+        let first = repository
+            .append_ordered_event(
+                &permit,
+                conversation_id,
+                99,
+                time(20),
+                ConversationEventType::MessageChunk,
+                json!({"structural":"first"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.seq, 1);
+        assert_eq!(CanonicalSequenceTicket::from_event(&first).seq, 1);
+        let second = repository
+            .append_ordered_event(
+                &permit,
+                conversation_id,
+                1,
+                time(21),
+                ConversationEventType::MessageChunk,
+                json!({"structural":"second"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.seq, 2);
+        assert_eq!(CanonicalSequenceTicket::from_event(&second).seq, 2);
+    }
+
+    #[tokio::test]
+    async fn stale_expected_seq_returns_allocated_ticket_not_conversation_conflict() {
+        let (_temp, repository, writer) = fixture();
+        writer
+            .create_conversation(record(), ConversationMutation::CreateConversation)
+            .await
+            .unwrap();
+        let conversation_id = ConversationId::parse(ID).unwrap();
+        writer
+            .append_event(
+                conversation_id,
+                time(20),
+                ConversationEventType::LocalTitleGenerated,
+                json!({"title":"lifecycle"}),
+                ConversationMutation::AcpEventAppend,
+            )
+            .await
+            .unwrap();
+        let permit = writer
+            .authorize(conversation_id, ConversationMutation::AcpEventAppend)
+            .unwrap();
+        let ticket = repository
+            .append_ordered_event(
+                &permit,
+                conversation_id,
+                1,
+                time(21),
+                ConversationEventType::MessageChunk,
+                json!({"structural":"stale"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ticket.seq, 2);
+        assert_eq!(CanonicalSequenceTicket::from_event(&ticket).seq, 2);
+        assert_eq!(
+            repository
+                .get_conversation(conversation_id)
+                .unwrap()
+                .last_seq,
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn allocate_canonical_sequence_inside_repository_lock_returns_ticket_seq() {
         let (_temp, repository, writer) = fixture();
         writer
@@ -4182,36 +4256,21 @@ mod tests {
                 json!({"structural":"stale-reservation"}),
             )
             .await
-            .unwrap_err();
-        assert_eq!(raced.code, ConversationErrorCode::ConversationConflict);
-        assert_ne!(raced.stable_code(), "CONVERSATION_SOURCE_SEQUENCE_INVALID");
-        assert_ne!(
-            raced.stable_code(),
-            "CONVERSATION_PERSISTENCE_FRONTIER_MISMATCH"
-        );
-        assert_ne!(
-            raced.code,
-            ConversationErrorCode::ConversationRecoveryRequired
-        );
-        assert_eq!(
-            repository
-                .get_conversation(conversation_id)
-                .unwrap()
-                .last_seq,
-            1
-        );
+            .unwrap();
+        assert_eq!(raced.seq, 2);
+        assert_eq!(CanonicalSequenceTicket::from_event(&raced).seq, 2);
         let reconciled = repository
             .append_ordered_event(
                 &permit,
                 conversation_id,
-                2,
+                reserved_relay_seq,
                 time(22),
                 ConversationEventType::MessageChunk,
                 json!({"structural":"reconciled"}),
             )
             .await
             .unwrap();
-        assert_eq!(reconciled.seq, 2);
+        assert_eq!(reconciled.seq, 3);
         assert_eq!(
             repository
                 .get_conversation(conversation_id)
@@ -4221,7 +4280,7 @@ mod tests {
         );
         let page = repository.read_event_page(conversation_id, 0, 17).unwrap();
         let seqs: Vec<u64> = page.iter().map(|event| event.seq).collect();
-        assert_eq!(seqs, vec![1, 2]);
+        assert_eq!(seqs, vec![1, 2, 3]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

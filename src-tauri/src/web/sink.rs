@@ -33,7 +33,7 @@ use std::fmt;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use serde::Serialize;
@@ -78,6 +78,83 @@ pub const RELIABLE_CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_RELAY_SESSIONS: usize = 256;
 pub const MAX_RELAY_BYTES: usize = 64 * 1024 * 1024;
 pub const SESSION_GATE_STRIPES: usize = 64;
+const MAX_FAILURE_CIRCUIT_ENTRIES: usize = 256;
+const FAILURE_CIRCUIT_TTL_SECS: u64 = 900;
+const MAX_SNAPSHOT_ENCODED_BYTES: usize = 4_194_304;
+
+#[derive(Debug, Clone, Copy)]
+struct DeliveryCircuitEntry {
+    code: &'static str,
+    opened_at: Instant,
+}
+
+struct DeliveryCircuitMap {
+    entries: HashMap<String, DeliveryCircuitEntry>,
+}
+
+impl DeliveryCircuitMap {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    fn prune(&mut self, now: Instant) {
+        self.entries.retain(|_, entry| {
+            now.duration_since(entry.opened_at).as_secs() < FAILURE_CIRCUIT_TTL_SECS
+        });
+    }
+
+    fn get(&mut self, session_id: &str) -> Option<&'static str> {
+        self.prune(Instant::now());
+        self.entries.get(session_id).map(|entry| entry.code)
+    }
+
+    fn insert(&mut self, session_id: String, code: &'static str) {
+        let now = Instant::now();
+        self.prune(now);
+        if self.entries.contains_key(&session_id) {
+            return;
+        }
+        if self.entries.len() >= MAX_FAILURE_CIRCUIT_ENTRIES {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.opened_at)
+                .map(|(key, _)| key.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(
+            session_id,
+            DeliveryCircuitEntry {
+                code,
+                opened_at: now,
+            },
+        );
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn insert_at(&mut self, session_id: String, code: &'static str, opened_at: Instant) {
+        self.prune(Instant::now());
+        self.entries
+            .insert(session_id, DeliveryCircuitEntry { code, opened_at });
+    }
+
+    fn remove(&mut self, session_id: &str) {
+        self.entries.remove(session_id);
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn contains_key(&mut self, session_id: &str) -> bool {
+        self.get(session_id).is_some()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
 pub const MAX_CONNECTION_SUBSCRIPTIONS: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,7 +190,7 @@ pub struct EventSinkError {
 }
 
 impl EventSinkError {
-    fn persistence_rejected(source_code: &'static str) -> Self {
+    pub(crate) fn persistence_rejected(source_code: &'static str) -> Self {
         Self {
             code: CONVERSATION_PERSISTENCE_REJECTED,
             source_code: Some(source_code),
@@ -269,7 +346,7 @@ pub struct WsRelaySink {
     /// Reverse index: session_id → set of subscribed client_ids.
     session_subs: Arc<Mutex<HashMap<String, HashSet<ClientId>>>>,
     /// A rejected durable admission opens a circuit only for the affected opaque session.
-    delivery_circuits: Mutex<HashMap<String, &'static str>>,
+    delivery_circuits: Mutex<DeliveryCircuitMap>,
     history_clock: AtomicU64,
     /// Bounded per-session ring capacity (default 4096, AC4).
     event_log_capacity: usize,
@@ -300,7 +377,7 @@ pub struct WsRelaySink {
         Option<Arc<crate::conversation::OrderedConversationPersistence>>,
     /// Fixed striped gates spanning canonical cursor selection, ticket acknowledgement, and live
     /// publication. The stripe count is constant under unbounded session churn.
-    persistence_submission_gates: [Mutex<()>; SESSION_GATE_STRIPES],
+    persistence_submission_gates: [tokio::sync::Mutex<()>; SESSION_GATE_STRIPES],
     /// Fixed striped gates serializing durable replay/catch-up/register handoff.
     replay_gates: [tokio::sync::Mutex<()>; SESSION_GATE_STRIPES],
 }
@@ -523,6 +600,61 @@ struct HistoryReservation {
     active: bool,
 }
 
+
+fn charge_snapshot_encoded_bytes(current: usize, record: &impl serde::Serialize) -> Result<usize, &'static str> {
+    let added = crate::conversation::contracts::encoded_json_len_bounded(
+        record,
+        crate::conversation::MAX_CONVERSATION_RECORD_BYTES,
+    )
+    .ok_or("CONVERSATION_RECORD_TOO_LARGE")?;
+    let total = current.saturating_add(added);
+    if total > MAX_SNAPSHOT_ENCODED_BYTES {
+        Err(crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED)
+    } else {
+        Ok(total)
+    }
+}
+
+fn materialize_conversation_snapshot(
+    persistence: &crate::conversation::ConversationPersistenceAdapter,
+    sid: &str,
+    after_seq: u64,
+) -> Result<(Vec<SequencedEvent>, u64), &'static str> {
+    let watermark = persistence.last_seq(sid).map_err(|error| error.code)?;
+    let mut events = Vec::new();
+    let mut cursor = after_seq;
+    let mut encoded_bytes = 0usize;
+    while cursor < watermark {
+        let remaining = crate::conversation::MAX_COMPAT_HISTORY_RECORDS.saturating_sub(events.len());
+        if remaining == 0 {
+            return Err(crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED);
+        }
+        let limit = remaining
+            .saturating_add(1)
+            .clamp(1, crate::conversation::MAX_CONVERSATION_HISTORY_PAGE_LIMIT);
+        let page = persistence
+            .history_page(sid, cursor, limit)
+            .map_err(|error| error.code)?;
+        if page.records.len() > remaining {
+            return Err(crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED);
+        }
+        for record in &page.records {
+            encoded_bytes = charge_snapshot_encoded_bytes(encoded_bytes, record)?;
+            events.push(SequencedEvent::new(
+                Some(record.session_id.clone()),
+                record.seq,
+                record.type_.clone(),
+                record.payload.clone(),
+            ));
+        }
+        cursor = page.next_cursor;
+        if page.complete {
+            break;
+        }
+    }
+    Ok((events, watermark))
+}
+
 /// Default per-session event-log capacity (AC4).
 pub const DEFAULT_EVENT_LOG_CAPACITY: usize = 4096;
 /// Default per-client lossy ring capacity (drop-oldest threshold).
@@ -543,7 +675,7 @@ impl WsRelaySink {
             sessions: Mutex::new(HashMap::new()),
             clients: Arc::new(Mutex::new(HashMap::new())),
             session_subs: Arc::new(Mutex::new(HashMap::new())),
-            delivery_circuits: Mutex::new(HashMap::new()),
+            delivery_circuits: Mutex::new(DeliveryCircuitMap::new()),
             history_clock: AtomicU64::new(0),
             event_log_capacity: event_log_capacity.max(1),
             lossy_capacity: lossy_capacity.max(1),
@@ -553,7 +685,7 @@ impl WsRelaySink {
             persistence: None,
             conversation_persistence: None,
             ordered_conversation_persistence: None,
-            persistence_submission_gates: std::array::from_fn(|_| Mutex::new(())),
+            persistence_submission_gates: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
             replay_gates: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
         }
     }
@@ -770,7 +902,7 @@ impl WsRelaySink {
             % SESSION_GATE_STRIPES
     }
 
-    fn persistence_submission_gate(&self, sid: &str) -> &Mutex<()> {
+    fn persistence_submission_gate(&self, sid: &str) -> &tokio::sync::Mutex<()> {
         &self.persistence_submission_gates[Self::session_gate_index(sid)]
     }
 
@@ -790,24 +922,22 @@ impl WsRelaySink {
     }
 
     fn next_sequenced_event(&self, sid: &str, type_: &str, payload: Value) -> SequencedEvent {
+        // Provisional reservation only. The repository lock allocates the canonical ticket.
         let next_seq = self.session_watermark(sid).saturating_add(1);
-        let ticket = crate::conversation::CanonicalSequenceTicket::from_allocated_seq(next_seq);
-        SequencedEvent::new(Some(sid.to_string()), ticket.seq, type_, payload)
+        SequencedEvent::new(Some(sid.to_string()), next_seq, type_, payload)
     }
 
     fn circuit_error(&self, sid: &str) -> Option<EventSinkError> {
         self.delivery_circuits
             .lock()
             .get(sid)
-            .copied()
             .map(EventSinkError::persistence_rejected)
     }
 
     fn open_delivery_circuit(&self, sid: &str, source_code: &'static str) {
         self.delivery_circuits
             .lock()
-            .entry(sid.to_string())
-            .or_insert(source_code);
+            .insert(sid.to_string(), source_code);
         log::error!(
             "[conversation-persistence] session delivery circuit opened code={} source_code={}",
             CONVERSATION_PERSISTENCE_REJECTED,
@@ -838,7 +968,7 @@ impl WsRelaySink {
             return Err(error);
         }
         let gate = self.persistence_submission_gate(sid);
-        let _submission_guard = gate.lock();
+        let _submission_guard = gate.blocking_lock();
         if let Some(error) = self.circuit_error(sid) {
             return Err(error);
         }
@@ -847,6 +977,7 @@ impl WsRelaySink {
         let mut reservation = self.reserve_history(sid, &sequenced)?;
         let durable_result: Result<Option<u64>, (&'static str, String)> =
             if let Some(persistence) = &self.ordered_conversation_persistence {
+                // Sync EventSink::emit may keep wait(). Tokio persist_user_prompt uses committed().
                 persistence
                     .submit(sid, sequenced.seq, type_, sequenced.payload.clone())
                     .and_then(|ticket| ticket.wait())
@@ -855,6 +986,77 @@ impl WsRelaySink {
             } else if let Some(persistence) = &self.persistence {
                 // The pre-cutover store historically retained every relay event. Keep compatibility
                 // reads exact while still rejecting before live commit if its queue refuses admission.
+                persistence
+                    .enqueue_event(PersistedEventRecord {
+                        schema_version: SESSION_SCHEMA_VERSION,
+                        session_id: sid.to_string(),
+                        seq: sequenced.seq,
+                        type_: type_.to_string(),
+                        recorded_at: now_millis(),
+                        payload: sequenced.payload.clone(),
+                    })
+                    .map(|()| None)
+                    .map_err(|error| (session_persistence_error_code(&error), error.to_string()))
+            } else {
+                Ok(None)
+            };
+
+        match durable_result {
+            Ok(Some(canonical_seq)) if canonical_seq != sequenced.seq => {
+                sequenced = SequencedEvent::new(
+                    Some(sid.to_string()),
+                    crate::conversation::CanonicalSequenceTicket::from_allocated_seq(
+                        canonical_seq,
+                    )
+                    .seq,
+                    type_,
+                    sequenced.payload.clone(),
+                );
+            }
+            Ok(_) => {}
+            Err((source_code, _detail)) => {
+                self.rollback_history(&mut reservation);
+                if !Self::is_retryable_persistence_code(source_code) {
+                    self.open_delivery_circuit(sid, source_code);
+                }
+                return Err(EventSinkError::persistence_rejected(source_code));
+            }
+        }
+        if let Err(error) = self.commit_history(&mut reservation, sequenced.clone()) {
+            self.rollback_history(&mut reservation);
+            return Err(error);
+        }
+        Ok(sequenced)
+    }
+
+    async fn admit_session_event_async(
+        &self,
+        sid: &str,
+        type_: &str,
+        payload: Value,
+    ) -> Result<SequencedEvent, EventSinkError> {
+        if let Some(error) = self.circuit_error(sid) {
+            return Err(error);
+        }
+        let gate = self.persistence_submission_gate(sid);
+        let _submission_guard = gate.lock().await;
+        if let Some(error) = self.circuit_error(sid) {
+            return Err(error);
+        }
+
+        let mut sequenced = self.next_sequenced_event(sid, type_, payload);
+        let mut reservation = self.reserve_history(sid, &sequenced)?;
+        let durable_result: Result<Option<u64>, (&'static str, String)> =
+            if let Some(persistence) = &self.ordered_conversation_persistence {
+                match persistence.submit(sid, sequenced.seq, type_, sequenced.payload.clone()) {
+                    Ok(ticket) => ticket
+                        .committed()
+                        .await
+                        .map(Some)
+                        .map_err(|error| (error.code, error.to_string())),
+                    Err(error) => Err((error.code, error.to_string())),
+                }
+            } else if let Some(persistence) = &self.persistence {
                 persistence
                     .enqueue_event(PersistedEventRecord {
                         schema_version: SESSION_SCHEMA_VERSION,
@@ -1321,20 +1523,18 @@ impl WsRelaySink {
                 }
             }
             if let Some(persistence) = &self.conversation_persistence {
-                let durable = match persistence.replay_after(sid, cursor) {
-                    Ok(records) => records,
-                    Err(_) => return ReplayResult::Stale,
+                let persistence = Arc::clone(persistence);
+                let sid_owned = sid.to_string();
+                let materialized = tokio::task::spawn_blocking(move || {
+                    materialize_conversation_snapshot(&persistence, &sid_owned, cursor)
+                })
+                .await;
+                let durable = match materialized {
+                    Ok(Ok((events, _))) => events,
+                    Ok(Err(_)) | Err(_) => return ReplayResult::Stale,
                 };
-                for record in durable {
-                    by_seq.insert(
-                        record.seq,
-                        SequencedEvent::new(
-                            Some(record.session_id),
-                            record.seq,
-                            record.type_,
-                            record.payload,
-                        ),
-                    );
+                for event in durable {
+                    by_seq.insert(event.seq, event);
                 }
             }
             if let Some(persistence) = &self.persistence {
@@ -1446,23 +1646,14 @@ impl WsRelaySink {
                 .map_err(|error| error.to_string())?;
         }
         if let Some(persistence) = &self.conversation_persistence {
-            let watermark = persistence
-                .last_seq(sid)
-                .map_err(|error| error.to_string())?;
-            let records = persistence
-                .replay_after(sid, 0)
-                .map_err(|error| error.to_string())?;
-            let snapshot = records
-                .into_iter()
-                .map(|record| {
-                    SequencedEvent::new(
-                        Some(record.session_id),
-                        record.seq,
-                        record.type_,
-                        record.payload,
-                    )
-                })
-                .collect();
+            let persistence = Arc::clone(persistence);
+            let sid_owned = sid.to_string();
+            let (snapshot, watermark) = tokio::task::spawn_blocking(move || {
+                materialize_conversation_snapshot(&persistence, &sid_owned, 0)
+            })
+            .await
+            .map_err(|_| "snapshot materialization task failed".to_string())?
+            .map_err(|code| code.to_string())?;
             self.register(client_id, sid, tx);
             return Ok((client_id, rx, snapshot, watermark));
         }
@@ -1511,7 +1702,8 @@ impl WsRelaySink {
         payload: Value,
     ) -> Result<SequencedEvent, String> {
         let event = self
-            .admit_session_event(sid, "user_prompt", payload)
+            .admit_session_event_async(sid, "user_prompt", payload)
+            .await
             .map_err(|error| error.code.to_string())?;
         if let Some(persistence) = &self.ordered_conversation_persistence {
             persistence
@@ -1642,7 +1834,7 @@ impl WsRelaySink {
     /// deliberately untouched. Repeated calls are successful no-ops.
     pub async fn retire_session(&self, sid: &str) -> Result<(), String> {
         {
-            let _submission_guard = self.persistence_submission_gate(sid).lock();
+            let _submission_guard = self.persistence_submission_gate(sid).lock().await;
         }
         if let Some(ordered) = &self.ordered_conversation_persistence {
             ordered
@@ -1650,7 +1842,7 @@ impl WsRelaySink {
                 .await
                 .map_err(|error| error.code.to_string())?;
         }
-        let _submission_guard = self.persistence_submission_gate(sid).lock();
+        let _submission_guard = self.persistence_submission_gate(sid).lock().await;
         self.retire_auxiliary(sid)
             .map_err(|error| error.code.to_string())?;
         self.sessions.lock().remove(sid);
@@ -3429,30 +3621,38 @@ mod tests {
         assert!(relay.sessions.lock().is_empty());
     }
 
-    #[test]
-    fn next_sequenced_event_consumes_live_watermark_ticket_seq() {
-        let relay = WsRelaySink::new();
-        {
-            let mut sessions = relay.sessions.lock();
-            sessions.insert(
-                "ticket-sid".to_string(),
-                SessionState {
-                    last_seq: 9,
-                    events: VecDeque::new(),
-                    snapshot_events: Vec::new(),
-                    base_seq: 1,
-                    retained_bytes: 0,
-                    reserved_bytes: 0,
-                    last_used: 1,
-                },
-            );
-        }
-        let event = relay.next_sequenced_event("ticket-sid", "message_chunk", json!({}));
-        assert_eq!(
-            event.seq,
-            crate::conversation::CanonicalSequenceTicket::from_allocated_seq(10).seq,
-            "next_sequenced_event must wrap the next live watermark in a repository ticket"
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn next_sequenced_event_consumes_live_watermark_ticket_seq() {
+        // Reversed from 7686059: next_sequenced_event is a reservation, not the canonical ticket.
+        let src = include_str!("sink.rs");
+        let needle = format!(
+            "from_allocated_seq({0})",
+            "next_seq"
         );
+        assert!(
+            !src.contains(&format!("let ticket = crate::conversation::CanonicalSequenceTicket::{needle};")),
+            "next_sequenced_event must not wrap watermark+1 as the canonical ticket"
+        );
+        let (root, repository, adapter, conversation_id) =
+            conversation_fixture("ticket-consume", "ticket-sid").await;
+        let relay = Arc::new(WsRelaySink::with_conversation_persistence(16, adapter, None));
+        let published = relay
+            .persist_user_prompt("ticket-sid", json!({"text":"hi"}))
+            .await
+            .expect("tokio persist consumes the repository ticket");
+        let last_seq = repository.get_conversation(conversation_id).unwrap().last_seq;
+        assert_eq!(
+            published.seq,
+            crate::conversation::CanonicalSequenceTicket::from_allocated_seq(last_seq).seq,
+            "live admission must consume the lock-allocated ticket"
+        );
+        relay
+            .shutdown_conversation_persistence()
+            .await
+            .expect("shutdown");
+        drop(relay);
+        drop(repository);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3494,4 +3694,101 @@ mod tests {
             .lock()
             .contains_key("keep-semantics"));
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admit_session_event_consumes_repository_ticket_not_watermark_plus_one() {
+        let (root, repository, adapter, conversation_id) =
+            conversation_fixture("admit-ticket", "admit-sid").await;
+        let writer = crate::conversation::ConversationWriter::for_test(Arc::clone(&repository));
+        writer
+            .append_event(
+                conversation_id,
+                Utc::now(),
+                crate::conversation::ConversationEventType::LocalTitleGenerated,
+                json!({"title":"lifecycle"}),
+                crate::conversation::ConversationMutation::AcpEventAppend,
+            )
+            .await
+            .unwrap();
+        let last_seq = repository.get_conversation(conversation_id).unwrap().last_seq;
+        let relay = Arc::new(WsRelaySink::with_conversation_persistence(16, adapter, None));
+        let published = relay
+            .persist_user_prompt("admit-sid", json!({"text":"prompt"}))
+            .await
+            .unwrap();
+        let after = repository.get_conversation(conversation_id).unwrap().last_seq;
+        assert_eq!(published.seq, after);
+        assert_eq!(
+            published.seq,
+            crate::conversation::CanonicalSequenceTicket::from_allocated_seq(after).seq
+        );
+        assert!(after > last_seq);
+        assert_eq!(relay.auxiliary_stats().delivery_circuits, 0);
+        relay.shutdown_conversation_persistence().await.unwrap();
+        drop(relay);
+        drop(repository);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persist_user_prompt_awaits_ticket_committed_not_sync_wait() {
+        let src = include_str!("sink.rs");
+        let persist_idx = src.find("pub async fn persist_user_prompt").expect("persist fn");
+        let persist_body = &src[persist_idx..persist_idx + 800];
+        assert!(
+            persist_body.contains("admit_session_event_async"),
+            "persist_user_prompt must use the Tokio committed path"
+        );
+        assert!(
+            !persist_body.contains("ticket.wait()"),
+            "persist_user_prompt must not call ticket.wait()"
+        );
+        assert!(src.contains(".committed()"));
+        let (root, repository, adapter, _conversation_id) =
+            conversation_fixture("persist-committed", "persist-sid").await;
+        let relay = Arc::new(WsRelaySink::with_conversation_persistence(16, adapter, None));
+        let published = relay
+            .persist_user_prompt("persist-sid", json!({"text":"prompt"}))
+            .await
+            .unwrap();
+        assert!(published.seq >= 1);
+        assert!(src.contains("admit_session_event_async"));
+        relay.shutdown_conversation_persistence().await.unwrap();
+        drop(relay);
+        drop(repository);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delivery_circuits_bound_to_256_entries_and_900s_ttl() {
+        let mut circuits = DeliveryCircuitMap::new();
+        for ordinal in 0..MAX_FAILURE_CIRCUIT_ENTRIES {
+            circuits.insert(format!("sid-{ordinal}"), "TEST_FATAL");
+        }
+        assert_eq!(circuits.len(), MAX_FAILURE_CIRCUIT_ENTRIES);
+        circuits.insert("sid-overflow".to_string(), "TEST_FATAL");
+        assert_eq!(circuits.len(), MAX_FAILURE_CIRCUIT_ENTRIES);
+        assert!(!circuits.contains_key("sid-0"));
+        assert!(circuits.contains_key("sid-overflow"));
+        circuits.insert_at(
+            "sid-expired".to_string(),
+            "TEST_FATAL",
+            Instant::now() - Duration::from_secs(FAILURE_CIRCUIT_TTL_SECS + 1),
+        );
+        assert!(!circuits.contains_key("sid-expired"));
+        assert_eq!(FAILURE_CIRCUIT_TTL_SECS, 900);
+        assert_eq!(MAX_FAILURE_CIRCUIT_ENTRIES, 256);
+    }
+
+    #[test]
+    fn subscribe_snapshot_and_existing_are_encoded_byte_bounded_on_blocking_path() {
+        assert_eq!(MAX_SNAPSHOT_ENCODED_BYTES, 4_194_304);
+        let err = charge_snapshot_encoded_bytes(MAX_SNAPSHOT_ENCODED_BYTES, &json!({"pad": "x"}))
+            .expect_err("encoded ceiling");
+        assert_eq!(err, crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED);
+        let src = include_str!("sink.rs");
+        assert!(src.contains("materialize_conversation_snapshot"));
+        assert!(src.contains("spawn_blocking"));
+        assert!(src.contains("MAX_SNAPSHOT_ENCODED_BYTES"));
+    }
+
 }
