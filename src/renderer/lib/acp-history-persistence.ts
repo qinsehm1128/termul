@@ -610,12 +610,18 @@ export function historyPagingMetrics(): HistoryPagingMetrics {
   }
 }
 
-function estimateAssemblyBytes(assembly: PartialHistoryAssembly): number {
+function encodedSessionPayloadBytes(payload: SessionPayload): number {
   try {
-    return new TextEncoder().encode(JSON.stringify(assembly.accumulator.snapshot())).length
+    return new TextEncoder().encode(JSON.stringify(payload)).length
   } catch {
     return 0
   }
+}
+
+function estimateAssemblyBytes(assembly: PartialHistoryAssembly): number {
+  // snapshot() is a published-projection primitive, not a tape measure. Use the
+  // already-published payload when present; otherwise report 0 without cloning.
+  return assembly.publishedPayload ? encodedSessionPayloadBytes(assembly.publishedPayload) : 0
 }
 
 function evictFailedPrefixAssemblies(now = Date.now()): void {
@@ -1223,6 +1229,7 @@ async function publishHistorySnapshot(
 ): Promise<void> {
   assembly.publishedPayload = payload
   assembly.publishedProgress = progress
+  assembly.payloadBytes = encodedSessionPayloadBytes(payload)
   flight.lastPublishedPayload = payload
   flight.lastPublishedProgress = progress
   await Promise.all(

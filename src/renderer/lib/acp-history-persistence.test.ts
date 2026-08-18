@@ -830,6 +830,12 @@ describe('progressive bounded history assembly', () => {
       [1, 2],
       [1, 2]
     ])
+    expect(historyPagingMetrics()).toMatchObject({
+      traversalStarts: 2,
+      pageRequests: 3,
+      recordApplications: 2,
+      snapshotsCreated: 2
+    })
   })
 
   it('retains the pinned prefix after a stable later-page failure and retries its exact cursor', async () => {
@@ -885,6 +891,12 @@ describe('progressive bounded history assembly', () => {
       [1, 2],
       [1, 2]
     ])
+    expect(historyPagingMetrics()).toMatchObject({
+      traversalStarts: 2,
+      pageRequests: 3,
+      recordApplications: 2,
+      snapshotsCreated: 2
+    })
   })
 
   it('rejects an oversized page without exceeding the 4 MiB retained-byte metric', async () => {
