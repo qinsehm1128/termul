@@ -6414,7 +6414,8 @@ mod tests {
             1
         );
         assert!(
-            body.find("stop_producers().await").unwrap()
+            body.find("timeout_at(deadline, acp_manager.stop_producers())")
+                .unwrap()
                 < body
                     .find(".shutdown_conversation_persistence_until(deadline)")
                     .unwrap()

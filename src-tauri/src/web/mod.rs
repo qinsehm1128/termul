@@ -686,10 +686,10 @@ mod tests {
             .expect("standalone shutdown helper boundary");
         let body = &source[start..end];
         let ordered_calls = [
-            "acp.stop_producers().await",
+            "timeout_at(deadline, acp.stop_producers())",
             ".shutdown_conversation_persistence_until(deadline)",
             ".flush_catalog_until(deadline)",
-            "acp.shutdown_persistence().await",
+            "timeout_at(deadline, acp.shutdown_persistence())",
             "pty.kill_all_until(deadline).await",
         ];
         let positions = ordered_calls.map(|needle| {
