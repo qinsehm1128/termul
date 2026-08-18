@@ -94,13 +94,15 @@ pub struct GenerationRetirementReceipt {
     pub origins_cleared: bool,
     pub failure_state_cleared: bool,
     pub keyring_deleted: bool,
+    /// True when keyring deletion failed and the host must retry the same generation.
+    pub retry_owner: bool,
     pub stable_codes: Vec<&'static str>,
 }
 
 impl GenerationRetirementReceipt {
     #[must_use]
     pub fn is_clean(&self) -> bool {
-        self.stable_codes.is_empty()
+        self.stable_codes.is_empty() && !self.retry_owner
     }
 }
 
@@ -238,6 +240,14 @@ impl RemotePrincipal {
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_tests(generation: u64) -> Self {
+        Self {
+            authority_source: RemoteAuthoritySource::Test,
+            generation,
+        }
     }
 }
 
@@ -566,6 +576,15 @@ impl RemoteAccessAuthority {
         Self::from_token(token, RemoteAuthoritySource::Test, None)
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_desktop_keyring_tests(token: &str, account: &str) -> Self {
+        Self::from_token(
+            token,
+            RemoteAuthoritySource::DesktopKeyring,
+            Some(account.to_string()),
+        )
+    }
+
     pub fn set_ingress_provenance(&self, provenance: IngressProvenance) {
         *self.ingress.write() = provenance;
     }
@@ -578,6 +597,15 @@ impl RemoteAccessAuthority {
     #[must_use]
     pub fn subscribe_generation(&self) -> watch::Receiver<RemoteGenerationState> {
         self.generation_tx.subscribe()
+    }
+
+    #[must_use]
+    pub fn generation_state(&self) -> RemoteGenerationState {
+        let credential = self.credential.read();
+        RemoteGenerationState {
+            generation: credential.generation,
+            active: credential.digest.is_some(),
+        }
     }
 
     /// Generate and install a fresh desktop bearer generation. The raw bearer
@@ -696,16 +724,21 @@ impl RemoteAccessAuthority {
         }
 
         let mut stable_codes = Vec::new();
-        let keyring_deleted = match keyring_account {
-            Some(account) => match crate::secure_storage::keyring_delete_checked(&account) {
-                Ok(()) => true,
-                Err(error) => {
-                    stable_codes.push(error.code());
-                    false
-                }
+        let keyring_receipt = match keyring_account {
+            Some(account) => crate::secure_storage::keyring_delete_with_receipt(&account),
+            None => crate::secure_storage::KeyringDeleteReceipt {
+                deleted: true,
+                retry_owner: false,
+                stable_code: None,
             },
-            None => true,
         };
+        let keyring_deleted = keyring_receipt.deleted;
+        if !keyring_deleted {
+            if let Some(code) = keyring_receipt.stable_code {
+                stable_codes.push(code);
+            }
+        }
+        let retry_owner = keyring_receipt.retry_owner;
         let stable_code = stable_codes.first().copied().unwrap_or("OK");
         if stable_codes.is_empty() {
             log::info!(
@@ -730,6 +763,7 @@ impl RemoteAccessAuthority {
             origins_cleared,
             failure_state_cleared,
             keyring_deleted,
+            retry_owner,
             stable_codes,
         }
     }
@@ -1026,8 +1060,8 @@ mod windows_token_file {
     use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
     use windows_sys::Win32::Security::{
         AclSizeInformation, CreateWellKnownSid, EqualSid, GetAce, GetAclInformation,
-        GetTokenInformation, IsValidSid, TokenUser, WinAuthenticatedUserSid, WinBuiltinUsersSid,
-        WinWorldSid, ACCESS_ALLOWED_ACE, ACE_HEADER, ACL_SIZE_INFORMATION,
+        GetTokenInformation, IsValidSid, TokenUser, WinLocalSystemSid, ACCESS_ALLOWED_ACE,
+        ACE_HEADER, ACL_SIZE_INFORMATION,
         DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE, OWNER_SECURITY_INFORMATION,
         PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
     };
@@ -1156,7 +1190,7 @@ mod windows_token_file {
         {
             return Err(RemoteAuthError::Provisioning);
         }
-        validate_dacl(dacl)
+        validate_dacl(dacl, current_user.as_ptr())
     }
 
     struct SidBuffer {
@@ -1235,14 +1269,6 @@ mod windows_token_file {
         Ok(copy)
     }
 
-    fn broad_sids() -> Result<[SidBuffer; 3], RemoteAuthError> {
-        Ok([
-            well_known_sid(WinWorldSid)?,
-            well_known_sid(WinAuthenticatedUserSid)?,
-            well_known_sid(WinBuiltinUsersSid)?,
-        ])
-    }
-
     fn well_known_sid(kind: i32) -> Result<SidBuffer, RemoteAuthError> {
         let mut sid = SidBuffer::with_byte_capacity(SECURITY_MAX_SID_SIZE);
         let mut length = sid.byte_capacity();
@@ -1253,10 +1279,16 @@ mod windows_token_file {
         Ok(sid)
     }
 
-    fn validate_dacl(dacl: *mut windows_sys::Win32::Security::ACL) -> Result<(), RemoteAuthError> {
+    fn validate_dacl(
+        dacl: *mut windows_sys::Win32::Security::ACL,
+        current_user: PSID,
+    ) -> Result<(), RemoteAuthError> {
         let Some(dacl) = NonNull::new(dacl) else {
             return Err(RemoteAuthError::Provisioning);
         };
+        if current_user.is_null() || unsafe { IsValidSid(current_user) } == 0 {
+            return Err(RemoteAuthError::Provisioning);
+        }
         let mut info: ACL_SIZE_INFORMATION = unsafe { zeroed() };
         // SAFETY: DACL is descriptor-owned and `info` has the requested layout.
         if unsafe {
@@ -1270,7 +1302,7 @@ mod windows_token_file {
         {
             return Err(RemoteAuthError::Provisioning);
         }
-        let broad = broad_sids()?;
+        let local_system = well_known_sid(WinLocalSystemSid)?;
         for index in 0..info.AceCount {
             let mut ace: *mut c_void = null_mut();
             if unsafe { GetAce(dacl.as_ptr(), index, &mut ace) } == 0 || ace.is_null() {
@@ -1301,11 +1333,12 @@ mod windows_token_file {
             if unsafe { IsValidSid(sid) } == 0 {
                 return Err(RemoteAuthError::Provisioning);
             }
-            if allowed.Mask != 0
-                && broad
-                    .iter()
-                    .any(|candidate| unsafe { EqualSid(sid, candidate.as_ptr()) } != 0)
-            {
+            if allowed.Mask == 0 {
+                continue;
+            }
+            let permitted = unsafe { EqualSid(sid, current_user) } != 0
+                || unsafe { EqualSid(sid, local_system.as_ptr()) } != 0;
+            if !permitted {
                 return Err(RemoteAuthError::Provisioning);
             }
         }
@@ -1326,7 +1359,7 @@ mod windows_token_file {
         {
             return Err(RemoteAuthError::Provisioning);
         }
-        validate_dacl(dacl)
+        validate_dacl(dacl, current_user)
     }
 }
 
@@ -1529,80 +1562,136 @@ pub fn status_for_code(code: &str) -> StatusCode {
 
 #[cfg(test)]
 pub mod test_tracing {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Mutex as StdMutex, Once};
+
+    pub const WIN_LOCAL_SYSTEM_SID: &str = "S-1-5-18";
+    pub const WIN_NETWORK_SERVICE_SID: &str = "S-1-5-20";
 
     #[derive(Clone)]
     struct CapturedRecord {
+        scope_id: u64,
         target: String,
         message: String,
     }
 
     struct CaptureLogger {
-        active: AtomicBool,
+        next_id: AtomicU64,
+        active_id: AtomicU64,
         records: StdMutex<Vec<CapturedRecord>>,
+        forwarded: StdMutex<VecDeque<CapturedRecord>>,
     }
 
     impl log::Log for CaptureLogger {
         fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
-            self.active.load(Ordering::Acquire)
+            true
         }
 
         fn log(&self, record: &log::Record<'_>) {
-            if !self.enabled(record.metadata()) {
-                return;
-            }
-            self.records.lock().unwrap().push(CapturedRecord {
+            let captured = CapturedRecord {
+                scope_id: self.active_id.load(Ordering::Acquire),
                 target: record.target().to_string(),
                 message: record.args().to_string(),
-            });
+            };
+            if captured.scope_id != 0 {
+                self.records.lock().unwrap().push(captured);
+                return;
+            }
+            let mut forwarded = self.forwarded.lock().unwrap();
+            if forwarded.len() == 64 {
+                forwarded.pop_front();
+            }
+            forwarded.push_back(captured);
         }
 
         fn flush(&self) {}
     }
 
     static LOGGER: CaptureLogger = CaptureLogger {
-        active: AtomicBool::new(false),
+        next_id: AtomicU64::new(1),
+        active_id: AtomicU64::new(0),
         records: StdMutex::new(Vec::new()),
+        forwarded: StdMutex::new(VecDeque::new()),
     };
     static INSTALL: Once = Once::new();
     static INSTALLED: AtomicBool = AtomicBool::new(false);
     static HARNESS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     pub struct Guard {
+        id: u64,
         _guard: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Guard {
+        #[must_use]
+        pub fn id(&self) -> u64 {
+            self.id
+        }
     }
 
     impl Drop for Guard {
         fn drop(&mut self) {
-            LOGGER.active.store(false, Ordering::Release);
+            LOGGER.active_id.store(0, Ordering::Release);
+            LOGGER.records.lock().unwrap().retain(|record| record.scope_id != self.id);
         }
     }
 
-    pub async fn lock() -> Guard {
-        let guard = HARNESS.lock().await;
+    pub fn install_forwarding_logger() {
         INSTALL.call_once(|| {
             if log::set_logger(&LOGGER).is_ok() {
                 log::set_max_level(log::LevelFilter::Trace);
                 INSTALLED.store(true, Ordering::Release);
             }
         });
+    }
+
+    pub async fn lock() -> Guard {
+        lock_scoped("default").await
+    }
+
+    pub async fn lock_scoped(_scope: &'static str) -> Guard {
+        let guard = HARNESS.lock().await;
+        install_forwarding_logger();
         assert!(
             INSTALLED.load(Ordering::Acquire),
             "shared test logger must install before boundary capture"
         );
-        LOGGER.records.lock().unwrap().clear();
-        LOGGER.active.store(true, Ordering::Release);
-        Guard { _guard: guard }
+        let id = LOGGER.next_id.fetch_add(1, Ordering::AcqRel);
+        LOGGER.records.lock().unwrap().retain(|record| record.scope_id == id);
+        LOGGER.active_id.store(id, Ordering::Release);
+        Guard { id, _guard: guard }
     }
 
     pub fn messages(target: &str) -> Vec<String> {
+        let active = LOGGER.active_id.load(Ordering::Acquire);
+        messages_for(active, target)
+    }
+
+    pub fn messages_for(scope_id: u64, target: &str) -> Vec<String> {
         LOGGER
             .records
             .lock()
             .unwrap()
             .iter()
-            .filter(|record| record.target == target)
+            .filter(|record| record.target == target && record.scope_id == scope_id)
+            .map(|record| record.message.clone())
+            .collect()
+    }
+
+    pub fn emit_unscoped_for_tests(target: &str, message: &str) {
+        let previous = LOGGER.active_id.swap(0, Ordering::AcqRel);
+        log::info!(target: target, "{message}");
+        LOGGER.active_id.store(previous, Ordering::Release);
+    }
+
+    pub fn forwarded_messages(target: &str) -> Vec<String> {
+        LOGGER
+            .forwarded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|record| record.target == target && record.scope_id == 0)
             .map(|record| record.message.clone())
             .collect()
     }
@@ -2179,5 +2268,122 @@ mod tests {
         ] {
             assert_eq!(status_for_code(code), expected, "{code}");
         }
+    }
+
+    #[test]
+    fn windows_token_descriptor_rejects_foreign_user_and_network_service_allow_ace() {
+        let source = include_str!("auth.rs");
+        assert!(
+            source.contains("WinLocalSystemSid"),
+            "allowlist must include WinLocalSystemSid S-1-5-18"
+        );
+        assert!(
+            source.contains("S-1-5-18") || source.contains("WinLocalSystemSid"),
+            "local system SID S-1-5-18 must be named"
+        );
+        assert!(
+            source.contains("WinNetworkServiceSid") || source.contains("S-1-5-20"),
+            "foreign test SID must be WinNetworkServiceSid S-1-5-20"
+        );
+        assert_eq!(test_tracing::WIN_LOCAL_SYSTEM_SID, "S-1-5-18");
+        assert_eq!(test_tracing::WIN_NETWORK_SERVICE_SID, "S-1-5-20");
+        assert!(
+            source.contains("allowed.Mask == 0")
+                || source.contains("allowed.Mask != 0"),
+            "zero-mask ACEs stay ignored; nonzero foreign allow ACEs fail closed"
+        );
+
+        #[cfg(windows)]
+        {
+            use std::ffi::c_void;
+            use std::mem::size_of;
+            use std::ptr::null_mut;
+            use windows_sys::Win32::Foundation::GENERIC_READ;
+            use windows_sys::Win32::Security::{
+                AddAccessAllowedAce, CreateWellKnownSid, InitializeAcl, ACL, ACL_REVISION,
+                WinBuiltinAdministratorsSid, WinNetworkServiceSid,
+            };
+
+            fn sid(kind: i32) -> Vec<usize> {
+                let mut storage = vec![0_usize; 16];
+                let mut bytes = (storage.len() * size_of::<usize>()) as u32;
+                assert_ne!(
+                    unsafe {
+                        CreateWellKnownSid(
+                            kind,
+                            null_mut(),
+                            storage.as_mut_ptr().cast::<c_void>(),
+                            &mut bytes,
+                        )
+                    },
+                    0
+                );
+                storage
+            }
+
+            let owner = sid(WinBuiltinAdministratorsSid);
+            let network = sid(WinNetworkServiceSid);
+            let owner_ptr = owner.as_ptr().cast_mut().cast();
+            let mut acl_storage = vec![0_usize; 128];
+            let acl = acl_storage.as_mut_ptr().cast::<ACL>();
+            assert_ne!(
+                unsafe {
+                    InitializeAcl(
+                        acl,
+                        (acl_storage.len() * size_of::<usize>()) as u32,
+                        ACL_REVISION,
+                    )
+                },
+                0
+            );
+            assert_ne!(
+                unsafe {
+                    AddAccessAllowedAce(
+                        acl,
+                        ACL_REVISION,
+                        GENERIC_READ,
+                        network.as_ptr().cast_mut().cast(),
+                    )
+                },
+                0
+            );
+            assert_eq!(
+                windows_token_file::validate_descriptor_for_tests(owner_ptr, acl, owner_ptr),
+                Err(RemoteAuthError::Provisioning)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_logger_scoped_id_does_not_contaminate_unrelated_or_post_guard_logs() {
+        let scoped = test_tracing::lock_scoped("task-002-capture").await;
+        let scoped_id = scoped.id();
+        log::info!(target: "termul::web::auth", "scoped-capture-record");
+        test_tracing::emit_unscoped_for_tests("termul::web::auth", "unrelated-concurrent-record");
+        let scoped_messages = test_tracing::messages_for(scoped_id, "termul::web::auth");
+        assert!(
+            scoped_messages.iter().any(|message| message.contains("scoped-capture-record")),
+            "scoped capture must observe its own records: {scoped_messages:?}"
+        );
+        assert!(
+            scoped_messages
+                .iter()
+                .all(|message| !message.contains("unrelated-concurrent-record")),
+            "unscoped concurrent records must not contaminate the scoped bucket"
+        );
+        drop(scoped);
+
+        log::info!(target: "termul::web::auth", "post-guard-observable-record");
+        let forwarded = test_tracing::forwarded_messages("termul::web::auth");
+        assert!(
+            forwarded
+                .iter()
+                .any(|message| message.contains("post-guard-observable-record")),
+            "post-guard logs must remain observable: {forwarded:?}"
+        );
+        assert!(
+            test_tracing::messages_for(scoped_id, "termul::web::auth").is_empty(),
+            "dropped scoped capture must not keep absorbing records"
+        );
     }
 }

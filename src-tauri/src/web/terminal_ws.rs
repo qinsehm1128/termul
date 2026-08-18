@@ -85,6 +85,36 @@ fn authorize_terminal_upgrade(
     authority.authorize(principal, RemoteCapability::Mutate)
 }
 
+fn principal_generation_mismatch(
+    authority: &RemoteAccessAuthority,
+    principal: &RemotePrincipal,
+) -> bool {
+    let current = authority.generation_state();
+    !current.active || current.generation != principal.generation()
+}
+
+fn should_forward_passive(
+    authority: &RemoteAccessAuthority,
+    principal_generation: u64,
+) -> bool {
+    let current = authority.generation_state();
+    current.active && current.generation == principal_generation
+}
+
+async fn abort_and_join_connection_tasks(
+    event_task: tokio::task::JoinHandle<()>,
+    attachments: HashMap<String, tokio::task::JoinHandle<()>>,
+) {
+    event_task.abort();
+    for task in attachments.values() {
+        task.abort();
+    }
+    let _ = event_task.await;
+    for task in attachments.into_values() {
+        let _ = task.await;
+    }
+}
+
 async fn run(
     socket: WebSocket,
     state: AppState,
@@ -116,11 +146,17 @@ async fn run(
     let event_tx = tx.clone();
     let event_state = state.clone();
     let event_authorized = authorized.clone();
+    let event_authority = Arc::clone(&authority);
+    let event_principal_generation = principal.generation();
     let mut event_rx = event_state.terminal_events.subscribe();
+    let mut generation_rx = authority.subscribe_generation();
     let event_task = tokio::spawn(async move {
         loop {
             match event_rx.recv().await {
                 Ok(event) => {
+                    if !should_forward_passive(&event_authority, event_principal_generation) {
+                        break;
+                    }
                     let terminal_id = event.terminal_id().to_string();
                     // Only forward events while the exact Conversation scope
                     // and claim generation authorized for this connection are
@@ -130,6 +166,9 @@ async fn run(
                         .is_none()
                     {
                         continue;
+                    }
+                    if !should_forward_passive(&event_authority, event_principal_generation) {
+                        break;
                     }
                     let payload = serde_json::to_value(&event).unwrap_or_else(|_| json!({}));
                     if send_json(&event_tx, json!({ "type": "event", "payload": payload }))
@@ -152,38 +191,66 @@ async fn run(
         attachments,
     };
 
-    while let Some(frame) = stream.next().await {
-        let Ok(message) = frame else { break };
-        let Message::Text(text) = message else {
-            continue;
-        };
-        let request = match serde_json::from_str::<Request>(&text) {
-            Ok(request) => request,
-            Err(error) => {
-                let _ = send_error(&tx, "malformed", "VALIDATION_ERROR", error.to_string()).await;
-                continue;
+    loop {
+        if principal_generation_mismatch(&authority, &principal) {
+            info!(
+                target: "termul::web::terminal_ws",
+                generation = principal.generation(),
+                lifecycle_phase = "generation_mismatch",
+                stable_code = "OK",
+                "terminal WebSocket closing after authority generation change"
+            );
+            break;
+        }
+        tokio::select! {
+            changed = generation_rx.changed() => {
+                if changed.is_err() || principal_generation_mismatch(&authority, &principal) {
+                    info!(
+                        target: "termul::web::terminal_ws",
+                        generation = principal.generation(),
+                        lifecycle_phase = "generation_mismatch",
+                        stable_code = "OK",
+                        "terminal WebSocket closing after authority generation change"
+                    );
+                    break;
+                }
             }
-        };
-        let id = request.id.clone();
-        let op_type = request.type_.clone();
-        info!("[terminal-ws] request start type={op_type}");
-        match handle(request, &state, &authority, &principal, &tx, &mut ctx).await {
-            Ok(data) => {
-                info!("[terminal-ws] request success type={op_type}");
-                let _ = send_json(&tx, json!({ "id": id, "success": true, "data": data })).await;
-            }
-            Err((code, message)) => {
-                warn!("[terminal-ws] request failed type={op_type} code={code}");
-                let _ = send_error(&tx, &id, code, message).await;
+            frame = stream.next() => {
+                let Some(frame) = frame else { break };
+                let Ok(message) = frame else { break };
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                if principal_generation_mismatch(&authority, &principal) {
+                    break;
+                }
+                let request = match serde_json::from_str::<Request>(&text) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        let _ = send_error(&tx, "malformed", "VALIDATION_ERROR", error.to_string()).await;
+                        continue;
+                    }
+                };
+                let id = request.id.clone();
+                let op_type = request.type_.clone();
+                info!("[terminal-ws] request start type={op_type}");
+                match handle(request, &state, &authority, &principal, &tx, &mut ctx).await {
+                    Ok(data) => {
+                        info!("[terminal-ws] request success type={op_type}");
+                        let _ = send_json(&tx, json!({ "id": id, "success": true, "data": data })).await;
+                    }
+                    Err((code, message)) => {
+                        warn!("[terminal-ws] request failed type={op_type} code={code}");
+                        let _ = send_error(&tx, &id, code, message).await;
+                    }
+                }
             }
         }
     }
 
-    // Cleanup: abort all output forwarding tasks. PTYs are preserved.
-    event_task.abort();
-    for task in ctx.attachments.values() {
-        task.abort();
-    }
+    // Cleanup: abort and join event/attachment tasks. PTYs are preserved.
+    let attachments = std::mem::take(&mut ctx.attachments);
+    abort_and_join_connection_tasks(event_task, attachments).await;
     info!(
         "[terminal-ws] client disconnected; {} PTY(s) preserved",
         ctx.authorized.read().len()
@@ -349,8 +416,19 @@ async fn handle(
                 .claim_generation
                 .ok_or_else(|| unauthorized_error(&resume.terminal_id))?;
             ctx.authorize(&resume.terminal_id, resume.conversation_id, generation);
-            install_replay_forwarder(&resume.terminal_id, replay, generation, state, tx, ctx)
-                .await?;
+            install_replay_forwarder(
+                &resume.terminal_id,
+                replay,
+                generation,
+                state,
+                PassiveForwardAuth {
+                    authority,
+                    principal_generation: principal.generation(),
+                },
+                tx,
+                ctx,
+            )
+            .await?;
             info!(
                 "[terminal-ws] resume success conversation_id={} terminal_id={} latest_seq={} gap={}",
                 resume.conversation_id,
@@ -442,7 +520,19 @@ async fn handle(
             // Sequenced replay: only unseen chunks, with gap detection.
             let replay = instance.subscribe_from(last_seq);
             let attach_result = state.pty.build_attach_result(&instance, &replay);
-            install_replay_forwarder(&terminal_id, replay, generation, state, tx, ctx).await?;
+            install_replay_forwarder(
+                &terminal_id,
+                replay,
+                generation,
+                state,
+                PassiveForwardAuth {
+                    authority,
+                    principal_generation: principal.generation(),
+                },
+                tx,
+                ctx,
+            )
+            .await?;
 
             // Shared attach result — byte-identical camelCase shape to the
             // desktop `terminal_attach` response (no claim key, ever).
@@ -672,17 +762,26 @@ fn retain_compound_cleanup_authorization(
     );
 }
 
+struct PassiveForwardAuth<'a> {
+    authority: &'a Arc<RemoteAccessAuthority>,
+    principal_generation: u64,
+}
+
 async fn install_replay_forwarder(
     terminal_id: &str,
     replay: TerminalReplay,
     generation: u64,
     state: &AppState,
+    forward_auth: PassiveForwardAuth<'_>,
     tx: &mpsc::Sender<Message>,
     ctx: &mut ConnectionContext,
 ) -> Result<(), (&'static str, String)> {
     // Never release replay bytes for a claim generation already invalidated by
     // a concurrent resume/rotate/revoke.
     authorized_terminal_scope(state, ctx, terminal_id)?;
+    if !should_forward_passive(forward_auth.authority, forward_auth.principal_generation) {
+        return Err(unauthorized_error(terminal_id));
+    }
 
     let snapshot = state.terminal_events.snapshot(terminal_id);
     let chunk_payloads: Vec<Value> = replay
@@ -719,6 +818,8 @@ async fn install_replay_forwarder(
     let output_tx = tx.clone();
     let attached_id = terminal_id.to_string();
     let pty = Arc::clone(&state.pty);
+    let attached_authority = Arc::clone(forward_auth.authority);
+    let principal_generation = forward_auth.principal_generation;
     let task = tokio::spawn(async move {
         let mut receiver = replay.receiver;
         let mut current_seq = replay.latest_seq;
@@ -728,10 +829,12 @@ async fn install_replay_forwarder(
         tick.tick().await;
 
         loop {
-            if crate::commands::forwarder_should_terminate(
-                Some(generation),
-                pty.claim_generation(&attached_id),
-            ) {
+            if !should_forward_passive(&attached_authority, principal_generation)
+                || crate::commands::forwarder_should_terminate(
+                    Some(generation),
+                    pty.claim_generation(&attached_id),
+                )
+            {
                 info!(
                     "[terminal-ws] attachment terminating (claim invalidated) terminal_id={attached_id}"
                 );
@@ -744,10 +847,12 @@ async fn install_replay_forwarder(
                             // A rotation may land while recv() is pending. Check
                             // again before forwarding so an old holder receives
                             // no post-rotation terminal bytes.
-                            if crate::commands::forwarder_should_terminate(
-                                Some(generation),
-                                pty.claim_generation(&attached_id),
-                            ) {
+                            if !should_forward_passive(&attached_authority, principal_generation)
+                                || crate::commands::forwarder_should_terminate(
+                                    Some(generation),
+                                    pty.claim_generation(&attached_id),
+                                )
+                            {
                                 break;
                             }
                             current_seq = chunk.seq;
@@ -1361,6 +1466,46 @@ mod tests {
                 "run disconnect cleanup must not call {forbidden}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_ws_event_and_attachment_close_on_generation_mismatch() {
+        let authority = Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token"));
+        let principal = RemotePrincipal::for_tests(1);
+        assert!(
+            !principal_generation_mismatch(&authority, &principal),
+            "fresh test authority must match principal generation 1"
+        );
+        let event_task = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+        let mut attachments = HashMap::new();
+        attachments.insert(
+            "t1".to_string(),
+            tokio::spawn(async {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                }
+            }),
+        );
+        let receipt = authority.retire_generation(1);
+        assert!(receipt.credential_invalidated || !authority.generation_state().active);
+        assert!(principal_generation_mismatch(&authority, &principal));
+        abort_and_join_connection_tasks(event_task, attachments).await;
+    }
+
+    #[test]
+    fn terminal_ws_passive_forward_rechecks_generation_before_send() {
+        let authority = RemoteAccessAuthority::for_tests("test-remote-access-token");
+        assert!(should_forward_passive(&authority, 1));
+        let _ = authority.retire_generation(1);
+        assert!(
+            !should_forward_passive(&authority, 1),
+            "passive forward must refuse after generation retirement"
+        );
+        assert!(!should_forward_passive(&authority, 99));
     }
 
     fn strip_comments(source: &str) -> String {

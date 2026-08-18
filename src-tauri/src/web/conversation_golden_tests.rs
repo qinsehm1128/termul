@@ -18,6 +18,7 @@ use tower::ServiceExt;
 use url::Url;
 use uuid::Uuid;
 
+use super::auth::test_tracing;
 use super::conversation_api;
 use super::ws::{dispatch_conversation_golden_request, AppState, HistoryMode};
 use crate::conversation::contracts::{
@@ -542,6 +543,20 @@ fn seed_recovery(repository: &ConversationRepository) -> RecoveryItemV1 {
         )
         .unwrap();
     item
+}
+
+#[test]
+fn golden_tests_cooperate_with_scoped_capture_logger() {
+    test_tracing::install_forwarding_logger();
+    let source = include_str!("conversation_golden_tests.rs");
+    assert!(
+        !source.contains("log::set_logger"),
+        "golden tests must not install a second global logger"
+    );
+    assert!(
+        source.contains("test_tracing"),
+        "golden tests share the scoped capture-logger identifiers"
+    );
 }
 
 #[tokio::test]

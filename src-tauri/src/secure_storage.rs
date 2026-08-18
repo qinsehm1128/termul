@@ -20,6 +20,15 @@ impl KeyringDeleteError {
     }
 }
 
+/// Host-owned keyring deletion outcome. A failed delete keeps retry ownership
+/// so `RemoteServerState::stop` cannot report success while bearer material remains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KeyringDeleteReceipt {
+    pub deleted: bool,
+    pub retry_owner: bool,
+    pub stable_code: Option<&'static str>,
+}
+
 impl std::fmt::Display for KeyringDeleteError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("keyring credential deletion failed")
@@ -124,6 +133,22 @@ pub(crate) fn keyring_delete_checked(key: &str) -> Result<(), KeyringDeleteError
 
 pub(crate) fn keyring_delete(key: &str) -> Result<(), String> {
     keyring_delete_checked(key).map_err(|error| error.to_string())
+}
+
+#[must_use]
+pub(crate) fn keyring_delete_with_receipt(key: &str) -> KeyringDeleteReceipt {
+    match keyring_delete_checked(key) {
+        Ok(()) => KeyringDeleteReceipt {
+            deleted: true,
+            retry_owner: false,
+            stable_code: None,
+        },
+        Err(error) => KeyringDeleteReceipt {
+            deleted: false,
+            retry_owner: true,
+            stable_code: Some(error.code()),
+        },
+    }
 }
 
 #[cfg(test)]

@@ -199,29 +199,44 @@ impl RemoteServer {
             .is_some_and(tokio::task::JoinHandle::is_finished)
     }
 
-    fn retire_credential(&mut self, lifecycle_phase: &'static str) {
-        if let Some(lease) = self.credential_lease.take() {
-            let generation = lease.generation();
-            let receipt = self.authority.retire_generation(generation);
-            if receipt.is_clean() {
-                log::info!(
-                    target: "termul::remote::host",
-                    "operation=generation_retire generation={} lifecycle_phase={} stable_code=OK keyring_deleted={}",
-                    generation,
-                    lifecycle_phase,
-                    receipt.keyring_deleted
-                );
-            } else {
-                log::error!(
-                    target: "termul::remote::host",
-                    "operation=generation_retire generation={} lifecycle_phase={} stable_code={} keyring_deleted={}",
-                    generation,
-                    lifecycle_phase,
-                    receipt.stable_codes.first().copied().unwrap_or("RETIREMENT_FAILED"),
-                    receipt.keyring_deleted
-                );
+    fn retire_credential(
+        &mut self,
+        lifecycle_phase: &'static str,
+    ) -> crate::web::auth::GenerationRetirementReceipt {
+        let Some(lease) = self.credential_lease.take() else {
+            return crate::web::auth::GenerationRetirementReceipt {
+                generation: 0,
+                credential_invalidated: false,
+                origins_cleared: false,
+                failure_state_cleared: false,
+                keyring_deleted: true,
+                retry_owner: false,
+                stable_codes: Vec::new(),
+            };
+        };
+        let generation = lease.generation();
+        let receipt = self.authority.retire_generation(generation);
+        if receipt.is_clean() {
+            log::info!(
+                target: "termul::remote::host",
+                "operation=generation_retire generation={} lifecycle_phase={} stable_code=OK keyring_deleted={}",
+                generation,
+                lifecycle_phase,
+                receipt.keyring_deleted
+            );
+        } else {
+            if receipt.retry_owner {
+                self.credential_lease = Some(lease);
             }
+            log::error!(
+                target: "termul::remote::host",
+                "operation=generation_retire generation={} lifecycle_phase={} stable_code=REMOTE_CREDENTIAL_CLEANUP_FAILED keyring_deleted={}",
+                generation,
+                lifecycle_phase,
+                receipt.keyring_deleted
+            );
         }
+        receipt
     }
 }
 
@@ -528,11 +543,25 @@ impl RemoteServerState {
     /// live agents survive a shared-live toggle-off.
     pub async fn stop(&self) -> Result<RemoteStatus, String> {
         let _lifecycle = self.lifecycle.lock().await;
+        let receipt = {
+            let mut slot = self.inner.lock().unwrap();
+            match slot.as_mut() {
+                Some(server) => server.retire_credential("stop"),
+                None => return Err("Remote server is not running".to_string()),
+            }
+        };
+        if !receipt.is_clean() {
+            log::error!(
+                target: "termul::remote::host",
+                "operation=shared_live_host lifecycle_phase=stop stable_code=REMOTE_CREDENTIAL_CLEANUP_FAILED generation={} keyring_deleted={} retry_owner={}",
+                receipt.generation,
+                receipt.keyring_deleted,
+                receipt.retry_owner
+            );
+            return Err("REMOTE_CREDENTIAL_CLEANUP_FAILED".to_string());
+        }
         let server = {
             let mut slot = self.inner.lock().unwrap();
-            if let Some(server) = slot.as_mut() {
-                server.retire_credential("stop");
-            }
             slot.take()
         };
         match server {
@@ -606,7 +635,24 @@ impl RemoteServerState {
                 "operation=tunnel_watchdog lifecycle_phase=tunnel_death stable_code=TUNNEL_EXITED"
             );
             let mut failed = slot.take().expect("dead tunnel server slot");
-            failed.retire_credential("tunnel_death");
+            let receipt = failed.retire_credential("tunnel_death");
+            if !receipt.is_clean() {
+                log::error!(
+                    target: "termul::remote::host",
+                    "operation=tunnel_watchdog lifecycle_phase=tunnel_death stable_code=REMOTE_CREDENTIAL_CLEANUP_FAILED generation={} keyring_deleted={} retry_owner={}",
+                    receipt.generation,
+                    receipt.keyring_deleted,
+                    receipt.retry_owner
+                );
+                *slot = Some(failed);
+                return RemoteStatus::running(
+                    slot.as_ref().expect("retry-owned server").addr,
+                    slot.as_ref().expect("retry-owned server").bind_mode,
+                    slot.as_ref().expect("retry-owned server").tunnel_url.clone(),
+                    slot.as_ref()
+                        .and_then(|server| server.credential_lease.as_ref()),
+                );
+            }
             return RemoteStatus::stopped();
         }
         RemoteStatus::running(
@@ -884,6 +930,46 @@ mod tests {
         let err = state.stop().await;
         assert!(err.is_err(), "stop on an unstarted server must error");
         assert!(!state.status().running);
+    }
+
+    #[tokio::test]
+    async fn stop_returns_remote_credential_cleanup_failed_when_keyring_delete_fails() {
+        let (acp, pty, relay, registry) = lifecycle_fixtures();
+        let authority = Arc::new(
+            crate::web::auth::RemoteAccessAuthority::for_desktop_keyring_tests(
+                "test-remote-access-token",
+                "opaque-task002-account",
+            ),
+        );
+        let state = RemoteServerState::with_desktop_authority(authority);
+        state
+            .start(
+                acp,
+                pty,
+                relay,
+                registry,
+                RemoteBindMode::Localhost,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("desktop keyring host starts");
+        assert!(state.status().running);
+        let (generation, _) = active_credential(&state);
+        crate::secure_storage::fail_next_keyring_deletes_for_tests(1);
+        let error = state.stop().await.expect_err("keyring delete must fail stop");
+        assert_eq!(error, "REMOTE_CREDENTIAL_CLEANUP_FAILED");
+        assert!(
+            state.status().running,
+            "retry ownership must keep the host slot when keyring delete fails"
+        );
+        let (retry_generation, _) = active_credential(&state);
+        assert_eq!(retry_generation, generation);
+        crate::secure_storage::fail_next_keyring_deletes_for_tests(0);
+        let stopped = state.stop().await.expect("retry stop succeeds after keyring recovers");
+        assert!(!stopped.running);
     }
 
     /// A real `AcpManager` (zero sinks is legal) + a `WsRelaySink` for the
