@@ -42,9 +42,14 @@ import { persistenceApi } from '@/lib/api'
 import type { ChatMessage } from '@/stores/acp-store'
 import {
   _clearPayloadCacheForTesting,
+  _failedPrefixIdsForTesting,
   _resetHistoryPagingForTesting,
   _resetPendingIndexWriteTrackerForTesting,
+  _resumeMetadataForTesting,
+  _seedFailedPrefixForTesting,
   deriveTitle,
+  disposeFailedPrefixPayloads,
+  FAILED_PREFIX_TTL_MS,
   flushSessionHistory,
   fromPersistedSessionSummary,
   getCachedSessionPayload,
@@ -53,6 +58,8 @@ import {
   INACTIVE_PAYLOAD_CACHE_BUDGET,
   loadSessionIndex,
   loadSessionPayload,
+  MAX_FAILED_PREFIX_ASSEMBLIES,
+  MAX_FAILED_PREFIX_PAYLOAD_BYTES,
   MAX_HISTORY_IN_FLIGHT_BYTES,
   markSessionPayloadPinned,
   maxPayloadSeq,
@@ -1367,5 +1374,53 @@ describe('serialized save/delete/close barriers', () => {
       expect.any(Error)
     )
     consoleError.mockRestore()
+  })
+})
+
+describe('failed prefix budgets', () => {
+  beforeEach(() => {
+    _resetHistoryPagingForTesting()
+  })
+
+  it('failed prefixes evict by count byte and ttl', () => {
+    const now = Date.now()
+    _seedFailedPrefixForTesting('s1', 100, now)
+    _seedFailedPrefixForTesting('s2', 100, now + 1)
+    _seedFailedPrefixForTesting('s3', 100, now + 2)
+    _seedFailedPrefixForTesting('s4', 100, now + 3)
+    _seedFailedPrefixForTesting('s5', 100, now + 4)
+    expect(_failedPrefixIdsForTesting()).toHaveLength(MAX_FAILED_PREFIX_ASSEMBLIES)
+    expect(_failedPrefixIdsForTesting()).not.toContain('s1')
+    expect(_failedPrefixIdsForTesting()).toEqual(['s2', 's3', 's4', 's5'])
+
+    _resetHistoryPagingForTesting()
+    _seedFailedPrefixForTesting('big-1', MAX_FAILED_PREFIX_PAYLOAD_BYTES - 10, now)
+    _seedFailedPrefixForTesting('big-2', 20, now + 1)
+    expect(_failedPrefixIdsForTesting()).toEqual(['big-2'])
+
+    _resetHistoryPagingForTesting()
+    _seedFailedPrefixForTesting('old', 10, now - FAILED_PREFIX_TTL_MS - 1)
+    _seedFailedPrefixForTesting('fresh', 10, now)
+    expect(_failedPrefixIdsForTesting()).toEqual(['fresh'])
+  })
+
+  it('unpin and dispose clear failed prefix payload keep resume metadata', () => {
+    const now = Date.now()
+    _seedFailedPrefixForTesting('kept', 32, now, 'CONVERSATION_PAGE_TOO_LARGE')
+    expect(_failedPrefixIdsForTesting()).toEqual(['kept'])
+    expect(_resumeMetadataForTesting('kept')).toEqual({
+      sessionId: 'kept',
+      cursor: 0,
+      targetLastSeq: 0,
+      errorCode: 'CONVERSATION_PAGE_TOO_LARGE'
+    })
+    unpinSessionPayload('kept')
+    expect(_failedPrefixIdsForTesting()).toEqual([])
+    expect(_resumeMetadataForTesting('kept')?.errorCode).toBe('CONVERSATION_PAGE_TOO_LARGE')
+
+    _seedFailedPrefixForTesting('other', 16, now, 'TRANSPORT_ERROR')
+    disposeFailedPrefixPayloads()
+    expect(_failedPrefixIdsForTesting()).toEqual([])
+    expect(_resumeMetadataForTesting('other')?.errorCode).toBe('TRANSPORT_ERROR')
   })
 })

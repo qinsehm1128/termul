@@ -115,6 +115,16 @@ describe('createTauriSessionWorkspaceApi', () => {
     })
   })
 
+  it('rejects malformed native success data with the same application error as HTTP', async () => {
+    const api = createTauriSessionWorkspaceApi()
+    invokeMock.mockResolvedValueOnce({ success: true, data: { extra: true } })
+    await expect(api.getWorkspace(conversationId)).resolves.toEqual({
+      success: false,
+      error: 'Invalid response from host',
+      code: 'NETWORK_ERROR'
+    })
+  })
+
   it('uses the exact shared RecoveryAction parser', async () => {
     const api = createTauriSessionWorkspaceApi()
     const invalid = await api.resolveRecovery({

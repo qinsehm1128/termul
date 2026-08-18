@@ -22,6 +22,10 @@ export interface ConversationRecoveryPanelProps {
   onItemsChange?: (items: readonly RecoveryItemV1[]) => void
 }
 
+function actionStateKey(recoveryId: string, revision: number): string {
+  return `${recoveryId}:${revision}`
+}
+
 function requestForAction(
   item: RecoveryItemV1,
   conversationId: ConversationId,
@@ -102,6 +106,8 @@ export function ConversationRecoveryPanel({
   const [errors, setErrors] = useState<Record<string, string | undefined>>({})
   const [running, setRunning] = useState<Record<string, RecoveryAction['action'] | undefined>>({})
   const idempotencyKeys = useRef<Record<string, string>>({})
+  const liveItemsRef = useRef(sourceItems)
+  liveItemsRef.current = sourceItems
   const visibleItems = useMemo(() => [...sourceItems], [sourceItems])
 
   if (visibleItems.length === 0) return null
@@ -109,7 +115,10 @@ export function ConversationRecoveryPanel({
   const run = async (item: RecoveryItemV1, action: RecoveryAction['action']): Promise<void> => {
     const canonicalId = actionConversationId(item, conversationId)
     if (!canonicalId && action !== 'inspect' && action !== 'dismissPreservedSource') {
-      setErrors((current) => ({ ...current, [item.recoveryId]: 'CONVERSATION_INVALID_ID' }))
+      setErrors((current) => ({
+        ...current,
+        [actionStateKey(item.recoveryId, item.revision)]: 'CONVERSATION_INVALID_ID'
+      }))
       return
     }
     const idempotencyKeySlot = `${item.recoveryId}:${item.revision}:${action}`
@@ -127,15 +136,23 @@ export function ConversationRecoveryPanel({
       action,
       idempotencyKey
     )
-    setRunning((current) => ({ ...current, [item.recoveryId]: action }))
-    setErrors((current) => ({ ...current, [item.recoveryId]: undefined }))
+    const requestKey = actionStateKey(item.recoveryId, item.revision)
+    const requestedRevision = item.revision
+    setRunning((current) => ({ ...current, [requestKey]: action }))
+    setErrors((current) => ({ ...current, [requestKey]: undefined }))
     if (action === 'inspect') {
-      setInspectedEvidence((current) => ({ ...current, [item.recoveryId]: undefined }))
+      setInspectedEvidence((current) => ({ ...current, [requestKey]: undefined }))
     }
     try {
       const result = await conversationApi.resolveRecovery(request)
+      const live = liveItemsRef.current.find(
+        (candidate) => candidate.recoveryId === item.recoveryId
+      )
+      if (!live || live.revision !== requestedRevision) {
+        return
+      }
       if (!result.success) {
-        setErrors((current) => ({ ...current, [item.recoveryId]: result.code }))
+        setErrors((current) => ({ ...current, [requestKey]: result.code }))
         void logFrontendError({
           level: 'warn',
           source: 'conversation-recovery-panel',
@@ -146,7 +163,7 @@ export function ConversationRecoveryPanel({
       if (!responseMatchesRequest(request, result.data)) {
         setErrors((current) => ({
           ...current,
-          [item.recoveryId]: 'CONVERSATION_RECOVERY_FAILED'
+          [requestKey]: 'CONVERSATION_RECOVERY_FAILED'
         }))
         void logFrontendError({
           level: 'warn',
@@ -155,11 +172,11 @@ export function ConversationRecoveryPanel({
         })
         return
       }
-      setResults((current) => ({ ...current, [item.recoveryId]: result.data }))
+      setResults((current) => ({ ...current, [requestKey]: result.data }))
       if (action === 'inspect') {
         setInspectedEvidence((current) => ({
           ...current,
-          [item.recoveryId]: snapshotInspectedEvidence(result.data)
+          [requestKey]: snapshotInspectedEvidence(result.data)
         }))
       } else {
         const updated = sourceItems.map((candidate) =>
@@ -179,11 +196,11 @@ export function ConversationRecoveryPanel({
       }
     } catch {
       if (action === 'inspect') {
-        setInspectedEvidence((current) => ({ ...current, [item.recoveryId]: undefined }))
+        setInspectedEvidence((current) => ({ ...current, [requestKey]: undefined }))
       }
       setErrors((current) => ({
         ...current,
-        [item.recoveryId]: 'CONVERSATION_RECOVERY_FAILED'
+        [requestKey]: 'CONVERSATION_RECOVERY_FAILED'
       }))
       void logFrontendError({
         level: 'warn',
@@ -191,7 +208,7 @@ export function ConversationRecoveryPanel({
         message: `recoveryId=${item.recoveryId} revision=${item.revision} action=${action} code=CONVERSATION_RECOVERY_FAILED`
       })
     } finally {
-      setRunning((current) => ({ ...current, [item.recoveryId]: undefined }))
+      setRunning((current) => ({ ...current, [requestKey]: undefined }))
     }
   }
 
@@ -215,10 +232,11 @@ export function ConversationRecoveryPanel({
 
       <div className="space-y-3">
         {visibleItems.map((item) => {
-          const result = results[item.recoveryId]
-          const inspected = inspectedEvidence[item.recoveryId]
-          const errorCode = errors[item.recoveryId]
-          const activeAction = running[item.recoveryId]
+          const stateKey = actionStateKey(item.recoveryId, item.revision)
+          const result = results[stateKey]
+          const inspected = inspectedEvidence[stateKey]
+          const errorCode = errors[stateKey]
+          const activeAction = running[stateKey]
           const validatedInspection =
             inspected?.action === 'inspect' &&
             inspected.recoveryId === item.recoveryId &&

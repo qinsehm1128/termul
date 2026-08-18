@@ -304,10 +304,22 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
 
       if (result.success) {
         set((state) => {
-          if (!state.cleanupRecoveries[terminalId]) return state
           const cleanupRecoveries = { ...state.cleanupRecoveries }
           delete cleanupRecoveries[terminalId]
-          return { cleanupRecoveries }
+          const ptyIdIndex = new Map(state.ptyIdIndex)
+          ptyIdIndex.delete(terminalId)
+          const terminals = state.terminals.filter((terminal) => terminal.ptyId !== terminalId)
+          const removedIds = new Set(
+            state.terminals
+              .filter((terminal) => terminal.ptyId === terminalId)
+              .map((terminal) => terminal.id)
+          )
+          return {
+            cleanupRecoveries,
+            ptyIdIndex,
+            terminals,
+            activeTerminalId: removedIds.has(state.activeTerminalId) ? '' : state.activeTerminalId
+          }
         })
         return true
       }

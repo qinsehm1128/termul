@@ -1,6 +1,10 @@
 import { parseConversationId } from '@shared/types/conversation.types'
 import type { ConversationLifecycleAction } from '@shared/types/conversation-lifecycle.types'
 import { afterEach, expect, it, vi } from 'vitest'
+
+const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }))
+vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }))
+
 import {
   _resetAcpTransportForTests,
   _setAcpTransportForTests,
@@ -184,4 +188,15 @@ it('decodes every lifecycle action through the sole HTTP IPC decoder', async () 
     )
   ).rejects.toMatchObject({ code: 'VALIDATION_ERROR' })
   expect(fetchMock).not.toHaveBeenCalled()
+})
+
+it('normalizes Tauri decoder TypeErrors to a stable application error', async () => {
+  invokeMock.mockRejectedValueOnce(new TypeError('IPC result must be an object'))
+  const api = createConversationLifecycleApi('tauri')
+  await expect(api.detachBinding(conversationId, 1)).rejects.toMatchObject({
+    name: 'ConversationLifecycleApiError',
+    code: 'NETWORK_ERROR',
+    message: HTTP_IPC_NETWORK_ERROR_MESSAGE,
+    compensation: null
+  })
 })

@@ -4,7 +4,9 @@ import {
   type ConversationRecordV2,
   type ExecutionTarget,
   isConversationId,
-  type ProjectAttachment
+  type ProjectAttachment,
+  parseConversationAggregateMutationOutcome,
+  parseConversationRecordV2
 } from '@shared/types/conversation.types'
 import type {
   ConversationApi,
@@ -13,9 +15,15 @@ import type {
   LegacyConversationKey,
   LegacyConversationResolution
 } from '@shared/types/conversation-api.types'
-import type { IpcResult } from '@shared/types/ipc.types'
-import { invoke } from '@tauri-apps/api/core'
+import {
+  parseConversationHostStatus,
+  parseConversationOpenOutcome,
+  parseConversationRecordV2Array,
+  parseLegacyConversationResolution
+} from '@shared/types/conversation-api.types'
+import type { IpcDataDecoder, IpcResult } from '@shared/types/ipc.types'
 import { listen } from '@tauri-apps/api/event'
+import { invokeDecodedIpcResult } from './invoke-decoded-ipc-result'
 
 export function normalizeConversationError(error: unknown): IpcResult<never> {
   if (error && typeof error === 'object') {
@@ -50,13 +58,10 @@ function invalidConversationId(): IpcResult<never> {
 
 async function invokeConversation<T>(
   command: string,
+  decodeData: IpcDataDecoder<T>,
   args?: Record<string, unknown>
 ): Promise<IpcResult<T>> {
-  try {
-    return await invoke<IpcResult<T>>(command, args)
-  } catch (error) {
-    return normalizeConversationError(error)
-  }
+  return invokeDecodedIpcResult(command, decodeData, args)
 }
 
 function withConversationId<T>(
@@ -83,15 +88,17 @@ function withExpectedRevision<T>(
 
 export function createTauriConversationApi(): ConversationApi {
   return {
-    getHostStatus: () => invokeConversation<ConversationHostStatus>('conversation_host_status'),
-    listConversations: () => invokeConversation<ConversationRecordV2[]>('conversation_list'),
+    getHostStatus: () =>
+      invokeConversation('conversation_host_status', parseConversationHostStatus),
+    listConversations: () =>
+      invokeConversation('conversation_list', parseConversationRecordV2Array),
     getConversation: (conversationId) =>
       withConversationId(conversationId, () =>
-        invokeConversation<ConversationRecordV2>('conversation_get', { conversationId })
+        invokeConversation('conversation_get', parseConversationRecordV2, { conversationId })
       ),
     openConversation: (conversationId) =>
       withConversationId(conversationId, () =>
-        invokeConversation<ConversationOpenOutcome>('conversation_open', { conversationId })
+        invokeConversation('conversation_open', parseConversationOpenOutcome, { conversationId })
       ),
     resolveLegacyConversationId: (request: LegacyConversationKey) => {
       if (!request.value.trim()) {
@@ -101,9 +108,11 @@ export function createTauriConversationApi(): ConversationApi {
           error: 'legacy value must be non-empty'
         })
       }
-      return invokeConversation<LegacyConversationResolution>('conversation_resolve_legacy_id', {
-        request
-      })
+      return invokeConversation(
+        'conversation_resolve_legacy_id',
+        parseLegacyConversationResolution,
+        { request }
+      )
     },
     attachProject(
       conversationId: ConversationId,
@@ -111,19 +120,27 @@ export function createTauriConversationApi(): ConversationApi {
       attachment: ProjectAttachment
     ) {
       return withExpectedRevision(conversationId, expectedRevision, () =>
-        invokeConversation<ConversationAggregateMutationOutcome>('conversation_attach_project', {
-          conversationId,
-          expectedRevision,
-          attachment
-        })
+        invokeConversation(
+          'conversation_attach_project',
+          parseConversationAggregateMutationOutcome,
+          {
+            conversationId,
+            expectedRevision,
+            attachment
+          }
+        )
       )
     },
     detachProject(conversationId: ConversationId, expectedRevision: number) {
       return withExpectedRevision(conversationId, expectedRevision, () =>
-        invokeConversation<ConversationAggregateMutationOutcome>('conversation_detach_project', {
-          conversationId,
-          expectedRevision
-        })
+        invokeConversation(
+          'conversation_detach_project',
+          parseConversationAggregateMutationOutcome,
+          {
+            conversationId,
+            expectedRevision
+          }
+        )
       )
     },
     updateExecutionTarget(
@@ -132,8 +149,9 @@ export function createTauriConversationApi(): ConversationApi {
       executionTarget: ExecutionTarget
     ) {
       return withExpectedRevision(conversationId, expectedRevision, () =>
-        invokeConversation<ConversationAggregateMutationOutcome>(
+        invokeConversation(
           'conversation_update_execution_target',
+          parseConversationAggregateMutationOutcome,
           { conversationId, expectedRevision, executionTarget }
         )
       )

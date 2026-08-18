@@ -306,4 +306,49 @@ describe('ConversationRecoveryPanel', () => {
       'remote principal lacks the required capability'
     )
   })
+
+  it('recovery action result discarded on revision mismatch', async () => {
+    let resolveAction!: (value: { success: true; data: RecoveryActionResult }) => void
+    resolveRecovery.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveAction = resolve
+        })
+    )
+    const onItemsChange = vi.fn()
+    const { rerender } = render(
+      <ConversationRecoveryPanel
+        items={[item]}
+        conversationId={conversationId}
+        onItemsChange={onItemsChange}
+      />
+    )
+    const associate = document.querySelector<HTMLButtonElement>(
+      '[data-recovery-action="associateConversation"]'
+    )
+    if (!associate) throw new Error('missing associateConversation action')
+    fireEvent.click(associate)
+    await waitFor(() => expect(resolveRecovery).toHaveBeenCalledTimes(1))
+
+    const newer = { ...item, revision: item.revision + 1 }
+    rerender(
+      <ConversationRecoveryPanel
+        items={[newer]}
+        conversationId={conversationId}
+        onItemsChange={onItemsChange}
+      />
+    )
+    resolveAction({
+      success: true,
+      data: resultFor({
+        recoveryId: item.recoveryId,
+        expectedRevision: item.revision,
+        action: 'associateConversation',
+        payload: { conversationId }
+      })
+    })
+    await waitFor(() => expect(resolveRecovery).toHaveBeenCalledTimes(1))
+    expect(onItemsChange).not.toHaveBeenCalled()
+    expect(screen.getByText(new RegExp(`revision ${newer.revision}`))).toBeInTheDocument()
+  })
 })

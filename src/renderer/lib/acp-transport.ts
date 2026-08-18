@@ -482,6 +482,8 @@ const HEARTBEAT_INTERVAL_MS = 30_000
  * never fires (the server→client reply path is broken but client→server works).
  */
 const HEARTBEAT_FAILURE_THRESHOLD = 2
+export const MAX_HISTORY_PAGE_TARGETS = 64
+export const HISTORY_PAGE_TARGET_TTL_MS = 300_000
 
 type Pending = {
   resolve: (value: unknown) => void
@@ -541,7 +543,7 @@ export class WsAcpTransport implements AcpTransport {
   /** Completion tails serialize bounded history requests independently per session. */
   private readonly historyPageRequests = new Map<string, Promise<void>>()
   /** First-page canonical frontier pinned across every later page for that session. */
-  private readonly historyPageTargets = new Map<string, number>()
+  private readonly historyPageTargets = new Map<string, { target: number; storedAt: number }>()
   private readonly listeners = new Map<string, Set<EventListener>>()
   /** Per-session last contiguous delivered seq. */
   private readonly lastSeq = new Map<string, number>()
@@ -661,8 +663,41 @@ export class WsAcpTransport implements AcpTransport {
       )
     }
     this.pending.clear()
+    this.historyPageTargets.clear()
     this.socket?.close()
     this.socket = null
+  }
+
+  historyPageTargetSizeForTesting(): number {
+    this.evictHistoryPageTargets()
+    return this.historyPageTargets.size
+  }
+
+  rememberHistoryPageTargetForTesting(
+    sessionId: string,
+    target: number,
+    storedAt = Date.now()
+  ): void {
+    this.rememberHistoryPageTarget(sessionId, target, storedAt)
+  }
+
+  private evictHistoryPageTargets(now = Date.now()): void {
+    for (const [sessionId, entry] of [...this.historyPageTargets.entries()]) {
+      if (now - entry.storedAt > HISTORY_PAGE_TARGET_TTL_MS) {
+        this.historyPageTargets.delete(sessionId)
+      }
+    }
+    while (this.historyPageTargets.size > MAX_HISTORY_PAGE_TARGETS) {
+      const oldest = this.historyPageTargets.keys().next().value
+      if (oldest === undefined) break
+      this.historyPageTargets.delete(oldest)
+    }
+  }
+
+  private rememberHistoryPageTarget(sessionId: string, target: number, now = Date.now()): void {
+    this.historyPageTargets.delete(sessionId)
+    this.historyPageTargets.set(sessionId, { target, storedAt: now })
+    this.evictHistoryPageTargets(now)
   }
 
   async subscribeSession(
@@ -884,7 +919,8 @@ export class WsAcpTransport implements AcpTransport {
     const request = (async () => {
       if (previous) await previous.catch(() => undefined)
       if (afterSeq === 0) this.historyPageTargets.delete(sessionId)
-      const targetLastSeq = this.historyPageTargets.get(sessionId)
+      this.evictHistoryPageTargets()
+      const targetLastSeq = this.historyPageTargets.get(sessionId)?.target
       const payload: {
         sessionId: string
         afterSeq: number
@@ -904,7 +940,7 @@ export class WsAcpTransport implements AcpTransport {
         )
       }
       if (page.complete) this.historyPageTargets.delete(sessionId)
-      else this.historyPageTargets.set(sessionId, page.targetLastSeq)
+      else this.rememberHistoryPageTarget(sessionId, page.targetLastSeq)
       return page
     })()
     const completion = request.then(

@@ -1,5 +1,6 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { i18n } from '@/i18n'
 import type { AcpSession } from '@/stores/acp-store'
 
 const {
@@ -281,12 +282,14 @@ describe('AgentChatPanel restored-tab rehydration', () => {
     const { rerender } = render(<AgentChatPanel sessionId="s1" isVisible />)
     const progress = screen.getByRole('status')
     expect(progress).toHaveAttribute('aria-live', 'polite')
-    expect(progress).toHaveTextContent('Loading history: 250 of 1000 records · next cursor 250.')
+    expect(progress).toHaveTextContent(
+      'Loading history: 250 entries loaded · next cursor 250 · target frontier 1000.'
+    )
     expect(screen.getByTestId('message-list')).toHaveAttribute('data-message-count', '1')
 
     mobileShellRef.current = false
     rerender(<AgentChatPanel sessionId="s1" isVisible />)
-    expect(screen.getByRole('status')).toHaveTextContent('250 of 1000 records')
+    expect(screen.getByRole('status')).toHaveTextContent('250 entries loaded')
     expect(screen.getByTestId('message-list')).toHaveAttribute('data-message-count', '1')
   })
 
@@ -317,7 +320,7 @@ describe('AgentChatPanel restored-tab rehydration', () => {
     const alert = screen.getByRole('alert')
     expect(alert).toHaveAttribute('aria-live', 'assertive')
     expect(alert).toHaveTextContent(
-      'History incomplete: loaded 250 of 1000 records · next cursor 250 · error code CONVERSATION_PAGE_TOO_LARGE.'
+      'History incomplete: 250 entries loaded · next cursor 250 · target frontier 1000 · error code CONVERSATION_PAGE_TOO_LARGE.'
     )
     const retryHistory = screen.getByRole('button', { name: 'Retry history' })
     const reconnect = screen.getByRole('button', { name: 'Reconnect' })
@@ -451,5 +454,32 @@ describe('AgentChatPanel pending question rendering (issue #411)', () => {
     // AskUserQuestion is mocked to null; assert no crash and the panel area
     // exists (the store selector runs with the seeded question below).
     expect(screen.queryByTestId('ask-user-question')).toBeNull()
+  })
+
+  it('incomplete history copy does not label frontier as record total', async () => {
+    const { readFileSync } = await import('node:fs')
+    const { resolve } = await import('node:path')
+    const en = readFileSync(resolve(process.cwd(), 'src/renderer/locales/en/chat.json'), 'utf8')
+    const zh = readFileSync(resolve(process.cwd(), 'src/renderer/locales/zh-CN/chat.json'), 'utf8')
+    expect(en).not.toMatch(/of \{\{targetLastSeq\}\} records/)
+    expect(zh).not.toContain('条记录')
+    seedLiveSession('s1')
+    backfillRef.current = {
+      s1: {
+        loading: false,
+        complete: false,
+        loadedRecordCount: 250,
+        nextCursor: 250,
+        targetLastSeq: 1_000,
+        errorCode: 'CONVERSATION_PAGE_TOO_LARGE'
+      }
+    }
+    const { rerender } = render(<AgentChatPanel sessionId="s1" isVisible />)
+    expect(screen.getByRole('alert').textContent ?? '').not.toMatch(/of 1000 records/)
+    expect(screen.getByRole('alert').textContent ?? '').not.toContain('条记录')
+    await i18n.changeLanguage('zh-CN')
+    rerender(<AgentChatPanel sessionId="s1" isVisible />)
+    expect(screen.getByRole('alert').textContent ?? '').not.toMatch(/of 1000 records/)
+    expect(screen.getByRole('alert').textContent ?? '').not.toContain('条记录')
   })
 })

@@ -17,7 +17,9 @@ import {
   _setAcpTransportForTests,
   AcpTransportError,
   createAcpTransport,
+  HISTORY_PAGE_TARGET_TTL_MS,
   isTransientAcpTransportError,
+  MAX_HISTORY_PAGE_TARGETS,
   resolveWsUrl,
   toTauriEventName,
   toWsEventType,
@@ -2465,5 +2467,33 @@ describe('Biome @tauri-apps ban (AC8)', () => {
       o.includes?.some((i) => i.includes('renderer/lib'))
     )
     expect(libOverride).toBeTruthy()
+  })
+})
+
+describe('history page target budget', () => {
+  it('bounds historyPageTargets by cardinality and TTL and clears on dispose', () => {
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    const now = Date.now()
+    for (let index = 0; index < MAX_HISTORY_PAGE_TARGETS + 2; index += 1) {
+      transport.rememberHistoryPageTargetForTesting(`s-${index}`, index + 1, now + index)
+    }
+    expect(transport.historyPageTargetSizeForTesting()).toBe(MAX_HISTORY_PAGE_TARGETS)
+
+    const ttlTransport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    ttlTransport.rememberHistoryPageTargetForTesting(
+      'expired',
+      9,
+      now - HISTORY_PAGE_TARGET_TTL_MS - 1
+    )
+    ttlTransport.rememberHistoryPageTargetForTesting('fresh', 10, now)
+    expect(ttlTransport.historyPageTargetSizeForTesting()).toBe(1)
+    ttlTransport.dispose()
+    expect(ttlTransport.historyPageTargetSizeForTesting()).toBe(0)
   })
 })

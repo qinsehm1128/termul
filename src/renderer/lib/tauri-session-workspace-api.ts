@@ -3,27 +3,29 @@ import type {
   RecoveryActionResult,
   ResolveRecoveryItemRequest
 } from '@shared/types/conversation-recovery.types'
-import { parseResolveRecoveryItemRequest } from '@shared/types/conversation-recovery.types'
-import type { IpcResult } from '@shared/types/ipc.types'
-import type {
-  SessionWorkspaceApi,
-  SessionWorkspaceLoadOutcome,
-  SessionWorkspaceV1,
-  SessionWorkspaceWriteOutcome
+import {
+  parseRecoveryActionResult,
+  parseResolveRecoveryItemRequest
+} from '@shared/types/conversation-recovery.types'
+import type { IpcDataDecoder, IpcResult } from '@shared/types/ipc.types'
+import {
+  parseSessionWorkspaceLoadOutcome,
+  parseSessionWorkspaceWriteOutcome,
+  type SessionWorkspaceApi,
+  type SessionWorkspaceLoadOutcome,
+  type SessionWorkspaceV1,
+  type SessionWorkspaceWriteOutcome
 } from '@shared/types/session-workspace.types'
-import { type InvokeArgs, invoke } from '@tauri-apps/api/core'
+import type { InvokeArgs } from '@tauri-apps/api/core'
+import { invokeDecodedIpcResult } from './invoke-decoded-ipc-result'
 import { isTauriContext } from './tauri-runtime'
 
-async function invokeIpc<T>(command: string, args?: InvokeArgs): Promise<IpcResult<T>> {
-  try {
-    return await invoke<IpcResult<T>>(command, args)
-  } catch (error) {
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : String(error),
-      code: 'INVOKE_ERROR'
-    }
-  }
+function invokeIpc<T>(
+  command: string,
+  decodeData: IpcDataDecoder<T>,
+  args?: InvokeArgs
+): Promise<IpcResult<T>> {
+  return invokeDecodedIpcResult(command, decodeData, args)
 }
 
 function invalidConversationId(): IpcResult<never> {
@@ -47,7 +49,9 @@ export function createTauriSessionWorkspaceApi(): SessionWorkspaceApi {
           code: 'INVOKE_ERROR'
         }
       }
-      return invokeIpc('session_workspace_get', { conversationId })
+      return invokeIpc('session_workspace_get', parseSessionWorkspaceLoadOutcome, {
+        conversationId
+      })
     },
 
     async writeWorkspace(
@@ -65,7 +69,11 @@ export function createTauriSessionWorkspaceApi(): SessionWorkspaceApi {
           code: 'INVOKE_ERROR'
         }
       }
-      return invokeIpc('session_workspace_write', { conversationId, basedRevision, workspace })
+      return invokeIpc('session_workspace_write', parseSessionWorkspaceWriteOutcome, {
+        conversationId,
+        basedRevision,
+        workspace
+      })
     },
 
     async resolveRecovery(
@@ -88,7 +96,9 @@ export function createTauriSessionWorkspaceApi(): SessionWorkspaceApi {
           code: 'INVOKE_ERROR'
         }
       }
-      return invokeIpc('conversation_recovery_resolve', { request: parsed })
+      return invokeIpc('conversation_recovery_resolve', parseRecoveryActionResult, {
+        request: parsed
+      })
     }
   }
 }

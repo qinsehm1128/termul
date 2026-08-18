@@ -8,11 +8,11 @@ import {
   parseConversationLifecycleOutcome,
   parseConversationReplacementRequest
 } from '@shared/types/conversation-lifecycle.types'
-import { decodeIpcResult, type IpcResult } from '@shared/types/ipc.types'
-import { invoke } from '@tauri-apps/api/core'
+import type { IpcResult } from '@shared/types/ipc.types'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
 import { HTTP_IPC_NETWORK_ERROR_MESSAGE, requestHttpIpcResult } from '@/lib/http-ipc-result'
 import { AcpTransportError, getAcpTransport, remoteAccessHeaders } from './acp-transport'
+import { invokeDecodedIpcResult } from './invoke-decoded-ipc-result'
 import { isTauriContext } from './tauri-runtime'
 
 type ConversationLifecycleRuntime = 'tauri' | 'web'
@@ -98,14 +98,11 @@ async function tauriMutation(
   request?: ConversationReplacementRequest
 ): Promise<ConversationLifecycleOutcome> {
   assertRequest(conversationId, expectedRevision, request)
-  const result = decodeIpcResult(
-    await invoke<unknown>(command, {
-      conversationId,
-      expectedRevision,
-      ...(request ? { request } : {})
-    }),
-    parseConversationLifecycleOutcome
-  )
+  const result = await invokeDecodedIpcResult(command, parseConversationLifecycleOutcome, {
+    conversationId,
+    expectedRevision,
+    ...(request ? { request } : {})
+  })
   return unwrap(result)
 }
 

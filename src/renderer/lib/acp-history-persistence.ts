@@ -27,6 +27,12 @@ export const WIPE_MIGRATION_KEY = 'acp/sessions/migrated-v2'
 export const INACTIVE_PAYLOAD_CACHE_BUDGET = 3
 export const RENDERER_HISTORY_PAGE_SIZE = 250
 export const MAX_HISTORY_IN_FLIGHT_BYTES = 4 * 1024 * 1024
+export const MAX_FAILED_PREFIX_ASSEMBLIES = 4
+export const MAX_FAILED_PREFIX_PAYLOAD_BYTES = 4_194_304
+export const FAILED_PREFIX_TTL_MS = 120_000
+export const MAX_RESUME_METADATA_ENTRIES = 32
+export const RESUME_METADATA_TTL_MS = 1_800_000
+export const RESUME_METADATA_MAX_BYTES = 8192
 
 export function sessionPayloadKey(id: string): string {
   return `acp/sessions/${id}`
@@ -542,6 +548,15 @@ interface PartialHistoryAssembly {
   accumulator: ProgressiveHistoryAccumulator
   publishedPayload?: SessionPayload
   publishedProgress?: HistoryPageProgress
+  storedAt: number
+  payloadBytes: number
+}
+
+export interface FailedPrefixResumeMetadata {
+  sessionId: string
+  cursor: number
+  targetLastSeq: number
+  errorCode: string
 }
 
 interface HistoryProgressSubscriber {
@@ -559,6 +574,10 @@ interface HistoryLoadFlight {
 }
 
 const partialHistoryAssemblies = new Map<string, PartialHistoryAssembly>()
+const failedPrefixResumeMetadata = new Map<
+  string,
+  FailedPrefixResumeMetadata & { storedAt: number; bytes: number }
+>()
 const historyLoadFlights = new Map<string, HistoryLoadFlight>()
 let currentHistoryInFlightBytes = 0
 let peakHistoryInFlightBytes = 0
@@ -591,8 +610,150 @@ export function historyPagingMetrics(): HistoryPagingMetrics {
   }
 }
 
+function estimateAssemblyBytes(assembly: PartialHistoryAssembly): number {
+  try {
+    return new TextEncoder().encode(JSON.stringify(assembly.accumulator.snapshot())).length
+  } catch {
+    return 0
+  }
+}
+
+function evictFailedPrefixAssemblies(now = Date.now()): void {
+  for (const [id, assembly] of [...partialHistoryAssemblies.entries()]) {
+    if (now - assembly.storedAt > FAILED_PREFIX_TTL_MS) {
+      partialHistoryAssemblies.delete(id)
+    }
+  }
+  while (partialHistoryAssemblies.size > MAX_FAILED_PREFIX_ASSEMBLIES) {
+    const oldest = partialHistoryAssemblies.keys().next().value
+    if (oldest === undefined) break
+    partialHistoryAssemblies.delete(oldest)
+  }
+  let totalBytes = 0
+  for (const assembly of partialHistoryAssemblies.values()) {
+    totalBytes += assembly.payloadBytes
+  }
+  if (totalBytes <= MAX_FAILED_PREFIX_PAYLOAD_BYTES) return
+  for (const id of [...partialHistoryAssemblies.keys()]) {
+    const assembly = partialHistoryAssemblies.get(id)
+    if (!assembly) continue
+    partialHistoryAssemblies.delete(id)
+    totalBytes -= assembly.payloadBytes
+    if (totalBytes <= MAX_FAILED_PREFIX_PAYLOAD_BYTES) return
+  }
+}
+
+function evictResumeMetadata(now = Date.now()): void {
+  for (const [id, entry] of [...failedPrefixResumeMetadata.entries()]) {
+    if (now - entry.storedAt > RESUME_METADATA_TTL_MS) {
+      failedPrefixResumeMetadata.delete(id)
+    }
+  }
+  while (failedPrefixResumeMetadata.size > MAX_RESUME_METADATA_ENTRIES) {
+    const oldest = failedPrefixResumeMetadata.keys().next().value
+    if (oldest === undefined) break
+    failedPrefixResumeMetadata.delete(oldest)
+  }
+  let totalBytes = 0
+  for (const entry of failedPrefixResumeMetadata.values()) {
+    totalBytes += entry.bytes
+  }
+  if (totalBytes <= RESUME_METADATA_MAX_BYTES) return
+  for (const id of [...failedPrefixResumeMetadata.keys()]) {
+    const entry = failedPrefixResumeMetadata.get(id)
+    if (!entry) continue
+    failedPrefixResumeMetadata.delete(id)
+    totalBytes -= entry.bytes
+    if (totalBytes <= RESUME_METADATA_MAX_BYTES) return
+  }
+}
+
+function rememberFailedPrefixResume(
+  id: string,
+  assembly: PartialHistoryAssembly,
+  errorCode: string,
+  now = Date.now()
+): void {
+  const metadata: FailedPrefixResumeMetadata = {
+    sessionId: id,
+    cursor: assembly.accumulator.cursor,
+    targetLastSeq: assembly.accumulator.targetLastSeq ?? 0,
+    errorCode
+  }
+  const bytes = new TextEncoder().encode(JSON.stringify(metadata)).length
+  failedPrefixResumeMetadata.delete(id)
+  failedPrefixResumeMetadata.set(id, { ...metadata, storedAt: now, bytes })
+  evictResumeMetadata(now)
+}
+
+function retainFailedPrefixAssembly(
+  id: string,
+  assembly: PartialHistoryAssembly,
+  errorCode: string,
+  now = Date.now()
+): void {
+  assembly.storedAt = now
+  if (assembly.payloadBytes <= 0) {
+    assembly.payloadBytes = estimateAssemblyBytes(assembly)
+  }
+  partialHistoryAssemblies.delete(id)
+  partialHistoryAssemblies.set(id, assembly)
+  rememberFailedPrefixResume(id, assembly, errorCode, now)
+  evictFailedPrefixAssemblies(now)
+}
+
+export function clearFailedPrefixPayload(id: string): void {
+  partialHistoryAssemblies.delete(id)
+}
+
+export function disposeFailedPrefixPayloads(): void {
+  partialHistoryAssemblies.clear()
+}
+
+export function _failedPrefixIdsForTesting(): string[] {
+  return [...partialHistoryAssemblies.keys()]
+}
+
+export function _resumeMetadataForTesting(id: string): FailedPrefixResumeMetadata | undefined {
+  const entry = failedPrefixResumeMetadata.get(id)
+  if (!entry) return undefined
+  return {
+    sessionId: entry.sessionId,
+    cursor: entry.cursor,
+    targetLastSeq: entry.targetLastSeq,
+    errorCode: entry.errorCode
+  }
+}
+
+export function _seedFailedPrefixForTesting(
+  id: string,
+  payloadBytes: number,
+  storedAt = Date.now(),
+  errorCode = 'TRANSPORT_ERROR'
+): void {
+  const metadata: SessionIndexEntry = {
+    id,
+    agentId: 'test',
+    title: id,
+    cwd: '/',
+    projectId: '',
+    createdAt: 0,
+    lastActivityAt: 0,
+    messageCount: 0,
+    status: 'closed'
+  }
+  const assembly: PartialHistoryAssembly = {
+    mode: 'tauri_store',
+    accumulator: new ProgressiveHistoryAccumulator(metadata),
+    storedAt,
+    payloadBytes
+  }
+  retainFailedPrefixAssembly(id, assembly, errorCode, storedAt)
+}
+
 export function _resetHistoryPagingForTesting(): void {
   partialHistoryAssemblies.clear()
+  failedPrefixResumeMetadata.clear()
   historyLoadFlights.clear()
   currentHistoryInFlightBytes = 0
   peakHistoryInFlightBytes = 0
@@ -916,6 +1077,7 @@ export function markSessionPayloadPinned(id: string): void {
 
 export function unpinSessionPayload(id: string): void {
   pinnedPayloads.delete(id)
+  clearFailedPrefixPayload(id)
   evictInactivePayloads()
 }
 
@@ -1115,7 +1277,12 @@ async function runHistoryTraversal(
   if (!assembly) {
     const metadata = await historyMetadata(id, mode, options)
     if (!metadata) return null
-    assembly = { mode, accumulator: new ProgressiveHistoryAccumulator(metadata) }
+    assembly = {
+      mode,
+      accumulator: new ProgressiveHistoryAccumulator(metadata),
+      storedAt: Date.now(),
+      payloadBytes: 0
+    }
     partialHistoryAssemblies.set(id, assembly)
   } else if (assembly.accumulator.cursor > 0 && assembly.accumulator.targetLastSeq !== undefined) {
     const resumedProgress = accumulatorProgress(id, assembly, 0, 0, true)
@@ -1183,6 +1350,7 @@ async function runHistoryTraversal(
     }
   } catch (error) {
     const transient = isTransientHistoryError(error)
+    const code = historyErrorCode(error) ?? 'TRANSPORT_ERROR'
     if (assembly.accumulator.cursor > 0) {
       // Every later-page failure retains the verified prefix and pinned frontier. Stable failures
       // (for example `stale` or an oversized page) must not silently turn Retry history into a
@@ -1193,10 +1361,10 @@ async function runHistoryTraversal(
         await publishHistorySnapshot(flight, assembly, retainedPayload, failureProgress)
       }
       flight.lastProgress = failureProgress
+      retainFailedPrefixAssembly(id, assembly, code)
     } else {
       partialHistoryAssemblies.delete(id)
     }
-    const code = historyErrorCode(error) ?? 'TRANSPORT_ERROR'
     void logFrontendError({
       level: transient ? 'warn' : 'error',
       source: 'acp.historyPaging',

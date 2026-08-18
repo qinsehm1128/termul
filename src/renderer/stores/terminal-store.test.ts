@@ -940,26 +940,29 @@ describe('terminal-store', () => {
       expect(terminalApi.resume).not.toHaveBeenCalled()
     })
 
-    it('clears only cleanup-only tracking after successful terminate and preserves terminal state', async () => {
+    it('successful destructive cleanup retry reconciles terminal record', async () => {
       useTerminalStore.setState((state) => ({
         terminals: state.terminals.map((terminal) =>
           terminal.id === 't1'
             ? { ...terminal, ptyId: 'pty-cleanup-success', claim: 'memory-only-claim' }
             : terminal
-        )
+        ),
+        ptyIdIndex: new Map([['pty-cleanup-success', 't1']]),
+        activeTerminalId: 't1'
       }))
-      const beforeTerminal = useTerminalStore
-        .getState()
-        .terminals.find((terminal) => terminal.id === 't1')
       const { recordTerminalCleanupFailure, retryTerminalCleanup } = useTerminalStore.getState()
       recordTerminalCleanupFailure(failure('pty-cleanup-success'))
 
       await expect(retryTerminalCleanup('pty-cleanup-success')).resolves.toBe(true)
 
-      expect(useTerminalStore.getState().cleanupRecoveries['pty-cleanup-success']).toBeUndefined()
+      const state = useTerminalStore.getState()
+      expect(state.cleanupRecoveries['pty-cleanup-success']).toBeUndefined()
+      expect(state.terminals.find((terminal) => terminal.id === 't1')).toBeUndefined()
       expect(
-        useTerminalStore.getState().terminals.find((terminal) => terminal.id === 't1')
-      ).toEqual(beforeTerminal)
+        state.terminals.find((terminal) => terminal.ptyId === 'pty-cleanup-success')
+      ).toBeUndefined()
+      expect(state.ptyIdIndex.has('pty-cleanup-success')).toBe(false)
+      expect(state.activeTerminalId).not.toBe('t1')
       expect(terminalApi.terminate).toHaveBeenCalledWith('pty-cleanup-success')
       expect(terminalApi.spawn).not.toHaveBeenCalled()
       expect(terminalApi.resume).not.toHaveBeenCalled()
