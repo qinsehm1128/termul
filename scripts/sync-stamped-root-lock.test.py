@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import atexit
+import errno
+import importlib.util
 from pathlib import Path
 import subprocess
 import sys
@@ -12,6 +15,27 @@ import unittest
 
 SCRIPT = Path(__file__).with_name("sync-stamped-root-lock.py").resolve()
 PACKAGE = "termul-manager"
+BYTECODE_CACHE = Path(importlib.util.cache_from_source(__file__)).resolve()
+
+
+def cleanup_generated_bytecode() -> None:
+    """Remove only this fixture's importlib cache and its directory when empty."""
+    cache_path = BYTECODE_CACHE
+    try:
+        cache_path.unlink()
+    except FileNotFoundError:
+        pass
+
+    try:
+        cache_path.parent.rmdir()
+    except FileNotFoundError:
+        pass
+    except OSError as error:
+        if error.errno not in (errno.ENOTEMPTY, errno.EEXIST):
+            raise
+
+
+atexit.register(cleanup_generated_bytecode)
 
 
 def write_fixture(root: Path, version: str, lock_text: str) -> tuple[Path, Path]:
