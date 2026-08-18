@@ -462,8 +462,10 @@ describe('Conversation-first desktop/browser flow matrix', () => {
     }))
     render(<ConversationRecoveryPanel items={[recoveryItem]} conversationId={ID} embedded />)
 
+    expect(screen.getAllByRole('complementary', { name: 'Conversation recovery' })).toHaveLength(1)
+    expect(document.querySelectorAll('[data-conversation-recovery-panel]')).toHaveLength(1)
     for (const action of recoveryItem.suggestedActions) {
-      expect(document.querySelector(`[data-recovery-action="${action}"]`)).toBeVisible()
+      expect(document.querySelectorAll(`[data-recovery-action="${action}"]`)).toHaveLength(1)
     }
     expect(screen.queryByText(/legacy_workspace_manifests\/0\/shared.json/)).not.toBeInTheDocument()
 
@@ -481,6 +483,20 @@ describe('Conversation-first desktop/browser flow matrix', () => {
     expect(screen.getAllByText(new RegExp(`sha256:${'e'.repeat(64)}`)).length).toBeGreaterThan(0)
     expect(screen.getByText('{"candidate":"preserved"}')).toBeVisible()
     expect(recoveryItem).toEqual(originalSnapshot)
+
+    mockConversationApi.resolveRecovery.mockClear()
+    fireEvent.click(screen.getByRole('button', { name: 'Associate conversation' }))
+    await waitFor(() => expect(mockConversationApi.resolveRecovery).toHaveBeenCalledTimes(1))
+    expect(mockConversationApi.resolveRecovery.mock.calls[0][0]).toEqual({
+      recoveryId: recoveryItem.recoveryId,
+      expectedRevision: 1,
+      action: 'associateConversation',
+      idempotencyKey: expect.stringMatching(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+      ),
+      payload: { conversationId: ID }
+    })
+    expect(document.querySelectorAll('[data-conversation-recovery-panel]')).toHaveLength(1)
   })
 
   it.each([

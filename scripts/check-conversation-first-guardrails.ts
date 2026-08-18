@@ -1,7 +1,17 @@
 import { readdirSync, readFileSync } from 'node:fs'
-import { extname, join, relative, resolve, sep } from 'node:path'
+import { extname, join, posix, relative, resolve, sep } from 'node:path'
 import { ts } from '@ts-morph/common'
-import { isMap, isScalar, isSeq, LineCounter, parseDocument, type Node as YamlNode } from 'yaml'
+import {
+  isMap,
+  isScalar,
+  isSeq,
+  LineCounter,
+  type Pair,
+  parseDocument,
+  type YAMLMap,
+  type Document as YamlDocument,
+  type Node as YamlNode
+} from 'yaml'
 
 export interface GuardFinding {
   rule: string
@@ -12,9 +22,50 @@ export interface GuardFinding {
 
 export type GuardSources = Readonly<Record<string, string>>
 
+type ReachabilityScope = 'default' | 'exports'
+
 interface SemanticSymbol {
   module: string
   exported: string
+}
+
+interface FunctionNodeInfo {
+  key: string
+  file: string
+  name: string
+  node: ts.FunctionLikeDeclaration
+  exported: boolean
+}
+
+interface WorkflowStep {
+  job: string
+  index: number
+  line: number
+  name?: string
+  nameScalar: boolean
+  run?: string
+  runScalar: boolean
+  uses?: string
+  usesScalar: boolean
+  args?: string
+  argsPresent: boolean
+  argsScalar: boolean
+}
+
+interface ParsedWorkflow {
+  file: string
+  source: string
+  document: YamlDocument.Parsed
+  steps: WorkflowStep[]
+  data: {
+    jobs?: Record<
+      string,
+      {
+        strategy?: { matrix?: { include?: Array<Record<string, unknown>> } }
+        steps?: Array<Record<string, unknown>>
+      }
+    >
+  }
 }
 
 const PORTABLE_EFFECT_HOOKS = [
@@ -72,8 +123,21 @@ const SHARED_PARSER_ADAPTER_SUFFIXES = [
   'src/renderer/lib/web-session-workspace-api.ts'
 ] as const
 
+const PR_GUARD_STEP_NAME = 'Check conversation-first guardrails'
+const PR_GUARD_RUN = 'bun run check:conversation-first'
+const SYNC_STEP_NAME = 'Synchronize stamped root lock entry'
+const SYNC_RUN =
+  'python3 scripts/sync-stamped-root-lock.py --manifest src-tauri/Cargo.toml --lockfile src-tauri/Cargo.lock --package termul-manager\n' +
+  'cargo metadata --locked --manifest-path src-tauri/Cargo.toml --format-version 1 --no-deps'
+const WINDOWS_TOKEN_SECURITY_RUN =
+  'cargo test --locked web::auth::tests::windows_token_descriptor_rejects_foreign_owner_null_dacl_and_broad_allow_ace -- --exact'
+
 function normalizePath(path: string): string {
   return path.split(sep).join('/')
+}
+
+function virtualPath(path: string): string {
+  return `/${normalizePath(path).replace(/^\/+/, '')}`
 }
 
 function lineAt(sourceFile: ts.SourceFile, node: ts.Node): number {
@@ -99,69 +163,537 @@ function isTypeScriptFile(file: string): boolean {
   return /\.(?:ts|tsx)$/.test(file) && !/\.d\.ts$/.test(file)
 }
 
-class TypeScriptModel {
-  readonly sourceFile: ts.SourceFile
-  private readonly imports = new Map<string, SemanticSymbol>()
-  private readonly aliases = new Map<string, ts.Expression>()
+const SEMANTIC_SOURCE_SUFFIXES = new Set([
+  'src/renderer/App.tsx',
+  'src/renderer/TauriApp.tsx',
+  'src/renderer/app/PortableAppEffects.tsx',
+  'src/renderer/app/portable-router.tsx',
+  'src/renderer/pages/WorkspaceDashboard.tsx',
+  'src/renderer/lib/conversation-api.ts',
+  'src/renderer/lib/acp-history-persistence.ts',
+  'src/renderer/lib/acp-transport.ts',
+  'src/shared/types/session-workspace.types.ts',
+  'src/shared/types/web-terminal-protocol.types.ts',
+  ...SHARED_PARSER_ADAPTER_SUFFIXES
+])
 
-  constructor(
-    readonly file: string,
-    readonly source: string
+function isSemanticTypeScriptSource(file: string, source: string): boolean {
+  const normalized = normalizePath(file)
+  return (
+    SEMANTIC_SOURCE_SUFFIXES.has(normalized) ||
+    (normalized.startsWith('src/renderer/') &&
+      /\b(?:terminate|forceKill|force_kill|kill_all|kill|terminateTerminalResource|writeManifest|deleteManifest|saveHistorySession|deleteHistorySession)\b/.test(
+        source
+      ))
+  )
+}
+
+function hasModifier(node: ts.Node, kind: ts.SyntaxKind): boolean {
+  return (
+    ts.canHaveModifiers(node) && Boolean(ts.getModifiers(node)?.some((item) => item.kind === kind))
+  )
+}
+
+function isFunctionNode(node: ts.Node): node is ts.FunctionLikeDeclaration {
+  return (
+    ts.isFunctionDeclaration(node) ||
+    ts.isFunctionExpression(node) ||
+    ts.isArrowFunction(node) ||
+    ts.isMethodDeclaration(node)
+  )
+}
+
+function functionName(node: ts.FunctionLikeDeclaration): string {
+  if ('name' in node && node.name && ts.isIdentifier(node.name)) return node.name.text
+  if (
+    (ts.isFunctionExpression(node) || ts.isArrowFunction(node)) &&
+    ts.isVariableDeclaration(node.parent) &&
+    ts.isIdentifier(node.parent.name)
   ) {
-    this.sourceFile = ts.createSourceFile(
-      file,
-      source,
-      ts.ScriptTarget.Latest,
-      true,
-      scriptKind(file)
+    return node.parent.name.text
+  }
+  return '<anonymous>'
+}
+
+function functionIsExported(node: ts.FunctionLikeDeclaration): boolean {
+  if (ts.isFunctionDeclaration(node)) {
+    return (
+      hasModifier(node, ts.SyntaxKind.ExportKeyword) ||
+      hasModifier(node, ts.SyntaxKind.DefaultKeyword)
     )
-    this.indexBindings()
+  }
+  if (
+    (ts.isFunctionExpression(node) || ts.isArrowFunction(node)) &&
+    ts.isVariableDeclaration(node.parent) &&
+    ts.isVariableDeclarationList(node.parent.parent) &&
+    ts.isVariableStatement(node.parent.parent.parent)
+  ) {
+    return hasModifier(node.parent.parent.parent, ts.SyntaxKind.ExportKeyword)
+  }
+  for (let owner: ts.Node | undefined = node.parent; owner; owner = owner.parent) {
+    if (
+      ts.isVariableDeclaration(owner) &&
+      ts.isVariableDeclarationList(owner.parent) &&
+      ts.isVariableStatement(owner.parent.parent) &&
+      hasModifier(owner.parent.parent, ts.SyntaxKind.ExportKeyword)
+    ) {
+      return true
+    }
+    if (ts.isClassDeclaration(owner)) {
+      return (
+        hasModifier(owner, ts.SyntaxKind.ExportKeyword) ||
+        hasModifier(owner, ts.SyntaxKind.DefaultKeyword)
+      )
+    }
+    if (isFunctionNode(owner)) return functionIsExported(owner)
+  }
+  return false
+}
+
+function constantBoolean(expression: ts.Expression): boolean | undefined {
+  if (expression.kind === ts.SyntaxKind.TrueKeyword) return true
+  if (expression.kind === ts.SyntaxKind.FalseKeyword) return false
+  if (ts.isParenthesizedExpression(expression)) return constantBoolean(expression.expression)
+  if (
+    ts.isPrefixUnaryExpression(expression) &&
+    expression.operator === ts.SyntaxKind.ExclamationToken
+  ) {
+    const value = constantBoolean(expression.operand)
+    return value === undefined ? undefined : !value
+  }
+  return undefined
+}
+
+function containsNode(container: ts.Node, candidate: ts.Node): boolean {
+  return candidate.pos >= container.pos && candidate.end <= container.end
+}
+
+function isStaticallyDead(node: ts.Node): boolean {
+  let child: ts.Node = node
+  for (let parent = node.parent; parent; child = parent, parent = parent.parent) {
+    if (ts.isIfStatement(parent)) {
+      const value = constantBoolean(parent.expression)
+      if (value === false && containsNode(parent.thenStatement, child)) return true
+      if (value === true && parent.elseStatement && containsNode(parent.elseStatement, child)) {
+        return true
+      }
+    }
+    if (ts.isConditionalExpression(parent)) {
+      const value = constantBoolean(parent.condition)
+      if (value === false && containsNode(parent.whenTrue, child)) return true
+      if (value === true && containsNode(parent.whenFalse, child)) return true
+    }
+    if (
+      (ts.isWhileStatement(parent) || ts.isDoStatement(parent)) &&
+      constantBoolean(parent.expression) === false &&
+      containsNode(parent.statement, child)
+    ) {
+      return true
+    }
+    if (ts.isBlock(parent)) {
+      const containingIndex = parent.statements.findIndex((statement) =>
+        containsNode(statement, child)
+      )
+      if (
+        containingIndex > 0 &&
+        parent.statements
+          .slice(0, containingIndex)
+          .some((statement) => ts.isReturnStatement(statement) || ts.isThrowStatement(statement))
+      ) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+class TypeScriptProject {
+  readonly checker: ts.TypeChecker
+  private readonly absoluteSources = new Map<string, string>()
+  private readonly sourceFiles = new Map<string, ts.SourceFile>()
+  private readonly functions = new Map<string, FunctionNodeInfo>()
+  private readonly nodeFunctionKeys = new Map<ts.FunctionLikeDeclaration, string>()
+  private readonly functionKeysByFile = new Map<string, Set<string>>()
+  private readonly exportedKeysByFile = new Map<string, Set<string>>()
+  private readonly defaultKeysByFile = new Map<string, Set<string>>()
+  private readonly moduleRootByFile = new Map<string, string>()
+  private readonly graph = new Map<string, Set<string>>()
+  private readonly callsByFile = new Map<string, ts.CallExpression[]>()
+  private readonly jsxByFile = new Map<string, ts.JsxOpeningLikeElement[]>()
+  private readonly reachableCache = new Map<string, Set<string>>()
+
+  constructor(readonly sources: GuardSources) {
+    for (const [file, source] of Object.entries(sources)) {
+      if (isTypeScriptFile(file)) this.absoluteSources.set(virtualPath(file), source)
+    }
+    const options: ts.CompilerOptions = {
+      allowJs: false,
+      jsx: ts.JsxEmit.ReactJSX,
+      module: ts.ModuleKind.ESNext,
+      moduleResolution: ts.ModuleResolutionKind.Bundler,
+      noLib: true,
+      noResolve: false,
+      skipLibCheck: true,
+      strict: false,
+      target: ts.ScriptTarget.Latest
+    }
+    const defaultHost = ts.createCompilerHost(options, true)
+    const host: ts.CompilerHost = {
+      ...defaultHost,
+      fileExists: (path) => this.absoluteSources.has(normalizePath(path)),
+      readFile: (path) => this.absoluteSources.get(normalizePath(path)),
+      getCurrentDirectory: () => '/',
+      getCanonicalFileName: (path) => normalizePath(path),
+      getNewLine: () => '\n',
+      useCaseSensitiveFileNames: () => true,
+      writeFile: () => undefined,
+      getSourceFile: (path, languageVersion) => {
+        const normalized = normalizePath(path)
+        const source = this.absoluteSources.get(normalized)
+        if (source === undefined) return undefined
+        return ts.createSourceFile(
+          normalized,
+          source,
+          languageVersion,
+          true,
+          scriptKind(normalized)
+        )
+      },
+      resolveModuleNames: (moduleNames, containingFile) =>
+        moduleNames.map((moduleName) => {
+          const resolved = this.resolveModule(moduleName, containingFile)
+          return resolved
+            ? {
+                resolvedFileName: resolved,
+                extension: resolved.endsWith('.tsx') ? ts.Extension.Tsx : ts.Extension.Ts,
+                isExternalLibraryImport: false
+              }
+            : undefined
+        })
+    }
+    const program = ts.createProgram([...this.absoluteSources.keys()], options, host)
+    this.checker = program.getTypeChecker()
+    for (const absolute of this.absoluteSources.keys()) {
+      const sourceFile = program.getSourceFile(absolute)
+      if (sourceFile) this.sourceFiles.set(absolute.slice(1), sourceFile)
+    }
+    this.indexFunctions()
+    this.indexEdges()
   }
 
-  private indexBindings(): void {
-    for (const statement of this.sourceFile.statements) {
-      if (ts.isImportDeclaration(statement) && ts.isStringLiteral(statement.moduleSpecifier)) {
-        const module = statement.moduleSpecifier.text
-        const clause = statement.importClause
-        if (!clause) continue
-        if (clause.name) this.imports.set(clause.name.text, { module, exported: 'default' })
-        if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
-          for (const element of clause.namedBindings.elements) {
-            this.imports.set(element.name.text, {
-              module,
-              exported: element.propertyName?.text ?? element.name.text
-            })
-          }
-        } else if (clause.namedBindings && ts.isNamespaceImport(clause.namedBindings)) {
-          this.imports.set(clause.namedBindings.name.text, { module, exported: '*' })
+  private resolveModule(moduleName: string, containingFile: string): string | undefined {
+    let base: string
+    if (moduleName.startsWith('@/')) {
+      base = `/src/renderer/${moduleName.slice(2)}`
+    } else if (moduleName.startsWith('@shared/')) {
+      base = `/src/shared/${moduleName.slice('@shared/'.length)}`
+    } else if (moduleName.startsWith('.')) {
+      base = posix.normalize(posix.join(posix.dirname(normalizePath(containingFile)), moduleName))
+    } else {
+      return undefined
+    }
+    for (const candidate of [
+      base,
+      `${base}.ts`,
+      `${base}.tsx`,
+      `${base}/index.ts`,
+      `${base}/index.tsx`
+    ]) {
+      if (this.absoluteSources.has(candidate)) return candidate
+    }
+    return undefined
+  }
+
+  sourceFile(file: string): ts.SourceFile | undefined {
+    return this.sourceFiles.get(normalizePath(file))
+  }
+
+  private moduleRoot(file: string): string {
+    let key = this.moduleRootByFile.get(file)
+    if (!key) {
+      key = `${file}::<module>`
+      this.moduleRootByFile.set(file, key)
+      this.graph.set(key, new Set())
+    }
+    return key
+  }
+
+  private addFunction(node: ts.FunctionLikeDeclaration, file: string): void {
+    const key = `${file}:${node.getStart()}`
+    const info: FunctionNodeInfo = {
+      key,
+      file,
+      name: functionName(node),
+      node,
+      exported: functionIsExported(node)
+    }
+    this.functions.set(key, info)
+    this.nodeFunctionKeys.set(node, key)
+    const fileKeys = this.functionKeysByFile.get(file) ?? new Set<string>()
+    fileKeys.add(key)
+    this.functionKeysByFile.set(file, fileKeys)
+    if (info.exported) {
+      const exported = this.exportedKeysByFile.get(file) ?? new Set<string>()
+      exported.add(key)
+      this.exportedKeysByFile.set(file, exported)
+    }
+    if (
+      (ts.isFunctionDeclaration(node) && hasModifier(node, ts.SyntaxKind.DefaultKeyword)) ||
+      (ts.isFunctionExpression(node) && hasModifier(node, ts.SyntaxKind.DefaultKeyword))
+    ) {
+      const defaults = this.defaultKeysByFile.get(file) ?? new Set<string>()
+      defaults.add(key)
+      this.defaultKeysByFile.set(file, defaults)
+    }
+    this.graph.set(key, new Set())
+  }
+
+  private indexFunctions(): void {
+    for (const [file, sourceFile] of this.sourceFiles) {
+      this.moduleRoot(file)
+      const visit = (node: ts.Node): void => {
+        if (isFunctionNode(node) && node.body) this.addFunction(node, file)
+        ts.forEachChild(node, visit)
+      }
+      visit(sourceFile)
+    }
+
+    for (const [file, sourceFile] of this.sourceFiles) {
+      for (const statement of sourceFile.statements) {
+        if (!ts.isExportAssignment(statement) || statement.isExportEquals) continue
+        const target = this.targetFunctionKey(statement.expression)
+        if (!target) continue
+        const defaults = this.defaultKeysByFile.get(file) ?? new Set<string>()
+        defaults.add(target)
+        this.defaultKeysByFile.set(file, defaults)
+      }
+    }
+  }
+
+  private nearestFunctionKey(node: ts.Node): string | undefined {
+    for (let owner = node.parent; owner; owner = owner.parent) {
+      if (isFunctionNode(owner)) return this.nodeFunctionKeys.get(owner)
+    }
+    return undefined
+  }
+
+  private declarationsForSymbol(
+    symbol: ts.Symbol | undefined,
+    seen = new Set<ts.Symbol>()
+  ): ts.Declaration[] {
+    if (!symbol || seen.has(symbol)) return []
+    seen.add(symbol)
+    const declarations = [...(symbol.declarations ?? [])]
+    if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+      const aliased = this.checker.getAliasedSymbol(symbol)
+      if (aliased && aliased !== symbol)
+        declarations.push(...this.declarationsForSymbol(aliased, seen))
+    }
+    return declarations
+  }
+
+  private targetFunctionKey(expression: ts.Expression): string | undefined {
+    let targetExpression = expression
+    while (ts.isParenthesizedExpression(targetExpression))
+      targetExpression = targetExpression.expression
+    const symbol = this.checker.getSymbolAtLocation(targetExpression)
+    for (const declaration of this.declarationsForSymbol(symbol)) {
+      if (isFunctionNode(declaration)) {
+        const key = this.nodeFunctionKeys.get(declaration)
+        if (key) return key
+      }
+      if (ts.isVariableDeclaration(declaration) && declaration.initializer) {
+        if (isFunctionNode(declaration.initializer)) {
+          const key = this.nodeFunctionKeys.get(declaration.initializer)
+          if (key) return key
+        }
+        if (ts.isExpression(declaration.initializer)) {
+          const key = this.targetFunctionKey(declaration.initializer)
+          if (key) return key
         }
       }
     }
-
-    const visit = (node: ts.Node): void => {
-      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
-        this.aliases.set(node.name.text, node.initializer)
-      }
-      ts.forEachChild(node, visit)
-    }
-    visit(this.sourceFile)
+    return undefined
   }
 
-  resolveExpression(expression: ts.Expression, seen = new Set<string>()): SemanticSymbol | null {
+  private addEdge(owner: string, target: string | undefined): void {
+    if (target) this.graph.get(owner)?.add(target)
+  }
+
+  private indexEdges(): void {
+    for (const [file, sourceFile] of this.sourceFiles) {
+      const calls: ts.CallExpression[] = []
+      const jsx: ts.JsxOpeningLikeElement[] = []
+      const visit = (node: ts.Node): void => {
+        if (ts.isCallExpression(node)) {
+          calls.push(node)
+          if (!isStaticallyDead(node)) {
+            const owner = this.nearestFunctionKey(node) ?? this.moduleRoot(file)
+            this.addEdge(owner, this.targetFunctionKey(node.expression))
+            for (const argument of node.arguments) {
+              if (isFunctionNode(argument)) this.addEdge(owner, this.nodeFunctionKeys.get(argument))
+            }
+          }
+        }
+        if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
+          jsx.push(node)
+          if (!isStaticallyDead(node)) {
+            const owner = this.nearestFunctionKey(node) ?? this.moduleRoot(file)
+            if (ts.isIdentifier(node.tagName) || ts.isPropertyAccessExpression(node.tagName)) {
+              this.addEdge(owner, this.targetFunctionKey(node.tagName))
+            }
+          }
+        }
+        ts.forEachChild(node, visit)
+      }
+      visit(sourceFile)
+      this.callsByFile.set(file, calls)
+      this.jsxByFile.set(file, jsx)
+    }
+  }
+
+  private seeds(file: string, scope: ReachabilityScope): Set<string> {
+    const seeds = new Set<string>([this.moduleRoot(file)])
+    const selected =
+      scope === 'default' ? this.defaultKeysByFile.get(file) : this.exportedKeysByFile.get(file)
+    for (const key of selected ?? []) seeds.add(key)
+    return seeds
+  }
+
+  private reachable(seeds: Iterable<string>): Set<string> {
+    const reached = new Set<string>()
+    const pending = [...seeds]
+    while (pending.length > 0) {
+      const key = pending.pop()
+      if (!key || reached.has(key)) continue
+      reached.add(key)
+      for (const target of this.graph.get(key) ?? []) pending.push(target)
+    }
+    return reached
+  }
+
+  private reachableFor(file: string, scope: ReachabilityScope): Set<string> {
+    const cacheKey = `${file}:${scope}`
+    let reached = this.reachableCache.get(cacheKey)
+    if (!reached) {
+      reached = this.reachable(this.seeds(file, scope))
+      this.reachableCache.set(cacheKey, reached)
+    }
+    return reached
+  }
+
+  private ownerReachable(node: ts.Node, file: string, scope: ReachabilityScope): boolean {
+    if (isStaticallyDead(node)) return false
+    const owner = this.nearestFunctionKey(node) ?? this.moduleRoot(file)
+    return this.reachableFor(file, scope).has(owner)
+  }
+
+  calls(file: string, scope: ReachabilityScope): ts.CallExpression[] {
+    return (this.callsByFile.get(file) ?? []).filter((node) =>
+      this.ownerReachable(node, file, scope)
+    )
+  }
+
+  jsx(file: string, scope: ReachabilityScope): ts.JsxOpeningLikeElement[] {
+    return (this.jsxByFile.get(file) ?? []).filter((node) => this.ownerReachable(node, file, scope))
+  }
+
+  functionNameForNode(node: ts.Node): string {
+    const key = this.nearestFunctionKey(node)
+    return key ? (this.functions.get(key)?.name ?? '') : ''
+  }
+
+  callReachableFromNamedFunction(file: string, call: ts.CallExpression, pattern: RegExp): boolean {
+    const owner = this.nearestFunctionKey(call)
+    if (!owner || isStaticallyDead(call)) return false
+    const seeds = [...(this.functionKeysByFile.get(file) ?? [])].filter((key) =>
+      pattern.test(this.functions.get(key)?.name ?? '')
+    )
+    return this.reachable(seeds).has(owner)
+  }
+}
+
+class TypeScriptModel {
+  readonly sourceFile: ts.SourceFile
+
+  constructor(
+    private readonly project: TypeScriptProject,
+    readonly file: string,
+    readonly source: string
+  ) {
+    const sourceFile = project.sourceFile(file)
+    if (!sourceFile) throw new Error(`missing TypeScript source model for ${file}`)
+    this.sourceFile = sourceFile
+  }
+
+  private importSemantic(declaration: ts.Declaration): SemanticSymbol | null {
+    if (ts.isImportSpecifier(declaration)) {
+      const importDeclaration = declaration.parent.parent.parent
+      if (
+        !ts.isImportDeclaration(importDeclaration) ||
+        !ts.isStringLiteral(importDeclaration.moduleSpecifier)
+      ) {
+        return null
+      }
+      return {
+        module: importDeclaration.moduleSpecifier.text,
+        exported: declaration.propertyName?.text ?? declaration.name.text
+      }
+    }
+    if (ts.isImportClause(declaration) && declaration.name) {
+      const importDeclaration = declaration.parent
+      if (
+        ts.isImportDeclaration(importDeclaration) &&
+        ts.isStringLiteral(importDeclaration.moduleSpecifier)
+      ) {
+        return { module: importDeclaration.moduleSpecifier.text, exported: 'default' }
+      }
+    }
+    if (ts.isNamespaceImport(declaration)) {
+      const importDeclaration = declaration.parent.parent
+      if (
+        ts.isImportDeclaration(importDeclaration) &&
+        ts.isStringLiteral(importDeclaration.moduleSpecifier)
+      ) {
+        return { module: importDeclaration.moduleSpecifier.text, exported: '*' }
+      }
+    }
+    return null
+  }
+
+  private semanticFromSymbol(
+    symbol: ts.Symbol | undefined,
+    seen: Set<ts.Symbol>
+  ): SemanticSymbol | null {
+    if (!symbol || seen.has(symbol)) return null
+    seen.add(symbol)
+    for (const declaration of symbol.declarations ?? []) {
+      const imported = this.importSemantic(declaration)
+      if (imported) return imported
+      if (ts.isVariableDeclaration(declaration) && declaration.initializer) {
+        const resolved = this.resolveExpression(declaration.initializer, seen)
+        if (resolved) return resolved
+      }
+      if (ts.isFunctionDeclaration(declaration) || ts.isMethodDeclaration(declaration)) {
+        return {
+          module: normalizePath(declaration.getSourceFile().fileName).replace(/^\//, ''),
+          exported: declaration.name?.getText() ?? symbol.name
+        }
+      }
+    }
+    if ((symbol.flags & ts.SymbolFlags.Alias) !== 0) {
+      const aliased = this.project.checker.getAliasedSymbol(symbol)
+      if (aliased && aliased !== symbol) return this.semanticFromSymbol(aliased, seen)
+    }
+    return { module: this.file, exported: symbol.name }
+  }
+
+  resolveExpression(expression: ts.Expression, seen = new Set<ts.Symbol>()): SemanticSymbol | null {
     if (ts.isParenthesizedExpression(expression))
       return this.resolveExpression(expression.expression, seen)
-    if (ts.isIdentifier(expression)) {
-      const imported = this.imports.get(expression.text)
-      if (imported) return imported
-      if (seen.has(expression.text)) return null
-      const alias = this.aliases.get(expression.text)
-      if (!alias) return { module: '', exported: expression.text }
-      seen.add(expression.text)
-      return this.resolveExpression(alias, seen)
-    }
     if (ts.isPropertyAccessExpression(expression)) {
       const base = this.resolveExpression(expression.expression, seen)
-      return { module: base?.module ?? '', exported: expression.name.text }
+      return { module: base?.module ?? this.file, exported: expression.name.text }
     }
     if (
       ts.isElementAccessExpression(expression) &&
@@ -169,57 +701,88 @@ class TypeScriptModel {
       ts.isStringLiteral(expression.argumentExpression)
     ) {
       const base = this.resolveExpression(expression.expression, seen)
-      return { module: base?.module ?? '', exported: expression.argumentExpression.text }
+      return { module: base?.module ?? this.file, exported: expression.argumentExpression.text }
     }
-    return null
+    const symbol = this.project.checker.getSymbolAtLocation(expression)
+    return this.semanticFromSymbol(symbol, seen)
   }
 
-  calls(): ts.CallExpression[] {
-    const calls: ts.CallExpression[] = []
-    const visit = (node: ts.Node): void => {
-      if (ts.isCallExpression(node)) calls.push(node)
-      ts.forEachChild(node, visit)
-    }
-    visit(this.sourceFile)
-    return calls
+  calls(scope: ReachabilityScope = 'exports'): ts.CallExpression[] {
+    return this.project.calls(this.file, scope)
   }
 
-  jsxTags(): Array<{ node: ts.JsxOpeningLikeElement; symbol: SemanticSymbol | null }> {
-    const tags: Array<{ node: ts.JsxOpeningLikeElement; symbol: SemanticSymbol | null }> = []
-    const visit = (node: ts.Node): void => {
-      if (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) {
-        const expression = ts.isIdentifier(node.tagName)
-          ? node.tagName
-          : ts.isPropertyAccessExpression(node.tagName)
-            ? node.tagName
-            : null
-        tags.push({ node, symbol: expression ? this.resolveExpression(expression) : null })
-      }
-      ts.forEachChild(node, visit)
-    }
-    visit(this.sourceFile)
-    return tags
+  jsxTags(
+    scope: ReachabilityScope = 'exports'
+  ): Array<{ node: ts.JsxOpeningLikeElement; symbol: SemanticSymbol | null }> {
+    return this.project.jsx(this.file, scope).map((node) => ({
+      node,
+      symbol:
+        ts.isIdentifier(node.tagName) || ts.isPropertyAccessExpression(node.tagName)
+          ? this.resolveExpression(node.tagName)
+          : null
+    }))
   }
 
   hasImport(module: string, exported: string): boolean {
-    return [...this.imports.values()].some(
-      (item) => item.module === module && item.exported === exported
-    )
+    for (const statement of this.sourceFile.statements) {
+      if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier))
+        continue
+      if (statement.moduleSpecifier.text !== module) continue
+      const clause = statement.importClause
+      if (exported === 'default' && clause?.name) return true
+      if (clause?.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+        if (
+          clause.namedBindings.elements.some(
+            (element) => (element.propertyName?.text ?? element.name.text) === exported
+          )
+        ) {
+          return true
+        }
+      }
+    }
+    return false
   }
 
-  hasCall(exported: string, module?: string): boolean {
-    return this.calls().some((call) => {
+  hasCall(exported: string, module?: string, scope: ReachabilityScope = 'exports'): boolean {
+    return this.calls(scope).some((call) => {
       const symbol = this.resolveExpression(call.expression)
       return symbol?.exported === exported && (module === undefined || symbol.module === module)
     })
   }
 
-  hasJsx(exported: string, module?: string): boolean {
-    return this.jsxTags().some(
+  hasJsx(exported: string, module?: string, scope: ReachabilityScope = 'exports'): boolean {
+    return this.jsxTags(scope).some(
       ({ symbol }) =>
         symbol?.exported === exported && (module === undefined || symbol.module === module)
     )
   }
+
+  countJsx(exported: string, module?: string, scope: ReachabilityScope = 'exports'): number {
+    return this.jsxTags(scope).filter(
+      ({ symbol }) =>
+        symbol?.exported === exported && (module === undefined || symbol.module === module)
+    ).length
+  }
+
+  ownerFunctionName(node: ts.Node): string {
+    return this.project.functionNameForNode(node)
+  }
+
+  callReachableFrom(node: ts.CallExpression, pattern: RegExp): boolean {
+    return this.project.callReachableFromNamedFunction(this.file, node, pattern)
+  }
+}
+
+function modelsForSources(sources: GuardSources): TypeScriptModel[] {
+  const semanticSources = Object.fromEntries(
+    Object.entries(sources).filter(
+      ([file, source]) => isTypeScriptFile(file) && isSemanticTypeScriptSource(file, source)
+    )
+  )
+  const project = new TypeScriptProject(semanticSources)
+  return Object.entries(semanticSources).map(
+    ([file, source]) => new TypeScriptModel(project, normalizePath(file), source)
+  )
 }
 
 function findModel(models: TypeScriptModel[], suffix: string): TypeScriptModel | undefined {
@@ -249,24 +812,36 @@ function checkRootParity(findings: GuardFinding[], models: TypeScriptModel[]): v
         'renderer root must import createPortableRouter from the shared portable router module'
       ],
       [
-        model.hasCall('createPortableRouter', '@/app/portable-router'),
-        'renderer root must call the imported createPortableRouter (aliases are supported)'
+        model.hasCall('createPortableRouter', '@/app/portable-router', 'default'),
+        'renderer root must execute the imported createPortableRouter (aliases are supported)'
       ],
       [
-        model.hasJsx('PortableAppEffects', '@/app/PortableAppEffects'),
+        model.hasJsx('PortableAppEffects', '@/app/PortableAppEffects', 'default'),
         'renderer root must render the imported PortableAppEffects component'
       ],
-      [model.hasJsx('ConversationHostStatus'), 'renderer root must render ConversationHostStatus'],
       [
-        model.hasJsx('ConversationRecoveryPanel'),
-        'renderer root must render ConversationRecoveryPanel'
+        model.hasJsx(
+          'ConversationHostStatus',
+          '@/components/conversation/ConversationHostStatus',
+          'default'
+        ),
+        'renderer root must render the imported ConversationHostStatus component'
+      ],
+      [
+        model.countJsx(
+          'ConversationRecoveryPanel',
+          '@/components/conversation/ConversationRecoveryPanel',
+          'default'
+        ) === 1,
+        'renderer root must execute exactly one imported ConversationRecoveryPanel owner'
       ]
     ]
     for (const [passed, message] of requirements) {
       if (!passed) findings.push({ rule: 'root-parity', file: model.file, line: 1, message })
     }
-    for (const call of model.calls()) {
-      if (model.resolveExpression(call.expression)?.exported === 'createHashRouter') {
+    for (const call of model.calls('default')) {
+      const symbol = model.resolveExpression(call.expression)
+      if (symbol?.exported === 'createHashRouter') {
         addFinding(
           findings,
           'root-parity',
@@ -276,7 +851,6 @@ function checkRootParity(findings: GuardFinding[], models: TypeScriptModel[]): v
           'renderer root must not redeclare the portable route table'
         )
       }
-      const symbol = model.resolveExpression(call.expression)
       if (
         symbol &&
         PORTABLE_EFFECT_HOOKS.includes(symbol.exported as (typeof PORTABLE_EFFECT_HOOKS)[number])
@@ -291,6 +865,27 @@ function checkRootParity(findings: GuardFinding[], models: TypeScriptModel[]): v
         )
       }
     }
+  }
+
+  const dashboard = findModel(models, 'src/renderer/pages/WorkspaceDashboard.tsx')
+  if (
+    dashboard &&
+    (dashboard.hasImport(
+      '@/components/conversation/ConversationRecoveryPanel',
+      'ConversationRecoveryPanel'
+    ) ||
+      dashboard.countJsx(
+        'ConversationRecoveryPanel',
+        '@/components/conversation/ConversationRecoveryPanel'
+      ) > 0)
+  ) {
+    findings.push({
+      rule: 'recovery-owner',
+      file: dashboard.file,
+      line: 1,
+      message:
+        'WorkspaceDashboard must inherit the renderer-root recovery owner, not mount another panel'
+    })
   }
 
   const effects = findModel(models, 'src/renderer/app/PortableAppEffects.tsx')
@@ -308,7 +903,7 @@ function checkRootParity(findings: GuardFinding[], models: TypeScriptModel[]): v
           rule: 'root-parity',
           file: effects.file,
           line: 1,
-          message: `shared portable effects are missing executable hook call ${hook}`
+          message: `shared portable effects are missing reachable hook call ${hook}`
         })
       }
     }
@@ -317,7 +912,7 @@ function checkRootParity(findings: GuardFinding[], models: TypeScriptModel[]): v
         rule: 'root-parity',
         file: effects.file,
         line: 1,
-        message: 'shared portable effects are missing initNotificationPermissions call'
+        message: 'shared portable effects are missing reachable initNotificationPermissions call'
       })
     }
   }
@@ -333,11 +928,14 @@ function checkRootParity(findings: GuardFinding[], models: TypeScriptModel[]): v
   } else {
     const routes = new Set<string>()
     const visit = (node: ts.Node): void => {
-      if (ts.isPropertyAssignment(node)) {
-        const name =
-          ts.isIdentifier(node.name) || ts.isStringLiteral(node.name) ? node.name.text : ''
-        if (name === 'path' && ts.isStringLiteralLike(node.initializer))
-          routes.add(node.initializer.text)
+      if (
+        ts.isPropertyAssignment(node) &&
+        (ts.isIdentifier(node.name) || ts.isStringLiteral(node.name)) &&
+        node.name.text === 'path' &&
+        ts.isStringLiteralLike(node.initializer) &&
+        !isStaticallyDead(node)
+      ) {
+        routes.add(node.initializer.text)
       }
       ts.forEachChild(node, visit)
     }
@@ -353,23 +951,6 @@ function checkRootParity(findings: GuardFinding[], models: TypeScriptModel[]): v
       }
     }
   }
-}
-
-function ownerFunctionName(node: ts.Node): string {
-  let owner: ts.Node | undefined = node
-  while (owner) {
-    if (ts.isFunctionDeclaration(owner) && owner.name) return owner.name.text
-    if (
-      (ts.isArrowFunction(owner) || ts.isFunctionExpression(owner)) &&
-      owner.parent &&
-      ts.isVariableDeclaration(owner.parent) &&
-      ts.isIdentifier(owner.parent.name)
-    ) {
-      return owner.parent.name.text
-    }
-    owner = owner.parent
-  }
-  return ''
 }
 
 function checkNavigationAndLegacy(findings: GuardFinding[], models: TypeScriptModel[]): void {
@@ -390,20 +971,7 @@ function checkNavigationAndLegacy(findings: GuardFinding[], models: TypeScriptMo
   ])
 
   for (const model of models.filter((item) => item.file.startsWith('src/renderer/'))) {
-    const calls = model.calls()
-    const calledByOwner = new Map<string, Set<string>>()
-    for (const call of calls) {
-      const owner = ownerFunctionName(call)
-      const symbol = model.resolveExpression(call.expression)
-      const calledName =
-        symbol?.exported ?? (ts.isIdentifier(call.expression) ? call.expression.text : '')
-      if (!owner || !calledName) continue
-      const called = calledByOwner.get(owner) ?? new Set<string>()
-      called.add(calledName)
-      calledByOwner.set(owner, called)
-    }
-
-    for (const call of calls) {
+    for (const call of model.calls()) {
       const symbol = model.resolveExpression(call.expression)
       if (!symbol) continue
       if (
@@ -420,12 +988,13 @@ function checkNavigationAndLegacy(findings: GuardFinding[], models: TypeScriptMo
         )
       }
       if (!forbiddenTeardown.has(symbol.exported)) continue
-      const ownerName = ownerFunctionName(call)
-      const calledFromNavigation = [...calledByOwner.entries()].some(
-        ([caller, callees]) => navigationName.test(caller) && callees.has(ownerName)
-      )
+      const ownerName = model.ownerFunctionName(call)
       const rootFile = /(?:^|\/)(?:App|TauriApp)\.tsx$/.test(model.file)
-      if (rootFile || navigationName.test(ownerName) || calledFromNavigation) {
+      if (
+        rootFile ||
+        navigationName.test(ownerName) ||
+        model.callReachableFrom(call, navigationName)
+      ) {
         addFinding(
           findings,
           'navigation-preserves-pty',
@@ -509,7 +1078,7 @@ function checkFacades(findings: GuardFinding[], models: TypeScriptModel[]): void
         file: model.file,
         line: 1,
         message:
-          'renderer Conversation adapter must import and call the shared ConversationId parser'
+          'renderer Conversation adapter must reach the imported shared ConversationId parser'
       })
     }
   }
@@ -560,13 +1129,13 @@ function checkFacades(findings: GuardFinding[], models: TypeScriptModel[]): void
   if (history) {
     if (
       !history.hasImport('@/lib/acp-history-api', 'acpHistoryApi') ||
-      !history.hasCall('getPage')
+      !history.hasCall('getPage', '@/lib/acp-history-api')
     ) {
       findings.push({
         rule: 'history-paging-facade',
         file: history.file,
         line: 1,
-        message: 'desktop history paging must call acpHistoryApi.getPage through the real facade'
+        message: 'desktop history paging must reach acpHistoryApi.getPage through the real facade'
       })
     }
     if (!history.hasCall('getSessionPayloadPage')) {
@@ -574,7 +1143,7 @@ function checkFacades(findings: GuardFinding[], models: TypeScriptModel[]): void
         rule: 'history-paging-facade',
         file: history.file,
         line: 1,
-        message: 'server history paging must call transport.getSessionPayloadPage'
+        message: 'server history paging must reach transport.getSessionPayloadPage'
       })
     }
   }
@@ -588,7 +1157,7 @@ function checkRendererCredential(findings: GuardFinding[], models: TypeScriptMod
       rule: 'authenticated-remote-access',
       file: transport.file,
       line: 1,
-      message: 'renderer WebSocket transport must call the in-memory credential boundary'
+      message: 'renderer WebSocket transport must reach the in-memory credential boundary'
     })
   }
   const visit = (node: ts.Node): void => {
@@ -597,7 +1166,8 @@ function checkRendererCredential(findings: GuardFinding[], models: TypeScriptMod
       if (
         (name === 'token' || name === 'credential') &&
         ts.isStringLiteralLike(node.initializer) &&
-        ['dev', 'placeholder', 'changeme'].includes(node.initializer.text.toLowerCase())
+        ['dev', 'placeholder', 'changeme'].includes(node.initializer.text.toLowerCase()) &&
+        !isStaticallyDead(node)
       ) {
         addFinding(
           findings,
@@ -614,14 +1184,25 @@ function checkRendererCredential(findings: GuardFinding[], models: TypeScriptMod
   visit(transport.sourceFile)
 }
 
-interface WorkflowRun {
-  command: string
-  line: number
-  job: string
-  step: string
+function mapPair(map: YAMLMap, key: string): Pair | undefined {
+  return map.items.find(
+    (pair): pair is Pair => isScalar(pair.key) && String(pair.key.value) === key
+  )
 }
 
-function workflowRuns(file: string, source: string, findings: GuardFinding[]): WorkflowRun[] {
+function scalarText(node: YamlNode | null | undefined): string | undefined {
+  return isScalar(node) && typeof node.value === 'string' ? node.value : undefined
+}
+
+function yamlLine(node: YamlNode | null | undefined, counter: LineCounter): number {
+  return node?.range ? counter.linePos(node.range[0]).line : 1
+}
+
+function parseWorkflow(
+  file: string,
+  source: string,
+  findings: GuardFinding[]
+): ParsedWorkflow | undefined {
   const counter = new LineCounter()
   const document = parseDocument(source, { lineCounter: counter })
   if (document.errors.length > 0) {
@@ -631,52 +1212,265 @@ function workflowRuns(file: string, source: string, findings: GuardFinding[]): W
       line: 1,
       message: `workflow YAML parse failed: ${document.errors[0]?.message ?? 'unknown parse error'}`
     })
-    return []
+    return undefined
   }
-  const runs: WorkflowRun[] = []
-  const walk = (node: YamlNode | null | undefined, path: string[]): void => {
-    if (!node) return
-    if (isMap(node)) {
-      for (const pair of node.items) {
-        const key = isScalar(pair.key) ? String(pair.key.value) : '<key>'
-        if (key === 'run' && isScalar(pair.value) && typeof pair.value.value === 'string') {
-          const position = pair.value.range
-            ? counter.linePos(pair.value.range[0])
-            : { line: 1, col: 1 }
-          const jobIndex = path.indexOf('jobs')
-          const stepsIndex = path.lastIndexOf('steps')
-          runs.push({
-            command: pair.value.value,
-            line: position.line,
-            job: jobIndex >= 0 ? (path[jobIndex + 1] ?? '<job>') : '<job>',
-            step: stepsIndex >= 0 ? (path[stepsIndex + 1] ?? '<step>') : '<step>'
-          })
-        }
-        walk(pair.value as YamlNode | null, [...path, key])
-      }
-    } else if (isSeq(node)) {
-      for (const [index, item] of node.items.entries()) {
-        walk(item as YamlNode | null, [...path, String(index)])
+  if (!isMap(document.contents)) {
+    findings.push({
+      rule: 'workflow-yaml',
+      file,
+      line: 1,
+      message: 'workflow YAML root must be a map'
+    })
+    return undefined
+  }
+  const jobsNode = mapPair(document.contents, 'jobs')?.value
+  const steps: WorkflowStep[] = []
+  if (isMap(jobsNode)) {
+    for (const jobPair of jobsNode.items) {
+      const job = isScalar(jobPair.key) ? String(jobPair.key.value) : '<job>'
+      if (!isMap(jobPair.value)) continue
+      const stepsNode = mapPair(jobPair.value, 'steps')?.value
+      if (!isSeq(stepsNode)) continue
+      for (const [index, item] of stepsNode.items.entries()) {
+        if (!isMap(item)) continue
+        const nameNode = mapPair(item, 'name')?.value as YamlNode | null | undefined
+        const runNode = mapPair(item, 'run')?.value as YamlNode | null | undefined
+        const usesNode = mapPair(item, 'uses')?.value as YamlNode | null | undefined
+        const withNode = mapPair(item, 'with')?.value as YamlNode | null | undefined
+        const argsNode = (isMap(withNode) ? mapPair(withNode, 'args')?.value : undefined) as
+          | YamlNode
+          | null
+          | undefined
+        steps.push({
+          job,
+          index,
+          line: yamlLine(item, counter),
+          name: scalarText(nameNode),
+          nameScalar: isScalar(nameNode) && typeof nameNode.value === 'string',
+          run: scalarText(runNode),
+          runScalar: isScalar(runNode) && typeof runNode.value === 'string',
+          uses: scalarText(usesNode),
+          usesScalar: isScalar(usesNode) && typeof usesNode.value === 'string',
+          args: scalarText(argsNode),
+          argsPresent: argsNode !== undefined,
+          argsScalar: isScalar(argsNode) && typeof argsNode.value === 'string'
+        })
       }
     }
   }
-  walk(document.contents as YamlNode | null, [])
-  return runs
+  return {
+    file,
+    source,
+    document,
+    steps,
+    data: document.toJS() as ParsedWorkflow['data']
+  }
 }
 
-function cargoCommandSegments(command: string): string[] {
-  const joined = command.replace(/\\\r?\n/g, ' ')
-  return joined
-    .split(/\r?\n|&&|;/)
-    .map((segment) => segment.trim())
+function shellFragments(command: string): string[] {
+  return command
+    .replace(/\\\r?\n/g, ' ')
+    .split(/\r?\n|&&|\|\||;|(?<!\|)\|(?!\|)/)
+    .map((fragment) => fragment.trim())
     .filter(Boolean)
 }
 
-function checkWorkflows(findings: GuardFinding[], sources: GuardSources): void {
-  const workflows = Object.entries(sources).filter(([file]) =>
-    /^\.github\/workflows\/.*\.(?:yml|yaml)$/.test(normalizePath(file))
+function cargoOccurrences(command: string): Array<{ kind: string; invocation: string }> {
+  const occurrences: Array<{ kind: string; invocation: string }> = []
+  for (const fragment of shellFragments(command)) {
+    const matches = [...fragment.matchAll(/\bcargo\s+(metadata|check|test|clippy|build)\b/g)]
+    for (const [index, match] of matches.entries()) {
+      const start = match.index ?? 0
+      const end = matches[index + 1]?.index ?? fragment.length
+      occurrences.push({ kind: match[1], invocation: fragment.slice(start, end).trim() })
+    }
+  }
+  return occurrences
+}
+
+function invocationIsLocked(invocation: string): boolean {
+  return /(?:^|[\s"'])--locked(?=$|[\s"'])/.test(invocation)
+}
+
+function stepDisplay(step: WorkflowStep): string {
+  return step.name ?? String(step.index)
+}
+
+function checkCargoRuns(findings: GuardFinding[], workflows: ParsedWorkflow[]): void {
+  for (const workflow of workflows) {
+    for (const step of workflow.steps) {
+      if (!step.runScalar || step.run === undefined) continue
+      for (const occurrence of cargoOccurrences(step.run)) {
+        if (invocationIsLocked(occurrence.invocation)) continue
+        findings.push({
+          rule: 'locked-rust-ci',
+          file: workflow.file,
+          line: step.line,
+          message: `job=${step.job} step=${stepDisplay(step)} cargo ${occurrence.kind} command must use --locked`
+        })
+      }
+    }
+  }
+}
+
+function checkDefaultPrGuard(findings: GuardFinding[], validation: ParsedWorkflow): void {
+  const named = validation.steps.filter(
+    (step) => step.nameScalar && step.name === PR_GUARD_STEP_NAME
   )
-  if (workflows.length === 0) {
+  if (named.length !== 1) {
+    findings.push({
+      rule: 'default-pr-guard',
+      file: validation.file,
+      line: named[0]?.line ?? 1,
+      message: `workflow must contain exactly one step named ${JSON.stringify(PR_GUARD_STEP_NAME)}; found ${named.length}`
+    })
+    return
+  }
+  if (!named[0].runScalar || named[0].run !== PR_GUARD_RUN) {
+    findings.push({
+      rule: 'default-pr-guard',
+      file: validation.file,
+      line: named[0].line,
+      message: `step ${JSON.stringify(PR_GUARD_STEP_NAME)} run scalar must equal ${JSON.stringify(PR_GUARD_RUN)}`
+    })
+  }
+}
+
+function checkNativeCi(findings: GuardFinding[], validation: ParsedWorkflow): void {
+  const jobs = validation.data.jobs ?? {}
+  const durability = jobs['conversation-native-durability']
+  const include = durability?.strategy?.matrix?.include
+  const platforms = new Set(
+    Array.isArray(include)
+      ? include
+          .map((item) => item.platform)
+          .filter((value): value is string => typeof value === 'string')
+      : []
+  )
+  for (const platform of ['linux', 'macos', 'windows']) {
+    if (!platforms.has(platform)) {
+      findings.push({
+        rule: 'native-ci-wiring',
+        file: validation.file,
+        line: 1,
+        message: `locked native durability matrix is missing ${platform}`
+      })
+    }
+  }
+
+  const exactRuns = new Set(
+    validation.steps.flatMap((step) =>
+      step.runScalar && step.run !== undefined
+        ? step.run
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter(Boolean)
+        : []
+    )
+  )
+  for (const required of [
+    'cargo test --locked conversation::native_durability_tests',
+    'cargo test --locked --test conversation_first_guardrails',
+    'cargo build --locked --bin termul-server --features standalone-server',
+    'cargo clippy --locked --bin termul-server --features standalone-server -- -D warnings',
+    WINDOWS_TOKEN_SECURITY_RUN
+  ]) {
+    if (!exactRuns.has(required)) {
+      findings.push({
+        rule: 'native-ci-wiring',
+        file: validation.file,
+        line: 1,
+        message: `locked native/semantic CI wiring is missing exact run ${required}`
+      })
+    }
+  }
+
+  const windowsSteps = validation.steps.filter((step) => step.job === 'rust-windows-check')
+  if (!windowsSteps.some((step) => step.runScalar && step.run === WINDOWS_TOKEN_SECURITY_RUN)) {
+    findings.push({
+      rule: 'native-ci-wiring',
+      file: validation.file,
+      line: 1,
+      message:
+        'rust-windows-check must execute the cfg(windows) token owner/DACL/reparse security test'
+    })
+  }
+}
+
+function checkStampedPackaging(findings: GuardFinding[], workflow: ParsedWorkflow): void {
+  const isNightly = workflow.file.endsWith('/nightly.yml')
+  const isRelease = workflow.file.endsWith('/release.yml')
+  if (!isNightly && !isRelease) return
+  const stampName = isNightly ? 'Stamp nightly version into sources' : 'Align app versions with tag'
+  for (const job of ['build', 'standalone-server']) {
+    const steps = workflow.steps.filter((step) => step.job === job)
+    const stamps = steps.filter((step) => step.nameScalar && step.name === stampName)
+    if (stamps.length !== 1) {
+      findings.push({
+        rule: 'stamped-root-lock',
+        file: workflow.file,
+        line: stamps[0]?.line ?? 1,
+        message: `job=${job} must contain exactly one stamp step ${JSON.stringify(stampName)}; found ${stamps.length}`
+      })
+      continue
+    }
+    const stampPosition = steps.indexOf(stamps[0])
+    const next = steps[stampPosition + 1]
+    if (!next || !next.nameScalar || next.name !== SYNC_STEP_NAME) {
+      findings.push({
+        rule: 'stamped-root-lock',
+        file: workflow.file,
+        line: stamps[0].line,
+        message: `job=${job} immediate step after ${JSON.stringify(stampName)} must be ${JSON.stringify(SYNC_STEP_NAME)}`
+      })
+      continue
+    }
+    if (!next.runScalar || next.run !== SYNC_RUN) {
+      findings.push({
+        rule: 'stamped-root-lock',
+        file: workflow.file,
+        line: next.line,
+        message: `job=${job} step=${SYNC_STEP_NAME} must use the exact two-line repository-root synchronization scalar`
+      })
+    }
+  }
+
+  const tauri = workflow.steps.filter(
+    (step) => step.usesScalar && step.uses?.startsWith('tauri-apps/tauri-action@')
+  )
+  if (tauri.length === 0) {
+    findings.push({
+      rule: 'locked-tauri-action',
+      file: workflow.file,
+      line: 1,
+      message: 'workflow must contain at least one tauri-apps/tauri-action step'
+    })
+  }
+  for (const step of tauri) {
+    if (!step.argsPresent || !step.argsScalar || step.args === undefined) {
+      findings.push({
+        rule: 'locked-tauri-action',
+        file: workflow.file,
+        line: step.line,
+        message: `job=${step.job} step=${stepDisplay(step)} tauri-action with.args must be a scalar`
+      })
+    } else if (!step.args.endsWith('-- --locked')) {
+      findings.push({
+        rule: 'locked-tauri-action',
+        file: workflow.file,
+        line: step.line,
+        message: `job=${step.job} step=${stepDisplay(step)} tauri-action with.args must end exactly -- --locked`
+      })
+    }
+  }
+}
+
+function checkWorkflows(findings: GuardFinding[], sources: GuardSources): void {
+  const discovered = Object.entries(sources)
+    .filter(([file]) => /^\.github\/workflows\/.*\.(?:yml|yaml)$/.test(normalizePath(file)))
+    .map(([file, source]) => parseWorkflow(normalizePath(file), source, findings))
+    .filter((workflow): workflow is ParsedWorkflow => workflow !== undefined)
+  if (discovered.length === 0) {
     findings.push({
       rule: 'source-discovery',
       file: '.github/workflows',
@@ -686,22 +1480,8 @@ function checkWorkflows(findings: GuardFinding[], sources: GuardSources): void {
     return
   }
 
-  for (const [file, source] of workflows) {
-    for (const run of workflowRuns(file, source, findings)) {
-      for (const segment of cargoCommandSegments(run.command)) {
-        const match = segment.match(/\bcargo\s+(metadata|check|test|clippy|build)\b/)
-        if (!match || /(?:^|\s)--locked(?:\s|$)/.test(segment)) continue
-        findings.push({
-          rule: 'locked-rust-ci',
-          file,
-          line: run.line,
-          message: `job=${run.job} step=${run.step} cargo ${match[1]} command must use --locked`
-        })
-      }
-    }
-  }
-
-  const validation = workflows.find(([file]) => file.endsWith('/pr-validation.yml'))
+  checkCargoRuns(findings, discovered)
+  const validation = discovered.find((workflow) => workflow.file.endsWith('/pr-validation.yml'))
   if (!validation) {
     findings.push({
       rule: 'native-ci-wiring',
@@ -709,47 +1489,14 @@ function checkWorkflows(findings: GuardFinding[], sources: GuardSources): void {
       line: 1,
       message: 'PR validation workflow is missing'
     })
-    return
+  } else {
+    checkDefaultPrGuard(findings, validation)
+    checkNativeCi(findings, validation)
   }
-  const [file, source] = validation
-  const document = parseDocument(source)
-  const data = document.toJS() as {
-    jobs?: Record<string, { strategy?: { matrix?: unknown }; steps?: Array<{ run?: string }> }>
-  }
-  const jobs = data.jobs ?? {}
-  const durability = jobs['conversation-native-durability']
-  const durabilityJson = JSON.stringify(durability?.strategy?.matrix ?? {})
-  for (const platform of ['linux', 'macos', 'windows']) {
-    if (!durabilityJson.includes(platform)) {
-      findings.push({
-        rule: 'native-ci-wiring',
-        file,
-        line: 1,
-        message: `locked native durability matrix is missing ${platform}`
-      })
-    }
-  }
-  const commands = Object.values(jobs)
-    .flatMap((job) => job.steps ?? [])
-    .map((step) => step.run ?? '')
-  for (const required of [
-    'cargo test --locked conversation::native_durability_tests',
-    'cargo test --locked --test conversation_first_guardrails',
-    'cargo build --locked --bin termul-server --features standalone-server',
-    'cargo clippy --locked --bin termul-server --features standalone-server -- -D warnings'
-  ]) {
-    if (!commands.some((command) => command.includes(required))) {
-      findings.push({
-        rule: 'native-ci-wiring',
-        file,
-        line: 1,
-        message: `locked native/semantic CI wiring is missing ${required}`
-      })
-    }
-  }
+  for (const workflow of discovered) checkStampedPackaging(findings, workflow)
 }
 
-/** Compatibility helper retained for callers; semantic checks use compiler AST nodes. */
+/** Compatibility helper retained for callers; semantic checks use compiler nodes. */
 export function stripComments(source: string): string {
   const scanner = ts.createScanner(
     ts.ScriptTarget.Latest,
@@ -782,9 +1529,7 @@ export function stripRustTestCode(source: string): string {
 }
 
 export function checkConversationFirstGuardrails(sources: GuardSources): GuardFinding[] {
-  const models = Object.entries(sources)
-    .filter(([file]) => isTypeScriptFile(file))
-    .map(([file, source]) => new TypeScriptModel(normalizePath(file), source))
+  const models = modelsForSources(sources)
   const findings: GuardFinding[] = []
   checkRootParity(findings, models)
   checkNavigationAndLegacy(findings, models)
@@ -814,17 +1559,18 @@ function walkFiles(root: string, directory: string, accept: (path: string) => bo
 }
 
 export function loadRepositorySources(root = process.cwd()): GuardSources {
+  const isProductionTypeScript = (path: string): boolean => {
+    const normalized = normalizePath(path)
+    return (
+      ['.ts', '.tsx'].includes(extname(path)) &&
+      !path.endsWith('.d.ts') &&
+      !normalized.includes('/__tests__/') &&
+      !/\.(?:test|spec)\.(?:ts|tsx)$/.test(normalized)
+    )
+  }
   const sourceFiles = [
-    ...walkFiles(
-      root,
-      'src/renderer',
-      (path) => ['.ts', '.tsx'].includes(extname(path)) && !path.endsWith('.d.ts')
-    ),
-    ...walkFiles(
-      root,
-      'src/shared',
-      (path) => ['.ts', '.tsx'].includes(extname(path)) && !path.endsWith('.d.ts')
-    ),
+    ...walkFiles(root, 'src/renderer', isProductionTypeScript),
+    ...walkFiles(root, 'src/shared', isProductionTypeScript),
     ...walkFiles(root, '.github/workflows', (path) => ['.yml', '.yaml'].includes(extname(path)))
   ].sort()
   return Object.fromEntries(

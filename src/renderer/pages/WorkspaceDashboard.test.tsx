@@ -65,6 +65,7 @@ vi.mock('@/stores/app-settings-store', () => ({
   })
 }))
 
+import { ConversationRecoveryPanel } from '@/components/conversation/ConversationRecoveryPanel'
 import { useConversationStore } from '@/stores/conversation-store'
 import WorkspaceDashboard from './WorkspaceDashboard'
 
@@ -96,9 +97,10 @@ const redactedRecoveryItem: RecoveryItemV1 = {
   associationDecisions: []
 }
 
-function renderDashboard(): ReturnType<typeof render> {
+function renderDashboard(withRootRecoveryOwner = false): ReturnType<typeof render> {
   return render(
     <MemoryRouter>
+      {withRootRecoveryOwner ? <ConversationRecoveryPanel /> : null}
       <WorkspaceDashboard />
     </MemoryRouter>
   )
@@ -121,15 +123,23 @@ describe('WorkspaceDashboard', () => {
     expect(screen.getByText(/No conversations yet/)).toBeVisible()
   })
 
-  it('keeps the project-less list and redacted recovery Inspect entry reachable together', () => {
+  it('inherits one root recovery owner without mounting a dashboard duplicate', () => {
     useConversationStore.getState().replaceSummaries([conversation])
     useConversationStore.getState().setRecoveryItems([redactedRecoveryItem])
 
-    renderDashboard()
-
+    const dashboardOnly = renderDashboard()
     expect(screen.getByTestId('conversation-list')).toBeVisible()
     expect(screen.getByText('No project')).toBeVisible()
+    expect(document.querySelectorAll('[data-conversation-recovery-panel]')).toHaveLength(0)
+    dashboardOnly.unmount()
+    cleanup()
+
+    renderDashboard(true)
+    expect(screen.getByTestId('conversation-list')).toBeVisible()
     expect(screen.getByRole('button', { name: 'Inspect preserved source' })).toBeEnabled()
-    expect(document.querySelector('[data-conversation-recovery-panel]')).toBeVisible()
+    expect(document.querySelectorAll('[data-conversation-recovery-panel]')).toHaveLength(1)
+    for (const action of redactedRecoveryItem.suggestedActions) {
+      expect(document.querySelectorAll(`[data-recovery-action="${action}"]`)).toHaveLength(1)
+    }
   })
 })

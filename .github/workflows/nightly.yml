@@ -143,6 +143,11 @@ jobs:
             fs.writeFileSync(cargoPath, cargo.replace(/^version\s*=\s*".*"/m, `version = "${v}"`));
           '
 
+      - name: Synchronize stamped root lock entry
+        run: |-
+          python3 scripts/sync-stamped-root-lock.py --manifest src-tauri/Cargo.toml --lockfile src-tauri/Cargo.lock --package termul-manager
+          cargo metadata --locked --manifest-path src-tauri/Cargo.toml --format-version 1 --no-deps
+
       - name: Install Linux dependencies
         if: matrix.runner == 'ubuntu-22.04'
         shell: bash
@@ -193,7 +198,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tauriScript: bun run tauri
-          args: ${{ matrix.args }} --config src-tauri/tauri.conf.prod.json
+          args: ${{ matrix.args }} --config src-tauri/tauri.conf.prod.json -- --locked
 
       - name: Persist Tauri artifact paths
         shell: bash
@@ -259,6 +264,11 @@ jobs:
             const cargo = fs.readFileSync(cargoPath, "utf8");
             fs.writeFileSync(cargoPath, cargo.replace(/^version\s*=\s*".*"/m, `version = "${v}"`));
           '
+
+      - name: Synchronize stamped root lock entry
+        run: |-
+          python3 scripts/sync-stamped-root-lock.py --manifest src-tauri/Cargo.toml --lockfile src-tauri/Cargo.lock --package termul-manager
+          cargo metadata --locked --manifest-path src-tauri/Cargo.toml --format-version 1 --no-deps
 
       - name: Install Linux dependencies
         run: |

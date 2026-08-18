@@ -1,7 +1,6 @@
 import { MessageSquarePlus } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { ConversationList } from '@/components/conversation/ConversationList'
-import { ConversationRecoveryPanel } from '@/components/conversation/ConversationRecoveryPanel'
 import { useConversationStore } from '@/stores/conversation-store'
 
 export default function WorkspaceDashboard(): React.JSX.Element {
@@ -45,7 +44,6 @@ export default function WorkspaceDashboard(): React.JSX.Element {
           )}
         </div>
       </div>
-      <ConversationRecoveryPanel />
     </section>
   )
 }

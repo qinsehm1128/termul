@@ -80,7 +80,14 @@ vi.mock('@/components/conversation/ConversationHostStatus', () => ({
 }))
 
 vi.mock('@/components/conversation/ConversationRecoveryPanel', () => ({
-  ConversationRecoveryPanel: () => <div data-testid="conversation-recovery-panel" />
+  ConversationRecoveryPanel: () => (
+    <aside aria-label="Conversation recovery" data-testid="conversation-recovery-panel">
+      <button type="button">Inspect preserved source</button>
+      <button type="button">Associate conversation</button>
+      <button type="button">Start empty workspace</button>
+      <button type="button">Dismiss preserved source</button>
+    </aside>
+  )
 }))
 
 vi.mock('./hooks/use-conversation-lifecycle', () => ({
@@ -251,6 +258,21 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
+const RECOVERY_ACTION_LABELS = [
+  'Inspect preserved source',
+  'Associate conversation',
+  'Start empty workspace',
+  'Dismiss preserved source'
+] as const
+
+function expectSingleRecoveryOwner(): void {
+  expect(screen.getAllByRole('complementary', { name: 'Conversation recovery' })).toHaveLength(1)
+  expect(screen.getAllByTestId('conversation-recovery-panel')).toHaveLength(1)
+  for (const label of RECOVERY_ACTION_LABELS) {
+    expect(screen.getAllByRole('button', { name: label })).toHaveLength(1)
+  }
+}
+
 describe('TauriApp', () => {
   it('loads context bar settings on mount', async () => {
     render(<TauriApp />)
@@ -280,7 +302,7 @@ describe('TauriApp', () => {
     ).toBeVisible()
     expect(screen.getByRole('button', { name: 'New Chat' })).toBeEnabled()
     expect(screen.queryByTestId('pane-renderer')).not.toBeInTheDocument()
-    expect(screen.getAllByTestId('conversation-recovery-panel').length).toBeGreaterThan(0)
+    expectSingleRecoveryOwner()
   })
 
   it('shows the native window after window state restoration', async () => {
@@ -303,7 +325,7 @@ describe('TauriApp', () => {
     render(<TauriApp />)
     expect(mockConversationHostBootstrap).toHaveBeenCalled()
     expect(document.querySelector('[data-testid="conversation-host-status"]')).not.toBeNull()
-    expect(document.querySelector('[data-testid="conversation-recovery-panel"]')).not.toBeNull()
+    expectSingleRecoveryOwner()
   })
 
   it('mounts Conversation lifecycle reconciliation at the desktop root', () => {

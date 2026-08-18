@@ -21,6 +21,12 @@ import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { ts } from '@ts-morph/common'
 import { describe, expect, it } from 'vitest'
+import { parse as parseYaml } from 'yaml'
+import {
+  checkConversationFirstGuardrails,
+  type GuardFinding,
+  loadRepositorySources
+} from '../../../../scripts/check-conversation-first-guardrails'
 
 // Type definitions for our test data
 interface DomainCheck {
@@ -38,6 +44,12 @@ interface DomainCheck {
  */
 const LIB_DIR = join(__dirname, '..')
 const TESTS_DIR = __dirname
+let semanticRepositoryFindingsCache: GuardFinding[] | undefined
+
+function semanticRepositoryFindings(): GuardFinding[] {
+  semanticRepositoryFindingsCache ??= checkConversationFirstGuardrails(loadRepositorySources())
+  return semanticRepositoryFindingsCache
+}
 
 /**
  * Helper to check if a file exists
@@ -550,75 +562,47 @@ describe('Parity Checklist Automation', () => {
       )
     })
 
-    it('pins authenticated HTTP/ACP/terminal boundaries and narrow remote spawn', () => {
-      const auth = readFileSync(join(REPOSITORY_ROOT, 'src-tauri/src/web/auth.rs'), 'utf-8')
-      const router = readFileSync(join(REPOSITORY_ROOT, 'src-tauri/src/web/router.rs'), 'utf-8')
-      const relay = readFileSync(join(REPOSITORY_ROOT, 'src-tauri/src/web/ws.rs'), 'utf-8')
-      const terminal = readFileSync(
-        join(REPOSITORY_ROOT, 'src-tauri/src/web/terminal_ws.rs'),
-        'utf-8'
-      )
-      const terminalProtocol = readFileSync(
-        join(REPOSITORY_ROOT, 'src/shared/types/web-terminal-protocol.types.ts'),
-        'utf-8'
-      )
-
-      expect(auth).toContain('subtle::ConstantTimeEq')
-      expect(auth).toContain('capability_middleware')
-      expect(auth).toContain('"/conversations"')
-      expect(auth).toContain('"/conversation-recovery/"')
-      expect(auth).toContain('"/terminal/ws"')
-      expect(router).toContain('.layer(middleware::from_fn(capability_middleware))')
-      expect(relay).toContain('authority.verify_bearer_for_peer(&payload.token')
-      expect(terminal).toContain('Extension(principal): Extension<RemotePrincipal>')
-      expect(terminal).toContain('TerminalSpawnIntentV1')
-      expect(terminalProtocol).toMatch(/interface TerminalSpawnIntentV1/)
-      const spawnIntent = terminalProtocol
-        .split('export interface TerminalSpawnIntentV1')[1]
-        ?.split('\n}')[0]
-      expect(spawnIntent).toBeDefined()
-      expect(spawnIntent).not.toMatch(/^\s*(?:program|args|env|cwd|shell)\??\s*:/m)
+    it('uses the executable semantic guard for authenticated remote access and spawn shape', () => {
+      const rules = new Set([
+        'authenticated-remote-access',
+        'remote-terminal-intent',
+        'shared-conversation-id-parser',
+        'history-paging-facade'
+      ])
+      expect(semanticRepositoryFindings().filter((finding) => rules.has(finding.rule))).toEqual([])
     })
 
-    it('pins crash-releasable migration locking and bootstrap-owned write admission', () => {
-      const lock = readFileSync(
-        join(REPOSITORY_ROOT, 'src-tauri/src/conversation/migration/lock.rs'),
-        'utf-8'
+    it('delegates Rust auth, write-admission, and no-teardown proof to the locked syn guard', () => {
+      const guardPath = join(
+        REPOSITORY_ROOT,
+        'src-tauri',
+        'tests',
+        'conversation_first_guardrails.rs'
       )
-      const authority = readFileSync(
-        join(REPOSITORY_ROOT, 'src-tauri/src/conversation/write_authority.rs'),
-        'utf-8'
-      )
-      const repository = readFileSync(
-        join(REPOSITORY_ROOT, 'src-tauri/src/conversation/repository.rs'),
-        'utf-8'
-      )
+      expect(existsSync(guardPath), 'the Rust semantic integration guard must exist').toBe(true)
 
-      expect(lock).toContain('try_lock_exclusive')
-      expect(lock).not.toMatch(/create_new\(true\)|remove_file\(&self\.lock_path\)/)
-      expect(authority).toContain('ReaderPrecedence::HybridLegacyFirst')
-      expect(authority).toContain('ConversationErrorCode::LegacyCompatibilityReadOnly')
-      expect(authority).toContain('pub(crate) struct RepositoryWritePermit')
-      expect(repository).toContain('permit: &RepositoryWritePermit')
-      expect(repository).not.toContain('lookup_single_open')
+      const workflow = parseYaml(
+        readFileSync(join(REPOSITORY_ROOT, '.github/workflows/pr-validation.yml'), 'utf-8')
+      ) as { jobs?: Record<string, { steps?: Array<{ run?: unknown }> }> }
+      const exactGuardRun = 'cargo test --locked --test conversation_first_guardrails'
+      const guardSteps = Object.values(workflow.jobs ?? {})
+        .flatMap((job) => job.steps ?? [])
+        .filter((step) => step.run === exactGuardRun)
+      expect(guardSteps).toHaveLength(1)
     })
 
-    it('pins Linux/macOS/Windows native jobs and locked standalone commands without receipts', () => {
-      const workflow = readFileSync(
-        join(REPOSITORY_ROOT, '.github/workflows/pr-validation.yml'),
-        'utf-8'
-      )
-      for (const token of [
-        'conversation-native-durability:',
-        'platform: linux',
-        'platform: macos',
-        'platform: windows',
-        'cargo test --locked conversation::native_durability_tests',
-        'cargo build --locked --bin termul-server --features standalone-server',
-        'cargo clippy --locked --bin termul-server --features standalone-server -- -D warnings'
-      ]) {
-        expect(workflow, `CI wiring missing ${token}`).toContain(token)
-      }
+    it('validates native and packaging workflows through parsed semantic guard results', () => {
+      const workflowRules = new Set([
+        'locked-rust-ci',
+        'default-pr-guard',
+        'native-ci-wiring',
+        'stamped-root-lock',
+        'locked-tauri-action',
+        'workflow-yaml'
+      ])
+      expect(
+        semanticRepositoryFindings().filter((finding) => workflowRules.has(finding.rule))
+      ).toEqual([])
     })
   })
 

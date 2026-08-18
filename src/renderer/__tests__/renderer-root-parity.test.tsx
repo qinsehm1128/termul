@@ -48,7 +48,14 @@ vi.mock('@/components/conversation/ConversationHostStatus', () => ({
 }))
 
 vi.mock('@/components/conversation/ConversationRecoveryPanel', () => ({
-  ConversationRecoveryPanel: () => <div data-testid="conversation-recovery-panel" />
+  ConversationRecoveryPanel: () => (
+    <aside aria-label="Conversation recovery" data-testid="conversation-recovery-panel">
+      <button type="button">Inspect preserved source</button>
+      <button type="button">Associate conversation</button>
+      <button type="button">Start empty workspace</button>
+      <button type="button">Dismiss preserved source</button>
+    </aside>
+  )
 }))
 
 vi.mock('@/components/ErrorBoundary', () => ({
@@ -144,6 +151,7 @@ async function navigateDashboardRoot(Root: ComponentType): Promise<{
   hasPortableEffects: boolean
   hasHostStatus: boolean
   recoveryPanels: number
+  recoveryActions: string[]
 }> {
   window.location.hash = '#/'
   window.dispatchEvent(new HashChangeEvent('hashchange'))
@@ -155,7 +163,13 @@ async function navigateDashboardRoot(Root: ComponentType): Promise<{
     hasTerminalShell: screen.queryByTestId('pane-renderer') !== null,
     hasPortableEffects: screen.queryByTestId('portable-app-effects') !== null,
     hasHostStatus: screen.queryByTestId('conversation-host-status') !== null,
-    recoveryPanels: screen.getAllByTestId('conversation-recovery-panel').length
+    recoveryPanels: screen.getAllByTestId('conversation-recovery-panel').length,
+    recoveryActions: [
+      'Inspect preserved source',
+      'Associate conversation',
+      'Start empty workspace',
+      'Dismiss preserved source'
+    ].filter((label) => screen.queryAllByRole('button', { name: label }).length === 1)
   }
   view.unmount()
   cleanup()
@@ -182,7 +196,13 @@ describe('renderer root runtime parity', () => {
       hasTerminalShell: false,
       hasPortableEffects: true,
       hasHostStatus: true,
-      recoveryPanels: 2
+      recoveryPanels: 1,
+      recoveryActions: [
+        'Inspect preserved source',
+        'Associate conversation',
+        'Start empty workspace',
+        'Dismiss preserved source'
+      ]
     })
     expect(native).toEqual(web)
   })

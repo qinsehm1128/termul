@@ -235,6 +235,11 @@ jobs:
           TAG_VERSION: ${{ needs.changelog.outputs.normalized_version }}
         run: bun scripts/align-version.ts
 
+      - name: Synchronize stamped root lock entry
+        run: |-
+          python3 scripts/sync-stamped-root-lock.py --manifest src-tauri/Cargo.toml --lockfile src-tauri/Cargo.lock --package termul-manager
+          cargo metadata --locked --manifest-path src-tauri/Cargo.toml --format-version 1 --no-deps
+
       # Build the Vite WEB bundle (dist-web/) BEFORE the desktop release build so
       # rust-embed embeds it into the desktop binary (the desktop's in-process
       # shared-live server serves this embedded bundle in a release install
@@ -258,7 +263,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tauriScript: bun run tauri
-          args: ${{ matrix.args }} --config src-tauri/tauri.conf.prod.json
+          args: ${{ matrix.args }} --config src-tauri/tauri.conf.prod.json -- --locked
 
       - name: Persist Tauri artifact paths
         shell: bash
@@ -436,6 +441,11 @@ jobs:
         env:
           TAG_VERSION: ${{ needs.changelog.outputs.normalized_version }}
         run: bun scripts/align-version.ts
+
+      - name: Synchronize stamped root lock entry
+        run: |-
+          python3 scripts/sync-stamped-root-lock.py --manifest src-tauri/Cargo.toml --lockfile src-tauri/Cargo.lock --package termul-manager
+          cargo metadata --locked --manifest-path src-tauri/Cargo.toml --format-version 1 --no-deps
 
       # ORDER MATTERS: web bundle before termul-server release build (rust-embed).
       - name: Build web client (dist-web/)

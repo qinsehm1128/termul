@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use syn::visit::{self, Visit};
 use syn::{
     Attribute, Expr, ExprCall, ExprMethodCall, ExprStruct, FnArg, ImplItem, Item, ItemFn, ItemImpl,
-    ItemMod, ItemUse, Type, UseTree,
+    ItemMod, ItemUse, Type, UseTree, Visibility,
 };
 
 const REPOSITORY_MUTATORS: &[&str] = &[
@@ -54,8 +54,10 @@ struct FunctionInfo {
     calls: HashSet<String>,
     references: HashSet<String>,
     methods: HashSet<String>,
+    method_uses: Vec<MethodUse>,
     type_refs: HashSet<String>,
     parameter_types: HashSet<String>,
+    production_entry: bool,
 }
 
 #[derive(Debug, Default)]
@@ -73,7 +75,7 @@ struct ModuleInfo {
     string_literals: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct MethodUse {
     method: String,
     receiver: String,
@@ -167,7 +169,6 @@ fn flatten_use(tree: &UseTree, prefix: &mut Vec<String>, aliases: &mut HashMap<S
 struct CallCollector<'a> {
     aliases: &'a HashMap<String, String>,
     info: FunctionInfo,
-    method_uses: Vec<MethodUse>,
     string_literals: Vec<String>,
 }
 
@@ -207,7 +208,7 @@ impl<'ast> Visit<'ast> for CallCollector<'_> {
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
         let method = node.method.to_string();
         self.info.methods.insert(method.clone());
-        self.method_uses.push(MethodUse {
+        self.info.method_uses.push(MethodUse {
             method,
             receiver: expression_name(&node.receiver),
             argument_names: node
@@ -256,6 +257,10 @@ struct ModuleCollector {
 }
 
 impl ModuleCollector {
+    fn is_production_entry(visibility: &Visibility) -> bool {
+        !matches!(visibility, Visibility::Inherited)
+    }
+
     fn canonicalize_types(&self, names: HashSet<String>) -> HashSet<String> {
         names
             .into_iter()
@@ -269,8 +274,10 @@ impl ModuleCollector {
         }
         let mut collector = CallCollector {
             aliases: &self.info.aliases,
-            info: FunctionInfo::default(),
-            method_uses: Vec::new(),
+            info: FunctionInfo {
+                production_entry: Self::is_production_entry(&function.vis),
+                ..FunctionInfo::default()
+            },
             string_literals: Vec::new(),
         };
         for argument in &function.sig.inputs {
@@ -284,7 +291,9 @@ impl ModuleCollector {
             .type_refs
             .extend(collector.info.parameter_types.iter().cloned());
         collector.visit_block(&function.block);
-        self.info.method_uses.extend(collector.method_uses);
+        self.info
+            .method_uses
+            .extend(collector.info.method_uses.iter().cloned());
         self.info.string_literals.extend(collector.string_literals);
         self.info
             .type_refs
@@ -323,8 +332,10 @@ impl ModuleCollector {
 
             let mut collector = CallCollector {
                 aliases: &self.info.aliases,
-                info: FunctionInfo::default(),
-                method_uses: Vec::new(),
+                info: FunctionInfo {
+                    production_entry: Self::is_production_entry(&method.vis),
+                    ..FunctionInfo::default()
+                },
                 string_literals: Vec::new(),
             };
             collector.info.parameter_types = self
@@ -337,7 +348,9 @@ impl ModuleCollector {
                 .type_refs
                 .extend(collector.info.parameter_types.iter().cloned());
             collector.visit_block(&method.block);
-            self.info.method_uses.extend(collector.method_uses);
+            self.info
+                .method_uses
+                .extend(collector.info.method_uses.iter().cloned());
             self.info.string_literals.extend(collector.string_literals);
             self.info
                 .type_refs
@@ -502,6 +515,51 @@ fn reachable_has_call(module: &ModuleInfo, entry: &str, expected: &str) -> bool 
     walk(module, entry, expected, &mut HashSet::new())
 }
 
+fn reachable_functions(module: &ModuleInfo, entry: &str) -> HashSet<String> {
+    fn walk(module: &ModuleInfo, function: &str, visited: &mut HashSet<String>) {
+        if !visited.insert(function.to_string()) {
+            return;
+        }
+        let Some(info) = module.functions.get(function) else {
+            return;
+        };
+        for callee in &info.calls {
+            walk(module, callee, visited);
+        }
+    }
+
+    let mut reached = HashSet::new();
+    walk(module, entry, &mut reached);
+    reached
+}
+
+fn production_entries(module: &ModuleInfo) -> Vec<String> {
+    module
+        .functions
+        .iter()
+        .filter_map(|(name, info)| info.production_entry.then_some(name.clone()))
+        .collect()
+}
+
+fn reachable_method_uses<'a>(module: &'a ModuleInfo, entry: &str) -> Vec<&'a MethodUse> {
+    reachable_functions(module, entry)
+        .into_iter()
+        .filter_map(|name| module.functions.get(&name))
+        .flat_map(|info| info.method_uses.iter())
+        .collect()
+}
+
+fn reachable_has_any_method(module: &ModuleInfo, entry: &str, expected: &HashSet<&str>) -> bool {
+    reachable_functions(module, entry)
+        .into_iter()
+        .filter_map(|name| module.functions.get(&name))
+        .any(|info| {
+            info.methods
+                .iter()
+                .any(|method| expected.contains(method.as_str()))
+        })
+}
+
 fn check_repository(modules: &[ModuleInfo], findings: &mut Vec<Finding>) {
     let Some(repository) = module_by_suffix(modules, "conversation/repository.rs") else {
         findings.push(Finding {
@@ -542,22 +600,46 @@ fn check_repository(modules: &[ModuleInfo], findings: &mut Vec<Finding>) {
         {
             continue;
         }
-        for usage in &module.method_uses {
-            if !REPOSITORY_MUTATORS.contains(&usage.method.as_str()) {
+        let mut reported = HashSet::new();
+        for entry in production_entries(module) {
+            let uses = reachable_method_uses(module, &entry);
+            let repository_mutations = uses
+                .iter()
+                .copied()
+                .filter(|usage| {
+                    REPOSITORY_MUTATORS.contains(&usage.method.as_str())
+                        && (usage.receiver.contains("repository") || usage.receiver == "repo")
+                })
+                .collect::<Vec<_>>();
+            if repository_mutations.is_empty() {
                 continue;
             }
-            let direct_repository =
-                usage.receiver.contains("repository") || usage.receiver == "repo";
-            if direct_repository && !usage.argument_names.contains("permit") {
+            if !reachable_has_any_method(module, &entry, &HashSet::from(["authorize"]))
+                && reported.insert((entry.clone(), "authorize"))
+            {
                 findings.push(Finding {
-                    rule: "sole-writer",
+                    rule: "write-admission",
                     file: module.file.clone(),
-                    line: line_of(&module.source, &usage.method),
+                    line: line_of(&module.source, &format!("fn {entry}")),
                     message: format!(
-                        "direct repository mutation {} must carry an admitted permit",
-                        usage.method
+                        "production entry {entry} reaches repository mutation without reaching write-authority authorize"
                     ),
                 });
+            }
+            for usage in repository_mutations {
+                if !usage.argument_names.contains("permit")
+                    && reported.insert((entry.clone(), usage.method.as_str()))
+                {
+                    findings.push(Finding {
+                        rule: "sole-writer",
+                        file: module.file.clone(),
+                        line: line_of(&module.source, &usage.method),
+                        message: format!(
+                            "production entry {entry} reaches direct repository mutation {} without an admitted permit",
+                            usage.method
+                        ),
+                    });
+                }
             }
         }
     }
@@ -616,59 +698,64 @@ fn check_authentication(modules: &[ModuleInfo], findings: &mut Vec<Finding>) {
         module.file.contains("/web/")
             && module.type_refs.contains("RemoteCapability")
             && !module.file.ends_with("web/auth.rs")
+            && !module.file.ends_with("web/ws.rs")
     }) {
-        let protected_entries = module.functions.values().filter(|function| {
-            function.parameter_types.contains("RemoteAccessAuthority")
-                && function.parameter_types.contains("RemotePrincipal")
-        });
-        if protected_entries.count() == 0 {
+        let protected_entries = module
+            .functions
+            .iter()
+            .filter(|(_, function)| {
+                function.production_entry
+                    && function.parameter_types.contains("RemoteAccessAuthority")
+                    && function.parameter_types.contains("RemotePrincipal")
+            })
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        if protected_entries.is_empty() {
             findings.push(Finding {
                 rule: "capability-auth",
                 file: module.file.clone(),
                 line: 1,
-                message: "protected web module has no handler receiving authority and principal"
+                message: "protected web module has no production handler receiving authority and principal"
                     .to_string(),
             });
         }
-        let authorization_present = module
-            .functions
-            .values()
-            .any(|function| function.methods.contains("authorize"));
-        if !authorization_present {
-            findings.push(Finding {
-                rule: "capability-auth",
-                file: module.file.clone(),
-                line: 1,
-                message: "protected web module never calls capability authorize".to_string(),
-            });
+        for entry in protected_entries {
+            if !reachable_has_any_method(module, &entry, &HashSet::from(["authorize"])) {
+                findings.push(Finding {
+                    rule: "capability-auth",
+                    file: module.file.clone(),
+                    line: line_of(&module.source, &format!("fn {entry}")),
+                    message: format!(
+                        "protected production handler {entry} does not reach capability authorize"
+                    ),
+                });
+            }
         }
     }
 
     let Some(ws) = module_by_suffix(modules, "web/ws.rs") else {
         return;
     };
-    if !ws
-        .functions
-        .values()
-        .any(|function| function.methods.contains("verify_bearer_for_peer"))
-    {
+    let ws_entries = production_entries(ws);
+    if !ws_entries.iter().any(|entry| {
+        reachable_has_any_method(ws, entry, &HashSet::from(["verify_bearer_for_peer"]))
+    }) {
         findings.push(Finding {
             rule: "capability-auth",
             file: ws.file.clone(),
             line: 1,
-            message: "ACP WebSocket must verify bearer credentials for the peer".to_string(),
+            message: "ACP WebSocket production entry must reach bearer verification".to_string(),
         });
     }
-    if !ws
-        .functions
-        .values()
-        .any(|function| function.methods.contains("verify_origin"))
+    if !ws_entries
+        .iter()
+        .any(|entry| reachable_has_any_method(ws, entry, &HashSet::from(["verify_origin"])))
     {
         findings.push(Finding {
             rule: "capability-auth",
             file: ws.file.clone(),
             line: 1,
-            message: "ACP WebSocket upgrade must verify Origin".to_string(),
+            message: "ACP WebSocket production entry must reach Origin verification".to_string(),
         });
     }
 }
@@ -687,9 +774,8 @@ fn check_remote_terminal(modules: &[ModuleInfo], findings: &mut Vec<Finding>) {
             });
         }
         let forbidden = HashSet::from(["kill", "force_kill", "terminate", "kill_all"]);
-        if module
-            .functions
-            .keys()
+        if production_entries(module)
+            .iter()
             .any(|entry| reachable_has_method(module, entry, &forbidden))
         {
             findings.push(Finding {
@@ -705,11 +791,7 @@ fn check_remote_terminal(modules: &[ModuleInfo], findings: &mut Vec<Finding>) {
 fn check_shared_live_teardown(modules: &[ModuleInfo], findings: &mut Vec<Finding>) {
     let forbidden = HashSet::from(["kill_all", "kill_all_checked", "terminate", "force_kill"]);
     if let Some(host) = module_by_suffix(modules, "remote/host.rs") {
-        let calls_router = host
-            .functions
-            .values()
-            .any(|function| function.calls.contains("serve_router"));
-        if !calls_router {
+        if !reachable_has_call(host, "start", "serve_router") {
             findings.push(Finding {
                 rule: "desktop-shared-live-ownership",
                 file: host.file.clone(),
@@ -718,10 +800,8 @@ fn check_shared_live_teardown(modules: &[ModuleInfo], findings: &mut Vec<Finding
                     .to_string(),
             });
         }
-        if host
-            .functions
-            .keys()
-            .any(|entry| reachable_has_method(host, entry, &forbidden))
+        if reachable_has_method(host, "start", &forbidden)
+            || reachable_has_method(host, "stop", &forbidden)
         {
             findings.push(Finding {
                 rule: "desktop-shared-live-ownership",
@@ -756,8 +836,9 @@ fn check_shared_live_teardown(modules: &[ModuleInfo], findings: &mut Vec<Finding
             function.methods.contains("stop_producers")
                 && function.methods.contains("shutdown_persistence")
         });
-        let shutdown_has_pty =
-            shutdown.is_some_and(|function| function.methods.contains("kill_all"));
+        let shutdown_has_pty = shutdown.is_some_and(|function| {
+            function.methods.contains("kill_all") || function.methods.contains("kill_all_until")
+        });
         if !shutdown_has_acp || !shutdown_has_pty {
             findings.push(Finding {
                 rule: "standalone-owns-shutdown",
@@ -879,7 +960,7 @@ impl ConversationWriter { #[cfg(test)] fn for_test() {} }
     );
     let bypass = fixture(
         "src/conversation/moved_writer.rs",
-        "fn mutate(repo: &Repo) { repo.append_event(value); }",
+        "pub fn mutate(repo: &Repo) { repo.append_event(value); }",
     );
     let mut findings = Vec::new();
     check_repository(&[repository, authority, bypass], &mut findings);
@@ -908,13 +989,96 @@ fn classified_routes(_authority: RemoteAccessAuthority) { from_fn(capability_mid
         "src/web/moved_unprotected.rs",
         r#"
 use crate::web::auth::{RemoteAccessAuthority as Authority, RemoteCapability, RemotePrincipal as Principal};
-fn handler(_authority: &Authority, _principal: &Principal) { let _ = RemoteCapability::Mutate; }
+pub fn handler(_authority: &Authority, _principal: &Principal) { let _ = RemoteCapability::Mutate; }
 "#,
     );
     let mut findings = Vec::new();
     check_authentication(&[router, missing_authorization], &mut findings);
     assert!(findings.iter().any(|finding| {
         finding.rule == "capability-auth"
-            && finding.message.contains("never calls capability authorize")
+            && finding
+                .message
+                .contains("does not reach capability authorize")
+    }));
+}
+
+#[test]
+fn disconnected_rust_references_cannot_satisfy_production_call_graphs() {
+    let router = fixture(
+        "src/web/router.rs",
+        r#"
+fn classified_routes(_authority: RemoteAccessAuthority) { from_fn(capability_middleware); }
+"#,
+    );
+    let disconnected_auth = fixture(
+        "src/web/disconnected_auth.rs",
+        r#"
+use crate::web::auth::{RemoteAccessAuthority as Authority, RemoteCapability, RemotePrincipal as Principal};
+fn decoy(authority: &Authority, principal: &Principal) { authority.authorize(principal, RemoteCapability::Mutate); }
+pub fn handler(_authority: &Authority, _principal: &Principal) { let _ = RemoteCapability::Mutate; }
+"#,
+    );
+    let mut findings = Vec::new();
+    check_authentication(&[router, disconnected_auth], &mut findings);
+    assert!(findings.iter().any(|finding| {
+        finding.rule == "capability-auth"
+            && finding
+                .message
+                .contains("handler does not reach capability authorize")
+    }));
+
+    let repository = fixture(
+        "src/conversation/repository.rs",
+        &format!(
+            "pub struct ConversationRepository;\nstruct RepositoryWritePermit;\nimpl ConversationRepository {{ {} }}",
+            REPOSITORY_MUTATORS
+                .iter()
+                .map(|name| format!("fn {name}(&self, permit: &RepositoryWritePermit) {{ let _ = permit; }}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ),
+    );
+    let authority = fixture(
+        "src/conversation/write_authority.rs",
+        r#"
+pub struct ConversationWriteAuthority;
+pub struct ConversationWriter;
+struct RepositoryWritePermit;
+struct MigrationWriter;
+impl ConversationWriter { #[cfg(test)] fn for_test() {} }
+"#,
+    );
+    let disconnected_writer = fixture(
+        "src/conversation/application.rs",
+        r#"
+fn decoy(writer: &Writer) { writer.authorize(); }
+fn mutate(repo: &Repo, permit: &Permit) { repo.append_event(permit, value); }
+pub fn execute(repo: &Repo, permit: &Permit) { mutate(repo, permit); }
+"#,
+    );
+    let mut findings = Vec::new();
+    check_repository(&[repository, authority, disconnected_writer], &mut findings);
+    assert!(findings.iter().any(|finding| {
+        finding.rule == "write-admission"
+            && finding
+                .message
+                .contains("without reaching write-authority authorize")
+    }));
+
+    let disconnected_host = fixture(
+        "src/remote/host.rs",
+        r#"
+fn decoy() { serve_router(); }
+pub fn start() {}
+pub fn stop() {}
+"#,
+    );
+    let mut findings = Vec::new();
+    check_shared_live_teardown(&[disconnected_host], &mut findings);
+    assert!(findings.iter().any(|finding| {
+        finding.rule == "desktop-shared-live-ownership"
+            && finding
+                .message
+                .contains("must call the non-owning serve_router path")
     }));
 }
