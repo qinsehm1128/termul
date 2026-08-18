@@ -550,7 +550,7 @@ fn golden_tests_cooperate_with_scoped_capture_logger() {
     test_tracing::install_forwarding_logger();
     let source = include_str!("conversation_golden_tests.rs");
     assert!(
-        !source.contains("log::set_logger"),
+        !source.contains(&["log::set_", "logger"].concat()),
         "golden tests must not install a second global logger"
     );
     assert!(
@@ -1315,14 +1315,14 @@ async fn canonical_usage_and_plan_full_replacements_survive_cold_restart() {
         .emit(&AcpEvent {
             sid: Some("opaque/golden/original".to_string()),
             type_: "acp:usage_update",
-            payload: json!({"tokens":{"input":0,"output":0},"cost":null}),
+            payload: json!({"used":0,"size":0}),
         })
         .unwrap();
     relay
         .emit(&AcpEvent {
             sid: Some("opaque/golden/original".to_string()),
             type_: "acp:plan_update",
-            payload: json!({"entries":[]}),
+            payload: json!({"plan":{"entries":[]}}),
         })
         .unwrap();
     relay.shutdown_conversation_persistence().await.unwrap();
@@ -1349,8 +1349,8 @@ async fn canonical_usage_and_plan_full_replacements_survive_cold_restart() {
         .iter()
         .find(|record| record.type_ == "plan_update")
         .unwrap();
-    assert_eq!(usage.payload, json!({"tokens":{"input":0,"output":0},"cost":null}));
-    assert_eq!(plan.payload, json!({"entries":[]}));
+    assert_eq!(usage.payload, json!({"used":0,"size":0}));
+    assert_eq!(plan.payload, json!({"plan":{"entries":[]}}));
     assert!(usage.seq < plan.seq);
 }
 
