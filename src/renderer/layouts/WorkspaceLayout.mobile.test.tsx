@@ -338,6 +338,7 @@ vi.mock('@/components/ssh/SSHFileExplorer', () => ({
   SSHFileExplorer: () => <div data-testid="ssh-file-explorer-stub" />
 }))
 
+import { ConversationRecoveryPanel } from '@/components/conversation/ConversationRecoveryPanel'
 import WorkspaceDashboard from '@/pages/WorkspaceDashboard'
 import { useConversationStore } from '@/stores/conversation-store'
 import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
@@ -381,6 +382,7 @@ const redactedHostRecoveryItem = {
 function renderMobileRoot(): ReturnType<typeof render> {
   return render(
     <MemoryRouter initialEntries={['/']}>
+      <ConversationRecoveryPanel />
       <Routes>
         <Route path="/" element={<WorkspaceLayout />}>
           <Route index element={<WorkspaceDashboard />} />
@@ -441,6 +443,13 @@ describe('WorkspaceLayout mobile branch', () => {
     expect(screen.getByLabelText('New chat')).toBeEnabled()
     expect(document.querySelector('[data-pane-renderer-stub]')).not.toBeInTheDocument()
     expect(screen.queryByText(/legacy_workspace_manifests\/0\/shared.json/)).not.toBeInTheDocument()
+    expect(document.querySelectorAll('[data-conversation-recovery-panel]')).toHaveLength(1)
+    expect(document.querySelectorAll('[data-recovery-action]')).toHaveLength(
+      redactedHostRecoveryItem.suggestedActions.length
+    )
+    for (const action of redactedHostRecoveryItem.suggestedActions) {
+      expect(document.querySelectorAll(`[data-recovery-action="${action}"]`)).toHaveLength(1)
+    }
 
     fireEvent.click(screen.getByRole('button', { name: 'Inspect preserved source' }))
 
