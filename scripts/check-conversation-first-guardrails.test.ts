@@ -1,7 +1,14 @@
+import { spawnSync } from 'node:child_process'
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
+import { performance } from 'node:perf_hooks'
 import { describe, expect, it, vi } from 'vitest'
 import {
   checkConversationFirstGuardrails,
+  type GuardFinding,
   type GuardSources,
+  loadRepositorySources,
   main,
   stripComments,
   stripRustTestCode
@@ -199,6 +206,35 @@ export interface TerminalSpawnIntentV1 { conversationId: string; cols: number; r
 
 function findings(sources: GuardSources, rule: string) {
   return checkConversationFirstGuardrails(sources).filter((item) => item.rule === rule)
+}
+
+const repositoryRoot = resolve(__dirname, '..')
+const guardScript = resolve(__dirname, 'check-conversation-first-guardrails.ts')
+
+function writeSources(root: string, sources: GuardSources): void {
+  for (const [file, source] of Object.entries(sources)) {
+    const target = join(root, file)
+    mkdirSync(dirname(target), { recursive: true })
+    writeFileSync(target, source)
+  }
+}
+
+function withTemporaryRepository<T>(sources: GuardSources, run: (root: string) => T): T {
+  const root = mkdtempSync(join(tmpdir(), 'conversation-first-guard-'))
+  try {
+    writeSources(root, sources)
+    mkdirSync(join(root, 'scripts'), { recursive: true })
+    symlinkSync(guardScript, join(root, 'scripts/check-conversation-first-guardrails.ts'))
+    return run(root)
+  } finally {
+    rmSync(root, { force: true, recursive: true })
+  }
+}
+
+function parseJsonFindings(stdout: string): GuardFinding[] {
+  const parsed: unknown = JSON.parse(stdout)
+  expect(Array.isArray(parsed)).toBe(true)
+  return parsed as GuardFinding[]
 }
 
 describe('Conversation-first semantic guardrails', () => {
@@ -459,6 +495,127 @@ export const payload = { token: 'dev' }
     )
     log.mockRestore()
     error.mockRestore()
+  })
+
+  it('keeps sub-100 fixture scans in-process without spawning bun', () => {
+    const originalPath = process.env.PATH
+    process.env.PATH = '/conversation-first-no-bun'
+    try {
+      const sources = validSources()
+      expect(Object.keys(sources).length).toBeLessThan(100)
+      expect(checkConversationFirstGuardrails(sources)).toEqual([])
+    } finally {
+      process.env.PATH = originalPath
+    }
+  })
+
+  it('memoizes by source identity in under 50ms without exposing cached mutable findings', () => {
+    const sources = validSources()
+    sources['.github/workflows/new-active.yaml'] =
+      'jobs:\n  x:\n    steps:\n      - run: cargo test\n'
+    const first = checkConversationFirstGuardrails(sources)
+    expect(first).toHaveLength(1)
+    first[0].message = 'mutated by caller'
+    first.push({ rule: 'caller', file: 'caller', line: 1, message: 'caller' })
+
+    const started = performance.now()
+    const second = checkConversationFirstGuardrails(sources)
+    const duration = performance.now() - started
+
+    expect(duration).toBeLessThan(50)
+    expect(second).toHaveLength(1)
+    expect(second[0].message).not.toBe('mutated by caller')
+    expect(second).not.toBe(first)
+    second[0].message = 'mutated again'
+    expect(checkConversationFirstGuardrails(sources)[0].message).not.toBe('mutated again')
+  })
+
+  it('filters repository loading to consumed sources while retaining exact rules and decoys', () => {
+    const sources = validSources()
+    sources['src/renderer/irrelevant.ts'] = 'export const harmless = true\n'
+    sources['src/renderer/irrelevant.test.ts'] = 'terminalApi.terminate("test-only")\n'
+    sources['src/renderer/moved/navigation-owner.ts'] = `
+import { terminalApi } from '@/lib/terminal-api'
+const dispose = terminalApi.terminate
+export function selectProject() { return dispose('pty') }
+`
+    sources['src/renderer/moved/string-decoy.ts'] = `
+const decoy = "terminalApi.terminate('string')"
+export function harmless() { return decoy.length }
+`
+
+    withTemporaryRepository(sources, (root) => {
+      const loaded = loadRepositorySources(root)
+      const loadedFiles = Object.keys(loaded)
+      expect(loadedFiles).not.toContain('src/renderer/irrelevant.ts')
+      expect(loadedFiles).not.toContain('src/renderer/irrelevant.test.ts')
+      expect(loadedFiles).toContain('src/renderer/moved/navigation-owner.ts')
+      expect(loadedFiles).toContain('src/renderer/moved/string-decoy.ts')
+      expect(loadedFiles).toEqual(
+        expect.arrayContaining(
+          Object.keys(validSources()).filter((file) => !file.endsWith('.test.ts'))
+        )
+      )
+      const repositoryMarker = Object.getOwnPropertySymbols(loaded)
+      expect(repositoryMarker).toHaveLength(1)
+      expect(Object.getOwnPropertyDescriptor(loaded, repositoryMarker[0])?.enumerable).toBe(false)
+
+      const inProcess = checkConversationFirstGuardrails(sources)
+      const delegated = checkConversationFirstGuardrails(loaded)
+      expect(delegated).toEqual(inProcess)
+      expect(delegated.filter((finding) => finding.rule === 'navigation-preserves-pty')).toEqual([
+        expect.objectContaining({ file: 'src/renderer/moved/navigation-owner.ts' })
+      ])
+      expect(
+        delegated.some((finding) => finding.file === 'src/renderer/moved/string-decoy.ts')
+      ).toBe(false)
+    })
+  })
+
+  it('emits only GuardFinding[] JSON and uses finding-sensitive CLI exit status', () => {
+    const sources = validSources()
+    sources['.github/workflows/new-active.yaml'] =
+      'jobs:\n  x:\n    steps:\n      - run: cargo test\n'
+    withTemporaryRepository(sources, (root) => {
+      const result = spawnSync('bun', [guardScript, '--json'], {
+        cwd: root,
+        encoding: 'utf8',
+        env: { ...process.env, PATH: `${process.env.HOME}/.bun/bin:${process.env.PATH}` }
+      })
+      const parsed = parseJsonFindings(result.stdout)
+      expect(result.status).toBe(1)
+      expect(result.stderr).toBe('')
+      expect(parsed).toHaveLength(1)
+      expect(parsed[0]).toMatchObject({
+        file: '.github/workflows/new-active.yaml',
+        rule: 'locked-rust-ci'
+      })
+    })
+  })
+
+  it('keeps real Bun and Node-delegated scans equal and within 4000ms', () => {
+    const bunStarted = performance.now()
+    const bunResult = spawnSync(
+      'bun',
+      ['scripts/check-conversation-first-guardrails.ts', '--json'],
+      {
+        cwd: repositoryRoot,
+        encoding: 'utf8',
+        env: { ...process.env, PATH: `${process.env.HOME}/.bun/bin:${process.env.PATH}` }
+      }
+    )
+    const bunDuration = performance.now() - bunStarted
+    const bunFindings = parseJsonFindings(bunResult.stdout)
+    expect(bunResult.status).toBe(0)
+    expect(bunResult.stderr).toBe('')
+    expect(bunDuration).toBeLessThan(4000)
+
+    const sources = loadRepositorySources(repositoryRoot)
+    const nodeStarted = performance.now()
+    const nodeFindings = checkConversationFirstGuardrails(sources)
+    const nodeDuration = performance.now() - nodeStarted
+    expect(nodeDuration).toBeLessThan(4000)
+    expect(nodeFindings).toEqual(bunFindings)
   })
 
   it('keeps compatibility stripping helpers line-stable', () => {

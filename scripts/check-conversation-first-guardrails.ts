@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process'
 import { readdirSync, readFileSync } from 'node:fs'
 import { extname, join, posix, relative, resolve, sep } from 'node:path'
 import { ts } from '@ts-morph/common'
@@ -21,6 +22,10 @@ export interface GuardFinding {
 }
 
 export type GuardSources = Readonly<Record<string, string>>
+
+const REAL_REPOSITORY_SOURCES = Symbol('conversation-first-real-repository-sources')
+const CHILD_SENTINEL = 'TERMUL_CONVERSATION_FIRST_GUARD_CHILD'
+const findingsBySourceIdentity = new WeakMap<GuardSources, GuardFinding[]>()
 
 type ReachabilityScope = 'default' | 'exports'
 
@@ -1662,7 +1667,64 @@ export function stripRustTestCode(source: string): string {
   return source.replace(/#\[cfg\(test\)\][\s\S]*$/m, (matched) => matched.replace(/[^\n]/g, ' '))
 }
 
-export function checkConversationFirstGuardrails(sources: GuardSources): GuardFinding[] {
+function cloneFindings(findings: GuardFinding[]): GuardFinding[] {
+  return findings.map((finding) => ({ ...finding }))
+}
+
+function isGuardFinding(value: unknown): value is GuardFinding {
+  if (!value || typeof value !== 'object') return false
+  const finding = value as Partial<GuardFinding>
+  return (
+    typeof finding.rule === 'string' &&
+    typeof finding.file === 'string' &&
+    Number.isInteger(finding.line) &&
+    (finding.line ?? 0) > 0 &&
+    typeof finding.message === 'string'
+  )
+}
+
+function repositoryRoot(sources: GuardSources): string | undefined {
+  return (sources as GuardSources & { [REAL_REPOSITORY_SOURCES]?: string })[REAL_REPOSITORY_SOURCES]
+}
+
+function shouldDelegateToBun(sources: GuardSources): boolean {
+  return (
+    !process.versions.bun &&
+    !process.env[CHILD_SENTINEL] &&
+    (repositoryRoot(sources) !== undefined || Object.keys(sources).length >= 100)
+  )
+}
+
+function delegatedFindings(sources: GuardSources): GuardFinding[] {
+  const root = repositoryRoot(sources) ?? process.cwd()
+  const result = spawnSync('bun', ['scripts/check-conversation-first-guardrails.ts', '--json'], {
+    cwd: root,
+    encoding: 'utf8',
+    env: { ...process.env, [CHILD_SENTINEL]: '1' },
+    maxBuffer: 10 * 1024 * 1024
+  })
+  if (result.error) throw result.error
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(result.stdout)
+  } catch (error) {
+    throw new Error(
+      `conversation-first bun delegate returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`
+    )
+  }
+  if (!Array.isArray(parsed) || !parsed.every(isGuardFinding)) {
+    throw new Error('conversation-first bun delegate returned an invalid GuardFinding[] payload')
+  }
+  const expectedStatus = parsed.length === 0 ? 0 : 1
+  if (result.status !== expectedStatus) {
+    throw new Error(
+      `conversation-first bun delegate exited ${String(result.status)} for ${parsed.length} finding(s): ${result.stderr.trim()}`
+    )
+  }
+  return parsed
+}
+
+function inProcessFindings(sources: GuardSources): GuardFinding[] {
   const models = modelsForSources(sources)
   const findings: GuardFinding[] = []
   checkRootParity(findings, models)
@@ -1680,19 +1742,41 @@ export function checkConversationFirstGuardrails(sources: GuardSources): GuardFi
   )
 }
 
-function walkFiles(root: string, directory: string, accept: (path: string) => boolean): string[] {
+export function checkConversationFirstGuardrails(sources: GuardSources): GuardFinding[] {
+  const cached = findingsBySourceIdentity.get(sources)
+  if (cached) return cloneFindings(cached)
+  const findings = shouldDelegateToBun(sources)
+    ? delegatedFindings(sources)
+    : inProcessFindings(sources)
+  findingsBySourceIdentity.set(sources, cloneFindings(findings))
+  return cloneFindings(findings)
+}
+
+function walkSources(
+  root: string,
+  directory: string,
+  acceptPath: (path: string) => boolean,
+  acceptSource: (file: string, source: string) => boolean
+): Array<[string, string]> {
   const absolute = resolve(root, directory)
-  const files: string[] = []
+  const sources: Array<[string, string]> = []
   for (const entry of readdirSync(absolute, { withFileTypes: true })) {
     const path = join(absolute, entry.name)
-    if (entry.isDirectory())
-      files.push(...walkFiles(root, normalizePath(relative(root, path)), accept))
-    else if (entry.isFile() && accept(path)) files.push(normalizePath(relative(root, path)))
+    if (entry.isDirectory()) {
+      sources.push(
+        ...walkSources(root, normalizePath(relative(root, path)), acceptPath, acceptSource)
+      )
+    } else if (entry.isFile() && acceptPath(path)) {
+      const file = normalizePath(relative(root, path))
+      const source = readFileSync(path, 'utf8')
+      if (acceptSource(file, source)) sources.push([file, source])
+    }
   }
-  return files
+  return sources
 }
 
 export function loadRepositorySources(root = process.cwd()): GuardSources {
+  const resolvedRoot = resolve(root)
   const isProductionTypeScript = (path: string): boolean => {
     const normalized = normalizePath(path)
     return (
@@ -1702,18 +1786,39 @@ export function loadRepositorySources(root = process.cwd()): GuardSources {
       !/\.(?:test|spec)\.(?:ts|tsx)$/.test(normalized)
     )
   }
-  const sourceFiles = [
-    ...walkFiles(root, 'src/renderer', isProductionTypeScript),
-    ...walkFiles(root, 'src/shared', isProductionTypeScript),
-    ...walkFiles(root, '.github/workflows', (path) => ['.yml', '.yaml'].includes(extname(path)))
-  ].sort()
-  return Object.fromEntries(
-    sourceFiles.map((file) => [file, readFileSync(resolve(root, file), 'utf8')])
-  )
+  const sourceEntries = [
+    ...walkSources(resolvedRoot, 'src/renderer', isProductionTypeScript, (file, source) =>
+      isSemanticTypeScriptSource(file, source)
+    ),
+    ...walkSources(resolvedRoot, 'src/shared', isProductionTypeScript, (file, source) =>
+      isSemanticTypeScriptSource(file, source)
+    ),
+    ...walkSources(
+      resolvedRoot,
+      '.github/workflows',
+      (path) => ['.yml', '.yaml'].includes(extname(path)),
+      () => true
+    )
+  ].sort(([left], [right]) => left.localeCompare(right))
+  const sources = Object.fromEntries(sourceEntries) as GuardSources
+  Object.defineProperty(sources, REAL_REPOSITORY_SOURCES, {
+    configurable: false,
+    enumerable: false,
+    value: resolvedRoot,
+    writable: false
+  })
+  return sources
 }
 
-export function main(sources: GuardSources = loadRepositorySources()): number {
+export function main(
+  sources: GuardSources = loadRepositorySources(),
+  options: { json?: boolean } = {}
+): number {
   const findings = checkConversationFirstGuardrails(sources)
+  if (options.json) {
+    console.log(JSON.stringify(findings))
+    return findings.length === 0 ? 0 : 1
+  }
   if (findings.length === 0) {
     console.log(
       `Conversation-first semantic guardrails passed (${Object.keys(sources).length} discovered sources)`
@@ -1727,4 +1832,5 @@ export function main(sources: GuardSources = loadRepositorySources()): number {
   return 1
 }
 
-if (import.meta.main) process.exit(main())
+if (import.meta.main)
+  process.exit(main(loadRepositorySources(), { json: process.argv.includes('--json') }))
