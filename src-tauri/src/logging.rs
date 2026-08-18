@@ -186,17 +186,14 @@ impl std::io::Write for TracingToLogWriter {
         if EMITTING.with(|flag| flag.replace(true)) {
             return Ok(buf.len());
         }
-        let result = (|| {
-            if let Ok(line) = std::str::from_utf8(buf) {
-                let trimmed = line.trim_end();
-                if !trimmed.is_empty() {
-                    log::info!(target: "termul::tracing", "{trimmed}");
-                }
+        if let Ok(line) = std::str::from_utf8(buf) {
+            let trimmed = line.trim_end();
+            if !trimmed.is_empty() {
+                log::info!(target: "termul::tracing", "{trimmed}");
             }
-            Ok(buf.len())
-        })();
+        }
         EMITTING.with(|flag| flag.set(false));
-        result
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
