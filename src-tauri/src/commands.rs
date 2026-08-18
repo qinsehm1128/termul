@@ -6208,6 +6208,26 @@ mod tests {
                 payload: serde_json::json!({"ordinal": 1}),
             })
             .unwrap();
+        let ordered = relay
+            .ordered_conversation_persistence()
+            .expect("ordered Conversation persistence");
+        let duplicate = ordered
+            .submit(
+                "desktop-exit-session",
+                1,
+                "message_chunk",
+                serde_json::json!({"ordinal": 2}),
+            )
+            .expect_err("duplicate source sequence must open a retained failure circuit");
+        assert_eq!(duplicate.code, "CONVERSATION_SOURCE_SEQUENCE_INVALID");
+        assert_eq!(
+            ordered
+                .health("desktop-exit-session")
+                .unwrap()
+                .unwrap()
+                .last_error_code,
+            Some("CONVERSATION_SOURCE_SEQUENCE_INVALID")
+        );
         let relay_sink: Arc<dyn EventSink> = relay.clone();
         let acp = Arc::new(crate::acp::AcpManager::new(vec![relay_sink]));
         let agent_id = crate::acp::AgentId("desktop-exit-agent".to_string());
@@ -6217,14 +6237,18 @@ mod tests {
         let outcome = crate::stop_desktop_producers_and_drain(
             Some(&acp),
             Some(&relay),
-            tokio::time::Instant::now(),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
         )
         .await;
         assert!(!outcome.clean_success());
         assert_eq!(outcome.conversation_drain_attempts, 1);
+        assert_eq!(outcome.catalog_flush_attempts, 1);
         assert!(outcome
             .failures
             .contains(&crate::web::CONVERSATION_PERSISTENCE_DRAIN_FAILED));
+        assert!(!outcome
+            .failures
+            .contains(&crate::web::CONVERSATION_CATALOG_FLUSH_FAILED));
         assert!(
             acp.stable_agent_namespace(&agent_id).is_err(),
             "producers must stop before the failed drain returns"
