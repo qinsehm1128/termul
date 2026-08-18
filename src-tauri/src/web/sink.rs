@@ -30,6 +30,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -752,10 +753,13 @@ impl WsRelaySink {
     /// Current session sequence frontier. Used as the snapshot watermark.
     #[must_use]
     pub fn session_watermark(&self, session_id: &str) -> u64 {
-        self.sessions.lock().get(session_id).map_or_else(
-            || self.durable_history_frontier(session_id).unwrap_or(0),
-            |state| state.last_seq,
-        )
+        let durable_frontier = self.durable_history_frontier(session_id).unwrap_or(0);
+        self.sessions
+            .lock()
+            .get(session_id)
+            .map_or(durable_frontier, |state| {
+                state.last_seq.max(durable_frontier)
+            })
     }
 
     fn session_gate_index(sid: &str) -> usize {
@@ -786,10 +790,8 @@ impl WsRelaySink {
     }
 
     fn next_sequenced_event(&self, sid: &str, type_: &str, payload: Value) -> SequencedEvent {
-        let durable_last = self.durable_history_frontier(sid).unwrap_or(0);
-        let ticket = crate::conversation::CanonicalSequenceTicket::from_allocated_seq(
-            durable_last.saturating_add(1),
-        );
+        let next_seq = self.session_watermark(sid).saturating_add(1);
+        let ticket = crate::conversation::CanonicalSequenceTicket::from_allocated_seq(next_seq);
         SequencedEvent::new(Some(sid.to_string()), ticket.seq, type_, payload)
     }
 
@@ -1907,6 +1909,56 @@ impl WsRelaySink {
     }
 }
 
+enum BoundedPayloadEncoding {
+    WithinLimit,
+    TooLarge,
+    SerializationFailed,
+}
+
+struct BoundedPayloadCounter {
+    bytes: usize,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl Write for BoundedPayloadCounter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let Some(next) = self.bytes.checked_add(buffer.len()) else {
+            self.exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "encoded JSON length overflow",
+            ));
+        };
+        if next > self.limit {
+            self.exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "encoded JSON exceeds configured limit",
+            ));
+        }
+        self.bytes = next;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn classify_payload_encoding<P: Serialize>(payload: &P, limit: usize) -> BoundedPayloadEncoding {
+    let mut counter = BoundedPayloadCounter {
+        bytes: 0,
+        limit,
+        exceeded: false,
+    };
+    match serde_json::to_writer(&mut counter, payload) {
+        Ok(()) => BoundedPayloadEncoding::WithinLimit,
+        Err(_) if counter.exceeded => BoundedPayloadEncoding::TooLarge,
+        Err(_) => BoundedPayloadEncoding::SerializationFailed,
+    }
+}
+
 /// Fan an event out to every sink, serializing the payload ONCE so each sink
 /// emits byte-identical JSON.
 ///
@@ -1936,22 +1988,34 @@ pub fn fan_out<P: Serialize>(
             session_seq: None,
         });
     }
-    if crate::conversation::contracts::encoded_json_len_bounded(
+    match classify_payload_encoding(
         payload,
         crate::conversation::MAX_CONVERSATION_RECORD_BYTES,
-    )
-    .is_none()
-    {
-        let error = EventSinkError::delivery_failed(
-            "relay history record exceeds the 262144-byte host bound",
-        );
-        return Err(FanOutError {
-            code: error.code,
-            source_code: error.source_code,
-            durable_rejection: error.durable_rejection,
-            delivered_count: 0,
-            detail: error.detail,
-        });
+    ) {
+        BoundedPayloadEncoding::WithinLimit => {}
+        BoundedPayloadEncoding::TooLarge => {
+            let error = EventSinkError::delivery_failed(
+                "relay history record exceeds the 262144-byte host bound",
+            );
+            return Err(FanOutError {
+                code: error.code,
+                source_code: error.source_code,
+                durable_rejection: error.durable_rejection,
+                delivered_count: 0,
+                detail: error.detail,
+            });
+        }
+        BoundedPayloadEncoding::SerializationFailed => {
+            log::error!("[acp] skipping {type_} event: payload failed to serialize");
+            let error = EventSinkError::serialization_failed();
+            return Err(FanOutError {
+                code: error.code,
+                source_code: error.source_code,
+                durable_rejection: error.durable_rejection,
+                delivered_count: 0,
+                detail: error.detail,
+            });
+        }
     }
     let payload = serde_json::to_value(payload).map_err(|error| {
         log::error!("[acp] skipping {type_} event: payload failed to serialize: {error}");
@@ -3366,7 +3430,7 @@ mod tests {
     }
 
     #[test]
-    fn next_sequenced_event_consumes_repository_ticket_seq() {
+    fn next_sequenced_event_consumes_live_watermark_ticket_seq() {
         let relay = WsRelaySink::new();
         {
             let mut sessions = relay.sessions.lock();
@@ -3386,10 +3450,9 @@ mod tests {
         let event = relay.next_sequenced_event("ticket-sid", "message_chunk", json!({}));
         assert_eq!(
             event.seq,
-            crate::conversation::CanonicalSequenceTicket::from_allocated_seq(1).seq,
-            "next_sequenced_event must consume the repository ticket, not relay last_seq+1"
+            crate::conversation::CanonicalSequenceTicket::from_allocated_seq(10).seq,
+            "next_sequenced_event must wrap the next live watermark in a repository ticket"
         );
-        assert_ne!(event.seq, 10);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

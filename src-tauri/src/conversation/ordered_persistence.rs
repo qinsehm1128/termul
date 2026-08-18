@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::io::{self, Write};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -1339,24 +1340,65 @@ fn shard_for(agent_session_id: &str) -> usize {
     hash as usize % WRITER_SHARDS
 }
 
+struct BoundedRecordCounter {
+    bytes: usize,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl Write for BoundedRecordCounter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let Some(next) = self.bytes.checked_add(buffer.len()) else {
+            self.exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "encoded JSON length overflow",
+            ));
+        };
+        if next > self.limit {
+            self.exceeded = true;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "encoded JSON exceeds configured limit",
+            ));
+        }
+        self.bytes = next;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn serialized_record_bytes(
     event_type: &str,
     payload: &Value,
 ) -> Result<usize, ConversationPersistenceError> {
-    crate::conversation::contracts::encoded_json_len_bounded(
+    let mut counter = BoundedRecordCounter {
+        bytes: 0,
+        limit: crate::conversation::MAX_CONVERSATION_RECORD_BYTES,
+        exceeded: false,
+    };
+    match serde_json::to_writer(
+        &mut counter,
         &SerializedRecordCharge {
             event_type,
             payload,
         },
-        crate::conversation::MAX_CONVERSATION_RECORD_BYTES,
-    )
-    .ok_or_else(|| {
-        persistence_error(
-            WRITER_SERIALIZATION_FAILED,
+    ) {
+        Ok(()) => Ok(counter.bytes),
+        Err(_) if counter.exceeded => Err(persistence_error(
+            WRITER_RECORD_TOO_LARGE,
             "ordered_submit",
             "record exceeds the 262144-byte host bound",
-        )
-    })
+        )),
+        Err(_) => Err(persistence_error(
+            WRITER_SERIALIZATION_FAILED,
+            "ordered_submit",
+            "record could not be serialized",
+        )),
+    }
 }
 
 fn disarm_record_command(command: &mut WorkerCommand) {
@@ -1694,29 +1736,46 @@ mod tests {
     async fn retryable_global_byte_pressure_waits_for_drain_then_succeeds() {
         let target = Arc::new(FakeTarget::stalled(1));
         let persistence = Arc::new(ordered(Arc::clone(&target)));
-        let first = persistence
-            .submit(
-                "opaque-0",
-                1,
-                "message_chunk",
-                serde_json::json!({"body":"a".repeat(8 * 1024 * 1024)}),
-            )
-            .unwrap();
+        let payload = serde_json::json!({
+            "body": "a".repeat(crate::conversation::MAX_CONVERSATION_RECORD_BYTES - 128)
+        });
+        let record_bytes = serialized_record_bytes("message_chunk", &payload).unwrap();
+        assert!(record_bytes < crate::conversation::MAX_CONVERSATION_RECORD_BYTES);
+        let admitted_records = GLOBAL_PENDING_BYTES / record_bytes;
+        assert!(admitted_records < PER_SESSION_PENDING_RECORDS);
+        assert!(record_bytes.saturating_mul(admitted_records) <= GLOBAL_PENDING_BYTES);
+        assert!(
+            record_bytes.saturating_mul(admitted_records + 1) > GLOBAL_PENDING_BYTES,
+            "one more legal record must exceed the aggregate byte budget"
+        );
+
+        let mut admitted = Vec::with_capacity(admitted_records);
+        for source_seq in 1..=admitted_records as u64 {
+            admitted.push(
+                persistence
+                    .submit("opaque-0", source_seq, "message_chunk", payload.clone())
+                    .unwrap(),
+            );
+        }
+        let blocked_seq = admitted_records as u64 + 1;
         let second_persistence = Arc::clone(&persistence);
+        let second_payload = payload.clone();
         let second = tokio::task::spawn_blocking(move || {
             second_persistence.submit(
                 "opaque-0",
-                2,
+                blocked_seq,
                 "message_chunk",
-                serde_json::json!({"body":"b".repeat(8 * 1024 * 1024)}),
+                second_payload,
             )
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!second.is_finished());
         target.release();
-        assert_eq!(first.committed().await.unwrap(), 1);
+        for (index, ticket) in admitted.into_iter().enumerate() {
+            assert_eq!(ticket.committed().await.unwrap(), index as u64 + 1);
+        }
         let second = second.await.unwrap().unwrap();
-        assert_eq!(second.committed().await.unwrap(), 2);
+        assert_eq!(second.committed().await.unwrap(), blocked_seq);
         persistence.flush_all().await.unwrap();
         assert_eq!(persistence.metrics().pending_records, 0);
         assert!(persistence.health("opaque-0").unwrap().is_none());
