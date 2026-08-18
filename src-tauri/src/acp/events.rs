@@ -170,8 +170,7 @@ fn classify_source_code(code: &'static str) -> DeliveryFailureClass {
     match code {
         "CONVERSATION_PERSISTENCE_BYTES_SATURATED"
         | "CONVERSATION_PERSISTENCE_QUEUE_SATURATED"
-        | "SESSION_PERSISTENCE_QUEUE_FULL"
-        | "CONVERSATION_CONFLICT" => DeliveryFailureClass::RetryableBackpressure,
+        | "SESSION_PERSISTENCE_QUEUE_FULL" => DeliveryFailureClass::RetryableBackpressure,
         CONVERSATION_PERSISTENCE_COMMIT_INDETERMINATE
         | "CONVERSATION_EVENT_APPEND_FAILED"
         | "CONVERSATION_PERSISTENCE_FRONTIER_MISMATCH" => DeliveryFailureClass::Indeterminate,
@@ -970,16 +969,4 @@ mod tests {
         .category(SessionConfigOptionCategory::Mode);
         assert_eq!(model_config_id_from_options(Some(&[non_model])), None);
     }
-    #[test]
-    fn classify_source_code_treats_conversation_conflict_as_retryable() {
-        assert_eq!(
-            classify_source_code("CONVERSATION_CONFLICT"),
-            DeliveryFailureClass::RetryableBackpressure
-        );
-        assert_ne!(
-            classify_source_code("CONVERSATION_CONFLICT"),
-            DeliveryFailureClass::Fatal
-        );
-    }
-
 }

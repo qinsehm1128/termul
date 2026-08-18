@@ -280,8 +280,18 @@ impl ConversationPersistenceAdapter {
             )
             .await
             .map_err(|source| map_append_error("append_ordered_event", source))?;
-        // event.seq is the lock-allocated ticket. Callers remap live envelopes to it.
-        let _ = source_seq;
+        // event.seq is the repository-allocated ticket sequence. Never trust a
+        // stale reserved source_seq when it differs.
+        if event.seq != source_seq {
+            return Err(error(
+                "CONVERSATION_CONFLICT",
+                "append_ordered_event",
+                format!(
+                    "reserved source seq {source_seq} differs from allocated seq {}",
+                    event.seq
+                ),
+            ));
+        }
         Ok(event.seq)
     }
 
@@ -1528,85 +1538,4 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "CONVERSATION_BINDING_NOT_FOUND");
     }
-    #[tokio::test]
-    async fn append_ordered_event_returns_allocated_seq_when_source_seq_differs() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().canonicalize().unwrap();
-        let private = root.join("private");
-        let visible = root.join("visible");
-        std::fs::create_dir_all(&visible).unwrap();
-        let (repository, _) = ConversationRepository::open(private.clone()).unwrap();
-        let writer = ConversationWriter::for_test(Arc::clone(&repository));
-        let id = crate::conversation::ConversationId::parse("11111111-1111-4111-8111-111111111111")
-            .unwrap();
-        let created_at = Utc
-            .timestamp_millis_opt(1_766_000_000_000)
-            .single()
-            .unwrap();
-        writer
-            .create_conversation(
-                ConversationRecordV2 {
-                    schema_version: CONVERSATION_SCHEMA_VERSION,
-                    conversation_id: id,
-                    created_at_utc: created_at,
-                    creation_partition: CreationPartition::from_created_at(created_at),
-                    workspace_cwd: visible.join("workspace").to_string_lossy().into_owned(),
-                    execution_target: ExecutionTarget::Workspace,
-                    project_attachment: None,
-                    lifecycle_state: ConversationLifecycleState::InitializingAgent,
-                    last_seq: 0,
-                    created_by: ConversationCreator::Termul,
-                },
-                ConversationMutation::CreateConversation,
-            )
-            .await
-            .unwrap();
-        writer
-            .bind_agent_session(
-                id,
-                AgentSessionBinding {
-                    schema_version: AGENT_SESSION_BINDING_SCHEMA_VERSION,
-                    binding_id: Uuid::new_v4(),
-                    agent_session_id: "opaque/session".to_string(),
-                    runtime_agent_id: "runtime".to_string(),
-                    stable_agent_namespace: "stable".to_string(),
-                    execution_cwd: visible.to_string_lossy().into_owned(),
-                    bound_at_utc: created_at,
-                    state: AgentSessionBindingState::Active,
-                },
-                created_at,
-            )
-            .await
-            .unwrap();
-        writer
-            .append_event(
-                id,
-                created_at,
-                crate::conversation::ConversationEventType::LocalTitleGenerated,
-                serde_json::json!({"title":"lifecycle"}),
-                crate::conversation::ConversationMutation::AcpEventAppend,
-            )
-            .await
-            .unwrap();
-        let reader = Arc::new(crate::conversation::ConversationReader::new(
-            Arc::clone(&repository),
-            crate::conversation::LegacyConversationReader::default(),
-            crate::conversation::ReaderPrecedence::ConversationV2Only,
-        ));
-        let adapter = Arc::new(ConversationPersistenceAdapter::new(
-            Arc::clone(&writer),
-            reader,
-        ));
-        let allocated = adapter
-            .append_ordered_event(
-                "opaque/session",
-                1,
-                "message_chunk",
-                serde_json::json!({"role":"agent","content":{"type":"text","text":"ok"}}),
-            )
-            .await
-            .unwrap();
-        assert_eq!(allocated, 3, "stale source_seq 1 must return lock-allocated ticket after bind+title");
-    }
-
 }

@@ -894,7 +894,6 @@ fn fan_out_session<P: Serialize>(
                 "CONVERSATION_PERSISTENCE_BYTES_SATURATED"
                     | "CONVERSATION_PERSISTENCE_QUEUE_SATURATED"
                     | "SESSION_PERSISTENCE_QUEUE_FULL"
-                    | "CONVERSATION_CONFLICT"
             )
         );
         if error.is_durable_rejection() && !retryable {
@@ -5207,41 +5206,4 @@ mod tests {
         watermark.forget_session("ttl-session");
         assert!(!watermark.is_seen("ttl-session", "turn-31"));
     }
-    struct ConflictAdmissionSink;
-
-    impl crate::web::EventSink for ConflictAdmissionSink {
-        fn priority(&self) -> crate::web::sink::EventSinkPriority {
-            crate::web::sink::EventSinkPriority::DurableAdmission
-        }
-
-        fn emit(
-            &self,
-            _event: &crate::web::sink::AcpEvent,
-        ) -> Result<crate::web::sink::EventDeliveryReceipt, crate::web::sink::EventSinkError> {
-            Err(crate::web::sink::EventSinkError::persistence_rejected(
-                "CONVERSATION_CONFLICT",
-            ))
-        }
-    }
-
-    #[test]
-    fn fan_out_session_does_not_open_900s_circuit_on_conversation_conflict() {
-        let circuits: SessionDeliveryCircuits =
-            Arc::new(Mutex::new(SessionDeliveryCircuitMap::new()));
-        let sinks: Vec<Arc<dyn crate::web::EventSink>> = vec![Arc::new(ConflictAdmissionSink)];
-        let error = fan_out_session(
-            &sinks,
-            &circuits,
-            "conflict-session",
-            "acp:message_chunk",
-            &serde_json::json!({"ok":true}),
-        )
-        .expect_err("conflict remains retryable");
-        assert_eq!(error.source_code, Some("CONVERSATION_CONFLICT"));
-        assert!(
-            !circuits.lock().contains_key("conflict-session"),
-            "CONVERSATION_CONFLICT must not open a 900s circuit"
-        );
-    }
-
 }
