@@ -47,7 +47,8 @@ use crate::acp::{AcpManager, AgentId, FileProjectRegistry, SessionCreationContex
 use crate::pty::PtyManager;
 use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub};
 use crate::web::auth::{
-    auth_error_response, RemoteAccessAuthority, RemoteAuthError, RemoteCapability, RemotePrincipal,
+    auth_error_response, IngressProvenance, RemoteAccessAuthority, RemoteAuthError,
+    RemoteCapability, RemotePrincipal,
 };
 use crate::web::permissions::{TurnClaim, DEFAULT_PERMISSION_RECONNECT_GRACE};
 use crate::web::project_registry::{ProjectRegistry, ProjectSwitchContext};
@@ -56,7 +57,11 @@ use crate::web::sink::{
     CLIENT_OUTBOUND_BYTES, CLIENT_OUTBOUND_RECORDS, MAX_CONNECTION_SUBSCRIPTIONS,
     RELIABLE_CLIENT_TIMEOUT,
 };
+use crate::web::operation_policy;
+use crate::web::upgraded_connections::{UpgradedConnectionKind, UpgradedConnectionRegistry};
 use crate::web::EventSink;
+
+const MAX_COMPAT_HISTORY_ENCODED_BYTES: usize = 4_194_304;
 
 // ---------------------------------------------------------------------------
 // Sequenced event — the wire envelope (AC2 + AC3)
@@ -653,6 +658,7 @@ pub async fn ws_upgrade(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    Extension(provenance): Extension<IngressProvenance>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
@@ -677,8 +683,14 @@ pub async fn ws_upgrade(
         duration_ms = started.elapsed().as_millis(),
         "WebSocket upgrade Origin accepted"
     );
+    let _ = provenance;
     ws.on_upgrade(move |socket| async move {
+        let registry = UpgradedConnectionRegistry::global();
+        let id = registry.register(UpgradedConnectionKind::Acp, None);
         run_relay(socket, state, authority, peer).await;
+        if let Some(id) = id {
+            registry.complete(id, false);
+        }
     })
     .into_response()
 }
@@ -724,6 +736,17 @@ fn generation_requires_reauthentication(
 ) -> bool {
     authenticated_generation != 0
         && (!current.active || current.generation != authenticated_generation)
+}
+
+fn publish_authenticated_generation(
+    slot: Option<&AtomicU64>,
+    generation: u64,
+    current: crate::web::auth::RemoteGenerationState,
+) -> bool {
+    if let Some(slot) = slot {
+        slot.store(generation, Ordering::Release);
+    }
+    !generation_requires_reauthentication(generation, current)
 }
 
 /// Epoch-millis timestamp for the keepalive watchdog. Uses `SystemTime` (not
@@ -932,15 +955,12 @@ async fn run_relay(
                         conversation.as_ref(),
                         &authority,
                         peer,
+                        Some(&read_authenticated_generation),
                     )
                     .await
                     {
                         break; // write half closed.
                     }
-                    read_authenticated_generation.store(
-                        principal.as_ref().map_or(0, RemotePrincipal::generation),
-                        Ordering::Release,
-                    );
                 }
                 Message::Binary(_) => {
                     // Protocol error — close the connection.
@@ -1077,6 +1097,7 @@ async fn dispatch_connection_text_with_conversation(
     conversation: Option<&Arc<crate::conversation::ConversationApplicationService>>,
     authority: &Arc<RemoteAccessAuthority>,
     peer: SocketAddr,
+    generation_slot: Option<&AtomicU64>,
 ) -> bool {
     if let Some((id, payload)) = authenticated_send_prompt(text, *authed) {
         if principal.as_ref().is_none_or(|principal| {
@@ -1131,6 +1152,7 @@ async fn dispatch_connection_text_with_conversation(
         conversation,
         authority,
         peer,
+        generation_slot,
     )
     .await;
     write_tx.send(Outbound::Reply(reply)).is_ok()
@@ -1182,6 +1204,7 @@ async fn dispatch_connection_text(
         None,
         &authority,
         SocketAddr::from(([127, 0, 0, 1], 3000)),
+        None,
     )
     .await
 }
@@ -1291,6 +1314,7 @@ async fn handle_request(
         None,
         &authority,
         SocketAddr::from(([127, 0, 0, 1], 3000)),
+        None,
     )
     .await
 }
@@ -1324,6 +1348,7 @@ async fn handle_request_with_conversation(
     conversation: Option<&Arc<crate::conversation::ConversationApplicationService>>,
     authority: &Arc<RemoteAccessAuthority>,
     peer: SocketAddr,
+    generation_slot: Option<&AtomicU64>,
 ) -> WsReply {
     let req: WsRequest = match serde_json::from_str(text) {
         Ok(r) => r,
@@ -1361,6 +1386,17 @@ async fn handle_request_with_conversation(
             };
             match authority.verify_bearer_for_peer(&payload.token, peer.ip()) {
                 Ok(verified_principal) => {
+                    if !publish_authenticated_generation(
+                        generation_slot,
+                        verified_principal.generation(),
+                        authority.generation_state(),
+                    ) {
+                        return WsReply::err_with_code(
+                            id,
+                            "REAUTHENTICATION_REQUIRED",
+                            "remote access generation rotated during admission",
+                        );
+                    }
                     *principal = Some(verified_principal);
                     *authed = true;
                     info!(
@@ -1655,6 +1691,12 @@ async fn handle_request_with_conversation(
         // rollback), and broadcasts `projects_changed` to ALL clients. Any
         // authenticated client can set the default for now (Epic 2 wires auth).
         "set_default_project" => {
+            if let Err(denial) = operation_policy::authorize_local_only(
+                authority.ingress_provenance(),
+                operation_policy::LocalOnlyOperation::SetDefaultProject,
+            ) {
+                return WsReply::err_with_code(id, denial.code, denial.message);
+            }
             handle_set_default_project(
                 id,
                 &req.payload,
@@ -1675,6 +1717,12 @@ async fn handle_request_with_conversation(
             handle_list_acp_catalog(id, &req.payload, acp_catalog, acp_install).await
         }
         "set_catalog_opt_in" => {
+            if let Err(denial) = operation_policy::authorize_local_only(
+                authority.ingress_provenance(),
+                operation_policy::LocalOnlyOperation::SetCatalogOptIn,
+            ) {
+                return WsReply::err_with_code(id, denial.code, denial.message);
+            }
             handle_set_catalog_opt_in(id, &req.payload, acp_catalog).await
         }
         // CAP-6 / Story 9: host-owned verified-atomic ACP install. The web
@@ -1687,6 +1735,12 @@ async fn handle_request_with_conversation(
         // carry SCREAMING_SNAKE_CASE codes byte-identical to the Tauri +
         // HTTP transports (via `WsReply::err_with_code`).
         "install_acp_agent" => {
+            if let Err(denial) = operation_policy::authorize_local_only(
+                authority.ingress_provenance(),
+                operation_policy::LocalOnlyOperation::InstallAcpAgent,
+            ) {
+                return WsReply::err_with_code(id, denial.code, denial.message);
+            }
             handle_install_acp_agent(id, &req.payload, acp_install).await
         }
         "kill_agent" => {
@@ -1756,6 +1810,68 @@ async fn handle_list_persisted_sessions(
     }
 }
 
+fn charge_compat_history_bytes(current: usize, record: &impl serde::Serialize) -> Result<usize, &'static str> {
+    let added = crate::conversation::contracts::encoded_json_len_bounded(
+        record,
+        crate::conversation::MAX_CONVERSATION_RECORD_BYTES,
+    )
+    .ok_or("CONVERSATION_RECORD_TOO_LARGE")?;
+    let total = current.saturating_add(added);
+    if total > MAX_COMPAT_HISTORY_ENCODED_BYTES {
+        Err(crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED)
+    } else {
+        Ok(total)
+    }
+}
+
+fn materialize_compat_session_payload(
+    persistence: &crate::conversation::ConversationPersistenceAdapter,
+    session_id: &str,
+    metadata: &crate::acp::session_persistence::SessionMetadata,
+    target_last_seq: u64,
+) -> Result<crate::acp::session_payload::MaterializedSessionPayload, (&'static str, String)> {
+    let mut accumulator = crate::acp::session_payload::SessionPayloadAccumulator::new(metadata);
+    let mut cursor = 0u64;
+    let mut materialized_records = 0usize;
+    let mut encoded_bytes = 0usize;
+    while cursor < target_last_seq {
+        let remaining =
+            crate::conversation::MAX_COMPAT_HISTORY_RECORDS.saturating_sub(materialized_records);
+        let limit = remaining
+            .saturating_add(1)
+            .clamp(1, crate::conversation::MAX_CONVERSATION_HISTORY_PAGE_LIMIT);
+        let page = persistence
+            .history_page(session_id, cursor, limit)
+            .map_err(|error| (error.code, "failed to read session payload".to_string()))?;
+        if page.records.len() > remaining {
+            return Err((
+                crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED,
+                "history exceeds the compatibility limit; use bounded pages".to_string(),
+            ));
+        }
+        for record in &page.records {
+            encoded_bytes = charge_compat_history_bytes(encoded_bytes, record).map_err(|code| {
+                (
+                    code,
+                    "history exceeds the 4194304-byte compatibility ceiling".to_string(),
+                )
+            })?;
+        }
+        materialized_records = materialized_records.saturating_add(page.records.len());
+        accumulator.push_history_page(&page, limit).map_err(|error| {
+            (
+                error.stable_code(),
+                "invalid canonical history page".to_string(),
+            )
+        })?;
+        cursor = page.next_cursor;
+        if page.complete {
+            break;
+        }
+    }
+    Ok(accumulator.snapshot())
+}
+
 /// `get_session_payload` — fetch the FULL stored transcript (`{ metadata,
 /// messages }`) for a session id. Both desktop shared-live and the standalone
 /// server materialize the renderer shape from the host-owned
@@ -1801,50 +1917,26 @@ async fn handle_get_session_payload(
                     return WsReply::err_with_code(id, error.code, "failed to read session payload")
                 }
             };
-        let mut accumulator =
-            crate::acp::session_payload::SessionPayloadAccumulator::new(&metadata);
-        let mut cursor = 0u64;
-        let mut materialized_records = 0usize;
-        while cursor < target_last_seq {
-            let remaining = crate::conversation::MAX_COMPAT_HISTORY_RECORDS
-                .saturating_sub(materialized_records);
-            let limit = remaining
-                .saturating_add(1)
-                .clamp(1, crate::conversation::MAX_CONVERSATION_HISTORY_PAGE_LIMIT);
-            let page = match persistence.history_page(&parsed.session_id, cursor, limit) {
-                Ok(page) => page,
-                Err(error) => {
-                    return WsReply::err_with_code(id, error.code, "failed to read session payload")
-                }
-            };
-            if page.records.len() > remaining {
-                tracing::warn!(
-                    target: "termul::web::ws",
-                    code = crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED,
-                    frontier = cursor,
-                    record_count = materialized_records.saturating_add(page.records.len()),
-                    "get_session_payload compatibility limit reached"
-                );
-                return WsReply::err_with_code(
-                    id,
-                    crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED,
-                    "history exceeds the compatibility limit; use bounded pages",
-                );
-            }
-            materialized_records = materialized_records.saturating_add(page.records.len());
-            if let Err(error) = accumulator.push_history_page(&page, limit) {
-                return WsReply::err_with_code(
-                    id,
-                    error.stable_code(),
-                    "invalid canonical history page",
-                );
-            }
-            cursor = page.next_cursor;
-            if page.complete {
-                break;
-            }
-        }
-        return ok_with_payload(id, &accumulator.snapshot());
+        let persistence = Arc::clone(&persistence);
+        let session_id = parsed.session_id.clone();
+        let materialized = tokio::task::spawn_blocking(move || {
+            materialize_compat_session_payload(
+                &persistence,
+                &session_id,
+                &metadata,
+                target_last_seq,
+            )
+        })
+        .await;
+        return match materialized {
+            Ok(Ok(snapshot)) => ok_with_payload(id, &snapshot),
+            Ok(Err((code, message))) => WsReply::err_with_code(id, code, message),
+            Err(_) => WsReply::err_with_code(
+                id,
+                "PERSIST_FAILED",
+                "session payload materialization task failed",
+            ),
+        };
     }
     match relay.persistence() {
         Some(persistence) => {
@@ -1972,6 +2064,72 @@ async fn handle_get_session_payload_page(
     }
 }
 
+async fn load_recover_snapshot(
+    relay: &Arc<WsRelaySink>,
+    session_id: &str,
+    history_mode: HistoryMode,
+) -> Result<(Vec<SequencedEvent>, u64), WsReply> {
+    if history_mode != HistoryMode::Server {
+        return Err(WsReply::err(
+            "recover",
+            WsErrorCode::Unsupported,
+            "atomic snapshot recovery is unavailable in live-only mode",
+        ));
+    }
+    if let Some(persistence) = relay.conversation_persistence() {
+        let watermark = persistence.last_seq(session_id).map_err(|error| {
+            WsReply::err_with_code("recover", error.code, "failed to read session snapshot")
+        })?;
+        let records = persistence.replay_after(session_id, 0).map_err(|error| {
+            WsReply::err_with_code("recover", error.code, "failed to read session snapshot")
+        })?;
+        let events = records
+            .into_iter()
+            .map(|record| {
+                SequencedEvent::new(
+                    Some(record.session_id),
+                    record.seq,
+                    record.type_,
+                    record.payload,
+                )
+            })
+            .collect();
+        return Ok((events, watermark));
+    }
+    if let Some(persistence) = relay.persistence() {
+        let watermark = persistence.last_seq(session_id).map_err(|error| {
+            WsReply::err(
+                "recover",
+                WsErrorCode::NotFound,
+                error.to_string(),
+            )
+        })?;
+        let records = persistence
+            .replay_after_async(session_id.to_string(), 0)
+            .await
+            .map_err(|error| {
+                WsReply::err(
+                    "recover",
+                    WsErrorCode::AgentCrashed,
+                    error.to_string(),
+                )
+            })?;
+        let events = records
+            .into_iter()
+            .map(|record| {
+                SequencedEvent::new(
+                    Some(record.session_id),
+                    record.seq,
+                    record.type_,
+                    record.payload,
+                )
+            })
+            .collect();
+        return Ok((events, watermark));
+    }
+    Ok((Vec::new(), 0))
+}
+
 async fn handle_recover_session_snapshot(
     id: String,
     payload: &Value,
@@ -2004,6 +2162,53 @@ async fn handle_recover_session_snapshot(
     };
     if parsed.session_id.is_empty() {
         return WsReply::err(id, WsErrorCode::Unsupported, "sessionId is required");
+    }
+    let distinct_subscriptions = subscribed_clients
+        .iter()
+        .map(|(session_id, _)| session_id)
+        .collect::<std::collections::HashSet<_>>();
+    if !distinct_subscriptions.contains(&parsed.session_id)
+        && distinct_subscriptions.len() >= MAX_CONNECTION_SUBSCRIPTIONS
+    {
+        return WsReply::err_with_code(
+            id,
+            "SUBSCRIPTION_LIMIT_EXCEEDED",
+            "one connection may subscribe to at most 64 sessions",
+        );
+    }
+    let connection_client = subscribed_clients.first().map(|(_, client_id)| *client_id);
+    if let Some(client_id) = connection_client {
+        let (events, watermark) =
+            match load_recover_snapshot(relay, &parsed.session_id, history_mode).await {
+                Ok(snapshot) => snapshot,
+                Err(reply) => return reply,
+            };
+        match relay
+            .subscribe_existing(client_id, &parsed.session_id, None)
+            .await
+        {
+            ReplayResult::Ok(_) => {}
+            ReplayResult::Stale => {
+                return WsReply::err(
+                    id,
+                    WsErrorCode::Stale,
+                    "connection client is no longer registered",
+                )
+            }
+        }
+        subscribed_clients.retain(|(sid, _)| sid != &parsed.session_id);
+        subscribed_clients.push((parsed.session_id.clone(), client_id));
+        if let Some(rendezvous) = relay.rendezvous() {
+            rendezvous.cancel_disconnect_grace(&parsed.session_id);
+        }
+        return WsReply::ok(
+            id,
+            Some(json!({
+                "sessionId": parsed.session_id,
+                "watermark": watermark,
+                "events": events,
+            })),
+        );
     }
     let prior_clients: Vec<ClientId> = subscribed_clients
         .iter()
@@ -3234,9 +3439,9 @@ async fn handle_set_default_project(
                 error = %e,
                 "set_default_project: malformed payload (want projectId)"
             );
-            return WsReply::err(
+            return WsReply::err_with_code(
                 id,
-                WsErrorCode::Unsupported,
+                operation_policy::VALIDATION_ERROR,
                 format!("malformed set_default_project payload (want projectId): {e}"),
             );
         }
@@ -3250,9 +3455,9 @@ async fn handle_set_default_project(
             project_id = %parsed.project_id,
             "set_default_project: project not found or not switchable"
         );
-        return WsReply::err(
+        return WsReply::err_with_code(
             id,
-            WsErrorCode::NotFound,
+            operation_policy::NOT_FOUND,
             format!(
                 "project '{}' not found or not switchable",
                 parsed.project_id
@@ -3290,9 +3495,9 @@ async fn handle_set_default_project(
                 error = %error,
                 "set_default_project: persistence failed (rolled back)"
             );
-            return WsReply::err(
+            return WsReply::err_with_code(
                 id,
-                WsErrorCode::Unsupported,
+                operation_policy::PERSIST_FAILED,
                 format!("failed to persist default project: {error}"),
             );
         }
@@ -3319,9 +3524,9 @@ async fn handle_set_default_project(
             project_id = %parsed.project_id,
             "set_default_project: target became unavailable before commit (file rolled back)"
         );
-        return WsReply::err(
+        return WsReply::err_with_code(
             id,
-            WsErrorCode::NotFound,
+            operation_policy::NOT_FOUND,
             "target project became unavailable before commit",
         );
     }
@@ -4877,6 +5082,7 @@ pub(crate) async fn dispatch_conversation_golden_request(
         Some(service),
         &authority,
         SocketAddr::from(([127, 0, 0, 1], 3000)),
+        None,
     )
     .await
 }
@@ -6133,6 +6339,7 @@ mod tests {
                 None,
                 &authority,
                 peer,
+                None,
             )
             .await;
             assert_eq!(
@@ -8012,7 +8219,7 @@ mod tests {
             )
             .await;
             assert!(!reply.ok, "{bad} should be rejected");
-            assert_eq!(reply.err.unwrap().code, "not_found");
+            assert_eq!(reply.err.unwrap().code, operation_policy::NOT_FOUND);
             // Default unchanged.
             assert_eq!(
                 registry.snapshot().default_project_id.as_deref(),
@@ -8575,6 +8782,7 @@ mod tests {
                 Some(&service),
                 &Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token")),
                 SocketAddr::from(([127, 0, 0, 1], 3000)),
+                None,
             )
             .await;
             assert_eq!(reply.err.unwrap().code, "UNAUTHORIZED");
@@ -8786,5 +8994,307 @@ mod tests {
         assert_eq!(cwd, "/a");
         // current_session unchanged (no new session).
         assert_eq!(current_session.lock().as_ref().unwrap().0, "s-prev");
+    }
+
+    async fn policy_request(
+        authority: &Arc<RemoteAccessAuthority>,
+        text: &str,
+        authed: &mut bool,
+        principal: &mut Option<RemotePrincipal>,
+        relay: &Arc<WsRelaySink>,
+        registry: &Arc<ProjectRegistry>,
+        subscribed: &mut Vec<(String, ClientId)>,
+    ) -> WsReply {
+        let acp = Arc::new(AcpManager::new(vec![]));
+        let (tx, _rx) = outbound_channel();
+        let mut current_agent = None;
+        let current_session = Arc::new(parking_lot::Mutex::new(None));
+        let current_conversation = Arc::new(parking_lot::Mutex::new(None));
+        let current_project = Arc::new(parking_lot::Mutex::new(None));
+        let switch_queue = Arc::new(tokio::sync::Mutex::new(ProjectSwitchQueue::default()));
+        handle_request_with_conversation(
+            text,
+            authed,
+            principal,
+            &acp,
+            relay,
+            registry,
+            None,
+            None,
+            &tx,
+            subscribed,
+            &mut current_agent,
+            &current_session,
+            &current_conversation,
+            &current_project,
+            &switch_queue,
+            HistoryMode::Server,
+            None,
+            None,
+            None,
+            authority,
+            SocketAddr::from(([127, 0, 0, 1], 3000)),
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn recover_session_snapshot_reuses_connection_client_and_64_cap() {
+        let relay = Arc::new(WsRelaySink::new());
+        let (client_id, _rx, _) = relay.subscribe("keep-client", None).await;
+        let mut subscribed = vec![("keep-client".to_string(), client_id)];
+        let before = relay.auxiliary_stats().clients;
+        let reply = handle_recover_session_snapshot(
+            "r1".to_string(),
+            &json!({ "sessionId": "second" }),
+            &relay,
+            &outbound_channel().0,
+            &mut subscribed,
+            HistoryMode::Server,
+        )
+        .await;
+        assert!(reply.ok, "{:?}", reply.err);
+        assert_eq!(relay.auxiliary_stats().clients, before);
+        assert!(subscribed.iter().all(|(_, id)| *id == client_id));
+        assert!(subscribed.len() <= MAX_CONNECTION_SUBSCRIPTIONS);
+    }
+
+    #[tokio::test]
+    async fn recover_session_snapshot_65th_session_is_rejected() {
+        let relay = Arc::new(WsRelaySink::new());
+        let (client_id, _rx, _) = relay.subscribe("s0", None).await;
+        let mut subscribed = vec![("s0".to_string(), client_id)];
+        for ordinal in 1..MAX_CONNECTION_SUBSCRIPTIONS {
+            let sid = format!("s{ordinal}");
+            let _ = relay.subscribe_existing(client_id, &sid, None).await;
+            subscribed.push((sid, client_id));
+        }
+        let reply = handle_recover_session_snapshot(
+            "r1".to_string(),
+            &json!({ "sessionId": "s64" }),
+            &relay,
+            &outbound_channel().0,
+            &mut subscribed,
+            HistoryMode::Server,
+        )
+        .await;
+        assert!(!reply.ok);
+        assert_eq!(reply.err.unwrap().code, "SUBSCRIPTION_LIMIT_EXCEEDED");
+        assert_eq!(subscribed.len(), MAX_CONNECTION_SUBSCRIPTIONS);
+    }
+
+    #[tokio::test]
+    async fn get_session_payload_enforces_cumulative_encoded_byte_ceiling_on_blocking_pool() {
+        let record = json!({ "pad": "y".repeat(8_192) });
+        let mut total = 0usize;
+        let mut rejected = false;
+        for _ in 0..2_000 {
+            match charge_compat_history_bytes(total, &record) {
+                Ok(next) => total = next,
+                Err(code) => {
+                    assert_eq!(code, crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED);
+                    rejected = true;
+                    break;
+                }
+            }
+        }
+        assert!(rejected, "ceiling 4194304 must reject");
+        assert!(total <= MAX_COMPAT_HISTORY_ENCODED_BYTES);
+        assert!(charge_compat_history_bytes(MAX_COMPAT_HISTORY_ENCODED_BYTES, &"x").is_err());
+    }
+
+    #[tokio::test]
+    async fn public_ws_set_default_project_returns_forbidden() {
+        let authority = Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token"));
+        authority.set_ingress_provenance(IngressProvenance::PublicTunnel);
+        let relay = Arc::new(WsRelaySink::new());
+        let registry = Arc::new(ProjectRegistry::new());
+        let mut authed = false;
+        let mut principal = None;
+        let mut subscribed = Vec::new();
+        let auth = policy_request(
+            &authority,
+            r#"{"id":"a","type":"authenticate","payload":{"token":"test-remote-access-token"}}"#,
+            &mut authed,
+            &mut principal,
+            &relay,
+            &registry,
+            &mut subscribed,
+        )
+        .await;
+        assert!(auth.ok, "{:?}", auth.err);
+        let reply = policy_request(
+            &authority,
+            r#"{"id":"r1","type":"set_default_project","payload":{"projectId":"p-1"}}"#,
+            &mut authed,
+            &mut principal,
+            &relay,
+            &registry,
+            &mut subscribed,
+        )
+        .await;
+        assert!(!reply.ok);
+        assert_eq!(reply.err.unwrap().code, operation_policy::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn public_ws_set_catalog_opt_in_returns_forbidden() {
+        let authority = Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token"));
+        authority.set_ingress_provenance(IngressProvenance::PublicTunnel);
+        let relay = Arc::new(WsRelaySink::new());
+        let registry = Arc::new(ProjectRegistry::new());
+        let mut authed = false;
+        let mut principal = None;
+        let mut subscribed = Vec::new();
+        assert!(policy_request(
+            &authority,
+            r#"{"id":"a","type":"authenticate","payload":{"token":"test-remote-access-token"}}"#,
+            &mut authed,
+            &mut principal,
+            &relay,
+            &registry,
+            &mut subscribed,
+        )
+        .await
+        .ok);
+        let reply = policy_request(
+            &authority,
+            r#"{"id":"r1","type":"set_catalog_opt_in","payload":{"enabled":true}}"#,
+            &mut authed,
+            &mut principal,
+            &relay,
+            &registry,
+            &mut subscribed,
+        )
+        .await;
+        assert_eq!(reply.err.unwrap().code, operation_policy::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn public_ws_install_acp_agent_returns_forbidden() {
+        let authority = Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token"));
+        authority.set_ingress_provenance(IngressProvenance::PublicTunnel);
+        let relay = Arc::new(WsRelaySink::new());
+        let registry = Arc::new(ProjectRegistry::new());
+        let mut authed = false;
+        let mut principal = None;
+        let mut subscribed = Vec::new();
+        assert!(policy_request(
+            &authority,
+            r#"{"id":"a","type":"authenticate","payload":{"token":"test-remote-access-token"}}"#,
+            &mut authed,
+            &mut principal,
+            &relay,
+            &registry,
+            &mut subscribed,
+        )
+        .await
+        .ok);
+        let reply = policy_request(
+            &authority,
+            r#"{"id":"r1","type":"install_acp_agent","payload":{"agentId":"opencode"}}"#,
+            &mut authed,
+            &mut principal,
+            &relay,
+            &registry,
+            &mut subscribed,
+        )
+        .await;
+        assert_eq!(reply.err.unwrap().code, operation_policy::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn authenticated_generation_published_atomically_with_admission() {
+        let slot = AtomicU64::new(0);
+        let admitted = publish_authenticated_generation(
+            Some(&slot),
+            7,
+            crate::web::auth::RemoteGenerationState {
+                generation: 7,
+                active: true,
+            },
+        );
+        assert!(admitted);
+        assert_eq!(slot.load(Ordering::Acquire), 7);
+        assert!(!publish_authenticated_generation(
+            Some(&slot),
+            7,
+            crate::web::auth::RemoteGenerationState {
+                generation: 8,
+                active: true,
+            },
+        ));
+        let authority = Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token"));
+        let relay = Arc::new(WsRelaySink::new());
+        let registry = Arc::new(ProjectRegistry::new());
+        let acp = Arc::new(AcpManager::new(vec![]));
+        let (tx, _rx) = outbound_channel();
+        let mut subscribed = Vec::new();
+        let mut current_agent = None;
+        let current_session = Arc::new(parking_lot::Mutex::new(None));
+        let current_conversation = Arc::new(parking_lot::Mutex::new(None));
+        let current_project = Arc::new(parking_lot::Mutex::new(None));
+        let switch_queue = Arc::new(tokio::sync::Mutex::new(ProjectSwitchQueue::default()));
+        let mut authed = false;
+        let mut principal = None;
+        let live = AtomicU64::new(0);
+        let reply = handle_request_with_conversation(
+            r#"{"id":"a","type":"authenticate","payload":{"token":"test-remote-access-token"}}"#,
+            &mut authed,
+            &mut principal,
+            &acp,
+            &relay,
+            &registry,
+            None,
+            None,
+            &tx,
+            &mut subscribed,
+            &mut current_agent,
+            &current_session,
+            &current_conversation,
+            &current_project,
+            &switch_queue,
+            HistoryMode::LiveOnly,
+            None,
+            None,
+            None,
+            &authority,
+            SocketAddr::from(([127, 0, 0, 1], 3000)),
+            Some(&live),
+        )
+        .await;
+        assert!(reply.ok, "{:?}", reply.err);
+        assert_ne!(live.load(Ordering::Acquire), 0);
+        assert_eq!(
+            live.load(Ordering::Acquire),
+            principal.as_ref().unwrap().generation()
+        );
+    }
+
+    #[tokio::test]
+    async fn set_default_project_ws_uses_http_application_codes() {
+        let relay = Arc::new(WsRelaySink::new());
+        let registry = Arc::new(ProjectRegistry::new());
+        let malformed = handle_set_default_project(
+            "r1".to_string(),
+            &json!({ "nope": true }),
+            &relay,
+            &registry,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(malformed.err.unwrap().code, operation_policy::VALIDATION_ERROR);
+        let missing = handle_set_default_project(
+            "r2".to_string(),
+            &json!({ "projectId": "missing" }),
+            &relay,
+            &registry,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(missing.err.unwrap().code, operation_policy::NOT_FOUND);
     }
 }

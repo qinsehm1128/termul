@@ -105,11 +105,11 @@ pub async fn set_default_project(
     // to `FileProjectRegistry` and broadcasts `projects_changed` to ALL
     // connected clients), so a LAN peer on a `0.0.0.0` bind must not reach it.
     // Mirrors the fs/git/workspace write routes' `check_local_only` (CWE-306).
-    if !provenance.allows_local_operator_mutation() {
-        return Json(IpcBody::<()>::err(
-            "host mutation requires local-operator ingress",
-            "FORBIDDEN",
-        ));
+    if let Err(denial) = crate::web::operation_policy::authorize_local_only(
+        provenance,
+        crate::web::operation_policy::LocalOnlyOperation::SetDefaultProject,
+    ) {
+        return Json(IpcBody::<()>::err(denial.message, denial.code));
     }
     let project_id = req.project_id;
     // Validate via switch_context (same path as `switch_project`).

@@ -10,7 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{
-    http::StatusCode,
+    extract::{State, ws::WebSocketUpgrade},
+    http::{HeaderMap, StatusCode},
     middleware,
     response::IntoResponse,
     routing::{get, post},
@@ -23,7 +24,8 @@ use crate::acp::{
 use crate::pty::PtyManager;
 use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub};
 use crate::web::auth::{
-    capability_middleware, IngressProvenance, RemoteAccessAuthority, RemoteRouteClass,
+    capability_middleware, IngressProvenance, RemoteAccessAuthority, RemotePrincipal,
+    RemoteRouteClass,
 };
 use crate::web::catalog_api;
 use crate::web::conversation_api;
@@ -41,6 +43,7 @@ use crate::web::session_workspace_api;
 use crate::web::sink::WsRelaySink;
 use crate::web::skills_api;
 use crate::web::terminal_ws::terminal_ws_upgrade;
+use crate::web::upgraded_connections::{UpgradedConnectionKind, UpgradedConnectionRegistry};
 use crate::web::workspace_api;
 use crate::web::worktree_api;
 use crate::web::ws::{ws_upgrade, AppState, HistoryMode};
@@ -76,7 +79,7 @@ fn api_routes(provenance: IngressProvenance) -> Router<AppState> {
         RemoteRouteClass::AcpWebSocket,
     ))
     .merge(classified_routes(
-        Router::<AppState>::new().route("/terminal/ws", get(terminal_ws_upgrade)),
+        Router::<AppState>::new().route("/terminal/ws", get(terminal_ws_upgrade_registered)),
         RemoteRouteClass::TerminalWebSocket,
     ))
     .merge(classified_routes(
@@ -370,6 +373,22 @@ pub fn router_with_static(
         })
         .layer(Extension(IngressProvenance::LocalOperator))
         .layer(Extension(Arc::new(RemoteAccessAuthority::unconfigured())))
+}
+
+/// Register every upgraded terminal socket in the host-owned registry.
+/// Host-controlled IngressProvenance is injected by the router layer and is
+/// not reconstructed from the TCP peer.
+async fn terminal_ws_upgrade_registered(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    Extension(principal): Extension<RemotePrincipal>,
+    Extension(_provenance): Extension<IngressProvenance>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let registry = UpgradedConnectionRegistry::global();
+    let _ticket = registry.register(UpgradedConnectionKind::Terminal, None);
+    terminal_ws_upgrade(ws, State(state), Extension(authority), Extension(principal), headers).await
 }
 
 /// Liveness probe for the ACP web server.

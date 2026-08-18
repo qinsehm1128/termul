@@ -25,7 +25,7 @@ use axum::{body::Bytes, extract::State, http::StatusCode, response::IntoResponse
 
 use crate::acp::install::{code, InstallOutcome, InstallRequest};
 use crate::web::auth::IngressProvenance;
-use crate::web::fs_api::{check_local_only, IpcBody};
+use crate::web::fs_api::IpcBody;
 use crate::web::ws::AppState;
 
 /// `POST /acp/install` — install a catalog agent.
@@ -47,8 +47,14 @@ pub async fn install(
     axum::Extension(provenance): axum::Extension<IngressProvenance>,
     body: Bytes,
 ) -> impl IntoResponse {
-    if let Some(forbidden) = check_local_only::<InstallOutcome>(provenance) {
-        return (StatusCode::OK, Json(forbidden));
+    if let Err(denial) = crate::web::operation_policy::authorize_local_only(
+        provenance,
+        crate::web::operation_policy::LocalOnlyOperation::InstallAcpAgent,
+    ) {
+        return (
+            StatusCode::OK,
+            Json(IpcBody::<InstallOutcome>::err(denial.message, denial.code)),
+        );
     }
     let req: InstallRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,
