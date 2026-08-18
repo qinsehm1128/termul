@@ -168,12 +168,12 @@ pub fn build_log_plugin<R: Runtime>() -> tauri::plugin::TauriPlugin<R> {
 /// Bridge `tracing` events from shared web/WS admission paths into the `log`
 /// facade so Desktop Tauri captures Origin/admission/lifecycle audits.
 pub fn install_desktop_tracing_bridge() {
-    use tracing_subscriber::prelude::*;
-    let layer = tracing_subscriber::fmt::layer()
+    let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
         .with_target(true)
-        .with_writer(TracingToLogWriter);
-    let _ = tracing_subscriber::registry().with(layer).try_init();
+        .with_writer(TracingToLogWriter)
+        .finish();
+    let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
 struct TracingToLogWriter;
@@ -271,7 +271,80 @@ pub fn log_startup_banner<R: Runtime>(app: &tauri::AppHandle<R>) {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
+    use std::process::Command;
+    use std::sync::Mutex;
+
     use super::*;
+
+    const BRIDGE_CHILD_CASE: &str = "TERMUL_LOGGING_BRIDGE_CHILD_CASE";
+
+    #[derive(Clone)]
+    struct CapturedLog {
+        target: String,
+        message: String,
+    }
+
+    struct BridgeCaptureLogger {
+        records: Mutex<Vec<CapturedLog>>,
+    }
+
+    impl log::Log for BridgeCaptureLogger {
+        fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            self.records.lock().unwrap().push(CapturedLog {
+                target: record.target().to_string(),
+                message: record.args().to_string(),
+            });
+        }
+
+        fn flush(&self) {}
+    }
+
+    static BRIDGE_CAPTURE_LOGGER: BridgeCaptureLogger = BridgeCaptureLogger {
+        records: Mutex::new(Vec::new()),
+    };
+
+    fn run_in_isolated_test_process(case: &str, test_name: &str) -> bool {
+        if std::env::var_os(BRIDGE_CHILD_CASE).as_deref() == Some(OsStr::new(case)) {
+            return true;
+        }
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .env(BRIDGE_CHILD_CASE, case)
+            .arg(test_name)
+            .arg("--exact")
+            .arg("--nocapture")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated logging test {case} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
+    fn install_bridge_capture_logger() {
+        log::set_logger(&BRIDGE_CAPTURE_LOGGER)
+            .expect("desktop tracing bridge must leave the global log logger unclaimed");
+        log::set_max_level(log::LevelFilter::Trace);
+    }
+
+    fn captured_messages(target: &str) -> Vec<String> {
+        BRIDGE_CAPTURE_LOGGER
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|record| record.target == target)
+            .map(|record| record.message.clone())
+            .collect()
+    }
 
     #[test]
     fn session_id_is_stable_and_short() {
@@ -360,11 +433,81 @@ mod tests {
 
     #[test]
     fn desktop_tracing_bridge_captures_ws_audit_events() {
+        if !run_in_isolated_test_process(
+            "capture-ws-audit",
+            "logging::tests::desktop_tracing_bridge_captures_ws_audit_events",
+        ) {
+            return;
+        }
+
+        install_bridge_capture_logger();
         install_desktop_tracing_bridge();
         tracing::info!(target: "termul::web::ws", stable_code = "OK", "WebSocket upgrade Origin accepted");
-        let source = include_str!("logging.rs");
-        assert!(source.contains("install_desktop_tracing_bridge"));
-        assert!(source.contains("TracingToLogWriter"));
-        assert!(source.contains("termul::tracing"));
+        let captured = captured_messages("termul::tracing");
+        assert!(
+            captured.iter().any(|message| {
+                message.contains("termul::web::ws")
+                    && message.contains("stable_code=\"OK\"")
+                    && message.contains("WebSocket upgrade Origin accepted")
+            }),
+            "WS audit tracing event must reach the desktop log facade: {captured:?}"
+        );
+    }
+
+    #[test]
+    fn desktop_tracing_bridge_leaves_global_log_logger_unclaimed() {
+        if !run_in_isolated_test_process(
+            "bridge-before-log-capture",
+            "logging::tests::desktop_tracing_bridge_leaves_global_log_logger_unclaimed",
+        ) {
+            return;
+        }
+
+        install_desktop_tracing_bridge();
+        install_bridge_capture_logger();
+        tracing::info!(target: "termul::web::ws", "bridge-before-capture");
+        let captured = captured_messages("termul::tracing");
+        assert!(
+            captured
+                .iter()
+                .any(|message| message.contains("bridge-before-capture")),
+            "bridge installed before the log capture must still forward: {captured:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_auth_capture_logger_coexists_after_bridge_setup() {
+        if !run_in_isolated_test_process(
+            "bridge-before-auth-capture",
+            "logging::tests::scoped_auth_capture_logger_coexists_after_bridge_setup",
+        ) {
+            return;
+        }
+
+        install_desktop_tracing_bridge();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let scoped = crate::web::auth::test_tracing::lock_scoped("task-005-bridge-order").await;
+            let scope_id = scoped.id();
+            tracing::info!(target: "termul::web::ws", stable_code = "OK", "scoped bridge audit");
+            log::info!(target: "termul::web::auth", "scoped auth capture");
+
+            let bridge = crate::web::auth::test_tracing::messages_for(scope_id, "termul::tracing");
+            assert!(
+                bridge
+                    .iter()
+                    .any(|message| message.contains("scoped bridge audit")),
+                "scoped capture must receive tracing bridge output: {bridge:?}"
+            );
+            let auth = crate::web::auth::test_tracing::messages_for(scope_id, "termul::web::auth");
+            assert!(
+                auth.iter()
+                    .any(|message| message.contains("scoped auth capture")),
+                "scoped auth capture must remain usable after bridge setup: {auth:?}"
+            );
+        });
     }
 }
