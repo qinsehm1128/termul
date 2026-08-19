@@ -14,7 +14,6 @@ import { formatNumber } from '@/i18n/format'
 import { terminalApi } from '@/lib/terminal-api'
 import type { GitStatus, Terminal, TerminalHealthStatus } from '@/types/project'
 import { useProjectStore } from './project-store'
-import { useSessionWorkspaceSyncStore } from './session-workspace-sync-store'
 
 const GLOBAL_TERMINAL_LIMIT = 30
 export const HIDDEN_BUFFER_TRUNCATION_DELAY = 15 * 60 * 1000 // 15 minutes
@@ -152,16 +151,9 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
       )
     }
 
-    const conversationId =
-      suppliedConversationId ?? useSessionWorkspaceSyncStore.getState().activeConversationId
-    if (!conversationId) {
-      throw new Error(
-        i18n.t('lifecycle.conversationScopeRequired', {
-          ns: 'terminal',
-          defaultValue: 'Open a Conversation before creating a durable terminal'
-        })
-      )
-    }
+    // Scope-less project terminals carry no Conversation id; only terminals
+    // created inside an open Conversation are conversation-scoped.
+    const conversationId = suppliedConversationId
 
     const newTerminal: Terminal = {
       id: Date.now().toString(),

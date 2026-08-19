@@ -49,6 +49,8 @@ export type RemoteBindMode = 'localhost' | 'all'
 // Application-wide settings
 export interface AppSettings {
   terminalFontFamily: string
+  /** Symbol/glyph font for the terminal: '' = auto Nerd Font fallback chain, 'none' = disabled. */
+  terminalSymbolFontFamily: string
   terminalFontSize: number
   terminalBufferSize: number // Scrollback buffer size in lines
   terminalRenderer: 'auto' | 'webgl' | 'dom'
@@ -127,7 +129,11 @@ export const FONT_FAMILY_OPTIONS = [
   { value: '"Courier New", Courier, monospace', label: 'Courier New' },
   { value: '"Source Code Pro", Menlo, monospace', label: 'Source Code Pro' },
   { value: '"JetBrains Mono", Menlo, monospace', label: 'JetBrains Mono' },
-  { value: '"Fira Code", Menlo, monospace', label: 'Fira Code' }
+  { value: '"Fira Code", Menlo, monospace', label: 'Fira Code' },
+  {
+    value: '"MesloLGLDZ Nerd Font Mono", Menlo, monospace',
+    label: 'MesloLGLDZ Nerd Font Mono'
+  }
 ]
 
 // Max terminals per project options
@@ -259,8 +265,27 @@ export const ACP_FIRST_PROMPT_WARMUP_OPTIONS: Array<{
 ]
 
 // Default application settings
+// Symbol font choices offered in App Preferences; values are CSS family lists.
+export const SYMBOL_FONT_OPTIONS = [
+  { value: '', label: 'Auto (Nerd Font fallback)' },
+  { value: 'none', label: 'None' },
+  {
+    value: '"MesloLGLDZ Nerd Font Mono", "MesloLGLDZ Nerd Font"',
+    label: 'MesloLGLDZ Nerd Font'
+  },
+  { value: '"MesloLGS NF", "MesloLGL NF", "MesloLGM NF"', label: 'MesloLGS NF' },
+  {
+    value: '"JetBrainsMono Nerd Font", "JetBrainsMono Nerd Font Mono"',
+    label: 'JetBrainsMono Nerd Font'
+  },
+  { value: '"FiraCode Nerd Font", "FiraCode Nerd Font Mono"', label: 'FiraCode Nerd Font' },
+  { value: '"Hack Nerd Font", "Hack Nerd Font Mono"', label: 'Hack Nerd Font' },
+  { value: '"Symbols Nerd Font", "Symbols Nerd Font Mono"', label: 'Symbols Nerd Font' }
+]
+
 export const DEFAULT_APP_SETTINGS: AppSettings = {
   terminalFontFamily: 'Menlo, Monaco, "Courier New", monospace',
+  terminalSymbolFontFamily: '',
   terminalFontSize: 14,
   terminalBufferSize: 10000,
   terminalRenderer: 'webgl',

@@ -49,17 +49,10 @@ export async function spawnTerminalInPane(
 ): Promise<SpawnTerminalResult> {
   const terminalStore = useTerminalStore.getState()
   const workspaceStore = useWorkspaceStore.getState()
-  const conversationId =
-    options?.conversationId ?? useSessionWorkspaceSyncStore.getState().activeConversationId
-  if (!conversationId) {
-    return {
-      success: false,
-      error: i18n.t('lifecycle.conversationScopeRequired', {
-        ns: 'terminal',
-        defaultValue: 'Open a Conversation before creating a durable terminal'
-      })
-    }
-  }
+  // Conversation scoping is explicit: callers inside an open Conversation pass
+  // its id; the regular project workspace spawns scope-less terminals and the
+  // host issues an ephemeral scope, keeping projects and chats disentangled.
+  const conversationId = options?.conversationId
 
   // Check per-project terminal limit
   if (options?.maxTerminalsPerProject !== undefined) {
@@ -219,7 +212,8 @@ export async function openTerminalAtCwd(
 
   const maxTerminalsPerProject = useAppSettingsStore.getState().settings.maxTerminalsPerProject
   const result = await spawnTerminalInPane(paneId, projectId, cwd, {
-    maxTerminalsPerProject
+    maxTerminalsPerProject,
+    conversationId: useSessionWorkspaceSyncStore.getState().activeConversationId ?? undefined
   })
 
   if (result.success) {

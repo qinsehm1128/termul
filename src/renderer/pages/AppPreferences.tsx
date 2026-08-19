@@ -61,6 +61,7 @@ import {
   useTerminalFontFamily,
   useTerminalFontSize,
   useTerminalRenderer,
+  useTerminalSymbolFontFamily,
   useTerminalUrlOpenMode,
   useUiLanguage,
   useUiZoomLevel
@@ -80,6 +81,7 @@ import {
   FONT_FAMILY_OPTIONS,
   MAX_TERMINALS_OPTIONS,
   ORPHAN_TIMEOUT_OPTIONS,
+  SYMBOL_FONT_OPTIONS,
   TERMINAL_RENDERER_OPTIONS,
   TERMINAL_URL_OPEN_MODE_OPTIONS,
   type TerminalUrlOpenMode,
@@ -113,6 +115,12 @@ const APP_PREF_SEARCH_DEFS = [
     labelKey: 'appearance.fontFamily',
     descriptionKey: 'appearance.fontFamilyHint',
     keywords: ['typeface', 'monospace']
+  },
+  {
+    categoryId: 'appearance',
+    labelKey: 'appearance.symbolFont',
+    descriptionKey: 'appearance.symbolFontHint',
+    keywords: ['nerd font', 'glyph', 'icons', 'symbols']
   },
   {
     categoryId: 'appearance',
@@ -290,6 +298,7 @@ export default function AppPreferences(): React.JSX.Element {
       ? tSettings('options.halfSecond')
       : tSettings('options.seconds', { count: milliseconds / 1000 })
   const fontFamily = useTerminalFontFamily()
+  const symbolFontFamily = useTerminalSymbolFontFamily()
   const fontSize = useTerminalFontSize()
   const uiZoomLevel = useUiZoomLevel()
   const languagePreference = useUiLanguage()
@@ -354,6 +363,10 @@ export default function AppPreferences(): React.JSX.Element {
 
   const handleFontFamilyChange = (value: string) => {
     updateSetting('terminalFontFamily', value)
+  }
+
+  const handleSymbolFontChange = (value: string) => {
+    updateSetting('terminalSymbolFontFamily', value)
   }
 
   const handleFontSizeChange = (value: number) => {
@@ -625,6 +638,27 @@ export default function AppPreferences(): React.JSX.Element {
                   </select>
                   <p className="text-xs text-muted-foreground mt-1">
                     {tSettings('appearance.fontFamilyHint')}
+                  </p>
+                </div>
+
+                {/* Symbol Font */}
+                <div>
+                  <label className="block text-sm font-medium text-secondary-foreground mb-2">
+                    {tSettings('appearance.symbolFont')}
+                  </label>
+                  <select
+                    value={symbolFontFamily}
+                    onChange={(e) => handleSymbolFontChange(e.target.value)}
+                    className="w-full bg-secondary/50 border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none transition-shadow"
+                  >
+                    {SYMBOL_FONT_OPTIONS.map((option) => (
+                      <option key={option.label} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    {tSettings('appearance.symbolFontHint')}
                   </p>
                 </div>
 

@@ -273,6 +273,7 @@ vi.mock('@/lib/api', () => ({
 
 vi.mock('@/stores/app-settings-store', () => ({
   useTerminalFontFamily: vi.fn(() => 'Menlo, Monaco, "Courier New", monospace'),
+  useTerminalSymbolFontFamily: vi.fn(() => ''),
   useTerminalFontSize: vi.fn(() => 14),
   useTerminalBufferSize: vi.fn(() => 10000),
   useTerminalRenderer: vi.fn(() => 'auto')

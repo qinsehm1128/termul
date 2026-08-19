@@ -46,7 +46,9 @@
     "maxTerminalsHint": "Maximum number of terminal tabs allowed per project.",
     "renderer": "Terminal Renderer",
     "rendererHint": "GPU-accelerated rendering for terminal output. WebGL provides best performance. Changes apply to new terminals.",
-    "preview": "Preview"
+    "preview": "Preview",
+    "symbolFont": "Symbol font (terminal icons/glyphs)",
+    "symbolFontHint": "Nerd Font used to render prompt icons and powerline glyphs; Auto picks installed Nerd Fonts."
   },
   "editor": {
     "source": "Source",

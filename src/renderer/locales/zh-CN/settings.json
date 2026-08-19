@@ -46,7 +46,9 @@
     "maxTerminalsHint": "每个项目允许的最大终端标签页数量。",
     "renderer": "终端渲染器",
     "rendererHint": "使用 GPU 加速渲染终端输出。WebGL 性能最佳。更改应用于新终端。",
-    "preview": "预览"
+    "preview": "预览",
+    "symbolFont": "符号字体（终端图标/字形）",
+    "symbolFontHint": "用于渲染提示符图标与 powerline 符号的 Nerd Font；Auto 自动回退到已安装的 Nerd 字体。"
   },
   "editor": {
     "source": "源代码",

@@ -400,25 +400,25 @@ async fn terminal_spawn_resource_impl(
         return error;
     }
     let is_ephemeral_ssh = options.kind.as_deref() == Some("ssh");
+    // Scope-less durable terminals (regular project workspace) spawn without a
+    // SessionWorkspace resource; conversation-scoped terminals keep admission.
     let conversation_id = if is_ephemeral_ssh {
         None
     } else {
-        let Some(conversation_id) = options.conversation_id else {
-            log::warn!("[terminal-command] durable spawn rejected: missing ConversationId");
-            return IpcResult::error(
-                "Durable terminal spawn requires conversationId",
-                "CONVERSATION_INVALID_ID",
-            );
-        };
-        if let Err(error) = workspace.ensure_terminal_ref_writable(conversation_id, true) {
-            log::warn!(
-                "[terminal-command] durable spawn admission rejected conversation_id={} code={}",
-                conversation_id,
-                error.code.as_str()
-            );
-            return IpcResult::error(error.detail, error.code.as_str());
+        match options.conversation_id {
+            Some(conversation_id) => {
+                if let Err(error) = workspace.ensure_terminal_ref_writable(conversation_id, true) {
+                    log::warn!(
+                        "[terminal-command] durable spawn admission rejected conversation_id={} code={}",
+                        conversation_id,
+                        error.code.as_str()
+                    );
+                    return IpcResult::error(error.detail, error.code.as_str());
+                }
+                Some(conversation_id)
+            }
+            None => None,
         }
-        Some(conversation_id)
     };
 
     let spawned = match pty_manager.spawn(options, on_data).await {

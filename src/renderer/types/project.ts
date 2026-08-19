@@ -75,8 +75,8 @@ export type TerminalViewState = 'visible' | 'hidden' | 'detached'
 
 export interface Terminal {
   id: string
-  /** Canonical primary PTY ownership and authorization scope. */
-  conversationId: string
+  /** Conversation ownership scope; absent for scope-less project terminals. */
+  conversationId?: string
   ptyId?: string
   name: string
   /** Optional attribution/filter only; never ownership or authorization. */

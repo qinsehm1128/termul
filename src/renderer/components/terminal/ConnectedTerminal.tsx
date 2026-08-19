@@ -38,7 +38,8 @@ import {
   useTerminalBufferSize,
   useTerminalFontFamily,
   useTerminalFontSize,
-  useTerminalRenderer
+  useTerminalRenderer,
+  useTerminalSymbolFontFamily
 } from '@/stores/app-settings-store'
 import { matchesShortcut, useKeyboardShortcutsStore } from '@/stores/keyboard-shortcuts-store'
 import { useActiveProject } from '@/stores/project-store'
@@ -120,6 +121,22 @@ function trapTerminalTabFocusNavigation(event: KeyboardEvent): boolean {
 
 const MAX_WEBGL_RECOVERY_ATTEMPTS = 3
 const WEBGL_CONTEXT_LOSS_RECOVERY_DELAY_MS = 100
+
+// Prompt themes (starship/powerlevel10k) rely on Nerd Font glyphs and CJK
+// text; the configured mono font rarely ships them, so a symbol font (user
+// selectable in App Preferences) plus a CJK tail is appended after the main
+// family and before the trailing generic family.
+const TERMINAL_CJK_TAIL = '"PingFang SC", "Microsoft YaHei", monospace'
+const TERMINAL_SYMBOL_FONTS_AUTO =
+  '"MesloLGLDZ Nerd Font Mono", "MesloLGLDZ Nerd Font", "MesloLGS NF", "MesloLGL NF", "MesloLGM NF", "JetBrainsMono Nerd Font", "JetBrainsMono Nerd Font Mono", "FiraCode Nerd Font", "Hack Nerd Font", "Symbols Nerd Font"'
+
+function buildTerminalFontChain(mainFamily: string, symbolFont: string): string {
+  const trimmed = mainFamily.trim()
+  const genericMatch = /,\s*(monospace|sans-serif|serif|cursive|fantasy)\s*$/i.exec(trimmed)
+  const head = trimmed ? (genericMatch ? trimmed.slice(0, genericMatch.index).trim() : trimmed) : ''
+  const symbol = symbolFont === 'none' ? '' : symbolFont || TERMINAL_SYMBOL_FONTS_AUTO
+  return [head, symbol, TERMINAL_CJK_TAIL].filter(Boolean).join(', ')
+}
 const VISIBILITY_RECOVERY_DELAY_MS = 150
 const POWER_RESUME_RECOVERY_DELAY_MS = 300
 const ACTIVITY_DEBOUNCE_MS = 1000
@@ -171,7 +188,7 @@ async function attachResumedTerminalRenderer(
   terminalId: string,
   storeTerminalId: string | undefined,
   rendererId: string
-): Promise<boolean> {
+): Promise<{ attached: boolean; stale: boolean }> {
   const store = useTerminalStore.getState()
   const record =
     (storeTerminalId
@@ -183,7 +200,7 @@ async function attachResumedTerminalRenderer(
       source: 'connected-terminal.resume',
       message: 'code=TERMINAL_NOT_FOUND'
     })
-    return false
+    return { attached: false, stale: true }
   }
 
   const resumed = await store.resumeTerminalResource(record.id)
@@ -193,7 +210,13 @@ async function attachResumedTerminalRenderer(
       source: 'connected-terminal.resume',
       message: `code=${resumed.code} terminalRecordId=${record.id}`
     })
-    return false
+    // Host restarted or the PTY is gone: clean the stale record silently
+    // instead of surfacing a resume error to the user.
+    if (resumed.code === 'TERMINAL_NOT_FOUND' || resumed.code === 'UNAUTHORIZED') {
+      useTerminalStore.getState().closeTerminal(record.id, record.projectId ?? '')
+      return { attached: false, stale: true }
+    }
+    return { attached: false, stale: false }
   }
 
   const reconciledStore = useTerminalStore.getState()
@@ -211,7 +234,7 @@ async function attachResumedTerminalRenderer(
       source: 'connected-terminal.resume',
       message: `code=UNAUTHORIZED terminalRecordId=${record.id}`
     })
-    return false
+    return { attached: false, stale: false }
   }
 
   const rendererRef = await addRendererRef(terminalId, rendererId)
@@ -224,11 +247,11 @@ async function attachResumedTerminalRenderer(
       source: 'connected-terminal.renderer-ref',
       message: `code=${rendererRef.code} terminalRecordId=${record.id}`
     })
-    return false
+    return { attached: false, stale: false }
   }
 
   useTerminalStore.getState().setRendererAttached(terminalId, true)
-  return true
+  return { attached: true, stale: false }
 }
 
 function ConnectedTerminalComponent({
@@ -277,7 +300,7 @@ function ConnectedTerminalComponent({
     })
   )
 
-  const fontFamily = useTerminalFontFamily()
+  const fontFamily = buildTerminalFontChain(useTerminalFontFamily(), useTerminalSymbolFontFamily())
   const fontSize = useTerminalFontSize()
   const bufferSize = useTerminalBufferSize()
   const rendererPreference = useTerminalRenderer()
@@ -1194,13 +1217,13 @@ function ConnectedTerminalComponent({
         // A cold renderer must complete the host-authorized resume path before
         // it registers a renderer reference. Missing/denied grants stay as
         // disconnected placeholders and never fall back to spawning.
-        const attached = await attachResumedTerminalRenderer(
+        const { attached, stale } = await attachResumedTerminalRenderer(
           externalTerminalId,
           storeTerminalId,
           instanceIdRef.current
         )
         if (!attached) {
-          if (!disposed && onErrorRef.current) {
+          if (!stale && !disposed && onErrorRef.current) {
             onErrorRef.current(tRef.current('resume.disconnectedTitle'))
           }
           return
@@ -1863,13 +1886,13 @@ function ConnectedTerminalComponent({
           spawnInFlightRef.current = false
         }
       } else {
-        const attached = await attachResumedTerminalRenderer(
+        const { attached, stale } = await attachResumedTerminalRenderer(
           externalTerminalId,
           storeTerminalId,
           instanceIdRef.current
         )
         if (!attached) {
-          if (!disposed && onErrorRef.current) {
+          if (!stale && !disposed && onErrorRef.current) {
             onErrorRef.current(tRef.current('resume.disconnectedTitle'))
           }
           return

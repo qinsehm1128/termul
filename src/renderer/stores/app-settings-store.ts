@@ -35,6 +35,8 @@ export const useAppSettings = () => useAppSettingsStore((state) => state.setting
 export const useAppSettingsLoaded = () => useAppSettingsStore((state) => state.isLoaded)
 export const useTerminalFontFamily = () =>
   useAppSettingsStore((state) => state.settings.terminalFontFamily)
+export const useTerminalSymbolFontFamily = () =>
+  useAppSettingsStore((state) => state.settings.terminalSymbolFontFamily)
 export const useTerminalFontSize = () =>
   useAppSettingsStore((state) => state.settings.terminalFontSize)
 export const useDefaultShell = () => useAppSettingsStore((state) => state.settings.defaultShell)

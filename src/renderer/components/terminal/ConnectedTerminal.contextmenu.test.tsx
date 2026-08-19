@@ -194,6 +194,7 @@ vi.mock('@/hooks/use-terminal-restore', async () => {
 
 vi.mock('@/stores/app-settings-store', () => ({
   useTerminalFontFamily: () => 'monospace',
+  useTerminalSymbolFontFamily: () => '',
   useTerminalFontSize: () => 14,
   useTerminalBufferSize: () => 10000,
   useTerminalRenderer: () => 'auto'
