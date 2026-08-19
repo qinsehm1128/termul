@@ -4045,6 +4045,8 @@ struct LoadResumeSessionPayload {
     agent_id: crate::acp::AgentId,
     session_id: crate::acp::SessionId,
     cwd: String,
+    #[serde(default)]
+    conversation_id: Option<String>,
 }
 
 async fn handle_load_session(
@@ -4070,11 +4072,17 @@ async fn handle_load_session(
     // we still need the session id to track it for `switch_project`.
     let agent_id = parsed.agent_id.clone();
     let session_id = parsed.session_id.clone();
+    let load_conversation_id = parsed.conversation_id.clone();
     match acp
         .load_session(&agent_id, parsed.session_id, parsed.cwd)
         .await
     {
         Ok(outcome) => {
+            if let Some(raw) = &load_conversation_id {
+                if let Ok(conversation_id) = crate::conversation::ConversationId::parse(raw) {
+                    acp.register_conversation_binding(&session_id.0, conversation_id);
+                }
+            }
             *current_agent = Some(agent_id);
             *current_conversation.lock() = acp.conversation_id_for_current_session(&session_id.0);
             *current_session.lock() = Some(session_id);
@@ -4110,11 +4118,19 @@ async fn handle_resume_session(
     // we still need the session id to track it for `switch_project`.
     let agent_id = parsed.agent_id.clone();
     let session_id = parsed.session_id.clone();
+    let resume_conversation_id = parsed.conversation_id.clone();
     match acp
         .resume_session(&agent_id, parsed.session_id, parsed.cwd)
         .await
     {
         Ok(outcome) => {
+            // Resumed sessions never went through creation binding; re-bind so
+            // ordered persistence admission resolves the canonical Conversation.
+            if let Some(raw) = &resume_conversation_id {
+                if let Ok(conversation_id) = crate::conversation::ConversationId::parse(raw) {
+                    acp.register_conversation_binding(&session_id.0, conversation_id);
+                }
+            }
             *current_agent = Some(agent_id);
             *current_conversation.lock() = acp.conversation_id_for_current_session(&session_id.0);
             *current_session.lock() = Some(session_id);
@@ -4525,16 +4541,28 @@ async fn accept_send_prompt(
         "content": content.clone(),
     });
     if !ephemeral {
-        relay
-            .persist_user_prompt(parsed.session_id.0.as_str(), prompt_payload)
-            .await
-            .map_err(|error| {
-                WsReply::err(
-                    id.clone(),
-                    WsErrorCode::NotImplemented,
-                    format!("failed to persist accepted prompt: {error}"),
-                )
-            })?;
+        // Unbound legacy sessions have no durable home; dispatch without
+        // history instead of surfacing a red persistence error.
+        let bound = acp
+            .conversation_id_for_current_session(&parsed.session_id.0)
+            .is_some();
+        if bound {
+            relay
+                .persist_user_prompt(parsed.session_id.0.as_str(), prompt_payload)
+                .await
+                .map_err(|error| {
+                    WsReply::err(
+                        id.clone(),
+                        WsErrorCode::NotImplemented,
+                        format!("failed to persist accepted prompt: {error}"),
+                    )
+                })?;
+        } else {
+            warn!(
+                "[ws] accepted prompt not persisted: session {} has no Conversation binding",
+                parsed.session_id.0
+            );
+        }
     }
 
     let started = acp

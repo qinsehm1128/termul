@@ -2406,13 +2406,15 @@ describe('createAcpTransport selection', () => {
     expect(invoke).toHaveBeenCalledWith('acp_load_session', {
       agentId: 'a1',
       sessionId: 's1',
-      cwd: '/work'
+      cwd: '/work',
+      conversationId: null
     })
     await expect(transport.resumeSession('a1', 's1', '/work')).resolves.toEqual(outcome)
     expect(invoke).toHaveBeenCalledWith('acp_resume_session', {
       agentId: 'a1',
       sessionId: 's1',
-      cwd: '/work'
+      cwd: '/work',
+      conversationId: null
     })
     transport.dispose()
   })

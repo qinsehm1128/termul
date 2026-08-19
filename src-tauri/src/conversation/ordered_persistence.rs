@@ -40,6 +40,13 @@ const MAX_ORDERED_ERROR_SESSIONS: usize = 256;
 const ORDERED_ERROR_TTL_SECS: u64 = 900;
 /// Default absolute budget for a complete flush or shutdown attempt.
 pub const DEFAULT_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bounded wait for a canonical binding that is still committing when the first
+/// accepted prompt races ahead of the lifecycle bind during Conversation launch.
+/// A miss beyond this window remains fatal; a miss inside it never latches the
+/// delivery circuit.
+const BINDING_RESOLUTION_TIMEOUT: Duration = DEFAULT_DELIVERY_COMMIT_TIMEOUT;
+const BINDING_RESOLUTION_RETRY: Duration = Duration::from_millis(25);
 /// Compatibility alias retained for existing callers.
 pub const QUEUE_CAPACITY: usize = PER_SESSION_PENDING_RECORDS;
 
@@ -652,13 +659,20 @@ impl OrderedConversationPersistence {
             ));
         }
 
-        let conversation_id = shared.target.resolve(agent_session_id).ok_or_else(|| {
-            persistence_error(
-                "CONVERSATION_BINDING_NOT_FOUND",
-                "ordered_submit",
-                "opaque agent session id has no canonical Conversation binding",
-            )
-        })?;
+        let binding_deadline = StdInstant::now() + BINDING_RESOLUTION_TIMEOUT;
+        let conversation_id = loop {
+            if let Some(conversation_id) = shared.target.resolve(agent_session_id) {
+                break conversation_id;
+            }
+            if StdInstant::now() >= binding_deadline {
+                return Err(persistence_error(
+                    "CONVERSATION_BINDING_NOT_FOUND",
+                    "ordered_submit",
+                    "opaque agent session id has no canonical Conversation binding",
+                ));
+            }
+            std::thread::sleep(BINDING_RESOLUTION_RETRY);
+        };
         let charged_bytes = serialized_record_bytes(event_type, &payload)?;
         if charged_bytes > GLOBAL_PENDING_BYTES {
             return Err(persistence_error(
@@ -1466,7 +1480,7 @@ mod tests {
     type RecordedSessions = HashMap<String, Vec<RecordedEvent>>;
 
     struct FakeTarget {
-        mappings: HashMap<String, ConversationId>,
+        mappings: Mutex<HashMap<String, ConversationId>>,
         records: Mutex<RecordedSessions>,
         append_count: AtomicUsize,
         stall_appends: bool,
@@ -1487,7 +1501,7 @@ mod tests {
                 })
                 .collect();
             Self {
-                mappings,
+                mappings: Mutex::new(mappings),
                 records: Mutex::new(HashMap::new()),
                 append_count: AtomicUsize::new(0),
                 stall_appends: false,
@@ -1508,11 +1522,17 @@ mod tests {
             self.released.store(true, Ordering::Release);
             self.release.notify_waiters();
         }
+
+        fn bind(&self, agent_session_id: &str, conversation_id: ConversationId) {
+            self.mappings
+                .lock()
+                .insert(agent_session_id.to_string(), conversation_id);
+        }
     }
 
     impl PersistenceTarget for FakeTarget {
         fn resolve(&self, agent_session_id: &str) -> Option<ConversationId> {
-            self.mappings.get(agent_session_id).copied()
+            self.mappings.lock().get(agent_session_id).copied()
         }
 
         fn append<'a>(
@@ -1577,6 +1597,25 @@ mod tests {
             )
             .unwrap();
         assert_eq!(ticket.committed().await.unwrap(), 1);
+        persistence.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn submit_waits_for_a_binding_that_commits_after_the_first_prompt() {
+        let target = Arc::new(FakeTarget::with_sessions(0));
+        let persistence = ordered(Arc::clone(&target));
+        let conversation =
+            ConversationId::parse("00000000-0000-4000-8000-000000000001").unwrap();
+        let binder = Arc::clone(&target);
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            binder.bind("opaque-race", conversation);
+        });
+        let ticket = persistence
+            .submit("opaque-race", 1, "user_prompt", serde_json::json!({"body":"race"}))
+            .unwrap();
+        assert_eq!(ticket.committed().await.unwrap(), 1);
+        handle.join().unwrap();
         persistence.shutdown().await.unwrap();
     }
 

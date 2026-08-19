@@ -825,6 +825,13 @@ impl WsRelaySink {
         )
     }
 
+    /// Sessions without a canonical binding (pre-rebind legacy reopens) have no
+    /// durable home; drop their events without latching the delivery circuit so
+    /// a later rebind can recover the session.
+    fn is_unbound_drop_code(code: &str) -> bool {
+        code == "CONVERSATION_BINDING_NOT_FOUND"
+    }
+
     /// Reserve relay retention, acquire durable admission, then commit the live frontier.
     /// The per-session submission gate prevents a rejected record from consuming a sequence and
     /// prevents another producer from observing the reservation as live state.
@@ -885,7 +892,9 @@ impl WsRelaySink {
             Ok(_) => {}
             Err((source_code, _detail)) => {
                 self.rollback_history(&mut reservation);
-                if !Self::is_retryable_persistence_code(source_code) {
+                if !Self::is_retryable_persistence_code(source_code)
+                    && !Self::is_unbound_drop_code(source_code)
+                {
                     self.open_delivery_circuit(sid, source_code);
                 }
                 return Err(EventSinkError::persistence_rejected(source_code));

@@ -116,8 +116,23 @@ pub async fn acp_load_session(
     agent_id: AgentId,
     session_id: SessionId,
     cwd: String,
+    conversation_id: Option<String>,
 ) -> Result<SessionReopenOutcome, String> {
-    manager.load_session(&agent_id, session_id, cwd).await
+    let session_id_str = session_id.0.clone();
+    let outcome = manager.load_session(&agent_id, session_id, cwd).await?;
+    // Reopened sessions never went through creation binding; re-bind so
+    // ordered persistence admission resolves the canonical Conversation.
+    if let Some(raw) = conversation_id {
+        match crate::conversation::ConversationId::parse(&raw) {
+            Ok(conversation_id) => {
+                manager.register_conversation_binding(&session_id_str, conversation_id)
+            }
+            Err(_) => {
+                log::warn!("[acp-command] load binding skipped: invalid conversationId {raw}");
+            }
+        }
+    }
+    Ok(outcome)
 }
 
 /// Resume a session (requires the agent's `sessionCapabilities.resume`).
@@ -127,8 +142,25 @@ pub async fn acp_resume_session(
     agent_id: AgentId,
     session_id: SessionId,
     cwd: String,
+    conversation_id: Option<String>,
 ) -> Result<SessionReopenOutcome, String> {
-    manager.resume_session(&agent_id, session_id, cwd).await
+    let session_id_str = session_id.0.clone();
+    let outcome = manager.resume_session(&agent_id, session_id, cwd).await?;
+    // Resumed agent sessions never went through creation binding; re-bind so
+    // ordered persistence admission can resolve the canonical Conversation.
+    if let Some(raw) = conversation_id {
+        match crate::conversation::ConversationId::parse(&raw) {
+            Ok(conversation_id) => {
+                manager.register_conversation_binding(&session_id_str, conversation_id)
+            }
+            Err(_) => {
+                log::warn!(
+                    "[acp-command] resume binding skipped: invalid conversationId {raw}"
+                );
+            }
+        }
+    }
+    Ok(outcome)
 }
 
 /// Close a session (requires the agent's `sessionCapabilities.close`).
@@ -300,18 +332,32 @@ pub async fn acp_send_prompt(
         }
     };
     if !ephemeral {
-        if let Err(error) =
-            persist_accepted_prompt(relay.inner(), &agent_id, &session_id, &blocks).await
-        {
-            // Persistence failure rejects dispatch so a transport failure
-            // cannot erase an accepted user message. Log session context only
-            // — never the prompt content.
+        // Sessions without a canonical Conversation binding (legacy reopens
+        // predating rebind-on-resume) have no durable home; dispatch without
+        // history instead of surfacing a red persistence error.
+        let bound = manager
+            .conversation_id_for_current_session(&session_id.0)
+            .is_some();
+        if bound {
+            if let Err(error) =
+                persist_accepted_prompt(relay.inner(), &agent_id, &session_id, &blocks).await
+            {
+                // Persistence failure rejects dispatch so a transport failure
+                // cannot erase an accepted user message. Log session context only
+                // — never the prompt content.
+                log::warn!(
+                    "[acp] failed to persist accepted prompt for session {} (agent {}): {error}",
+                    session_id.0,
+                    agent_id.0
+                );
+                return Err(format!("failed to persist accepted prompt: {error}"));
+            }
+        } else {
             log::warn!(
-                "[acp] failed to persist accepted prompt for session {} (agent {}): {error}",
+                "[acp] accepted prompt not persisted: session {} has no Conversation binding (agent {})",
                 session_id.0,
                 agent_id.0
             );
-            return Err(format!("failed to persist accepted prompt: {error}"));
         }
     }
     // Desktop path: no client turn-id (the renderer's dedup is Tauri-event-

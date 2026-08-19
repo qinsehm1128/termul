@@ -3394,7 +3394,8 @@ describe('acp-store', () => {
     expect(invoke).toHaveBeenCalledWith('acp_resume_session', {
       agentId: 'agent-r',
       sessionId: 's-resume',
-      cwd: '/w'
+      cwd: '/w',
+      conversationId: null
     })
     expect(useAcpStore.getState().toolCalls['s-resume']).toEqual([
       expect.objectContaining({ toolCallId: 'tc-9', seq: 2 })
@@ -3570,7 +3571,8 @@ describe('acp-store', () => {
     expect(invoke).toHaveBeenCalledWith('acp_load_session', {
       agentId: 'agent-1',
       sessionId: 's-closed',
-      cwd: '/w'
+      cwd: '/w',
+      conversationId: null
     })
     // The local transcript stays visible while (and after) the load: an agent
     // that replays nothing must not blank the chat. A real replay replaces it
@@ -3806,7 +3808,8 @@ describe('acp-store', () => {
     expect(invoke).toHaveBeenCalledWith('acp_resume_session', {
       agentId: 'agent-1',
       sessionId: 's-closed',
-      cwd: '/w'
+      cwd: '/w',
+      conversationId: null
     })
     expect(useAcpStore.getState().messages['s-closed']).toHaveLength(1)
     expect(useAcpStore.getState().sessions['s-closed'].status).toBe('active')
@@ -4080,7 +4083,8 @@ describe('acp-store', () => {
     expect(invoke).toHaveBeenCalledWith('acp_load_session', {
       agentId: 'fresh-agent',
       sessionId: 's-reopen',
-      cwd: '/w'
+      cwd: '/w',
+      conversationId: null
     })
     expect(useAcpStore.getState().sessions['s-reopen'].agentId).toBe('fresh-agent')
     expect(useAcpStore.getState().sessions['s-reopen'].status).toBe('active')
@@ -4136,7 +4140,8 @@ describe('acp-store', () => {
     expect(invoke).toHaveBeenCalledWith('acp_load_session', {
       agentId: 'fresh-agent',
       sessionId: 's-cold-start',
-      cwd: '/w'
+      cwd: '/w',
+      conversationId: null
     })
     expect(useAcpStore.getState().sessions['s-cold-start'].status).toBe('active')
   })
@@ -4259,7 +4264,8 @@ describe('acp-store', () => {
     expect(invoke).toHaveBeenCalledWith('acp_load_session', {
       agentId: 'spawned-1',
       sessionId: 's-spawn',
-      cwd: '/w'
+      cwd: '/w',
+      conversationId: null
     })
     expect(useAcpStore.getState().sessions['s-spawn'].agentId).toBe('spawned-1')
     expect(useAcpStore.getState().sessions['s-spawn'].status).toBe('active')
@@ -6261,7 +6267,8 @@ describe('session discovery (gh-407)', () => {
     expect(invoke).toHaveBeenCalledWith('acp_load_session', {
       agentId: 'agent-1',
       sessionId: 'sess-overlap',
-      cwd: '/work'
+      cwd: '/work',
+      conversationId: null
     })
 
     reopen.resolve({
@@ -6315,7 +6322,8 @@ describe('session discovery (gh-407)', () => {
     expect(invoke).toHaveBeenLastCalledWith('acp_load_session', {
       agentId: 'agent-1',
       sessionId: 'sess-recreated',
-      cwd: '/work'
+      cwd: '/work',
+      conversationId: null
     })
 
     oldReopen.resolve({

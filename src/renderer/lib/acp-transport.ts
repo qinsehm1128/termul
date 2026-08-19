@@ -140,8 +140,18 @@ export interface AcpTransport {
     mcpServers?: McpServer[],
     options?: NewSessionOptions
   ): Promise<NewSessionOutcome>
-  loadSession(agentId: AgentId, sessionId: SessionId, cwd: string): Promise<SessionReopenOutcome>
-  resumeSession(agentId: AgentId, sessionId: SessionId, cwd: string): Promise<SessionReopenOutcome>
+  loadSession(
+    agentId: AgentId,
+    sessionId: SessionId,
+    cwd: string,
+    conversationId?: string
+  ): Promise<SessionReopenOutcome>
+  resumeSession(
+    agentId: AgentId,
+    sessionId: SessionId,
+    cwd: string,
+    conversationId?: string
+  ): Promise<SessionReopenOutcome>
   closeSession(agentId: AgentId, sessionId: SessionId): Promise<void>
   disposeEphemeralSession(agentId: AgentId, sessionId: SessionId): Promise<void>
   listSessions(agentId: AgentId, cwd?: string, cursor?: string): Promise<ListSessionsResponse>
@@ -308,10 +318,20 @@ function createTauriAcpTransport(): AcpTransport {
         ...(!options?.ephemeral ? { executionTarget } : {})
       })
     },
-    loadSession: (agentId, sessionId, cwd) =>
-      invoke<SessionReopenOutcome>('acp_load_session', { agentId, sessionId, cwd }),
-    resumeSession: (agentId, sessionId, cwd) =>
-      invoke<SessionReopenOutcome>('acp_resume_session', { agentId, sessionId, cwd }),
+    loadSession: (agentId, sessionId, cwd, conversationId) =>
+      invoke<SessionReopenOutcome>('acp_load_session', {
+        agentId,
+        sessionId,
+        cwd,
+        conversationId: conversationId ?? null
+      }),
+    resumeSession: (agentId, sessionId, cwd, conversationId) =>
+      invoke<SessionReopenOutcome>('acp_resume_session', {
+        agentId,
+        sessionId,
+        cwd,
+        conversationId: conversationId ?? null
+      }),
     closeSession: async (agentId, sessionId) => {
       await invoke('acp_close_session', { agentId, sessionId })
     },
@@ -1043,12 +1063,14 @@ export class WsAcpTransport implements AcpTransport {
   async loadSession(
     agentId: AgentId,
     sessionId: SessionId,
-    cwd: string
+    cwd: string,
+    conversationId?: string
   ): Promise<SessionReopenOutcome> {
     const outcome = await this.request<SessionReopenOutcome>('load_session', {
       agentId,
       sessionId,
-      cwd
+      cwd,
+      ...(conversationId ? { conversationId } : {})
     })
     await this.subscribeSession(sessionId, this.lastSeq.get(sessionId) ?? 0, true)
     return outcome
@@ -1057,12 +1079,14 @@ export class WsAcpTransport implements AcpTransport {
   async resumeSession(
     agentId: AgentId,
     sessionId: SessionId,
-    cwd: string
+    cwd: string,
+    conversationId?: string
   ): Promise<SessionReopenOutcome> {
     const outcome = await this.request<SessionReopenOutcome>('resume_session', {
       agentId,
       sessionId,
-      cwd
+      cwd,
+      ...(conversationId ? { conversationId } : {})
     })
     await this.subscribeSession(sessionId, this.lastSeq.get(sessionId) ?? 0, true)
     return outcome

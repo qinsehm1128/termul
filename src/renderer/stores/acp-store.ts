@@ -2687,7 +2687,9 @@ async function openHistorySessionInner(
 
   if (strategy === 'load') {
     try {
-      const outcome = (await acpApi.loadSession(liveAgentId, id, meta.cwd)) ?? {}
+      const outcome =
+        (await acpApi.loadSession(liveAgentId, id, meta.cwd, get().sessions[id]?.conversationId)) ??
+        {}
       if (deletedMidOpen() || !isCurrentSessionReopen(id, reopenGeneration)) {
         if (isCurrentSessionReopen(id, reopenGeneration)) clearReplayIfPresent()
         return
@@ -2730,7 +2732,13 @@ async function openHistorySessionInner(
     }
   } else if (strategy === 'resume') {
     try {
-      const outcome = (await acpApi.resumeSession(liveAgentId, id, meta.cwd)) ?? {}
+      const outcome =
+        (await acpApi.resumeSession(
+          liveAgentId,
+          id,
+          meta.cwd,
+          get().sessions[id]?.conversationId
+        )) ?? {}
       if (deletedMidOpen() || !isCurrentSessionReopen(id, reopenGeneration)) {
         if (isCurrentSessionReopen(id, reopenGeneration)) clearReplayIfPresent()
         return
@@ -4559,7 +4567,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       // `acpApi.resumeSession` routes to `acp_resume_session` (desktop) or the
       // `resume_session` WS request (web). On web it auto-re-subscribes with
       // `this.lastSeq.get(sid) ?? 0`, so the hook seeds the server cursor first.
-      await acpApi.resumeSession(agentId, id, cwd)
+      await acpApi.resumeSession(agentId, id, cwd, get().sessions[id]?.conversationId)
       // Gap-replay has landed on the restored transcript; clear the resume
       // window. `withSessionActive` alone leaves `replaying: 'streaming'`,
       // which would disable rAF coalescing for live chunks after resume.
@@ -4910,7 +4918,13 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       if (strategy === 'load') {
         // Agent replays history via session/update into the empty transcript.
         try {
-          const outcome = (await acpApi.loadSession(agentId, sessionId, cwd)) ?? {}
+          const outcome =
+            (await acpApi.loadSession(
+              agentId,
+              sessionId,
+              cwd,
+              get().sessions[sessionId]?.conversationId
+            )) ?? {}
           if (!isCurrentSessionReopen(sessionId, reopenGeneration)) return
           mergeReopenOutcomeIfUnchanged(set, sessionId, reopenGeneration, reopenBaseline, outcome)
           set((s) => {
@@ -4946,7 +4960,13 @@ export const useAcpStore = create<AcpState>((set, get) => ({
         }
       } else if (strategy === 'resume') {
         try {
-          const outcome = (await acpApi.resumeSession(agentId, sessionId, cwd)) ?? {}
+          const outcome =
+            (await acpApi.resumeSession(
+              agentId,
+              sessionId,
+              cwd,
+              get().sessions[sessionId]?.conversationId
+            )) ?? {}
           if (!isCurrentSessionReopen(sessionId, reopenGeneration)) return
           mergeReopenOutcomeIfUnchanged(set, sessionId, reopenGeneration, reopenBaseline, outcome)
           set((s) => ({
