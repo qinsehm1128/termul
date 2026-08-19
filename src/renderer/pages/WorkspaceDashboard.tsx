@@ -2,6 +2,7 @@ import { MessageSquarePlus } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { ConversationList } from '@/components/conversation/ConversationList'
 import { useConversationStore } from '@/stores/conversation-store'
+import { useWorkspaceStore } from '@/stores/workspace-store'
 
 export default function WorkspaceDashboard(): React.JSX.Element {
   const { t } = useTranslation('conversation')
@@ -24,6 +25,17 @@ export default function WorkspaceDashboard(): React.JSX.Element {
             {t('dashboard.title')}
           </h1>
           <p className="mt-1 text-sm text-muted-foreground">{t('dashboard.description')}</p>
+          <button
+            type="button"
+            className="mt-4 inline-flex min-h-9 items-center gap-1.5 rounded-lg bg-primary px-3 text-xs font-medium text-primary-foreground hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            onClick={() => {
+              const paneId = useWorkspaceStore.getState().activePaneId
+              if (paneId) useWorkspaceStore.getState().showAgentLauncher(paneId)
+            }}
+          >
+            <MessageSquarePlus className="size-4" aria-hidden="true" />
+            {t('navigation.newChat')}
+          </button>
           {activeConversation ? (
             <div className="mt-4 rounded-lg bg-muted/50 p-3 text-xs">
               <span className="font-medium">{t('dashboard.workspace')}:</span>{' '}

@@ -112,6 +112,8 @@ import type { Worktree } from '@/types/project'
 interface AgentLauncherProps {
   paneId: string
   className?: string
+  /** Invoked once with the canonical ConversationId after a successful launch. */
+  onLaunched?: (conversationId: string) => void
 }
 
 const EMPTY_COMMANDS: [] = []
@@ -129,7 +131,11 @@ export function __resetLauncherSelectionCache(): void {
   cachedConfigId = null
 }
 
-export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.JSX.Element {
+export function AgentLauncher({
+  paneId,
+  className,
+  onLaunched
+}: AgentLauncherProps): React.JSX.Element {
   const t = useRuntimeTranslation('agents')
   const [prompt, setPrompt] = useState('')
   const [selectedConfigId, setSelectedConfigId] = useState(() => cachedConfigId ?? '')
@@ -1243,6 +1249,7 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
           }
           if (handedOffConversationId === canonicalConversationId) return
           handedOffConversationId = canonicalConversationId
+          onLaunched?.(canonicalConversationId)
           useWorkspaceStore.getState().addAgentChatTab(canonicalConversationId, paneSnapshot)
           useWorkspaceStore.getState().hideAgentLauncher()
           setPendingOptions(emptyPendingLauncherOptions())
@@ -1323,6 +1330,7 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
     isolationMode,
     canUseWorktree,
     baseBranch,
+    onLaunched,
     t
   ])
 

@@ -35,7 +35,10 @@ export function ConversationHostStatus(): React.JSX.Element {
       data-testid="conversation-host-status"
       data-state={visibleState}
       className={cn(
-        'fixed left-1/2 top-2 z-[70] flex max-w-[calc(100vw-1rem)] -translate-x-1/2 items-center gap-2 rounded-md border bg-background/95 px-3 py-2 text-xs shadow-sm backdrop-blur sm:top-3 sm:text-sm',
+        'fixed left-1/2 top-2 z-[70] flex max-w-[calc(100vw-1rem)] -translate-x-1/2 items-center gap-2 rounded-md border bg-background/95 px-3 py-2 text-xs shadow-sm backdrop-blur transition-opacity duration-500 sm:top-3 sm:text-sm',
+        // The ready confirmation is transient: fade out instead of pinning a
+        // permanent banner over the workspace.
+        visibleState === 'ready' && 'pointer-events-none opacity-0',
         visibleState === 'ready' && 'border-border text-muted-foreground',
         visibleState === 'migrating' && 'border-border text-foreground',
         visibleState === 'hybrid' && 'border-amber-500/40 text-foreground',

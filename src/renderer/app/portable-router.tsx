@@ -25,7 +25,10 @@ export const portableRouteObjects: RouteObject[] = [
     path: '/',
     element: <WorkspaceLayout />,
     children: [
-      { index: true, element: deferred(<WorkspaceDashboard />) },
+      // The index route owns the regular project workspace (terminal panes);
+      // the independent Conversation area is entered explicitly from the
+      // Activity Rail chat toggle.
+      { path: 'conversations', element: deferred(<WorkspaceDashboard />) },
       { path: 'c/:conversationId', element: <ConversationRoute /> },
       {
         path: 'legacy/session/:legacyValue',

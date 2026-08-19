@@ -294,14 +294,14 @@ describe('TauriApp', () => {
     expect(mockSessionWorkspaceBootstrap).toHaveBeenCalled()
   })
 
-  it('renders the real native WorkspaceDashboard through the production WorkspaceLayout at root', async () => {
+  it('renders the regular native project workspace through the production WorkspaceLayout at root', async () => {
     render(<TauriApp />)
 
+    expect(await screen.findByTestId('pane-renderer')).toBeVisible()
     expect(
-      await screen.findByRole('heading', { name: 'Your Conversation workspace' })
-    ).toBeVisible()
-    expect(screen.getByRole('button', { name: 'New Chat' })).toBeEnabled()
-    expect(screen.queryByTestId('pane-renderer')).not.toBeInTheDocument()
+      screen.queryByRole('heading', { name: 'Your Conversation workspace' })
+    ).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'New Chat' })).not.toBeInTheDocument()
     expectSingleRecoveryOwner()
   })
 

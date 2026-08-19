@@ -23,16 +23,10 @@ const railButtonClass =
 interface ActivityRailProps {
   isShortcutsOpen?: boolean
   onShortcutsOpenChange?: (open: boolean) => void
-  /** Opens the command palette (project switcher / launcher). */
-  onOpenCommandPalette?: () => void
   /** Opens a git changes tab in the active pane. */
   onOpenGitChanges?: () => void
   /** Whether a git changes tab can currently be opened (active project has a path). */
   canOpenGitChanges?: boolean
-  /** Opens the New Agent Chat dialog. */
-  onOpenAgentChat?: () => void
-  /** Whether a new agent chat can currently be started (active project has a path). */
-  canOpenAgentChat?: boolean
   /** Opens a git history (commit graph) tab in the active pane. */
   onOpenGitHistory?: () => void
   /** Whether a git history tab can currently be opened (active project has a path). */
@@ -63,11 +57,8 @@ interface ActivityRailProps {
 export function ActivityRail({
   isShortcutsOpen,
   onShortcutsOpenChange,
-  onOpenCommandPalette,
   onOpenGitChanges,
   canOpenGitChanges = false,
-  onOpenAgentChat,
-  canOpenAgentChat = false,
   onOpenGitHistory,
   canOpenGitHistory = false,
   isThemePickerOpen = false,
@@ -78,6 +69,8 @@ export function ActivityRail({
   const updatePanelVisibility = useUpdatePanelVisibility()
   const navigate = useNavigate()
   const location = useLocation()
+  const isConversationsActive =
+    location.pathname === '/conversations' || location.pathname.startsWith('/c/')
 
   const handleToggleSSHPanel = async (e: React.MouseEvent<HTMLButtonElement>): Promise<void> => {
     e.stopPropagation()
@@ -107,14 +100,17 @@ export function ActivityRail({
         type="button"
         onClick={(e) => {
           e.stopPropagation()
-          onOpenCommandPalette?.()
+          navigate('/')
         }}
         className={railButtonClass}
         title={t('activityRail.projects')}
         aria-label={t('activityRail.openProjects')}
-        disabled={!onOpenCommandPalette}
+        aria-pressed={location.pathname === '/'}
       >
-        <FolderKanban size={18} className="text-muted-foreground" />
+        <FolderKanban
+          size={18}
+          className={location.pathname === '/' ? 'text-foreground' : 'text-muted-foreground'}
+        />
       </button>
 
       <button
@@ -142,20 +138,16 @@ export function ActivityRail({
         type="button"
         onClick={(e) => {
           e.stopPropagation()
-          onOpenAgentChat?.()
+          navigate(isConversationsActive ? '/' : '/conversations')
         }}
         className={railButtonClass}
-        title={
-          canOpenAgentChat
-            ? t('activityRail.newAgentChat')
-            : t('activityRail.newAgentChatNeedsProject')
-        }
-        aria-label={t('activityRail.newAgentChat')}
-        disabled={!onOpenAgentChat || !canOpenAgentChat}
+        title={t('activityRail.conversations')}
+        aria-label={t('activityRail.openConversations')}
+        aria-pressed={isConversationsActive}
       >
         <MessageSquarePlus
           size={18}
-          className={canOpenAgentChat ? 'text-muted-foreground' : 'text-muted-foreground/40'}
+          className={isConversationsActive ? 'text-foreground' : 'text-muted-foreground'}
         />
       </button>
 

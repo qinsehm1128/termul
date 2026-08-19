@@ -137,6 +137,7 @@ vi.mock('@/stores/app-settings-store', () => ({
   useTerminalFontSize: vi.fn(() => 14),
   useUiZoomLevel: vi.fn(() => 1),
   useTerminalFontFamily: vi.fn(() => 'monospace'),
+  useTerminalSymbolFontFamily: vi.fn(() => ''),
   useTerminalBufferSize: vi.fn(() => 10000),
   useDefaultShell: vi.fn(() => 'bash'),
   useMaxTerminalsPerProject: vi.fn(() => 10),
@@ -458,13 +459,34 @@ const renderWithRouter = (initialEntries = ['/c/018f7a1c-1b4d-7c8a-9f01-01234567
 }
 
 describe('WorkspaceLayout - Empty States', () => {
-  it('renders the real dashboard index outlet at root without terminal workspace content', async () => {
+  it('renders the regular project workspace at root without the conversation area', async () => {
     render(
       <TooltipProvider>
         <MemoryRouter initialEntries={['/']}>
           <Routes>
             <Route path="/" element={<WorkspaceLayout />}>
-              <Route index element={<WorkspaceDashboard />} />
+              <Route path="conversations" element={<WorkspaceDashboard />} />
+            </Route>
+          </Routes>
+        </MemoryRouter>
+      </TooltipProvider>
+    )
+
+    expect(await screen.findByTestId('pane-renderer')).toBeVisible()
+    expect(
+      screen.queryByRole('heading', { name: 'Your Conversation workspace' })
+    ).not.toBeInTheDocument()
+    // Exclusive sidebars: root shows the project sidebar, never the conversation one.
+    expect(screen.queryByLabelText('Search conversations')).not.toBeInTheDocument()
+  })
+
+  it('renders the independent conversation area only on the conversations route', async () => {
+    render(
+      <TooltipProvider>
+        <MemoryRouter initialEntries={['/conversations']}>
+          <Routes>
+            <Route path="/" element={<WorkspaceLayout />}>
+              <Route path="conversations" element={<WorkspaceDashboard />} />
             </Route>
           </Routes>
         </MemoryRouter>
@@ -475,6 +497,7 @@ describe('WorkspaceLayout - Empty States', () => {
       await screen.findByRole('heading', { name: 'Your Conversation workspace' })
     ).toBeVisible()
     expect(screen.getByRole('button', { name: 'New Chat' })).toBeEnabled()
+    expect(screen.getByLabelText('Search conversations')).toBeVisible()
     expect(screen.queryByTestId('pane-renderer')).not.toBeInTheDocument()
   })
 

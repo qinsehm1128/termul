@@ -153,7 +153,7 @@ async function navigateDashboardRoot(Root: ComponentType): Promise<{
   recoveryPanels: number
   recoveryActions: string[]
 }> {
-  window.location.hash = '#/'
+  window.location.hash = '#/conversations'
   window.dispatchEvent(new HashChangeEvent('hashchange'))
   const view = render(<Root />)
   const heading = await screen.findByRole('heading', { name: 'Your Conversation workspace' })
@@ -186,7 +186,7 @@ afterEach(() => {
 })
 
 describe('renderer root runtime parity', () => {
-  it('renders the same real dashboard and recovery entry through WorkspaceLayout at root', async () => {
+  it('renders the same real dashboard and recovery entry through WorkspaceLayout on the conversations route', async () => {
     const web = await navigateDashboardRoot(App)
     const native = await navigateDashboardRoot(TauriApp)
 

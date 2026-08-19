@@ -1,11 +1,13 @@
 import type { ShellInfo } from '@shared/types/ipc.types'
 import type { SFTPEntry } from '@shared/types/ssh.types'
 import { motion } from 'framer-motion'
+import { X } from 'lucide-react'
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
 import { ActivityRail } from '@/components/ActivityRail'
+import { AgentLauncher } from '@/components/agents/AgentLauncher'
 import { ConfirmDialog } from '@/components/ConfirmDialog'
 import { CreateSnapshotModal } from '@/components/CreateSnapshotModal'
 import { ConversationSidebar } from '@/components/conversation/ConversationSidebar'
@@ -629,6 +631,37 @@ export default function WorkspaceLayout(): React.JSX.Element {
     }
   }, [activeProject?.path, activeProjectId])
 
+  // The file tree follows the open Conversation's workspace directory while in
+  // the Conversation area, and the active project elsewhere. Project switches
+  // keep their dedicated effect above; this one only owns scope transitions.
+  useEffect(() => {
+    const inConversationScope = location.pathname.startsWith('/c/')
+    const desiredRoot = inConversationScope
+      ? (activeConversation?.workspaceCwd ?? '')
+      : (activeProject?.path ?? '')
+    if (!desiredRoot || desiredRoot === watchedRootPathRef.current) return
+    const previousWatchedRoot = watchedRootPathRef.current
+    let cancelled = false
+    void filesystemApi.watchDirectory(desiredRoot).then((watchResult) => {
+      if (cancelled) return
+      if (!watchResult.success && watchResult.code !== 'WEB_UNSUPPORTED') {
+        useFileExplorerStore.getState().setRootLoadError({
+          message: watchResult.error ?? 'Failed to watch directory',
+          code: watchResult.code ?? 'WATCH_FAILED'
+        })
+        return
+      }
+      useFileExplorerStore.getState().setRootPath(desiredRoot)
+      if (previousWatchedRoot && previousWatchedRoot !== desiredRoot) {
+        filesystemApi.unwatchDirectory(previousWatchedRoot)
+      }
+      watchedRootPathRef.current = desiredRoot
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [location.pathname, activeConversation?.workspaceCwd, activeProject?.path])
+
   // Editor state persistence
   useEditorPersistence(activeConversationId ? '' : activeProjectId)
 
@@ -1009,9 +1042,22 @@ export default function WorkspaceLayout(): React.JSX.Element {
     [uiZoomLevel, updateAppSetting]
   )
 
-  // The portable index route owns `/`; terminal workspace chrome is reserved for explicit
-  // Conversation routes so the real WorkspaceDashboard outlet remains reachable on every root.
-  const isWorkspaceRoute = location.pathname.startsWith('/c/')
+  // Desktop: the independent Conversation area (list dashboard + open conversations) is
+  // entered from the Activity Rail chat toggle; the portable index route owns the regular
+  // project workspace with terminal panes, so the two areas never render side by side.
+  // The phone shell keeps its own navigation and still owns the dashboard at its root.
+  const isConversationListRoute = location.pathname === '/conversations'
+  // File explorer visibility follows the Conversation workspace in the
+  // Conversation area and the active project elsewhere.
+  const explorerRootVisible = location.pathname.startsWith('/c/')
+    ? Boolean(activeConversation?.workspaceCwd)
+    : Boolean(activeProject?.path)
+  const isConversationRoute =
+    isConversationListRoute ||
+    location.pathname.startsWith('/c/') ||
+    (isMobileWebShell && location.pathname === '/')
+  const isWorkspaceRoute =
+    location.pathname.startsWith('/c/') || (!isMobileWebShell && location.pathname === '/')
 
   // Unified tab cycling - cycles through ALL workspace tabs in active pane
   const cycleTab = useCallback(
@@ -1029,12 +1075,19 @@ export default function WorkspaceLayout(): React.JSX.Element {
   // Terminal creation callbacks - defined before keyboard shortcut useEffect
   const handleCreateTerminalInPane = useCallback(
     async (paneId: string, shellName?: string) => {
-      const cwd = activeConversation?.workspaceCwd ?? getDefaultCwdForProject(activeProjectId)
+      // Terminals are Conversation-scoped only inside an open Conversation;
+      // the regular project workspace keeps scope-less project terminals.
+      const inConversationScope =
+        location.pathname.startsWith('/c/') && Boolean(activeConversationId)
+      const cwd = inConversationScope
+        ? (activeConversation?.workspaceCwd ?? getDefaultCwdForProject(activeProjectId))
+        : getDefaultCwdForProject(activeProjectId)
 
       const result = await spawnTerminalInPane(paneId, activeProjectId, cwd, {
         shell: shellName || activeProject?.defaultShell || appDefaultShell || undefined,
         envVars: activeProject?.envVars,
-        maxTerminalsPerProject: maxTerminals
+        maxTerminalsPerProject: maxTerminals,
+        conversationId: inConversationScope ? (activeConversationId ?? undefined) : undefined
       })
       if (!result.success) {
         toast.error(
@@ -1047,8 +1100,10 @@ export default function WorkspaceLayout(): React.JSX.Element {
       activeProject?.defaultShell,
       activeProject?.envVars,
       activeConversation?.workspaceCwd,
+      activeConversationId,
       activeProjectId,
       appDefaultShell,
+      location.pathname,
       maxTerminals
     ]
   )
@@ -1090,6 +1145,27 @@ export default function WorkspaceLayout(): React.JSX.Element {
     },
     [handleCreateTerminalInPane]
   )
+
+  // Entering a project (sidebar click or startup with a restored active project)
+  // always lands in the regular project workspace: leave the independent
+  // Conversation area and open one terminal when the project has none yet, so
+  // the project section is entered instead of the chat launcher empty state.
+  const locationPathRef = useRef(location.pathname)
+  locationPathRef.current = location.pathname
+  const enteredProjectRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (isMobileWebShell || !isLoaded || !activeProjectId) return
+    if (enteredProjectRef.current === activeProjectId) return
+    enteredProjectRef.current = activeProjectId
+    const timer = setTimeout(() => {
+      if (locationPathRef.current !== '/') return
+      const hasProjectTerminal = useTerminalStore
+        .getState()
+        .terminals.some((terminal) => terminal.projectId === activeProjectId)
+      if (!hasProjectTerminal) handleAddTerminal(undefined)
+    }, 400)
+    return () => clearTimeout(timer)
+  }, [activeProjectId, isLoaded, isMobileWebShell, handleAddTerminal])
 
   const handleNewBrowserTab = useCallback((paneId?: string) => {
     const resolvedPaneId = paneId ?? useWorkspaceStore.getState().activePaneId
@@ -1667,7 +1743,6 @@ export default function WorkspaceLayout(): React.JSX.Element {
             <ActivityRail
               isShortcutsOpen={isShortcutMenuOpen}
               onShortcutsOpenChange={setIsShortcutMenuOpen}
-              onOpenCommandPalette={() => setIsCommandPaletteOpen(true)}
               canOpenGitChanges={false}
             />
             <div className="flex-1 flex flex-col min-w-0">
@@ -2007,15 +2082,12 @@ export default function WorkspaceLayout(): React.JSX.Element {
           <ActivityRail
             isShortcutsOpen={isShortcutMenuOpen}
             onShortcutsOpenChange={setIsShortcutMenuOpen}
-            onOpenCommandPalette={() => setIsCommandPaletteOpen(true)}
             onOpenGitChanges={() => handleAddGitTab()}
             canOpenGitChanges={Boolean(activeProject?.path)}
             onOpenGitHistory={() => handleAddGitHistoryTab()}
             canOpenGitHistory={Boolean(activeProject?.path)}
             isThemePickerOpen={isThemePickerOpen}
             onToggleThemePicker={handleToggleThemePicker}
-            onOpenAgentChat={handleOpenAgentChat}
-            canOpenAgentChat
           />
           <div className="flex-1 flex flex-col min-w-0">
             <TitleBar />
@@ -2024,21 +2096,24 @@ export default function WorkspaceLayout(): React.JSX.Element {
               {/* Sidebar */}
               {isSidebarVisible && (
                 <div className="mr-2 flex h-full gap-2">
-                  <ConversationSidebar onNewChat={handleOpenAgentChat} />
-                  <ProjectSidebar
-                    projects={projects}
-                    activeProjectId={activeProjectId}
-                    onSelectProject={handleSelectProject}
-                    onNewProject={() => setIsNewProjectModalOpen(true)}
-                    onUpdateProject={updateProject}
-                    onDeleteProject={deleteProject}
-                    onArchiveProject={archiveProject}
-                    onRestoreProject={restoreProject}
-                    onReorderProjects={reorderProjects}
-                    onSSHConnect={handleSSHConnect}
-                    onSelectSSHProfile={handleSelectSSHProfile}
-                    activeSSHProfileId={activeSSHProfileId}
-                  />
+                  {isConversationRoute ? (
+                    <ConversationSidebar onNewChat={handleOpenAgentChat} />
+                  ) : (
+                    <ProjectSidebar
+                      projects={projects}
+                      activeProjectId={activeProjectId}
+                      onSelectProject={handleSelectProject}
+                      onNewProject={() => setIsNewProjectModalOpen(true)}
+                      onUpdateProject={updateProject}
+                      onDeleteProject={deleteProject}
+                      onArchiveProject={archiveProject}
+                      onRestoreProject={restoreProject}
+                      onReorderProjects={reorderProjects}
+                      onSSHConnect={handleSSHConnect}
+                      onSelectSSHProfile={handleSelectSSHProfile}
+                      activeSSHProfileId={activeSSHProfileId}
+                    />
+                  )}
                 </div>
               )}
 
@@ -2046,15 +2121,43 @@ export default function WorkspaceLayout(): React.JSX.Element {
               <PaneDndProvider>
                 <div className="flex-1 flex min-h-0 h-full gap-0 overflow-hidden min-w-0">
                   {/* Main Content Area */}
-                  <main className="flex-1 flex flex-col min-w-0 rounded-xl bg-card overflow-hidden">
+                  <main className="relative flex-1 flex flex-col min-w-0 rounded-xl bg-card overflow-hidden">
                     <WorkspaceConflictBanner conversationId={activeConversationId} />
                     {workspaceMain}
+                    {isConversationListRoute && isAgentLauncherOpen ? (
+                      <div
+                        className="absolute inset-0 z-30 flex flex-col bg-background/95 backdrop-blur-sm"
+                        role="dialog"
+                        aria-modal="true"
+                        aria-label={runtimeT('workspace', 'pane.agentLauncher', 'Agent launcher')}
+                      >
+                        <button
+                          type="button"
+                          className="absolute right-3 top-3 z-10 flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted/60 hover:text-foreground"
+                          aria-label={runtimeT(
+                            'workspace',
+                            'pane.closeAgentLauncher',
+                            'Close agent launcher'
+                          )}
+                          onClick={() => useWorkspaceStore.getState().hideAgentLauncher()}
+                        >
+                          <X className="h-4 w-4" aria-hidden="true" />
+                        </button>
+                        <AgentLauncher
+                          paneId={useWorkspaceStore.getState().activePaneId}
+                          onLaunched={(conversationId) => {
+                            useWorkspaceStore.getState().hideAgentLauncher()
+                            navigate(`/c/${conversationId}`)
+                          }}
+                        />
+                      </div>
+                    ) : null}
                   </main>
 
                   {/* File Explorer - separate floating panel */}
-                  {(isExplorerVisible && activeProject?.path) || activeSSHProfile ? (
+                  {(isExplorerVisible && explorerRootVisible) || activeSSHProfile ? (
                     <div className="flex-shrink-0 ml-2 flex flex-col gap-2 h-full">
-                      {isExplorerVisible && activeProject?.path && (
+                      {isExplorerVisible && explorerRootVisible && (
                         <div className={activeSSHProfile ? 'flex-1 min-h-0' : 'h-full'}>
                           <Suspense fallback={<ShellSkeleton />}>
                             <FileExplorer side="right" />
@@ -2065,7 +2168,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
                         <div
                           className={cn(
                             'flex-1 bg-background rounded-xl overflow-hidden min-h-0 flex flex-col border border-border',
-                            !(isExplorerVisible && activeProject?.path) && 'w-64'
+                            !(isExplorerVisible && explorerRootVisible) && 'w-64'
                           )}
                         >
                           <Suspense fallback={<ShellSkeleton />}>
