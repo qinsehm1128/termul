@@ -101,12 +101,17 @@ pub type TerminalResourceDescriptor = SessionWorkspaceResourceDescriptor;
 pub enum SessionWorkspaceProjectionState {
     Native,
     Projected {
+        #[serde(rename = "sourcePath", alias = "source_path")]
         source_path: String,
+        #[serde(rename = "sourceSha256", alias = "source_sha256")]
         source_sha256: String,
+        #[serde(rename = "projectedResourceCount", alias = "projected_resource_count")]
         projected_resource_count: usize,
+        #[serde(rename = "unresolvedResourceCount", alias = "unresolved_resource_count")]
         unresolved_resource_count: usize,
     },
     RecoveryRequired {
+        #[serde(rename = "recoveryIds", alias = "recovery_ids")]
         recovery_ids: Vec<String>,
     },
 }
@@ -130,13 +135,16 @@ pub struct SessionWorkspaceV1 {
 #[serde(tag = "status", rename_all = "camelCase")]
 pub enum SessionWorkspaceLoadOutcome {
     Missing {
+        #[serde(rename = "conversationId", alias = "conversation_id")]
         conversation_id: ConversationId,
     },
     Loaded {
         workspace: Box<SessionWorkspaceV1>,
     },
     RecoveryRequired {
+        #[serde(rename = "conversationId", alias = "conversation_id")]
         conversation_id: ConversationId,
+        #[serde(rename = "recoveryItems", alias = "recovery_items")]
         recovery_items: Vec<RecoveryItemV1>,
     },
 }
@@ -146,14 +154,19 @@ pub enum SessionWorkspaceLoadOutcome {
 pub enum SessionWorkspaceWriteOutcome {
     Updated {
         revision: u64,
+        #[serde(rename = "updatedAtUtc", alias = "updated_at_utc")]
         updated_at_utc: String,
     },
     Conflict {
+        #[serde(rename = "currentRevision", alias = "current_revision")]
         current_revision: u64,
+        #[serde(rename = "currentUpdatedAtUtc", alias = "current_updated_at_utc")]
         current_updated_at_utc: String,
+        #[serde(rename = "currentUpdateIdentity", alias = "current_update_identity")]
         current_update_identity: Option<String>,
     },
     RecoveryRequired {
+        #[serde(rename = "recoveryItems", alias = "recovery_items")]
         recovery_items: Vec<RecoveryItemV1>,
     },
 }

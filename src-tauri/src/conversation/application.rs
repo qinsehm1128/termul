@@ -79,13 +79,128 @@ pub enum ConversationHostState {
     Error,
 }
 
+/// Wire casing for the host-status envelope only. The shared TypeScript contract
+/// (`src/shared/types/conversation-api.types.ts`) requires camelCase enum values,
+/// while persisted migration layout/journal files remain snake_case; this adapter
+/// keeps the two representations from drifting into a decode failure.
+mod host_status_wire {
+    use super::{MigrationPhase, ReaderPrecedence};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize_phase<S>(value: &MigrationPhase, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let wire = match value {
+            MigrationPhase::Detected => "detected",
+            MigrationPhase::Quiescing => "quiescing",
+            MigrationPhase::Inventoried => "inventoried",
+            MigrationPhase::Staging => "staging",
+            MigrationPhase::Verifying => "verifying",
+            MigrationPhase::CutoverPending => "cutoverPending",
+            MigrationPhase::Committed => "committed",
+            MigrationPhase::ObservationWindow => "observationWindow",
+            MigrationPhase::RollbackPending => "rollbackPending",
+            MigrationPhase::RolledBack => "rolledBack",
+            MigrationPhase::Finalized => "finalized",
+        };
+        wire.serialize(serializer)
+    }
+
+    pub fn deserialize_phase<'de, D>(deserializer: D) -> Result<MigrationPhase, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match String::deserialize(deserializer)?.as_str() {
+            "detected" => MigrationPhase::Detected,
+            "quiescing" => MigrationPhase::Quiescing,
+            "inventoried" => MigrationPhase::Inventoried,
+            "staging" => MigrationPhase::Staging,
+            "verifying" => MigrationPhase::Verifying,
+            "cutoverPending" | "cutover_pending" => MigrationPhase::CutoverPending,
+            "committed" => MigrationPhase::Committed,
+            "observationWindow" | "observation_window" => MigrationPhase::ObservationWindow,
+            "rollbackPending" | "rollback_pending" => MigrationPhase::RollbackPending,
+            "rolledBack" | "rolled_back" => MigrationPhase::RolledBack,
+            "finalized" => MigrationPhase::Finalized,
+            other => {
+                return Err(serde::de::Error::unknown_variant(
+                    other,
+                    &[
+                        "detected",
+                        "quiescing",
+                        "inventoried",
+                        "staging",
+                        "verifying",
+                        "cutoverPending",
+                        "committed",
+                        "observationWindow",
+                        "rollbackPending",
+                        "rolledBack",
+                        "finalized",
+                    ],
+                ))
+            }
+        })
+    }
+
+    pub fn serialize_precedence<S>(
+        value: &ReaderPrecedence,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let wire = match value {
+            ReaderPrecedence::LegacyOnly => "legacyOnly",
+            ReaderPrecedence::ConversationV2First => "conversationV2First",
+            ReaderPrecedence::HybridLegacyFirst => "hybridLegacyFirst",
+            ReaderPrecedence::ConversationV2Only => "conversationV2Only",
+        };
+        wire.serialize(serializer)
+    }
+
+    pub fn deserialize_precedence<'de, D>(deserializer: D) -> Result<ReaderPrecedence, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match String::deserialize(deserializer)?.as_str() {
+            "legacyOnly" | "legacy_only" => ReaderPrecedence::LegacyOnly,
+            "conversationV2First" | "conversation_v2_first" => {
+                ReaderPrecedence::ConversationV2First
+            }
+            "hybridLegacyFirst" | "hybrid_legacy_first" => ReaderPrecedence::HybridLegacyFirst,
+            "conversationV2Only" | "conversation_v2_only" => ReaderPrecedence::ConversationV2Only,
+            other => {
+                return Err(serde::de::Error::unknown_variant(
+                    other,
+                    &[
+                        "legacyOnly",
+                        "conversationV2First",
+                        "hybridLegacyFirst",
+                        "conversationV2Only",
+                    ],
+                ))
+            }
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConversationHostStatus {
     pub host_kind: ConversationHostKind,
     pub state: ConversationHostState,
     pub code: String,
+    #[serde(
+        serialize_with = "host_status_wire::serialize_phase",
+        deserialize_with = "host_status_wire::deserialize_phase"
+    )]
     pub migration_phase: MigrationPhase,
+    #[serde(
+        serialize_with = "host_status_wire::serialize_precedence",
+        deserialize_with = "host_status_wire::deserialize_precedence"
+    )]
     pub reader_precedence: ReaderPrecedence,
     pub recovery_item_count: usize,
     pub recovery_items: Vec<RecoveryItemV1>,
@@ -1189,6 +1304,48 @@ mod tests {
             ConversationHostState::Ready
         );
         let _ = SessionWorkspaceProjectionState::Native;
+    }
+
+    #[tokio::test]
+    async fn host_status_wire_matches_shared_contract_camel_case() {
+        let (_temp, service) = service().await;
+        let status = service.host_status().unwrap();
+        let wire = serde_json::to_value(&status).unwrap();
+        // The shared TypeScript parser (src/shared/types/conversation-api.types.ts)
+        // requires camelCase enum values on the wire even though persisted
+        // migration layout/journal files stay snake_case.
+        assert!(
+            matches!(
+                wire["migrationPhase"].as_str(),
+                Some("observationWindow") | Some("finalized")
+            ),
+            "migrationPhase must serialize camelCase, got {wire:?}"
+        );
+        assert!(
+            matches!(
+                wire["readerPrecedence"].as_str(),
+                Some("legacyOnly")
+                    | Some("conversationV2First")
+                    | Some("hybridLegacyFirst")
+                    | Some("conversationV2Only")
+            ),
+            "readerPrecedence must serialize camelCase, got {wire:?}"
+        );
+        // Deserialization accepts both wire and legacy persisted casings.
+        for phase in ["observationWindow", "observation_window"] {
+            let json = serde_json::json!({
+                "hostKind": "desktop",
+                "state": "ready",
+                "code": "CONVERSATION_HOST_READY",
+                "migrationPhase": phase,
+                "readerPrecedence": "conversation_v2_first",
+                "recoveryItemCount": 0,
+                "recoveryItems": []
+            });
+            let decoded: ConversationHostStatus = serde_json::from_value(json).unwrap();
+            assert_eq!(decoded.migration_phase, MigrationPhase::ObservationWindow);
+            assert_eq!(decoded.reader_precedence, ReaderPrecedence::ConversationV2First);
+        }
     }
 
     #[tokio::test]
