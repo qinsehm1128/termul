@@ -170,9 +170,7 @@ struct SessionState {
 
 impl SessionState {
     fn is_idle_error(&self) -> bool {
-        self.last_error_code.is_some()
-            && self.pending_records == 0
-            && self.pending_bytes == 0
+        self.last_error_code.is_some() && self.pending_records == 0 && self.pending_bytes == 0
     }
 
     fn record_error(&mut self, code: &'static str) {
@@ -281,10 +279,7 @@ impl OrderedPersistenceTicket {
         self.wait_until(StdInstant::now() + DEFAULT_DELIVERY_COMMIT_TIMEOUT)
     }
 
-    pub fn wait_until(
-        self,
-        deadline: StdInstant,
-    ) -> Result<u64, ConversationPersistenceError> {
+    pub fn wait_until(self, deadline: StdInstant) -> Result<u64, ConversationPersistenceError> {
         let mut result = self.completion.result.lock();
         loop {
             if let Some(result) = result.take() {
@@ -777,7 +772,9 @@ impl OrderedConversationPersistence {
                     "ordered persistence capacity did not drain before the retry deadline",
                 ));
             }
-            let timed_out = shared.capacity_available.wait_for(&mut state, deadline - now);
+            let timed_out = shared
+                .capacity_available
+                .wait_for(&mut state, deadline - now);
             if timed_out.timed_out() {
                 return Err(persistence_error(
                     code,
@@ -910,7 +907,9 @@ impl OrderedConversationPersistence {
                     "timed out waiting for admitted session work",
                 ));
             }
-            let timed_out = shared.capacity_available.wait_for(&mut state, deadline - now);
+            let timed_out = shared
+                .capacity_available
+                .wait_for(&mut state, deadline - now);
             if timed_out.timed_out() {
                 return Err(deadline_error(
                     "ordered_retire_session",
@@ -969,12 +968,7 @@ impl OrderedConversationPersistence {
                 last_persisted_source_seq: session.persisted_frontier,
                 last_error_code: session.last_error_code,
                 running: !self.core.shared.shutting_down.load(Ordering::Acquire)
-                    && self
-                        .core
-                        .shared
-                        .active_writer_tasks
-                        .load(Ordering::Acquire)
-                        > 0,
+                    && self.core.shared.active_writer_tasks.load(Ordering::Acquire) > 0,
             })
         }))
     }
@@ -990,10 +984,7 @@ impl OrderedConversationPersistence {
     /// Number of fixed shared Tokio writer tasks that have not exited.
     #[must_use]
     pub fn active_worker_count(&self) -> usize {
-        self.core
-            .shared
-            .active_writer_tasks
-            .load(Ordering::Acquire)
+        self.core.shared.active_writer_tasks.load(Ordering::Acquire)
     }
 
     /// Secret-safe current and high-water resource accounting.
@@ -1038,12 +1029,17 @@ impl OrderedConversationPersistence {
         let lifecycle_guard = tokio::time::timeout_at(deadline, self.core.lifecycle_lock.lock())
             .await
             .map_err(|_| deadline_error("ordered_shutdown", "timed out acquiring shutdown gate"))?;
-        self.core.shared.shutting_down.store(true, Ordering::Release);
+        self.core
+            .shared
+            .shutting_down
+            .store(true, Ordering::Release);
         self.core.shared.capacity_available.notify_all();
 
         let mut first_error = self.flush_until_locked(deadline).await.err();
         for shard in &self.core.shards {
-            match tokio::time::timeout_at(deadline, shard.sender.send(WorkerCommand::Shutdown)).await {
+            match tokio::time::timeout_at(deadline, shard.sender.send(WorkerCommand::Shutdown))
+                .await
+            {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => {
                     first_error.get_or_insert_with(|| {
@@ -1255,12 +1251,8 @@ fn build_core(target: Arc<dyn PersistenceTarget>) -> Arc<OrderedPersistenceCore>
         let guard = WorkerTaskGuard {
             shared: Arc::clone(&shared),
         };
-        let join_handle = runtime.spawn(run_shard(
-            shard_index,
-            receiver,
-            Arc::clone(&shared),
-            guard,
-        ));
+        let join_handle =
+            runtime.spawn(run_shard(shard_index, receiver, Arc::clone(&shared), guard));
         shards.push(ShardControl {
             sender,
             join_handle: Mutex::new(Some(join_handle)),
@@ -1341,7 +1333,8 @@ fn coordinator_runtime_handle() -> tokio::runtime::Handle {
 }
 
 fn adapter_coordinator_registry() -> &'static Mutex<HashMap<usize, Weak<OrderedPersistenceCore>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<OrderedPersistenceCore>>>> = OnceLock::new();
+    static REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<OrderedPersistenceCore>>>> =
+        OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -1451,7 +1444,11 @@ fn completion_error(code: &'static str) -> ConversationPersistenceError {
     } else {
         "ordered_append"
     };
-    persistence_error(code, operation, "canonical Conversation append did not commit")
+    persistence_error(
+        code,
+        operation,
+        "canonical Conversation append did not commit",
+    )
 }
 
 fn deadline_error(operation: &'static str, detail: &'static str) -> ConversationPersistenceError {
@@ -1604,15 +1601,19 @@ mod tests {
     async fn submit_waits_for_a_binding_that_commits_after_the_first_prompt() {
         let target = Arc::new(FakeTarget::with_sessions(0));
         let persistence = ordered(Arc::clone(&target));
-        let conversation =
-            ConversationId::parse("00000000-0000-4000-8000-000000000001").unwrap();
+        let conversation = ConversationId::parse("00000000-0000-4000-8000-000000000001").unwrap();
         let binder = Arc::clone(&target);
         let handle = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
             binder.bind("opaque-race", conversation);
         });
         let ticket = persistence
-            .submit("opaque-race", 1, "user_prompt", serde_json::json!({"body":"race"}))
+            .submit(
+                "opaque-race",
+                1,
+                "user_prompt",
+                serde_json::json!({"body":"race"}),
+            )
             .unwrap();
         assert_eq!(ticket.committed().await.unwrap(), 1);
         handle.join().unwrap();
@@ -1800,12 +1801,7 @@ mod tests {
         let second_persistence = Arc::clone(&persistence);
         let second_payload = payload.clone();
         let second = tokio::task::spawn_blocking(move || {
-            second_persistence.submit(
-                "opaque-0",
-                blocked_seq,
-                "message_chunk",
-                second_payload,
-            )
+            second_persistence.submit("opaque-0", blocked_seq, "message_chunk", second_payload)
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!second.is_finished());

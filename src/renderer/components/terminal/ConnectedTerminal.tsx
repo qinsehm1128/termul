@@ -210,11 +210,16 @@ async function attachResumedTerminalRenderer(
       source: 'connected-terminal.resume',
       message: `code=${resumed.code} terminalRecordId=${record.id}`
     })
-    // Host restarted or the PTY is gone: clean the stale record silently
-    // instead of surfacing a resume error to the user.
+    // Conversation-scoped records that the host no longer knows about can be
+    // dropped. Scope-less project terminals must stay so the pane can show a
+    // reconnect state instead of going blank.
     if (resumed.code === 'TERMINAL_NOT_FOUND' || resumed.code === 'UNAUTHORIZED') {
-      useTerminalStore.getState().closeTerminal(record.id, record.projectId ?? '')
-      return { attached: false, stale: true }
+      if (record.conversationId) {
+        useTerminalStore.getState().closeTerminal(record.id, record.projectId ?? '')
+        return { attached: false, stale: true }
+      }
+      useTerminalStore.getState().setTerminalHealthStatus(record.id, 'disconnected')
+      return { attached: false, stale: false }
     }
     return { attached: false, stale: false }
   }

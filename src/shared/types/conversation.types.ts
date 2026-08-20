@@ -127,6 +127,12 @@ export const CONVERSATION_ERROR_CODES = [
 
 export type ConversationErrorCode = (typeof CONVERSATION_ERROR_CODES)[number]
 
+export type ConversationTitleSource =
+  | 'background_generated'
+  | 'agent_supplied'
+  | 'derived_first_message'
+  | 'local_alias'
+
 /** Canonical Conversation metadata record. Binding and resource history are stored separately. */
 export interface ConversationRecordV2 {
   schemaVersion: typeof CONVERSATION_SCHEMA_VERSION
@@ -139,6 +145,8 @@ export interface ConversationRecordV2 {
   lifecycleState: ConversationLifecycleState
   lastSeq: number
   createdBy: 'termul'
+  title?: string | null
+  titleSource?: ConversationTitleSource | null
 }
 
 export type ConversationAggregateMutationAction =
@@ -343,18 +351,25 @@ export function parseAgentSessionBinding(value: unknown): AgentSessionBinding {
 /** Validate one exact canonical Conversation record without cloning it. */
 export function parseConversationRecordV2(value: unknown): ConversationRecordV2 {
   const candidate = runtimeRecord(value, 'conversation')
-  exactKeys(candidate, [
-    'schemaVersion',
-    'conversationId',
-    'createdAtUtc',
-    'creationPartition',
-    'workspaceCwd',
-    'executionTarget',
-    'projectAttachment',
-    'lifecycleState',
-    'lastSeq',
-    'createdBy'
-  ])
+  exactKeys(
+    candidate,
+    [
+      'schemaVersion',
+      'conversationId',
+      'createdAtUtc',
+      'creationPartition',
+      'workspaceCwd',
+      'executionTarget',
+      'projectAttachment',
+      'lifecycleState',
+      'lastSeq',
+      'createdBy'
+    ],
+    ['title', 'titleSource']
+  )
+  if (candidate.title !== undefined && candidate.title !== null) {
+    nonEmptyString(candidate.title, 'conversation.title')
+  }
   if (candidate.schemaVersion !== CONVERSATION_SCHEMA_VERSION) {
     throw new TypeError('conversation schemaVersion is unsupported')
   }

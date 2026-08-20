@@ -1,13 +1,16 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { MemoryRouter, Route, Routes } from 'react-router-dom'
+import { type MutableRefObject, useEffect } from 'react'
+import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TooltipProvider } from '@/components/ui/tooltip'
+import { persistState, restoreProjectWorkspace } from '@/hooks/use-editor-persistence'
 import WorkspaceDashboard from '@/pages/WorkspaceDashboard'
 import { useConversationStore } from '@/stores/conversation-store'
 import { useFileExplorerStore } from '@/stores/file-explorer-store'
 import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
 import { useSidebarStore } from '@/stores/sidebar-store'
 import { useThemePickerStore } from '@/stores/theme-picker-store'
+import { useWorkspaceStore } from '@/stores/workspace-store'
 import type { Project, ProjectColor, Terminal } from '@/types/project'
 import WorkspaceLayout from './WorkspaceLayout'
 
@@ -112,8 +115,11 @@ vi.mock('@/stores/terminal-store', () => ({
     {
       getState: () => ({
         terminals: mockUseTerminals(),
+        activeTerminalId: mockUseActiveTerminalId(),
         findTerminalByPtyId: (ptyId: string) =>
-          mockUseTerminals().find((terminal) => terminal.ptyId === ptyId)
+          mockUseTerminals().find((terminal) => terminal.ptyId === ptyId),
+        selectTerminal: vi.fn(),
+        isTerminalLimitReached: vi.fn(() => false)
       })
     }
   ),
@@ -250,7 +256,9 @@ vi.mock('@/hooks/use-file-watcher', () => ({
 
 vi.mock('@/hooks/use-editor-persistence', () => ({
   useEditorPersistence: vi.fn(),
-  persistState: vi.fn()
+  persistState: vi.fn(),
+  restoreProjectWorkspace: vi.fn().mockResolvedValue(false),
+  subscribeProjectWorkspaceRestored: vi.fn(() => () => {})
 }))
 
 // P17: shared canonical mock shape for the Story 6 sync hook + banner —
@@ -456,6 +464,18 @@ const renderWithRouter = (initialEntries = ['/c/018f7a1c-1b4d-7c8a-9f01-01234567
       </MemoryRouter>
     </TooltipProvider>
   )
+}
+
+function WorkspaceLayoutWithNavigate({
+  navigateRef
+}: {
+  navigateRef: MutableRefObject<((to: string) => void) | null>
+}) {
+  const navigate = useNavigate()
+  useEffect(() => {
+    navigateRef.current = navigate
+  }, [navigate, navigateRef])
+  return <WorkspaceLayout />
 }
 
 describe('WorkspaceLayout - Empty States', () => {
@@ -1144,6 +1164,32 @@ describe('WorkspaceLayout - Empty States', () => {
 
       expect(screen.getByText('Hidden running terminals')).toBeInTheDocument()
       expect(screen.getByRole('button', { name: 'Reopen Hidden shell' })).toHaveClass('h-9')
+      expect(screen.getByRole('button', { name: 'Stop' })).toBeInTheDocument()
+    })
+
+    it('surfaces hidden live project terminals so they can be reopened or stopped', () => {
+      const projects = [createProject('a', '/workspace/a', 'blue')]
+      const terminal = {
+        id: 'terminal-project-hidden',
+        projectId: 'a',
+        name: 'zsh',
+        shell: 'zsh',
+        ptyId: 'pty-project-hidden',
+        viewState: 'hidden',
+        healthStatus: 'running'
+      } as Terminal
+      mockUseProjects.mockReturnValue(projects)
+      mockUseTerminals.mockReturnValue([terminal])
+      mockUseAllTerminals.mockReturnValue([terminal])
+      mockUseActiveProject.mockReturnValue(projects[0])
+      mockUseActiveProjectId.mockReturnValue('a')
+
+      renderWithRouter(['/'])
+
+      expect(screen.getByText('Hidden running terminals')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Reopen zsh' })).toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+      expect(screen.getByText('Terminate terminal process?')).toBeInTheDocument()
     })
 
     it.skip('does not re-run terminal sync when terminal ids stay unchanged across rerenders', async () => {
@@ -1232,5 +1278,112 @@ describe('WorkspaceLayout - Empty States', () => {
         mockApi.filesystem.watchDirectory.mockResolvedValue({ success: true })
       }
     }, 15_000)
+  })
+})
+
+describe('WorkspaceLayout - conversation area navigation', () => {
+  afterEach(() => {
+    useWorkspaceStore.getState().resetLayout()
+    vi.mocked(restoreProjectWorkspace).mockReset()
+    vi.mocked(restoreProjectWorkspace).mockResolvedValue(false)
+    vi.mocked(persistState).mockReset()
+  })
+
+  function setupActiveProject(): void {
+    const projects = [createProject('a', '/workspace/a', 'blue')]
+    mockUseProjects.mockReturnValue(projects)
+    mockUseActiveProject.mockReturnValue(projects[0])
+    mockUseActiveProjectId.mockReturnValue('a')
+  }
+
+  it('does not restore the project workspace when leaving an open chat for the conversation list', async () => {
+    setupActiveProject()
+    const navigateRef: MutableRefObject<((to: string) => void) | null> = { current: null }
+    vi.mocked(restoreProjectWorkspace).mockClear()
+
+    render(
+      <TooltipProvider>
+        <MemoryRouter initialEntries={['/c/018f7a1c-1b4d-7c8a-9f01-0123456789ab']}>
+          <WorkspaceLayoutWithNavigate navigateRef={navigateRef} />
+        </MemoryRouter>
+      </TooltipProvider>
+    )
+
+    await waitFor(() => {
+      expect(navigateRef.current).not.toBeNull()
+    })
+
+    act(() => {
+      navigateRef.current?.('/conversations')
+    })
+
+    await waitFor(() => {
+      expect(vi.mocked(restoreProjectWorkspace)).not.toHaveBeenCalled()
+    })
+  })
+
+  it('restores the project workspace only when leaving the conversation area for projects', async () => {
+    setupActiveProject()
+    const terminal = {
+      id: 'terminal-a',
+      projectId: 'a',
+      name: 'zsh',
+      shell: 'zsh',
+      ptyId: 'pty-a',
+      viewState: 'open',
+      healthStatus: 'running'
+    } as Terminal
+    mockUseTerminals.mockReturnValue([terminal])
+    mockUseAllTerminals.mockReturnValue([terminal])
+    useWorkspaceStore.getState().addTerminalTab('terminal-a')
+    const navigateRef: MutableRefObject<((to: string) => void) | null> = { current: null }
+    vi.mocked(restoreProjectWorkspace).mockReset()
+    vi.mocked(restoreProjectWorkspace).mockResolvedValue(true)
+
+    render(
+      <TooltipProvider>
+        <MemoryRouter initialEntries={['/c/018f7a1c-1b4d-7c8a-9f01-0123456789ab']}>
+          <WorkspaceLayoutWithNavigate navigateRef={navigateRef} />
+        </MemoryRouter>
+      </TooltipProvider>
+    )
+
+    await waitFor(() => {
+      expect(navigateRef.current).not.toBeNull()
+    })
+
+    act(() => {
+      navigateRef.current?.('/')
+    })
+
+    await waitFor(() => {
+      expect(vi.mocked(restoreProjectWorkspace)).toHaveBeenCalledWith('a')
+    })
+  })
+
+  it('persists the project layout when entering the conversation list from the project workspace', async () => {
+    setupActiveProject()
+    const navigateRef: MutableRefObject<((to: string) => void) | null> = { current: null }
+    vi.mocked(persistState).mockClear()
+
+    render(
+      <TooltipProvider>
+        <MemoryRouter initialEntries={['/']}>
+          <WorkspaceLayoutWithNavigate navigateRef={navigateRef} />
+        </MemoryRouter>
+      </TooltipProvider>
+    )
+
+    await waitFor(() => {
+      expect(navigateRef.current).not.toBeNull()
+    })
+
+    act(() => {
+      navigateRef.current?.('/conversations')
+    })
+
+    await waitFor(() => {
+      expect(vi.mocked(persistState)).toHaveBeenCalledWith('a')
+    })
   })
 })

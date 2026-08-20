@@ -8,6 +8,7 @@ import type { RecoveryItemV1 } from '@shared/types/conversation-recovery.types'
 import type { SessionWorkspaceV1 } from '@shared/types/session-workspace.types'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { useState } from 'react'
+import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ConversationRecoveryPanel } from '@/components/conversation/ConversationRecoveryPanel'
 import { ExecutionTargetPicker } from '@/components/conversation/ExecutionTargetPicker'
@@ -454,7 +455,11 @@ describe('Conversation-first responsive phone matrix', () => {
 
     const root = useWorkspaceStore.getState().root
     if (root.type !== 'leaf') throw new Error('expected restored phone leaf')
-    render(<PaneContent pane={root} />)
+    render(
+      <MemoryRouter>
+        <PaneContent pane={root} />
+      </MemoryRouter>
+    )
 
     expect(screen.getByRole('region', { name: 'Terminal is disconnected' })).toBeVisible()
     expect(screen.getByText(/saved terminal is unavailable/i)).toBeVisible()

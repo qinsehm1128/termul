@@ -153,7 +153,7 @@
       },
       "delete": {
         "title": "Delete conversation?",
-        "message": "Tombstone “{{title}}”? This is refused while an agent binding or terminal resource is still live.",
+        "message": "This will permanently delete “{{title}}” and its workspace directory, including files inside. Live agent sessions and terminal processes will be stopped first.",
         "confirm": "Delete conversation"
       }
     },
@@ -166,7 +166,7 @@
     },
     "blocked": {
       "title": "Conversation still has live resources",
-      "description": "Resolve these resources first: {{resources}}"
+      "description": "These terminal processes could not be stopped, so the conversation was not deleted: {{resources}}"
     },
     "errors": {
       "CONVERSATION_CONFLICT": "The conversation changed. Refresh and try again.",
@@ -175,7 +175,7 @@
       "CONVERSATION_BINDING_NOT_ACTIVE": "This action requires an active agent binding.",
       "CONVERSATION_BINDING_NOT_DETACHED": "This action requires a detached agent binding.",
       "CONVERSATION_BINDING_NOT_ADDRESSABLE": "The detached agent session is no longer reachable.",
-      "CONVERSATION_LIVE_RESOURCES": "Resolve the live agent or terminal resources before deleting.",
+      "CONVERSATION_LIVE_RESOURCES": "A live terminal process could not be stopped, so the conversation was not deleted.",
       "CONVERSATION_RECOVERY_REQUIRED": "Conversation recovery is required before this action.",
       "CONVERSATION_DURABILITY_FAILED": "The lifecycle change could not be saved safely.",
       "ACP_CLOSE_UNSUPPORTED": "This agent does not support suspension.",
@@ -184,7 +184,13 @@
       "VALIDATION_ERROR": "The lifecycle request was invalid.",
       "FORBIDDEN": "This lifecycle action is not allowed from the current connection.",
       "NETWORK_ERROR": "The lifecycle request could not reach the host."
-    }
+    },
+    "rename": "Rename",
+    "renameTitle": "Rename conversation",
+    "renamePlaceholder": "Enter a new name (1-120 characters)",
+    "renameCancel": "Cancel",
+    "renameConfirm": "Save",
+    "renameSuccess": "Renamed"
   },
   "question": {
     "sendFailed": "Could not send your answer. Try again.",

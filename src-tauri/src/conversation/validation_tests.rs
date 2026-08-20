@@ -73,6 +73,14 @@ impl TerminalResourceInspector for MatrixTerminals {
     fn is_live(&self, terminal_id: &str) -> bool {
         self.0.lock().contains(terminal_id)
     }
+
+    fn terminate<'a>(
+        &'a self,
+        terminal_id: &'a str,
+    ) -> ProviderFuture<'a, std::result::Result<(), String>> {
+        self.0.lock().remove(terminal_id);
+        Box::pin(async move { Ok(()) })
+    }
 }
 
 struct MatrixFixture {
@@ -130,6 +138,8 @@ async fn fixture() -> MatrixFixture {
                 lifecycle_state: ConversationLifecycleState::Ready,
                 last_seq: 0,
                 created_by: ConversationCreator::Termul,
+                title: None,
+                title_source: None,
             },
             ConversationMutation::CreateConversation,
         )
@@ -377,19 +387,6 @@ async fn lifecycle_matrix() {
         .0
         .lock()
         .insert("terminal-live".to_string());
-    let blocked = fixture
-        .application
-        .delete_conversation(fixture.id, revision(&fixture))
-        .await
-        .unwrap();
-    assert!(matches!(
-        blocked,
-        ConversationLifecycleOutcome::Blocked { blockers, .. }
-            if blockers.iter().any(|blocker| matches!(blocker, ConversationDeleteBlocker::LiveBinding { .. }))
-                && blockers.iter().any(|blocker| matches!(blocker, ConversationDeleteBlocker::TerminalResources { .. }))
-    ));
-    assert!(fixture.terminals.is_live("terminal-live"));
-
     let events = fixture.repository.read_events(fixture.id, 0).unwrap();
     for expected in [
         ConversationEventType::BindingDetached,
@@ -399,6 +396,22 @@ async fn lifecycle_matrix() {
     ] {
         assert!(events.iter().any(|event| event.type_ == expected));
     }
+    let deleted = fixture
+        .application
+        .delete_conversation(fixture.id, revision(&fixture))
+        .await
+        .unwrap();
+    assert!(matches!(
+        deleted,
+        ConversationLifecycleOutcome::Updated {
+            action: ConversationLifecycleAction::DeleteConversation,
+            lifecycle_state: ConversationLifecycleState::Deleted,
+            current_binding: None,
+            ..
+        }
+    ));
+    assert!(!fixture.terminals.is_live("terminal-live"));
+    assert!(fixture.repository.get_conversation(fixture.id).is_err());
 }
 
 #[tokio::test]
@@ -610,6 +623,8 @@ async fn hybrid_legacy_first_full_mutation_matrix() {
                     lifecycle_state: ConversationLifecycleState::Ready,
                     last_seq: 0,
                     created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
                 },
                 ConversationMutation::CreateConversation,
             )
@@ -681,6 +696,8 @@ async fn terminal_service_graph_is_host_exact() {
                     lifecycle_state: ConversationLifecycleState::Ready,
                     last_seq: 0,
                     created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
                 },
                 ConversationMutation::CreateConversation,
             )

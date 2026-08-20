@@ -7,6 +7,7 @@ import {
 } from '@/lib/router-navigate'
 import { randomUUID } from '@/lib/uuid'
 import { useTerminalStore } from '@/stores/terminal-store'
+import { isOpenTerminalView } from '@/types/project'
 import type {
   DropPosition,
   LeafNode,
@@ -956,36 +957,27 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => {
         let newRoot = root
         let didChange = false
 
+        const shouldKeepTerminalTab = (tab: WorkspaceTab): boolean => {
+          if (tab.type !== 'terminal') return true
+          if (terminalTabIds.has(tab.id)) return true
+          if (!tab.terminalId) return false
+          const record = terminalStore.terminals.find((term) => term.id === tab.terminalId)
+          // Hidden close-view records stay in the store on purpose. Do not keep
+          // or recreate their tabs — that makes the first close look like it failed.
+          if (!record || !isOpenTerminalView(record)) return false
+          // Preserve pending spawns that exist in the store but have no ptyId yet.
+          return !record.ptyId
+        }
+
         // Remove orphaned terminal tabs from all panes.
-        // A tab is orphaned only when its terminalId is NOT in the store at all.
-        // Tabs whose terminal exists but lacks a ptyId are "pending" and must
-        // be preserved to avoid the MOUNT/UNMOUNT cascade described in the
-        // agent-launcher-spawn-issue investigation.
+        // A tab is orphaned when its terminal is gone, hidden, or not in the
+        // visible sync set. Pending records without a ptyId are kept.
         for (const leaf of allLeaves) {
-          const hasOrphans = leaf.tabs.some(
-            (t) =>
-              t.type === 'terminal' &&
-              !terminalTabIds.has(t.id) &&
-              // Preserve tabs for terminals that exist in the store (even without
-              // a ptyId). These are pending initialization and will sync once
-              // the PTY is assigned.
-              (t.terminalId
-                ? !terminalStore.terminals.some((term) => term.id === t.terminalId)
-                : true)
-          )
+          const hasOrphans = leaf.tabs.some((t) => !shouldKeepTerminalTab(t))
           if (hasOrphans) {
             didChange = true
             newRoot = updateLeaf(newRoot, leaf.id, (l) => {
-              const newTabs = l.tabs.filter(
-                (t) =>
-                  t.type !== 'terminal' ||
-                  terminalTabIds.has(t.id) ||
-                  // Keep pending terminals whose store record exists but ptyId
-                  // hasn't been assigned yet.
-                  (t.terminalId
-                    ? terminalStore.terminals.some((term) => term.id === t.terminalId)
-                    : false)
-              )
+              const newTabs = l.tabs.filter((t) => shouldKeepTerminalTab(t))
               let newActive = l.activeTabId
               if (newActive && !newTabs.some((t) => t.id === newActive)) {
                 newActive = newTabs.length > 0 ? newTabs[newTabs.length - 1].id : null
@@ -1005,6 +997,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => {
         })
 
         for (const tid of terminalIds) {
+          const record = terminalStore.terminals.find((term) => term.id === tid)
+          if (record && !isOpenTerminalView(record)) continue
           const id = terminalTabId(tid)
           if (!existingTerminalIds.has(id)) {
             didChange = true

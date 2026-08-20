@@ -120,6 +120,7 @@
     "projectless": "No project",
     "projectView": "Project conversations",
     "empty": "No conversations match this view.",
+    "untitled": "Untitled conversation",
     "loadMore": "Load {{count}} more",
     "recoveryBadge_one": "{{count}} recovery item",
     "recoveryBadge_other": "{{count}} recovery items"

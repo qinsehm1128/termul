@@ -11,6 +11,7 @@ import { create } from 'zustand'
 import { useShallow } from 'zustand/shallow'
 import { i18n } from '@/i18n'
 import { formatNumber } from '@/i18n/format'
+import { logFrontendError } from '@/lib/log-api'
 import { terminalApi } from '@/lib/terminal-api'
 import type { GitStatus, Terminal, TerminalHealthStatus } from '@/types/project'
 import { useProjectStore } from './project-store'
@@ -203,7 +204,15 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
     if (!terminal) return false
     if (terminal.ptyId) {
       const result = await terminalApi.closeView(terminal.ptyId)
-      if (!result.success) return false
+      if (!result.success) {
+        // Close-view is a local UI hide. The PTY is supposed to keep running,
+        // so a detach/forwarder failure must not block removing the tab.
+        void logFrontendError({
+          level: 'warn',
+          source: 'terminal-store.close-view',
+          message: `code=${result.code ?? 'CLOSE_VIEW_FAILED'} terminalId=${terminal.ptyId}`
+        })
+      }
     }
     set((state) => ({
       terminals: state.terminals.map((candidate) =>
@@ -449,11 +458,16 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
 
     const task = (async (): Promise<IpcResult<void>> => {
       const terminal = get().terminals.find((candidate) => candidate.id === id)
-      if (!terminal?.ptyId || !terminal.conversationId) {
+      if (!terminal?.ptyId) {
         return { success: false, error: 'Terminal unavailable', code: 'TERMINAL_NOT_FOUND' }
       }
+      // Scope-less project terminals already hold the spawn-issued claim.
+      // Requiring a Conversation id here closes them on mount and blanks the pane.
       if (terminal.healthStatus === 'running' && terminal.claim) {
         return { success: true, data: undefined }
+      }
+      if (!terminal.conversationId) {
+        return { success: false, error: 'Terminal unavailable', code: 'TERMINAL_NOT_FOUND' }
       }
 
       const descriptor: TerminalResourceDescriptor = {
@@ -861,7 +875,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
 
   restartTerminalResource: async (id: string): Promise<boolean> => {
     const terminal = get().terminals.find((candidate) => candidate.id === id)
-    if (!terminal?.ptyId || !terminal.conversationId) return false
+    if (!terminal?.ptyId) return false
 
     const terminated = await terminalApi.terminate(terminal.ptyId)
     if (!terminated.success) {
@@ -890,7 +904,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
     })
 
     const spawned = await terminalApi.spawn({
-      conversationId: terminal.conversationId,
+      ...(terminal.conversationId ? { conversationId: terminal.conversationId } : {}),
       projectId: terminal.projectId,
       shell: terminal.agentProgram ? undefined : terminal.shell,
       cwd: terminal.cwd,

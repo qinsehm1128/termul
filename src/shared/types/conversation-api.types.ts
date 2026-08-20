@@ -93,6 +93,10 @@ export interface ConversationApi {
   listConversations(): Promise<IpcResult<ConversationRecordV2[]>>
   getConversation(conversationId: ConversationId): Promise<IpcResult<ConversationRecordV2>>
   openConversation(conversationId: ConversationId): Promise<IpcResult<ConversationOpenOutcome>>
+  renameConversation(
+    conversationId: ConversationId,
+    title: string
+  ): Promise<IpcResult<ConversationRecordV2>>
   resolveLegacyConversationId(
     key: LegacyConversationKey
   ): Promise<IpcResult<LegacyConversationResolution>>

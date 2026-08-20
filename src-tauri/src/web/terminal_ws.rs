@@ -93,10 +93,7 @@ fn principal_generation_mismatch(
     !current.active || current.generation != principal.generation()
 }
 
-fn should_forward_passive(
-    authority: &RemoteAccessAuthority,
-    principal_generation: u64,
-) -> bool {
+fn should_forward_passive(authority: &RemoteAccessAuthority, principal_generation: u64) -> bool {
     let current = authority.generation_state();
     current.active && current.generation == principal_generation
 }
@@ -1037,6 +1034,8 @@ mod tests {
                     lifecycle_state: ConversationLifecycleState::Ready,
                     last_seq: 0,
                     created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
                 },
                 ConversationMutation::CreateConversation,
             )

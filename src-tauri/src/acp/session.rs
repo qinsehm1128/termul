@@ -259,7 +259,8 @@ impl DriverState {
         }
         let (cancel_tx, cancel_rx) = oneshot::channel();
         let (idle_tx, idle_rx) = watch::channel(());
-        self.active_turns.insert(session_id.to_string(), Some(cancel_tx));
+        self.active_turns
+            .insert(session_id.to_string(), Some(cancel_tx));
         self.idle_resets.insert(session_id.to_string(), idle_tx);
         Some(TurnHandles { cancel_rx, idle_rx })
     }

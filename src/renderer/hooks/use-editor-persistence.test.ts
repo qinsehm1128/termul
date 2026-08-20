@@ -1,7 +1,11 @@
 import { renderHook, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { LeafNode, PaneNode, SplitNode } from '@/types/workspace.types'
-import { persistState, useEditorPersistence } from './use-editor-persistence'
+import {
+  persistState,
+  subscribeProjectWorkspaceRestored,
+  useEditorPersistence
+} from './use-editor-persistence'
 
 const { mockLoadPersistedTerminals } = vi.hoisted(() => ({
   mockLoadPersistedTerminals: vi.fn()
@@ -127,6 +131,14 @@ vi.mock('@/stores/workspace-store', async () => {
 vi.mock('@/stores/project-store', () => ({
   useProjectStore: {
     getState: vi.fn(() => mockProjectState)
+  }
+}))
+
+const mockConversationState = { activeConversationId: null as string | null }
+
+vi.mock('@/stores/conversation-store', () => ({
+  useConversationStore: {
+    getState: vi.fn(() => mockConversationState)
   }
 }))
 
@@ -271,6 +283,7 @@ beforeEach(() => {
   mockWorkspaceState.loadProjectWorkspace.mockReset()
 
   mockTerminalState.terminals = []
+  mockConversationState.activeConversationId = null
 })
 
 afterEach(() => {
@@ -429,6 +442,41 @@ describe('useEditorPersistence', () => {
       { type: 'terminal', terminalId: 'old-1' },
       { type: 'editor', filePath: '/projects/a/src/index.ts' }
     ])
+  })
+
+  it('does not persist the project pane tree while a Conversation is active', () => {
+    mockConversationState.activeConversationId = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+    persistState('project-a')
+    expect(mockPersistenceWriteDebounced).not.toHaveBeenCalled()
+  })
+
+  it('notifies listeners after a project pane restore finishes', async () => {
+    mockPersistenceRead.mockResolvedValue({
+      success: true,
+      data: {
+        openFiles: [],
+        activeFilePath: null,
+        expandedDirs: [],
+        activeTabId: null,
+        paneLayout: {
+          type: 'leaf',
+          id: 'pane-empty',
+          tabs: [],
+          activeTabId: null
+        }
+      }
+    })
+    const restored: string[] = []
+    const unsubscribe = subscribeProjectWorkspaceRestored((projectId) => {
+      restored.push(projectId)
+    })
+
+    renderHook(() => useEditorPersistence('project-a'))
+
+    await waitFor(() => {
+      expect(restored).toEqual(['project-a'])
+    })
+    unsubscribe()
   })
 
   it('restores pane layout, remaps terminal tabs to live terminals, and prunes missing editor tabs', async () => {

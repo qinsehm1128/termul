@@ -11,6 +11,10 @@ vi.mock('@/lib/terminal-api', () => ({
   }
 }))
 
+vi.mock('@/lib/log-api', () => ({
+  logFrontendError: vi.fn(async () => undefined)
+}))
+
 import { useProjectStore } from './project-store'
 import { useSessionWorkspaceSyncStore } from './session-workspace-sync-store'
 import {
@@ -44,6 +48,8 @@ describe('terminal-store', () => {
       ptyIdIndex: new Map(),
       cleanupRecoveries: {}
     })
+    vi.mocked(terminalApi.closeView).mockReset()
+    vi.mocked(terminalApi.closeView).mockResolvedValue({ success: true, data: undefined })
     vi.mocked(terminalApi.terminate).mockReset()
     vi.mocked(terminalApi.terminate).mockResolvedValue({ success: true, data: undefined })
     vi.mocked(terminalApi.spawn).mockReset()
@@ -139,6 +145,113 @@ describe('terminal-store', () => {
     })
   })
 
+  describe('resumeTerminalResource', () => {
+    it('treats a scope-less running project terminal with a claim as already attached', async () => {
+      useTerminalStore.setState({
+        terminals: [
+          {
+            id: 'proj-term',
+            name: 'Project terminal',
+            projectId: '1',
+            shell: 'bash',
+            ptyId: 'pty-proj',
+            claim: 'spawn-claim',
+            healthStatus: 'running',
+            output: []
+          }
+        ],
+        activeTerminalId: 'proj-term',
+        ptyIdIndex: new Map([['pty-proj', 'proj-term']]),
+        cleanupRecoveries: {}
+      })
+
+      const result = await useTerminalStore.getState().resumeTerminalResource('proj-term')
+
+      expect(result).toEqual({ success: true, data: undefined })
+      expect(terminalApi.resume).not.toHaveBeenCalled()
+    })
+
+    it('does not call the Conversation resume path for a scope-less terminal without a claim', async () => {
+      useTerminalStore.setState({
+        terminals: [
+          {
+            id: 'proj-term',
+            name: 'Project terminal',
+            projectId: '1',
+            shell: 'bash',
+            ptyId: 'pty-proj',
+            healthStatus: 'running',
+            output: []
+          }
+        ],
+        activeTerminalId: 'proj-term',
+        ptyIdIndex: new Map([['pty-proj', 'proj-term']]),
+        cleanupRecoveries: {}
+      })
+
+      const result = await useTerminalStore.getState().resumeTerminalResource('proj-term')
+
+      expect(result).toEqual({
+        success: false,
+        error: 'Terminal unavailable',
+        code: 'TERMINAL_NOT_FOUND'
+      })
+      expect(terminalApi.resume).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('restartTerminalResource', () => {
+    it('respawns a scope-less project terminal without a Conversation id', async () => {
+      vi.mocked(terminalApi.spawn).mockResolvedValue({
+        success: true,
+        data: {
+          id: 'pty-restarted-project',
+          shell: 'bash',
+          cwd: '/tmp',
+          pid: 3,
+          cols: 80,
+          rows: 24,
+          claim: 'fresh-project-claim'
+        }
+      })
+      useTerminalStore.setState({
+        terminals: [
+          {
+            id: 'proj-term',
+            name: 'Project terminal',
+            projectId: '1',
+            shell: 'bash',
+            ptyId: 'pty-proj',
+            claim: 'old-claim',
+            healthStatus: 'running',
+            output: []
+          }
+        ],
+        activeTerminalId: 'proj-term',
+        ptyIdIndex: new Map([['pty-proj', 'proj-term']]),
+        cleanupRecoveries: {}
+      })
+
+      const restarted = await useTerminalStore.getState().restartTerminalResource('proj-term')
+
+      expect(restarted).toBe(true)
+      expect(terminalApi.terminate).toHaveBeenCalledWith('pty-proj')
+      expect(terminalApi.spawn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          projectId: '1',
+          shell: 'bash'
+        })
+      )
+      expect(vi.mocked(terminalApi.spawn).mock.calls[0]?.[0]).not.toHaveProperty('conversationId')
+      expect(useTerminalStore.getState().terminals[0]).toMatchObject({
+        id: 'proj-term',
+        ptyId: 'pty-restarted-project',
+        claim: 'fresh-project-claim',
+        healthStatus: 'running'
+      })
+    })
+  })
+
   describe('closeTerminal', () => {
     it('should remove terminal from array', () => {
       const { closeTerminal } = useTerminalStore.getState()
@@ -165,6 +278,28 @@ describe('terminal-store', () => {
 
       const { activeTerminalId } = useTerminalStore.getState()
       expect(activeTerminalId).toBe('t1')
+    })
+
+    it('hides the view even when closeView IPC fails', async () => {
+      useTerminalStore.setState((state) => ({
+        terminals: state.terminals.map((terminal) =>
+          terminal.id === 't1' ? { ...terminal, ptyId: 'pty-1' } : terminal
+        )
+      }))
+      vi.mocked(terminalApi.closeView).mockResolvedValueOnce({
+        success: false,
+        error: 'forwarder busy',
+        code: 'INVOKE_ERROR'
+      })
+      const { closeTerminalView } = useTerminalStore.getState()
+
+      await expect(closeTerminalView('t1')).resolves.toBe(true)
+      expect(terminalApi.closeView).toHaveBeenCalledWith('pty-1')
+
+      expect(useTerminalStore.getState().terminals.find((t) => t.id === 't1')).toMatchObject({
+        viewState: 'hidden',
+        isHidden: true
+      })
     })
 
     it('should set empty activeTerminalId when closing last terminal for project', () => {

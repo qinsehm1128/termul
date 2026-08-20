@@ -95,13 +95,15 @@ async function tauriMutation(
   command: string,
   conversationId: ConversationId,
   expectedRevision: number,
-  request?: ConversationReplacementRequest
+  request?: ConversationReplacementRequest,
+  removeWorkspace?: boolean
 ): Promise<ConversationLifecycleOutcome> {
   assertRequest(conversationId, expectedRevision, request)
   const result = await invokeDecodedIpcResult(command, parseConversationLifecycleOutcome, {
     conversationId,
     expectedRevision,
-    ...(request ? { request } : {})
+    ...(request ? { request } : {}),
+    ...(removeWorkspace ? { removeWorkspace } : {})
   })
   return unwrap(result)
 }
@@ -115,14 +117,19 @@ async function httpMutation(
   action: 'detach' | 'rebind' | 'suspend' | 'replace' | 'delete',
   conversationId: ConversationId,
   expectedRevision: number,
-  request?: ConversationReplacementRequest
+  request?: ConversationReplacementRequest,
+  removeWorkspace?: boolean
 ): Promise<ConversationLifecycleOutcome> {
   const result = await requestHttpIpcResult(
     `${serverBase()}/conversations/${encodeURIComponent(conversationId)}/lifecycle/${action}`,
     {
       method: 'POST',
       headers: remoteAccessHeaders({ 'content-type': 'application/json' }),
-      body: JSON.stringify({ expectedRevision, ...(request ? { request } : {}) })
+      body: JSON.stringify({
+        expectedRevision,
+        ...(request ? { request } : {}),
+        ...(removeWorkspace ? { removeWorkspace } : {})
+      })
     },
     parseConversationLifecycleOutcome
   )
@@ -133,7 +140,8 @@ async function webMutation(
   action: 'detach' | 'rebind' | 'suspend' | 'replace' | 'delete',
   conversationId: ConversationId,
   expectedRevision: number,
-  request?: ConversationReplacementRequest
+  request?: ConversationReplacementRequest,
+  removeWorkspace?: boolean
 ): Promise<ConversationLifecycleOutcome> {
   assertRequest(conversationId, expectedRevision, request)
   try {
@@ -143,7 +151,7 @@ async function webMutation(
         await transport.conversationLifecycle(action, conversationId, expectedRevision, request)
       )
     }
-    return await httpMutation(action, conversationId, expectedRevision, request)
+    return await httpMutation(action, conversationId, expectedRevision, request, removeWorkspace)
   } catch (error) {
     if (error instanceof ConversationLifecycleApiError) throw error
     if (error instanceof AcpTransportError) {
@@ -186,10 +194,16 @@ export function createConversationLifecycleApi(
         : webMutation('replace', conversationId, expectedRevision, request)
     },
 
-    deleteConversation(conversationId, expectedRevision) {
+    deleteConversation(conversationId, expectedRevision, removeWorkspace) {
       return useTauri
-        ? tauriMutation('conversation_delete', conversationId, expectedRevision)
-        : webMutation('delete', conversationId, expectedRevision)
+        ? tauriMutation(
+            'conversation_delete',
+            conversationId,
+            expectedRevision,
+            undefined,
+            removeWorkspace
+          )
+        : webMutation('delete', conversationId, expectedRevision, undefined, removeWorkspace)
     },
 
     subscribe(listener) {

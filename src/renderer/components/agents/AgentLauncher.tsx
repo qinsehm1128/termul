@@ -12,7 +12,7 @@ import {
   GitBranch,
   Loader2
 } from 'lucide-react'
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import {
   emptyPendingLauncherOptions,
@@ -26,8 +26,10 @@ import { AttachmentPreviewGroup } from '@/components/chat/AttachmentPreviewGroup
 import { ComposerPill } from '@/components/chat/ComposerPill'
 import { attachmentToBlock } from '@/components/chat/chat-attachments'
 import {
+  canonicalizeClaudeModelId,
   extractFastModeOption,
   filterDuplicateModeConfigOptions,
+  normalizeSessionConfigOption,
   partitionConfigOptions,
   resolveModelOption
 } from '@/components/chat/chat-input-bar-config'
@@ -45,10 +47,7 @@ import {
 } from '@/components/chat/use-composer-caret-restore'
 import { useComposerMentions } from '@/components/chat/use-composer-mentions'
 import { useOptimisticSelect } from '@/components/chat/use-optimistic-select'
-import {
-  ExecutionTargetPicker,
-  validateExecutionTarget
-} from '@/components/conversation/ExecutionTargetPicker'
+import { validateExecutionTarget } from '@/components/conversation/ExecutionTargetPicker'
 import { TermulMark } from '@/components/TermulMark'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -88,6 +87,7 @@ import {
 } from '@/lib/agents/supported-acp-agents'
 import { dialogApi, openerApi, persistenceApi } from '@/lib/api'
 import { registerSessionTempFiles } from '@/lib/attachment-temp-cleanup'
+import { resolveConversationSessionId } from '@/lib/conversation-binding'
 import { logFrontendError } from '@/lib/log-api'
 import { platform as osPlatform } from '@/lib/tauri-os'
 import { isLoopbackWebClient } from '@/lib/tauri-runtime'
@@ -337,7 +337,9 @@ export function AgentLauncher({
   const optionsInteractive = Boolean(draftSession || hasCachedOptions)
   const showModelLoading = !prepareError && isPreparing && !draftSession && !hasCachedModels
 
-  const usableConfigOptions = effectiveConfigOptions.filter((o) => o.options.length > 0)
+  const usableConfigOptions = effectiveConfigOptions
+    .map(normalizeSessionConfigOption)
+    .filter((o) => o.options.length > 0)
   const {
     model,
     thoughtLevel,
@@ -401,13 +403,15 @@ export function AgentLauncher({
   const handleSetConfig = useCallback(
     async (configId: string, valueId: string) => {
       if (!preparedSessionId) {
+        const resolvedValueId =
+          modelOption?.id === configId ? canonicalizeClaudeModelId(valueId) : valueId
         setPendingOptions((prev) => ({
           ...prev,
-          configValues: { ...prev.configValues, [configId]: valueId }
+          configValues: { ...prev.configValues, [configId]: resolvedValueId }
         }))
         if (activeConfigId) {
           persistComposerOptions(activeConfigId, {
-            configValues: { [configId]: valueId }
+            configValues: { [configId]: resolvedValueId }
           })
         }
         return
@@ -423,16 +427,17 @@ export function AgentLauncher({
         throw err
       }
     },
-    [preparedSessionId, activeConfigId, t]
+    [preparedSessionId, activeConfigId, modelOption?.id, t]
   )
 
   const handleSetModel = useCallback(
     async (valueId: string) => {
       if (!preparedSessionId) {
+        const resolvedModelId = canonicalizeClaudeModelId(valueId)
         if (modelSource === 'models') {
-          setPendingOptions((prev) => ({ ...prev, modelId: valueId }))
+          setPendingOptions((prev) => ({ ...prev, modelId: resolvedModelId }))
           if (activeConfigId) {
-            persistComposerOptions(activeConfigId, { modelId: valueId })
+            persistComposerOptions(activeConfigId, { modelId: resolvedModelId })
           }
           return
         }
@@ -443,13 +448,13 @@ export function AgentLauncher({
         }
         setPendingOptions((prev) => ({
           ...prev,
-          modelId: valueId,
-          configValues: { ...prev.configValues, [modelOption.id]: valueId }
+          modelId: resolvedModelId,
+          configValues: { ...prev.configValues, [modelOption.id]: resolvedModelId }
         }))
         if (activeConfigId) {
           persistComposerOptions(activeConfigId, {
-            modelId: valueId,
-            configValues: { [modelOption.id]: valueId }
+            modelId: resolvedModelId,
+            configValues: { [modelOption.id]: resolvedModelId }
           })
         }
         return
@@ -572,10 +577,11 @@ export function AgentLauncher({
         if (saved.configValues) {
           for (const [cid, vid] of Object.entries(saved.configValues)) {
             const opt = effectiveConfigOptions.find((o) => o.id === cid)
+            const resolvedVid = opt?.category === 'model' ? canonicalizeClaudeModelId(vid) : vid
             // Drop the value when the option is missing OR the value is no
             // longer in the option's advertised values.
-            if (opt && opt.options.some((o) => o.value === vid)) {
-              configValues[cid] = vid
+            if (opt && opt.options.some((o) => o.value === resolvedVid)) {
+              configValues[cid] = resolvedVid
             } else {
               void logFrontendError({
                 level: 'warn',
@@ -585,7 +591,7 @@ export function AgentLauncher({
             }
           }
         }
-        let modelId = saved.modelId
+        let modelId = saved.modelId ? canonicalizeClaudeModelId(saved.modelId) : saved.modelId
         if (modelId) {
           const modelOpt = resolveModelOption(
             partitionConfigOptions(effectiveConfigOptions).model,
@@ -1218,7 +1224,9 @@ export function AgentLauncher({
         // running-chatbox changes; this catches the pre-launch pending
         // options that never went through a store setter (no prepared session).
         persistComposerOptions(configSnapshot.id, {
-          modelId: pendingSnapshot.modelId,
+          modelId: pendingSnapshot.modelId
+            ? canonicalizeClaudeModelId(pendingSnapshot.modelId)
+            : pendingSnapshot.modelId,
           modeId: pendingSnapshot.modeId,
           configValues:
             Object.keys(pendingSnapshot.configValues).length > 0
@@ -1243,7 +1251,7 @@ export function AgentLauncher({
         let handedOffConversationId: string | null = null
         const completeCanonicalHandoff = (realSessionId: string): void => {
           const canonicalConversationId =
-            useAcpStore.getState().sessions[realSessionId]?.conversationId
+            useAcpStore.getState().sessions[realSessionId]?.conversationId ?? activeConversationId
           if (!canonicalConversationId) {
             throw new Error('CONVERSATION_CREATE_FAILED: canonical ConversationId missing')
           }
@@ -1264,6 +1272,49 @@ export function AgentLauncher({
         }
 
         let realId = sessionId
+        const existingSessionId = activeConversationId
+          ? resolveConversationSessionId(liveStore, activeConversationId)
+          : null
+        const retryableConversationId =
+          activeConversationId &&
+          (activeConversation?.lifecycleState === 'allocating_workspace' ||
+            activeConversation?.lifecycleState === 'initializing_agent' ||
+            activeConversation?.lifecycleState === 'agent_failed')
+            ? activeConversationId
+            : undefined
+        if (existingSessionId) {
+          const live = liveStore.sessions[existingSessionId]
+          if (live && live.status !== 'closed') {
+            liveStore.discardLaunchPlaceholder(sessionId)
+            await liveStore.applyPendingLauncherOptions(
+              existingSessionId,
+              hasPendingLauncherOptions(pendingSnapshot) ? pendingSnapshot : null
+            )
+            if (blocks.length > 0) {
+              await liveStore.sendPromptBlocks(existingSessionId, blocks)
+            }
+            liveStore.clearLaunchingSession(existingSessionId)
+            completeCanonicalHandoff(existingSessionId)
+            return
+          }
+          if (!live || live.status === 'closed') {
+            await liveStore.openHistorySession(existingSessionId)
+          }
+          const afterOpen = useAcpStore.getState().sessions[existingSessionId]
+          if (afterOpen && afterOpen.status !== 'closed') {
+            liveStore.discardLaunchPlaceholder(sessionId)
+            await liveStore.applyPendingLauncherOptions(
+              existingSessionId,
+              hasPendingLauncherOptions(pendingSnapshot) ? pendingSnapshot : null
+            )
+            if (blocks.length > 0) {
+              await liveStore.sendPromptBlocks(existingSessionId, blocks)
+            }
+            liveStore.clearLaunchingSession(existingSessionId)
+            completeCanonicalHandoff(existingSessionId)
+            return
+          }
+        }
         if (usedPlaceholder) {
           realId = await liveStore.finalizeChatLaunch({
             placeholderId: sessionId,
@@ -1279,6 +1330,7 @@ export function AgentLauncher({
             },
             worktreePath,
             worktreeBranch,
+            conversationId: retryableConversationId ?? activeConversationId ?? undefined,
             projectAttachment: attachmentSnapshot ?? undefined,
             executionTarget: finalExecutionTarget
           })
@@ -1331,6 +1383,8 @@ export function AgentLauncher({
     canUseWorktree,
     baseBranch,
     onLaunched,
+    activeConversationId,
+    activeConversation?.lifecycleState,
     t
   ])
 
@@ -1411,27 +1465,16 @@ export function AgentLauncher({
         className
       )}
     >
-      <div className="mb-8 flex w-full flex-col items-center gap-4 text-center">
-        <TermulMark size={48} className="text-foreground" />
-        <h1 className="break-words text-3xl font-medium tracking-tight text-foreground md:text-4xl">
-          {t('launcher.heading', 'What should we do in {{project}}?', { project: projectLabel })}
-        </h1>
-      </div>
+      {!activeConversation && (
+        <div className="mb-8 flex w-full flex-col items-center gap-4 text-center">
+          <TermulMark size={48} className="text-foreground" />
+          <h1 className="break-words text-3xl font-medium tracking-tight text-foreground md:text-4xl">
+            {t('launcher.heading', 'What should we do in {{project}}?', { project: projectLabel })}
+          </h1>
+        </div>
+      )}
 
       <div className="flex min-w-0 w-full max-w-4xl flex-col gap-4">
-        <ExecutionTargetPicker
-          projects={projects}
-          value={executionTarget}
-          attachment={projectAttachment}
-          conversation={activeConversation}
-          workspaceCwd={activeConversation?.workspaceCwd}
-          onChange={(target) => {
-            setExecutionTarget(target)
-            if (target.kind !== 'worktree') setBaseBranch(null)
-            else if (target.worktreeBranch) setBaseBranch(target.worktreeBranch)
-          }}
-          onAttachmentChange={setProjectAttachment}
-        />
         <div className="relative">
           {slashOpen && (
             <SlashCommandMenu
@@ -2132,7 +2175,7 @@ function AcpModelPicker({
   const filteredModels =
     modelOption?.options.filter((value) => {
       if (!normalizedQuery) return true
-      return [value.name, value.value, value.description ?? '']
+      return [value.name, value.value, value.description ?? '', value.group ?? '']
         .join(' ')
         .toLowerCase()
         .includes(normalizedQuery)
@@ -2203,32 +2246,42 @@ function AcpModelPicker({
             )}
             <div data-testid="acp-model-options" className="max-h-[180px] overflow-y-auto pr-1">
               {filteredModels.length > 0 ? (
-                filteredModels.map((value) => (
-                  <button
-                    key={value.value}
-                    type="button"
-                    onPointerDown={(event) => {
-                      if ((event.button ?? 0) !== 0) return
-                      event.preventDefault()
-                      handleSelectModel(value.value)
-                    }}
-                    onClick={() => handleSelectModel(value.value)}
-                    className={cn(
-                      'flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left text-sm text-foreground transition-colors hover:bg-accent hover:text-accent-foreground',
-                      value.value === displayValue && 'bg-accent text-accent-foreground'
-                    )}
-                  >
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate font-medium">{value.name}</span>
-                      {value.description && (
-                        <span className="block text-xs opacity-70">{value.description}</span>
+                filteredModels.map((value, index) => {
+                  const prevGroup = filteredModels[index - 1]?.group
+                  const showGroup = Boolean(value.group && value.group !== prevGroup)
+                  return (
+                    <Fragment key={value.value}>
+                      {showGroup && (
+                        <div className="label-group px-2 py-1 text-muted-foreground">
+                          {value.group}
+                        </div>
                       )}
-                    </span>
-                    {value.value === displayValue && (
-                      <Check size={14} className="mt-0.5 text-muted-foreground" />
-                    )}
-                  </button>
-                ))
+                      <button
+                        type="button"
+                        onPointerDown={(event) => {
+                          if ((event.button ?? 0) !== 0) return
+                          event.preventDefault()
+                          handleSelectModel(value.value)
+                        }}
+                        onClick={() => handleSelectModel(value.value)}
+                        className={cn(
+                          'flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left text-sm text-foreground transition-colors hover:bg-accent hover:text-accent-foreground',
+                          value.value === displayValue && 'bg-accent text-accent-foreground'
+                        )}
+                      >
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate font-medium">{value.name}</span>
+                          {value.description && (
+                            <span className="block text-xs opacity-70">{value.description}</span>
+                          )}
+                        </span>
+                        {value.value === displayValue && (
+                          <Check size={14} className="mt-0.5 text-muted-foreground" />
+                        )}
+                      </button>
+                    </Fragment>
+                  )
+                })
               ) : (
                 <div className="px-2 py-1.5 text-xs text-muted-foreground">
                   {t('launcher.noModels', 'No matching models.')}

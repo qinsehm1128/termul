@@ -48,4 +48,30 @@ describe('pending-launcher-options', () => {
     expect(hasPendingLauncherOptions(emptyPendingLauncherOptions())).toBe(false)
     expect(hasPendingLauncherOptions({ modelId: 'm2', configValues: {} })).toBe(true)
   })
+
+  it('canonicalizes family-only Claude ids on pending model overlays', () => {
+    const overlaid = overlayPendingLauncherOptions({
+      models: {
+        currentModelId: 'claude-sonnet',
+        availableModels: [{ modelId: 'claude-sonnet-5[1m]', name: 'Opus (1M context)' }]
+      },
+      modes: null,
+      configOptions: [
+        {
+          id: 'model',
+          name: 'Model',
+          category: 'model',
+          type: 'select',
+          currentValue: 'claude-sonnet',
+          options: [{ value: 'claude-sonnet-5[1m]', name: 'Opus (1M context)' }]
+        }
+      ],
+      pending: {
+        modelId: 'claude-sonnet[1m]',
+        configValues: { model: 'claude-sonnet[1m]' }
+      }
+    })
+    expect(overlaid.models?.currentModelId).toBe('claude-sonnet-5[1m]')
+    expect(overlaid.configOptions[0]?.currentValue).toBe('claude-sonnet-5[1m]')
+  })
 })

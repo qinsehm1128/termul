@@ -1,12 +1,16 @@
 import { describe, expect, it } from 'vitest'
 import type { SessionConfigOption, SessionModeState } from '@/lib/acp-api'
 import {
+  canonicalizeClaudeModelId,
   extractFastModeOption,
   filterDuplicateModeConfigOptions,
+  flattenConfigOptionValues,
   isFastModeEnabled,
   isFastModeOption,
+  normalizeSessionConfigOption,
   oppositeFastModeValue,
-  partitionConfigOptions
+  partitionConfigOptions,
+  resolveModelOption
 } from './chat-input-bar-config'
 
 function opt(id: string, category: string | null): SessionConfigOption {
@@ -81,6 +85,38 @@ describe('partitionConfigOptions', () => {
     expect(result.thoughtLevel).toBeNull()
     expect(result.rest).toEqual([model2])
   })
+
+  it('flattens grouped model selectors so the picker gets leaf values', () => {
+    const grouped = {
+      id: 'model',
+      name: 'Model',
+      category: 'model',
+      type: 'select',
+      currentValue: 'claude-opus-4',
+      options: [
+        {
+          group: 'claude',
+          name: 'Claude',
+          options: [
+            { value: 'claude-opus-4', name: 'Opus 4' },
+            { value: 'claude-sonnet-4', name: 'Sonnet 4' }
+          ]
+        },
+        {
+          group: 'bedrock',
+          name: 'Bedrock',
+          options: [{ value: 'bedrock-sonnet', name: 'Sonnet (Bedrock)' }]
+        }
+      ]
+    } as unknown as SessionConfigOption
+    const result = partitionConfigOptions([grouped])
+    expect(result.model?.options).toEqual([
+      { value: 'claude-opus-4', name: 'Opus 4', group: 'Claude' },
+      { value: 'claude-sonnet-4', name: 'Sonnet 4', group: 'Claude' },
+      { value: 'bedrock-sonnet', name: 'Sonnet (Bedrock)', group: 'Bedrock' }
+    ])
+    expect(result.model?.currentValue).toBe('claude-opus-4')
+  })
 })
 
 describe('filterDuplicateModeConfigOptions', () => {
@@ -147,5 +183,62 @@ describe('fast mode helpers', () => {
       rest: [custom]
     })
     expect(extractFastModeOption([custom])).toEqual({ fastMode: null, rest: [custom] })
+  })
+})
+
+describe('grouped config option flattening', () => {
+  it('returns an empty list for missing or non-array options', () => {
+    expect(flattenConfigOptionValues(undefined)).toEqual([])
+    expect(flattenConfigOptionValues(null)).toEqual([])
+  })
+
+  it('preserves already-flat options by identity', () => {
+    const option = opt('model', 'model')
+    expect(normalizeSessionConfigOption(option)).toBe(option)
+  })
+
+  it('flattens parent-with-value groups to versioned Claude leaves', () => {
+    expect(
+      flattenConfigOptionValues([
+        {
+          name: 'Sonnet',
+          value: 'claude-sonnet',
+          options: [
+            { value: 'claude-sonnet-5', name: 'Sonnet 5' },
+            { value: '[1m]', name: 'Opus (1M context)' }
+          ]
+        }
+      ] as unknown as SessionConfigOption['options'])
+    ).toEqual([
+      { value: 'claude-sonnet-5', name: 'Sonnet 5', group: 'Sonnet' },
+      { value: 'claude-sonnet-5[1m]', name: 'Opus (1M context)', group: 'Sonnet' }
+    ])
+  })
+
+  it('rewrites family-only Claude ids so ACP receives the versioned value', () => {
+    expect(canonicalizeClaudeModelId('claude-sonnet[1m]')).toBe('claude-sonnet-5[1m]')
+    expect(canonicalizeClaudeModelId('claude-opus')).toBe('claude-opus-5')
+    expect(canonicalizeClaudeModelId('claude-sonnet-5[1m]')).toBe('claude-sonnet-5[1m]')
+    expect(canonicalizeClaudeModelId('claude-sonnet-4-5[1m]')).toBe('claude-sonnet-4-5[1m]')
+  })
+
+  it('falls through to native session.models when the config option has no leaf values', () => {
+    const emptyModel = {
+      id: 'model',
+      name: 'Model',
+      category: 'model',
+      type: 'select',
+      currentValue: 'm1',
+      options: []
+    }
+    const resolved = resolveModelOption(emptyModel, {
+      currentModelId: 'openrouter/gpt-5.5',
+      availableModels: [{ modelId: 'openrouter/gpt-5.5', name: 'GPT-5.5' }]
+    })
+    expect(resolved.source).toBe('models')
+    expect(resolved.option?.currentValue).toBe('openrouter/gpt-5.5')
+    expect(resolved.option?.options).toEqual([
+      { value: 'openrouter/gpt-5.5', name: 'GPT-5.5', description: undefined }
+    ])
   })
 })

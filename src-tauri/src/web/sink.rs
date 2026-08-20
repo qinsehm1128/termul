@@ -70,6 +70,7 @@ pub struct AcpEvent {
 }
 
 pub const CONVERSATION_PERSISTENCE_REJECTED: &str = "CONVERSATION_PERSISTENCE_REJECTED";
+pub const CONVERSATION_BINDING_NOT_FOUND: &str = "CONVERSATION_BINDING_NOT_FOUND";
 pub const EVENT_DELIVERY_FAILED: &str = "EVENT_DELIVERY_FAILED";
 pub const EVENT_SERIALIZATION_FAILED: &str = "EVENT_SERIALIZATION_FAILED";
 pub const CLIENT_OUTBOUND_RECORDS: usize = 512;
@@ -170,6 +171,28 @@ impl FanOutError {
     #[must_use]
     pub const fn is_durable_rejection(&self) -> bool {
         self.durable_rejection
+    }
+
+    /// Warm-pool / pre-bind sessions have no Conversation yet. Durable
+    /// admission fail-closes, but that must not latch a delivery circuit or
+    /// fail user-facing `set_model` / `set_config_option` — the agent already
+    /// applied the change.
+    #[must_use]
+    pub fn is_unbound_session(&self) -> bool {
+        self.source_code == Some(CONVERSATION_BINDING_NOT_FOUND)
+    }
+
+    #[must_use]
+    pub fn should_open_session_circuit(&self) -> bool {
+        let retryable = matches!(
+            self.source_code,
+            Some(
+                "CONVERSATION_PERSISTENCE_BYTES_SATURATED"
+                    | "CONVERSATION_PERSISTENCE_QUEUE_SATURATED"
+                    | "SESSION_PERSISTENCE_QUEUE_FULL"
+            )
+        );
+        self.is_durable_rejection() && !retryable && !self.is_unbound_session()
     }
 
     #[must_use]
@@ -763,10 +786,9 @@ impl WsRelaySink {
     }
 
     fn session_gate_index(sid: &str) -> usize {
-        sid.bytes()
-            .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-                (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
-            }) as usize
+        sid.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        }) as usize
             % SESSION_GATE_STRIPES
     }
 
@@ -829,7 +851,7 @@ impl WsRelaySink {
     /// durable home; drop their events without latching the delivery circuit so
     /// a later rebind can recover the session.
     fn is_unbound_drop_code(code: &str) -> bool {
-        code == "CONVERSATION_BINDING_NOT_FOUND"
+        code == CONVERSATION_BINDING_NOT_FOUND
     }
 
     /// Reserve relay retention, acquire durable admission, then commit the live frontier.
@@ -881,10 +903,8 @@ impl WsRelaySink {
             Ok(Some(canonical_seq)) if canonical_seq != sequenced.seq => {
                 sequenced = SequencedEvent::new(
                     Some(sid.to_string()),
-                    crate::conversation::CanonicalSequenceTicket::from_allocated_seq(
-                        canonical_seq,
-                    )
-                    .seq,
+                    crate::conversation::CanonicalSequenceTicket::from_allocated_seq(canonical_seq)
+                        .seq,
                     type_,
                     sequenced.payload.clone(),
                 );
@@ -1093,11 +1113,9 @@ impl WsRelaySink {
     }
 
     fn auxiliary_charged_bytes(&self) -> usize {
-        let circuit_bytes = self
-            .delivery_circuits
-            .lock()
-            .len()
-            .saturating_mul(std::mem::size_of::<String>().saturating_add(std::mem::size_of::<&'static str>()));
+        let circuit_bytes = self.delivery_circuits.lock().len().saturating_mul(
+            std::mem::size_of::<String>().saturating_add(std::mem::size_of::<&'static str>()),
+        );
         let watermark = self.turn_watermark.stats();
         let watermark_bytes = watermark
             .seen_turns
@@ -1997,10 +2015,7 @@ pub fn fan_out<P: Serialize>(
             session_seq: None,
         });
     }
-    match classify_payload_encoding(
-        payload,
-        crate::conversation::MAX_CONVERSATION_RECORD_BYTES,
-    ) {
+    match classify_payload_encoding(payload, crate::conversation::MAX_CONVERSATION_RECORD_BYTES) {
         BoundedPayloadEncoding::WithinLimit => {}
         BoundedPayloadEncoding::TooLarge => {
             let error = EventSinkError::delivery_failed(
@@ -2177,6 +2192,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unbound_session_does_not_open_delivery_circuit() {
+        let unbound = FanOutError {
+            code: CONVERSATION_PERSISTENCE_REJECTED,
+            source_code: Some(CONVERSATION_BINDING_NOT_FOUND),
+            durable_rejection: true,
+            delivered_count: 0,
+            detail: "unbound".to_string(),
+        };
+        assert!(unbound.is_unbound_session());
+        assert!(!unbound.should_open_session_circuit());
+
+        let fatal = FanOutError {
+            code: CONVERSATION_PERSISTENCE_REJECTED,
+            source_code: Some("CONVERSATION_RECOVERY_REQUIRED"),
+            durable_rejection: true,
+            delivered_count: 0,
+            detail: "recovery".to_string(),
+        };
+        assert!(fatal.should_open_session_circuit());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn durable_rejection_does_not_advance_live_frontier() {
         struct CapturingLiveSink {
@@ -2251,13 +2288,7 @@ mod tests {
             );
         }
         assert_eq!(
-            relay
-                .clients
-                .lock()
-                .get(&client)
-                .unwrap()
-                .sessions
-                .len(),
+            relay.clients.lock().get(&client).unwrap().sessions.len(),
             MAX_CONNECTION_SUBSCRIPTIONS
         );
         let sinks: Vec<Arc<dyn EventSink>> = vec![relay.clone()];
@@ -2392,8 +2423,14 @@ mod tests {
             relay.delivery_circuits.lock().contains_key("lru-session-0"),
             "LRU payload eviction must not semantically retire circuits"
         );
-        assert_eq!(relay.auxiliary_stats().submission_gate_stripes, SESSION_GATE_STRIPES);
-        assert_eq!(relay.auxiliary_stats().replay_gate_stripes, SESSION_GATE_STRIPES);
+        assert_eq!(
+            relay.auxiliary_stats().submission_gate_stripes,
+            SESSION_GATE_STRIPES
+        );
+        assert_eq!(
+            relay.auxiliary_stats().replay_gate_stripes,
+            SESSION_GATE_STRIPES
+        );
         relay.retire_session("lru-session-0").await.unwrap();
         relay.retire_session("lru-session-0").await.unwrap();
 
@@ -3217,6 +3254,8 @@ mod tests {
                     lifecycle_state: ConversationLifecycleState::InitializingAgent,
                     last_seq: 0,
                     created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
                 },
                 ConversationMutation::CreateConversation,
             )

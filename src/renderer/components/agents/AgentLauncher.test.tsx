@@ -23,6 +23,7 @@ import { SKILL_PAD_DEFAULT } from '@/lib/composer/doc-to-prompt'
 import { skillToken } from '@/lib/skill-tokens'
 import { isTauriContext } from '@/lib/tauri-runtime'
 import type { AcpSession } from '@/stores/acp-store'
+import { useConversationStore } from '@/stores/conversation-store'
 import { __resetLauncherSelectionCache, AgentLauncher } from './AgentLauncher'
 
 // jsdom omits `document.elementFromPoint`. Radix/floating-ui call it during
@@ -398,6 +399,9 @@ vi.mock('@/stores/workspace-store', () => {
 vi.mock('@/stores/acp-store', () => {
   const getState = () => ({
     sessions: acpStateRef.current.sessions,
+    sessionIndex: [],
+    discardLaunchPlaceholder: vi.fn(),
+    openHistorySession: vi.fn(),
     startChat: mockStartChat,
     prepareChat: mockPrepareChat,
     cancelPreparedChat: mockCancelPreparedChat,
@@ -561,6 +565,7 @@ function renderLauncher(): void {
 beforeEach(() => {
   vi.clearAllMocks()
   vi.restoreAllMocks()
+  useConversationStore.getState().reset()
   __resetLauncherSelectionCache()
   // Start each test from a clean skill slate (web/no-skills default). Skill
   // tests override mockSkills.current.
@@ -659,7 +664,6 @@ describe('AgentLauncher ACP new thread', () => {
     mockProjectsRef.current = []
     renderLauncher()
 
-    expect(screen.getByRole('combobox', { name: 'Execution target' })).toHaveValue('workspace')
     setComposerValue('project-less chat')
     fireEvent.click(screen.getByLabelText('Start agent chat'))
 
@@ -679,13 +683,11 @@ describe('AgentLauncher ACP new thread', () => {
     )
   })
 
-  it('keeps explicit project target and optional attachment separate', async () => {
+  it('starts a chat in the conversation workspace without attach/target chrome', async () => {
     renderLauncher()
 
-    fireEvent.change(screen.getByRole('combobox', { name: 'Execution target' }), {
-      target: { value: 'project_root' }
-    })
-    fireEvent.click(screen.getByRole('button', { name: 'Attach project context' }))
+    expect(screen.queryByRole('combobox', { name: 'Execution target' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Attach project context' })).not.toBeInTheDocument()
     setComposerValue('explicit target')
     fireEvent.click(screen.getByLabelText('Start agent chat'))
 
@@ -693,17 +695,8 @@ describe('AgentLauncher ACP new thread', () => {
     expect(mockFinalizeChatLaunch).toHaveBeenCalledWith(
       expect.objectContaining({
         cwd: '/work',
-        projectId: 'p1',
-        executionTarget: {
-          kind: 'project_root',
-          projectId: 'p1',
-          projectRoot: '/work'
-        },
-        projectAttachment: expect.objectContaining({
-          schemaVersion: 1,
-          projectId: 'p1',
-          projectPathSnapshot: '/work'
-        })
+        projectId: '',
+        executionTarget: { kind: 'workspace' }
       })
     )
   })
@@ -1061,6 +1054,47 @@ describe('AgentLauncher ACP new thread', () => {
 
     expect(mockSetModel).toHaveBeenCalledWith('prepared-1', 'openrouter/gpt-5.5')
     expect(mockSetConfigOption).not.toHaveBeenCalled()
+  })
+
+  it('flattens grouped Claude model options and sends the leaf value id', async () => {
+    const key = 'acp-registry:claude-acp\0/work\0'
+    acpStateRef.current.agentConfigs = [ACP_CONFIG]
+    mockPersistRead.mockResolvedValue({
+      success: true,
+      data: { agentId: 'acp-registry:claude-acp', mode: 'acp' }
+    })
+    acpStateRef.current.preparedSessions = { [key]: 'prepared-1' }
+    acpStateRef.current.sessions = {
+      'prepared-1': {
+        ...preparedSession(ACP_CONFIG),
+        configOptions: [
+          {
+            id: 'model',
+            name: 'Model',
+            category: 'model',
+            type: 'select',
+            currentValue: 'claude-sonnet-4',
+            options: [
+              {
+                group: 'claude',
+                name: 'Claude',
+                options: [
+                  { value: 'claude-sonnet-4', name: 'Sonnet 4' },
+                  { value: 'claude-opus-4', name: 'Opus 4' }
+                ]
+              }
+            ]
+          } as unknown as AcpSession['configOptions'][number]
+        ]
+      }
+    }
+    renderLauncher()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Select model: Sonnet 4' }))
+    expect(screen.getByText('Claude')).toBeInTheDocument()
+    clickMenuOption('Opus 4')
+    expect(mockSetConfigOption).toHaveBeenCalledWith('prepared-1', 'model', 'claude-opus-4')
+    expect(mockSetModel).not.toHaveBeenCalled()
   })
 
   it('searches and scroll-limits large model menus', async () => {

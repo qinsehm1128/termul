@@ -128,6 +128,16 @@ export interface Terminal {
   claim?: string
 }
 
+/** True when the renderer should keep a workspace tab for this record. */
+export function isOpenTerminalView(terminal: Pick<Terminal, 'viewState' | 'isHidden'>): boolean {
+  return terminal.viewState !== 'hidden' && !terminal.isHidden
+}
+
+/** Conversation-owned PTY: hide can keep the process. Project shells should die on close. */
+export function isConversationScopedTerminal(terminal: Pick<Terminal, 'conversationId'>): boolean {
+  return Boolean(terminal.conversationId)
+}
+
 export interface TerminalLine {
   type: 'command' | 'output' | 'error' | 'warning' | 'info' | 'success'
   content: string

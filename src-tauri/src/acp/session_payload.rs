@@ -794,6 +794,8 @@ mod tests {
                     lifecycle_state: ConversationLifecycleState::Ready,
                     last_seq: 0,
                     created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
                 },
                 ConversationMutation::CreateConversation,
             )

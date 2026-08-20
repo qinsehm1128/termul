@@ -130,6 +130,8 @@ async fn fixture() -> GoldenFixture {
                 lifecycle_state: ConversationLifecycleState::Ready,
                 last_seq: 0,
                 created_by: ConversationCreator::Termul,
+                title: None,
+                title_source: None,
             },
             ConversationMutation::CreateConversation,
         )
@@ -1338,9 +1340,7 @@ async fn canonical_usage_and_plan_full_replacements_survive_cold_restart() {
         ReaderPrecedence::ConversationV2Only,
     ));
     let restarted = ConversationPersistenceAdapter::new(restarted_writer, restarted_reader);
-    let records = restarted
-        .replay_after("opaque/golden/original", 0)
-        .unwrap();
+    let records = restarted.replay_after("opaque/golden/original", 0).unwrap();
     let usage = records
         .iter()
         .find(|record| record.type_ == "usage_update")
@@ -1457,9 +1457,7 @@ async fn http_conversation_delete_retires_on_success_and_retains_on_blocked_or_e
             Request::builder()
                 .method("POST")
                 .uri(format!("/conversations/{ID}/lifecycle/delete"))
-                .body(Body::from(
-                    json!({"expectedRevision":revision}).to_string(),
-                ))
+                .body(Body::from(json!({"expectedRevision":revision}).to_string()))
                 .unwrap(),
         )
         .await
@@ -1467,17 +1465,16 @@ async fn http_conversation_delete_retires_on_success_and_retains_on_blocked_or_e
     assert_eq!(deleted.status(), axum::http::StatusCode::OK);
     let deleted_body = response_json(deleted).await;
     assert_eq!(deleted_body["data"]["status"], "updated", "{deleted_body}");
-    assert!(!relay
-        .turn_watermark()
-        .is_seen("opaque/golden/original", "turn-retained"), "{deleted_body}");
-    assert_eq!(
-        fixture
-            .repository
-            .get_conversation(ConversationId::parse(ID).unwrap())
-            .unwrap()
-            .lifecycle_state,
-        ConversationLifecycleState::Deleted
+    assert!(
+        !relay
+            .turn_watermark()
+            .is_seen("opaque/golden/original", "turn-retained"),
+        "{deleted_body}"
     );
+    assert!(fixture
+        .repository
+        .get_conversation(ConversationId::parse(ID).unwrap())
+        .is_err());
 }
 
 #[tokio::test]

@@ -119,6 +119,7 @@ export interface AcpTransport {
   setSessionNewTimeout(secs: number | null): Promise<void>
   setSessionReopenTimeout(secs: number | null): Promise<void>
   setFirstPromptWarmupTimeout(secs: number | null): Promise<void>
+  setPreferLocalNpmInstall(prefer: boolean): Promise<void>
   fetchRegistrySnapshot(forceRefresh?: boolean): Promise<AcpRegistrySnapshot>
   /**
    * On-demand MCP client probe (Termul's own rmcp client connection — NOT the
@@ -284,6 +285,8 @@ function createTauriAcpTransport(): AcpTransport {
     setSessionReopenTimeout: (secs) => invoke<void>('acp_set_session_reopen_timeout', { secs }),
     setFirstPromptWarmupTimeout: (secs) =>
       invoke<void>('acp_set_first_prompt_warmup_timeout', { secs }),
+    setPreferLocalNpmInstall: (prefer) =>
+      invoke<void>('acp_set_prefer_local_npm_install', { prefer }),
     fetchRegistrySnapshot: (forceRefresh = false) =>
       invoke<AcpRegistrySnapshot>('acp_fetch_registry_snapshot', { forceRefresh }),
     probeMcpServer: (server) => invoke<ProbeResult>('acp_probe_mcp_server', { server }),
@@ -877,6 +880,11 @@ export class WsAcpTransport implements AcpTransport {
   async setFirstPromptWarmupTimeout(_secs: number | null): Promise<void> {
     // Desktop-only: the standalone server has no settings surface and configures
     // the first-prompt warmup timeout via TERMUL_ACP_FIRST_PROMPT_WARMUP_SECS.
+  }
+
+  async setPreferLocalNpmInstall(_prefer: boolean): Promise<void> {
+    // Desktop-only: the standalone server has no settings surface and
+    // configures local npm install via TERMUL_ACP_PREFER_LOCAL_NPM.
   }
 
   /**

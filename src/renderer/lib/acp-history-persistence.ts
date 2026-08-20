@@ -19,6 +19,7 @@ import {
   isTransientAcpTransportError
 } from '@/lib/acp-transport'
 import { persistenceApi } from '@/lib/api'
+import { conversationIdForIndexEntry } from '@/lib/conversation-binding'
 import { logFrontendError } from '@/lib/log-api'
 import type { ChatMessage, SessionStatus } from '@/stores/acp-store'
 
@@ -42,6 +43,8 @@ export interface SessionIndexEntry {
   id: string
   /** Canonical Conversation identity; host summaries expose it as storageKey. */
   conversationId?: string
+  /** Present on some host list payloads; treated as Conversation identity when canonical. */
+  storageKey?: string
   agentId: string
   agentConfigId?: string
   title: string
@@ -925,6 +928,11 @@ export function fromPersistedSessionSummary(entry: PersistedSessionSummary): Ses
   }
 }
 
+function normalizeDesktopIndexEntry(entry: SessionIndexEntry): SessionIndexEntry {
+  const conversationId = conversationIdForIndexEntry(entry)
+  return conversationId === entry.conversationId ? entry : { ...entry, conversationId }
+}
+
 export async function loadSessionIndex(): Promise<SessionIndexEntry[]> {
   const transport = getAcpTransport()
   const mode = transport.historyMode?.()
@@ -932,7 +940,7 @@ export async function loadSessionIndex(): Promise<SessionIndexEntry[]> {
     return (await transport.listPersistedSessions()).map(fromPersistedSessionSummary)
   }
   if (mode === 'live_only') return []
-  return (await acpHistoryApi.list()).sessions
+  return (await acpHistoryApi.list()).sessions.map(normalizeDesktopIndexEntry)
 }
 
 type PendingHistoryWaiter = {

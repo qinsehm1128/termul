@@ -1,4 +1,4 @@
-//! HTTP adapters for canonical Conversation binding and tombstone lifecycle operations.
+//! HTTP adapters for canonical Conversation binding and delete lifecycle operations.
 
 use std::sync::Arc;
 
@@ -26,6 +26,8 @@ use crate::web::EventSink;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RevisionRequest {
     expected_revision: u64,
+    #[serde(default)]
+    remove_workspace: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -171,6 +173,14 @@ async fn mutate_revision(
         Ok(service) => service,
         Err((code, detail)) => return failure(code, detail),
     };
+    let workspace_cwd = if matches!(mutation, Mutation::Delete) {
+        service
+            .get_conversation(conversation_id)
+            .ok()
+            .map(|record| record.workspace_cwd)
+    } else {
+        None
+    };
     let current_session_id = if matches!(mutation, Mutation::Delete) {
         match service
             .writer()
@@ -210,6 +220,17 @@ async fn mutate_revision(
                 .await
         }
     };
+    if matches!(mutation, Mutation::Delete) && request.remove_workspace && result.is_ok() {
+        if let Some(path) = workspace_cwd.filter(|path| !path.trim().is_empty()) {
+            if let Err(error) = std::fs::remove_dir_all(&path) {
+                log::warn!(
+                    "[conversation-delete] workspace removal failed conversation_id={} path={} error={error}",
+                    conversation_id,
+                    path
+                );
+            }
+        }
+    }
     respond(&state, conversation_id, current_session_id, result).await
 }
 
@@ -379,6 +400,8 @@ mod tests {
                     lifecycle_state: ConversationLifecycleState::Ready,
                     last_seq: 0,
                     created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
                 },
                 ConversationMutation::CreateConversation,
             )

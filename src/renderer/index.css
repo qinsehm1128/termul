@@ -83,8 +83,9 @@
     --surface-dark: 0 0% 11%; /* #1c1c1c */
     --surface-darker: 0 0% 7%;
 
-    /* Status bar (VS Code style) */
-    --status-bar: 217 91% 40%; /* #007acc */
+    /* Status bar — follows chrome surfaces, not a fixed accent stripe */
+    --status-bar: 0 0% 11%;
+    --status-bar-foreground: 0 0% 70%;
 
     /* Shimmer text (transitions.dev) — demo hex defaults */
     --shimmer-dur: 2000ms;

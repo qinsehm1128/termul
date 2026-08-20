@@ -100,6 +100,13 @@ export function createTauriConversationApi(): ConversationApi {
       withConversationId(conversationId, () =>
         invokeConversation('conversation_open', parseConversationOpenOutcome, { conversationId })
       ),
+    renameConversation: (conversationId, title) =>
+      withConversationId(conversationId, () =>
+        invokeConversation('conversation_rename', parseConversationRecordV2, {
+          conversationId,
+          title
+        })
+      ),
     resolveLegacyConversationId: (request: LegacyConversationKey) => {
       if (!request.value.trim()) {
         return Promise.resolve({

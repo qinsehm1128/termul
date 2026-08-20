@@ -2,8 +2,9 @@ import type { ConversationRecordV2 } from '@shared/types/conversation.types'
 import type { ConversationLifecycleOutcome } from '@shared/types/conversation-lifecycle.types'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { closeViewSpy, remapViewSpy, invokeSpy } = vi.hoisted(() => ({
+const { closeViewSpy, closeTerminalViewSpy, remapViewSpy, invokeSpy } = vi.hoisted(() => ({
   closeViewSpy: vi.fn(),
+  closeTerminalViewSpy: vi.fn(),
   remapViewSpy: vi.fn(),
   invokeSpy: vi.fn()
 }))
@@ -12,6 +13,7 @@ vi.mock('@/stores/workspace-store', () => ({
   useWorkspaceStore: {
     getState: () => ({
       closeChatView: closeViewSpy,
+      closeTerminalView: closeTerminalViewSpy,
       remapAgentChatSession: remapViewSpy,
       addAgentChatTab: vi.fn(),
       getActiveTab: vi.fn(() => undefined)
@@ -33,8 +35,10 @@ vi.mock('@/lib/tauri-runtime', () => ({ isTauriContext: () => true }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeSpy }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn() }))
 
+import { terminalApi } from '@/lib/terminal-api'
 import { useAcpStore } from './acp-store'
 import { useConversationStore } from './conversation-store'
+import { useTerminalStore } from './terminal-store'
 
 const conversationId = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
 
@@ -80,6 +84,12 @@ function updated(
 
 function seed(): void {
   useConversationStore.getState().reset()
+  useTerminalStore.setState({
+    terminals: [],
+    activeTerminalId: '',
+    ptyIdIndex: new Map(),
+    cleanupRecoveries: {}
+  })
   useConversationStore.getState().replaceSummaries([conversation])
   useAcpStore.setState({
     sessionIndex: [
@@ -301,5 +311,71 @@ describe('ACP Conversation lifecycle store', () => {
     expect(useAcpStore.getState().sessionIndex).toEqual([])
     expect(useAcpStore.getState().sessions['session-old']).toBeUndefined()
     expect(closeViewSpy).toHaveBeenCalledWith(conversationId)
+  })
+
+  it('terminates conversation-scoped terminals before the host delete route', async () => {
+    useTerminalStore.setState({
+      terminals: [
+        {
+          id: 'term-chat',
+          conversationId,
+          name: 'Chat shell',
+          projectId: '',
+          shell: 'bash',
+          cwd: '/visible/conversation',
+          output: [],
+          healthStatus: 'running',
+          viewState: 'visible',
+          isHidden: false,
+          ptyId: 'pty-live'
+        },
+        {
+          id: 'term-project',
+          name: 'Project shell',
+          projectId: 'project-1',
+          shell: 'bash',
+          cwd: '/visible/project',
+          output: [],
+          healthStatus: 'running',
+          viewState: 'visible',
+          isHidden: false,
+          ptyId: 'pty-other'
+        }
+      ],
+      activeTerminalId: 'term-chat',
+      ptyIdIndex: new Map([
+        ['pty-live', 'term-chat'],
+        ['pty-other', 'term-project']
+      ]),
+      cleanupRecoveries: {}
+    })
+    const terminateSpy = vi.spyOn(terminalApi, 'terminate').mockResolvedValue({
+      success: true
+    })
+    invokeSpy.mockResolvedValueOnce({
+      success: true,
+      data: {
+        status: 'updated',
+        action: 'deleteConversation',
+        conversationId,
+        previousRevision: 4,
+        revision: 5,
+        workspaceCwd: '/visible/conversation',
+        lifecycleState: 'deleted',
+        currentBinding: null
+      }
+    })
+
+    await useAcpStore.getState().deleteConversation(conversationId)
+
+    expect(terminateSpy).toHaveBeenCalledTimes(1)
+    expect(terminateSpy).toHaveBeenCalledWith('pty-live')
+    expect(closeTerminalViewSpy).toHaveBeenCalledWith('term-chat')
+    expect(useTerminalStore.getState().terminals.map((item) => item.id)).toEqual(['term-project'])
+    expect(invokeSpy).toHaveBeenCalledWith('conversation_delete', {
+      conversationId,
+      expectedRevision: 4
+    })
+    terminateSpy.mockRestore()
   })
 })

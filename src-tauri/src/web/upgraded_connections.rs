@@ -84,7 +84,9 @@ impl UpgradedConnectionRegistry {
     }
 
     pub fn revoke_generations(&self) -> u64 {
-        self.generation.fetch_add(1, Ordering::AcqRel).saturating_add(1)
+        self.generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1)
     }
 
     pub fn current_generation(&self) -> u64 {
@@ -119,7 +121,10 @@ impl UpgradedConnectionRegistry {
 
     pub fn cancel(&self, id: Uuid) -> bool {
         let mut inner = self.inner.lock();
-        let Some(connection) = inner.connections.iter().find(|connection| connection.id == id)
+        let Some(connection) = inner
+            .connections
+            .iter()
+            .find(|connection| connection.id == id)
         else {
             return false;
         };
@@ -153,7 +158,11 @@ impl UpgradedConnectionRegistry {
 
     pub fn complete(&self, id: Uuid, failed: bool) {
         let mut inner = self.inner.lock();
-        if let Some(connection) = inner.connections.iter().find(|connection| connection.id == id) {
+        if let Some(connection) = inner
+            .connections
+            .iter()
+            .find(|connection| connection.id == id)
+        {
             log::info!(
                 "[upgraded-connections] complete kind={:?} failed={} session_count={}",
                 connection.kind,

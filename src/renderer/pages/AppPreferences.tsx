@@ -45,6 +45,7 @@ import { isAurUpdateMode } from '@/lib/tauri-updater-api'
 import { cn } from '@/lib/utils'
 import {
   useAcpFirstPromptWarmup,
+  useAcpPreferLocalNpmInstall,
   useAcpSessionNewTimeout,
   useAcpSessionReopenTimeout,
   useAcpTurnIdleTimeout,
@@ -202,6 +203,12 @@ const APP_PREF_SEARCH_DEFS = [
   },
   {
     categoryId: 'ai-agents',
+    labelKey: 'aiAgents.preferLocalNpmInstall',
+    descriptionKey: 'aiAgents.preferLocalNpmInstallHint',
+    keywords: ['npx', 'npm', 'local install', 'codex', 'claude']
+  },
+  {
+    categoryId: 'ai-agents',
     labelKey: 'aiAgents.turnTimeout',
     descriptionKey: 'aiAgents.turnTimeoutHint',
     keywords: ['acp', 'timeout', 'turn', 'hard cap', 'unlimited', 'wedge']
@@ -318,6 +325,7 @@ export default function AppPreferences(): React.JSX.Element {
   const acpSessionNewTimeoutSecs = useAcpSessionNewTimeout()
   const acpSessionReopenTimeoutSecs = useAcpSessionReopenTimeout()
   const acpFirstPromptWarmupSecs = useAcpFirstPromptWarmup()
+  const acpPreferLocalNpmInstall = useAcpPreferLocalNpmInstall()
   const updateSetting = useUpdateAppSetting()
   const resetSettings = useResetAppSettings()
 
@@ -493,6 +501,15 @@ export default function AppPreferences(): React.JSX.Element {
       await acpApi.setSessionReopenTimeout(value)
     } catch (error) {
       console.error('Failed to apply ACP session reopen timeout:', error)
+    }
+  }
+
+  const handleAcpPreferLocalNpmInstallToggle = async (enabled: boolean) => {
+    await updateSetting('acpPreferLocalNpmInstall', enabled)
+    try {
+      await acpApi.setPreferLocalNpmInstall(enabled)
+    } catch (error) {
+      console.error('Failed to apply ACP local npm install preference:', error)
     }
   }
 
@@ -1041,6 +1058,42 @@ export default function AppPreferences(): React.JSX.Element {
               </div>
               <div className="w-2/3 space-y-4">
                 <AcpAgentsSettings />
+                <div>
+                  <label className="block text-sm font-medium text-secondary-foreground mb-2">
+                    {tSettings('aiAgents.preferLocalNpmInstall')}
+                  </label>
+                  <div className="flex items-center justify-between bg-secondary/30 border border-border rounded-md px-4 py-3">
+                    <div className="flex-1">
+                      <div className="text-sm text-foreground">
+                        {tSettings('aiAgents.preferLocalNpmInstall')}
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-0.5">
+                        {tSettings('aiAgents.preferLocalNpmInstallHint')}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={acpPreferLocalNpmInstall}
+                      aria-label={tSettings('aiAgents.preferLocalNpmInstall')}
+                      disabled={!isTauriContext()}
+                      onClick={() =>
+                        handleAcpPreferLocalNpmInstallToggle(!acpPreferLocalNpmInstall)
+                      }
+                      className={cn(
+                        'relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed',
+                        acpPreferLocalNpmInstall ? 'bg-primary' : 'bg-input'
+                      )}
+                    >
+                      <span
+                        className={cn(
+                          'inline-block h-4 w-4 transform rounded-full bg-white transition-transform',
+                          acpPreferLocalNpmInstall ? 'translate-x-6' : 'translate-x-1'
+                        )}
+                      />
+                    </button>
+                  </div>
+                </div>
                 <div>
                   <label className="block text-sm font-medium text-secondary-foreground mb-2">
                     {tSettings('aiAgents.turnTimeout')}

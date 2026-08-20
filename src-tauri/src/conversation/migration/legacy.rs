@@ -481,6 +481,8 @@ async fn stage_one(
         },
         last_seq: 0,
         created_by: ConversationCreator::Termul,
+        title: None,
+        title_source: None,
     };
     match writer
         .repository()

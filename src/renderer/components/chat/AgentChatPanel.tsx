@@ -23,6 +23,18 @@ import { buildTimeline, consolidateThoughtGroups } from './chat-timeline'
 import { PermissionDialog } from './PermissionDialog'
 import { PlanPanel } from './PlanPanel'
 
+function settingErrorMessage(
+  err: unknown,
+  fallback: string,
+  t: (key: 'lifecycle.errors.CONVERSATION_BINDING_NOT_FOUND') => string
+): string {
+  const text = err instanceof Error ? err.message : String(err)
+  if (text.includes('CONVERSATION_BINDING_NOT_FOUND')) {
+    return t('lifecycle.errors.CONVERSATION_BINDING_NOT_FOUND')
+  }
+  return fallback
+}
+
 /** Concatenate the text blocks of a message into a single string. */
 function messageText(blocks: ContentBlock[]): string {
   return blocks
@@ -60,6 +72,7 @@ function ChatRestorePreload(): React.JSX.Element {
 
 interface AgentChatPanelProps {
   sessionId: SessionId
+  paneId?: string
   /**
    * Whether this panel's tab is the pane's active tab. Gates the restored-tab
    * rehydrate so only visible chats trigger `openHistorySession` (a hidden
@@ -161,6 +174,7 @@ export function AgentChatPanel({
   // record is missing, and history exists for the id, reopen it from history
   // (deduped store-side against a concurrent sidebar open).
   const openHistorySession = useAcpStore((s) => s.openHistorySession)
+  const reconnectClosedSession = useAcpStore((s) => s.reconnectClosedSession)
   const openDiscoveredSession = useAcpStore((s) => s.openDiscoveredSession)
   const discoveredReopenContext = useAcpStore((s) => s.discoveredReopenContexts[sessionId] ?? null)
   const hasHistoryEntry = useAcpStore((s) => s.sessionIndex.some((e) => e.id === sessionId))
@@ -240,7 +254,7 @@ export function AgentChatPanel({
       try {
         await setConfigOption(sessionId, configId, valueId)
       } catch (err) {
-        toast.error(t('panel.settingFailed'))
+        toast.error(settingErrorMessage(err, t('panel.settingFailed'), t))
         throw err
       }
     },
@@ -252,7 +266,7 @@ export function AgentChatPanel({
       try {
         await setMode(sessionId, modeId)
       } catch (err) {
-        toast.error(t('panel.modeFailed'))
+        toast.error(settingErrorMessage(err, t('panel.modeFailed'), t))
         throw err
       }
     },
@@ -264,7 +278,7 @@ export function AgentChatPanel({
       try {
         await setModel(sessionId, modelId)
       } catch (err) {
-        toast.error(t('panel.modelFailed'))
+        toast.error(settingErrorMessage(err, t('panel.modelFailed'), t))
         throw err
       }
     },
@@ -468,7 +482,7 @@ export function AgentChatPanel({
             <button
               type="button"
               onClick={() => {
-                void openHistorySession(sessionId).catch(() => {
+                void reconnectClosedSession(sessionId).catch(() => {
                   toast.error(t('history.reconnectFailed'))
                 })
               }}

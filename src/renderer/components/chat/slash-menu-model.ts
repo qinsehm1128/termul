@@ -12,6 +12,7 @@ import type {
   SessionModeState
 } from '@/lib/acp-api'
 import type { AgentSkillSummary } from '@/lib/skills-api'
+import { MODEL_CATEGORY, normalizeSessionConfigOption } from './chat-input-bar-config'
 
 export interface SlashCommandItem {
   kind: 'command'
@@ -63,6 +64,8 @@ export interface SlashMenuInput {
   skills?: AgentSkillSummary[]
   /** The text after the leading `/`, used to filter. */
   filter: string
+  /** Resolved model picker option (config or synthesized from session.models). */
+  modelOption?: SessionConfigOption | null
 }
 
 function matches(filter: string, ...fields: (string | null | undefined)[]): boolean {
@@ -92,8 +95,22 @@ function headingForCategory(category: string | null | undefined, fallbackName: s
  * `modes` section is omitted entirely (precedence). When it is empty, a single
  * legacy Modes section is emitted if modes exist.
  */
+function configOptionsForSlash(input: SlashMenuInput): SessionConfigOption[] {
+  const options = input.configOptions.map(normalizeSessionConfigOption)
+  const modelOption = input.modelOption ? normalizeSessionConfigOption(input.modelOption) : null
+  if (
+    modelOption &&
+    modelOption.options.length > 0 &&
+    !options.some((option) => option.category === MODEL_CATEGORY || option.id === modelOption.id)
+  ) {
+    return [modelOption, ...options]
+  }
+  return options
+}
+
 export function buildSlashSections(input: SlashMenuInput): SlashSection[] {
-  const { commands, configOptions, modes, skills = [], filter } = input
+  const { commands, modes, skills = [], filter } = input
+  const configOptions = configOptionsForSlash(input)
   const sections: SlashSection[] = []
 
   // Dedup against the agent's ACP commands: when a skill shares a name with

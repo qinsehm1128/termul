@@ -97,6 +97,10 @@ export interface AppSettings {
    * Rust default (45s); 0 disables the warmup entirely. Set via App
    * Preferences; pushed to the Rust core. */
   acpFirstPromptWarmupSecs: number | null
+  /** When true (default), first `npx -y` agent launch installs the package
+   * into Termul's local prefix and later launches skip npx. When false,
+   * always run through npx. Pushed to the Rust core. */
+  acpPreferLocalNpmInstall: boolean
 }
 
 /** Whole-UI zoom bounds â€” match the native View menu semantics (0.5xâ€“3.0x, 10% steps). */
@@ -310,7 +314,8 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   acpTurnIdleTimeoutSecs: null,
   acpSessionNewTimeoutSecs: null,
   acpSessionReopenTimeoutSecs: null,
-  acpFirstPromptWarmupSecs: null
+  acpFirstPromptWarmupSecs: null,
+  acpPreferLocalNpmInstall: true
 }
 
 // Persistence key for app settings

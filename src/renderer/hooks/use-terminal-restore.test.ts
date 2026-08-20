@@ -87,11 +87,13 @@ const mockProjectState = {
   ]
 }
 
+const mockSessionWorkspaceState = {
+  activeConversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab' as string | null
+}
+
 vi.mock('../stores/session-workspace-sync-store', () => ({
   useSessionWorkspaceSyncStore: {
-    getState: () => ({
-      activeConversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
-    })
+    getState: () => mockSessionWorkspaceState
   }
 }))
 
@@ -175,6 +177,7 @@ beforeEach(() => {
     (projectId: string) => `corr-${projectId}`
   )
   mockProjectState.activeProjectId = ''
+  mockSessionWorkspaceState.activeConversationId = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
   mockTerminalStoreState.terminals = []
   mockTerminalStoreState.activeTerminalId = ''
   mockAcpState.sessions = {}
@@ -683,6 +686,40 @@ describe('useTerminalRestore', () => {
     // The key assertion: terminalApi.kill should NOT be called during project switch
     // (the old implementation would have called kill for project-a's terminals)
     expect(mockTerminalKill).not.toHaveBeenCalled()
+  })
+
+  it('restores persisted project terminals without an active Conversation', async () => {
+    mockSessionWorkspaceState.activeConversationId = null
+    mockTerminalStoreState.terminals = []
+    mockLoadPersistedTerminals.mockResolvedValue({
+      activeTerminalId: 'persisted-shell',
+      terminals: [
+        {
+          id: 'persisted-shell',
+          name: 'Terminal 1',
+          shell: 'bash',
+          cwd: '/projects/a',
+          scrollback: []
+        }
+      ],
+      updatedAt: '2026-03-09T00:00:00.000Z'
+    })
+
+    renderHook(() => {
+      mockProjectState.activeProjectId = 'project-a'
+      useTerminalRestore()
+    })
+
+    await waitFor(() => {
+      expect(mockTerminalSpawn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          projectId: 'project-a',
+          shell: 'bash',
+          cwd: '/projects/a'
+        })
+      )
+    })
+    expect(mockTerminalSpawn.mock.calls[0]?.[0]).not.toHaveProperty('conversationId')
   })
 
   it('passes projectId when restoring an agent terminal (agent branch)', async () => {

@@ -78,7 +78,10 @@ pub(crate) fn require_host_admission<T>() -> Result<(), IpcResult<T>> {
 
 macro_rules! validate_and_stringify {
     ($path:expr) => {{
-        if crate::host_admission::HostAdmission::global().check().is_err() {
+        if crate::host_admission::HostAdmission::global()
+            .check()
+            .is_err()
+        {
             return Ok(IpcResult::error(
                 "host is shutting down",
                 crate::host_admission::HOST_SHUTTING_DOWN,
@@ -867,7 +870,7 @@ pub(crate) async fn terminal_terminate_resource(
     pty_manager: &Arc<PtyManager>,
     workspace: &Arc<crate::conversation::SessionWorkspaceService>,
 ) -> IpcResult<()> {
-    let scope = pty_manager
+    let mut scope = pty_manager
         .get(terminal_id)
         .filter(|instance| instance.workspace_ref_tracked)
         .map(|instance| instance.conversation_id);
@@ -875,14 +878,25 @@ pub(crate) async fn terminal_terminate_resource(
         return IpcResult::success(());
     }
     if let Some(conversation_id) = scope {
-        if let Err(error) = workspace.ensure_terminal_ref_writable(conversation_id, false) {
-            log::warn!(
-                "[terminal-command] terminate admission rejected conversation_id={} terminal_id={} code={}",
-                conversation_id,
-                terminal_id,
-                error.code.as_str()
-            );
-            return IpcResult::error(error.detail, error.code.as_str());
+        match terminate_workspace_scope(workspace, conversation_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                log::info!(
+                    "[terminal-command] terminate skips missing workspace conversation_id={} terminal_id={}",
+                    conversation_id,
+                    terminal_id
+                );
+                scope = None;
+            }
+            Err(error) => {
+                log::warn!(
+                    "[terminal-command] terminate admission rejected conversation_id={} terminal_id={} code={}",
+                    conversation_id,
+                    terminal_id,
+                    error.code.as_str()
+                );
+                return IpcResult::error(error.detail, error.code.as_str());
+            }
         }
     }
 
@@ -911,17 +925,69 @@ pub(crate) async fn terminal_terminate_resource(
             .remove_terminal_ref_after_termination(conversation_id, terminal_id)
             .await
         {
-            log::warn!(
-                "[terminal-command] terminate ref cleanup failed conversation_id={} terminal_id={} code={}",
-                conversation_id,
-                terminal_id,
-                error.code.as_str()
-            );
-            return IpcResult::error(error.detail, error.code.as_str());
+            if is_missing_conversation_workspace_error(&error) {
+                log::info!(
+                    "[terminal-command] terminate ignores missing workspace after kill conversation_id={} terminal_id={}",
+                    conversation_id,
+                    terminal_id
+                );
+            } else {
+                log::warn!(
+                    "[terminal-command] terminate ref cleanup failed conversation_id={} terminal_id={} code={}",
+                    conversation_id,
+                    terminal_id,
+                    error.code.as_str()
+                );
+                return IpcResult::error(error.detail, error.code.as_str());
+            }
         }
     }
     log::info!("[terminal-command] terminated terminal_id={terminal_id}");
     IpcResult::success(())
+}
+
+fn is_missing_conversation_workspace_error(
+    error: &crate::conversation::SessionWorkspaceError,
+) -> bool {
+    use crate::conversation::SessionWorkspaceErrorCode;
+    if error.code == SessionWorkspaceErrorCode::ConversationNotFound {
+        return true;
+    }
+    if error.code != SessionWorkspaceErrorCode::SessionWorkspaceRecoveryRequired {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(&error.detail)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("primaryCode")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .is_some_and(|code| code == "CONVERSATION_NOT_FOUND")
+}
+
+/// Returns `Ok(true)` when the Conversation still owns a workspace ref,
+/// `Ok(false)` when it was never persisted (scope-less project terminals).
+async fn terminate_workspace_scope(
+    workspace: &Arc<crate::conversation::SessionWorkspaceService>,
+    conversation_id: crate::conversation::ConversationId,
+) -> Result<bool, crate::conversation::SessionWorkspaceError> {
+    match workspace.load(conversation_id).await {
+        Ok(crate::conversation::SessionWorkspaceLoadOutcome::Missing { .. }) => Ok(false),
+        Ok(_) => workspace
+            .ensure_terminal_ref_writable(conversation_id, false)
+            .map(|()| true)
+            .or_else(|error| {
+                if is_missing_conversation_workspace_error(&error) {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }),
+        Err(error) if is_missing_conversation_workspace_error(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// Deprecated compatibility alias; identical to `terminal_terminate`.
@@ -4182,6 +4248,11 @@ fn host_entry_to_desktop(
         discovered: entry.discovered,
         worktree_path: entry.worktree_path,
         worktree_branch: entry.worktree_branch,
+        conversation_id: crate::conversation::ConversationId::parse_path_component(
+            &entry.storage_key,
+        )
+        .ok()
+        .map(|id| id.to_string()),
     }
 }
 
@@ -4198,7 +4269,15 @@ pub async fn acp_history_list(
         persistence
             .list_sessions()
             .into_iter()
-            .map(host_entry_to_desktop)
+            .map(|entry| {
+                let mut desktop = host_entry_to_desktop(entry);
+                if desktop.conversation_id.is_none() {
+                    desktop.conversation_id = persistence
+                        .conversation_id_for_history_binding(&desktop.id)
+                        .map(|id| id.to_string());
+                }
+                desktop
+            })
             .collect()
     } else if let Some(persistence) = &host.legacy_read_only {
         persistence
@@ -4257,28 +4336,26 @@ fn materialize_acp_history_with_ceiling(
             crate::conversation::MIN_CONVERSATION_HISTORY_PAGE_LIMIT,
             crate::conversation::MAX_CONVERSATION_HISTORY_PAGE_LIMIT,
         );
-        let page = persistence.history_page_at(
-            session_id,
-            cursor,
-            limit,
-            Some(target_last_seq),
-        )?;
+        let page = persistence.history_page_at(session_id, cursor, limit, Some(target_last_seq))?;
         if page.records.len() > remaining {
             return Err(crate::conversation::ConversationPersistenceError {
                 code: crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED,
                 operation: "acp_history_get",
-                detail: "history exceeds the compatibility materialization limit; use bounded pages"
-                    .to_string(),
+                detail:
+                    "history exceeds the compatibility materialization limit; use bounded pages"
+                        .to_string(),
             });
         }
         for record in &page.records {
-            encoded_bytes = charge_acp_history_encoded_bytes(encoded_bytes, record).map_err(
-                |code| crate::conversation::ConversationPersistenceError {
-                    code,
-                    operation: "acp_history_get",
-                    detail: "history exceeds the 4194304-byte compatibility ceiling".to_string(),
-                },
-            )?;
+            encoded_bytes =
+                charge_acp_history_encoded_bytes(encoded_bytes, record).map_err(|code| {
+                    crate::conversation::ConversationPersistenceError {
+                        code,
+                        operation: "acp_history_get",
+                        detail: "history exceeds the 4194304-byte compatibility ceiling"
+                            .to_string(),
+                    }
+                })?;
         }
         records.extend(page.records.into_iter().map(|record| {
             crate::acp::session_persistence::PersistedEventRecord {
@@ -4417,14 +4494,8 @@ pub async fn acp_history_get_page(
     host: State<'_, HostHistoryStore>,
 ) -> Result<IpcResult<crate::conversation::ConversationHistoryPageV1>, String> {
     Ok(
-        acp_history_get_page_inner(
-            &session_id,
-            after_seq,
-            limit,
-            target_last_seq,
-            host.inner(),
-        )
-        .await,
+        acp_history_get_page_inner(&session_id, after_seq, limit, target_last_seq, host.inner())
+            .await,
     )
 }
 
@@ -5050,6 +5121,24 @@ pub fn conversation_get(
     Ok(conversation_get_inner(service.inner(), &conversation_id))
 }
 
+#[tauri::command]
+pub async fn conversation_rename(
+    conversation_id: String,
+    title: String,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::ConversationRecordV2>, String> {
+    let conversation_id = match parse_conversation_id(&conversation_id) {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    Ok(
+        match service.rename_conversation(conversation_id, title).await {
+            Ok(record) => IpcResult::success(record),
+            Err(error) => IpcResult::error(error.detail, error.code),
+        },
+    )
+}
+
 pub(crate) async fn conversation_open_inner(
     service: &crate::conversation::ConversationApplicationService,
     conversation_id: &str,
@@ -5483,12 +5572,9 @@ async fn conversation_delete_with_retirement(
         .await
     {
         Ok(outcome) => {
-            if let Err(code) = retire_deleted_binding_if_updated(
-                relay,
-                current_session_id.as_deref(),
-                &outcome,
-            )
-            .await
+            if let Err(code) =
+                retire_deleted_binding_if_updated(relay, current_session_id.as_deref(), &outcome)
+                    .await
             {
                 log::error!(
                     "[conversation-retirement] operation=tauri_delete code={} conversation_id={}",
@@ -5511,6 +5597,7 @@ pub async fn conversation_delete(
     app: AppHandle,
     conversation_id: String,
     expected_revision: u64,
+    remove_workspace: Option<bool>,
     service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
     relay: State<'_, Arc<crate::web::WsRelaySink>>,
 ) -> Result<IpcResult<crate::conversation::ConversationLifecycleOutcome>, String> {
@@ -5518,14 +5605,33 @@ pub async fn conversation_delete(
         Ok(value) => value,
         Err(error) => return Ok(error),
     };
-    let outcome = conversation_delete_with_retirement(
-        service.inner(),
-        relay.inner(),
-        id,
-        expected_revision,
-    )
-    .await;
+    let workspace_cwd = service
+        .get_conversation(id)
+        .ok()
+        .map(|record| record.workspace_cwd);
+    let outcome =
+        conversation_delete_with_retirement(service.inner(), relay.inner(), id, expected_revision)
+            .await;
     if outcome.success {
+        if remove_workspace == Some(true) {
+            if let Some(path) = workspace_cwd.filter(|path| !path.trim().is_empty()) {
+                // User-confirmed recursive removal of the Conversation workspace
+                // directory; best-effort so a locked file cannot veto the delete.
+                if let Err(error) = std::fs::remove_dir_all(&path) {
+                    log::warn!(
+                        "[conversation-delete] workspace removal failed conversation_id={} path={} error={error}",
+                        conversation_id,
+                        path
+                    );
+                } else {
+                    log::info!(
+                        "[conversation-delete] workspace removed conversation_id={} path={}",
+                        conversation_id,
+                        path
+                    );
+                }
+            }
+        }
         let _ = app.emit("conversation:lifecycle", outcome.data.as_ref());
     }
     Ok(outcome)
@@ -5842,6 +5948,8 @@ mod tests {
                     lifecycle_state: ConversationLifecycleState::Ready,
                     last_seq: 0,
                     created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
                 },
                 ConversationMutation::CreateConversation,
             )
@@ -5957,6 +6065,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_terminate_succeeds_for_scope_less_project_terminal() {
+        use crate::conversation::{
+            ConversationRepository, ConversationWriter, SessionWorkspaceService,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let (repository, _) = ConversationRepository::open(base.join("private")).unwrap();
+        let workspace = Arc::new(SessionWorkspaceService::new(ConversationWriter::for_test(
+            repository,
+        )));
+        let pty = crate::web::test_pty_manager();
+        let spawned = pty
+            .spawn(
+                SpawnOptions {
+                    cwd: Some(base.to_string_lossy().into_owned()),
+                    project_id: Some("project-1".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !pty.get(&spawned.info.id)
+                .expect("spawned project terminal")
+                .workspace_ref_tracked
+        );
+
+        let result = terminal_terminate_resource(&spawned.info.id, &pty, &workspace).await;
+        assert!(result.success, "terminate failed: {:?}", result.error);
+        assert!(pty.get(&spawned.info.id).is_none());
+        assert_eq!(pty.active_terminal_slot_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_terminate_succeeds_when_tracked_conversation_is_missing() {
+        use crate::conversation::{
+            ConversationId, ConversationRepository, ConversationWriter, SessionWorkspaceService,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let (repository, _) = ConversationRepository::open(base.join("private")).unwrap();
+        let workspace = Arc::new(SessionWorkspaceService::new(ConversationWriter::for_test(
+            repository,
+        )));
+        let pty = crate::web::test_pty_manager();
+        let orphan_conversation = ConversationId::new_v4();
+        let spawned = pty
+            .spawn(
+                SpawnOptions {
+                    conversation_id: Some(orphan_conversation),
+                    cwd: Some(base.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            pty.get(&spawned.info.id)
+                .expect("spawned orphan-scoped terminal")
+                .workspace_ref_tracked
+        );
+
+        let result = terminal_terminate_resource(&spawned.info.id, &pty, &workspace).await;
+        assert!(
+            result.success,
+            "terminate should kill PTY when conversation is missing: {:?}",
+            result.error
+        );
+        assert!(pty.get(&spawned.info.id).is_none());
+        assert_eq!(pty.active_terminal_slot_count(), 0);
+    }
+
+    #[tokio::test]
     async fn terminal_resume_requires_passive_ref_and_returns_grant() {
         use crate::conversation::{
             parse_created_at_utc, ConversationCreator, ConversationLifecycleState,
@@ -5987,6 +6172,8 @@ mod tests {
                     lifecycle_state: ConversationLifecycleState::Ready,
                     last_seq: 0,
                     created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
                 },
                 ConversationMutation::CreateConversation,
             )
@@ -6106,6 +6293,34 @@ mod tests {
         assert_eq!(desktop.created_at, 10);
         assert_eq!(desktop.last_activity_at, 20);
         assert_eq!(desktop.message_count, 3);
+        assert!(desktop.conversation_id.is_none());
+
+        let bound = crate::acp::SessionIndexEntry {
+            storage_key: "018f7a1c-1b4d-7c8a-9f01-0123456789ab".to_string(),
+            session_id: "opaque/session".to_string(),
+            stable_agent_namespace: Some("config:claude".to_string()),
+            runtime_agent_id: Some("runtime-1".to_string()),
+            project_id: None,
+            cwd: "/work".to_string(),
+            title: Some("Bound".to_string()),
+            title_source: None,
+            created_at: 10,
+            last_activity_at: 20,
+            status: crate::acp::PersistedSessionStatus::Closed,
+            message_count: 2,
+            tool_count: 0,
+            last_seq: 2,
+            discovered: false,
+            resume_eligible: true,
+            worktree_path: None,
+            worktree_branch: None,
+        };
+        let bound_desktop = host_entry_to_desktop(bound);
+        assert_eq!(
+            bound_desktop.conversation_id.as_deref(),
+            Some("018f7a1c-1b4d-7c8a-9f01-0123456789ab")
+        );
+        assert_eq!(bound_desktop.id, "opaque/session");
         assert!(matches!(
             desktop.status,
             crate::acp::ChatHistoryStatus::Active
@@ -6182,6 +6397,8 @@ mod tests {
             lifecycle_state: ConversationLifecycleState::Ready,
             last_seq: 0,
             created_by: ConversationCreator::Termul,
+            title: None,
+            title_source: None,
         };
         writer
             .create_conversation(record.clone(), ConversationMutation::CreateConversation)
@@ -6262,7 +6479,8 @@ mod tests {
 
         for invalid_limit in [0, 1_001] {
             let invalid =
-                acp_history_get_page_inner("opaque/desktop-page", 0, invalid_limit, None, &host).await;
+                acp_history_get_page_inner("opaque/desktop-page", 0, invalid_limit, None, &host)
+                    .await;
             assert!(!invalid.success);
             assert_eq!(invalid.code.as_deref(), Some("VALIDATION_ERROR"));
         }
@@ -6315,6 +6533,8 @@ mod tests {
                     lifecycle_state: ConversationLifecycleState::InitializingAgent,
                     last_seq: 0,
                     created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
                 },
                 ConversationMutation::CreateConversation,
             )
@@ -6719,7 +6939,10 @@ mod tests {
     fn late_tauri_mutator_returns_host_shutting_down() {
         crate::host_admission::HostAdmission::global().close();
         let err = require_host_admission::<()>().expect_err("closed admission rejects mutators");
-        assert_eq!(err.code.as_deref(), Some(crate::host_admission::HOST_SHUTTING_DOWN));
+        assert_eq!(
+            err.code.as_deref(),
+            Some(crate::host_admission::HOST_SHUTTING_DOWN)
+        );
         crate::host_admission::HostAdmission::global().reopen_for_tests();
         assert!(require_host_admission::<()>().is_ok());
     }

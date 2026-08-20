@@ -77,3 +77,5 @@ export const useAcpSessionReopenTimeout = () =>
   useAppSettingsStore((state) => state.settings.acpSessionReopenTimeoutSecs)
 export const useAcpFirstPromptWarmup = () =>
   useAppSettingsStore((state) => state.settings.acpFirstPromptWarmupSecs)
+export const useAcpPreferLocalNpmInstall = () =>
+  useAppSettingsStore((state) => state.settings.acpPreferLocalNpmInstall)

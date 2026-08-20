@@ -238,6 +238,13 @@ vi.mock('@/components/workspace/PaneRenderer', () => ({
 
 // P17: shared canonical mock shape for the Story 6 sync hook + banner —
 // identical inline factories across the three WorkspaceLayout suites.
+vi.mock('@/hooks/use-editor-persistence', () => ({
+  useEditorPersistence: vi.fn(),
+  persistState: vi.fn(),
+  restoreProjectWorkspace: vi.fn().mockResolvedValue(false),
+  subscribeProjectWorkspaceRestored: vi.fn(() => () => {})
+}))
+
 vi.mock('@/hooks/use-workspace-manifest-sync', () => ({
   useWorkspaceManifestSync: vi.fn(),
   loadWorkspaceManifest: vi.fn().mockResolvedValue(false),

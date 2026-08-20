@@ -118,6 +118,7 @@
     "terminateFailed": "Failed to terminate terminal process.",
     "restartFailed": "Failed to restart terminal process.",
     "reopen": "Reopen",
+    "stopHidden": "Stop",
     "reconnect": "Reconnect",
     "hiddenRunning": "Hidden running terminals",
     "conversationScopeRequired": "Open a Conversation before creating a durable terminal",

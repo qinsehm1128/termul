@@ -72,6 +72,16 @@ impl DeliveryError {
     pub const fn is_durable_rejection(&self) -> bool {
         self.source_code.is_some()
     }
+
+    #[must_use]
+    pub fn is_unbound_session(&self) -> bool {
+        self.source_code == Some(crate::web::sink::CONVERSATION_BINDING_NOT_FOUND)
+    }
+
+    #[must_use]
+    pub fn should_open_session_circuit(&self) -> bool {
+        self.is_durable_rejection() && !self.is_retryable() && !self.is_unbound_session()
+    }
 }
 
 impl std::fmt::Display for DeliveryError {
@@ -647,6 +657,18 @@ pub struct UsageUpdateEvent {
 mod tests {
     use super::*;
     use agent_client_protocol::schema::v1::SessionConfigSelectOption;
+
+    #[test]
+    fn unbound_session_delivery_does_not_open_circuit() {
+        let unbound = DeliveryError {
+            code: crate::web::sink::CONVERSATION_PERSISTENCE_REJECTED,
+            source_code: Some(crate::web::sink::CONVERSATION_BINDING_NOT_FOUND),
+            class: DeliveryFailureClass::Fatal,
+            delivered_count: 0,
+        };
+        assert!(unbound.is_unbound_session());
+        assert!(!unbound.should_open_session_circuit());
+    }
 
     #[test]
     fn agent_spawned_serializes_camel_case() {

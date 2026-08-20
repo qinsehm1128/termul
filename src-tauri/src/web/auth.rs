@@ -1061,9 +1061,8 @@ mod windows_token_file {
     use windows_sys::Win32::Security::{
         AclSizeInformation, CreateWellKnownSid, EqualSid, GetAce, GetAclInformation,
         GetTokenInformation, IsValidSid, TokenUser, WinLocalSystemSid, ACCESS_ALLOWED_ACE,
-        ACE_HEADER, ACL_SIZE_INFORMATION,
-        DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE, OWNER_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
+        ACE_HEADER, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, INHERIT_ONLY_ACE,
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FileAttributeTagInfo, GetFileInformationByHandleEx, GetFileSizeEx,
@@ -1633,7 +1632,11 @@ pub mod test_tracing {
     impl Drop for Guard {
         fn drop(&mut self) {
             LOGGER.active_id.store(0, Ordering::Release);
-            LOGGER.records.lock().unwrap().retain(|record| record.scope_id != self.id);
+            LOGGER
+                .records
+                .lock()
+                .unwrap()
+                .retain(|record| record.scope_id != self.id);
         }
     }
 
@@ -1658,7 +1661,11 @@ pub mod test_tracing {
             "shared test logger must install before boundary capture"
         );
         let id = LOGGER.next_id.fetch_add(1, Ordering::AcqRel);
-        LOGGER.records.lock().unwrap().retain(|record| record.scope_id == id);
+        LOGGER
+            .records
+            .lock()
+            .unwrap()
+            .retain(|record| record.scope_id == id);
         LOGGER.active_id.store(id, Ordering::Release);
         Guard { id, _guard: guard }
     }
@@ -1881,8 +1888,8 @@ mod tests {
         use std::ptr::null_mut;
         use windows_sys::Win32::Foundation::GENERIC_READ;
         use windows_sys::Win32::Security::{
-            AddAccessAllowedAce, CreateWellKnownSid, InitializeAcl, ACL, ACL_REVISION,
-            WinAuthenticatedUserSid, WinBuiltinAdministratorsSid, WinWorldSid,
+            AddAccessAllowedAce, CreateWellKnownSid, InitializeAcl, WinAuthenticatedUserSid,
+            WinBuiltinAdministratorsSid, WinWorldSid, ACL, ACL_REVISION,
         };
 
         fn sid(kind: i32) -> Vec<usize> {
@@ -1907,11 +1914,7 @@ mod tests {
         let owner_ptr = owner.as_ptr().cast_mut().cast();
         let foreign_ptr = foreign.as_ptr().cast_mut().cast();
         assert_eq!(
-            windows_token_file::validate_descriptor_for_tests(
-                foreign_ptr,
-                null_mut(),
-                owner_ptr,
-            ),
+            windows_token_file::validate_descriptor_for_tests(foreign_ptr, null_mut(), owner_ptr,),
             Err(RemoteAuthError::Provisioning)
         );
         assert_eq!(
@@ -2288,8 +2291,7 @@ mod tests {
         assert_eq!(test_tracing::WIN_LOCAL_SYSTEM_SID, "S-1-5-18");
         assert_eq!(test_tracing::WIN_NETWORK_SERVICE_SID, "S-1-5-20");
         assert!(
-            source.contains("allowed.Mask == 0")
-                || source.contains("allowed.Mask != 0"),
+            source.contains("allowed.Mask == 0") || source.contains("allowed.Mask != 0"),
             "zero-mask ACEs stay ignored; nonzero foreign allow ACEs fail closed"
         );
 
@@ -2300,8 +2302,8 @@ mod tests {
             use std::ptr::null_mut;
             use windows_sys::Win32::Foundation::GENERIC_READ;
             use windows_sys::Win32::Security::{
-                AddAccessAllowedAce, CreateWellKnownSid, InitializeAcl, ACL, ACL_REVISION,
-                WinBuiltinAdministratorsSid, WinNetworkServiceSid,
+                AddAccessAllowedAce, CreateWellKnownSid, InitializeAcl,
+                WinBuiltinAdministratorsSid, WinNetworkServiceSid, ACL, ACL_REVISION,
             };
 
             fn sid(kind: i32) -> Vec<usize> {
@@ -2362,7 +2364,9 @@ mod tests {
         test_tracing::emit_unscoped_for_tests("termul::web::auth", "unrelated-concurrent-record");
         let scoped_messages = test_tracing::messages_for(scoped_id, "termul::web::auth");
         assert!(
-            scoped_messages.iter().any(|message| message.contains("scoped-capture-record")),
+            scoped_messages
+                .iter()
+                .any(|message| message.contains("scoped-capture-record")),
             "scoped capture must observe its own records: {scoped_messages:?}"
         );
         assert!(

@@ -1,5 +1,14 @@
 import type { ConversationLifecycleOutcome } from '@shared/types/conversation-lifecycle.types'
-import { Link2, MoreHorizontal, PauseCircle, RefreshCw, Trash2, Unlink, X } from 'lucide-react'
+import {
+  Link2,
+  MoreHorizontal,
+  PauseCircle,
+  Pencil,
+  RefreshCw,
+  Trash2,
+  Unlink,
+  X
+} from 'lucide-react'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -13,6 +22,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { cn } from '@/lib/utils'
 import { useAcpStore, useAgentTemplateId } from '@/stores/acp-store'
+import { useConversationStore } from '@/stores/conversation-store'
 import { AgentGlyph } from './AgentGlyph'
 
 export interface ChatHistorySidebarEntry {
@@ -84,7 +94,10 @@ export function ConversationLifecycleActions({
   const suspendAgentBinding = useAcpStore((state) => state.suspendAgentBinding)
   const replaceAgentBinding = useAcpStore((state) => state.replaceAgentBinding)
   const deleteConversation = useAcpStore((state) => state.deleteConversation)
+  const renameConversation = useConversationStore((state) => state.renameConversation)
   const [pendingAction, setPendingAction] = useState<ConfirmedLifecycleAction | null>(null)
+  const [renameOpen, setRenameOpen] = useState(false)
+  const [renameValue, setRenameValue] = useState('')
   const [running, setRunning] = useState(false)
 
   const closeView = (): void => {
@@ -108,7 +121,7 @@ export function ConversationLifecycleActions({
               ? await suspendAgentBinding(conversationId)
               : action === 'replace'
                 ? await replaceAgentBinding(conversationId)
-                : await deleteConversation(conversationId)
+                : await deleteConversation(conversationId, true)
       if (outcome.status === 'blocked') {
         toast.error(t('lifecycle.blocked.title'), {
           description: t('lifecycle.blocked.description', {
@@ -169,6 +182,15 @@ export function ConversationLifecycleActions({
             <RefreshCw className="mr-2 size-4" aria-hidden="true" />
             {t('lifecycle.replace')}
           </DropdownMenuItem>
+          <DropdownMenuItem
+            onSelect={() => {
+              setRenameValue(title)
+              setRenameOpen(true)
+            }}
+          >
+            <Pencil className="mr-2 size-4" aria-hidden="true" />
+            {t('lifecycle.rename')}
+          </DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuItem
             className="text-destructive focus:text-destructive"
@@ -196,6 +218,62 @@ export function ConversationLifecycleActions({
         onConfirm={() => void runConfirmedAction()}
         onCancel={() => setPendingAction(null)}
       />
+
+      {renameOpen && conversationId ? (
+        <div
+          className="fixed inset-0 z-[80] flex items-center justify-center bg-black/50"
+          role="dialog"
+          aria-modal="true"
+          aria-label={t('lifecycle.renameTitle')}
+        >
+          <div className="w-80 rounded-lg border border-border bg-background p-4 shadow-lg">
+            <h3 className="mb-2 text-sm font-semibold text-foreground">
+              {t('lifecycle.renameTitle')}
+            </h3>
+            <input
+              autoFocus
+              value={renameValue}
+              maxLength={120}
+              placeholder={t('lifecycle.renamePlaceholder')}
+              aria-label={t('lifecycle.renamePlaceholder')}
+              onChange={(event) => setRenameValue(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape') setRenameOpen(false)
+              }}
+              className="mb-3 h-9 w-full rounded-md border border-border bg-secondary/50 px-3 text-sm text-foreground outline-none focus:ring-2 focus:ring-primary"
+            />
+            <div className="flex justify-end gap-2">
+              <button
+                type="button"
+                className="h-8 rounded-md px-3 text-xs text-muted-foreground hover:bg-muted"
+                onClick={() => setRenameOpen(false)}
+              >
+                {t('lifecycle.renameCancel')}
+              </button>
+              <button
+                type="button"
+                disabled={!renameValue.trim() || running}
+                className="h-8 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+                onClick={() => {
+                  if (!conversationId) return
+                  setRunning(true)
+                  renameConversation(conversationId, renameValue)
+                    .then(() => toast.success(t('lifecycle.renameSuccess')))
+                    .catch((error) => {
+                      toast.error(error instanceof Error ? error.message : String(error))
+                    })
+                    .finally(() => {
+                      setRunning(false)
+                      setRenameOpen(false)
+                    })
+                }}
+              >
+                {t('lifecycle.renameConfirm')}
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </>
   )
 }

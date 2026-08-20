@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react'
 import { persistenceApi } from '@/lib/api'
 import { randomUUID } from '@/lib/uuid'
 import { useBrowserSessionStore } from '@/stores/browser-session-store'
+import { useConversationStore } from '@/stores/conversation-store'
 import type { EditorFileState } from '@/stores/editor-store'
 import { useEditorStore } from '@/stores/editor-store'
 import { useFileExplorerStore } from '@/stores/file-explorer-store'
@@ -13,6 +14,7 @@ import {
   browserTabId,
   editorTabId,
   findPaneById,
+  getAllLeafPanes,
   terminalTabId,
   useWorkspaceStore
 } from '@/stores/workspace-store'
@@ -116,6 +118,22 @@ function editorStateKey(projectId: string): string {
   return `editor-state/${projectId}`
 }
 
+const projectWorkspaceRestoredListeners = new Set<(projectId: string) => void>()
+
+/** Fires after a project pane restore finishes so the workspace can spawn a terminal. */
+export function subscribeProjectWorkspaceRestored(
+  listener: (projectId: string) => void
+): () => void {
+  projectWorkspaceRestoredListeners.add(listener)
+  return () => {
+    projectWorkspaceRestoredListeners.delete(listener)
+  }
+}
+
+function notifyProjectWorkspaceRestored(projectId: string): void {
+  for (const listener of projectWorkspaceRestoredListeners) listener(projectId)
+}
+
 function normalizePath(path: string): string {
   return path.replace(/\\/g, '/')
 }
@@ -183,6 +201,17 @@ function serializePaneTree(node: PaneNode): PersistedPaneNode {
     children: node.children.map(serializePaneTree),
     sizes: node.sizes
   }
+}
+
+function stripAgentChatTabs(node: PaneNode): PaneNode {
+  if (node.type === 'leaf') {
+    const tabs = node.tabs.filter((tab) => tab.type !== 'agent-chat')
+    const activeTabId = tabs.some((tab) => tab.id === node.activeTabId)
+      ? node.activeTabId
+      : (tabs[0]?.id ?? null)
+    return { ...node, tabs, activeTabId }
+  }
+  return { ...node, children: node.children.map(stripAgentChatTabs) }
 }
 
 function sanitizePaneNode(node: PaneNode): PaneNode | null {
@@ -629,7 +658,7 @@ export function useEditorPersistence(projectId: string): void {
           // No manifest (or load failed — logged + degraded gracefully).
           // Fall back to the existing renderer-local paneLayout path.
           if (persisted.paneLayout) {
-            const restoredTree = deserializePaneTree(persisted.paneLayout)
+            const restoredTree = stripAgentChatTabs(deserializePaneTree(persisted.paneLayout))
             const openFilePaths = new Set(useEditorStore.getState().openFiles.keys())
             const liveProjectTerminals = useTerminalStore
               .getState()
@@ -663,6 +692,9 @@ export function useEditorPersistence(projectId: string): void {
         if (restoreRunIdRef.current === restoreRunId) {
           isRestoringRef.current = false
           setManifestRestoreInProgress(projectId, false)
+          if (!cancelled && prevProjectIdRef.current === projectId) {
+            notifyProjectWorkspaceRestored(projectId)
+          }
         } else if (prevProjectIdRef.current !== projectId) {
           // Superseded by a run for a DIFFERENT project: that run owns its own
           // guard key, so this project's key would otherwise stay `true`
@@ -689,6 +721,7 @@ export function useEditorPersistence(projectId: string): void {
 
     const schedulePersist = (): void => {
       if (isRestoringRef.current) return
+      if (useConversationStore.getState().activeConversationId) return
       if (persistTimeoutId) clearTimeout(persistTimeoutId)
       persistTimeoutId = setTimeout(() => {
         persistState(projectId)
@@ -718,7 +751,32 @@ export function useEditorPersistence(projectId: string): void {
   }, [projectId])
 }
 
+/** Reload the project pane tree after leaving a Conversation workspace. */
+export async function restoreProjectWorkspace(projectId: string): Promise<boolean> {
+  if (!projectId) return false
+  const result = await persistenceApi.read<PersistedEditorState>(editorStateKey(projectId))
+  if (result.success && result.data?.paneLayout) {
+    const restoredTree = stripAgentChatTabs(deserializePaneTree(result.data.paneLayout))
+    const openFilePaths = new Set(useEditorStore.getState().openFiles.keys())
+    const liveProjectTerminals = useTerminalStore
+      .getState()
+      .terminals.filter((terminal) => terminal.projectId === projectId && !!terminal.ptyId)
+    const persistedTerminalLayout = await loadPersistedTerminals(projectId)
+    const cleanTree = reconcileTerminalTabs(
+      restoredTree,
+      openFilePaths,
+      liveProjectTerminals,
+      persistedTerminalLayout
+    )
+    useWorkspaceStore.getState().loadProjectWorkspace(cleanTree, result.data.activePaneId)
+    return getAllLeafPanes(cleanTree).some((leaf) => leaf.tabs.length > 0)
+  }
+  const manifestRestored = await loadWorkspaceManifest(projectId)
+  return manifestRestored
+}
+
 export function persistState(projectId: string): void {
+  if (useConversationStore.getState().activeConversationId) return
   const editorState = useEditorStore.getState()
   const explorerState = useFileExplorerStore.getState()
   const workspaceState = useWorkspaceStore.getState()

@@ -29,8 +29,8 @@ pub mod git_api;
 pub mod install_api;
 pub mod log_api;
 pub mod mcp_probe_api;
-pub mod operation_policy;
 pub mod mcp_servers_api;
+pub mod operation_policy;
 pub mod permissions;
 pub mod project_registry;
 pub mod projects_api;
@@ -562,6 +562,8 @@ mod tests {
                     lifecycle_state: ConversationLifecycleState::InitializingAgent,
                     last_seq: 0,
                     created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
                 },
                 ConversationMutation::CreateConversation,
             )

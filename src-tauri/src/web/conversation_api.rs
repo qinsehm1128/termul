@@ -96,6 +96,34 @@ pub async fn open(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct RenameRequest {
+    title: String,
+}
+
+pub async fn rename(
+    State(state): State<AppState>,
+    Path(conversation_id): Path<String>,
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    Extension(principal): Extension<RemotePrincipal>,
+    Json(request): Json<RenameRequest>,
+) -> impl IntoResponse {
+    let result = match require(&authority, &principal, RemoteCapability::Mutate)
+        .and_then(|()| parse_id(&conversation_id))
+    {
+        Ok(conversation_id) => match service(&state) {
+            Ok(service) => service
+                .rename_conversation(conversation_id, request.title)
+                .await
+                .map_err(|error| (error.code, error.detail)),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    };
+    respond(result)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct AttachProjectRequest {
     expected_revision: u64,
     attachment: ProjectAttachment,
@@ -365,6 +393,8 @@ mod tests {
                     lifecycle_state: ConversationLifecycleState::Ready,
                     last_seq: 0,
                     created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
                 },
                 ConversationMutation::CreateConversation,
             )

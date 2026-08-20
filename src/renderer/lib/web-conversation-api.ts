@@ -111,6 +111,14 @@ export function createWebConversationApi(): ConversationApi {
           parseConversationOpenOutcome
         )
       ),
+    renameConversation: (conversationId, title) =>
+      withConversationId(conversationId, () =>
+        postJson<ConversationRecordV2>(
+          `/conversations/${encodeURIComponent(conversationId)}/rename`,
+          { title },
+          parseConversationRecordV2
+        )
+      ),
     resolveLegacyConversationId: (request: LegacyConversationKey) => {
       if (
         !request ||

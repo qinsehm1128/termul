@@ -638,6 +638,7 @@ describe('WsAcpTransport', () => {
     await transport.setSessionNewTimeout(120)
     await transport.setSessionReopenTimeout(300)
     await transport.setFirstPromptWarmupTimeout(0)
+    await transport.setPreferLocalNpmInstall(false)
 
     expect(sock.sent.length).toBe(sentBefore)
     transport.dispose()

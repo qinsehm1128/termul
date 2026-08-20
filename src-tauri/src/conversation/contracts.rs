@@ -569,6 +569,8 @@ pub struct ConversationRecordV2 {
     pub lifecycle_state: ConversationLifecycleState,
     pub last_seq: u64,
     pub created_by: ConversationCreator,
+    pub title: Option<String>,
+    pub title_source: Option<ConversationTitleSource>,
 }
 
 #[cfg(test)]
@@ -631,6 +633,8 @@ mod tests {
             lifecycle_state: ConversationLifecycleState::AllocatingWorkspace,
             last_seq: 0,
             created_by: ConversationCreator::Termul,
+            title: None,
+            title_source: None,
         };
         assert_eq!(
             serde_json::to_value(&record).unwrap(),

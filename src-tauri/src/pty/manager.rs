@@ -691,6 +691,13 @@ impl Default for SpawnOptions {
     }
 }
 
+/// SessionWorkspace refs exist only for conversation-scoped local terminals.
+/// Scope-less project terminals and ephemeral SSH keep a process-local
+/// ConversationId for claims, but they never enter workspace admission.
+pub(crate) fn tracks_session_workspace_ref(options: &SpawnOptions) -> bool {
+    options.kind.as_deref() != Some("ssh") && options.conversation_id.is_some()
+}
+
 /// Observable cleanup phase. These are the only phase names allowed onto the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1642,7 +1649,10 @@ impl PtyManager {
         options: SpawnOptions,
         on_data: Option<Channel<Response>>,
     ) -> Result<SpawnedTerminal, String> {
-        if crate::host_admission::HostAdmission::global().check().is_err() {
+        if crate::host_admission::HostAdmission::global()
+            .check()
+            .is_err()
+        {
             return Err(crate::host_admission::HOST_SHUTTING_DOWN.to_string());
         }
         // Start orphan detection on first spawn (lazy initialization)
@@ -1653,10 +1663,11 @@ impl PtyManager {
             .ok_or_else(|| "Global terminal limit reached".to_string())?;
 
         let id = self.generate_id();
-        // Durable callers are validated at their transport boundary. The only
-        // scope-less compatibility caller is the explicitly ephemeral SSH
-        // terminal; give it a process-local ConversationId so claims still have
-        // one typed primary scope and never fall back to ProjectId ownership.
+        // SessionWorkspace refs exist only when the caller supplied a real
+        // Conversation id. Scope-less project terminals and ephemeral SSH still
+        // get a process-local ConversationId so claims have one typed primary
+        // scope, but they must not take the workspace admission/remove path.
+        let tracks_workspace_ref = tracks_session_workspace_ref(&options);
         let conversation_id = options
             .conversation_id
             .unwrap_or_else(ConversationId::new_v4);
@@ -1672,7 +1683,10 @@ impl PtyManager {
 
         let mut scoped_options = options;
         scoped_options.conversation_id = Some(conversation_id);
-        let info = match self.spawn_pty(id.clone(), scoped_options, on_data).await {
+        let info = match self
+            .spawn_pty(id.clone(), scoped_options, on_data, tracks_workspace_ref)
+            .await
+        {
             Ok(info) => info,
             Err(e) => {
                 // claim_guard drops here and removes the dangling record.
@@ -1707,6 +1721,7 @@ impl PtyManager {
         id: String,
         options: SpawnOptions,
         on_data: Option<Channel<Response>>,
+        workspace_ref_tracked: bool,
     ) -> Result<TerminalInfo, String> {
         // ADR-004.2: Resolve the program to run. When `program` is set we run
         // that executable directly (terminal-native agent launch); otherwise we
@@ -1751,7 +1766,21 @@ impl PtyManager {
         // Get terminal size
         let cols = options.cols.unwrap_or(80);
         let rows = options.rows.unwrap_or(24);
-        let env = self.merge_environment(options.env.clone());
+        let mut env = self.merge_environment(options.env.clone());
+        if options.program.is_none() {
+            env.insert("SHELL".to_string(), shell_path.clone());
+        }
+        // Identify this PTY as Termul so ~/.zshrc can feature-gate (starship,
+        // shared history) the same way Ghostty/Orca do. Overwrite inherited
+        // Cursor/Ghostty TERM_PROGRAM — the child pane is Termul, not its parent.
+        env.insert("TERM".to_string(), "xterm-256color".to_string());
+        env.insert("COLORTERM".to_string(), "truecolor".to_string());
+        env.insert("TERM_PROGRAM".to_string(), "Termul".to_string());
+        env.insert(
+            "TERM_PROGRAM_VERSION".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        );
+        env.insert("FORCE_HYPERLINK".to_string(), "1".to_string());
 
         // On Windows, use our custom ConPTY implementation to avoid console window
         #[cfg(target_os = "windows")]
@@ -1796,7 +1825,7 @@ impl PtyManager {
                 conversation_id: options
                     .conversation_id
                     .expect("spawn assigned a ConversationId scope"),
-                workspace_ref_tracked: options.kind.as_deref() != Some("ssh"),
+                workspace_ref_tracked,
                 project_id: options.project_id.clone(),
                 child: Arc::new(AsyncMutex::new(Some(Box::new(child)))),
                 master: Arc::new(AsyncMutex::new(None)), // No master for ConPTY
@@ -1913,11 +1942,10 @@ impl PtyManager {
                 .map_err(|e| format!("Failed to open PTY: {}", e))?;
 
             let mut cmd = CommandBuilder::new(&shell_path);
-            // Interactive shells: login flag so profile-sourced PATH is applied (GH-275).
+            // Login + interactive so ~/.zprofile and ~/.zshrc load (GH-275).
             if options.program.is_none() {
-                if let Some(login_arg) = crate::pty::env_refresh::shell_wants_login_arg(&shell_path)
-                {
-                    cmd.arg(login_arg);
+                for arg in crate::pty::env_refresh::shell_startup_args(&shell_path) {
+                    cmd.arg(*arg);
                 }
             }
             // ADR-004.2: In agent mode, append the argv tail as discrete
@@ -1955,7 +1983,7 @@ impl PtyManager {
                 conversation_id: options
                     .conversation_id
                     .expect("spawn assigned a ConversationId scope"),
-                workspace_ref_tracked: options.kind.as_deref() != Some("ssh"),
+                workspace_ref_tracked,
                 project_id: options.project_id.clone(),
                 child: Arc::new(AsyncMutex::new(Some(child))),
                 master: Arc::new(AsyncMutex::new(Some(pty_pair.master))),
@@ -3054,16 +3082,8 @@ impl PtyManager {
 
         #[cfg(not(target_os = "windows"))]
         {
-            let candidates = vec![
-                format!("/bin/{}", shell),
-                format!("/usr/bin/{}", shell),
-                format!("/usr/local/bin/{}", shell),
-            ];
-
-            for candidate in candidates {
-                if Path::new(&candidate).exists() {
-                    return Ok(candidate);
-                }
+            if let Some(resolved) = crate::shell_paths::unix_shell_paths::resolve_name(shell) {
+                return Ok(resolved);
             }
         }
 
@@ -4447,6 +4467,8 @@ mod tests {
             lifecycle_state: crate::conversation::ConversationLifecycleState::Ready,
             last_seq: 0,
             created_by: crate::conversation::ConversationCreator::Termul,
+            title: None,
+            title_source: None,
         }
     }
 
@@ -4482,6 +4504,7 @@ mod tests {
         assert!(options.args.is_none());
         assert!(options.env.is_none());
         assert!(options.kind.is_none());
+        assert!(tracks_session_workspace_ref(&options));
 
         let wrong_project = TerminalSpawnIntentV1 {
             conversation_id,
@@ -4491,6 +4514,26 @@ mod tests {
             rows: 24,
         };
         assert!(wrong_project.into_trusted_options(&record).is_err());
+    }
+
+    #[test]
+    fn workspace_ref_tracking_requires_real_conversation_scope() {
+        let conversation_id =
+            ConversationId::parse("018f7a1c-1b4d-7c8a-9f01-0123456789ab").unwrap();
+        assert!(!tracks_session_workspace_ref(&SpawnOptions::default()));
+        assert!(tracks_session_workspace_ref(&SpawnOptions {
+            conversation_id: Some(conversation_id),
+            ..Default::default()
+        }));
+        assert!(!tracks_session_workspace_ref(&SpawnOptions {
+            conversation_id: Some(conversation_id),
+            kind: Some("ssh".to_string()),
+            ..Default::default()
+        }));
+        assert!(!tracks_session_workspace_ref(&SpawnOptions {
+            kind: Some("ssh".to_string()),
+            ..Default::default()
+        }));
     }
 
     #[tokio::test]

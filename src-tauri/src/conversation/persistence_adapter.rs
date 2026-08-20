@@ -1070,6 +1070,8 @@ mod tests {
                     lifecycle_state: ConversationLifecycleState::InitializingAgent,
                     last_seq: 0,
                     created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
                 },
                 ConversationMutation::CreateConversation,
             )
@@ -1154,6 +1156,8 @@ mod tests {
                     lifecycle_state: ConversationLifecycleState::InitializingAgent,
                     last_seq: 0,
                     created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
                 },
                 ConversationMutation::CreateConversation,
             )
@@ -1333,6 +1337,8 @@ mod tests {
             lifecycle_state: ConversationLifecycleState::InitializingAgent,
             last_seq: 0,
             created_by: ConversationCreator::Termul,
+            title: None,
+            title_source: None,
         };
         writer
             .create_conversation(record.clone(), ConversationMutation::CreateConversation)
@@ -1468,6 +1474,8 @@ mod tests {
                     lifecycle_state: ConversationLifecycleState::InitializingAgent,
                     last_seq: 0,
                     created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
                 },
                 ConversationMutation::CreateConversation,
             )

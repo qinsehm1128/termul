@@ -214,6 +214,7 @@ fn main() -> ExitCode {
         let acp_install_dir = cfg
             .service_account_state_dir()
             .join("acp-registry-binaries");
+        crate::acp::npm_local::set_root(cfg.service_account_state_dir().join("acp-npm-packages"));
         let acp_install = match AcpInstallService::open(
             acp_install_dir,
             std::sync::Arc::clone(acp_catalog.as_ref().expect("catalog opened above")),

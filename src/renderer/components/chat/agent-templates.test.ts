@@ -23,6 +23,7 @@ describe('agent-templates', () => {
     for (const t of AGENT_TEMPLATES) {
       if (t.config.command === 'npx') {
         expect(t.config.args[0]).toBe('-y')
+        expect(t.notes.toLowerCase()).toContain('locally')
       }
     }
   })

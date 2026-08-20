@@ -69,18 +69,6 @@ export const projectColors: Record<
   }
 }
 
-export const statusBarColors: Record<ProjectColor, string> = {
-  blue: 'bg-blue-600',
-  purple: 'bg-purple-600',
-  green: 'bg-green-600',
-  yellow: 'bg-yellow-600',
-  red: 'bg-red-600',
-  cyan: 'bg-cyan-600',
-  pink: 'bg-pink-600',
-  orange: 'bg-orange-600',
-  gray: 'bg-gray-600'
-}
-
 export const availableColors: ProjectColor[] = [
   'blue',
   'purple',

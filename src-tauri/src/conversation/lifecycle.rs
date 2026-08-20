@@ -1,9 +1,10 @@
-//! Explicit Conversation binding and tombstone lifecycle coordination.
+//! Explicit Conversation binding and delete lifecycle coordination.
 //!
 //! Renderer view close is deliberately absent from this host service. Every mutation compares the
 //! caller's expected revision with canonical `ConversationRecordV2.lastSeq` while holding the
-//! repository's per-Conversation lock. PTYs are inspected only as delete blockers and are never
-//! terminated here.
+//! repository's per-Conversation lock. Explicit delete first releases live agent bindings and
+//! terminates conversation-scoped PTYs; remaining live terminals still block delete. Successful
+//! delete physically removes the Conversation — it is not archived.
 //!
 //! Title, attach, detach, target, and binding mutations consume the repository's in-lock
 //! canonical sequence allocator (`append_event` / `append_event_locked`) and never open a second
@@ -230,11 +231,38 @@ impl ConversationAgentLifecycle for AcpManager {
 
 pub trait TerminalResourceInspector: Send + Sync {
     fn is_live(&self, terminal_id: &str) -> bool;
+    fn terminate<'a>(
+        &'a self,
+        terminal_id: &'a str,
+    ) -> ProviderFuture<'a, std::result::Result<(), String>> {
+        Box::pin(async move {
+            let _ = terminal_id;
+            Err("terminal terminate is not available".to_string())
+        })
+    }
 }
 
 impl TerminalResourceInspector for PtyManager {
     fn is_live(&self, terminal_id: &str) -> bool {
         self.get(terminal_id).is_some()
+    }
+
+    fn terminate<'a>(
+        &'a self,
+        terminal_id: &'a str,
+    ) -> ProviderFuture<'a, std::result::Result<(), String>> {
+        Box::pin(async move {
+            self.terminate(terminal_id)
+                .await
+                .map(|_| ())
+                .map_err(|failure| {
+                    format!(
+                        "terminal_id={} cleanup_stage={}",
+                        failure.terminal_id,
+                        failure.stage.as_str()
+                    )
+                })
+        })
     }
 }
 
@@ -515,29 +543,9 @@ impl ConversationLifecycleService {
             .map_err(map_repository_error)?;
         let _guard = self.repository.lifecycle_lock(conversation_id).await;
         let record = self.expected(conversation_id, expected_revision, "delete_conversation")?;
-        let mut blockers = Vec::new();
-        if let Some(binding) = self
-            .repository
-            .current_binding(conversation_id)
-            .map_err(map_repository_error)?
-        {
-            if matches!(
-                binding.state,
-                AgentSessionBindingState::Active | AgentSessionBindingState::Detached
-            ) {
-                blockers.push(ConversationDeleteBlocker::LiveBinding {
-                    count: 1,
-                    ids: vec![binding.agent_session_id],
-                });
-            }
-        }
-        let terminal_ids = self.live_terminal_resource_ids(conversation_id)?;
-        if !terminal_ids.is_empty() {
-            blockers.push(ConversationDeleteBlocker::TerminalResources {
-                count: terminal_ids.len(),
-                ids: terminal_ids,
-            });
-        }
+        self.release_live_resources_for_delete(&permit, conversation_id)
+            .await?;
+        let blockers = self.delete_blockers(conversation_id)?;
         if !blockers.is_empty() {
             log::warn!(
                 "[conversation-lifecycle] delete blocked conversation_id={} blocker_count={} revision={}",
@@ -555,23 +563,20 @@ impl ConversationLifecycleService {
         }
         let deleted = self
             .repository
-            .tombstone_conversation_locked(&permit, conversation_id)
+            .purge_conversation_locked(&permit, conversation_id)
             .map_err(map_repository_error)?;
-        self.repository
-            .refresh_lifecycle_catalog(&permit, conversation_id)
-            .await
-            .map_err(map_repository_error)?;
+        log::info!(
+            "[conversation-lifecycle] conversation deleted conversation_id={}",
+            conversation_id
+        );
         Ok(ConversationLifecycleOutcome::Updated {
             action: ConversationLifecycleAction::DeleteConversation,
             conversation_id,
             previous_revision: record.last_seq,
             revision: deleted.last_seq,
             workspace_cwd: deleted.workspace_cwd,
-            lifecycle_state: deleted.lifecycle_state,
-            current_binding: self
-                .repository
-                .current_binding(conversation_id)
-                .map_err(map_repository_error)?,
+            lifecycle_state: ConversationLifecycleState::Deleted,
+            current_binding: None,
             previous_agent_session_id: None,
         })
     }
@@ -639,6 +644,92 @@ impl ConversationLifecycleService {
             current_binding,
             previous_agent_session_id,
         })
+    }
+
+    async fn release_live_resources_for_delete(
+        &self,
+        permit: &crate::conversation::write_authority::RepositoryWritePermit,
+        conversation_id: ConversationId,
+    ) -> Result<()> {
+        if let Some(binding) = self
+            .repository
+            .current_binding(conversation_id)
+            .map_err(map_repository_error)?
+        {
+            if matches!(
+                binding.state,
+                AgentSessionBindingState::Active | AgentSessionBindingState::Detached
+            ) {
+                if let Err(source) = self.provider.suspend(&binding).await {
+                    log::warn!(
+                        "[conversation-lifecycle] delete suspends binding best-effort conversation_id={} code={}",
+                        conversation_id,
+                        provider_error_code(source.kind)
+                    );
+                }
+                if let Err(error) = self.repository.release_binding_for_delete_locked(
+                    permit,
+                    conversation_id,
+                    Utc::now(),
+                ) {
+                    log::warn!(
+                        "[conversation-lifecycle] delete binding release failed conversation_id={} code={}",
+                        conversation_id,
+                        error.stable_code()
+                    );
+                }
+            }
+        }
+
+        for terminal_id in self.live_terminal_resource_ids(conversation_id)? {
+            match self.terminals.terminate(&terminal_id).await {
+                Ok(()) => {
+                    log::info!(
+                        "[conversation-lifecycle] delete terminated terminal_id={} conversation_id={}",
+                        terminal_id,
+                        conversation_id
+                    );
+                }
+                Err(detail) => {
+                    log::warn!(
+                        "[conversation-lifecycle] delete terminal terminate failed conversation_id={} detail={}",
+                        conversation_id,
+                        detail
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_blockers(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Result<Vec<ConversationDeleteBlocker>> {
+        let mut blockers = Vec::new();
+        if let Some(binding) = self
+            .repository
+            .current_binding(conversation_id)
+            .map_err(map_repository_error)?
+        {
+            if matches!(
+                binding.state,
+                AgentSessionBindingState::Active | AgentSessionBindingState::Detached
+            ) {
+                blockers.push(ConversationDeleteBlocker::LiveBinding {
+                    count: 1,
+                    ids: vec![binding.agent_session_id],
+                });
+            }
+        }
+        let terminal_ids = self.live_terminal_resource_ids(conversation_id)?;
+        if !terminal_ids.is_empty() {
+            blockers.push(ConversationDeleteBlocker::TerminalResources {
+                count: terminal_ids.len(),
+                ids: terminal_ids,
+            });
+        }
+        Ok(blockers)
     }
 
     fn live_terminal_resource_ids(&self, conversation_id: ConversationId) -> Result<Vec<String>> {
@@ -828,11 +919,25 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct FakeTerminals(Mutex<HashSet<String>>);
+    struct FakeTerminals {
+        live: Mutex<HashSet<String>>,
+        fail_terminate: std::sync::atomic::AtomicBool,
+    }
 
     impl TerminalResourceInspector for FakeTerminals {
         fn is_live(&self, terminal_id: &str) -> bool {
-            self.0.lock().contains(terminal_id)
+            self.live.lock().contains(terminal_id)
+        }
+
+        fn terminate<'a>(
+            &'a self,
+            terminal_id: &'a str,
+        ) -> ProviderFuture<'a, std::result::Result<(), String>> {
+            if self.fail_terminate.load(Ordering::SeqCst) {
+                return Box::pin(async move { Err("terminate refused".to_string()) });
+            }
+            self.live.lock().remove(terminal_id);
+            Box::pin(async move { Ok(()) })
         }
     }
 
@@ -871,6 +976,8 @@ mod tests {
                     lifecycle_state: ConversationLifecycleState::Ready,
                     last_seq: 0,
                     created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
                 },
                 ConversationMutation::CreateConversation,
             )
@@ -1320,33 +1427,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_blocks_live_binding_and_terminal_then_tombstones_without_killing_resource() {
+    async fn delete_releases_live_binding_and_terminal_then_purges() {
         let fixture = fixture().await;
-        let blocked = fixture
-            .service
-            .delete_conversation(fixture.id, revision(&fixture))
-            .await
-            .unwrap();
-        let ConversationLifecycleOutcome::Blocked { code, blockers, .. } = blocked else {
-            panic!("live binding must block delete");
-        };
-        assert_eq!(
-            code,
-            ConversationLifecycleErrorCode::ConversationLiveResources
-        );
-        assert!(matches!(
-            blockers[0],
-            ConversationDeleteBlocker::LiveBinding { .. }
-        ));
-
-        fixture
-            .service
-            .suspend_agent_binding(fixture.id, revision(&fixture))
-            .await
-            .unwrap();
         fixture
             .terminals
-            .0
+            .live
             .lock()
             .insert("terminal-live".to_string());
         let workspace_service = SessionWorkspaceService::new(Arc::clone(fixture.creation.writer()));
@@ -1372,6 +1457,78 @@ mod tests {
             )
             .await
             .unwrap();
+
+        let workspace_cwd = fixture
+            .repository
+            .get_conversation(fixture.id)
+            .unwrap()
+            .workspace_cwd;
+        let deleted = fixture
+            .service
+            .delete_conversation(fixture.id, revision(&fixture))
+            .await
+            .unwrap();
+        assert!(matches!(
+            deleted,
+            ConversationLifecycleOutcome::Updated {
+                action: ConversationLifecycleAction::DeleteConversation,
+                lifecycle_state: ConversationLifecycleState::Deleted,
+                current_binding: None,
+                ..
+            }
+        ));
+        assert_eq!(fixture.provider.suspend_calls.load(Ordering::SeqCst), 1);
+        assert!(!fixture.terminals.is_live("terminal-live"));
+        assert!(fixture.repository.get_conversation(fixture.id).is_err());
+        assert!(std::path::Path::new(&workspace_cwd).exists());
+        let root = fixture.repository.root().to_path_buf();
+        let conversation_id = fixture.id;
+        let (reopened, _) = ConversationRepository::open(root).unwrap();
+        assert!(reopened.get_conversation(conversation_id).is_err());
+        assert!(reopened
+            .list_conversations()
+            .iter()
+            .all(|record| record.conversation_id != conversation_id));
+        let _ = &fixture.creation;
+        let _ = DurableFileSystem::new();
+    }
+
+    #[tokio::test]
+    async fn delete_blocks_when_terminal_terminate_fails() {
+        let fixture = fixture().await;
+        fixture
+            .terminals
+            .fail_terminate
+            .store(true, Ordering::SeqCst);
+        fixture
+            .terminals
+            .live
+            .lock()
+            .insert("terminal-stuck".to_string());
+        let workspace_service = SessionWorkspaceService::new(Arc::clone(fixture.creation.writer()));
+        workspace_service
+            .write(
+                fixture.id,
+                None,
+                SessionWorkspaceV1 {
+                    schema_version: SESSION_WORKSPACE_SCHEMA_VERSION,
+                    conversation_id: fixture.id,
+                    revision: 0,
+                    updated_at_utc: String::new(),
+                    update_identity: Some("test".to_string()),
+                    topology: None,
+                    active_pane_id: None,
+                    resources: vec![SessionWorkspaceResourceDescriptor::Terminal {
+                        terminal_id: "terminal-stuck".to_string(),
+                        terminal_record_id: None,
+                        conversation_id: fixture.id,
+                    }],
+                    projection_state: SessionWorkspaceProjectionState::Native,
+                },
+            )
+            .await
+            .unwrap();
+
         let blocked = fixture
             .service
             .delete_conversation(fixture.id, revision(&fixture))
@@ -1379,35 +1536,21 @@ mod tests {
             .unwrap();
         assert!(matches!(
             blocked,
-            ConversationLifecycleOutcome::Blocked { blockers, .. }
-                if blockers.iter().any(|blocker| matches!(blocker, ConversationDeleteBlocker::TerminalResources { ids, .. } if ids == &vec!["terminal-live".to_string()]))
+            ConversationLifecycleOutcome::Blocked {
+                action: ConversationLifecycleAction::DeleteConversation,
+                code: ConversationLifecycleErrorCode::ConversationLiveResources,
+                ..
+            }
         ));
-        assert!(fixture.terminals.is_live("terminal-live"));
-
-        fixture.terminals.0.lock().clear();
-        fixture
-            .service
-            .delete_conversation(fixture.id, revision(&fixture))
-            .await
-            .unwrap();
+        assert!(fixture.terminals.is_live("terminal-stuck"));
         assert_eq!(
             fixture
                 .repository
                 .get_conversation(fixture.id)
                 .unwrap()
                 .lifecycle_state,
-            ConversationLifecycleState::Deleted
+            ConversationLifecycleState::Ready
         );
-        assert!(fixture.terminals.0.lock().is_empty());
-        assert!(std::path::Path::new(
-            &fixture
-                .repository
-                .get_conversation(fixture.id)
-                .unwrap()
-                .workspace_cwd
-        )
-        .exists());
-        let _ = &fixture.creation;
-        let _ = DurableFileSystem::new();
+        assert_eq!(fixture.provider.suspend_calls.load(Ordering::SeqCst), 1);
     }
 }

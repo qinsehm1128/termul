@@ -28,7 +28,7 @@ const REPOSITORY_MUTATORS: &[&str] = &[
     "write_provenance",
     "sync_conversation",
     "mark_deleted",
-    "tombstone_conversation_locked",
+    "purge_conversation_locked",
     "mark_lifecycle_recovery_required_locked",
     "clear_recovery_item",
 ];
@@ -273,11 +273,7 @@ impl<'ast> Visit<'ast> for CallCollector<'_> {
     fn visit_expr_method_call(&mut self, node: &'ast ExprMethodCall) {
         let method = node.method.to_string();
         let receiver = expression_name(&node.receiver);
-        let receiver_type = self
-            .local_types
-            .get(&receiver)
-            .cloned()
-            .unwrap_or_default();
+        let receiver_type = self.local_types.get(&receiver).cloned().unwrap_or_default();
         self.info.methods.insert(method.clone());
         self.info.method_uses.push(MethodUse {
             method,

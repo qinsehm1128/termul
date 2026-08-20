@@ -52,6 +52,10 @@ pub struct ChatHistoryIndexEntry {
     pub worktree_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_branch: Option<String>,
+    /// Canonical Conversation identity when `storage_key` is a ConversationId.
+    /// Absent on legacy rows whose storage key is the opaque ACP session id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

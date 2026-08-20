@@ -13,6 +13,7 @@ mod path_validation;
 mod pty;
 mod remote;
 mod secure_storage;
+pub mod scheduled_tasks;
 // Opt-in `termul-server` self-update subsystem. The library module itself is
 // intentionally NOT feature-gated so its full test suite — including signature
 // verification — runs under the spec's default `cargo test` gate. Only the
@@ -341,6 +342,7 @@ pub use conversation::{
     ConversationRecordV2, CreationPartition, ExecutionTarget, ProjectAttachment,
     TerminalResourceRef,
 };
+pub use scheduled_tasks::ScheduledTaskStore;
 pub use pty::PtyManager;
 pub use trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub};
 // Desktop ACP event sink: wraps the Tauri `AppHandle` so the dispatcher's
@@ -610,23 +612,34 @@ fn get_available_shells() -> Vec<ShellInfo> {
 
     #[cfg(not(target_os = "windows"))]
     {
-        let candidates = vec![
-            ("bash", "/bin/bash"),
-            ("zsh", "/bin/zsh"),
-            ("zsh", "/usr/bin/zsh"),
-            ("fish", "/bin/fish"),
-            ("fish", "/usr/bin/fish"),
-            ("sh", "/bin/sh"),
-        ];
+        let mut push_unique = |name: &str, path: &str| {
+            if !is_shell_available(path) {
+                return;
+            }
+            if shells
+                .iter()
+                .any(|existing| existing.name == name || existing.path == path)
+            {
+                return;
+            }
+            shells.push(ShellInfo {
+                name: name.to_string(),
+                path: path.to_string(),
+                display_name: shell_display_name(name),
+                args: None,
+            });
+        };
 
-        for (name, path) in candidates {
-            if is_shell_available(path) && !shells.iter().any(|s| s.name == name) {
-                shells.push(ShellInfo {
-                    name: name.to_string(),
-                    path: path.to_string(),
-                    display_name: shell_display_name(name),
-                    args: None,
-                });
+        // Prefer the login SHELL so picking "Zsh" matches Ghostty / Terminal.app.
+        if let Ok(login) = env::var("SHELL") {
+            if let Some(name) = Path::new(&login).file_name().and_then(|s| s.to_str()) {
+                push_unique(name, &login);
+            }
+        }
+
+        for prefix in crate::shell_paths::unix_shell_paths::PREFIXES {
+            for name in ["zsh", "bash", "fish", "sh"] {
+                push_unique(name, &format!("{prefix}/{name}"));
             }
         }
     }
@@ -1266,10 +1279,12 @@ pub(crate) async fn stop_desktop_producers_and_drain(
 ) -> DesktopExitDurabilityOutcome {
     let mut outcome = DesktopExitDurabilityOutcome::default();
     let producer_stop_failed = match acp_manager {
-        Some(acp_manager) => match tokio::time::timeout_at(deadline, acp_manager.stop_producers()).await {
-            Ok(Ok(())) => false,
-            Ok(Err(_)) | Err(_) => true,
-        },
+        Some(acp_manager) => {
+            match tokio::time::timeout_at(deadline, acp_manager.stop_producers()).await {
+                Ok(Ok(())) => false,
+                Ok(Err(_)) | Err(_) => true,
+            }
+        }
         None => true,
     };
     if producer_stop_failed {
@@ -1611,6 +1626,13 @@ pub fn run() {
                 .app_data_dir()
                 .map_err(|error| format!("failed to resolve app data directory: {error}"))?
                 .join("acp-registry-binaries");
+            crate::acp::npm_local::set_root(
+                handle
+                    .path()
+                    .app_data_dir()
+                    .map_err(|error| format!("failed to resolve app data directory: {error}"))?
+                    .join("acp-npm-packages"),
+            );
             let acp_install_service =
                 match acp_catalog_service.as_ref().zip(Some(acp_install_root.clone())) {
                     Some((catalog, root)) => {
@@ -1724,6 +1746,28 @@ pub fn run() {
                 tauri::async_runtime::handle().inner().clone(),
             ));
             ws_relay.set_question_rendezvous(question_rendezvous);
+            let scheduled_task_store = Arc::new(
+                crate::scheduled_tasks::ScheduledTaskStore::open(
+                    app_data_dir.join("scheduled-tasks").join("v1").join("projects"),
+                )
+                .map_err(|error| format!("failed to open scheduled task store: {error}"))?,
+            );
+            let scheduled_task_executor = Arc::new(
+                crate::scheduled_tasks::AcpScheduledTaskExecutor::new(
+                    Arc::clone(&acp_manager),
+                    Arc::clone(&ws_relay),
+                ),
+            );
+            let scheduled_tasks = crate::scheduled_tasks::ScheduledTaskService::new(
+                scheduled_task_store,
+                scheduled_task_executor,
+            );
+            scheduled_tasks.start_on(tauri::async_runtime::handle().inner());
+            log::info!(
+                "[scheduled-task] boundary=service_started host=desktop root={}",
+                scheduled_tasks.store().root().display()
+            );
+            app.manage(Arc::clone(&scheduled_tasks));
             app.manage(acp_manager);
             app.manage(ws_relay);
 
@@ -2037,6 +2081,7 @@ pub fn run() {
             acp::commands::acp_set_session_new_timeout,
             acp::commands::acp_set_session_reopen_timeout,
             acp::commands::acp_set_first_prompt_warmup_timeout,
+            acp::commands::acp_set_prefer_local_npm_install,
             acp::commands::acp_probe_mcp_server,
             // CAP-6 / Story 8: ACP catalog (host-owned resolution).
             acp::commands::acp_list_catalog,
@@ -2075,6 +2120,7 @@ pub fn run() {
             commands::conversation_host_status,
             commands::conversation_list,
             commands::conversation_get,
+            commands::conversation_rename,
             commands::conversation_open,
             commands::conversation_resolve_legacy_id,
             commands::conversation_attach_project,
@@ -2132,6 +2178,9 @@ pub fn run() {
             let ws_relay = app_handle
                 .try_state::<Arc<WsRelaySink>>()
                 .map(|state| state.inner().clone());
+            let scheduled_tasks = app_handle
+                .try_state::<Arc<crate::scheduled_tasks::ScheduledTaskService>>()
+                .map(|state| state.inner().clone());
             let pty_manager = app_handle
                 .try_state::<Arc<PtyManager>>()
                 .map(|state| state.inner().clone());
@@ -2165,6 +2214,12 @@ pub fn run() {
                             "[desktop-exit] shutdown_phase=stop_remote stable_code=REMOTE_STOP_TIMEOUT result=FAILED"
                         ),
                     }
+                }
+
+                if let Some(scheduled_tasks) = scheduled_tasks {
+                    scheduled_tasks
+                        .shutdown(deadline.saturating_duration_since(tokio::time::Instant::now()))
+                        .await;
                 }
 
                 let mut durability = stop_desktop_producers_and_drain(
@@ -2339,6 +2394,8 @@ mod tests {
                     lifecycle_state: ConversationLifecycleState::InitializingAgent,
                     last_seq: 0,
                     created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
                 },
                 ConversationMutation::CreateConversation,
             )
@@ -2513,6 +2570,26 @@ mod tests {
     fn test_get_available_shells_not_empty() {
         let shells = get_available_shells();
         assert!(!shells.is_empty());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_available_shells_prefer_login_shell_path() {
+        let Ok(login) = env::var("SHELL") else {
+            return;
+        };
+        let Some(name) = Path::new(&login).file_name().and_then(|s| s.to_str()) else {
+            return;
+        };
+        if !Path::new(&login).exists() {
+            return;
+        }
+        let shells = get_available_shells();
+        let listed = shells.iter().find(|shell| shell.name == name);
+        assert_eq!(
+            listed.map(|shell| shell.path.as_str()),
+            Some(login.as_str())
+        );
     }
 
     #[test]

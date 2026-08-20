@@ -118,6 +118,7 @@
     "terminateFailed": "无法终止终端进程。",
     "restartFailed": "无法重启终端进程。",
     "reopen": "重新打开",
+    "stopHidden": "停止",
     "reconnect": "重新连接",
     "hiddenRunning": "已隐藏但仍在运行的终端",
     "conversationScopeRequired": "请先打开一个对话，再创建持久终端",

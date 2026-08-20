@@ -1,10 +1,11 @@
-import type { ConversationRecordV2 } from '@shared/types/conversation.types'
 import { AlertTriangle, MessageSquare } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useNavigate } from 'react-router-dom'
 import { ConversationLifecycleActions } from '@/components/chat/ChatHistoryEntryRow'
+import { displayConversationTitle, sessionTitleForConversation } from '@/lib/conversation-title'
 import { cn } from '@/lib/utils'
+import { useAcpStore } from '@/stores/acp-store'
 import {
   recoveryCountForConversation,
   useConversationStore,
@@ -21,11 +22,6 @@ interface ConversationListProps {
   className?: string
 }
 
-function conversationTitle(conversation: ConversationRecordV2): string {
-  const workspaceName = conversation.workspaceCwd.split(/[\\/]/).filter(Boolean).pop()
-  return workspaceName || conversation.conversationId.slice(0, 8)
-}
-
 export function ConversationList({
   projectId,
   pageSize = DEFAULT_PAGE_SIZE,
@@ -37,6 +33,8 @@ export function ConversationList({
   const conversations = useVisibleConversations()
   const recoveryItems = useConversationStore((state) => state.recoveryItems)
   const activeConversationId = useConversationStore((state) => state.activeConversationId)
+  const sessions = useAcpStore((state) => state.sessions)
+  const sessionIndex = useAcpStore((state) => state.sessionIndex)
   const projects = useProjectStore((state) => state.projects)
   const [visibleCount, setVisibleCount] = useState(pageSize)
 
@@ -63,7 +61,14 @@ export function ConversationList({
   return (
     <div className={cn('flex flex-col py-1', className)} data-testid="conversation-list">
       {visible.map((conversation) => {
-        const title = conversationTitle(conversation)
+        const title = displayConversationTitle(conversation, {
+          sessionTitle: sessionTitleForConversation(
+            conversation.conversationId,
+            sessions,
+            sessionIndex
+          ),
+          untitled: t('conversationNavigation.untitled')
+        })
         const project = conversation.projectAttachment
           ? projects.find((candidate) => candidate.id === conversation.projectAttachment?.projectId)
           : undefined

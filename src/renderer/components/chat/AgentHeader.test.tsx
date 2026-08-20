@@ -19,7 +19,7 @@ vi.mock('framer-motion', async () => {
 
 function option(
   currentValue: string,
-  options: Array<{ value: string; name: string }> = [
+  options: Array<{ value: string; name: string; group?: string }> = [
     { value: 'a', name: 'Alpha' },
     { value: 'b', name: 'Beta' },
     { value: 'c', name: 'Gamma' }
@@ -157,6 +157,27 @@ describe('ConfigChip pending selection', () => {
       expect(screen.getByRole('button', { name: /^Alpha$/ })).toBeInTheDocument()
       expect(screen.getByRole('button', { name: /^Alpha$/ })).not.toHaveAttribute('aria-busy')
     })
+  })
+
+  it('renders group headings and selects the leaf value from a grouped option', async () => {
+    const onSelect = vi.fn(async () => undefined)
+    render(
+      <ConfigChip
+        option={option('claude-sonnet-4', [
+          { value: 'claude-sonnet-4', name: 'Sonnet 4', group: 'Claude' },
+          { value: 'claude-opus-4', name: 'Opus 4', group: 'Claude' },
+          { value: 'gpt-5.5', name: 'GPT-5.5', group: 'OpenAI' }
+        ])}
+        disabled={false}
+        onSelect={onSelect}
+      />
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /^Sonnet 4$/ }))
+    expect(screen.getByText('Claude')).toBeInTheDocument()
+    expect(screen.getByText('OpenAI')).toBeInTheDocument()
+    clickMenuOption('Opus 4')
+    expect(onSelect).toHaveBeenCalledWith('claude-opus-4')
   })
 
   it('no-ops when selecting the already displayed value', async () => {

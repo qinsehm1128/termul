@@ -80,6 +80,11 @@ export const PersistenceKeys = {
   // so the next chat starts with the user's last pick regardless of which
   // surface (launcher or running chatbox) set it.
   lastComposerOptions: (configId: string): string => `agents/composer-options/${configId}`,
+  // Last composer selections for one Conversation (agent + model/mode/config).
+  // Restored on closed-history reopen and reconnect so this chat keeps its own
+  // last run, not the global last pick for the agent.
+  conversationComposer: (conversationId: string): string =>
+    `conversations/composer-options/${conversationId}`,
   // Mobile file explorer: last folder the user navigated into, per project.
   // Restored on drawer reopen across close/reopen and page reloads (web only).
   mobileFileExplorerFolder: (projectId: string): string => `mobile-file-explorer/${projectId}`
@@ -102,6 +107,17 @@ export interface PersistedComposerOptions {
   configValues?: Record<string, string>
   isolationMode?: 'current' | 'worktree'
   baseBranch?: string | null
+}
+
+/** Per-conversation composer snapshot, including display names for closed-session chips. */
+export interface ConversationComposerSnapshot {
+  agentConfigId?: string
+  modelId?: string
+  modelName?: string
+  modeId?: string
+  modeName?: string
+  configValues?: Record<string, string>
+  configLabels?: Record<string, { optionName?: string; valueName?: string }>
 }
 
 // Persisted project data (stored at projects.json)

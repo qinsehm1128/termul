@@ -154,9 +154,7 @@ pub async fn acp_resume_session(
                 manager.register_conversation_binding(&session_id_str, conversation_id)
             }
             Err(_) => {
-                log::warn!(
-                    "[acp-command] resume binding skipped: invalid conversationId {raw}"
-                );
+                log::warn!("[acp-command] resume binding skipped: invalid conversationId {raw}");
             }
         }
     }
@@ -173,30 +171,29 @@ pub async fn acp_close_session(
     session_id: SessionId,
 ) -> Result<(), String> {
     let retirement_id = session_id.0.clone();
-    let result = if let Some(conversation_id) =
-        manager.conversation_id_for_current_session(&session_id.0)
-    {
-        let service = crate::conversation::ConversationLifecycleService::from_manager(
-            manager.inner().clone(),
-            pty.inner().clone(),
-        )
-        .map_err(|error| error.to_string())?;
-        let creation = manager
-            .conversation_creation()
-            .ok_or_else(|| "CONVERSATION_BOOTSTRAP_REQUIRED".to_string())?;
-        let expected_revision = creation
-            .repository()
-            .get_conversation(conversation_id)
-            .map_err(|error| error.to_string())?
-            .last_seq;
-        service
-            .suspend_agent_binding(conversation_id, expected_revision)
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-    } else {
-        manager.close_session(&agent_id, session_id).await
-    };
+    let result =
+        if let Some(conversation_id) = manager.conversation_id_for_current_session(&session_id.0) {
+            let service = crate::conversation::ConversationLifecycleService::from_manager(
+                manager.inner().clone(),
+                pty.inner().clone(),
+            )
+            .map_err(|error| error.to_string())?;
+            let creation = manager
+                .conversation_creation()
+                .ok_or_else(|| "CONVERSATION_BOOTSTRAP_REQUIRED".to_string())?;
+            let expected_revision = creation
+                .repository()
+                .get_conversation(conversation_id)
+                .map_err(|error| error.to_string())?
+                .last_seq;
+            service
+                .suspend_agent_binding(conversation_id, expected_revision)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        } else {
+            manager.close_session(&agent_id, session_id).await
+        };
     retire_after_success(result, relay.inner(), &retirement_id).await
 }
 
@@ -750,6 +747,16 @@ pub fn acp_set_first_prompt_warmup_timeout(secs: Option<u64>) -> Result<(), Stri
     Ok(())
 }
 
+/// Prefer host-owned local `npm install` for `npx -y` agents (default), or
+/// always launch through npx. Pushed from App Preferences. Desktop-only;
+/// standalone `termul-server` uses `TERMUL_ACP_PREFER_LOCAL_NPM`.
+#[tauri::command]
+pub fn acp_set_prefer_local_npm_install(prefer: bool) -> Result<(), String> {
+    crate::acp::npm_local::set_prefer_local_npm_install(prefer);
+    log::info!("[acp] prefer local npm install: {prefer}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -853,13 +860,11 @@ mod tests {
     async fn tauri_close_retires_on_success_and_retains_on_error() {
         let relay = WsRelaySink::new();
         relay.turn_watermark().mark_seen("tauri-close", "turn-1");
-        assert!(retire_after_success(
-            Err("close failed".to_string()),
-            &relay,
-            "tauri-close"
-        )
-        .await
-        .is_err());
+        assert!(
+            retire_after_success(Err("close failed".to_string()), &relay, "tauri-close")
+                .await
+                .is_err()
+        );
         assert!(relay.turn_watermark().is_seen("tauri-close", "turn-1"));
 
         retire_after_success(Ok(()), &relay, "tauri-close")
@@ -874,22 +879,16 @@ mod tests {
         relay
             .turn_watermark()
             .mark_seen("tauri-ephemeral", "turn-1");
-        assert!(retire_after_success(
-            Err("dispose failed".to_string()),
-            &relay,
-            "tauri-ephemeral"
-        )
-        .await
-        .is_err());
-        assert!(relay
-            .turn_watermark()
-            .is_seen("tauri-ephemeral", "turn-1"));
+        assert!(
+            retire_after_success(Err("dispose failed".to_string()), &relay, "tauri-ephemeral")
+                .await
+                .is_err()
+        );
+        assert!(relay.turn_watermark().is_seen("tauri-ephemeral", "turn-1"));
 
         retire_after_success(Ok(()), &relay, "tauri-ephemeral")
             .await
             .unwrap();
-        assert!(!relay
-            .turn_watermark()
-            .is_seen("tauri-ephemeral", "turn-1"));
+        assert!(!relay.turn_watermark().is_seen("tauri-ephemeral", "turn-1"));
     }
 }

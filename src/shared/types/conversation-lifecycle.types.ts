@@ -121,7 +121,8 @@ export interface ConversationLifecycleApi {
   ): Promise<ConversationLifecycleOutcome>
   deleteConversation(
     conversationId: ConversationId,
-    expectedRevision: number
+    expectedRevision: number,
+    removeWorkspace?: boolean
   ): Promise<ConversationLifecycleOutcome>
   subscribe(listener: (outcome: ConversationLifecycleOutcome) => void): () => void
 }

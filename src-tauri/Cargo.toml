@@ -186,6 +186,8 @@ minisign-verify = "0.2"
 # the minisign `.pub` file text, base64-encoded) so `PublicKey::decode` can
 # parse the raw key the updater verifies against.
 base64 = "0.22"
+cron = "0.17.0"
+chrono-tz = "0.10.4"
 
 [dev-dependencies]
 tauri = { version = "2.0", features = ["test"] }

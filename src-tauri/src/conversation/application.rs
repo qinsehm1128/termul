@@ -557,12 +557,7 @@ impl ConversationApplicationService {
         let started = Instant::now();
         let result = self
             .writer
-            .attach_project(
-                conversation_id,
-                expected_revision,
-                attachment,
-                Utc::now(),
-            )
+            .attach_project(conversation_id, expected_revision, attachment, Utc::now())
             .await
             .map_err(map_repository_error)
             .and_then(|mutation| {
@@ -847,6 +842,53 @@ impl ConversationApplicationService {
             Some(conversation_id),
             self.host_kind,
             Some(expected_revision),
+            started,
+            &result,
+        );
+        result
+    }
+
+    /// Rename a Conversation (LocalAlias title precedence).
+    pub async fn rename_conversation(
+        &self,
+        conversation_id: ConversationId,
+        title: String,
+    ) -> Result<ConversationRecordV2> {
+        let started = Instant::now();
+        let result = async {
+            let trimmed = title.trim();
+            let char_count = trimmed.chars().count();
+            if trimmed.is_empty() || char_count > 120 {
+                return Err(application_error(
+                    "CONVERSATION_VALIDATION",
+                    "rename_conversation",
+                    Some(conversation_id),
+                    "title must be between 1 and 120 characters",
+                ));
+            }
+            self.ensure_writable(conversation_id, ConversationMutation::MetadataUpdate)?;
+            self.writer
+                .update_metadata(
+                    conversation_id,
+                    crate::conversation::ConversationMetadataUpdate {
+                        lifecycle_state: None,
+                        execution_target: None,
+                        title: Some(trimmed.to_string()),
+                        title_source: Some(
+                            crate::conversation::ConversationTitleSource::LocalAlias,
+                        ),
+                    },
+                    ConversationMutation::MetadataUpdate,
+                )
+                .await
+                .map_err(map_repository_error)
+        }
+        .await;
+        log_result(
+            "rename_conversation",
+            Some(conversation_id),
+            self.host_kind,
+            None,
             started,
             &result,
         );
@@ -1212,6 +1254,8 @@ mod tests {
                     lifecycle_state: ConversationLifecycleState::Ready,
                     last_seq: 0,
                     created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
                 },
                 ConversationMutation::CreateConversation,
             )
@@ -1344,7 +1388,10 @@ mod tests {
             });
             let decoded: ConversationHostStatus = serde_json::from_value(json).unwrap();
             assert_eq!(decoded.migration_phase, MigrationPhase::ObservationWindow);
-            assert_eq!(decoded.reader_precedence, ReaderPrecedence::ConversationV2First);
+            assert_eq!(
+                decoded.reader_precedence,
+                ReaderPrecedence::ConversationV2First
+            );
         }
     }
 

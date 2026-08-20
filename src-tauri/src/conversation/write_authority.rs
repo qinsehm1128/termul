@@ -448,10 +448,8 @@ impl ConversationWriter {
         execution_target: ExecutionTarget,
         recorded_at_utc: DateTime<Utc>,
     ) -> Result<crate::conversation::repository::ConversationAggregateMutationRecord> {
-        let permit = self.authorize(
-            conversation_id,
-            ConversationMutation::ExecutionTargetUpdate,
-        )?;
+        let permit =
+            self.authorize(conversation_id, ConversationMutation::ExecutionTargetUpdate)?;
         self.repository
             .update_execution_target_cas(
                 &permit,
@@ -493,12 +491,7 @@ impl ConversationWriter {
             ConversationMutation::ProjectAttachmentDetach,
         )?;
         self.repository
-            .detach_project_cas(
-                &permit,
-                conversation_id,
-                expected_revision,
-                recorded_at_utc,
-            )
+            .detach_project_cas(&permit, conversation_id, expected_revision, recorded_at_utc)
             .await
     }
 

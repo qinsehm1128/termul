@@ -616,6 +616,9 @@ export function useTerminalRestore(): void {
         debugLog('useTerminalRestore', `RESTORE COMPLETE [${callId}]`, {
           projectId: projectIdToRestore
         })
+        isRestoringRef.current.delete(projectIdToRestore)
+        PROJECT_RESTORE_LOCKS.delete(projectIdToRestore)
+        setTerminalRestoreInProgress(projectIdToRestore, false, restoreOwnerId)
         const idx = RESTORE_CALL_STACK.indexOf(callId)
         if (idx > -1) RESTORE_CALL_STACK.splice(idx, 1)
       }
@@ -800,10 +803,7 @@ async function restoreFromLayout(
   isCancelled: () => boolean
 ): Promise<RestoreExecutionResult> {
   const restoreId = `restore-${randomUUID().slice(0, 5)}`
-  const conversationId = useSessionWorkspaceSyncStore.getState().activeConversationId
-  if (!conversationId) {
-    return { status: 'blocked', path: 'persisted-replay' }
-  }
+  const conversationId = useSessionWorkspaceSyncStore.getState().activeConversationId ?? undefined
 
   // FIX #2: Use proper lock acquire/release with owner tracking
   if (!acquireGlobalSpawnLock(restoreId)) {
@@ -849,13 +849,14 @@ async function restoreFromLayout(
     // Create all terminals at once to avoid multiple re-renders
     const newTerminals: Array<{
       id: string
-      conversationId: string
+      conversationId?: string
       name: string
       projectId: string
       shell: string
       viewState: 'visible'
       cwd?: string
       output: never[]
+      healthStatus?: 'running'
       pendingScrollback?: string[]
       transcript?: string
       // R3: DEC private-mode snapshot replayed before pendingScrollback on mount.
@@ -937,14 +938,14 @@ async function restoreFromLayout(
             const result = await terminalApi.spawn(
               agentSpawnOptions
                 ? {
-                    conversationId,
+                    ...(conversationId ? { conversationId } : {}),
                     projectId,
                     cwd: persistedTerminal.cwd,
                     ...agentSpawnOptions,
                     ...(spawnEnv ? { env: spawnEnv } : {})
                   }
                 : {
-                    conversationId,
+                    ...(conversationId ? { conversationId } : {}),
                     projectId,
                     shell: normalizedShell,
                     cwd: persistedTerminal.cwd,
@@ -1011,12 +1012,13 @@ async function restoreFromLayout(
         idMap.set(persistedTerminal.id, newId)
         newTerminals.push({
           id: newId,
-          conversationId,
+          ...(conversationId ? { conversationId } : {}),
           name: persistedTerminal.name,
           projectId,
           shell: normalizedShell,
           cwd: persistedTerminal.cwd,
           output: [],
+          healthStatus: 'running',
           viewState: 'visible',
           pendingScrollback: persistedTerminal.scrollback,
           transcript: persistedTerminal.transcript,
@@ -1121,10 +1123,7 @@ async function createDefaultTerminal(
   isCancelled: () => boolean
 ): Promise<RestoreExecutionResult> {
   const defaultId = `default-${randomUUID().slice(0, 5)}`
-  const conversationId = useSessionWorkspaceSyncStore.getState().activeConversationId
-  if (!conversationId) {
-    return { status: 'blocked', path: 'default-terminal' }
-  }
+  const conversationId = useSessionWorkspaceSyncStore.getState().activeConversationId ?? undefined
 
   // FIX #2: Use proper lock acquire/release with owner tracking
   if (!acquireGlobalSpawnLock(defaultId)) {
@@ -1218,7 +1217,7 @@ async function createDefaultTerminal(
         const result = await terminalApi.spawn({
           shell,
           cwd,
-          conversationId,
+          ...(conversationId ? { conversationId } : {}),
           projectId,
           ...(hasProjectEnv ? { env } : {})
         })
@@ -1296,7 +1295,11 @@ async function createDefaultTerminal(
     useTerminalStore.setState((state) => ({
       terminals: state.terminals.map((terminal) =>
         terminal.id === newTerminal.id
-          ? { ...terminal, conversationId, viewState: 'visible' }
+          ? {
+              ...terminal,
+              ...(conversationId ? { conversationId } : {}),
+              viewState: 'visible'
+            }
           : terminal
       )
     }))

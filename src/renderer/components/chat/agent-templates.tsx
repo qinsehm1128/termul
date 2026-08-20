@@ -36,7 +36,8 @@ export const AGENT_TEMPLATES: AgentTemplate[] = [
   {
     id: 'gemini',
     label: 'Gemini CLI',
-    notes: "Google's official CLI for Gemini. Runs via npx.",
+    notes:
+      "Google's official CLI for Gemini. First launch installs locally; later launches skip npx.",
     icon: GeminiIcon,
     config: {
       name: 'Gemini CLI',
@@ -49,7 +50,8 @@ export const AGENT_TEMPLATES: AgentTemplate[] = [
   {
     id: 'claude-acp',
     label: 'Claude Agent',
-    notes: "ACP wrapper for Anthropic's Claude. Runs via npx.",
+    notes:
+      "ACP wrapper for Anthropic's Claude. First launch installs locally; later launches skip npx.",
     config: {
       name: 'Claude Agent',
       command: 'npx',
@@ -61,7 +63,8 @@ export const AGENT_TEMPLATES: AgentTemplate[] = [
   {
     id: 'codex-acp',
     label: 'Codex CLI',
-    notes: "ACP adapter for OpenAI's Codex. Runs via npx.",
+    notes:
+      "ACP adapter for OpenAI's Codex. First launch installs locally; later launches skip npx.",
     icon: CodexIcon,
     config: {
       name: 'Codex CLI',
@@ -74,7 +77,8 @@ export const AGENT_TEMPLATES: AgentTemplate[] = [
   {
     id: 'github-copilot-cli',
     label: 'GitHub Copilot',
-    notes: "GitHub's AI pair programmer CLI. Runs via npx.",
+    notes:
+      "GitHub's AI pair programmer CLI. First launch installs locally; later launches skip npx.",
     icon: CopilotIcon,
     config: {
       name: 'GitHub Copilot',
@@ -87,7 +91,8 @@ export const AGENT_TEMPLATES: AgentTemplate[] = [
   {
     id: 'qwen-code',
     label: 'Qwen Code',
-    notes: "Alibaba's Qwen coding assistant. Runs via npx.",
+    notes:
+      "Alibaba's Qwen coding assistant. First launch installs locally; later launches skip npx.",
     icon: QwenIcon,
     config: {
       name: 'Qwen Code',
@@ -152,7 +157,7 @@ export const AGENT_TEMPLATES: AgentTemplate[] = [
   {
     id: 'cline',
     label: 'Cline',
-    notes: 'Autonomous coding agent CLI. Runs via npx.',
+    notes: 'Autonomous coding agent CLI. First launch installs locally; later launches skip npx.',
     config: {
       name: 'Cline',
       command: 'npx',
@@ -164,7 +169,7 @@ export const AGENT_TEMPLATES: AgentTemplate[] = [
   {
     id: 'auggie',
     label: 'Auggie CLI',
-    notes: "Augment Code's software agent. Runs via npx.",
+    notes: "Augment Code's software agent. First launch installs locally; later launches skip npx.",
     config: {
       name: 'Auggie CLI',
       command: 'npx',

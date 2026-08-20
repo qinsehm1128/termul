@@ -71,6 +71,8 @@ export interface SessionConfigOptionValue {
   value: string
   name: string
   description?: string | null
+  /** Provider/family heading when the agent advertised grouped select options. */
+  group?: string
 }
 
 export interface SessionConfigOption {
@@ -750,6 +752,12 @@ export async function acpSetFirstPromptWarmupTimeout(secs: number | null): Promi
   await getAcpTransport().setFirstPromptWarmupTimeout(secs)
 }
 
+// Prefer host-owned local npm install for `npx -y` agents, or always use npx.
+// Desktop-only: the WS transport no-ops on the standalone server.
+export async function acpSetPreferLocalNpmInstall(prefer: boolean): Promise<void> {
+  await getAcpTransport().setPreferLocalNpmInstall(prefer)
+}
+
 // --- Event subscription ----------------------------------------------------
 
 /**
@@ -784,6 +792,7 @@ export const acpApi = {
   setSessionNewTimeout: acpSetSessionNewTimeout,
   setSessionReopenTimeout: acpSetSessionReopenTimeout,
   setFirstPromptWarmupTimeout: acpSetFirstPromptWarmupTimeout,
+  setPreferLocalNpmInstall: acpSetPreferLocalNpmInstall,
   installRegistryBinary: acpInstallRegistryBinary,
   installAcpAgent: acpInstallAcpAgent,
   probeRuntime: acpProbeRuntime,

@@ -31,8 +31,9 @@ use crate::conversation::catalog::{CatalogAdmissionMetrics, ConversationCatalogG
 use crate::conversation::contracts::{
     encoded_json_len_bounded, AgentSessionBinding, AgentSessionBindingState, ConversationErrorCode,
     ConversationHistorySummaryV1, ConversationId, ConversationLifecycleState, ConversationRecordV2,
-    ExecutionTarget, ProjectAttachment, AGENT_SESSION_BINDING_SCHEMA_VERSION,
-    CONVERSATION_SCHEMA_VERSION, MAX_CONVERSATION_RECORD_BYTES, PROJECT_ATTACHMENT_SCHEMA_VERSION,
+    ConversationTitleSource, ExecutionTarget, ProjectAttachment,
+    AGENT_SESSION_BINDING_SCHEMA_VERSION, CONVERSATION_SCHEMA_VERSION,
+    MAX_CONVERSATION_RECORD_BYTES, PROJECT_ATTACHMENT_SCHEMA_VERSION,
 };
 use crate::conversation::durable_fs::{DirectoryPermissions, DurableFileSystem};
 use crate::conversation::event_log::{
@@ -106,6 +107,8 @@ pub(crate) fn bootstrap_scan_metrics<'a>(
 pub struct ConversationMetadataUpdate {
     pub lifecycle_state: Option<ConversationLifecycleState>,
     pub execution_target: Option<ExecutionTarget>,
+    pub title: Option<String>,
+    pub title_source: Option<ConversationTitleSource>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -247,6 +250,21 @@ impl CatalogFlushCoordinator {
         frontier: &ConversationFrontier,
     ) -> u64 {
         let generation = self.admit_generation(record, frontier);
+        self.wake.notify_waiters();
+        self.schedule();
+        generation
+    }
+
+    fn remove(self: &Arc<Self>, conversation_id: ConversationId) -> u64 {
+        let now = Instant::now();
+        let generation = {
+            let mut state = self.state.lock();
+            let generation = state.catalog.remove(conversation_id);
+            state.first_dirty_at.get_or_insert(now);
+            state.last_dirty_at = Some(now);
+            state.last_conversation_id = Some(conversation_id);
+            generation
+        };
         self.wake.notify_waiters();
         self.schedule();
         generation
@@ -1091,6 +1109,29 @@ impl ConversationRepository {
         recovery_items.extend(scan_workspace_recovery(&rebuilt.accepted));
 
         let mut recovered_incomplete = false;
+        let mut purged_deleted = false;
+        rebuilt.accepted.retain(|accepted| {
+            if accepted.record.lifecycle_state != ConversationLifecycleState::Deleted {
+                return true;
+            }
+            purged_deleted = true;
+            if let Err(error) = remove_conversation_directory(
+                &accepted.directory,
+                locator.root(),
+                accepted.record.conversation_id,
+            ) {
+                log::warn!(
+                    "[conversation-repository] leftover deleted conversation purge failed conversation_id={} error={error}",
+                    accepted.record.conversation_id
+                );
+            } else {
+                log::info!(
+                    "[conversation-repository] leftover deleted conversation purged conversation_id={}",
+                    accepted.record.conversation_id
+                );
+            }
+            false
+        });
         for accepted in &mut rebuilt.accepted {
             let mut changed = reconcile_metadata(accepted)?;
             if accepted.record.lifecycle_state == ConversationLifecycleState::InitializingAgent {
@@ -1116,7 +1157,7 @@ impl ConversationRepository {
             }
         }
 
-        if recovered_incomplete {
+        if recovered_incomplete || purged_deleted {
             rebuilt = rebuild_catalog(&locator, &durable_fs).map_err(|error| {
                 repository_error(
                     ConversationErrorCode::ConversationRecoveryRequired,
@@ -1525,7 +1566,8 @@ impl ConversationRepository {
                 item.detail,
             ));
         }
-        self.states
+        let mut record = self
+            .states
             .lock()
             .get(&conversation_id)
             .map(|state| state.record.clone())
@@ -1536,7 +1578,14 @@ impl ConversationRepository {
                     Some(conversation_id),
                     "canonical Conversation was not found".to_string(),
                 )
-            })
+            })?;
+        if record.title.is_none() {
+            if let Ok(summary) = self.history_summary(conversation_id) {
+                record.title = summary.title;
+                record.title_source = summary.title_source;
+            }
+        }
+        Ok(record)
     }
 
     #[must_use]
@@ -1547,6 +1596,16 @@ impl ConversationRepository {
             .values()
             .map(|state| state.record.clone())
             .collect::<Vec<_>>();
+        // Untitled records fall back to the event-log derived title so lists
+        // show the first-question prefix instead of opaque ids.
+        for record in records.iter_mut() {
+            if record.title.is_none() {
+                if let Ok(summary) = self.history_summary(record.conversation_id) {
+                    record.title = summary.title;
+                    record.title_source = summary.title_source;
+                }
+            }
+        }
         records.sort_by_key(|record| record.conversation_id.to_string());
         records
     }
@@ -1572,6 +1631,12 @@ impl ConversationRepository {
         }
         if let Some(execution_target) = update.execution_target {
             record.execution_target = execution_target;
+        }
+        if let Some(title) = update.title {
+            record.title = Some(title);
+        }
+        if let Some(title_source) = update.title_source {
+            record.title_source = Some(title_source);
         }
         self.persist_record_metadata(&record, "update_metadata")?;
         self.states
@@ -2102,6 +2167,32 @@ impl ConversationRepository {
         )
     }
 
+    /// Delete may release Active or Detached bindings after a best-effort ACP close.
+    pub(crate) fn release_binding_for_delete_locked(
+        &self,
+        permit: &RepositoryWritePermit,
+        conversation_id: ConversationId,
+        recorded_at_utc: DateTime<Utc>,
+    ) -> Result<Option<ConversationEventRecordV2>> {
+        self.validate_write_permit(permit, conversation_id, "release_binding_for_delete")?;
+        let Some(mut binding) = self.current_binding(conversation_id)? else {
+            return Ok(None);
+        };
+        if !matches!(
+            binding.state,
+            AgentSessionBindingState::Active | AgentSessionBindingState::Detached
+        ) {
+            return Ok(None);
+        }
+        binding.state = AgentSessionBindingState::Suspended;
+        Ok(Some(self.append_event_locked(
+            conversation_id,
+            recorded_at_utc,
+            ConversationEventType::BindingSuspended,
+            serde_json::to_value(BindingEventPayloadV1 { binding }).expect("binding serializes"),
+        )?))
+    }
+
     pub(crate) fn replace_agent_binding_locked(
         &self,
         permit: &RepositoryWritePermit,
@@ -2541,10 +2632,8 @@ impl ConversationRepository {
         Ok(())
     }
 
-    /// Stage-2 deletion is a durable tombstone only. Physical removal and blocker policy belong to
-    /// the explicit lifecycle service.
-    // Retained as the single-operation authority API; lifecycle deletion uses the locked variant
-    // to combine blocker checks, terminal cleanup, and the tombstone under one revision gate.
+    /// Explicit delete removes the Conversation from the live repository and
+    /// deletes its private directory. This is not an archive/tombstone.
     #[allow(dead_code)]
     pub(crate) async fn mark_deleted(
         self: &Arc<Self>,
@@ -2553,38 +2642,36 @@ impl ConversationRepository {
     ) -> Result<ConversationRecordV2> {
         self.validate_write_permit(permit, conversation_id, "mark_deleted")?;
         let guard = self.lifecycle_lock(conversation_id).await;
-        let record = self.tombstone_conversation_locked(permit, conversation_id)?;
+        let record = self.purge_conversation_locked(permit, conversation_id)?;
         drop(guard);
-        self.mark_catalog_entry_dirty(conversation_id);
         Ok(record)
     }
 
-    pub(crate) fn tombstone_conversation_locked(
-        &self,
+    pub(crate) fn purge_conversation_locked(
+        self: &Arc<Self>,
         permit: &RepositoryWritePermit,
         conversation_id: ConversationId,
     ) -> Result<ConversationRecordV2> {
-        self.validate_write_permit(permit, conversation_id, "tombstone_conversation")?;
-        self.check_recovery(conversation_id, "tombstone_conversation")?;
-        let mut record = self
+        self.validate_write_permit(permit, conversation_id, "purge_conversation")?;
+        self.check_recovery(conversation_id, "purge_conversation")?;
+        let record = self
             .states
             .lock()
             .get(&conversation_id)
             .map(|state| state.record.clone())
-            .ok_or_else(|| not_found("tombstone_conversation", conversation_id))?;
-        if record.lifecycle_state == ConversationLifecycleState::Deleted {
-            return Ok(record);
-        }
-        record.lifecycle_state = ConversationLifecycleState::Deleted;
-        self.persist_record_metadata(&record, "tombstone_conversation")?;
-        self.states
+            .ok_or_else(|| not_found("purge_conversation", conversation_id))?;
+        let directory = self.conversation_dir(&record, "purge_conversation")?;
+        remove_conversation_directory(&directory, self.locator.root(), conversation_id)?;
+        self.states.lock().remove(&conversation_id);
+        self.recovery_by_id.lock().remove(&conversation_id);
+        self.recovery_items
             .lock()
-            .get_mut(&conversation_id)
-            .expect("per-Conversation lock preserves state")
-            .record = record.clone();
-        self.refresh_binding_index_for_conversation(conversation_id);
+            .retain(|item| item.conversation_id != Some(conversation_id));
+        self.active_tail_cache.lock().invalidate(conversation_id);
+        self.binding_index.lock().remove(conversation_id);
+        self.catalog_flush.remove(conversation_id);
         log::info!(
-            "[conversation-repository] conversation deletion tombstoned conversation_id={}",
+            "[conversation-repository] conversation purged conversation_id={}",
             conversation_id
         );
         Ok(record)
@@ -3213,6 +3300,48 @@ fn reconcile_metadata(accepted: &mut AcceptedCanonicalConversation) -> Result<bo
     Ok(current != accepted.record)
 }
 
+fn remove_conversation_directory(
+    directory: &Path,
+    private_root: &Path,
+    conversation_id: ConversationId,
+) -> Result<()> {
+    let canonical_root = private_root.canonicalize().map_err(|error| {
+        repository_error(
+            ConversationErrorCode::ConversationPathEscape,
+            "purge_conversation",
+            Some(conversation_id),
+            format!("private root cannot be resolved: {error}"),
+        )
+    })?;
+    match directory.canonicalize() {
+        Ok(canonical_dir) => {
+            if !canonical_dir.starts_with(&canonical_root) || canonical_dir == canonical_root {
+                return Err(repository_error(
+                    ConversationErrorCode::ConversationPathEscape,
+                    "purge_conversation",
+                    Some(conversation_id),
+                    "conversation directory is outside the private root".to_string(),
+                ));
+            }
+            fs::remove_dir_all(&canonical_dir).map_err(|error| {
+                repository_error(
+                    ConversationErrorCode::ConversationDurabilityFailed,
+                    "purge_conversation",
+                    Some(conversation_id),
+                    format!("conversation directory could not be removed: {error}"),
+                )
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(repository_error(
+            ConversationErrorCode::ConversationDurabilityFailed,
+            "purge_conversation",
+            Some(conversation_id),
+            format!("conversation directory cannot be resolved: {error}"),
+        )),
+    }
+}
+
 fn persist_metadata_at(
     durable_fs: &DurableFileSystem,
     directory: &Path,
@@ -3473,6 +3602,8 @@ mod tests {
             lifecycle_state: ConversationLifecycleState::InitializingAgent,
             last_seq: 0,
             created_by: ConversationCreator::Termul,
+            title: None,
+            title_source: None,
         }
     }
 
@@ -3535,6 +3666,87 @@ mod tests {
         );
         assert_eq!(fs::read(workspace.join("user-file.txt")).unwrap(), b"keep");
         assert_eq!(fs::read_dir(&workspace).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn mark_deleted_removes_conversation_from_repository_and_disk() {
+        let (_temp, repository, writer) = fixture();
+        let mut value = record();
+        value.lifecycle_state = ConversationLifecycleState::Ready;
+        writer
+            .create_conversation(value.clone(), ConversationMutation::CreateConversation)
+            .await
+            .unwrap();
+        let conversation_id = value.conversation_id;
+        let directory = repository
+            .locator
+            .private_dir(conversation_id, &value.creation_partition)
+            .unwrap();
+        assert!(directory.exists());
+        writer.mark_deleted(conversation_id).await.unwrap();
+        assert!(repository.get_conversation(conversation_id).is_err());
+        assert!(!directory.exists());
+        assert!(repository
+            .list_conversations()
+            .iter()
+            .all(|record| record.conversation_id != conversation_id));
+        let root = repository.root().to_path_buf();
+        drop(writer);
+        drop(repository);
+        let (reopened, _) = ConversationRepository::open(root).unwrap();
+        assert!(reopened.get_conversation(conversation_id).is_err());
+        assert!(reopened
+            .list_conversations()
+            .iter()
+            .all(|record| record.conversation_id != conversation_id));
+    }
+
+    #[tokio::test]
+    async fn leftover_deleted_metadata_is_purged_on_open_instead_of_resurrected() {
+        let (_temp, repository, writer) = fixture();
+        let mut value = record();
+        value.lifecycle_state = ConversationLifecycleState::Ready;
+        writer
+            .create_conversation(value.clone(), ConversationMutation::CreateConversation)
+            .await
+            .unwrap();
+        let conversation_id = value.conversation_id;
+        writer
+            .bind_agent_session(
+                conversation_id,
+                binding("b2832b54-2ca4-4db4-93fd-f93bf6793114", "agent/opaque:first"),
+                time(16),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .get_conversation(conversation_id)
+                .unwrap()
+                .lifecycle_state,
+            ConversationLifecycleState::Ready
+        );
+        let directory = repository
+            .locator
+            .private_dir(conversation_id, &value.creation_partition)
+            .unwrap();
+        let mut leftover = repository.get_conversation(conversation_id).unwrap();
+        leftover.lifecycle_state = ConversationLifecycleState::Deleted;
+        fs::write(
+            directory.join(CONVERSATION_METADATA_FILE),
+            serde_json::to_vec_pretty(&leftover).unwrap(),
+        )
+        .unwrap();
+        let root = repository.root().to_path_buf();
+        drop(writer);
+        drop(repository);
+        let (reopened, _) = ConversationRepository::open(root).unwrap();
+        assert!(reopened.get_conversation(conversation_id).is_err());
+        assert!(!directory.exists());
+        assert!(reopened
+            .list_conversations()
+            .iter()
+            .all(|record| record.conversation_id != conversation_id));
     }
 
     #[tokio::test]

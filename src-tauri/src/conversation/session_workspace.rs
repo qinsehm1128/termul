@@ -107,7 +107,10 @@ pub enum SessionWorkspaceProjectionState {
         source_sha256: String,
         #[serde(rename = "projectedResourceCount", alias = "projected_resource_count")]
         projected_resource_count: usize,
-        #[serde(rename = "unresolvedResourceCount", alias = "unresolved_resource_count")]
+        #[serde(
+            rename = "unresolvedResourceCount",
+            alias = "unresolved_resource_count"
+        )]
         unresolved_resource_count: usize,
     },
     RecoveryRequired {
@@ -1673,6 +1676,8 @@ mod tests {
                         lifecycle_state: ConversationLifecycleState::Ready,
                         last_seq: 0,
                         created_by: ConversationCreator::Termul,
+                        title: None,
+                        title_source: None,
                     },
                     ConversationMutation::CreateConversation,
                 )

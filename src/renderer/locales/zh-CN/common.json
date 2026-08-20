@@ -120,6 +120,7 @@
     "projectless": "无项目",
     "projectView": "项目会话",
     "empty": "此视图中没有匹配的会话。",
+    "untitled": "未命名对话",
     "loadMore": "再加载 {{count}} 个",
     "recoveryBadge_one": "{{count}} 个恢复项",
     "recoveryBadge_other": "{{count}} 个恢复项"

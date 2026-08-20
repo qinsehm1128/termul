@@ -648,7 +648,10 @@ impl RemoteServerState {
                 return RemoteStatus::running(
                     slot.as_ref().expect("retry-owned server").addr,
                     slot.as_ref().expect("retry-owned server").bind_mode,
-                    slot.as_ref().expect("retry-owned server").tunnel_url.clone(),
+                    slot.as_ref()
+                        .expect("retry-owned server")
+                        .tunnel_url
+                        .clone(),
                     slot.as_ref()
                         .and_then(|server| server.credential_lease.as_ref()),
                 );
@@ -959,7 +962,10 @@ mod tests {
         assert!(state.status().running);
         let (generation, _) = active_credential(&state);
         crate::secure_storage::fail_next_keyring_deletes_for_tests(1);
-        let error = state.stop().await.expect_err("keyring delete must fail stop");
+        let error = state
+            .stop()
+            .await
+            .expect_err("keyring delete must fail stop");
         assert_eq!(error, "REMOTE_CREDENTIAL_CLEANUP_FAILED");
         assert!(
             state.status().running,
@@ -968,7 +974,10 @@ mod tests {
         let (retry_generation, _) = active_credential(&state);
         assert_eq!(retry_generation, generation);
         crate::secure_storage::fail_next_keyring_deletes_for_tests(0);
-        let stopped = state.stop().await.expect("retry stop succeeds after keyring recovers");
+        let stopped = state
+            .stop()
+            .await
+            .expect("retry stop succeeds after keyring recovers");
         assert!(!stopped.running);
     }
 

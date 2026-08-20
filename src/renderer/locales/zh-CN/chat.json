@@ -153,7 +153,7 @@
       },
       "delete": {
         "title": "删除对话？",
-        "message": "要为“{{title}}”写入删除标记吗？如果代理绑定或终端资源仍存活，操作会被拒绝。",
+        "message": "将永久删除“{{title}}”及其工作区目录（含其中的文件）。仍在运行的代理会话和终端进程会一并结束。",
         "confirm": "删除对话"
       }
     },
@@ -166,7 +166,7 @@
     },
     "blocked": {
       "title": "对话仍有存活资源",
-      "description": "请先处理这些资源：{{resources}}"
+      "description": "无法结束这些终端进程，删除已取消：{{resources}}"
     },
     "errors": {
       "CONVERSATION_CONFLICT": "对话已发生变化，请刷新后重试。",
@@ -175,7 +175,7 @@
       "CONVERSATION_BINDING_NOT_ACTIVE": "此操作需要活动的代理绑定。",
       "CONVERSATION_BINDING_NOT_DETACHED": "此操作需要已分离的代理绑定。",
       "CONVERSATION_BINDING_NOT_ADDRESSABLE": "已分离的代理会话已无法访问。",
-      "CONVERSATION_LIVE_RESOURCES": "删除前请先处理存活的代理或终端资源。",
+      "CONVERSATION_LIVE_RESOURCES": "仍有终端进程无法结束，删除已取消。",
       "CONVERSATION_RECOVERY_REQUIRED": "执行此操作前需要先恢复对话。",
       "CONVERSATION_DURABILITY_FAILED": "无法安全保存生命周期变更。",
       "ACP_CLOSE_UNSUPPORTED": "此代理不支持暂停。",
@@ -184,7 +184,13 @@
       "VALIDATION_ERROR": "生命周期请求无效。",
       "FORBIDDEN": "当前连接不允许执行此生命周期操作。",
       "NETWORK_ERROR": "生命周期请求无法连接到主机。"
-    }
+    },
+    "rename": "重命名",
+    "renameTitle": "重命名对话",
+    "renamePlaceholder": "输入新名称（1-120 字符）",
+    "renameCancel": "取消",
+    "renameConfirm": "保存",
+    "renameSuccess": "已重命名"
   },
   "question": {
     "sendFailed": "无法发送回答，请重试。",

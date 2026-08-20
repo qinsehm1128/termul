@@ -1,5 +1,5 @@
 import { Bot, Brain } from 'lucide-react'
-import { type ReactNode, useState } from 'react'
+import { Fragment, type ReactNode, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import type { SessionConfigOption } from '@/lib/acp-api'
@@ -64,7 +64,7 @@ export function ConfigChip({
   const normalizedQuery = query.trim().toLowerCase()
   const filteredOptions = option.options.filter((value) => {
     if (!normalizedQuery) return true
-    return [value.name, value.value, value.description ?? '']
+    return [value.name, value.value, value.description ?? '', value.group ?? '']
       .join(' ')
       .toLowerCase()
       .includes(normalizedQuery)
@@ -101,32 +101,38 @@ export function ConfigChip({
           className="max-h-[180px] overflow-y-auto pr-1"
         >
           {filteredOptions.length > 0 ? (
-            filteredOptions.map((v) => (
-              <button
-                key={v.value}
-                type="button"
-                onPointerDown={(event) => {
-                  // Primary only; treat missing button as primary (jsdom/synthetic).
-                  if ((event.button ?? 0) !== 0) return
-                  // Prefer pointerdown so the choice lands before Radix closes the
-                  // controlled popover (click can lose the race and drop onSelect).
-                  event.preventDefault()
-                  handleSelect(v.value)
-                }}
-                // Keyboard activation (Enter/Space) fires click, not pointerdown;
-                // useOptimisticSelect ignores the repeat when both fire on mouse.
-                onClick={() => handleSelect(v.value)}
-                className={cn(
-                  SELECTOR_OPTION_ROW,
-                  v.value === displayValue && SELECTOR_OPTION_SELECTED
-                )}
-              >
-                <span className="font-medium">{v.name}</span>
-                {v.description && (
-                  <span className={SELECTOR_OPTION_DESCRIPTION}>{v.description}</span>
-                )}
-              </button>
-            ))
+            filteredOptions.map((v, index) => {
+              const prevGroup = filteredOptions[index - 1]?.group
+              const showGroup = Boolean(v.group && v.group !== prevGroup)
+              return (
+                <Fragment key={v.value}>
+                  {showGroup && <div className={SELECTOR_SECTION_LABEL}>{v.group}</div>}
+                  <button
+                    type="button"
+                    onPointerDown={(event) => {
+                      // Primary only; treat missing button as primary (jsdom/synthetic).
+                      if ((event.button ?? 0) !== 0) return
+                      // Prefer pointerdown so the choice lands before Radix closes the
+                      // controlled popover (click can lose the race and drop onSelect).
+                      event.preventDefault()
+                      handleSelect(v.value)
+                    }}
+                    // Keyboard activation (Enter/Space) fires click, not pointerdown;
+                    // useOptimisticSelect ignores the repeat when both fire on mouse.
+                    onClick={() => handleSelect(v.value)}
+                    className={cn(
+                      SELECTOR_OPTION_ROW,
+                      v.value === displayValue && SELECTOR_OPTION_SELECTED
+                    )}
+                  >
+                    <span className="font-medium">{v.name}</span>
+                    {v.description && (
+                      <span className={SELECTOR_OPTION_DESCRIPTION}>{v.description}</span>
+                    )}
+                  </button>
+                </Fragment>
+              )
+            })
           ) : (
             <div className="px-2 py-1.5 text-xs text-muted-foreground">
               {t('selectors.noModels')}

@@ -12,7 +12,7 @@ import { useProjectStore } from '@/stores/project-store'
 import { useRemoteStatus, useRemoteStatusStore } from '@/stores/remote-status-store'
 
 const statusBarTriggerClass =
-  'flex items-center hover:bg-white/10 px-2 py-0.5 rounded cursor-pointer transition-colors'
+  'flex cursor-pointer items-center rounded px-2 py-0.5 transition-colors hover:bg-muted hover:text-foreground'
 
 /**
  * StatusBar popover for remote agent access.

@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{
-    extract::{State, ws::WebSocketUpgrade},
+    extract::{ws::WebSocketUpgrade, State},
     http::{HeaderMap, StatusCode},
     middleware,
     response::IntoResponse,
@@ -169,6 +169,10 @@ fn api_routes(provenance: IngressProvenance) -> Router<AppState> {
             .route(
                 "/conversations/{conversationId}/open",
                 post(conversation_api::open),
+            )
+            .route(
+                "/conversations/{conversationId}/rename",
+                post(conversation_api::rename),
             )
             .route(
                 "/conversations/{conversationId}/attach-project",
@@ -388,7 +392,14 @@ async fn terminal_ws_upgrade_registered(
 ) -> impl IntoResponse {
     let registry = UpgradedConnectionRegistry::global();
     let _ticket = registry.register(UpgradedConnectionKind::Terminal, None);
-    terminal_ws_upgrade(ws, State(state), Extension(authority), Extension(principal), headers).await
+    terminal_ws_upgrade(
+        ws,
+        State(state),
+        Extension(authority),
+        Extension(principal),
+        headers,
+    )
+    .await
 }
 
 /// Liveness probe for the ACP web server.

@@ -423,6 +423,29 @@ impl ConversationCatalog {
         self.generation
     }
 
+    /// Drop a Conversation from the disposable catalog cache after a real delete.
+    pub fn remove(&mut self, conversation_id: ConversationId) -> u64 {
+        let target = conversation_id.to_string();
+        let chunks = Arc::make_mut(&mut self.chunks);
+        let mut removed = false;
+        for chunk_arc in chunks.iter_mut() {
+            let chunk = Arc::make_mut(chunk_arc);
+            if let Ok(index) =
+                chunk.binary_search_by_key(&target, |candidate| candidate.conversation_id.to_string())
+            {
+                chunk.remove(index);
+                removed = true;
+                break;
+            }
+        }
+        if !removed {
+            return self.generation;
+        }
+        chunks.retain(|chunk| !chunk.is_empty());
+        self.generation = self.generation.saturating_add(1);
+        self.generation
+    }
+
     /// Capture one immutable generation without serializing or flattening entries.
     #[must_use]
     pub fn capture(&self) -> ConversationCatalogGeneration {
@@ -646,9 +669,7 @@ pub fn rebuild_catalog(
         if let Some(execution_target) = &scan.frontier.execution_target {
             record.execution_target = execution_target.clone();
         }
-        if let Some(lifecycle_state) = scan.frontier.lifecycle_state {
-            record.lifecycle_state = lifecycle_state;
-        }
+        apply_scanned_lifecycle(&mut record, &scan.frontier);
         accepted.push(AcceptedCanonicalConversation {
             directory,
             record,
@@ -684,6 +705,18 @@ pub fn rebuild_catalog(
         recovery_issues,
         repairs,
     })
+}
+
+/// Leftover Deleted metadata from the old archive/tombstone path must not be
+/// resurrected to Ready by an event-log frontier. Physical delete removes the
+/// directory; this guard only protects residual tombstones until open-time purge.
+fn apply_scanned_lifecycle(record: &mut ConversationRecordV2, frontier: &ConversationFrontier) {
+    if record.lifecycle_state == ConversationLifecycleState::Deleted {
+        return;
+    }
+    if let Some(lifecycle_state) = frontier.lifecycle_state {
+        record.lifecycle_state = lifecycle_state;
+    }
 }
 
 fn entry_from_frontier(
@@ -1000,6 +1033,8 @@ mod tests {
             lifecycle_state: ConversationLifecycleState::Ready,
             last_seq: 0,
             created_by: ConversationCreator::Termul,
+            title: None,
+            title_source: None,
         }
     }
 
@@ -1077,6 +1112,21 @@ mod tests {
                 .unwrap();
         }
         directory
+    }
+
+    #[test]
+    fn catalog_remove_drops_the_entry() {
+        let mut catalog = ConversationCatalog::from_file(ConversationCatalogFileV1 {
+            schema_version: CATALOG_SCHEMA_VERSION,
+            generated_at_utc: EMPTY_CATALOG_GENERATED_AT_UTC.to_string(),
+            conversations: Vec::new(),
+        });
+        let value = record(FIRST, "2026-08-15T09:45:15.000Z");
+        catalog.upsert(&value, &ConversationFrontier::default());
+        assert_eq!(catalog.len(), 1);
+        catalog.remove(value.conversation_id);
+        assert!(catalog.is_empty());
+        assert_eq!(catalog.len(), 0);
     }
 
     #[test]

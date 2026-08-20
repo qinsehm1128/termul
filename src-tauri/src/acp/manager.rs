@@ -870,10 +870,10 @@ fn circuit_map_insert_for_tests(
     code: &'static str,
     opened_at: std::time::Instant,
 ) {
-    circuits.lock().entries.insert(
-        session_id.to_string(),
-        CircuitEntry { code, opened_at },
-    );
+    circuits
+        .lock()
+        .entries
+        .insert(session_id.to_string(), CircuitEntry { code, opened_at });
 }
 
 fn fan_out_session<P: Serialize>(
@@ -888,15 +888,7 @@ fn fan_out_session<P: Serialize>(
     }
     let result = events::fan_out(sinks, Some(session_id), type_, payload);
     if let Err(error) = &result {
-        let retryable = matches!(
-            error.source_code,
-            Some(
-                "CONVERSATION_PERSISTENCE_BYTES_SATURATED"
-                    | "CONVERSATION_PERSISTENCE_QUEUE_SATURATED"
-                    | "SESSION_PERSISTENCE_QUEUE_FULL"
-            )
-        );
-        if error.is_durable_rejection() && !retryable {
+        if error.should_open_session_circuit() {
             circuits.lock().insert(
                 session_id.to_string(),
                 error
@@ -926,7 +918,7 @@ async fn fan_out_session_committed<P: Serialize>(
     }
     let result = events::deliver(sinks, persistence, Some(session_id), type_, payload).await;
     if let Err(error) = &result {
-        if error.is_durable_rejection() && !error.is_retryable() {
+        if error.should_open_session_circuit() {
             circuits.lock().insert(
                 session_id.to_string(),
                 error
@@ -1166,6 +1158,24 @@ impl AcpManager {
         self.conversation_creation.clone()
     }
 
+    /// Resolve a currently connected runtime agent by its durable renderer config id.
+    ///
+    /// Scheduled tasks persist only the stable config id, never launch environment
+    /// values or credentials. A host can therefore execute a task only while the
+    /// matching agent is connected; otherwise the run is recorded as
+    /// `AGENT_UNAVAILABLE` and may be retried explicitly after the agent starts.
+    #[must_use]
+    pub fn find_agent_by_config_id(&self, config_id: &str) -> Option<AgentId> {
+        let namespace = format!("config:{}", config_id.trim());
+        self.agents
+            .lock()
+            .iter()
+            .find_map(|(agent_id, entry)| {
+                (entry.stable_namespace.as_deref() == Some(namespace.as_str()))
+                    .then(|| agent_id.clone())
+            })
+    }
+
     #[must_use]
     pub fn conversation_id_for_current_session(
         &self,
@@ -1202,6 +1212,18 @@ impl AcpManager {
     /// synchronously from the response (CAP-4: the spawn response — not the
     /// async event — is the source of truth).
     pub async fn spawn(&self, config: AgentConfig) -> Result<SpawnOutcome, String> {
+        let config = match tokio::task::spawn_blocking({
+            let config = config.clone();
+            move || crate::acp::npm_local::materialize_npx_config(config)
+        })
+        .await
+        {
+            Ok(next) => next,
+            Err(error) => {
+                log::warn!("[acp-npm] materialize join failed: {error}");
+                config
+            }
+        };
         self.spawn_with_sinks(config, self.sinks.clone()).await
     }
 
@@ -2879,7 +2901,7 @@ async fn drive_connection(
                         // Backpressure cancels only the current turn; draining capacity admits a
                         // later submission and never opens a permanent session circuit.
                         notif_state.lock().signal_cancel(&session_id);
-                    } else if error.is_durable_rejection() {
+                    } else if error.should_open_session_circuit() {
                         notif_circuits.lock().insert(
                             session_id.clone(),
                             error.source_code.unwrap_or(CONVERSATION_PERSISTENCE_REJECTED),
@@ -4194,6 +4216,10 @@ async fn run_command_loop(
                                 &event,
                             ) {
                                 Ok(_) => send_reply(&task_slot, Ok(())),
+                                Err(error) if error.is_unbound_session() => {
+                                    log_delivery_error("set_model", &error);
+                                    send_reply(&task_slot, Ok(()));
+                                }
                                 Err(error) => {
                                     log_delivery_error("set_model", &error);
                                     send_reply(&task_slot, Err(error.code.to_string()));
@@ -4248,6 +4274,10 @@ async fn run_command_loop(
                                 &event,
                             ) {
                                 Ok(_) => send_reply(&task_slot, Ok(response.config_options)),
+                                Err(error) if error.is_unbound_session() => {
+                                    log_delivery_error("set_config_option", &error);
+                                    send_reply(&task_slot, Ok(response.config_options));
+                                }
                                 Err(error) => {
                                     log_delivery_error("set_config_option", &error);
                                     send_reply(&task_slot, Err(error.code.to_string()));

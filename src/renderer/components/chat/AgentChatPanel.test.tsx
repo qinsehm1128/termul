@@ -5,6 +5,7 @@ import type { AcpSession } from '@/stores/acp-store'
 
 const {
   mockOpen,
+  mockReconnect,
   mockOpenDiscovered,
   mockRetryHistory,
   sessionRef,
@@ -20,6 +21,7 @@ const {
   discoveredContextRef
 } = vi.hoisted(() => ({
   mockOpen: vi.fn(),
+  mockReconnect: vi.fn(),
   mockOpenDiscovered: vi.fn(),
   mockRetryHistory: vi.fn(),
   // AcpSession shape; typed loosely here because vi.hoisted runs before the
@@ -71,6 +73,7 @@ vi.mock('@/stores/acp-store', () => {
     discoveredReopenContexts: discoveredContextRef.current,
     transportReconnecting: transportReconnectingRef.current,
     openHistorySession: mockOpen,
+    reconnectClosedSession: mockReconnect,
     retryHistoryBackfill: mockRetryHistory,
     openDiscoveredSession: mockOpenDiscovered,
     sendPrompt: vi.fn(),
@@ -103,8 +106,15 @@ vi.mock('@/hooks/use-mobile-web-shell', () => ({
 
 // Child components pull in heavy chat rendering; the states under test render
 // before any of them mount.
+vi.mock('@/components/agents/AgentLauncher', () => ({
+  AgentLauncher: () => <div data-testid="agent-launcher" />
+}))
 vi.mock('./ChatErrorNotice', () => ({ ChatErrorNotice: () => null }))
-vi.mock('./ChatInputBar', () => ({ ChatInputBar: () => null }))
+vi.mock('./ChatInputBar', () => ({
+  ChatInputBar: ({ disabled }: { disabled?: boolean }) => (
+    <div data-testid="chat-input-bar" data-disabled={disabled ? 'true' : 'false'} />
+  )
+}))
 vi.mock('./ChatMessageList', () => ({
   ChatMessageList: ({ items }: { items: unknown[] }) => (
     <div data-testid="message-list" data-message-count={items.length} />
@@ -141,6 +151,7 @@ function seedLiveSession(id: string, lastError: string | null = null): void {
 describe('AgentChatPanel restored-tab rehydration', () => {
   beforeEach(() => {
     mockOpen.mockReset().mockResolvedValue(undefined)
+    mockReconnect.mockReset().mockResolvedValue('s1')
     mockOpenDiscovered.mockReset().mockResolvedValue(undefined)
     mockRetryHistory.mockReset().mockResolvedValue(undefined)
     sessionRef.current = null
@@ -255,7 +266,8 @@ describe('AgentChatPanel restored-tab rehydration', () => {
     indexRef.current = [{ id: 's1' }]
     render(<AgentChatPanel sessionId="s1" isVisible />)
     fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
-    expect(mockOpen).toHaveBeenCalledWith('s1')
+    expect(mockReconnect).toHaveBeenCalledWith('s1')
+    expect(mockOpen).not.toHaveBeenCalled()
   })
 
   it('renders aria-live per-page history progress with the retained transcript on phone and desktop DOM', () => {
@@ -332,6 +344,7 @@ describe('AgentChatPanel restored-tab rehydration', () => {
     fireEvent.click(retryHistory)
     expect(mockRetryHistory).toHaveBeenCalledWith('s1')
     expect(mockOpen).not.toHaveBeenCalled()
+    expect(mockReconnect).not.toHaveBeenCalled()
     expect(screen.getByTestId('message-list')).toHaveAttribute('data-message-count', '1')
 
     backfillRef.current = {
@@ -358,12 +371,21 @@ describe('AgentChatPanel restored-tab rehydration', () => {
     expect(screen.getByText(/read-only/)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Reconnect' })).toBeInTheDocument()
   })
+
+  it('keeps the existing composer instead of the new-chat launcher when a closed conversation is open', () => {
+    seedLiveSession('s1')
+    indexRef.current = [{ id: 's1' }]
+    render(<AgentChatPanel sessionId="s1" paneId="pane-1" isVisible />)
+    expect(screen.getByTestId('chat-input-bar')).toHaveAttribute('data-disabled', 'true')
+    expect(screen.queryByTestId('agent-launcher')).not.toBeInTheDocument()
+  })
 })
 
 // Story 5.3 (AC1, AC3, AC4) — OSK spacer + reconnect overlay.
 describe('AgentChatPanel OSK + reconnect overlay (Story 5.3)', () => {
   beforeEach(() => {
     mockOpen.mockReset().mockResolvedValue(undefined)
+    mockReconnect.mockReset().mockResolvedValue('s1')
     mockOpenDiscovered.mockReset().mockResolvedValue(undefined)
     mockRetryHistory.mockReset().mockResolvedValue(undefined)
     sessionRef.current = null

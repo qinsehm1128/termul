@@ -9,7 +9,7 @@
  *   const result = await shellApi.getAvailableShells()
  */
 
-import type { DetectedShells, IpcResult, ShellApi } from '@shared/types/ipc.types'
+import type { DetectedShells, IpcResult, ShellApi, ShellInfo } from '@shared/types/ipc.types'
 import { type InvokeArgs, invoke } from '@tauri-apps/api/core'
 import { isTauriContext } from './tauri-runtime'
 import { webServerShell } from './web-server-api'
@@ -93,4 +93,10 @@ export const shellApi: ShellApi = createTauriShellApi()
 export function _resetShellCacheForTesting(): void {
   cachedShells = null
   shellCachePromise = null
+}
+
+/** Match a detected shell against a stored default (name or absolute path). */
+export function isPreferredShell(shell: ShellInfo, defaultShell?: string): boolean {
+  if (!defaultShell) return false
+  return shell.path === defaultShell || shell.name === defaultShell
 }

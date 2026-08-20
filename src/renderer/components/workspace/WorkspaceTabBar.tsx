@@ -20,6 +20,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { usePaneDnd } from '@/hooks/use-pane-dnd'
 import { clipboardApi, shellApi } from '@/lib/api'
 import { browserTabHide, browserTabShow } from '@/lib/browser-api'
+import { isPreferredShell } from '@/lib/shell-api'
 import { cn } from '@/lib/utils'
 import { useAcpStore, useAgentIdentity } from '@/stores/acp-store'
 import { useAnnotationStore } from '@/stores/annotation-store'
@@ -191,7 +192,7 @@ function TerminalTabInline({
             }
           }}
           disabled={isClosing}
-          className="ml-auto p-0.5 rounded-md hover:bg-secondary opacity-0 group-hover:opacity-100 transition-opacity disabled:opacity-100 disabled:cursor-wait"
+          className="ml-auto p-0.5 rounded-md text-muted-foreground opacity-70 hover:bg-secondary hover:text-foreground group-hover:opacity-100 transition-opacity disabled:opacity-100 disabled:cursor-wait"
         >
           {isClosing ? <Loader2 size={11} className="animate-spin" /> : <XIcon size={11} />}
         </button>
@@ -858,8 +859,8 @@ export function WorkspaceTabBar({
 
   const sortedShells = shells?.available?.slice().sort((a, b) => {
     if (defaultShell) {
-      if (a.name === defaultShell) return -1
-      if (b.name === defaultShell) return 1
+      if (isPreferredShell(a, defaultShell)) return -1
+      if (isPreferredShell(b, defaultShell)) return 1
     }
     return a.displayName.localeCompare(b.displayName)
   })
@@ -1084,12 +1085,12 @@ export function WorkspaceTabBar({
                         onClick={() => handleSelectShell(shell)}
                         className={cn(
                           'w-full px-2.5 py-1.5 text-left text-2xs hover:bg-secondary flex items-center gap-2 leading-none',
-                          shell.name === defaultShell && 'text-primary'
+                          isPreferredShell(shell, defaultShell) && 'text-primary'
                         )}
                       >
                         <TerminalIcon size={11} />
                         <span className="truncate">{shell.displayName}</span>
-                        {shell.name === defaultShell && (
+                        {isPreferredShell(shell, defaultShell) && (
                           <span className="ml-auto text-3xs text-muted-foreground">
                             {t('tabs.default')}
                           </span>

@@ -2,6 +2,7 @@ import type { ShellInfo } from '@shared/types/ipc.types'
 import { RefreshCcw, Unplug, X } from 'lucide-react'
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
+import { useLocation } from 'react-router-dom'
 // Import useShallow for selective re-rendering
 import { useShallow } from 'zustand/shallow'
 import { AgentIcon } from '@/components/agents/AgentIcon'
@@ -9,10 +10,11 @@ import { AgentLauncher } from '@/components/agents/AgentLauncher'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useMobileWebShell } from '@/hooks/use-mobile-web-shell'
 import { usePaneDnd } from '@/hooks/use-pane-dnd'
+import { resolveConversationSessionId } from '@/lib/conversation-binding'
 import { logFrontendError } from '@/lib/log-api'
 import { cn } from '@/lib/utils'
 import { useAcpStore } from '@/stores/acp-store'
-import { useProjectStore } from '@/stores/project-store'
+import { useConversationStore } from '@/stores/conversation-store'
 import { useTerminalActions, useTerminalStore } from '@/stores/terminal-store'
 import type { AgentChatTab, WorkspaceTab } from '@/stores/workspace-store'
 import { getAllLeafPanes, useWorkspaceStore } from '@/stores/workspace-store'
@@ -49,25 +51,27 @@ function PaneSkeleton(): React.JSX.Element {
 
 function ConversationAgentChatPanel({
   tab,
+  paneId,
   isVisible
 }: {
   tab: AgentChatTab
+  paneId: string
   isVisible: boolean
 }): React.JSX.Element {
   const sessionId = useAcpStore((state) => {
     if (tab.sessionId) return tab.sessionId
-    const live = Object.values(state.sessions).find(
-      (session) => session.conversationId === tab.conversationId
-    )
-    return (
-      live?.id ??
-      state.sessionIndex.find((entry) => entry.conversationId === tab.conversationId)?.id ??
-      null
-    )
+    if (!tab.conversationId) return null
+    return resolveConversationSessionId(state, tab.conversationId)
   })
+  const opening = useConversationStore((state) =>
+    tab.conversationId ? state.openingById[tab.conversationId] === true : false
+  )
 
-  if (!sessionId) return <PaneSkeleton />
-  return <AgentChatPanel sessionId={sessionId} isVisible={isVisible} />
+  if (!sessionId) {
+    if (opening) return <PaneSkeleton />
+    return <AgentLauncher paneId={paneId} />
+  }
+  return <AgentChatPanel sessionId={sessionId} paneId={paneId} isVisible={isVisible} />
 }
 
 interface PaneContentProps {
@@ -92,19 +96,19 @@ export function PaneContent({
   defaultShell
 }: PaneContentProps): React.JSX.Element {
   const { t } = useTranslation(['workspace', 'terminal'])
+  const location = useLocation()
+  const isConversationWorkspace = location.pathname.startsWith('/c/')
   // CRITICAL FIX: Get terminal IDs from this pane's tabs
   const terminalIdsInPane = useMemo(
     () => new Set(pane.tabs.filter((t) => t.type === 'terminal').map((t) => t.terminalId)),
     [pane.tabs]
   )
 
-  // CRITICAL FIX: Only subscribe to terminals' essential properties (not output!)
-  // and ENSURE we only show terminals belonging to the active project to prevent "leaks"
-  const activeProjectId = useProjectStore((state) => state.activeProjectId)
+  // Subscribe to terminals referenced by this pane's tabs. Do not filter by
+  // active projectId: conversation-scoped terminals must still render, and
+  // stale project-id mismatches previously produced a blank pane.
   const terminalsInPane = useTerminalStore(
-    useShallow((state) =>
-      state.terminals.filter((t) => terminalIdsInPane.has(t.id) && t.projectId === activeProjectId)
-    )
+    useShallow((state) => state.terminals.filter((t) => terminalIdsInPane.has(t.id)))
   )
 
   // FIX: Batch workspace store subscriptions with useShallow to prevent cascading re-renders
@@ -530,18 +534,42 @@ export function PaneContent({
                     className={isVisible ? 'w-full h-full' : INACTIVE_TAB_PANE_CLASS}
                   >
                     <Suspense fallback={<PaneSkeleton />}>
-                      <ConversationAgentChatPanel tab={tab} isVisible={isVisible} />
+                      <ConversationAgentChatPanel
+                        tab={tab}
+                        paneId={pane.id}
+                        isVisible={isVisible}
+                      />
                     </Suspense>
                   </div>
                 )
               })}
 
-            {pane.tabs.length === 0 ? (
-              <div className="absolute inset-0">
-                {/* ADR-004.5: agent launch + plain terminal picker */}
-                <AgentLauncher paneId={pane.id} />
-              </div>
-            ) : null}
+            {(() => {
+              const hasRenderableContent = pane.tabs.some((tab) => {
+                if (tab.type !== 'terminal') return true
+                return terminalsInPane.some((terminal) => terminal.id === tab.terminalId)
+              })
+              if (hasRenderableContent) return null
+              if (isConversationWorkspace) {
+                return (
+                  <div className="absolute inset-0">
+                    <AgentLauncher paneId={pane.id} />
+                  </div>
+                )
+              }
+              if (!handleAddTerminalForPane) return null
+              return (
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-background">
+                  <button
+                    type="button"
+                    className="rounded-md border border-border bg-card px-3 py-2 text-sm hover:bg-accent"
+                    onClick={() => handleAddTerminalForPane()}
+                  >
+                    {t('emptyPane.create', { ns: 'terminal' })}
+                  </button>
+                </div>
+              )
+            })()}
           </div>
         </div>
 

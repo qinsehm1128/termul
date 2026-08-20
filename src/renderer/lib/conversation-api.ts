@@ -27,6 +27,8 @@ export function createConversationFacadeApi(
     listConversations: () => coreApi.listConversations(),
     getConversation: (conversationId) => coreApi.getConversation(conversationId),
     openConversation: (conversationId) => coreApi.openConversation(conversationId),
+    renameConversation: (conversationId, title) =>
+      coreApi.renameConversation(conversationId, title),
     resolveLegacyConversationId: (key) => coreApi.resolveLegacyConversationId(key),
     attachProject: (conversationId, expectedRevision, attachment) =>
       coreApi.attachProject(conversationId, expectedRevision, attachment),

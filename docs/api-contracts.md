@@ -254,15 +254,21 @@ advertises no methods sends `authMethods: []` (a no-auth agent). Extended auth
 types (`env_var`, `terminal`) and `logout` remain out of scope (Ask First); only
 the stable `id`/`name`/optional `description` surface is carried.
 
-**2. Authenticate before `session/new`.** The store retains the advertised methods
-and, before creating a session (`acp_new_session`), runs `acp_authenticate`
-(`authenticate(methodId)`) when the agent advertises auth:
+**2. Try `session/new` first; authenticate only when the agent requires it.**
+Advertised `authMethods` are a menu of available login options, not a signal
+that the user is logged out. Codex ACP always lists ChatGPT + API-key methods
+even when `~/.codex` already has credentials from `codex login`. The store
+therefore creates the session (`acp_new_session`) first:
 
-- exactly one method → authenticate that method, then create the session;
-- more than one method → **do not choose one**; surface an actionable
-  "multiple sign-in methods" failure that lists the method names (there is no
-  automatic "unambiguous default" pick);
-- no method (or only empty/whitespace ids) → unchanged spawn → `session/new` flow.
+- `session/new` succeeds → no Sign-in (existing provider login is enough);
+- `session/new` fails with an auth-classified error and exactly one usable
+  method → run `acp_authenticate` (`authenticate(methodId)`), then retry
+  `session/new` once;
+- `session/new` fails with an auth-classified error and more than one method →
+  **do not choose one**; surface an actionable "multiple sign-in methods"
+  failure that lists the method names so the launcher can show a chooser;
+- no method (or only empty/whitespace ids) → unchanged spawn → `session/new`
+  flow; an auth-classified failure is surfaced as-is.
 
 For the default `agent` auth type the provider owns the login UX (it may open its
 own browser); Termul never invents a client-side login-URL redirect and never

@@ -15,6 +15,8 @@ import type { RecoveryItemV1 } from '@shared/types/conversation-recovery.types'
 import { create } from 'zustand'
 import { useShallow } from 'zustand/shallow'
 import { conversationApi } from '@/lib/conversation-api'
+import { isLiveAcpSession, resolveConversationSessionId } from '@/lib/conversation-binding'
+import { mergeConversationTitle } from '@/lib/conversation-title'
 import { logFrontendError } from '@/lib/log-api'
 import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
 import { useWorkspaceStore } from '@/stores/workspace-store'
@@ -45,6 +47,10 @@ interface ConversationState {
   errorsById: Record<ConversationId, ConversationStoreError | undefined>
   listError: ConversationStoreError | null
   replaceSummaries: (summaries: ConversationRecordV2[]) => void
+  renameConversation: (
+    conversationId: ConversationId,
+    title: string
+  ) => Promise<ConversationRecordV2>
   setRecoveryItems: (items: RecoveryItemV1[]) => void
   setSearchQuery: (query: string) => void
   setProjectFilter: (projectFilter: ConversationProjectFilter) => void
@@ -228,6 +234,7 @@ function indexRevisionOrderedSummaries(
   const ordered = new Map<ConversationId, ConversationRecordV2>()
   for (const incoming of summaries) {
     if (!isConversationId(incoming.conversationId)) continue
+    if (incoming.lifecycleState === 'deleted') continue
     const knownRevision = state.lifecycleRevisionById[incoming.conversationId] ?? -1
     const deletedRevision = state.deletedRevisionById[incoming.conversationId]
     if (deletedRevision !== undefined && incoming.lastSeq <= deletedRevision) continue
@@ -292,11 +299,7 @@ function bindingSessionId(
   },
   conversationId: ConversationId
 ): string | null {
-  const live = Object.values(state.sessions).find(
-    (session) => session.conversationId === conversationId
-  )
-  if (live) return live.id
-  return state.sessionIndex.find((entry) => entry.conversationId === conversationId)?.id ?? null
+  return resolveConversationSessionId(state, conversationId)
 }
 
 export const useConversationStore = create<ConversationState>((set, get) => ({
@@ -313,6 +316,17 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         )
       }
     }),
+
+  renameConversation: async (conversationId, title) => {
+    const result = await conversationApi.renameConversation(conversationId, title)
+    if (!result.success) {
+      throw new Error(result.error || result.code)
+    }
+    set((state) => ({
+      summariesById: { ...state.summariesById, [conversationId]: result.data }
+    }))
+    return result.data
+  },
 
   setRecoveryItems: (recoveryItems) => set({ recoveryItems: [...recoveryItems] }),
 
@@ -482,12 +496,15 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
             }
           }
         }
-        opened = { ...result.data, conversation }
+        opened = {
+          ...result.data,
+          conversation: mergeConversationTitle(current, conversation)
+        }
         const summaryAlreadyListed = Boolean(state.summariesById[conversationId])
         return {
           summariesById: {
             ...state.summariesById,
-            [conversationId]: conversation
+            [conversationId]: opened.conversation
           },
           conversationIds: summaryAlreadyListed
             ? state.conversationIds
@@ -612,6 +629,21 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       return false
     }
 
+    // Snapshot the project pane tree before this Conversation becomes active so
+    // later project-layout writes cannot persist Conversation chrome.
+    try {
+      const { persistState } = await import('@/hooks/use-editor-persistence')
+      const projectId = (await import('@/stores/project-store')).useProjectStore.getState()
+        .activeProjectId
+      if (projectId) persistState(projectId)
+    } catch {
+      // Project layout persist is best-effort; conversation open must continue.
+    }
+    if (!isCurrent()) {
+      logStaleActivation(conversationId, activationEpoch, 'persist-project')
+      return false
+    }
+
     let activatedOutcome: ConversationOpenOutcome | null = null
     set((state) => {
       if (!activationIsCurrent(state, conversationId, activationEpoch)) return {}
@@ -636,12 +668,15 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
           }
         }
       }
-      activatedOutcome = { ...openResult.data, conversation }
+      activatedOutcome = {
+        ...openResult.data,
+        conversation: mergeConversationTitle(current, conversation)
+      }
       const alreadyListed = Boolean(state.summariesById[conversationId])
       return {
         summariesById: {
           ...state.summariesById,
-          [conversationId]: conversation
+          [conversationId]: activatedOutcome.conversation
         },
         conversationIds: alreadyListed
           ? state.conversationIds
@@ -684,10 +719,20 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       logStaleActivation(conversationId, activationEpoch, 'binding-import')
       return false
     }
+    try {
+      await useAcpStore.getState().loadSessionIndex()
+    } catch {
+      // Index refresh is best-effort; live sessions and a prior index still bind.
+    }
+    if (!isCurrent()) {
+      logStaleActivation(conversationId, activationEpoch, 'binding-index')
+      return false
+    }
     let acp = useAcpStore.getState()
     const sessionId = bindingSessionId(acp, conversationId)
     if (!sessionId) {
       acp.setActiveSession(null)
+      useWorkspaceStore.getState().addAgentChatTab(conversationId, undefined, false)
       set((state) =>
         activationIsCurrent(state, conversationId, activationEpoch)
           ? { openingById: { ...state.openingById, [conversationId]: false } }
@@ -707,7 +752,30 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         acp = useAcpStore.getState()
       }
       if (!isCurrent()) return false
-      acp.setActiveSession(sessionId)
+      let boundSessionId = sessionId
+      if (!isCurrent()) return false
+      acp = useAcpStore.getState()
+      const resolved = resolveConversationSessionId(acp, conversationId)
+      if (resolved && isLiveAcpSession(acp.sessions[resolved])) {
+        boundSessionId = resolved
+      }
+      acp.setActiveSession(boundSessionId)
+      useAcpStore.setState((state) => {
+        const session = state.sessions[boundSessionId]
+        return {
+          sessions: session
+            ? {
+                ...state.sessions,
+                [boundSessionId]: { ...session, conversationId }
+              }
+            : state.sessions,
+          sessionIndex: state.sessionIndex.map((entry) =>
+            entry.id === boundSessionId || entry.id === sessionId
+              ? { ...entry, conversationId }
+              : entry
+          )
+        }
+      })
       useWorkspaceStore.getState().addAgentChatTab(conversationId, undefined, false)
     } catch {
       if (!isCurrent()) {
@@ -1142,6 +1210,7 @@ export function selectVisibleConversations(state: ConversationState): Conversati
   return state.conversationIds
     .map((conversationId) => state.summariesById[conversationId])
     .filter((summary): summary is ConversationRecordV2 => Boolean(summary))
+    .filter((summary) => summary.lifecycleState !== 'deleted')
     .filter((summary) => {
       if (state.projectFilter === 'projectless') return summary.projectAttachment === null
       if (state.projectFilter) {

@@ -13,13 +13,19 @@ import { useAcpStore } from '@/stores/acp-store'
 import { selectVisibleConversations, useConversationStore } from '@/stores/conversation-store'
 import { useWorkspaceStore } from '@/stores/workspace-store'
 
-const { loadSessionWorkspaceMock, openHistorySessionMock, addAgentChatTabMock } = vi.hoisted(
-  () => ({
-    loadSessionWorkspaceMock: vi.fn(),
-    openHistorySessionMock: vi.fn(),
-    addAgentChatTabMock: vi.fn()
-  })
-)
+const {
+  loadSessionWorkspaceMock,
+  openHistorySessionMock,
+  loadSessionIndexMock,
+  addAgentChatTabMock,
+  startChatMock
+} = vi.hoisted(() => ({
+  loadSessionWorkspaceMock: vi.fn(),
+  openHistorySessionMock: vi.fn(),
+  loadSessionIndexMock: vi.fn(),
+  addAgentChatTabMock: vi.fn(),
+  startChatMock: vi.fn()
+}))
 
 vi.mock('@/lib/conversation-api', () => ({
   conversationApi: {
@@ -33,6 +39,11 @@ vi.mock('@/lib/conversation-api', () => ({
 
 vi.mock('@/hooks/use-session-workspace-sync', () => ({
   loadSessionWorkspace: loadSessionWorkspaceMock
+}))
+
+vi.mock('@/hooks/use-editor-persistence', () => ({
+  persistState: vi.fn(),
+  restoreProjectWorkspace: vi.fn().mockResolvedValue(false)
 }))
 
 vi.mock('@/lib/log-api', () => ({ logFrontendError: vi.fn() }))
@@ -173,11 +184,16 @@ beforeEach(() => {
   useConversationStore.getState().reset()
   loadSessionWorkspaceMock.mockResolvedValue(true)
   openHistorySessionMock.mockResolvedValue(undefined)
+  loadSessionIndexMock.mockResolvedValue(undefined)
+  startChatMock.mockResolvedValue('opaque/live')
   useAcpStore.setState({
     sessions: {},
     activeSessionId: null,
     sessionIndex: [],
-    openHistorySession: openHistorySessionMock
+    agentConfigs: [],
+    openHistorySession: openHistorySessionMock,
+    loadSessionIndex: loadSessionIndexMock,
+    startChat: startChatMock
   })
   useWorkspaceStore.setState({ addAgentChatTab: addAgentChatTabMock })
   setRouterNavigate(navigateMock)
@@ -202,6 +218,17 @@ describe('ConversationStore canonical authority', () => {
     expect(state.summariesById[attachedId].projectAttachment?.projectId).toBe('project-1')
   })
 
+  it('does not rematerialize deleted Conversations after a list reload', async () => {
+    vi.mocked(conversationApi.listConversations).mockResolvedValue({
+      success: true,
+      data: [{ ...projectless, lifecycleState: 'deleted' }]
+    })
+
+    await expect(useConversationStore.getState().loadConversations()).resolves.toBe(true)
+    expect(useConversationStore.getState().conversationIds).toEqual([])
+    expect(useConversationStore.getState().summariesById[projectlessId]).toBeUndefined()
+  })
+
   it('opens canonical Conversation details without claiming route activation', async () => {
     vi.mocked(conversationApi.openConversation).mockResolvedValue({
       success: true,
@@ -223,6 +250,118 @@ describe('ConversationStore canonical authority', () => {
     useAcpStore.setState({ activeSessionId: 'opaque-runtime-session' })
     expect(useConversationStore.getState().activeConversationId).toBeNull()
     expect(useConversationStore.getState().conversationIds).toEqual([projectlessId])
+  })
+
+  it('keeps a listed title when open returns an untitled record', async () => {
+    const titled = {
+      ...projectless,
+      title: 'bi查询demo',
+      titleSource: 'derived_first_message' as const
+    }
+    useConversationStore.getState().replaceSummaries([titled])
+    vi.mocked(conversationApi.openConversation).mockResolvedValue({
+      success: true,
+      data: {
+        conversation: { ...projectless, title: null, titleSource: null, lastSeq: 5 },
+        workspace: { status: 'missing', conversationId: projectlessId }
+      }
+    })
+
+    await useConversationStore.getState().openConversation(projectlessId)
+    expect(useConversationStore.getState().summariesById[projectlessId]).toMatchObject({
+      title: 'bi查询demo',
+      titleSource: 'derived_first_message',
+      lastSeq: 5
+    })
+  })
+
+  it('reopens history when the session index binds the Conversation', async () => {
+    vi.mocked(conversationApi.openConversation).mockResolvedValue({
+      success: true,
+      data: {
+        conversation: projectless,
+        workspace: { status: 'missing', conversationId: projectlessId }
+      }
+    })
+    useAcpStore.setState({
+      sessions: {},
+      sessionIndex: [
+        {
+          id: 'opaque/history',
+          conversationId: projectlessId,
+          agentId: 'agent-1',
+          title: 'bi查询demo',
+          cwd: projectless.workspaceCwd,
+          projectId: '',
+          createdAt: 1,
+          lastActivityAt: 2,
+          messageCount: 4,
+          status: 'closed'
+        }
+      ]
+    })
+
+    const epoch = useConversationStore.getState().beginConversationActivation(projectlessId)
+    await expect(
+      useConversationStore.getState().activateConversation(projectlessId, epoch)
+    ).resolves.toBe(true)
+    expect(loadSessionIndexMock).toHaveBeenCalled()
+    expect(openHistorySessionMock).toHaveBeenCalledWith('opaque/history')
+    expect(useAcpStore.getState().activeSessionId).toBe('opaque/history')
+    expect(addAgentChatTabMock).toHaveBeenCalledWith(projectlessId, undefined, false)
+  })
+
+  it('keeps the same ACP session id when history reopen stays closed', async () => {
+    vi.mocked(conversationApi.openConversation).mockResolvedValue({
+      success: true,
+      data: {
+        conversation: projectless,
+        workspace: { status: 'missing', conversationId: projectlessId }
+      }
+    })
+    useAcpStore.setState({
+      sessions: {},
+      sessionIndex: [
+        {
+          id: 'opaque/history',
+          conversationId: projectlessId,
+          agentId: 'agent-1',
+          agentConfigId: 'pi',
+          title: 'bi查询demo',
+          cwd: projectless.workspaceCwd,
+          projectId: '',
+          createdAt: 1,
+          lastActivityAt: 2,
+          messageCount: 4,
+          status: 'closed'
+        }
+      ]
+    })
+
+    const epoch = useConversationStore.getState().beginConversationActivation(projectlessId)
+    await expect(
+      useConversationStore.getState().activateConversation(projectlessId, epoch)
+    ).resolves.toBe(true)
+    expect(openHistorySessionMock).toHaveBeenCalledWith('opaque/history')
+    expect(startChatMock).not.toHaveBeenCalled()
+    expect(useAcpStore.getState().activeSessionId).toBe('opaque/history')
+  })
+
+  it('opens a chat tab even when the Conversation has no agent binding', async () => {
+    vi.mocked(conversationApi.openConversation).mockResolvedValue({
+      success: true,
+      data: {
+        conversation: projectless,
+        workspace: { status: 'missing', conversationId: projectlessId }
+      }
+    })
+
+    const epoch = useConversationStore.getState().beginConversationActivation(projectlessId)
+    await expect(
+      useConversationStore.getState().activateConversation(projectlessId, epoch)
+    ).resolves.toBe(true)
+    expect(useAcpStore.getState().activeSessionId).toBeNull()
+    expect(addAgentChatTabMock).toHaveBeenCalledWith(projectlessId, undefined, false)
   })
 
   it('rejects an opaque ACP session id without using it as a store key', async () => {
@@ -329,7 +468,7 @@ describe('ConversationStore canonical authority', () => {
     expect(state.openingById[projectlessId]).toBeUndefined()
     expect(state.aggregateBusyById[projectlessId]).toBeUndefined()
     expect(state.errorsById[projectlessId]).toBeUndefined()
-    expect(navigateMock).toHaveBeenCalledWith('/')
+    expect(navigateMock).toHaveBeenCalledWith('/conversations')
 
     useConversationStore.getState().replaceSummaries([projectless, attached])
     expect(useConversationStore.getState().conversationIds).toEqual([])

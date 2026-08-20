@@ -50,6 +50,7 @@ use crate::web::auth::{
     auth_error_response, IngressProvenance, RemoteAccessAuthority, RemoteAuthError,
     RemoteCapability, RemotePrincipal,
 };
+use crate::web::operation_policy;
 use crate::web::permissions::{TurnClaim, DEFAULT_PERMISSION_RECONNECT_GRACE};
 use crate::web::project_registry::{ProjectRegistry, ProjectSwitchContext};
 use crate::web::sink::{
@@ -57,7 +58,6 @@ use crate::web::sink::{
     CLIENT_OUTBOUND_BYTES, CLIENT_OUTBOUND_RECORDS, MAX_CONNECTION_SUBSCRIPTIONS,
     RELIABLE_CLIENT_TIMEOUT,
 };
-use crate::web::operation_policy;
 use crate::web::upgraded_connections::{UpgradedConnectionKind, UpgradedConnectionRegistry};
 use crate::web::EventSink;
 
@@ -1180,8 +1180,8 @@ async fn dispatch_connection_text(
 ) -> bool {
     let current_conversation = Arc::new(parking_lot::Mutex::new(None));
     let authority = Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token"));
-    let mut principal = (*authed)
-        .then(|| authority.verify_bearer("test-remote-access-token").unwrap());
+    let mut principal =
+        (*authed).then(|| authority.verify_bearer("test-remote-access-token").unwrap());
     dispatch_connection_text_with_conversation(
         text,
         authed,
@@ -1290,8 +1290,8 @@ async fn handle_request(
 ) -> WsReply {
     let current_conversation = Arc::new(parking_lot::Mutex::new(None));
     let authority = Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token"));
-    let mut principal = (*authed)
-        .then(|| authority.verify_bearer("test-remote-access-token").unwrap());
+    let mut principal =
+        (*authed).then(|| authority.verify_bearer("test-remote-access-token").unwrap());
     handle_request_with_conversation(
         text,
         authed,
@@ -1810,7 +1810,10 @@ async fn handle_list_persisted_sessions(
     }
 }
 
-fn charge_compat_history_bytes(current: usize, record: &impl serde::Serialize) -> Result<usize, &'static str> {
+fn charge_compat_history_bytes(
+    current: usize,
+    record: &impl serde::Serialize,
+) -> Result<usize, &'static str> {
     let added = crate::conversation::contracts::encoded_json_len_bounded(
         record,
         crate::conversation::MAX_CONVERSATION_RECORD_BYTES,
@@ -1858,12 +1861,14 @@ fn materialize_compat_session_payload(
             })?;
         }
         materialized_records = materialized_records.saturating_add(page.records.len());
-        accumulator.push_history_page(&page, limit).map_err(|error| {
-            (
-                error.stable_code(),
-                "invalid canonical history page".to_string(),
-            )
-        })?;
+        accumulator
+            .push_history_page(&page, limit)
+            .map_err(|error| {
+                (
+                    error.stable_code(),
+                    "invalid canonical history page".to_string(),
+                )
+            })?;
         cursor = page.next_cursor;
         if page.complete {
             break;
@@ -2097,22 +2102,14 @@ async fn load_recover_snapshot(
         return Ok((events, watermark));
     }
     if let Some(persistence) = relay.persistence() {
-        let watermark = persistence.last_seq(session_id).map_err(|error| {
-            WsReply::err(
-                "recover",
-                WsErrorCode::NotFound,
-                error.to_string(),
-            )
-        })?;
+        let watermark = persistence
+            .last_seq(session_id)
+            .map_err(|error| WsReply::err("recover", WsErrorCode::NotFound, error.to_string()))?;
         let records = persistence
             .replay_after_async(session_id.to_string(), 0)
             .await
             .map_err(|error| {
-                WsReply::err(
-                    "recover",
-                    WsErrorCode::AgentCrashed,
-                    error.to_string(),
-                )
+                WsReply::err("recover", WsErrorCode::AgentCrashed, error.to_string())
             })?;
         let events = records
             .into_iter()
@@ -2827,13 +2824,9 @@ async fn handle_conversation_lifecycle(
     };
     match result {
         Ok(outcome) => {
-            if retire_ws_deleted_binding_if_updated(
-                relay,
-                current_session_id.as_deref(),
-                &outcome,
-            )
-            .await
-            .is_err()
+            if retire_ws_deleted_binding_if_updated(relay, current_session_id.as_deref(), &outcome)
+                .await
+                .is_err()
             {
                 return WsReply::err_with_code(
                     id,
@@ -2946,13 +2939,9 @@ async fn handle_conversation_lifecycle_with_service(
     };
     match result {
         Ok(outcome) => {
-            if retire_ws_deleted_binding_if_updated(
-                relay,
-                current_session_id.as_deref(),
-                &outcome,
-            )
-            .await
-            .is_err()
+            if retire_ws_deleted_binding_if_updated(relay, current_session_id.as_deref(), &outcome)
+                .await
+                .is_err()
             {
                 return WsReply::err_with_code(
                     id,
@@ -5086,8 +5075,8 @@ pub(crate) async fn dispatch_conversation_golden_request(
     let current_project = Arc::new(parking_lot::Mutex::new(None));
     let switch_queue = Arc::new(tokio::sync::Mutex::new(ProjectSwitchQueue::default()));
     let authority = Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token"));
-    let mut principal = (*authed)
-        .then(|| authority.verify_bearer("test-remote-access-token").unwrap());
+    let mut principal =
+        (*authed).then(|| authority.verify_bearer("test-remote-access-token").unwrap());
     handle_request_with_conversation(
         text,
         authed,
@@ -6093,30 +6082,25 @@ mod tests {
     #[tokio::test]
     async fn ws_ephemeral_dispose_retires_on_success_and_retains_on_error() {
         let relay = WsRelaySink::new();
-        relay
-            .turn_watermark()
-            .mark_seen("ws-ephemeral", "turn-1");
+        relay.turn_watermark().mark_seen("ws-ephemeral", "turn-1");
         let dispose_result: Result<(), &str> = Err("dispose failed");
         assert!(dispose_result.is_err());
-        assert!(relay
-            .turn_watermark()
-            .is_seen("ws-ephemeral", "turn-1"));
+        assert!(relay.turn_watermark().is_seen("ws-ephemeral", "turn-1"));
         relay.retire_session("ws-ephemeral").await.unwrap();
-        assert!(!relay
-            .turn_watermark()
-            .is_seen("ws-ephemeral", "turn-1"));
+        assert!(!relay.turn_watermark().is_seen("ws-ephemeral", "turn-1"));
     }
 
     #[test]
     fn generation_revocation_sends_only_reauthentication_required_without_credential_and_closes() {
         let authority = RemoteAccessAuthority::for_tests("first-generation-token");
-        let first = authority
-            .verify_bearer("first-generation-token")
-            .unwrap();
+        let first = authority.verify_bearer("first-generation-token").unwrap();
         let generation_rx = authority.subscribe_generation();
         let rotated = authority.rotate_desktop_credential().unwrap();
         let current = *generation_rx.borrow();
-        assert!(generation_requires_reauthentication(first.generation(), current));
+        assert!(generation_requires_reauthentication(
+            first.generation(),
+            current
+        ));
         assert!(authority
             .authorize(&first, RemoteCapability::Connect)
             .is_err());
@@ -6144,7 +6128,10 @@ mod tests {
             .split("() = write_disconnect.notified()")
             .next()
             .unwrap();
-        assert_eq!(branch.matches("reauthentication_required_event()").count(), 1);
+        assert_eq!(
+            branch.matches("reauthentication_required_event()").count(),
+            1
+        );
         assert_eq!(branch.matches("Message::Close(None)").count(), 1);
     }
 
@@ -8589,6 +8576,8 @@ mod tests {
                         lifecycle_state: ConversationLifecycleState::Ready,
                         last_seq: 0,
                         created_by: ConversationCreator::Termul,
+                        title: None,
+                        title_source: None,
                     },
                     ConversationMutation::CreateConversation,
                 )
@@ -8885,6 +8874,8 @@ mod tests {
                         lifecycle_state: ConversationLifecycleState::Ready,
                         last_seq: 0,
                         created_by: ConversationCreator::Termul,
+                        title: None,
+                        title_source: None,
                     },
                     ConversationMutation::CreateConversation,
                 )
@@ -9121,7 +9112,10 @@ mod tests {
             match charge_compat_history_bytes(total, &record) {
                 Ok(next) => total = next,
                 Err(code) => {
-                    assert_eq!(code, crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED);
+                    assert_eq!(
+                        code,
+                        crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED
+                    );
                     rejected = true;
                     break;
                 }
@@ -9313,7 +9307,10 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(malformed.err.unwrap().code, operation_policy::VALIDATION_ERROR);
+        assert_eq!(
+            malformed.err.unwrap().code,
+            operation_policy::VALIDATION_ERROR
+        );
         let missing = handle_set_default_project(
             "r2".to_string(),
             &json!({ "projectId": "missing" }),

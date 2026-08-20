@@ -9,13 +9,17 @@ import { useConversationStore } from '@/stores/conversation-store'
 import { useWorkspaceStore } from '@/stores/workspace-store'
 import { ConversationRoute } from './ConversationRoute'
 
-const { mockLoadSessionWorkspace, mockAddAgentChatTab, mockOpenHistorySession } = vi.hoisted(
-  () => ({
-    mockLoadSessionWorkspace: vi.fn(),
-    mockAddAgentChatTab: vi.fn(),
-    mockOpenHistorySession: vi.fn()
-  })
-)
+const {
+  mockLoadSessionWorkspace,
+  mockAddAgentChatTab,
+  mockOpenHistorySession,
+  mockLoadSessionIndex
+} = vi.hoisted(() => ({
+  mockLoadSessionWorkspace: vi.fn(),
+  mockAddAgentChatTab: vi.fn(),
+  mockOpenHistorySession: vi.fn(),
+  mockLoadSessionIndex: vi.fn()
+}))
 
 vi.mock('@/lib/conversation-api', () => ({
   conversationApi: {
@@ -69,6 +73,7 @@ beforeEach(() => {
   useConversationStore.getState().reset()
   mockLoadSessionWorkspace.mockResolvedValue(true)
   mockOpenHistorySession.mockResolvedValue(undefined)
+  mockLoadSessionIndex.mockResolvedValue(undefined)
   useAcpStore.setState({
     sessions: {},
     activeSessionId: null,
@@ -86,7 +91,8 @@ beforeEach(() => {
         status: 'closed'
       }
     ],
-    openHistorySession: mockOpenHistorySession
+    openHistorySession: mockOpenHistorySession,
+    loadSessionIndex: mockLoadSessionIndex
   })
   useWorkspaceStore.setState({ addAgentChatTab: mockAddAgentChatTab })
 })
@@ -157,7 +163,8 @@ describe('ConversationRoute canonical open', () => {
         }
       ],
       activeSessionId: null,
-      openHistorySession: mockOpenHistorySession
+      openHistorySession: mockOpenHistorySession,
+      loadSessionIndex: mockLoadSessionIndex
     })
     mockLoadSessionWorkspace.mockImplementation(async (id, isCurrent: () => boolean) => {
       if (!isCurrent()) return false
@@ -252,7 +259,8 @@ describe('ConversationRoute canonical open', () => {
         }
       ],
       activeSessionId: null,
-      openHistorySession: mockOpenHistorySession
+      openHistorySession: mockOpenHistorySession,
+      loadSessionIndex: mockLoadSessionIndex
     })
     mockLoadSessionWorkspace.mockImplementation(async (id, isCurrent: () => boolean) => {
       if (!isCurrent()) return false

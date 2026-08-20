@@ -242,11 +242,9 @@ impl Downloader for HttpDownloader {
             }))
             .build()
             .map_err(|e| InstallError::new(code::DOWNLOAD_FAILED, format!("http client: {e}")))?;
-        let response = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| InstallError::new(code::DOWNLOAD_FAILED, format!("download failed: {e}")))?;
+        let response = client.get(url).send().await.map_err(|e| {
+            InstallError::new(code::DOWNLOAD_FAILED, format!("download failed: {e}"))
+        })?;
         if response.status().is_redirection() {
             // An https→http downgrade was refused by the redirect policy
             // (it stopped following). Surface it as a download failure.
@@ -317,7 +315,9 @@ impl Extractor for ArchiveExtractor {
             // Map the archive helpers' coarse strings to install codes.
             if e.contains("too many files") || e.contains("size limit") {
                 InstallError::new(code::EXTRACTION_QUOTA_EXCEEDED, e)
-            } else if e.contains("unsafe path") || e.contains("escapes") || e.contains("invalid cmd")
+            } else if e.contains("unsafe path")
+                || e.contains("escapes")
+                || e.contains("invalid cmd")
             {
                 InstallError::new(code::PATH_TRAVERSAL_DETECTED, e)
             } else {
@@ -435,9 +435,7 @@ impl AcpInstallService {
         }
         let manifest = Self::load_manifest_blocking(&root.join(INSTALLED_MANIFEST_FILENAME))
             .unwrap_or_else(|error| {
-                log::warn!(
-                    "[acp-install] manifest load failed (defaulting to empty): {error}"
-                );
+                log::warn!("[acp-install] manifest load failed (defaulting to empty): {error}");
                 InstalledManifestFile::default()
             });
         log::info!("[acp-install] service ready root={}", root.display());
@@ -502,10 +500,7 @@ impl AcpInstallService {
 
     /// Persist the manifest atomically (mirrors `WorkspaceManifestService::write`'s
     /// `spawn_blocking` + `atomic_file::replace`).
-    fn persist_manifest_blocking(
-        root: &Path,
-        manifest: &InstalledManifestFile,
-    ) -> io::Result<()> {
+    fn persist_manifest_blocking(root: &Path, manifest: &InstalledManifestFile) -> io::Result<()> {
         let path = root.join(INSTALLED_MANIFEST_FILENAME);
         let serialized = serde_json::to_vec_pretty(manifest).map_err(io::Error::other)?;
         atomic_file::replace(&path, &serialized)
@@ -526,14 +521,20 @@ impl AcpInstallService {
             ));
         }
         let catalog = self.catalog.list_catalog(false).await.map_err(|error| {
-            InstallError::new(code::INSTALL_FAILED, format!("catalog resolve failed: {error}"))
+            InstallError::new(
+                code::INSTALL_FAILED,
+                format!("catalog resolve failed: {error}"),
+            )
         })?;
         let agent = catalog
             .agents
             .iter()
             .find(|a| a.id == agent_id)
             .ok_or_else(|| {
-                InstallError::new(code::CATALOG_AGENT_NOT_FOUND, format!("agent '{agent_id}' not in catalog"))
+                InstallError::new(
+                    code::CATALOG_AGENT_NOT_FOUND,
+                    format!("agent '{agent_id}' not in catalog"),
+                )
             })?;
         self.install(agent, &catalog.host, None, None).await
     }
@@ -594,17 +595,17 @@ impl AcpInstallService {
                 )
             })?;
 
-        let cmd = target
-            .get("cmd")
-            .and_then(|c| c.as_str())
-            .ok_or_else(|| {
-                InstallError::new(code::INSTALL_FAILED, "catalog binary target missing 'cmd'")
-            })?;
+        let cmd = target.get("cmd").and_then(|c| c.as_str()).ok_or_else(|| {
+            InstallError::new(code::INSTALL_FAILED, "catalog binary target missing 'cmd'")
+        })?;
         let archive_url = target
             .get("archive")
             .and_then(|a| a.as_str())
             .ok_or_else(|| {
-                InstallError::new(code::UNSUPPORTED_PLATFORM, "catalog binary target missing 'archive'")
+                InstallError::new(
+                    code::UNSUPPORTED_PLATFORM,
+                    "catalog binary target missing 'archive'",
+                )
             })?;
         // No sha256 verification: the catalog is the trusted Zed ACP registry,
         // so the host downloads + extracts + activates without integrity
@@ -648,12 +649,9 @@ impl AcpInstallService {
         // Staging dir under the install root. Owns BOTH the downloaded
         // archive temp file AND the extracted tree — a single
         // `remove_dir_all` cleans up on any failure path.
-        let tmp_dir = self
-            .root
-            .join(format!(".staging-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&tmp_dir).map_err(|e| {
-            InstallError::new(code::INSTALL_FAILED, format!("create staging: {e}"))
-        })?;
+        let tmp_dir = self.root.join(format!(".staging-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&tmp_dir)
+            .map_err(|e| InstallError::new(code::INSTALL_FAILED, format!("create staging: {e}")))?;
         let staging = tmp_dir.join("stage");
         std::fs::create_dir_all(&staging).map_err(|e| {
             let _ = std::fs::remove_dir_all(&tmp_dir);
@@ -824,7 +822,10 @@ impl AcpInstallService {
     /// entry linger is the safe choice (mirrors the conservative path).
     pub async fn uninstall(self: &Arc<Self>, agent_id: &str) -> Result<(), InstallError> {
         if !is_safe_agent_id(agent_id) {
-            return Err(InstallError::new(code::VALIDATION_ERROR, "invalid agent id"));
+            return Err(InstallError::new(
+                code::VALIDATION_ERROR,
+                "invalid agent id",
+            ));
         }
         let lock = self.agent_lock(agent_id);
         let _guard = lock.lock().await;
@@ -865,12 +866,7 @@ impl AcpInstallService {
     /// writes the manifest; the catalog-status refresh is a deferred parity
     /// item).
     pub fn installed_agents(&self) -> Vec<InstalledAgent> {
-        self.manifest
-            .lock()
-            .agents
-            .values()
-            .cloned()
-            .collect()
+        self.manifest.lock().agents.values().cloned().collect()
     }
 }
 
@@ -882,7 +878,11 @@ impl AcpInstallService {
 /// `catalog::host_platform_arch` but takes the host capability (testable with
 /// synthetic input) instead of `std::env::consts::OS`.
 fn host_platform_arch(host: &HostCapability) -> String {
-    let os = if host.os == "macos" { "darwin" } else { &host.os };
+    let os = if host.os == "macos" {
+        "darwin"
+    } else {
+        &host.os
+    };
     format!("{}-{}", os, host.arch)
 }
 
@@ -928,7 +928,6 @@ fn archive_host_for_log(url: &str) -> &str {
         .next()
         .unwrap_or("")
 }
-
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1008,8 +1007,8 @@ mod tests {
     /// expected sha256 hex.
     fn tiny_zip(payload: &str) -> (Vec<u8>, String) {
         use std::io::Write;
-        let tmp = std::env::temp_dir()
-            .join(format!("termul-acp-install-zip-{}", uuid::Uuid::new_v4()));
+        let tmp =
+            std::env::temp_dir().join(format!("termul-acp-install-zip-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let payload_path = tmp.join("acp");
         let mut f = std::fs::File::create(&payload_path).unwrap();
@@ -1060,14 +1059,19 @@ mod tests {
             target_dir: &Path,
         ) -> Result<DownloadedArchive, InstallError> {
             if self.fail {
-                return Err(InstallError::new(code::DOWNLOAD_FAILED, "canned download failure"));
+                return Err(InstallError::new(
+                    code::DOWNLOAD_FAILED,
+                    "canned download failure",
+                ));
             }
             use std::io::Write;
             let path = target_dir.join(&self.filename);
-            let mut f = std::fs::File::create(&path)
-                .map_err(|e| InstallError::new(code::INSTALL_FAILED, format!("canned create: {e}")))?;
-            f.write_all(&self.bytes)
-                .map_err(|e| InstallError::new(code::INSTALL_FAILED, format!("canned write: {e}")))?;
+            let mut f = std::fs::File::create(&path).map_err(|e| {
+                InstallError::new(code::INSTALL_FAILED, format!("canned create: {e}"))
+            })?;
+            f.write_all(&self.bytes).map_err(|e| {
+                InstallError::new(code::INSTALL_FAILED, format!("canned write: {e}"))
+            })?;
             Ok(DownloadedArchive {
                 path,
                 filename: self.filename.clone(),
@@ -1093,7 +1097,9 @@ mod tests {
     }
 
     /// An extractor that always fails with a traversal-style message.
-    struct FailingExtractor { message: String }
+    struct FailingExtractor {
+        message: String,
+    }
     #[async_trait::async_trait]
     impl Extractor for FailingExtractor {
         async fn extract(&self, _archive_path: &Path, _dest: &Path) -> Result<(), InstallError> {
@@ -1348,13 +1354,7 @@ mod tests {
         let pa = platform_arch_for(&host());
         // No integrity check — the download is attempted regardless of the
         // `sha256` field. The TooLargeDownloader then trips ARCHIVE_TOO_LARGE.
-        let agent = sample_binary_agent(
-            "big",
-            &pa,
-            None,
-            "./acp",
-            "https://example.com/big.zip",
-        );
+        let agent = sample_binary_agent("big", &pa, None, "./acp", "https://example.com/big.zip");
         let downloader: Arc<dyn Downloader> = Arc::new(TooLargeDownloader);
         let err = service
             .install(&agent, &host(), Some(downloader), None)
@@ -1410,8 +1410,8 @@ mod tests {
     /// extraction dir). Returns the archive bytes + their sha256 hex.
     fn slip_zip() -> (Vec<u8>, String) {
         use std::io::Write;
-        let tmp = std::env::temp_dir()
-            .join(format!("termul-acp-install-slip-{}", uuid::Uuid::new_v4()));
+        let tmp =
+            std::env::temp_dir().join(format!("termul-acp-install-slip-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&tmp).unwrap();
         let zip_path = tmp.join("evil.zip");
         {
@@ -1441,8 +1441,10 @@ mod tests {
     /// archive bytes + their sha256 hex.
     fn slip_tar_gz() -> (Vec<u8>, String) {
         use std::io::Write;
-        let tmp = std::env::temp_dir()
-            .join(format!("termul-acp-install-tarslip-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!(
+            "termul-acp-install-tarslip-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&tmp).unwrap();
         let tar_gz_path = tmp.join("evil.tar.gz");
         {
@@ -1486,8 +1488,10 @@ mod tests {
     /// trips. Returns the archive bytes + their sha256 hex.
     fn overfull_zip(n: usize) -> (Vec<u8>, String) {
         use std::io::Write;
-        let tmp = std::env::temp_dir()
-            .join(format!("termul-acp-install-overfull-{}", uuid::Uuid::new_v4()));
+        let tmp = std::env::temp_dir().join(format!(
+            "termul-acp-install-overfull-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&tmp).unwrap();
         let zip_path = tmp.join("overfull.zip");
         {
@@ -1720,9 +1724,7 @@ mod tests {
         let catalog = crate::acp::AcpCatalogService::open(root.join("catalog"))
             .await
             .unwrap();
-        let service = AcpInstallService::open(install_dir, catalog)
-            .await
-            .unwrap();
+        let service = AcpInstallService::open(install_dir, catalog).await.unwrap();
         assert!(service.installed_agents().is_empty());
 
         // Backup exists.
@@ -1874,15 +1876,24 @@ mod tests {
     async fn install_by_id_rejects_invalid_agent_id() {
         let root = temp_dir("bad-id");
         let service = open_service(root.clone()).await;
-        let err = service.install_by_id("").await.expect_err("empty id errors");
+        let err = service
+            .install_by_id("")
+            .await
+            .expect_err("empty id errors");
         assert_eq!(err.code(), code::VALIDATION_ERROR);
-        let err = service.install_by_id("../escape").await.expect_err("bad id errors");
+        let err = service
+            .install_by_id("../escape")
+            .await
+            .expect_err("bad id errors");
         assert_eq!(err.code(), code::VALIDATION_ERROR);
         // Bare `.` / `..` denote the current/parent directory and would escape
         // the install root via `root.join(&agent.id)` (CWE-22) — reject.
         let err = service.install_by_id(".").await.expect_err("dot id errors");
         assert_eq!(err.code(), code::VALIDATION_ERROR);
-        let err = service.install_by_id("..").await.expect_err("dotdot id errors");
+        let err = service
+            .install_by_id("..")
+            .await
+            .expect_err("dotdot id errors");
         assert_eq!(err.code(), code::VALIDATION_ERROR);
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1962,10 +1973,15 @@ mod tests {
     #[test]
     fn archive_host_for_log_extracts_host_only() {
         assert_eq!(
-            archive_host_for_log("https://github.com/anomalyco/opencode/releases/download/v1/opencode.zip"),
+            archive_host_for_log(
+                "https://github.com/anomalyco/opencode/releases/download/v1/opencode.zip"
+            ),
             "github.com"
         );
-        assert_eq!(archive_host_for_log("https://example.com/path?query=1"), "example.com");
+        assert_eq!(
+            archive_host_for_log("https://example.com/path?query=1"),
+            "example.com"
+        );
         assert_eq!(archive_host_for_log("not-a-url"), "not-a-url");
     }
 }

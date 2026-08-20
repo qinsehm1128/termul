@@ -131,6 +131,8 @@ impl LegacyConversationReader {
                         lifecycle_state: ConversationLifecycleState::Ready,
                         last_seq: 0,
                         created_by: ConversationCreator::Termul,
+                        title: None,
+                        title_source: None,
                     },
                     source_key: entry.source_key.clone(),
                     opaque_agent_session_id: entry.legacy_agent_session_id.clone(),
@@ -272,6 +274,7 @@ impl ConversationReader {
             }
         }
         let mut records = records.into_values().collect::<Vec<_>>();
+        records.retain(|record| record.lifecycle_state != ConversationLifecycleState::Deleted);
         records.sort_by_key(|record| record.conversation_id.to_string());
         records
     }
@@ -372,6 +375,8 @@ mod tests {
             lifecycle_state: ConversationLifecycleState::Ready,
             last_seq: 0,
             created_by: ConversationCreator::Termul,
+            title: None,
+            title_source: None,
         }
     }
 

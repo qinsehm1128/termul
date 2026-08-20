@@ -147,7 +147,9 @@ impl AgentCompensationFailure {
 
     #[must_use]
     pub fn from_wire_error(value: &str) -> Option<Self> {
-        let detail = value.strip_prefix(ACP_COMPENSATION_FAILED)?.strip_prefix(':')?;
+        let detail = value
+            .strip_prefix(ACP_COMPENSATION_FAILED)?
+            .strip_prefix(':')?;
         serde_json::from_str(detail).ok()
     }
 
@@ -600,6 +602,8 @@ impl ConversationCreationService {
                         ConversationMetadataUpdate {
                             lifecycle_state: Some(ConversationLifecycleState::AgentFailed),
                             execution_target: None,
+                            title: None,
+                            title_source: None,
                         },
                         ConversationMutation::CreationRecovery,
                     )
@@ -673,6 +677,8 @@ impl ConversationCreationService {
             lifecycle_state: ConversationLifecycleState::AllocatingWorkspace,
             last_seq: 0,
             created_by: ConversationCreator::Termul,
+            title: None,
+            title_source: None,
         };
         self.writer
             .create_conversation(record, ConversationMutation::CreateConversation)
@@ -708,6 +714,8 @@ impl ConversationCreationService {
                 ConversationMetadataUpdate {
                     lifecycle_state: Some(ConversationLifecycleState::InitializingAgent),
                     execution_target: None,
+                    title: None,
+                    title_source: None,
                 },
                 ConversationMutation::MetadataUpdate,
             )
@@ -744,6 +752,19 @@ impl ConversationCreationService {
             .repository
             .get_conversation(conversation_id)
             .map_err(map_repository_error)?;
+        if existing.lifecycle_state == ConversationLifecycleState::Ready {
+            let workspace = self.canonical_workspace_for(&existing)?;
+            let execution_cwd = self.resolve_execution_cwd(
+                &existing.execution_target,
+                &workspace,
+                existing.project_attachment.as_ref(),
+            )?;
+            log::info!(
+                "[conversation-creation] continue ready conversation_id={}",
+                conversation_id
+            );
+            return Ok(prepared_from_record(&existing, execution_cwd));
+        }
         if !matches!(
             existing.lifecycle_state,
             ConversationLifecycleState::AllocatingWorkspace
@@ -810,6 +831,8 @@ impl ConversationCreationService {
                 ConversationMetadataUpdate {
                     lifecycle_state: Some(ConversationLifecycleState::InitializingAgent),
                     execution_target: Some(request.execution_target),
+                    title: None,
+                    title_source: None,
                 },
                 ConversationMutation::CreationRetry,
             )
@@ -1006,27 +1029,28 @@ impl ConversationCreationService {
         );
         let recovery_id = item.recovery_id.clone();
         let repository_root = self.repository.root();
-        let state_root = if repository_root.file_name().and_then(|name| name.to_str()) == Some("v2")
-            && repository_root
-                .parent()
-                .and_then(Path::file_name)
-                .and_then(|name| name.to_str())
-                == Some("conversations")
-        {
-            repository_root.parent().and_then(Path::parent)
-        } else {
-            // Unit-test/injected roots may not use the production suffix. Keep their recovery
-            // queue inside the owning temporary root rather than widening to a shared ancestor.
-            repository_root.parent()
-        }
-        .ok_or_else(|| {
-            creation_error(
-                ConversationErrorCode::ConversationRecoveryRequired,
-                "persist_compensation_recovery",
-                Some(conversation_id),
-                "canonical repository root has no owning state directory",
-            )
-        })?;
+        let state_root =
+            if repository_root.file_name().and_then(|name| name.to_str()) == Some("v2")
+                && repository_root
+                    .parent()
+                    .and_then(Path::file_name)
+                    .and_then(|name| name.to_str())
+                    == Some("conversations")
+            {
+                repository_root.parent().and_then(Path::parent)
+            } else {
+                // Unit-test/injected roots may not use the production suffix. Keep their recovery
+                // queue inside the owning temporary root rather than widening to a shared ancestor.
+                repository_root.parent()
+            }
+            .ok_or_else(|| {
+                creation_error(
+                    ConversationErrorCode::ConversationRecoveryRequired,
+                    "persist_compensation_recovery",
+                    Some(conversation_id),
+                    "canonical repository root has no owning state directory",
+                )
+            })?;
         let operation_dir = state_root
             .join("conversation-migrations")
             .join(RUNTIME_RECOVERY_OPERATION);
@@ -1804,6 +1828,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_of_ready_conversation_continues_without_rewinding_lifecycle() {
+        let fixture = fixture(
+            &["2026-08-15T09:45:15.123Z", "2026-08-15T09:45:16.000Z"],
+            &[ID, BINDING_ID],
+        );
+        let prepared = fixture
+            .service
+            .create_with_agent_gate(request(ExecutionTarget::Workspace), |_prepared| async {
+                Ok(binding("agent/opaque:first"))
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .repository
+                .get_conversation(prepared.conversation_id)
+                .unwrap()
+                .lifecycle_state,
+            ConversationLifecycleState::Ready
+        );
+        let continued = fixture
+            .service
+            .prepare_conversation(retry(
+                prepared.conversation_id,
+                ExecutionTarget::Workspace,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(continued.conversation_id, prepared.conversation_id);
+        assert_eq!(continued.workspace_cwd, prepared.workspace_cwd);
+        assert_eq!(
+            fixture
+                .repository
+                .get_conversation(prepared.conversation_id)
+                .unwrap()
+                .lifecycle_state,
+            ConversationLifecycleState::Ready
+        );
+    }
+
+    #[tokio::test]
     async fn startup_recovery_preserves_nonempty_workspace_and_recreates_only_missing_workspace() {
         let fixture = fixture(&["2026-08-15T09:45:15.123Z"], &[ID]);
         let prepared = fixture
@@ -1821,6 +1886,8 @@ mod tests {
                 ConversationMetadataUpdate {
                     lifecycle_state: Some(ConversationLifecycleState::AllocatingWorkspace),
                     execution_target: None,
+                    title: None,
+                    title_source: None,
                 },
                 ConversationMutation::MetadataUpdate,
             )
