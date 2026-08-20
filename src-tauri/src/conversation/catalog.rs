@@ -430,8 +430,8 @@ impl ConversationCatalog {
         let mut removed = false;
         for chunk_arc in chunks.iter_mut() {
             let chunk = Arc::make_mut(chunk_arc);
-            if let Ok(index) =
-                chunk.binary_search_by_key(&target, |candidate| candidate.conversation_id.to_string())
+            if let Ok(index) = chunk
+                .binary_search_by_key(&target, |candidate| candidate.conversation_id.to_string())
             {
                 chunk.remove(index);
                 removed = true;

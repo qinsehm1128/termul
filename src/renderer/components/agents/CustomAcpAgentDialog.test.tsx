@@ -250,6 +250,26 @@ describe('CustomAcpAgentDialog', () => {
     expect(stored.allowTerminal).toBe(true)
   })
 
+  it('permissionPolicy:allow_all requires a dedicated confirmation', async () => {
+    render(<CustomAcpAgentDialog open={true} onOpenChange={() => {}} />)
+    await pasteAndAdvanceToConfirm(`{
+      "name": "Trusted",
+      "command": "node",
+      "args": [],
+      "env": {},
+      "permissionPolicy": "allow_all"
+    }`)
+    await clickButton('Confirm — Execute Command')
+    expect(mockSaveAgentConfig).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: 'Confirm — Allow All' })).toBeInTheDocument()
+
+    await clickButton('Confirm — Allow All')
+    await waitFor(() => expect(mockSaveAgentConfig).toHaveBeenCalledTimes(1))
+    expect(mockSaveAgentConfig.mock.calls[0][0]).toMatchObject({
+      permissionPolicy: 'allow_all'
+    })
+  })
+
   it('exportAgentConfig strips id/templateId, has no trailing newline, and round-trips', async () => {
     const stored: StoredAgentConfig = {
       id: 'custom-abc12345',
@@ -266,11 +286,12 @@ describe('CustomAcpAgentDialog', () => {
     expect(json.endsWith('\n')).toBe(false)
     const parsed = JSON.parse(json)
     expect(Object.keys(parsed).sort()).toEqual(
-      ['allowTerminal', 'args', 'command', 'configId', 'env', 'name'].sort()
+      ['allowTerminal', 'args', 'command', 'configId', 'env', 'name', 'permissionPolicy'].sort()
     )
     expect(parsed).not.toHaveProperty('id')
     expect(parsed).not.toHaveProperty('templateId')
     expect(parsed.configId).toBe('custom-abc12345')
+    expect(parsed.permissionPolicy).toBe('ask')
 
     // Round-trip: pasting the exported JSON imports cleanly (no unknown
     // fields). configId is honored, fresh id generated (no existing config).

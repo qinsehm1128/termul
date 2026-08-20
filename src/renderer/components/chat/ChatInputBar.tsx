@@ -46,6 +46,7 @@ import { ChatComposerEditor } from './composer/ChatComposerEditor'
 import { FastModeToggle } from './FastModeToggle'
 import { FileMentionMenu } from './FileMentionMenu'
 import { McpBadge } from './McpBadge'
+import { PermissionPolicyBadge } from './PermissionPolicyBadge'
 import { PromptQueuePanel } from './PromptQueuePanel'
 import { SlashCommandMenu, type SlashMenuHandle } from './SlashCommandMenu'
 import { isSlashTriggerAny } from './slash-menu-model'
@@ -708,6 +709,7 @@ export function ChatInputBar({
               <div className="flex min-w-0 items-center gap-2">
                 {canPick && <AttachFilesButton onClick={() => void pickFiles()} />}
                 {mcpBadge}
+                <PermissionPolicyBadge session={session} />
               </div>
               <div
                 className={cn(

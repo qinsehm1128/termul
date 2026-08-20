@@ -1850,10 +1850,7 @@ mod tests {
         );
         let continued = fixture
             .service
-            .prepare_conversation(retry(
-                prepared.conversation_id,
-                ExecutionTarget::Workspace,
-            ))
+            .prepare_conversation(retry(prepared.conversation_id, ExecutionTarget::Workspace))
             .await
             .unwrap();
         assert_eq!(continued.conversation_id, prepared.conversation_id);

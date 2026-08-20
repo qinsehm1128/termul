@@ -97,12 +97,18 @@ pub struct TermulPlanTodo {
 /// host doesn't know at injection time). The parent binds the provisional id
 /// → real `session_id` after the `session/new` response arrives, then emits
 /// the plan_update for the real id. The `token` authenticates the child.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum FrameKind {
     #[default]
     Plan,
     SetTitle,
+    ScheduledTaskList,
+    ScheduledTaskGet,
+    ScheduledTaskPreview,
+    ScheduledTaskDraftCreate,
+    ScheduledTaskDraftUpdate,
+    ScheduledTaskPause,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -115,6 +121,8 @@ pub struct FrameRequest {
     pub todos: Vec<TermulPlanTodo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
 }
 
 /// Parent reply frame (one per connection).
@@ -123,6 +131,8 @@ pub struct FrameReply {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
 }
 
 impl FrameReply {
@@ -131,6 +141,16 @@ impl FrameReply {
         Self {
             ok: true,
             error: None,
+            result: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_result(result: serde_json::Value) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            result: Some(result),
         }
     }
 
@@ -139,8 +159,59 @@ impl FrameReply {
         Self {
             ok: false,
             error: Some(msg.into()),
+            result: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScheduledTaskListInput {
+    #[serde(default)]
+    pub project_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScheduledTaskGetInput {
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScheduledTaskPreviewInput {
+    /// A schedule object: `{kind:"cron", expression, timezone}`,
+    /// `{kind:"interval", everySeconds, anchorAt}`, or `{kind:"at", at}`.
+    pub schedule: serde_json::Value,
+    #[serde(default = "default_preview_count")]
+    pub count: usize,
+}
+
+fn default_preview_count() -> usize {
+    5
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScheduledTaskDraftCreateInput {
+    /// ScheduledTaskDraftInputV1. Never include secrets or credentials.
+    pub draft: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScheduledTaskDraftUpdateInput {
+    pub task_id: String,
+    pub expected_revision: u64,
+    /// Complete replacement ScheduledTaskDraftInputV1.
+    pub draft: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScheduledTaskPauseInput {
+    pub task_id: String,
+    pub expected_revision: u64,
 }
 
 /// Map the agent's todo input → ACP `PlanEntry` list, preserving order.
@@ -376,6 +447,7 @@ mod tests {
             kind: FrameKind::SetTitle,
             todos: Vec::new(),
             title: Some("Fix login bug".into()),
+            payload: None,
         };
         let value = serde_json::to_value(&frame).unwrap();
         assert_eq!(value["kind"], "set_title");

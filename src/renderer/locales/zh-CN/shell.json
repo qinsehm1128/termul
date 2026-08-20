@@ -31,6 +31,8 @@
     "openGitChanges": "打开 Git 更改",
     "conversations": "会话",
     "openConversations": "打开会话区",
+    "scheduledTasks": "定时任务",
+    "openScheduledTasks": "打开定时任务",
     "gitHistory": "Git 历史",
     "gitHistoryNeedsProject": "Git 历史（请先打开项目）",
     "openGitHistory": "打开 Git 历史",

@@ -365,6 +365,27 @@ const P1_DOMAINS: DomainCheck[] = [
     methods: ['getManifest', 'writeManifest', 'deleteManifest'],
     apiBridgeExport: 'workspaceManifestApi',
     testFile: 'tauri-workspace-manifest-api.test.ts'
+  },
+  {
+    domain: 'ScheduledTask',
+    priority: 'P1',
+    tauriAdapterFile: 'tauri-scheduled-task-api.ts',
+    adapterExportName: 'createTauriScheduledTaskApi',
+    methods: [
+      'previewSchedule',
+      'listTasks',
+      'getTask',
+      'createDraft',
+      'updateDraft',
+      'activateTask',
+      'pauseTask',
+      'resumeTask',
+      'runNow',
+      'listRuns',
+      'listAudit'
+    ],
+    apiBridgeExport: 'scheduledTaskApi',
+    testFile: '../tauri-scheduled-task-api.test.ts'
   }
 ]
 
@@ -527,6 +548,7 @@ describe('Parity Checklist Automation', () => {
         'legacy/session/:legacyValue',
         'legacy/storage/:legacyValue',
         'legacy/history/:legacyValue',
+        'scheduled-tasks',
         'snapshots',
         'settings',
         'preferences'
@@ -961,6 +983,27 @@ describe('Parity Checklist Automation', () => {
       const content = readFileSync(protoPath, 'utf-8')
       expect(content).toMatch(/'list_acp_catalog'/)
       expect(content).toMatch(/'set_catalog_opt_in'/)
+    })
+  })
+
+  describe('ACP permission policy parity', () => {
+    const AcpTransport = join(LIB_DIR, 'acp-transport.ts')
+    const ProtoTypes = join(LIB_DIR, '..', '..', 'shared', 'types', 'web-protocol.types.ts')
+    const CommandsRust = join(LIB_DIR, '..', '..', '..', 'src-tauri', 'src', 'acp', 'commands.rs')
+    const WsRust = join(LIB_DIR, '..', '..', '..', 'src-tauri', 'src', 'web', 'ws.rs')
+    const TauriLib = join(LIB_DIR, '..', '..', '..', 'src-tauri', 'src', 'lib.rs')
+
+    it('desktop and web transports expose live permission-policy updates', () => {
+      const transport = readFileSync(AcpTransport, 'utf-8')
+      expect(transport).toMatch(/acp_set_permission_policy/)
+      expect(transport).toMatch(/set_permission_policy/)
+      expect(readFileSync(ProtoTypes, 'utf-8')).toMatch(/'set_permission_policy'/)
+    })
+
+    it('both host entry points route permission-policy updates to AcpManager', () => {
+      expect(readFileSync(CommandsRust, 'utf-8')).toMatch(/acp_set_permission_policy/)
+      expect(readFileSync(WsRust, 'utf-8')).toMatch(/handle_set_permission_policy/)
+      expect(readFileSync(TauriLib, 'utf-8')).toMatch(/acp::commands::acp_set_permission_policy/)
     })
   })
 

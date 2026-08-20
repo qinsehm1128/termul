@@ -218,6 +218,7 @@ impl ScheduledTaskService {
         task_id: &str,
     ) -> Result<ScheduledTaskRunV1, ScheduledTaskStoreError> {
         let task = self.store.get_task(task_id)?;
+        ensure_task_active(&task)?;
         let run = new_queued_run(
             &task,
             ScheduledTaskRunTrigger::Manual,
@@ -234,6 +235,7 @@ impl ScheduledTaskService {
         retry_of_run_id: &str,
     ) -> Result<ScheduledTaskRunV1, ScheduledTaskStoreError> {
         let task = self.store.get_task(task_id)?;
+        ensure_task_active(&task)?;
         let previous = self
             .store
             .list_runs(task_id)?
@@ -550,6 +552,15 @@ fn next_future_after_now(task: &ScheduledTaskV1, now: DateTime<Utc>) -> Option<D
     next_after(&task.schedule, now).ok().flatten()
 }
 
+fn ensure_task_active(task: &ScheduledTaskV1) -> Result<(), ScheduledTaskStoreError> {
+    if task.status != ScheduledTaskStatus::Active {
+        return Err(ScheduledTaskStoreError::InvalidInput(
+            "only an active scheduled task can execute".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn parse_utc(value: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(value)
         .ok()
@@ -574,6 +585,11 @@ mod tests {
 
     struct SuccessExecutor;
 
+    struct GateExecutor {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
     #[async_trait]
     impl ScheduledTaskExecutor for SuccessExecutor {
         async fn execute(
@@ -584,6 +600,23 @@ mod tests {
             Ok(TaskExecutionOutcome {
                 conversation_id: None,
                 summary: Some("done".to_string()),
+                usage: None,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl ScheduledTaskExecutor for GateExecutor {
+        async fn execute(
+            &self,
+            _task: ScheduledTaskV1,
+            _run: ScheduledTaskRunV1,
+        ) -> Result<TaskExecutionOutcome, TaskExecutionError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(TaskExecutionOutcome {
+                conversation_id: None,
+                summary: Some("released".to_string()),
                 usage: None,
             })
         }
@@ -629,11 +662,166 @@ mod tests {
         let task = service
             .create_draft(input(&root, OverlapPolicy::BufferOne), Default::default())
             .unwrap();
+        let task = service
+            .activate(
+                &task.task_id,
+                task.revision,
+                &task.draft_hash,
+                Default::default(),
+            )
+            .unwrap();
         service.run_now(&task.task_id).unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         let runs = service.list_runs(&task.task_id).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, ScheduledTaskRunStatus::Succeeded);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn draft_cannot_run_before_explicit_activation() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("termul-scheduler-draft-{}", Uuid::new_v4()));
+        let store = Arc::new(ScheduledTaskStore::open(root.join("state")).unwrap());
+        let service = ScheduledTaskService::with_max_concurrent_runs(
+            Arc::clone(&store),
+            Arc::new(SuccessExecutor),
+            1,
+        );
+        let task = service
+            .create_draft(input(&root, OverlapPolicy::BufferOne), Default::default())
+            .unwrap();
+        assert!(matches!(
+            service.run_now(&task.task_id),
+            Err(ScheduledTaskStoreError::InvalidInput(detail))
+                if detail.contains("only an active")
+        ));
+        assert!(service.list_runs(&task.task_id).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_recovery_marks_queued_runs_interrupted_without_reexecution() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("termul-scheduler-recovery-{}", Uuid::new_v4()));
+        let store = Arc::new(ScheduledTaskStore::open(root.join("state")).unwrap());
+        let service = ScheduledTaskService::with_max_concurrent_runs(
+            Arc::clone(&store),
+            Arc::new(SuccessExecutor),
+            1,
+        );
+        let task = service
+            .create_draft(input(&root, OverlapPolicy::BufferOne), Default::default())
+            .unwrap();
+        let run = new_queued_run(
+            &task,
+            ScheduledTaskRunTrigger::Manual,
+            Utc::now().to_rfc3339(),
+            None,
+        )
+        .unwrap();
+        store.append_run(&run).unwrap();
+
+        service.recover_interrupted_runs();
+
+        let recovered = store.list_runs(&task.task_id).unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].status, ScheduledTaskRunStatus::Interrupted);
+        assert_eq!(
+            recovered[0].error_code.as_deref(),
+            Some("HOST_RESTART_INTERRUPTED")
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn startup_catch_up_enqueues_only_latest_missed_occurrence() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("termul-scheduler-catchup-{}", Uuid::new_v4()));
+        let store = Arc::new(ScheduledTaskStore::open(root.join("state")).unwrap());
+        let service = ScheduledTaskService::with_max_concurrent_runs(
+            Arc::clone(&store),
+            Arc::new(SuccessExecutor),
+            1,
+        );
+        let mut draft = input(&root, OverlapPolicy::BufferOne);
+        draft.schedule = ScheduleSpecV1::Interval {
+            every_seconds: 60 * 60,
+            anchor_at: (Utc::now() - ChronoDuration::hours(3)).to_rfc3339(),
+        };
+        let task = service.create_draft(draft, Default::default()).unwrap();
+        let task = service
+            .activate(
+                &task.task_id,
+                task.revision,
+                &task.draft_hash,
+                Default::default(),
+            )
+            .unwrap();
+        store
+            .set_next_run_at(
+                &task.task_id,
+                Some((Utc::now() - ChronoDuration::hours(2)).to_rfc3339()),
+            )
+            .unwrap();
+
+        service.catch_up_after_start().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let runs = store.list_runs(&task.task_id).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].trigger, ScheduledTaskRunTrigger::CatchUp);
+        assert_eq!(runs[0].status, ScheduledTaskRunStatus::Succeeded);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn skip_overlap_records_second_occurrence_without_executing_it() {
+        let root = std::fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("termul-scheduler-overlap-{}", Uuid::new_v4()));
+        let store = Arc::new(ScheduledTaskStore::open(root.join("state")).unwrap());
+        let executor = Arc::new(GateExecutor {
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let service =
+            ScheduledTaskService::with_max_concurrent_runs(Arc::clone(&store), executor.clone(), 1);
+        let task = service
+            .create_draft(input(&root, OverlapPolicy::Skip), Default::default())
+            .unwrap();
+        let task = service
+            .activate(
+                &task.task_id,
+                task.revision,
+                &task.draft_hash,
+                Default::default(),
+            )
+            .unwrap();
+
+        service.run_now(&task.task_id).unwrap();
+        executor.started.notified().await;
+        service.run_now(&task.task_id).unwrap();
+        executor.release.notify_one();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let runs = store.list_runs(&task.task_id).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(
+            runs.iter()
+                .filter(|run| run.status == ScheduledTaskRunStatus::Skipped)
+                .count(),
+            1
+        );
+        assert_eq!(
+            runs.iter()
+                .filter(|run| run.status == ScheduledTaskRunStatus::Succeeded)
+                .count(),
+            1
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 }

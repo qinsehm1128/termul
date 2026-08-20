@@ -1,4 +1,5 @@
 import {
+  CalendarClock,
   FolderKanban,
   GitBranch,
   History,
@@ -110,6 +111,25 @@ export function ActivityRail({
         <FolderKanban
           size={18}
           className={location.pathname === '/' ? 'text-foreground' : 'text-muted-foreground'}
+        />
+      </button>
+
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation()
+          navigate('/scheduled-tasks')
+        }}
+        className={railButtonClass}
+        title={t('activityRail.scheduledTasks')}
+        aria-label={t('activityRail.openScheduledTasks')}
+        aria-current={location.pathname === '/scheduled-tasks' ? 'page' : undefined}
+      >
+        <CalendarClock
+          size={18}
+          className={
+            location.pathname === '/scheduled-tasks' ? 'text-foreground' : 'text-muted-foreground'
+          }
         />
       </button>
 

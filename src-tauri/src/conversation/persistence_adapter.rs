@@ -21,10 +21,10 @@ use crate::acp::session_persistence::{
 use crate::conversation::contracts::{
     encoded_json_len_bounded, AgentSessionBinding, AgentSessionBindingState,
     ConversationHistoryPageV1, ConversationHistoryRecordV1, ConversationId,
-    ConversationLifecycleState, ConversationTitleSource, CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION,
-    CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION, MAX_CONVERSATION_HISTORY_PAGE_BYTES,
-    MAX_CONVERSATION_HISTORY_PAGE_LIMIT, MAX_CONVERSATION_RECORD_BYTES,
-    MIN_CONVERSATION_HISTORY_PAGE_LIMIT,
+    ConversationLifecycleState, ConversationTitleSource, ExecutionTarget,
+    CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION, CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION,
+    MAX_CONVERSATION_HISTORY_PAGE_BYTES, MAX_CONVERSATION_HISTORY_PAGE_LIMIT,
+    MAX_CONVERSATION_RECORD_BYTES, MIN_CONVERSATION_HISTORY_PAGE_LIMIT,
 };
 use crate::conversation::event_log::ConversationEventType;
 use crate::conversation::migration::ConversationReader;
@@ -166,6 +166,33 @@ impl ConversationPersistenceAdapter {
     #[must_use]
     pub fn conversation_id_for_session(&self, agent_session_id: &str) -> Option<ConversationId> {
         self.conversation_id_for_active_binding(agent_session_id)
+    }
+
+    /// Resolve the host-owned scope used by scheduled-task drafts. Agent tool
+    /// input must never choose another project, execution directory, or ACP.
+    #[must_use]
+    pub fn scheduled_task_scope_for_session(
+        &self,
+        agent_session_id: &str,
+    ) -> Option<(String, String, ExecutionTarget, String, String)> {
+        let conversation_id = self.conversation_id_for_active_binding(agent_session_id)?;
+        let record = self.reader.get(conversation_id).ok()?;
+        let binding = self
+            .binding_for_session(conversation_id, agent_session_id)
+            .ok()?;
+        let project_id = record.project_attachment?.project_id;
+        let agent_config_id = binding
+            .stable_agent_namespace
+            .strip_prefix("config:")
+            .unwrap_or(binding.stable_agent_namespace.as_str())
+            .to_string();
+        Some((
+            project_id,
+            record.workspace_cwd,
+            record.execution_target,
+            binding.execution_cwd,
+            agent_config_id,
+        ))
     }
 
     #[must_use]

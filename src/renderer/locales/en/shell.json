@@ -31,6 +31,8 @@
     "openGitChanges": "Open git changes",
     "conversations": "Conversations",
     "openConversations": "Open the conversations area",
+    "scheduledTasks": "Scheduled tasks",
+    "openScheduledTasks": "Open scheduled tasks",
     "gitHistory": "Git history",
     "gitHistoryNeedsProject": "Git history (open a project first)",
     "openGitHistory": "Open git history",

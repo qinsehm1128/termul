@@ -44,16 +44,22 @@ impl std::fmt::Display for ScheduledTaskStoreError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Io(error) => write!(formatter, "scheduled task store io error: {error}"),
-            Self::Durable(error) => write!(formatter, "scheduled task durable write failed: {error}"),
+            Self::Durable(error) => {
+                write!(formatter, "scheduled task durable write failed: {error}")
+            }
             Self::Json(error) => write!(formatter, "scheduled task JSON is invalid: {error}"),
-            Self::InvalidInput(detail) => write!(formatter, "scheduled task input is invalid: {detail}"),
+            Self::InvalidInput(detail) => {
+                write!(formatter, "scheduled task input is invalid: {detail}")
+            }
             Self::InvalidSchedule(error) => write!(formatter, "{error}"),
             Self::NotFound(id) => write!(formatter, "scheduled task was not found: {id}"),
             Self::RevisionConflict { expected, actual } => write!(
                 formatter,
                 "scheduled task revision conflict: expected {expected}, actual {actual}"
             ),
-            Self::DraftHashConflict => write!(formatter, "scheduled task draft changed after review"),
+            Self::DraftHashConflict => {
+                write!(formatter, "scheduled task draft changed after review")
+            }
             Self::BadSchemaVersion { expected, actual } => write!(
                 formatter,
                 "scheduled task schema mismatch: expected {expected}, got {actual}"
@@ -115,7 +121,10 @@ impl ScheduledTaskStore {
     }
 
     pub fn list_tasks(&self, project_id: Option<&str>) -> Result<Vec<ScheduledTaskV1>> {
-        let _guard = self.mutation_lock.lock().map_err(|_| ScheduledTaskStoreError::Poisoned)?;
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| ScheduledTaskStoreError::Poisoned)?;
         let mut tasks = if let Some(project_id) = project_id {
             validate_component(project_id, "projectId")?;
             self.load_catalog(project_id)?.tasks
@@ -152,7 +161,10 @@ impl ScheduledTaskStore {
         input: ScheduledTaskDraftInputV1,
         context: TaskMutationContextV1,
     ) -> Result<ScheduledTaskV1> {
-        let _guard = self.mutation_lock.lock().map_err(|_| ScheduledTaskStoreError::Poisoned)?;
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| ScheduledTaskStoreError::Poisoned)?;
         let input = validate_input(input)?;
         let now = Utc::now();
         let mut catalog = self.load_catalog(&input.project_id)?;
@@ -196,7 +208,10 @@ impl ScheduledTaskStore {
         context: TaskMutationContextV1,
     ) -> Result<ScheduledTaskV1> {
         validate_uuid(task_id, "taskId")?;
-        let _guard = self.mutation_lock.lock().map_err(|_| ScheduledTaskStoreError::Poisoned)?;
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| ScheduledTaskStoreError::Poisoned)?;
         let input = validate_input(input)?;
         let mut catalog = self.load_catalog(&input.project_id)?;
         let index = catalog
@@ -296,7 +311,10 @@ impl ScheduledTaskStore {
         context: TaskMutationContextV1,
     ) -> Result<()> {
         validate_uuid(task_id, "taskId")?;
-        let _guard = self.mutation_lock.lock().map_err(|_| ScheduledTaskStoreError::Poisoned)?;
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| ScheduledTaskStoreError::Poisoned)?;
         let (project_id, mut catalog, index) = self.locate_task_locked(task_id)?;
         let before = catalog.tasks[index].clone();
         ensure_revision(&before, expected_revision)?;
@@ -310,9 +328,16 @@ impl ScheduledTaskStore {
     /// Persist scheduler projection state without changing the user-facing
     /// task revision. This prevents a normal occurrence from invalidating a
     /// concurrent pause/edit CAS while still making `nextRunAt` crash durable.
-    pub fn set_next_run_at(&self, task_id: &str, next_run_at: Option<String>) -> Result<ScheduledTaskV1> {
+    pub fn set_next_run_at(
+        &self,
+        task_id: &str,
+        next_run_at: Option<String>,
+    ) -> Result<ScheduledTaskV1> {
         validate_uuid(task_id, "taskId")?;
-        let _guard = self.mutation_lock.lock().map_err(|_| ScheduledTaskStoreError::Poisoned)?;
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| ScheduledTaskStoreError::Poisoned)?;
         let (project_id, mut catalog, index) = self.locate_task_locked(task_id)?;
         if catalog.tasks[index].next_run_at == next_run_at {
             return Ok(catalog.tasks[index].clone());
@@ -326,7 +351,10 @@ impl ScheduledTaskStore {
 
     pub fn append_run(&self, run: &ScheduledTaskRunV1) -> Result<()> {
         validate_run(run)?;
-        let _guard = self.mutation_lock.lock().map_err(|_| ScheduledTaskStoreError::Poisoned)?;
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| ScheduledTaskStoreError::Poisoned)?;
         let project_dir = self.ensure_project_dir(&run.project_id)?;
         let bytes = serde_json::to_vec(run)?;
         self.durable_fs
@@ -338,8 +366,12 @@ impl ScheduledTaskStore {
 
     pub fn list_runs(&self, task_id: &str) -> Result<Vec<ScheduledTaskRunV1>> {
         let task = self.get_task(task_id)?;
-        let _guard = self.mutation_lock.lock().map_err(|_| ScheduledTaskStoreError::Poisoned)?;
-        let records = read_jsonl::<ScheduledTaskRunV1>(&self.project_dir(&task.project_id).join(RUNS_FILE))?;
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| ScheduledTaskStoreError::Poisoned)?;
+        let records =
+            read_jsonl::<ScheduledTaskRunV1>(&self.project_dir(&task.project_id).join(RUNS_FILE))?;
         let mut latest = BTreeMap::new();
         for run in records.into_iter().filter(|run| run.task_id == task_id) {
             validate_run(&run)?;
@@ -352,7 +384,10 @@ impl ScheduledTaskStore {
 
     pub fn list_audit(&self, task_id: &str) -> Result<Vec<ScheduledTaskAuditEventV1>> {
         let task = self.get_task(task_id)?;
-        let _guard = self.mutation_lock.lock().map_err(|_| ScheduledTaskStoreError::Poisoned)?;
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| ScheduledTaskStoreError::Poisoned)?;
         let mut events = read_jsonl::<ScheduledTaskAuditEventV1>(
             &self.project_dir(&task.project_id).join(AUDIT_FILE),
         )?
@@ -373,7 +408,10 @@ impl ScheduledTaskStore {
         context: TaskMutationContextV1,
     ) -> Result<ScheduledTaskV1> {
         validate_uuid(task_id, "taskId")?;
-        let _guard = self.mutation_lock.lock().map_err(|_| ScheduledTaskStoreError::Poisoned)?;
+        let _guard = self
+            .mutation_lock
+            .lock()
+            .map_err(|_| ScheduledTaskStoreError::Poisoned)?;
         let (project_id, mut catalog, index) = self.locate_task_locked(task_id)?;
         let before = catalog.tasks[index].clone();
         ensure_revision(&before, expected_revision)?;
@@ -398,10 +436,7 @@ impl ScheduledTaskStore {
         Ok(updated)
     }
 
-    fn locate_task_locked(
-        &self,
-        task_id: &str,
-    ) -> Result<(String, ScheduledTaskCatalogV1, usize)> {
+    fn locate_task_locked(&self, task_id: &str) -> Result<(String, ScheduledTaskCatalogV1, usize)> {
         for entry in fs::read_dir(&self.root)? {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
@@ -411,7 +446,11 @@ impl ScheduledTaskStore {
                 continue;
             };
             let catalog = self.load_catalog(&project_id)?;
-            if let Some(index) = catalog.tasks.iter().position(|task| task.task_id == task_id) {
+            if let Some(index) = catalog
+                .tasks
+                .iter()
+                .position(|task| task.task_id == task_id)
+            {
                 return Ok((project_id, catalog, index));
             }
         }
@@ -551,9 +590,8 @@ fn validate_component(value: &str, label: &str) -> Result<()> {
 }
 
 fn validate_uuid(value: &str, label: &str) -> Result<()> {
-    Uuid::parse_str(value).map_err(|_| {
-        ScheduledTaskStoreError::InvalidInput(format!("{label} must be a UUID"))
-    })?;
+    Uuid::parse_str(value)
+        .map_err(|_| ScheduledTaskStoreError::InvalidInput(format!("{label} must be a UUID")))?;
     Ok(())
 }
 
@@ -667,10 +705,8 @@ pub fn new_queued_run(
 
 #[cfg(test)]
 mod tests {
+    use super::super::models::{CatchUpPolicy, ExecutionPolicyV1, OverlapPolicy, ScheduleSpecV1};
     use super::*;
-    use super::super::models::{
-        CatchUpPolicy, ExecutionPolicyV1, OverlapPolicy, ScheduleSpecV1,
-    };
 
     fn input(root: &Path) -> ScheduledTaskDraftInputV1 {
         ScheduledTaskDraftInputV1 {

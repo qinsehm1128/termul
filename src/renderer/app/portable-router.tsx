@@ -9,6 +9,7 @@ const WorkspaceDashboard = lazy(() => import('@/pages/WorkspaceDashboard'))
 const ProjectSettings = lazy(() => import('@/pages/ProjectSettings'))
 const AppPreferences = lazy(() => import('@/pages/AppPreferences'))
 const WorkspaceSnapshots = lazy(() => import('@/pages/WorkspaceSnapshots'))
+const ScheduledTasks = lazy(() => import('@/pages/ScheduledTasks'))
 const NotFound = lazy(() => import('@/pages/NotFound'))
 
 function RouteFallback(): React.JSX.Element {
@@ -43,6 +44,7 @@ export const portableRouteObjects: RouteObject[] = [
         element: <ChatRoute sourceKind="legacyChatHistoryId" />
       },
       { path: 'snapshots', element: deferred(<WorkspaceSnapshots />) },
+      { path: 'scheduled-tasks', element: deferred(<ScheduledTasks />) },
       { path: 'settings', element: deferred(<ProjectSettings />) },
       { path: 'preferences', element: deferred(<AppPreferences />) }
     ]

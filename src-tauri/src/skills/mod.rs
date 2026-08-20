@@ -6,6 +6,9 @@
 //! agent already reports natively is not shown twice (see `slash-menu-model`).
 
 pub mod commands;
+pub mod provisioner;
+
+pub use provisioner::ConversationSkillProvisioner;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

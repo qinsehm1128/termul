@@ -4,6 +4,7 @@
 //! agent execution is represented by a separate Conversation v2 record so
 //! messages, plans, tool calls and usage keep one canonical audit source.
 
+pub mod commands;
 pub mod models;
 pub mod runner;
 pub mod schedule;
@@ -19,14 +20,12 @@ pub use models::{
     SCHEDULED_TASK_AUDIT_SCHEMA_VERSION, SCHEDULED_TASK_RUN_SCHEMA_VERSION,
     SCHEDULED_TASK_SCHEMA_VERSION, SKILL_TEMPLATE_VERSION,
 };
-pub use schedule::{
-    next_after, normalize_schedule, occurrences_after, preview_schedule, ScheduleError,
-};
-pub use scheduler::ScheduledTaskService;
 pub use runner::{
     AcpScheduledTaskExecutor, ScheduledTaskExecutor, TaskExecutionError, TaskExecutionOutcome,
     DEFAULT_TASK_TURN_TIMEOUT,
 };
-pub use store::{
-    new_queued_run, snapshot_hash, ScheduledTaskStore, ScheduledTaskStoreError,
+pub use schedule::{
+    next_after, normalize_schedule, occurrences_after, preview_schedule, ScheduleError,
 };
+pub use scheduler::ScheduledTaskService;
+pub use store::{new_queued_run, snapshot_hash, ScheduledTaskStore, ScheduledTaskStoreError};

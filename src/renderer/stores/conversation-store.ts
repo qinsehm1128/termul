@@ -14,6 +14,7 @@ import type { ConversationLifecycleOutcome } from '@shared/types/conversation-li
 import type { RecoveryItemV1 } from '@shared/types/conversation-recovery.types'
 import { create } from 'zustand'
 import { useShallow } from 'zustand/shallow'
+import { notifyAgentSkillsChanged } from '@/lib/agent-skills-events'
 import { conversationApi } from '@/lib/conversation-api'
 import { isLiveAcpSession, resolveConversationSessionId } from '@/lib/conversation-binding'
 import { mergeConversationTitle } from '@/lib/conversation-title'
@@ -472,6 +473,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         })
         return null
       }
+      notifyAgentSkillsChanged(result.data.conversation.workspaceCwd)
 
       let opened: ConversationOpenOutcome | null = null
       set((state) => {
@@ -628,6 +630,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       })
       return false
     }
+    notifyAgentSkillsChanged(openResult.data.conversation.workspaceCwd)
 
     // Snapshot the project pane tree before this Conversation becomes active so
     // later project-layout writes cannot persist Conversation chrome.
@@ -744,12 +747,17 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     try {
       const live = acp.sessions[sessionId]
       if (!live || live.status === 'closed') {
-        await acp.openHistorySession(sessionId)
-        if (!isCurrent()) {
-          logStaleActivation(conversationId, activationEpoch, 'binding-open')
-          return false
-        }
-        acp = useAcpStore.getState()
+        // Durable history belongs to Termul and is rendered independently from
+        // the agent process. Reconnect in the background so a slow ACP
+        // session/resume (or load fallback) cannot keep the Conversation route
+        // behind its full-screen opening state.
+        void acp.openHistorySession(sessionId).catch((error) => {
+          void logFrontendError({
+            level: 'warn',
+            source: 'conversation-store.activation',
+            message: `conversationId=${conversationId} epoch=${activationEpoch} stage=binding-reconnect code=ACP_SESSION_REOPEN_FAILED error=${error instanceof Error ? error.message : String(error)}`
+          })
+        })
       }
       if (!isCurrent()) return false
       let boundSessionId = sessionId

@@ -474,6 +474,7 @@ impl ConversationApplicationService {
         let started = Instant::now();
         let result = async {
             let conversation = self.get_conversation(conversation_id)?;
+            self.backfill_managed_skills(&conversation);
             let workspace = self
                 .workspace
                 .load(conversation_id)
@@ -494,6 +495,39 @@ impl ConversationApplicationService {
             &result,
         );
         result
+    }
+
+    fn backfill_managed_skills(&self, conversation: &ConversationRecordV2) {
+        let binding = match self
+            .writer
+            .repository()
+            .current_binding(conversation.conversation_id)
+        {
+            Ok(Some(binding)) => binding,
+            Ok(None) => return,
+            Err(error) => {
+                log::warn!(
+                    "[scheduled-task-skill] boundary=backfill_binding_lookup_failed conversation_id={} error={error}",
+                    conversation.conversation_id
+                );
+                return;
+            }
+        };
+        let provider_key = binding
+            .stable_agent_namespace
+            .strip_prefix("config:")
+            .unwrap_or(binding.stable_agent_namespace.as_str());
+        if let Err(error) = crate::skills::ConversationSkillProvisioner::new().provision(
+            std::path::Path::new(&conversation.workspace_cwd),
+            provider_key,
+        ) {
+            // Opening durable history must remain available even if an old
+            // workspace is missing or contains an unmanaged collision.
+            log::warn!(
+                "[scheduled-task-skill] boundary=backfill_failed conversation_id={} error={error}",
+                conversation.conversation_id
+            );
+        }
     }
 
     pub fn resolve_legacy_conversation_id(
@@ -1213,8 +1247,9 @@ fn log_result<T>(
 mod tests {
     use super::*;
     use crate::conversation::contracts::{
-        parse_created_at_utc, ConversationCreator, ConversationLifecycleState,
-        ConversationRecordV2, CreationPartition, ExecutionTarget, CONVERSATION_SCHEMA_VERSION,
+        parse_created_at_utc, AgentSessionBinding, AgentSessionBindingState, ConversationCreator,
+        ConversationLifecycleState, ConversationRecordV2, CreationPartition, ExecutionTarget,
+        AGENT_SESSION_BINDING_SCHEMA_VERSION, CONVERSATION_SCHEMA_VERSION,
     };
     use crate::conversation::migration::{
         CreatedAtSource, IdentityDecision, MigrationMapEntryV1, MIGRATION_MAP_SCHEMA_VERSION,
@@ -1241,6 +1276,8 @@ mod tests {
         let writer = ConversationWriter::for_test(Arc::clone(&repository));
         let id = ConversationId::parse(ID).unwrap();
         let created_at = parse_created_at_utc("2026-08-15T09:45:15.123Z").unwrap();
+        let workspace_cwd = temp.path().canonicalize().unwrap().join("workspace");
+        std::fs::create_dir_all(&workspace_cwd).unwrap();
         writer
             .create_conversation(
                 ConversationRecordV2 {
@@ -1248,7 +1285,7 @@ mod tests {
                     conversation_id: id,
                     created_at_utc: created_at,
                     creation_partition: CreationPartition::from_created_at(created_at),
-                    workspace_cwd: "/visible/conversation".to_string(),
+                    workspace_cwd: workspace_cwd.to_string_lossy().into_owned(),
                     execution_target: ExecutionTarget::Workspace,
                     project_attachment: None,
                     lifecycle_state: ConversationLifecycleState::Ready,
@@ -1348,6 +1385,43 @@ mod tests {
             ConversationHostState::Ready
         );
         let _ = SessionWorkspaceProjectionState::Native;
+    }
+
+    #[tokio::test]
+    async fn opening_an_existing_conversation_backfills_its_agent_skills_idempotently() {
+        let (_temp, _repository, service) = fixture().await;
+        let conversation_id = ConversationId::parse(ID).unwrap();
+        let conversation = service.get_conversation(conversation_id).unwrap();
+        let bound_at = parse_created_at_utc("2026-08-15T09:45:16.123Z").unwrap();
+        service
+            .writer()
+            .bind_agent_session(
+                conversation_id,
+                AgentSessionBinding {
+                    schema_version: AGENT_SESSION_BINDING_SCHEMA_VERSION,
+                    binding_id: Uuid::new_v4(),
+                    agent_session_id: "old/opaque-session".to_string(),
+                    runtime_agent_id: "runtime-agent".to_string(),
+                    stable_agent_namespace: "config:claude-agent-acp".to_string(),
+                    execution_cwd: conversation.workspace_cwd.clone(),
+                    bound_at_utc: bound_at,
+                    state: AgentSessionBindingState::Active,
+                },
+                bound_at,
+            )
+            .await
+            .unwrap();
+
+        service.open_conversation(conversation_id).await.unwrap();
+        let cross_tool = std::path::Path::new(&conversation.workspace_cwd)
+            .join(".agents/skills/termul-scheduled-tasks/SKILL.md");
+        let provider = std::path::Path::new(&conversation.workspace_cwd)
+            .join(".claude/skills/termul-scheduled-tasks/SKILL.md");
+        let first = std::fs::read_to_string(&cross_tool).unwrap();
+        assert!(provider.exists());
+
+        service.open_conversation(conversation_id).await.unwrap();
+        assert_eq!(std::fs::read_to_string(cross_tool).unwrap(), first);
     }
 
     #[tokio::test]

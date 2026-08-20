@@ -59,6 +59,19 @@ export function validateAgentConfig(cfg: Partial<AgentConfig>): AgentConfigValid
       )
     )
   }
+  if (
+    cfg.permissionPolicy !== undefined &&
+    cfg.permissionPolicy !== 'ask' &&
+    cfg.permissionPolicy !== 'allow_all'
+  ) {
+    errors.push(
+      runtimeT(
+        'agents',
+        'customAcp.errors.permissionPolicy',
+        'permissionPolicy must be "ask" or "allow_all".'
+      )
+    )
+  }
   return { valid: errors.length === 0, errors }
 }
 
@@ -130,7 +143,8 @@ export async function loadAgentConfigs(): Promise<StoredAgentConfig[]> {
         configId,
         args,
         env,
-        allowTerminal: typeof cfg.allowTerminal === 'boolean' ? cfg.allowTerminal : false
+        allowTerminal: typeof cfg.allowTerminal === 'boolean' ? cfg.allowTerminal : false,
+        permissionPolicy: cfg.permissionPolicy === 'allow_all' ? 'allow_all' : 'ask'
       }
     })
   }

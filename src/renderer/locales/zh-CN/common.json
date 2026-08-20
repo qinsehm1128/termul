@@ -139,5 +139,39 @@
       "CONVERSATION_LEGACY_RESOLVE_FAILED": "旧版标识符解析器不可用。",
       "CONVERSATION_OPEN_FAILED": "无法打开该会话。"
     }
+  },
+  "scheduledTasks": {
+    "title": "定时任务",
+    "refresh": "刷新定时任务",
+    "empty": "当前项目还没有定时任务。可以在聊天中让 AI 创建草稿。",
+    "selectTask": "请选择一个定时任务查看详情。",
+    "activate": "审核并启用",
+    "pause": "暂停",
+    "resume": "恢复",
+    "runNow": "立即运行",
+    "everySeconds": "每 {{count}} 秒",
+    "prompt": "任务提示词",
+    "agent": "代理：{{agent}}",
+    "revision": "修订：{{revision}}",
+    "hash": "草稿哈希：{{hash}}",
+    "history": "执行历史",
+    "noRuns": "该任务尚未执行。",
+    "audit": "任务审计",
+    "confirmTitle": "要启用这个定时任务吗？",
+    "confirmDescription": "{{name}} 将按 {{schedule}} 执行。你正在确认第 {{revision}} 版及其精确草稿哈希。",
+    "status": {
+      "draft": "草稿",
+      "active": "已启用",
+      "paused": "已暂停"
+    },
+    "runStatus": {
+      "queued": "等待中",
+      "running": "执行中",
+      "succeeded": "成功",
+      "failed": "失败",
+      "cancelled": "已取消",
+      "skipped": "已跳过",
+      "interrupted": "已中断"
+    }
   }
 }

@@ -55,15 +55,18 @@ const ALLOWED_AGENT_CONFIG_FIELDS = new Set<keyof AgentConfig>([
   'command',
   'args',
   'env',
-  'allowTerminal'
+  'allowTerminal',
+  'permissionPolicy'
 ])
 
 const ARBITRARY_COMMAND_PROMPT =
   'This will execute an arbitrary command on your machine. Are you sure you want to persist this agent?'
 const ARBITRARY_COMMAND_TERMINAL_PROMPT =
   'This agent requests the ACP terminal capability, which allows it to execute arbitrary commands on your machine. Are you sure you want to allow this?'
+const ALLOW_ALL_PERMISSION_PROMPT =
+  'This agent requests full tool permission. Termul will automatically accept allow options without asking each time.'
 
-type ConfirmStep = 'idle' | 'confirm' | 'confirmTerminal'
+type ConfirmStep = 'idle' | 'confirm' | 'confirmTerminal' | 'confirmPermission'
 
 /** Generate a fresh `custom-<uuid8>` identity. */
 function freshCustomId(): string {
@@ -88,7 +91,8 @@ export function exportAgentConfig(stored: StoredAgentConfig): string {
     command: stored.command,
     args: stored.args,
     env: stored.env,
-    allowTerminal: stored.allowTerminal
+    allowTerminal: stored.allowTerminal,
+    permissionPolicy: stored.permissionPolicy ?? 'ask'
   }
   return JSON.stringify(exported, null, 2)
 }
@@ -101,7 +105,7 @@ type ParsedConfig = {
 
 /**
  * Parse + validate the pasted JSON. Returns an error string on failure, or the
- * promoted `AgentConfig` on success. Only the 6 AgentConfig fields are
+ * promoted `AgentConfig` on success. Only AgentConfig fields are
  * permitted; unknown fields (incl. `id`/`templateId`) are rejected loudly so
  * the export shape round-trips. A whitespace-only `configId` is rejected
  * (rather than silently trimmed to a fresh identity).
@@ -133,7 +137,7 @@ function parsePastedAgentConfig(raw: string): ParsedConfig | { error: string } {
       return {
         error: t(
           'customAcp.errors.unknownField',
-          'Unknown field "{{field}}". Only configId, name, command, args, env, allowTerminal are allowed.',
+          'Unknown field "{{field}}". Only configId, name, command, args, env, allowTerminal, permissionPolicy are allowed.',
           { field: key }
         )
       }
@@ -153,6 +157,7 @@ function parsePastedAgentConfig(raw: string): ParsedConfig | { error: string } {
   const args = obj.args
   const env = obj.env
   const allowTerminal = obj.allowTerminal
+  const permissionPolicy = obj.permissionPolicy
   // undefined is allowed (field optional); when present, must be the right
   // type. The shared `validateAgentConfig` covers element/value-type checks
   // too, but surface a clearer error here before constructing a typed object.
@@ -178,6 +183,18 @@ function parsePastedAgentConfig(raw: string): ParsedConfig | { error: string } {
       error: t('customAcp.errors.allowTerminalBoolean', 'allowTerminal must be a boolean.')
     }
   }
+  if (
+    permissionPolicy !== undefined &&
+    permissionPolicy !== 'ask' &&
+    permissionPolicy !== 'allow_all'
+  ) {
+    return {
+      error: t(
+        'customAcp.errors.permissionPolicy',
+        'permissionPolicy must be "ask" or "allow_all".'
+      )
+    }
+  }
 
   const cfg: AgentConfig = {
     configId: rawConfigId?.trim() || undefined,
@@ -188,7 +205,8 @@ function parsePastedAgentConfig(raw: string): ParsedConfig | { error: string } {
       env !== undefined && typeof env === 'object' && env !== null
         ? (env as Record<string, string>)
         : {},
-    allowTerminal: typeof allowTerminal === 'boolean' ? allowTerminal : false
+    allowTerminal: typeof allowTerminal === 'boolean' ? allowTerminal : false,
+    permissionPolicy: permissionPolicy === 'allow_all' ? 'allow_all' : 'ask'
   }
 
   // Shape validation (non-empty name/command + element/value types) — reuse
@@ -315,6 +333,17 @@ export function CustomAcpAgentDialog({
     if (!pendingConfig || saving) return
     if (pendingConfig.allowTerminal === true) {
       setStep('confirmTerminal')
+    } else if (pendingConfig.permissionPolicy === 'allow_all') {
+      setStep('confirmPermission')
+    } else {
+      void performSave()
+    }
+  }, [pendingConfig, saving, performSave])
+
+  const handleConfirmTerminal = useCallback(() => {
+    if (!pendingConfig || saving) return
+    if (pendingConfig.permissionPolicy === 'allow_all') {
+      setStep('confirmPermission')
     } else {
       void performSave()
     }
@@ -327,7 +356,8 @@ export function CustomAcpAgentDialog({
     setError(null)
   }, [saving])
 
-  const confirming = step === 'confirm' || step === 'confirmTerminal'
+  const confirming =
+    step === 'confirm' || step === 'confirmTerminal' || step === 'confirmPermission'
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -347,7 +377,7 @@ export function CustomAcpAgentDialog({
                 )
               : t(
                   'customAcp.description',
-                  'Paste an ACP agent config as JSON. Only configId, name, command, args, env, and allowTerminal fields are accepted; env values must be $VAR placeholders.'
+                  'Paste an ACP agent config as JSON. Only configId, name, command, args, env, allowTerminal, and permissionPolicy fields are accepted; env values must be $VAR placeholders.'
                 )}
           </DialogDescription>
         </DialogHeader>
@@ -393,7 +423,9 @@ export function CustomAcpAgentDialog({
               <p className="text-sm text-destructive">
                 {step === 'confirmTerminal'
                   ? t('customAcp.terminalPrompt', ARBITRARY_COMMAND_TERMINAL_PROMPT)
-                  : t('customAcp.arbitraryCommandPrompt', ARBITRARY_COMMAND_PROMPT)}
+                  : step === 'confirmPermission'
+                    ? t('customAcp.permissionPrompt', ALLOW_ALL_PERMISSION_PROMPT)
+                    : t('customAcp.arbitraryCommandPrompt', ARBITRARY_COMMAND_PROMPT)}
               </p>
               <dl className="grid grid-cols-[max-content_1fr] gap-x-3 gap-y-1 rounded-md border border-border/60 bg-muted/40 px-3 py-2 font-mono text-xs">
                 <dt className="text-muted-foreground">name</dt>
@@ -410,12 +442,26 @@ export function CustomAcpAgentDialog({
                     <dd className="text-amber-500">true</dd>
                   </>
                 )}
+                {pendingConfig.permissionPolicy === 'allow_all' && (
+                  <>
+                    <dt className="text-muted-foreground">permissionPolicy</dt>
+                    <dd className="text-amber-500">allow_all</dd>
+                  </>
+                )}
               </dl>
               {step === 'confirmTerminal' && (
                 <p className="text-2xs text-amber-500">
                   {t(
                     'customAcp.terminalSecondConfirmation',
                     'This is the second confirmation: terminal capability lets the agent run arbitrary commands on your machine.'
+                  )}
+                </p>
+              )}
+              {step === 'confirmPermission' && (
+                <p className="text-2xs text-amber-500">
+                  {t(
+                    'customAcp.permissionSecondConfirmation',
+                    'This is a separate confirmation: all allow options offered by the agent will be accepted automatically.'
                   )}
                 </p>
               )}
@@ -445,15 +491,23 @@ export function CustomAcpAgentDialog({
           ) : (
             <>
               <Button variant="outline" size="sm" onClick={cancelConfirm} disabled={saving}>
-                {step === 'confirmTerminal'
+                {step === 'confirmTerminal' || step === 'confirmPermission'
                   ? t('common.back', 'Back')
                   : t('common.cancel', 'Cancel')}
               </Button>
               <Button
                 size="sm"
-                variant={step === 'confirmTerminal' ? 'destructive' : 'default'}
+                variant={
+                  step === 'confirmTerminal' || step === 'confirmPermission'
+                    ? 'destructive'
+                    : 'default'
+                }
                 onClick={
-                  step === 'confirmTerminal' ? () => void performSave() : handleConfirmArbitrary
+                  step === 'confirmTerminal'
+                    ? handleConfirmTerminal
+                    : step === 'confirmPermission'
+                      ? () => void performSave()
+                      : handleConfirmArbitrary
                 }
                 disabled={saving}
               >
@@ -461,7 +515,9 @@ export function CustomAcpAgentDialog({
                   ? t('common.saving', 'Saving…')
                   : step === 'confirmTerminal'
                     ? t('customAcp.confirmTerminal', 'Confirm — Allow Terminal')
-                    : t('customAcp.confirmExecute', 'Confirm — Execute Command')}
+                    : step === 'confirmPermission'
+                      ? t('customAcp.confirmPermission', 'Confirm — Allow All')
+                      : t('customAcp.confirmExecute', 'Confirm — Execute Command')}
               </Button>
             </>
           )}

@@ -15,7 +15,8 @@
 //! desktop binary and the standalone `termul-server` (no `AppHandle`).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 use parking_lot::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -73,6 +74,9 @@ pub struct HostPlanServer {
     persistence: Option<Arc<SessionPersistence>>,
     /// Canonical Conversation history used for durable plan acknowledgement and cold hydration.
     conversation_persistence: Option<Arc<ConversationPersistenceAdapter>>,
+    /// Installed after host bootstrap constructs the scheduled-task service.
+    /// Weak avoids a cycle through AcpScheduledTaskExecutor -> AcpManager.
+    scheduled_tasks: Mutex<Option<Weak<crate::scheduled_tasks::ScheduledTaskService>>>,
 }
 
 impl HostPlanServer {
@@ -113,6 +117,7 @@ impl HostPlanServer {
             plan_store: PlanStore::new(),
             persistence,
             conversation_persistence,
+            scheduled_tasks: Mutex::new(None),
         });
         let server_for_thread = Arc::clone(&server);
         let (port_tx, port_rx) = std::sync::mpsc::channel::<u16>();
@@ -206,6 +211,15 @@ impl HostPlanServer {
             "[host-mcp] registered agent {agent_id} on port {port} (provisional sid {provisional_sid})"
         );
         (port, token, provisional_sid)
+    }
+
+    pub fn set_scheduled_tasks(&self, service: &Arc<crate::scheduled_tasks::ScheduledTaskService>) {
+        *self.scheduled_tasks.lock() = Some(Arc::downgrade(service));
+    }
+
+    #[must_use]
+    pub fn scheduled_tasks(&self) -> Option<Arc<crate::scheduled_tasks::ScheduledTaskService>> {
+        self.scheduled_tasks.lock().as_ref().and_then(Weak::upgrade)
     }
 
     /// Bind the real ACP session_id (returned by `session/new`) to a token.
@@ -515,6 +529,236 @@ impl HostPlanServer {
                         FrameReply::err(error)
                     }
                 }
+            }
+            kind @ (FrameKind::ScheduledTaskList
+            | FrameKind::ScheduledTaskGet
+            | FrameKind::ScheduledTaskPreview
+            | FrameKind::ScheduledTaskDraftCreate
+            | FrameKind::ScheduledTaskDraftUpdate
+            | FrameKind::ScheduledTaskPause) => {
+                if !req.todos.is_empty() || req.title.is_some() {
+                    return FrameReply::err("scheduled task frame has incompatible fields");
+                }
+                self.process_scheduled_task_request(
+                    kind,
+                    req.payload,
+                    &auth.agent_id,
+                    &real_session_id,
+                )
+            }
+        }
+    }
+
+    fn process_scheduled_task_request(
+        &self,
+        kind: FrameKind,
+        payload: Option<serde_json::Value>,
+        agent_id: &str,
+        real_session_id: &str,
+    ) -> FrameReply {
+        let started = Instant::now();
+        log::info!(
+            "[host-mcp] boundary=scheduled_task_request_started kind={kind:?} agent_id={} session_id={}",
+            agent_id,
+            real_session_id
+        );
+        let service = self.scheduled_tasks.lock().as_ref().and_then(Weak::upgrade);
+        let Some(service) = service else {
+            return FrameReply::err("scheduled task service unavailable");
+        };
+        let payload = payload.unwrap_or_else(|| serde_json::json!({}));
+        let Some(persistence) = self.conversation_persistence.as_ref() else {
+            return FrameReply::err("scheduled task conversation scope unavailable");
+        };
+        let source_conversation_id = persistence
+            .conversation_id_for_session(real_session_id)
+            .map(|id| id.to_string());
+        let Some((
+            scoped_project_id,
+            scoped_workspace_cwd,
+            scoped_execution_target,
+            scoped_execution_cwd,
+            scoped_agent_config_id,
+        )) = persistence.scheduled_task_scope_for_session(real_session_id)
+        else {
+            return FrameReply::err(
+                "scheduled tasks require an active project-backed Conversation",
+            );
+        };
+        let context = crate::scheduled_tasks::TaskMutationContextV1 {
+            actor: crate::scheduled_tasks::ScheduledTaskAuditActor::Agent,
+            source_conversation_id: source_conversation_id.clone(),
+            source_tool_call_id: None,
+        };
+
+        let result = match kind {
+            FrameKind::ScheduledTaskList => serde_json::from_value::<
+                crate::acp::host_mcp::ScheduledTaskListInput,
+            >(payload)
+            .map_err(|error| error.to_string())
+            .and_then(|_input| {
+                service
+                    .list_tasks(Some(&scoped_project_id))
+                    .map_err(|error| error.to_string())
+            })
+            .and_then(|tasks| serde_json::to_value(tasks).map_err(|error| error.to_string())),
+            FrameKind::ScheduledTaskGet => {
+                serde_json::from_value::<crate::acp::host_mcp::ScheduledTaskGetInput>(payload)
+                    .map_err(|error| error.to_string())
+                    .and_then(|input| {
+                        service
+                            .get_task(&input.task_id)
+                            .map_err(|error| error.to_string())
+                    })
+                    .and_then(|task| {
+                        if task.project_id == scoped_project_id {
+                            Ok(task)
+                        } else {
+                            Err("scheduled task is outside this Conversation project".to_string())
+                        }
+                    })
+                    .and_then(|task| serde_json::to_value(task).map_err(|error| error.to_string()))
+            }
+            FrameKind::ScheduledTaskPreview => serde_json::from_value::<
+                crate::acp::host_mcp::ScheduledTaskPreviewInput,
+            >(payload)
+            .map_err(|error| error.to_string())
+            .and_then(|input| {
+                serde_json::from_value::<crate::scheduled_tasks::ScheduleSpecV1>(input.schedule)
+                    .map_err(|error| error.to_string())
+                    .and_then(|schedule| {
+                        service
+                            .preview(&schedule, input.count)
+                            .map_err(|error| error.to_string())
+                    })
+            })
+            .and_then(|preview| serde_json::to_value(preview).map_err(|error| error.to_string())),
+            FrameKind::ScheduledTaskDraftCreate => serde_json::from_value::<
+                crate::acp::host_mcp::ScheduledTaskDraftCreateInput,
+            >(payload)
+            .map_err(|error| error.to_string())
+            .and_then(|input| {
+                serde_json::from_value::<crate::scheduled_tasks::ScheduledTaskDraftInputV1>(
+                    input.draft,
+                )
+                .map_err(|error| error.to_string())
+            })
+            .and_then(|mut draft| {
+                draft.project_id = scoped_project_id.clone();
+                draft.workspace_cwd = scoped_workspace_cwd.clone();
+                draft.execution_target = scoped_execution_target.clone();
+                draft.execution_cwd = scoped_execution_cwd.clone();
+                draft.agent_config_id = scoped_agent_config_id.clone();
+                draft.source_conversation_id = source_conversation_id.clone();
+                service
+                    .create_draft(draft, context.clone())
+                    .map_err(|error| error.to_string())
+            })
+            .and_then(|task| {
+                self.emit_scheduled_task_draft(agent_id, real_session_id, &task);
+                serde_json::to_value(task).map_err(|error| error.to_string())
+            }),
+            FrameKind::ScheduledTaskDraftUpdate => serde_json::from_value::<
+                crate::acp::host_mcp::ScheduledTaskDraftUpdateInput,
+            >(payload)
+            .map_err(|error| error.to_string())
+            .and_then(|input| {
+                serde_json::from_value::<crate::scheduled_tasks::ScheduledTaskDraftInputV1>(
+                    input.draft,
+                )
+                .map_err(|error| error.to_string())
+                .map(|mut draft| {
+                    draft.project_id = scoped_project_id.clone();
+                    draft.workspace_cwd = scoped_workspace_cwd.clone();
+                    draft.execution_target = scoped_execution_target.clone();
+                    draft.execution_cwd = scoped_execution_cwd.clone();
+                    draft.agent_config_id = scoped_agent_config_id.clone();
+                    draft.source_conversation_id = source_conversation_id.clone();
+                    (input.task_id, input.expected_revision, draft)
+                })
+            })
+            .and_then(|(task_id, expected_revision, draft)| {
+                let current = service
+                    .get_task(&task_id)
+                    .map_err(|error| error.to_string())?;
+                if current.project_id != scoped_project_id {
+                    return Err("scheduled task is outside this Conversation project".to_string());
+                }
+                service
+                    .update_draft(&task_id, expected_revision, draft, context.clone())
+                    .map_err(|error| error.to_string())
+            })
+            .and_then(|task| {
+                self.emit_scheduled_task_draft(agent_id, real_session_id, &task);
+                serde_json::to_value(task).map_err(|error| error.to_string())
+            }),
+            FrameKind::ScheduledTaskPause => serde_json::from_value::<
+                crate::acp::host_mcp::ScheduledTaskPauseInput,
+            >(payload)
+            .map_err(|error| error.to_string())
+            .and_then(|input| {
+                let current = service
+                    .get_task(&input.task_id)
+                    .map_err(|error| error.to_string())?;
+                if current.project_id != scoped_project_id {
+                    return Err("scheduled task is outside this Conversation project".to_string());
+                }
+                service
+                    .pause(&input.task_id, input.expected_revision, context)
+                    .map_err(|error| error.to_string())
+            })
+            .and_then(|task| serde_json::to_value(task).map_err(|error| error.to_string())),
+            FrameKind::Plan | FrameKind::SetTitle => unreachable!("scheduled match only"),
+        };
+        match result {
+            Ok(value) => {
+                log::info!(
+                    "[host-mcp] boundary=scheduled_task_request_completed kind={kind:?} agent_id={} session_id={} elapsed_ms={}",
+                    agent_id,
+                    real_session_id,
+                    started.elapsed().as_millis()
+                );
+                FrameReply::with_result(value)
+            }
+            Err(error) => {
+                log::warn!(
+                    "[host-mcp] boundary=scheduled_task_request_rejected kind={kind:?} agent_id={} session_id={} elapsed_ms={} error={}",
+                    agent_id,
+                    real_session_id,
+                    started.elapsed().as_millis(),
+                    error.lines().next().unwrap_or("unknown")
+                );
+                FrameReply::err(
+                    error
+                        .lines()
+                        .next()
+                        .unwrap_or("scheduled task request failed"),
+                )
+            }
+        }
+    }
+
+    fn emit_scheduled_task_draft(
+        &self,
+        agent_id: &str,
+        real_session_id: &str,
+        task: &crate::scheduled_tasks::ScheduledTaskV1,
+    ) {
+        let event = crate::web::sink::AcpEvent {
+            sid: Some(real_session_id.to_string()),
+            type_: "acp:scheduled_task_draft",
+            payload: serde_json::json!({
+                "agentId": agent_id,
+                "sessionId": real_session_id,
+                "task": task
+            }),
+        };
+        for sink in &self.sinks {
+            if let Err(error) = sink.emit(&event) {
+                log::warn!(
+                    "[host-mcp] scheduled task draft event delivery failed code={}",
+                    error.code
+                );
             }
         }
     }

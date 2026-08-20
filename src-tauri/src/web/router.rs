@@ -38,6 +38,7 @@ use crate::web::mcp_probe_api;
 use crate::web::mcp_servers_api;
 use crate::web::project_registry::ProjectRegistry;
 use crate::web::projects_api;
+use crate::web::scheduled_tasks_api;
 use crate::web::search_api;
 use crate::web::session_workspace_api;
 use crate::web::sink::WsRelaySink;
@@ -218,6 +219,56 @@ fn api_routes(provenance: IngressProvenance) -> Router<AppState> {
             post(conversation_api::resolve_recovery),
         ),
         RemoteRouteClass::Recovery,
+    ))
+    .merge(classified_routes(
+        Router::<AppState>::new()
+            .route("/scheduled-tasks", get(scheduled_tasks_api::list))
+            .route(
+                "/scheduled-tasks/preview",
+                post(scheduled_tasks_api::preview),
+            )
+            .route(
+                "/scheduled-tasks/drafts",
+                post(scheduled_tasks_api::create_draft),
+            )
+            .route("/scheduled-tasks/{taskId}", get(scheduled_tasks_api::get))
+            .route(
+                "/scheduled-tasks/{taskId}/draft",
+                post(scheduled_tasks_api::update_draft),
+            )
+            .route(
+                "/scheduled-tasks/{taskId}/activate",
+                post(scheduled_tasks_api::activate),
+            )
+            .route(
+                "/scheduled-tasks/{taskId}/pause",
+                post(scheduled_tasks_api::pause),
+            )
+            .route(
+                "/scheduled-tasks/{taskId}/resume",
+                post(scheduled_tasks_api::resume),
+            )
+            .route(
+                "/scheduled-tasks/{taskId}/delete",
+                post(scheduled_tasks_api::delete_task),
+            )
+            .route(
+                "/scheduled-tasks/{taskId}/run",
+                post(scheduled_tasks_api::run_now),
+            )
+            .route(
+                "/scheduled-tasks/{taskId}/runs",
+                get(scheduled_tasks_api::list_runs),
+            )
+            .route(
+                "/scheduled-tasks/{taskId}/runs/{runId}/retry",
+                post(scheduled_tasks_api::retry_run),
+            )
+            .route(
+                "/scheduled-tasks/{taskId}/audit",
+                get(scheduled_tasks_api::list_audit),
+            ),
+        RemoteRouteClass::ScheduledTask,
     ))
     .merge(classified_routes(
         Router::<AppState>::new()

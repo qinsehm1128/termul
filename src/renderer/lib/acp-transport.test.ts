@@ -325,6 +325,19 @@ class FakeWebSocket {
       this.emitReply({ id: req.id, ok: true, payload: [...this.liveAgents] })
       return
     }
+    if (req.type === 'set_permission_policy') {
+      const payload = req.payload as { agentId?: string; policy?: string }
+      if (!payload.agentId || !this.liveAgents.has(payload.agentId)) {
+        this.emitReply({
+          id: req.id,
+          ok: false,
+          err: { code: 'not_found', message: 'unknown agent' }
+        })
+        return
+      }
+      this.emitReply({ id: req.id, ok: true, payload: {} })
+      return
+    }
     if (req.type === 'kill_agent') {
       const payload = req.payload as { agentId?: string }
       if (!payload.agentId) {
@@ -562,6 +575,9 @@ describe('WsAcpTransport', () => {
     expect(spawnResult.stableNamespace).toBe('config:test')
     expect(await transport.listAgents()).toEqual(['agent-spawned-1'])
 
+    await expect(
+      transport.setPermissionPolicy(spawnResult.agentId, 'allow_all')
+    ).resolves.toBeUndefined()
     await transport.killAgent(spawnResult.agentId)
     expect(await transport.listAgents()).toEqual([])
 
@@ -1384,15 +1400,25 @@ describe('WsAcpTransport', () => {
     })
     await transport.connect()
     const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+    const mcpServers = [
+      { type: 'stdio' as const, name: 'files', command: 'node', args: [], env: [] }
+    ]
 
-    const loaded = await transport.loadSession('a1', 's-load', '/work')
-    const resumed = await transport.resumeSession('a1', 's-resume', '/work')
+    const loaded = await transport.loadSession('a1', 's-load', '/work', undefined, mcpServers)
+    const resumed = await transport.resumeSession('a1', 's-resume', '/work', undefined, mcpServers)
 
     expect(loaded).toEqual(sock.reopenOutcome)
     expect(resumed).toEqual(sock.reopenOutcome)
     const types = sock.sent.map((frame) => (JSON.parse(frame) as { type: string }).type)
     expect(types).toContain('load_session')
     expect(types).toContain('resume_session')
+    const reopens = sock.sent
+      .map(
+        (frame) =>
+          JSON.parse(frame) as { type: string; payload: { mcpServers?: typeof mcpServers } }
+      )
+      .filter((frame) => frame.type === 'load_session' || frame.type === 'resume_session')
+    expect(reopens.every((frame) => frame.payload.mcpServers?.[0]?.name === 'files')).toBe(true)
     expect(types.filter((type) => type === 'subscribe')).toHaveLength(2)
     const subscriptions = sock.sent
       .map((frame) => JSON.parse(frame) as { type: string; payload: { lastSeq?: number } })
@@ -2400,22 +2426,31 @@ describe('createAcpTransport selection', () => {
   it('desktop load/resume return the typed Tauri invoke outcome', async () => {
     const { invoke } = await import('@tauri-apps/api/core')
     const outcome = { configOptions: [] }
+    const mcpServers = [
+      { type: 'stdio' as const, name: 'files', command: 'node', args: [], env: [] }
+    ]
     vi.mocked(invoke).mockResolvedValue(outcome)
     const transport = createAcpTransport({ force: 'tauri' })
 
-    await expect(transport.loadSession('a1', 's1', '/work')).resolves.toEqual(outcome)
+    await expect(
+      transport.loadSession('a1', 's1', '/work', undefined, mcpServers)
+    ).resolves.toEqual(outcome)
     expect(invoke).toHaveBeenCalledWith('acp_load_session', {
       agentId: 'a1',
       sessionId: 's1',
       cwd: '/work',
-      conversationId: null
+      conversationId: null,
+      mcpServers
     })
-    await expect(transport.resumeSession('a1', 's1', '/work')).resolves.toEqual(outcome)
+    await expect(
+      transport.resumeSession('a1', 's1', '/work', undefined, mcpServers)
+    ).resolves.toEqual(outcome)
     expect(invoke).toHaveBeenCalledWith('acp_resume_session', {
       agentId: 'a1',
       sessionId: 's1',
       cwd: '/work',
-      conversationId: null
+      conversationId: null,
+      mcpServers
     })
     transport.dispose()
   })
@@ -2429,6 +2464,7 @@ describe('createAcpTransport selection', () => {
       spawnAgent: vi.fn(),
       killAgent: vi.fn(),
       listAgents: vi.fn(),
+      setPermissionPolicy: vi.fn(),
       newSession: vi.fn(),
       loadSession: vi.fn(),
       resumeSession: vi.fn(),

@@ -32,6 +32,21 @@
     "sendFailed": "无法发送消息，请重试。",
     "updateMcpFailed": "无法更新 MCP 服务器，已恢复之前的设置。"
   },
+  "permissionPolicy": {
+    "title": "工具权限",
+    "description": "选择此 ACP 代理使用工具前是否必须询问。该设置会应用到使用此代理的所有会话。",
+    "allowAll": "完全允许工具请求",
+    "allowAllHint": "自动接受代理提供的允许选项。",
+    "askShort": "询问",
+    "allowAllShort": "完全允许",
+    "open": "工具权限策略：{{policy}}",
+    "toggle": "完全允许工具请求",
+    "confirmTitle": "完全允许这个代理的请求？",
+    "confirmDescription": "代理之后提供的允许选项将不再逐次询问，可能会修改文件或执行命令。请只对你信任的代理和工作区启用。",
+    "keepAsking": "继续逐次询问",
+    "enableFullAccess": "启用完全允许",
+    "updateFailed": "无法更新工具权限：{{message}}"
+  },
   "connection": {
     "connected": "已连接",
     "disconnected": "已断开",
@@ -378,5 +393,12 @@
     "temporarySessionClosed": "临时 ACP 会话意外关闭",
     "worktreeCreationFailed": "创建工作树失败：{{error}}",
     "unknownError": "未知错误"
+  },
+  "scheduledTaskDraft": {
+    "title": "定时任务草稿",
+    "review": "审核",
+    "everySeconds": "每 {{count}} 秒",
+    "revisionHash": "第 {{revision}} 版 · {{hash}}…",
+    "notActive": "该草稿在你审核并确认精确修订与哈希前不会执行。"
   }
 }

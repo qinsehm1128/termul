@@ -23,7 +23,9 @@ impl std::fmt::Display for ScheduleError {
         match self {
             Self::InvalidCron(detail) => write!(formatter, "invalid cron expression: {detail}"),
             Self::InvalidTimezone(detail) => write!(formatter, "invalid IANA timezone: {detail}"),
-            Self::InvalidTimestamp(detail) => write!(formatter, "invalid RFC3339 timestamp: {detail}"),
+            Self::InvalidTimestamp(detail) => {
+                write!(formatter, "invalid RFC3339 timestamp: {detail}")
+            }
             Self::InvalidInterval(detail) => write!(formatter, "invalid interval: {detail}"),
             Self::NoFutureOccurrence => write!(formatter, "schedule has no future occurrence"),
         }
@@ -134,7 +136,9 @@ pub fn occurrences_after(
             let first = anchor
                 .checked_add_signed(Duration::seconds(periods.saturating_mul(interval)))
                 .ok_or_else(|| {
-                    ScheduleError::InvalidInterval("next occurrence overflows timestamp".to_string())
+                    ScheduleError::InvalidInterval(
+                        "next occurrence overflows timestamp".to_string(),
+                    )
                 })?;
             let mut values = Vec::with_capacity(count);
             for offset in 0..count {

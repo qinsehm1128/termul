@@ -139,5 +139,39 @@
       "CONVERSATION_LEGACY_RESOLVE_FAILED": "The legacy identifier resolver is unavailable.",
       "CONVERSATION_OPEN_FAILED": "The conversation could not be opened."
     }
+  },
+  "scheduledTasks": {
+    "title": "Scheduled tasks",
+    "refresh": "Refresh scheduled tasks",
+    "empty": "No scheduled tasks for this project. Ask an AI in chat to create a draft.",
+    "selectTask": "Select a scheduled task to inspect it.",
+    "activate": "Review and activate",
+    "pause": "Pause",
+    "resume": "Resume",
+    "runNow": "Run now",
+    "everySeconds": "Every {{count}} seconds",
+    "prompt": "Task prompt",
+    "agent": "Agent: {{agent}}",
+    "revision": "Revision: {{revision}}",
+    "hash": "Draft hash: {{hash}}",
+    "history": "Execution history",
+    "noRuns": "This task has not run yet.",
+    "audit": "Task audit",
+    "confirmTitle": "Activate this scheduled task?",
+    "confirmDescription": "{{name}} will run on {{schedule}}. You are confirming revision {{revision}} and its exact draft hash.",
+    "status": {
+      "draft": "Draft",
+      "active": "Active",
+      "paused": "Paused"
+    },
+    "runStatus": {
+      "queued": "Queued",
+      "running": "Running",
+      "succeeded": "Succeeded",
+      "failed": "Failed",
+      "cancelled": "Cancelled",
+      "skipped": "Skipped",
+      "interrupted": "Interrupted"
+    }
   }
 }

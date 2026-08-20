@@ -161,12 +161,8 @@ impl ScheduledTaskExecutor for AcpScheduledTaskExecutor {
 
         let stop_reason = tokio::time::timeout(
             self.turn_timeout,
-            self.manager.send_prompt(
-                &agent_id,
-                session.session_id,
-                blocks,
-                Some(run.run_id),
-            ),
+            self.manager
+                .send_prompt(&agent_id, session.session_id, blocks, Some(run.run_id)),
         )
         .await
         .map_err(|_| {
@@ -250,6 +246,9 @@ pub async fn execute_and_record(
 }
 
 fn sanitize_error(value: String) -> String {
-    let first_line = value.lines().next().unwrap_or("scheduled task execution failed");
+    let first_line = value
+        .lines()
+        .next()
+        .unwrap_or("scheduled task execution failed");
     first_line.chars().take(512).collect()
 }

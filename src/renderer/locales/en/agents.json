@@ -52,16 +52,19 @@
   "customAcp": {
     "title": "Add Custom ACP Agent",
     "confirmTitle": "Confirm arbitrary command",
-    "description": "Paste an ACP agent config as JSON. Only configId, name, command, args, env, and allowTerminal fields are accepted; env values must be $VAR placeholders.",
+    "description": "Paste an ACP agent config as JSON. Only configId, name, command, args, env, allowTerminal, and permissionPolicy fields are accepted; env values must be $VAR placeholders.",
     "confirmDescription": "Persisting this agent will let it execute the configured command. Review it before confirming.",
     "jsonLabel": "Agent config JSON",
     "savedHint": "Saved agents appear in the ACP launcher and reattach to their session on restart. Use Copy JSON on a saved agent to share it.",
     "arbitraryCommandPrompt": "This will execute an arbitrary command on your machine. Are you sure you want to persist this agent?",
     "terminalPrompt": "This agent requests the ACP terminal capability, which allows it to execute arbitrary commands on your machine. Are you sure you want to allow this?",
     "terminalSecondConfirmation": "This is the second confirmation: terminal capability lets the agent run arbitrary commands on your machine.",
+    "permissionPrompt": "This agent requests full tool permission. Termul will automatically accept allow options without asking each time.",
+    "permissionSecondConfirmation": "This is a separate confirmation: all allow options offered by the agent will be accepted automatically.",
     "saveAgent": "Save Agent",
     "confirmExecute": "Confirm — Execute Command",
     "confirmTerminal": "Confirm — Allow Terminal",
+    "confirmPermission": "Confirm — Allow All",
     "saved": "Agent \"{{name}}\" saved",
     "errors": {
       "pasteFirst": "Paste an agent config JSON first.",
@@ -77,6 +80,7 @@
       "envObject": "env must be an object.",
       "envStrings": "env values must be strings.",
       "allowTerminalBoolean": "allowTerminal must be a boolean.",
+      "permissionPolicy": "permissionPolicy must be \"ask\" or \"allow_all\".",
       "loadConfigs": "Failed to load agent configs",
       "persistConfigs": "Failed to persist agent configs",
       "rawSecret": "refusing to persist a raw secret for env \"{{key}}\" on agent \"{{name}}\"; store it in secure storage and reference it as ${{key}}"
@@ -164,6 +168,16 @@
     "browse": "Browse",
     "savePath": "Save path",
     "clearPath": "Clear saved path",
+    "permissionPolicy": {
+      "allowAll": "Allow all tool requests",
+      "description": "Automatically accepts allow options offered by this ACP agent. The agent's own sandbox still applies.",
+      "aria": "Allow all permission requests from {{name}}",
+      "confirmTitle": "Allow all requests from this agent?",
+      "confirmDescription": "{{name}} will be able to run every tool request it presents without asking you each time. This can modify files or execute commands. Only enable this for an agent and workspace you trust.",
+      "confirm": "Enable full access",
+      "cancel": "Keep asking",
+      "saved": "Permission policy updated"
+    },
     "status": {
       "sessionReady": "Session ready",
       "warming": "Warming…",

@@ -12,8 +12,8 @@ mod migrations;
 mod path_validation;
 mod pty;
 mod remote;
-mod secure_storage;
 pub mod scheduled_tasks;
+mod secure_storage;
 // Opt-in `termul-server` self-update subsystem. The library module itself is
 // intentionally NOT feature-gated so its full test suite — including signature
 // verification — runs under the spec's default `cargo test` gate. Only the
@@ -332,6 +332,9 @@ pub use acp::{
     AcpCatalogService, AcpInstallService, AcpManager, ChatHistoryStore, FileProjectRegistry,
     SessionPersistence, WorkspaceManifestService,
 };
+pub fn set_acp_npm_local_root(path: std::path::PathBuf) {
+    acp::npm_local::set_root(path);
+}
 // Host-injected `plan` MCP tool: the `--internal-mcp-plan-server`
 // subcommand branch in `main.rs` + `server_main.rs` reaches `host_mcp::CHILD_ARG`
 // + `host_mcp::child::run()` through this re-export (the `acp` module itself is
@@ -342,8 +345,8 @@ pub use conversation::{
     ConversationRecordV2, CreationPartition, ExecutionTarget, ProjectAttachment,
     TerminalResourceRef,
 };
-pub use scheduled_tasks::ScheduledTaskStore;
 pub use pty::PtyManager;
+pub use scheduled_tasks::ScheduledTaskStore;
 pub use trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub};
 // Desktop ACP event sink: wraps the Tauri `AppHandle` so the dispatcher's
 // `Vec<Arc<dyn EventSink>>` fan-out reaches the renderer as `acp:*` events
@@ -1762,6 +1765,7 @@ pub fn run() {
                 scheduled_task_store,
                 scheduled_task_executor,
             );
+            acp_manager.set_scheduled_tasks(&scheduled_tasks);
             scheduled_tasks.start_on(tauri::async_runtime::handle().inner());
             log::info!(
                 "[scheduled-task] boundary=service_started host=desktop root={}",
@@ -2060,6 +2064,7 @@ pub fn run() {
             acp::commands::acp_spawn_agent,
             acp::commands::acp_kill_agent,
             acp::commands::acp_list_agents,
+            acp::commands::acp_set_permission_policy,
             acp::commands::acp_new_session,
             acp::commands::acp_load_session,
             acp::commands::acp_resume_session,
@@ -2096,6 +2101,20 @@ pub fn run() {
             // Agent Skills (Zed-compatible SKILL.md packages)
             skills::commands::list_agent_skills_cmd,
             skills::commands::read_agent_skill_cmd,
+            // Project-scoped AI scheduled tasks
+            scheduled_tasks::commands::scheduled_task_preview,
+            scheduled_tasks::commands::scheduled_task_list,
+            scheduled_tasks::commands::scheduled_task_get,
+            scheduled_tasks::commands::scheduled_task_draft_create,
+            scheduled_tasks::commands::scheduled_task_draft_update,
+            scheduled_tasks::commands::scheduled_task_activate,
+            scheduled_tasks::commands::scheduled_task_pause,
+            scheduled_tasks::commands::scheduled_task_resume,
+            scheduled_tasks::commands::scheduled_task_delete,
+            scheduled_tasks::commands::scheduled_task_run_now,
+            scheduled_tasks::commands::scheduled_task_retry_run,
+            scheduled_tasks::commands::scheduled_task_list_runs,
+            scheduled_tasks::commands::scheduled_task_list_audit,
             // Remote server commands
             commands::remote_server_start,
             commands::remote_server_stop,

@@ -55,6 +55,7 @@ import type {
   McpServerConfig,
   NewSessionOptions,
   NewSessionOutcome,
+  PermissionPolicy,
   ProbeResult,
   SessionConfigOption,
   SessionId,
@@ -135,6 +136,7 @@ export interface AcpTransport {
   spawnAgent(config: AgentConfig): Promise<SpawnAgentResult>
   killAgent(agentId: AgentId): Promise<void>
   listAgents(): Promise<AgentId[]>
+  setPermissionPolicy(agentId: AgentId, policy: PermissionPolicy): Promise<void>
   newSession(
     agentId: AgentId,
     cwd: string,
@@ -145,13 +147,15 @@ export interface AcpTransport {
     agentId: AgentId,
     sessionId: SessionId,
     cwd: string,
-    conversationId?: string
+    conversationId?: string,
+    mcpServers?: McpServer[]
   ): Promise<SessionReopenOutcome>
   resumeSession(
     agentId: AgentId,
     sessionId: SessionId,
     cwd: string,
-    conversationId?: string
+    conversationId?: string,
+    mcpServers?: McpServer[]
   ): Promise<SessionReopenOutcome>
   closeSession(agentId: AgentId, sessionId: SessionId): Promise<void>
   disposeEphemeralSession(agentId: AgentId, sessionId: SessionId): Promise<void>
@@ -295,6 +299,9 @@ function createTauriAcpTransport(): AcpTransport {
       await invoke('acp_kill_agent', { agentId })
     },
     listAgents: () => invoke<AgentId[]>('acp_list_agents'),
+    setPermissionPolicy: async (agentId, policy) => {
+      await invoke('acp_set_permission_policy', { agentId, policy })
+    },
     newSession: (agentId, cwd, mcpServers, options) => {
       const executionTarget =
         options?.executionTarget ??
@@ -321,19 +328,21 @@ function createTauriAcpTransport(): AcpTransport {
         ...(!options?.ephemeral ? { executionTarget } : {})
       })
     },
-    loadSession: (agentId, sessionId, cwd, conversationId) =>
+    loadSession: (agentId, sessionId, cwd, conversationId, mcpServers) =>
       invoke<SessionReopenOutcome>('acp_load_session', {
         agentId,
         sessionId,
         cwd,
-        conversationId: conversationId ?? null
+        conversationId: conversationId ?? null,
+        mcpServers: mcpServers ?? []
       }),
-    resumeSession: (agentId, sessionId, cwd, conversationId) =>
+    resumeSession: (agentId, sessionId, cwd, conversationId, mcpServers) =>
       invoke<SessionReopenOutcome>('acp_resume_session', {
         agentId,
         sessionId,
         cwd,
-        conversationId: conversationId ?? null
+        conversationId: conversationId ?? null,
+        mcpServers: mcpServers ?? []
       }),
     closeSession: async (agentId, sessionId) => {
       await invoke('acp_close_session', { agentId, sessionId })
@@ -1013,6 +1022,10 @@ export class WsAcpTransport implements AcpTransport {
     return this.request<AgentId[]>('list_agents', {})
   }
 
+  async setPermissionPolicy(agentId: AgentId, policy: PermissionPolicy): Promise<void> {
+    await this.request('set_permission_policy', { agentId, policy })
+  }
+
   // --- WS-mapped session/prompt methods ------------------------------------
 
   async newSession(
@@ -1072,12 +1085,14 @@ export class WsAcpTransport implements AcpTransport {
     agentId: AgentId,
     sessionId: SessionId,
     cwd: string,
-    conversationId?: string
+    conversationId?: string,
+    mcpServers?: McpServer[]
   ): Promise<SessionReopenOutcome> {
     const outcome = await this.request<SessionReopenOutcome>('load_session', {
       agentId,
       sessionId,
       cwd,
+      mcpServers: mcpServers ?? [],
       ...(conversationId ? { conversationId } : {})
     })
     await this.subscribeSession(sessionId, this.lastSeq.get(sessionId) ?? 0, true)
@@ -1088,12 +1103,14 @@ export class WsAcpTransport implements AcpTransport {
     agentId: AgentId,
     sessionId: SessionId,
     cwd: string,
-    conversationId?: string
+    conversationId?: string,
+    mcpServers?: McpServer[]
   ): Promise<SessionReopenOutcome> {
     const outcome = await this.request<SessionReopenOutcome>('resume_session', {
       agentId,
       sessionId,
       cwd,
+      mcpServers: mcpServers ?? [],
       ...(conversationId ? { conversationId } : {})
     })
     await this.subscribeSession(sessionId, this.lastSeq.get(sessionId) ?? 0, true)

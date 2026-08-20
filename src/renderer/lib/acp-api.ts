@@ -15,6 +15,7 @@
  */
 
 import type { ExecutionTarget, ProjectAttachment } from '@shared/types/conversation.types'
+import type { ScheduledTaskRecordV1 } from '@shared/types/scheduled-task.types'
 import { getAcpTransport } from '@/lib/acp-transport'
 import type { AcpRuntimeAvailability } from '@/lib/agents/supported-acp-agents'
 
@@ -241,6 +242,8 @@ export interface ProbeResult {
 /** Wire type forwarded verbatim to the backend `acp_new_session` command. */
 export type McpServer = McpServerConfig
 
+export type PermissionPolicy = 'ask' | 'allow_all'
+
 export interface AgentConfig {
   /** Stable configured-agent identity used for standalone durable history matching. */
   configId?: string
@@ -250,6 +253,8 @@ export interface AgentConfig {
   env: Record<string, string>
   /** Whether this agent may use the ACP terminal capability (default false). */
   allowTerminal?: boolean
+  /** How Termul handles ACP permission requests for this agent. */
+  permissionPolicy?: PermissionPolicy
 }
 
 export type ConversationExecutionTarget = ExecutionTarget
@@ -373,6 +378,11 @@ export interface PlanUpdateEvent {
   sessionId: SessionId
   plan: Plan
 }
+export interface ScheduledTaskDraftEvent {
+  agentId: AgentId
+  sessionId: SessionId
+  task: ScheduledTaskRecordV1
+}
 export interface CommandsUpdateEvent {
   agentId: AgentId
   sessionId: SessionId
@@ -489,6 +499,7 @@ export const ACP_EVENTS = {
   toolCall: 'acp:tool_call',
   toolCallUpdate: 'acp:tool_call_update',
   planUpdate: 'acp:plan_update',
+  scheduledTaskDraft: 'acp:scheduled_task_draft',
   commandsUpdate: 'acp:commands_update',
   modeUpdate: 'acp:mode_update',
   configOptionsUpdate: 'acp:config_options_update',
@@ -588,6 +599,13 @@ export async function acpListAgents(): Promise<AgentId[]> {
   return getAcpTransport().listAgents()
 }
 
+export async function acpSetPermissionPolicy(
+  agentId: AgentId,
+  policy: PermissionPolicy
+): Promise<void> {
+  await getAcpTransport().setPermissionPolicy(agentId, policy)
+}
+
 export async function acpNewSession(
   agentId: AgentId,
   cwd: string,
@@ -601,18 +619,20 @@ export async function acpLoadSession(
   agentId: AgentId,
   sessionId: SessionId,
   cwd: string,
-  conversationId?: string
+  conversationId?: string,
+  mcpServers?: McpServer[]
 ): Promise<SessionReopenOutcome> {
-  return getAcpTransport().loadSession(agentId, sessionId, cwd, conversationId)
+  return getAcpTransport().loadSession(agentId, sessionId, cwd, conversationId, mcpServers)
 }
 
 export async function acpResumeSession(
   agentId: AgentId,
   sessionId: SessionId,
   cwd: string,
-  conversationId?: string
+  conversationId?: string,
+  mcpServers?: McpServer[]
 ): Promise<SessionReopenOutcome> {
-  return getAcpTransport().resumeSession(agentId, sessionId, cwd, conversationId)
+  return getAcpTransport().resumeSession(agentId, sessionId, cwd, conversationId, mcpServers)
 }
 
 export async function acpCloseSession(agentId: AgentId, sessionId: SessionId): Promise<void> {
@@ -772,6 +792,7 @@ export const acpApi = {
   spawnAgent: acpSpawnAgent,
   killAgent: acpKillAgent,
   listAgents: acpListAgents,
+  setPermissionPolicy: acpSetPermissionPolicy,
   newSession: acpNewSession,
   loadSession: acpLoadSession,
   resumeSession: acpResumeSession,

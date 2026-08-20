@@ -214,7 +214,9 @@ fn main() -> ExitCode {
         let acp_install_dir = cfg
             .service_account_state_dir()
             .join("acp-registry-binaries");
-        crate::acp::npm_local::set_root(cfg.service_account_state_dir().join("acp-npm-packages"));
+        termul_manager_lib::set_acp_npm_local_root(
+            cfg.service_account_state_dir().join("acp-npm-packages"),
+        );
         let acp_install = match AcpInstallService::open(
             acp_install_dir,
             std::sync::Arc::clone(acp_catalog.as_ref().expect("catalog opened above")),
@@ -237,6 +239,33 @@ fn main() -> ExitCode {
             Arc::clone(&conversation_bootstrap.creation),
             Arc::clone(&conversation_bootstrap.persistence_adapter),
         ));
+        let scheduled_task_store = match termul_manager_lib::ScheduledTaskStore::open(
+            cfg.service_account_state_dir()
+                .join("scheduled-tasks")
+                .join("v1")
+                .join("projects"),
+        ) {
+            Ok(store) => Arc::new(store),
+            Err(error) => {
+                eprintln!("termul-server: failed to open scheduled task store: {error}");
+                return ExitCode::from(1);
+            }
+        };
+        let scheduled_tasks = termul_manager_lib::scheduled_tasks::ScheduledTaskService::new(
+            scheduled_task_store,
+            Arc::new(
+                termul_manager_lib::scheduled_tasks::AcpScheduledTaskExecutor::new(
+                    Arc::clone(&acp),
+                    Arc::clone(&ws_relay),
+                ),
+            ),
+        );
+        acp.set_scheduled_tasks(&scheduled_tasks);
+        scheduled_tasks.start();
+        info!(
+            root = %scheduled_tasks.store().root().display(),
+            "scheduled task service started"
+        );
         // Story 1.7: attach the server-side permission rendezvous (bounded
         // timeout, at-most-one, first-response-wins, disconnect-deny, TOCTOU).
         // The relay snapshots `acp:permission_request` events into it; the
@@ -356,8 +385,12 @@ fn main() -> ExitCode {
         )
         .await
         {
-            Ok(()) => ExitCode::SUCCESS,
+            Ok(()) => {
+                scheduled_tasks.shutdown(Duration::from_secs(10)).await;
+                ExitCode::SUCCESS
+            }
             Err(e) => {
+                scheduled_tasks.shutdown(Duration::from_secs(10)).await;
                 eprintln!("termul-server failed: {e}");
                 ExitCode::from(1)
             }

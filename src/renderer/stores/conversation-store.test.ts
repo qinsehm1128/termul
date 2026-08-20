@@ -7,6 +7,10 @@ import type {
 } from '@shared/types/conversation.types'
 import type { ConversationLifecycleOutcome } from '@shared/types/conversation-lifecycle.types'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import {
+  AGENT_SKILLS_CHANGED_EVENT,
+  type AgentSkillsChangedDetail
+} from '@/lib/agent-skills-events'
 import { conversationApi } from '@/lib/conversation-api'
 import { setRouterNavigate } from '@/lib/router-navigate'
 import { useAcpStore } from '@/stores/acp-store'
@@ -309,6 +313,55 @@ describe('ConversationStore canonical authority', () => {
     expect(openHistorySessionMock).toHaveBeenCalledWith('opaque/history')
     expect(useAcpStore.getState().activeSessionId).toBe('opaque/history')
     expect(addAgentChatTabMock).toHaveBeenCalledWith(projectlessId, undefined, false)
+  })
+
+  it('shows the Conversation before background ACP reconnect completes', async () => {
+    vi.mocked(conversationApi.openConversation).mockResolvedValue({
+      success: true,
+      data: {
+        conversation: projectless,
+        workspace: { status: 'missing', conversationId: projectlessId }
+      }
+    })
+    useAcpStore.setState({
+      sessions: {},
+      sessionIndex: [
+        {
+          id: 'opaque/history',
+          conversationId: projectlessId,
+          agentId: 'agent-1',
+          title: 'bi查询demo',
+          cwd: projectless.workspaceCwd,
+          projectId: '',
+          createdAt: 1,
+          lastActivityAt: 2,
+          messageCount: 4,
+          status: 'closed'
+        }
+      ]
+    })
+    const reconnect = deferred<void>()
+    openHistorySessionMock.mockReturnValueOnce(reconnect.promise)
+    const changedRoots: string[] = []
+    const onSkillsChanged = (event: Event): void => {
+      changedRoots.push((event as CustomEvent<AgentSkillsChangedDetail>).detail.root)
+    }
+    window.addEventListener(AGENT_SKILLS_CHANGED_EVENT, onSkillsChanged)
+
+    const epoch = useConversationStore.getState().beginConversationActivation(projectlessId)
+    await expect(
+      useConversationStore.getState().activateConversation(projectlessId, epoch)
+    ).resolves.toBe(true)
+    window.removeEventListener(AGENT_SKILLS_CHANGED_EVENT, onSkillsChanged)
+
+    expect(useConversationStore.getState().openingById[projectlessId]).toBe(false)
+    expect(changedRoots).toContain(projectless.workspaceCwd)
+    expect(useAcpStore.getState().activeSessionId).toBe('opaque/history')
+    expect(addAgentChatTabMock).toHaveBeenCalledWith(projectlessId, undefined, false)
+    expect(openHistorySessionMock).toHaveBeenCalledWith('opaque/history')
+
+    reconnect.resolve(undefined)
+    await reconnect.promise
   })
 
   it('keeps the same ACP session id when history reopen stays closed', async () => {

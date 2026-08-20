@@ -33,6 +33,7 @@ import type {
   ConversationReplacementRequest
 } from '@shared/types/conversation-lifecycle.types'
 import { type PersistedComposerOptions, PersistenceKeys } from '@shared/types/persistence.types'
+import type { ScheduledTaskRecordV1 } from '@shared/types/scheduled-task.types'
 import type {
   ProjectSwitchCompletedEvent,
   ProjectSwitchFailedEvent,
@@ -77,6 +78,7 @@ import {
   type ProbeStatus,
   type PromptCompleteEvent,
   type QuestionOption,
+  type ScheduledTaskDraftEvent,
   type SessionClosedEvent,
   type SessionConfigOption,
   type SessionCreatedEvent,
@@ -399,6 +401,7 @@ interface AcpState {
   toolCalls: Record<SessionId, ToolCall[]>
   /** ACP agent-plan entries per session (`session/update` plan, full replace). */
   plans: Record<SessionId, PlanEntry[]>
+  scheduledTaskDrafts: Record<SessionId, ScheduledTaskRecordV1>
   commands: Record<SessionId, AvailableCommand[]>
   pendingPermissions: Record<string, PendingPermission> // P3 renders, keyed by requestId
   pendingQuestions: Record<string, PendingQuestion> // issue #411, keyed by questionId
@@ -709,6 +712,7 @@ interface AcpState {
   _onToolCall: (e: ToolCallEvent) => void
   _onToolCallUpdate: (e: ToolCallUpdateEvent) => void
   _onPlanUpdate: (e: PlanUpdateEvent) => void
+  _onScheduledTaskDraft: (e: ScheduledTaskDraftEvent) => void
   _onCommandsUpdate: (e: CommandsUpdateEvent) => void
   _onModeUpdate: (e: ModeUpdateEvent) => void
   _onConfigOptionsUpdate: (e: ConfigOptionsUpdateEvent) => void
@@ -2552,7 +2556,7 @@ function promotePreparedSession(
  * the session with its local transcript, and run load/resume when the
  * capability allows.
  *
- * Closed Conversation-backed rows still follow `decideResume` (load > resume >
+ * Closed Conversation-backed rows still follow `decideResume` (resume > load >
  * local) after the durable transcript is installed. Skipping that step left the
  * session closed, so a later Start Chat / prepared-session promotion minted a
  * new host session instead of showing history. A follow-up prompt may continue
@@ -2731,6 +2735,14 @@ function rehydratePlanFromHistoryIfNeeded(
 type HistoryReopenOptions = {
   /** Spawn failures and a local-only strategy reject instead of staying read-only. */
   requireLive?: boolean
+}
+
+async function configuredMcpServersForReopen(
+  get: () => AcpState,
+  agentId: AgentId
+): Promise<McpServer[]> {
+  if (!get().mcpServersLoaded) await get().loadMcpServers()
+  return selectMcpServersForAgent(get().mcpServers, get().agents[agentId]?.capabilities).servers
 }
 
 async function openHistorySessionInner(
@@ -2914,12 +2926,15 @@ async function openHistorySessionInner(
 
   const connected = get().agentStatus[liveAgentId] === 'connected'
   const capabilities = get().agents[liveAgentId]?.capabilities ?? null
-  const strategy = decideResume({ connected, capabilities })
+  const strategy = decideResume({ connected, capabilities, localHistoryAvailable: true })
   if (options.requireLive && strategy === 'local') {
     throw Object.assign(new Error('agent cannot load or resume this session'), {
       code: 'ACP_RECONNECT_FAILED'
     })
   }
+  const reopenMcpServers =
+    strategy === 'local' ? [] : await configuredMcpServersForReopen(get, liveAgentId)
+  if (deletedMidOpen() || !isCurrentSessionReopen(id, reopenGeneration)) return
 
   // Point the record at the resolved live agent so streaming events from
   // `session/load` route to this session, and (for 'load') open the replay
@@ -2949,9 +2964,11 @@ async function openHistorySessionInner(
   const conversationId =
     get().sessions[id]?.conversationId ?? meta.conversationId ?? indexMetadata?.conversationId
 
-  if (strategy === 'load') {
+  const runLoadFallback = async (): Promise<void> => {
     try {
-      const outcome = (await acpApi.loadSession(liveAgentId, id, meta.cwd, conversationId)) ?? {}
+      const outcome =
+        (await acpApi.loadSession(liveAgentId, id, meta.cwd, conversationId, reopenMcpServers)) ??
+        {}
       if (deletedMidOpen() || !isCurrentSessionReopen(id, reopenGeneration)) {
         if (isCurrentSessionReopen(id, reopenGeneration)) clearReplayIfPresent()
         return
@@ -2992,9 +3009,15 @@ async function openHistorySessionInner(
       }))
       throw err
     }
+  }
+
+  if (strategy === 'load') {
+    await runLoadFallback()
   } else if (strategy === 'resume') {
     try {
-      const outcome = (await acpApi.resumeSession(liveAgentId, id, meta.cwd, conversationId)) ?? {}
+      const outcome =
+        (await acpApi.resumeSession(liveAgentId, id, meta.cwd, conversationId, reopenMcpServers)) ??
+        {}
       if (deletedMidOpen() || !isCurrentSessionReopen(id, reopenGeneration)) {
         if (isCurrentSessionReopen(id, reopenGeneration)) clearReplayIfPresent()
         return
@@ -3003,7 +3026,30 @@ async function openHistorySessionInner(
       set((s) => ({ sessions: withSessionActive(s.sessions, id) }))
       scheduleReplayEnd(set, id, reopenGeneration)
     } catch (err) {
-      if (deletedMidOpen() || !isCurrentSessionReopen(id, reopenGeneration)) return
+      if (deletedMidOpen() || !isCurrentSessionReopen(id, reopenGeneration)) {
+        if (isCurrentSessionReopen(id, reopenGeneration)) clearReplayIfPresent()
+        return
+      }
+      if (capabilities?.loadSession === true) {
+        void logFrontendError({
+          level: 'warn',
+          source: 'acp.openHistorySession',
+          message: `session/resume failed for ${safeHistorySessionIdForLog(id)}; falling back to session/load`
+        })
+        set((s) => {
+          const session = s.sessions[id]
+          if (!session) return {}
+          return {
+            sessions: {
+              ...s.sessions,
+              [id]: { ...session, replaying: 'pending' as const }
+            }
+          }
+        })
+        await runLoadFallback()
+        return
+      }
+      clearReplayIfPresent()
       set((s) => ({ sessions: withSessionResumeError(s.sessions, id, err) }))
       throw err
     }
@@ -3455,6 +3501,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
   messages: {},
   toolCalls: {},
   plans: {},
+  scheduledTaskDrafts: {},
   commands: {},
   pendingPermissions: {},
   pendingQuestions: {},
@@ -3922,6 +3969,24 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     // Do not kill warm agents here — that remains deleteAgentConfig's job.
     if (agentConfigIdentityChanged(prev, config)) {
       invalidateAgentOptionsCache(set, config.id)
+    }
+    const configKeys = new Set<string>([config.id])
+    if (config.configId) configKeys.add(config.configId)
+    const liveAgentIds = new Set<AgentId>()
+    for (const [reuseKey, agentId] of Object.entries(get().configToLiveAgent)) {
+      if (configKeys.has(configIdFromReuseKey(reuseKey))) liveAgentIds.add(agentId)
+    }
+    const permissionPolicy = config.permissionPolicy ?? 'ask'
+    for (const agentId of liveAgentIds) {
+      try {
+        await acpApi.setPermissionPolicy(agentId, permissionPolicy)
+      } catch (error) {
+        void logFrontendError({
+          level: 'warn',
+          source: 'acp.saveAgentConfig.permissionPolicy',
+          message: `agentId=${agentId} policy=${permissionPolicy} sync_failed=${error instanceof Error ? error.message : String(error)}`
+        })
+      }
     }
   },
 
@@ -4975,10 +5040,17 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       toolCalls: { ...s.toolCalls, [id]: restoredToolCalls(payload) }
     }))
     try {
+      const reopenMcpServers = await configuredMcpServersForReopen(get, agentId)
       // `acpApi.resumeSession` routes to `acp_resume_session` (desktop) or the
       // `resume_session` WS request (web). On web it auto-re-subscribes with
       // `this.lastSeq.get(sid) ?? 0`, so the hook seeds the server cursor first.
-      await acpApi.resumeSession(agentId, id, cwd, get().sessions[id]?.conversationId)
+      await acpApi.resumeSession(
+        agentId,
+        id,
+        cwd,
+        get().sessions[id]?.conversationId,
+        reopenMcpServers
+      )
       // Gap-replay has landed on the restored transcript; clear the resume
       // window. `withSessionActive` alone leaves `replaying: 'streaming'`,
       // which would disable rAF coalescing for live chunks after resume.
@@ -5278,7 +5350,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     const task = (async () => {
       const connected = get().agentStatus[agentId] === 'connected'
       const capabilities = get().agents[agentId]?.capabilities ?? null
-      const strategy = decideResume({ connected, capabilities })
+      const strategy = decideResume({ connected, capabilities, localHistoryAvailable: false })
 
       if (strategy === 'local') {
         set((s) => ({
@@ -5288,6 +5360,8 @@ export const useAcpStore = create<AcpState>((set, get) => ({
           'agent does not support loading or resuming sessions (no loadSession or sessionCapabilities.resume)'
         )
       }
+      const reopenMcpServers = await configuredMcpServersForReopen(get, agentId)
+      if (!isCurrentSessionReopen(sessionId, reopenGeneration)) return
 
       // Preserve controls from an existing discovered record when the reopen
       // response omits optional fields. An explicit configOptions: [] below still
@@ -5334,7 +5408,8 @@ export const useAcpStore = create<AcpState>((set, get) => ({
               agentId,
               sessionId,
               cwd,
-              get().sessions[sessionId]?.conversationId
+              get().sessions[sessionId]?.conversationId,
+              reopenMcpServers
             )) ?? {}
           if (!isCurrentSessionReopen(sessionId, reopenGeneration)) return
           mergeReopenOutcomeIfUnchanged(set, sessionId, reopenGeneration, reopenBaseline, outcome)
@@ -5376,7 +5451,8 @@ export const useAcpStore = create<AcpState>((set, get) => ({
               agentId,
               sessionId,
               cwd,
-              get().sessions[sessionId]?.conversationId
+              get().sessions[sessionId]?.conversationId,
+              reopenMcpServers
             )) ?? {}
           if (!isCurrentSessionReopen(sessionId, reopenGeneration)) return
           mergeReopenOutcomeIfUnchanged(set, sessionId, reopenGeneration, reopenBaseline, outcome)
@@ -6039,6 +6115,17 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       // Do not re-grow plan cache for closed/unknown sessions after eviction.
       if (!acceptsSessionTranscriptEvents(s.sessions[e.sessionId])) return {}
       return { plans: { ...s.plans, [e.sessionId]: entries } }
+    }),
+
+  _onScheduledTaskDraft: (e) =>
+    set((state) => {
+      if (!acceptsSessionTranscriptEvents(state.sessions[e.sessionId])) return {}
+      return {
+        scheduledTaskDrafts: {
+          ...state.scheduledTaskDrafts,
+          [e.sessionId]: e.task
+        }
+      }
     }),
 
   _onCommandsUpdate: (e) =>
@@ -6941,6 +7028,9 @@ export function initAcpEventListeners(): () => void {
     ),
     acpApi.onEvent<PlanUpdateEvent>(ACP_EVENTS.planUpdate, (e) =>
       useAcpStore.getState()._onPlanUpdate(e)
+    ),
+    acpApi.onEvent<ScheduledTaskDraftEvent>(ACP_EVENTS.scheduledTaskDraft, (e) =>
+      useAcpStore.getState()._onScheduledTaskDraft(e)
     ),
     acpApi.onEvent<CommandsUpdateEvent>(ACP_EVENTS.commandsUpdate, (e) =>
       useAcpStore.getState()._onCommandsUpdate(e)

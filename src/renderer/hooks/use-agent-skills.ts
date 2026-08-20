@@ -1,4 +1,8 @@
 import { useCallback, useEffect, useState } from 'react'
+import {
+  AGENT_SKILLS_CHANGED_EVENT,
+  type AgentSkillsChangedDetail
+} from '@/lib/agent-skills-events'
 import { logFrontendError } from '@/lib/log-api'
 import { type AgentSkillSummary, skillsApi } from '@/lib/skills-api'
 import { type FramedSkill, formatPromptWithSkills } from '@/lib/skills-prompt'
@@ -15,6 +19,15 @@ export function useAgentSkills(projectRoot: string | undefined): {
   const reload = useCallback(() => {
     setReloadToken((t) => t + 1)
   }, [])
+
+  useEffect(() => {
+    const onSkillsChanged = (event: Event): void => {
+      const changedRoot = (event as CustomEvent<AgentSkillsChangedDetail>).detail?.root
+      if (changedRoot === projectRoot?.trim()) reload()
+    }
+    window.addEventListener(AGENT_SKILLS_CHANGED_EVENT, onSkillsChanged)
+    return () => window.removeEventListener(AGENT_SKILLS_CHANGED_EVENT, onSkillsChanged)
+  }, [projectRoot, reload])
 
   useEffect(() => {
     void reloadToken

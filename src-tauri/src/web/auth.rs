@@ -140,6 +140,7 @@ pub enum RemoteRouteClass {
     FrontendLog,
     Workspace,
     Conversation,
+    ScheduledTask,
     Recovery,
     AcpCatalog,
     AcpInstall,
@@ -162,6 +163,7 @@ impl RemoteRouteClass {
             Self::FrontendLog => "frontend_log",
             Self::Workspace => "workspace",
             Self::Conversation => "conversation",
+            Self::ScheduledTask => "scheduled_task",
             Self::Recovery => "recovery",
             Self::AcpCatalog => "acp_catalog",
             Self::AcpInstall => "acp_install",
@@ -213,6 +215,8 @@ impl RemoteRouteClass {
             Some(Self::Recovery)
         } else if path == "/conversations" || path.starts_with("/conversations/") {
             Some(Self::Conversation)
+        } else if path == "/scheduled-tasks" || path.starts_with("/scheduled-tasks/") {
+            Some(Self::ScheduledTask)
         } else if path == "/acp/catalog" || path.starts_with("/acp/catalog/") {
             Some(Self::AcpCatalog)
         } else if path == "/acp/install" {

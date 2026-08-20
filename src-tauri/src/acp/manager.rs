@@ -33,9 +33,9 @@ use std::time::Duration;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthenticateRequest, CancelNotification, CloseSessionRequest,
     ContentBlock, EnvVariable, InitializeRequest, ListSessionsResponse, LoadSessionRequest,
-    LoadSessionResponse, McpServer, McpServerStdio, NewSessionRequest, PromptRequest,
-    RequestPermissionOutcome, RequestPermissionResponse, ResumeSessionRequest,
-    ResumeSessionResponse, SelectedPermissionOutcome, SessionConfigOption,
+    LoadSessionResponse, McpServer, McpServerStdio, NewSessionRequest, PermissionOption,
+    PermissionOptionKind, PromptRequest, RequestPermissionOutcome, RequestPermissionResponse,
+    ResumeSessionRequest, ResumeSessionResponse, SelectedPermissionOutcome, SessionConfigOption,
     SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason,
 };
 use agent_client_protocol::schema::ProtocolVersion;
@@ -46,7 +46,7 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::acp::client;
-use crate::acp::config::{AgentConfig, AgentId, SessionId};
+use crate::acp::config::{AgentConfig, AgentId, PermissionPolicy, SessionId};
 use crate::acp::events::{
     self, AgentCrashedEvent, AgentDisconnectedEvent, AgentErrorEvent, AgentSpawnedEvent,
     AuthMethodInfo, ConfigOptionsUpdateEvent, FanOutError, FanOutReceipt, PromptCompleteEvent,
@@ -645,11 +645,13 @@ enum AcpCommand {
     LoadSession {
         session_id: SessionId,
         cwd: String,
+        mcp_servers: Vec<McpServer>,
         reply: oneshot::Sender<Result<SessionReopenOutcome, String>>,
     },
     ResumeSession {
         session_id: SessionId,
         cwd: String,
+        mcp_servers: Vec<McpServer>,
         reply: oneshot::Sender<Result<SessionReopenOutcome, String>>,
     },
     CloseSession {
@@ -778,6 +780,7 @@ struct AgentEntry {
     /// driver thread's teardown can tell an intentional kill (silent) from a
     /// spontaneous crash (emits `acp:agent_disconnected`). See L4.
     killed: Arc<AtomicBool>,
+    permission_policy: Arc<Mutex<PermissionPolicy>>,
 }
 
 /// Manages all ACP agents, mirroring the `PtyManager` ownership pattern.
@@ -1167,13 +1170,19 @@ impl AcpManager {
     #[must_use]
     pub fn find_agent_by_config_id(&self, config_id: &str) -> Option<AgentId> {
         let namespace = format!("config:{}", config_id.trim());
-        self.agents
-            .lock()
-            .iter()
-            .find_map(|(agent_id, entry)| {
-                (entry.stable_namespace.as_deref() == Some(namespace.as_str()))
-                    .then(|| agent_id.clone())
-            })
+        self.agents.lock().iter().find_map(|(agent_id, entry)| {
+            (entry.stable_namespace.as_deref() == Some(namespace.as_str()))
+                .then(|| agent_id.clone())
+        })
+    }
+
+    pub fn set_scheduled_tasks(&self, service: &Arc<crate::scheduled_tasks::ScheduledTaskService>) {
+        self.host_plan_server.set_scheduled_tasks(service);
+    }
+
+    #[must_use]
+    pub fn scheduled_tasks(&self) -> Option<Arc<crate::scheduled_tasks::ScheduledTaskService>> {
+        self.host_plan_server.scheduled_tasks()
     }
 
     #[must_use]
@@ -1252,6 +1261,7 @@ impl AcpManager {
         // `Err(_)` with no detail; the driver records the real error here so we
         // can surface it instead of a generic "did not initialize" message.
         let start_error = Arc::new(Mutex::new(None::<String>));
+        let permission_policy = Arc::new(Mutex::new(config.permission_policy));
 
         let thread_agent_id = agent_id.clone();
         let thread_config = config.clone();
@@ -1263,6 +1273,7 @@ impl AcpManager {
         let thread_conversation_persistence = self.conversation_persistence.clone();
         let thread_warmup_done = self.warmup_done.clone();
         let thread_host_plan_server = self.host_plan_server.clone();
+        let thread_permission_policy = permission_policy.clone();
         let stable_namespace = stable_agent_namespace(&config);
 
         let join_handle = std::thread::Builder::new()
@@ -1272,6 +1283,7 @@ impl AcpManager {
                     thread_config,
                     sinks,
                     thread_host_plan_server,
+                    thread_permission_policy,
                     thread_agent_id,
                     command_rx,
                     init_tx,
@@ -1332,6 +1344,7 @@ impl AcpManager {
                     stable_namespace: stable_namespace.clone(),
                     join_handle: Some(join_handle),
                     killed,
+                    permission_policy,
                 },
             );
         }
@@ -1388,6 +1401,25 @@ impl AcpManager {
             .get(agent_id)
             .map(|entry| entry.capabilities.clone())
             .ok_or_else(|| format!("unknown agent: {agent_id}"))
+    }
+
+    pub fn set_permission_policy(
+        &self,
+        agent_id: &AgentId,
+        policy: PermissionPolicy,
+    ) -> Result<(), String> {
+        let policy_ref = self
+            .agents
+            .lock()
+            .get(agent_id)
+            .map(|entry| entry.permission_policy.clone())
+            .ok_or_else(|| format!("unknown agent: {agent_id}"))?;
+        *policy_ref.lock() = policy;
+        log::info!(
+            "[acp-permission] boundary=policy_updated agent_id={} policy={policy:?}",
+            agent_id.0
+        );
+        Ok(())
     }
 
     /// Resolve the stable agent namespace (config id or safe fallback) for a
@@ -1589,6 +1621,16 @@ impl AcpManager {
             return Err("CONVERSATION_BOOTSTRAP_REQUIRED: non-ephemeral creation has no ConversationCreationService".to_string());
         };
 
+        if let Some(prepared) = prepared.as_ref() {
+            let provider_key = stable_agent_namespace
+                .as_deref()
+                .and_then(|value| value.strip_prefix("config:"))
+                .unwrap_or(agent_id.0.as_str());
+            crate::skills::ConversationSkillProvisioner::new()
+                .provision(std::path::Path::new(&prepared.workspace_cwd), provider_key)
+                .map_err(|error| format!("SCHEDULED_TASK_SKILL_PROVISION_FAILED: {error}"))?;
+        }
+
         // Host-injected `plan` MCP tool: prepend a self-spawned stdio child to every
         // non-ephemeral session. The provisional token is rebound after durable binding.
         let (combined_mcp_servers, plan_token): (Vec<McpServer>, Option<String>) = if !context
@@ -1770,16 +1812,24 @@ impl AcpManager {
         agent_id: &AgentId,
         session_id: SessionId,
         cwd: String,
+        mcp_servers: Vec<McpServer>,
     ) -> Result<SessionReopenOutcome, String> {
         let caps = self.capabilities(agent_id)?;
         gate_load_session(&caps)?;
         let tx = self.command_tx(agent_id)?;
-        send_command(&tx, |reply| AcpCommand::LoadSession {
+        let (mcp_servers, host_token) =
+            self.prepare_reopen_mcp_servers(agent_id, &session_id, mcp_servers)?;
+        let outcome = send_command(&tx, |reply| AcpCommand::LoadSession {
             session_id,
             cwd,
+            mcp_servers,
             reply,
         })
-        .await
+        .await;
+        if outcome.is_err() {
+            self.host_plan_server.unregister_by_token(&host_token);
+        }
+        outcome
     }
 
     /// Resume a session. Gated on the agent's `sessionCapabilities.resume`.
@@ -1788,16 +1838,51 @@ impl AcpManager {
         agent_id: &AgentId,
         session_id: SessionId,
         cwd: String,
+        mcp_servers: Vec<McpServer>,
     ) -> Result<SessionReopenOutcome, String> {
         let caps = self.capabilities(agent_id)?;
         gate_resume_session(&caps)?;
         let tx = self.command_tx(agent_id)?;
-        send_command(&tx, |reply| AcpCommand::ResumeSession {
+        let (mcp_servers, host_token) =
+            self.prepare_reopen_mcp_servers(agent_id, &session_id, mcp_servers)?;
+        let outcome = send_command(&tx, |reply| AcpCommand::ResumeSession {
             session_id,
             cwd,
+            mcp_servers,
             reply,
         })
-        .await
+        .await;
+        if outcome.is_err() {
+            self.host_plan_server.unregister_by_token(&host_token);
+        }
+        outcome
+    }
+
+    fn prepare_reopen_mcp_servers(
+        &self,
+        agent_id: &AgentId,
+        session_id: &SessionId,
+        configured_mcp_servers: Vec<McpServer>,
+    ) -> Result<(Vec<McpServer>, String), String> {
+        // Reopen requests carry the complete MCP set. Replace any previous
+        // in-process route for this session before issuing a fresh credential.
+        self.host_plan_server.unregister_session(&session_id.0);
+        let (port, token, provisional_sid) = self.host_plan_server.register_session(&agent_id.0);
+        self.host_plan_server.bind_session(&token, &session_id.0);
+        let mut combined = build_internal_plan_stdio(&agent_id.0, port, &token, &provisional_sid);
+        let configured_count = configured_mcp_servers.len();
+        combined.extend(configured_mcp_servers);
+        if let Err(error) = gate_mcp_servers(&self.capabilities(agent_id)?, &combined) {
+            self.host_plan_server.unregister_by_token(&token);
+            return Err(error);
+        }
+        log::info!(
+            "[host-mcp] boundary=session_reopen_injected agent_id={} configured_count={} total_count={}",
+            agent_id.0,
+            configured_count,
+            combined.len()
+        );
+        Ok((combined, token))
     }
 
     /// Close a session. Gated on the agent's `sessionCapabilities.close`.
@@ -2202,6 +2287,7 @@ impl AcpManager {
                 stable_namespace: Some("config:test".to_string()),
                 join_handle: None,
                 killed: Arc::new(AtomicBool::new(false)),
+                permission_policy: Arc::new(Mutex::new(PermissionPolicy::Ask)),
             },
         );
     }
@@ -2253,6 +2339,7 @@ impl AcpManager {
                 stable_namespace: None,
                 join_handle: None,
                 killed: Arc::new(AtomicBool::new(false)),
+                permission_policy: Arc::new(Mutex::new(PermissionPolicy::Ask)),
             },
         );
     }
@@ -2355,6 +2442,7 @@ impl AcpManager {
                 stable_namespace: None,
                 join_handle: None,
                 killed: Arc::new(AtomicBool::new(false)),
+                permission_policy: Arc::new(Mutex::new(PermissionPolicy::Ask)),
             },
         );
         (release_tx, entered_rx)
@@ -2549,6 +2637,17 @@ async fn join_thread_bounded(handle: JoinHandle<()>) {
     }
 }
 
+fn preferred_allow_option(options: &[PermissionOption]) -> Option<&PermissionOption> {
+    options
+        .iter()
+        .find(|option| option.kind == PermissionOptionKind::AllowAlways)
+        .or_else(|| {
+            options
+                .iter()
+                .find(|option| option.kind == PermissionOptionKind::AllowOnce)
+        })
+}
+
 /// Entry point for an agent's dedicated driver thread.
 ///
 /// Builds a current-thread Tokio runtime and drives the ACP connection to
@@ -2562,6 +2661,7 @@ fn run_agent(
     config: AgentConfig,
     sinks: Vec<Arc<dyn EventSink>>,
     host_plan_server: Arc<crate::acp::host_mcp::parent::HostPlanServer>,
+    permission_policy: Arc<Mutex<PermissionPolicy>>,
     agent_id: AgentId,
     command_rx: mpsc::UnboundedReceiver<AcpCommand>,
     init_tx: oneshot::Sender<Result<InitOutcome, String>>,
@@ -2599,6 +2699,7 @@ fn run_agent(
         config,
         sinks.clone(),
         host_plan_server.clone(),
+        permission_policy,
         agent_id.clone(),
         command_rx,
         init_tx,
@@ -2751,6 +2852,7 @@ async fn drive_connection(
     config: AgentConfig,
     sinks: Vec<Arc<dyn EventSink>>,
     host_plan_server: Arc<crate::acp::host_mcp::parent::HostPlanServer>,
+    permission_policy: Arc<Mutex<PermissionPolicy>>,
     agent_id: AgentId,
     command_rx: mpsc::UnboundedReceiver<AcpCommand>,
     init_tx: oneshot::Sender<Result<InitOutcome, String>>,
@@ -2799,6 +2901,7 @@ async fn drive_connection(
     let perm_agent_id = agent_id.clone();
     let perm_state = driver_state.clone();
     let perm_circuits = Arc::clone(&delivery_circuits);
+    let perm_policy = permission_policy;
     let question_sinks = sinks.clone();
     let question_agent_id = agent_id.clone();
     let question_state = driver_state.clone();
@@ -2930,6 +3033,35 @@ async fn drive_connection(
                         RequestPermissionOutcome::Cancelled,
                     ));
                     return Ok(());
+                }
+                let active_policy = *perm_policy.lock();
+                log::info!(
+                    "[acp-permission] boundary=request_received agent_id={} session_id={} policy={active_policy:?} option_count={}",
+                    perm_agent_id.0,
+                    session_string,
+                    options.len()
+                );
+                if active_policy == PermissionPolicy::AllowAll {
+                    if let Some(option) = preferred_allow_option(&options) {
+                        log::info!(
+                            "[acp-permission] boundary=auto_allowed agent_id={} session_id={} option_kind={:?}",
+                            perm_agent_id.0,
+                            session_string,
+                            option.kind
+                        );
+                        let _ = responder.respond(RequestPermissionResponse::new(
+                            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                                option.option_id.clone(),
+                            )),
+                        ));
+                        return Ok(());
+                    }
+                    log::warn!(
+                        "[acp-permission] boundary=auto_allow_unavailable agent_id={} session_id={} option_count={}",
+                        perm_agent_id.0,
+                        session_string,
+                        options.len()
+                    );
                 }
                 // A permission request is agent activity — the turn is waiting
                 // on user input, not wedged. Nudge the idle deadline so a
@@ -3632,6 +3764,7 @@ async fn run_command_loop(
             AcpCommand::LoadSession {
                 session_id,
                 cwd,
+                mcp_servers,
                 reply,
             } => {
                 let slot = reply_slot(reply);
@@ -3660,7 +3793,8 @@ async fn run_command_loop(
                     // Bounded like session/new: a wedged agent must not park the
                     // renderer's reconnect forever (the reply sender would be
                     // held indefinitely).
-                    let request = LoadSessionRequest::new(&session_id, cwd.clone());
+                    let request =
+                        LoadSessionRequest::new(&session_id, cwd.clone()).mcp_servers(mcp_servers);
                     let result = run_session_reopen(
                         "session/load",
                         &session_id.0,
@@ -3676,6 +3810,7 @@ async fn run_command_loop(
             AcpCommand::ResumeSession {
                 session_id,
                 cwd,
+                mcp_servers,
                 reply,
             } => {
                 let slot = reply_slot(reply);
@@ -3695,7 +3830,8 @@ async fn run_command_loop(
                             );
                         }
                     }
-                    let request = ResumeSessionRequest::new(&session_id, cwd.clone());
+                    let request = ResumeSessionRequest::new(&session_id, cwd.clone())
+                        .mcp_servers(mcp_servers);
                     let result = run_session_reopen(
                         "session/resume",
                         &session_id.0,
@@ -4420,6 +4556,7 @@ mod tests {
                 "secret-two".to_string(),
             )]),
             allow_terminal: false,
+            permission_policy: PermissionPolicy::Ask,
         };
         let namespace = stable_agent_namespace(&config).unwrap();
         config.name = "example agent".to_string();
@@ -4441,6 +4578,53 @@ mod tests {
         assert_eq!(stable_agent_namespace(&config), None);
     }
 
+    #[test]
+    fn allow_all_prefers_persistent_then_one_time_allow_options() {
+        let once = PermissionOption::new("once", "Allow once", PermissionOptionKind::AllowOnce);
+        let always =
+            PermissionOption::new("always", "Always allow", PermissionOptionKind::AllowAlways);
+        let reject = PermissionOption::new("reject", "Reject", PermissionOptionKind::RejectAlways);
+
+        assert_eq!(
+            preferred_allow_option(&[once.clone(), always.clone()])
+                .map(|option| option.option_id.to_string())
+                .as_deref(),
+            Some("always")
+        );
+        assert_eq!(
+            preferred_allow_option(&[reject.clone(), once])
+                .map(|option| option.option_id.to_string())
+                .as_deref(),
+            Some("once")
+        );
+        assert!(preferred_allow_option(&[reject]).is_none());
+    }
+
+    #[test]
+    fn live_permission_policy_updates_without_restarting_agent() {
+        let manager = AcpManager::new(vec![]);
+        let agent_id = AgentId::new();
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let policy = Arc::new(Mutex::new(PermissionPolicy::Ask));
+        manager.agents.lock().insert(
+            agent_id.clone(),
+            AgentEntry {
+                command_tx,
+                capabilities: AgentCapabilities::default(),
+                stable_namespace: Some("config:test".to_string()),
+                join_handle: None,
+                killed: Arc::new(AtomicBool::new(false)),
+                permission_policy: policy.clone(),
+            },
+        );
+
+        manager
+            .set_permission_policy(&agent_id, PermissionPolicy::AllowAll)
+            .unwrap();
+
+        assert_eq!(*policy.lock(), PermissionPolicy::AllowAll);
+    }
+
     #[tokio::test]
     async fn owns_session_queries_authoritative_agent_driver_state() {
         let manager = AcpManager::new(vec![]);
@@ -4454,6 +4638,7 @@ mod tests {
                 stable_namespace: None,
                 join_handle: None,
                 killed: Arc::new(AtomicBool::new(false)),
+                permission_policy: Arc::new(Mutex::new(PermissionPolicy::Ask)),
             },
         );
         let requested = SessionId::new("owned-session");
@@ -4581,6 +4766,83 @@ mod tests {
             gate_list_sessions(&caps).is_err(),
             "default agent must not advertise session/list"
         );
+    }
+
+    #[tokio::test]
+    async fn reopen_methods_prepend_internal_mcp_to_configured_servers() {
+        let manager = AcpManager::new(vec![]);
+        let agent_id = AgentId::new();
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let mut capabilities = AgentCapabilities::default();
+        capabilities.load_session = true;
+        capabilities.session_capabilities.resume = Some(Default::default());
+        manager.agents.lock().insert(
+            agent_id.clone(),
+            AgentEntry {
+                command_tx,
+                capabilities,
+                stable_namespace: Some("config:test".to_string()),
+                join_handle: None,
+                killed: Arc::new(AtomicBool::new(false)),
+                permission_policy: Arc::new(Mutex::new(PermissionPolicy::Ask)),
+            },
+        );
+        let configured = McpServer::Stdio(McpServerStdio::new(
+            "configured".to_string(),
+            PathBuf::from("/bin/echo"),
+        ));
+        let capture = tokio::spawn(async move {
+            let mut received = Vec::new();
+            for _ in 0..2 {
+                let command = command_rx.recv().await.unwrap();
+                let (mcp_servers, reply) = match command {
+                    AcpCommand::ResumeSession {
+                        mcp_servers, reply, ..
+                    }
+                    | AcpCommand::LoadSession {
+                        mcp_servers, reply, ..
+                    } => (mcp_servers, reply),
+                    _ => panic!("unexpected ACP command"),
+                };
+                received.push(mcp_servers);
+                reply
+                    .send(Ok(SessionReopenOutcome {
+                        modes: None,
+                        models: None,
+                        config_options: None,
+                    }))
+                    .unwrap();
+            }
+            received
+        });
+
+        manager
+            .resume_session(
+                &agent_id,
+                SessionId::new("resume-session"),
+                "/workspace".to_string(),
+                vec![configured.clone()],
+            )
+            .await
+            .unwrap();
+        manager
+            .load_session(
+                &agent_id,
+                SessionId::new("load-session"),
+                "/workspace".to_string(),
+                vec![configured],
+            )
+            .await
+            .unwrap();
+
+        for servers in capture.await.unwrap() {
+            assert_eq!(servers.len(), 2);
+            assert_eq!(serde_json::to_value(&servers[0]).unwrap()["name"], "termul");
+            assert_eq!(
+                serde_json::to_value(&servers[1]).unwrap()["name"],
+                "configured"
+            );
+        }
     }
 
     /// The rejection path must NOT enqueue any command (agent never contacted).

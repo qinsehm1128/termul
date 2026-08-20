@@ -32,6 +32,21 @@
     "sendFailed": "Could not send your message. Try again.",
     "updateMcpFailed": "Could not update the MCP server. Your previous setting was restored."
   },
+  "permissionPolicy": {
+    "title": "Tool permissions",
+    "description": "Choose whether this ACP agent must ask before using tools. This applies to all conversations using the agent.",
+    "allowAll": "Allow all tool requests",
+    "allowAllHint": "Automatically accepts allow options offered by the agent.",
+    "askShort": "Ask",
+    "allowAllShort": "Full access",
+    "open": "Tool permission policy: {{policy}}",
+    "toggle": "Allow all tool requests",
+    "confirmTitle": "Allow all requests from this agent?",
+    "confirmDescription": "This agent will be able to use every allow option it presents without asking each time. It may modify files or execute commands. Only enable this for an agent and workspace you trust.",
+    "keepAsking": "Keep asking",
+    "enableFullAccess": "Enable full access",
+    "updateFailed": "Could not update tool permissions: {{message}}"
+  },
   "connection": {
     "connected": "Connected",
     "disconnected": "Disconnected",
@@ -378,5 +393,12 @@
     "temporarySessionClosed": "The temporary ACP session closed unexpectedly",
     "worktreeCreationFailed": "Worktree creation failed: {{error}}",
     "unknownError": "unknown"
+  },
+  "scheduledTaskDraft": {
+    "title": "Scheduled task draft",
+    "review": "Review",
+    "everySeconds": "Every {{count}} seconds",
+    "revisionHash": "Revision {{revision}} · {{hash}}…",
+    "notActive": "This draft cannot run until you review and confirm its exact revision and hash."
   }
 }

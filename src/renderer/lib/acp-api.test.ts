@@ -20,6 +20,7 @@ import {
   acpRespondPermission,
   acpSendPrompt,
   acpSetConfigOption,
+  acpSetPermissionPolicy,
   acpSpawnAgent,
   onAcpEvent
 } from './acp-api'
@@ -46,6 +47,15 @@ describe('acp-api command wrappers (Tauri transport)', () => {
     expect(result).toEqual(spawnResult)
     expect(result.agentId).toBe('agent-1')
     expect(result.authMethods).toHaveLength(1)
+  })
+
+  it('acpSetPermissionPolicy updates a live desktop agent', async () => {
+    ;(invoke as ReturnType<typeof vi.fn>).mockResolvedValue(undefined)
+    await acpSetPermissionPolicy('agent-1', 'allow_all')
+    expect(invoke).toHaveBeenCalledWith('acp_set_permission_policy', {
+      agentId: 'agent-1',
+      policy: 'allow_all'
+    })
   })
 
   it('acpNewSession passes agentId, cwd, mcpServers', async () => {

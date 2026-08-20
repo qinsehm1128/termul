@@ -320,6 +320,7 @@ mod tests {
             args: args.iter().map(|arg| (*arg).to_string()).collect(),
             env: HashMap::new(),
             allow_terminal: false,
+            permission_policy: crate::acp::config::PermissionPolicy::Ask,
         }
     }
 
@@ -432,11 +433,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::env::set_var("TERMUL_ACP_NPM_ROOT", temp.path());
         let slug = package_slug("@zed-industries/codex-acp").unwrap();
-        let bin_dir = temp
-            .path()
-            .join(slug)
-            .join("node_modules")
-            .join(".bin");
+        let bin_dir = temp.path().join(slug).join("node_modules").join(".bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         let shim = bin_dir.join("codex-acp");
         std::fs::write(&shim, "#!/bin/sh\n").unwrap();
@@ -455,11 +452,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::env::set_var("TERMUL_ACP_NPM_ROOT", temp.path());
         let slug = package_slug("@zed-industries/codex-acp").unwrap();
-        let bin_dir = temp
-            .path()
-            .join(slug)
-            .join("node_modules")
-            .join(".bin");
+        let bin_dir = temp.path().join(slug).join("node_modules").join(".bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         std::fs::write(bin_dir.join("codex-acp"), "#!/bin/sh\n").unwrap();
 

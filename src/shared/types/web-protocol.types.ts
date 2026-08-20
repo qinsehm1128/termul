@@ -123,6 +123,7 @@ export const WS_REQUEST_TYPES = [
   'spawn_agent',
   'kill_agent',
   'list_agents',
+  'set_permission_policy',
   'switch_project',
   // WS connection token-gate handshake (pre-auth). Distinct from
   // `authenticate_agent` (the ACP agent method).

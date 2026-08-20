@@ -2475,7 +2475,8 @@ describe('acp-store', () => {
       agentId: 'agent-9',
       sessionId: 's-closed',
       cwd: '/work',
-      conversationId: CONVERSATION_ID
+      conversationId: CONVERSATION_ID,
+      mcpServers: []
     })
     expect(vi.mocked(invoke).mock.calls.some(([command]) => command === 'acp_new_session')).toBe(
       false
@@ -3701,7 +3702,8 @@ describe('acp-store', () => {
       agentId: 'agent-r',
       sessionId: 's-resume',
       cwd: '/w',
-      conversationId: null
+      conversationId: null,
+      mcpServers: []
     })
     expect(useAcpStore.getState().toolCalls['s-resume']).toEqual([
       expect.objectContaining({ toolCallId: 'tc-9', seq: 2 })
@@ -3878,7 +3880,8 @@ describe('acp-store', () => {
       agentId: 'agent-1',
       sessionId: 's-closed',
       cwd: '/w',
-      conversationId: null
+      conversationId: null,
+      mcpServers: []
     })
     // The local transcript stays visible while (and after) the load: an agent
     // that replays nothing must not blank the chat. A real replay replaces it
@@ -3954,7 +3957,8 @@ describe('acp-store', () => {
       agentId: 'agent-1',
       sessionId: 's-conv-closed',
       cwd: '/w',
-      conversationId: CONVERSATION_ID
+      conversationId: CONVERSATION_ID,
+      mcpServers: []
     })
     expect(vi.mocked(invoke).mock.calls.some(([command]) => command === 'acp_new_session')).toBe(
       false
@@ -3979,16 +3983,18 @@ describe('acp-store', () => {
     })
   })
 
-  it('openHistorySession resume keeps the saved transcript and ignores user_prompt echoes', async () => {
+  it('openHistorySession prefers resume over load and keeps the saved transcript', async () => {
     useAcpStore.setState((s) => ({
       agents: {
         ...s.agents,
         'agent-1': {
           id: 'agent-1',
-          capabilities: { loadSession: false, sessionCapabilities: { resume: {} } }
+          capabilities: { loadSession: true, sessionCapabilities: { resume: {} } }
         }
       },
-      agentStatus: { ...s.agentStatus, 'agent-1': 'connected' }
+      agentStatus: { ...s.agentStatus, 'agent-1': 'connected' },
+      mcpServers: [{ id: 'files', type: 'stdio', name: 'Files', command: 'node', enabled: true }],
+      mcpServersLoaded: true
     }))
     const { loadSessionPayload } = await import('@/lib/acp-history-persistence')
     ;(loadSessionPayload as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
@@ -4036,8 +4042,75 @@ describe('acp-store', () => {
       agentId: 'agent-1',
       sessionId: 's-conv-resume',
       cwd: '/w',
-      conversationId: CONVERSATION_ID
+      conversationId: CONVERSATION_ID,
+      mcpServers: [{ type: 'stdio', name: 'Files', command: 'node', args: [], env: [] }]
     })
+    expect(invoke).not.toHaveBeenCalledWith('acp_load_session', expect.anything())
+  })
+
+  it('openHistorySession falls back to load when a supported resume call fails', async () => {
+    useAcpStore.setState((s) => ({
+      agents: {
+        ...s.agents,
+        'agent-1': {
+          id: 'agent-1',
+          capabilities: { loadSession: true, sessionCapabilities: { resume: {} } }
+        }
+      },
+      agentStatus: { ...s.agentStatus, 'agent-1': 'connected' }
+    }))
+    const { loadSessionPayload } = await import('@/lib/acp-history-persistence')
+    ;(loadSessionPayload as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      metadata: {
+        id: 's-resume-fallback',
+        conversationId: CONVERSATION_ID,
+        agentId: 'agent-1',
+        title: 'Saved chat',
+        cwd: '/w',
+        projectId: 'p1',
+        createdAt: 1,
+        lastActivityAt: 2,
+        messageCount: 1,
+        status: 'closed'
+      },
+      messages: [
+        {
+          id: 'm-saved',
+          role: 'user',
+          blocks: [{ type: 'text', text: 'saved transcript' }],
+          streaming: false,
+          timestamp: 0
+        }
+      ]
+    })
+    vi.mocked(invoke).mockImplementation(async (command: string) => {
+      if (command === 'acp_resume_session') throw new Error('resume unavailable for this session')
+      if (command === 'acp_load_session') return {}
+      throw new Error(`unexpected invoke command in resume-fallback test: ${command}`)
+    })
+
+    await useAcpStore.getState().openHistorySession('s-resume-fallback')
+
+    expect(invoke).toHaveBeenNthCalledWith(1, 'acp_resume_session', {
+      agentId: 'agent-1',
+      sessionId: 's-resume-fallback',
+      cwd: '/w',
+      conversationId: CONVERSATION_ID,
+      mcpServers: []
+    })
+    expect(invoke).toHaveBeenNthCalledWith(2, 'acp_load_session', {
+      agentId: 'agent-1',
+      sessionId: 's-resume-fallback',
+      cwd: '/w',
+      conversationId: CONVERSATION_ID,
+      mcpServers: []
+    })
+    expect(useAcpStore.getState().sessions['s-resume-fallback']).toMatchObject({
+      status: 'active',
+      lastError: null,
+      replaying: null
+    })
+    expect(useAcpStore.getState().messages['s-resume-fallback'][0].id).toBe('m-saved')
   })
 
   it('openHistorySession preserves cached controls when reopen omits fields and clears explicit configOptions', async () => {
@@ -4267,7 +4340,8 @@ describe('acp-store', () => {
       agentId: 'agent-1',
       sessionId: 's-closed',
       cwd: '/w',
-      conversationId: null
+      conversationId: null,
+      mcpServers: []
     })
     expect(useAcpStore.getState().messages['s-closed']).toHaveLength(1)
     expect(useAcpStore.getState().sessions['s-closed'].status).toBe('active')
@@ -4542,7 +4616,8 @@ describe('acp-store', () => {
       agentId: 'fresh-agent',
       sessionId: 's-reopen',
       cwd: '/w',
-      conversationId: null
+      conversationId: null,
+      mcpServers: []
     })
     expect(useAcpStore.getState().sessions['s-reopen'].agentId).toBe('fresh-agent')
     expect(useAcpStore.getState().sessions['s-reopen'].status).toBe('active')
@@ -4599,7 +4674,8 @@ describe('acp-store', () => {
       agentId: 'fresh-agent',
       sessionId: 's-cold-start',
       cwd: '/w',
-      conversationId: null
+      conversationId: null,
+      mcpServers: []
     })
     expect(useAcpStore.getState().sessions['s-cold-start'].status).toBe('active')
   })
@@ -4723,7 +4799,8 @@ describe('acp-store', () => {
       agentId: 'spawned-1',
       sessionId: 's-spawn',
       cwd: '/w',
-      conversationId: null
+      conversationId: null,
+      mcpServers: []
     })
     expect(useAcpStore.getState().sessions['s-spawn'].agentId).toBe('spawned-1')
     expect(useAcpStore.getState().sessions['s-spawn'].status).toBe('active')
@@ -6925,7 +7002,8 @@ describe('session discovery (gh-407)', () => {
       agentId: 'agent-1',
       sessionId: 'sess-overlap',
       cwd: '/work',
-      conversationId: null
+      conversationId: null,
+      mcpServers: []
     })
 
     reopen.resolve({
@@ -6980,7 +7058,8 @@ describe('session discovery (gh-407)', () => {
       agentId: 'agent-1',
       sessionId: 'sess-recreated',
       cwd: '/work',
-      conversationId: null
+      conversationId: null,
+      mcpServers: []
     })
 
     oldReopen.resolve({
@@ -7011,10 +7090,13 @@ describe('session discovery (gh-407)', () => {
     expect(session.modes?.currentModeId).toBe('fresh')
   })
 
-  it('openDiscoveredSession load keeps in-flight live mode/config updates authoritative', async () => {
+  it('openDiscoveredSession prefers load when no local transcript is available', async () => {
     useAcpStore.setState({
       agents: {
-        'agent-1': { id: 'agent-1', capabilities: { loadSession: true } }
+        'agent-1': {
+          id: 'agent-1',
+          capabilities: { loadSession: true, sessionCapabilities: { resume: {} } }
+        }
       },
       agentStatus: { 'agent-1': 'connected' }
     })

@@ -42,7 +42,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 
-use crate::acp::config::AgentConfig;
+use crate::acp::config::{AgentConfig, PermissionPolicy};
 use crate::acp::{AcpManager, AgentId, FileProjectRegistry, SessionCreationContext, SessionId};
 use crate::pty::PtyManager;
 use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub};
@@ -1755,6 +1755,7 @@ async fn handle_request_with_conversation(
             .await
         }
         "list_agents" => handle_list_agents(id, acp),
+        "set_permission_policy" => handle_set_permission_policy(id, &req.payload, acp),
         // CAP: ACP agent `authenticate` method (agent-advertised auth, e.g.
         // `pi_terminal_login`). Distinct from the WS connection `authenticate`
         // token gate — this runs the method on the host where the agent lives.
@@ -3087,6 +3088,32 @@ fn handle_list_agents(id: String, acp: &Arc<AcpManager>) -> WsReply {
     ok_with_payload(id, &acp.list_agents())
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetPermissionPolicyPayload {
+    agent_id: AgentId,
+    policy: PermissionPolicy,
+}
+
+fn handle_set_permission_policy(id: String, payload: &Value, acp: &Arc<AcpManager>) -> WsReply {
+    let parsed: SetPermissionPolicyPayload = match serde_json::from_value(payload.clone()) {
+        Ok(value) => value,
+        Err(error) => {
+            return WsReply::err(
+                id,
+                WsErrorCode::Unsupported,
+                format!(
+                    "malformed set_permission_policy payload (want agentId and policy): {error}"
+                ),
+            )
+        }
+    };
+    match acp.set_permission_policy(&parsed.agent_id, parsed.policy) {
+        Ok(()) => WsReply::ok(id, Some(json!({}))),
+        Err(error) => acp_err_to_reply(id, error),
+    }
+}
+
 // --- CAP-6 / Story 8: ACP catalog WS handlers ------------------------------
 
 /// `list_acp_catalog` WS request payload. `refresh` is optional (defaults to
@@ -3663,12 +3690,22 @@ async fn try_reopen_session_for_switch(
     // cheap error. Any failure (capability, purged session, agent error) →
     // fall back to a new session.
     match acp
-        .resume_session(agent_id, session_id.clone(), target.cwd.clone())
+        .resume_session(
+            agent_id,
+            session_id.clone(),
+            target.cwd.clone(),
+            target.mcp_servers.clone(),
+        )
         .await
     {
         Ok(_) => Ok(Some(session_id)),
         Err(resume_err) => match acp
-            .load_session(agent_id, session_id.clone(), target.cwd.clone())
+            .load_session(
+                agent_id,
+                session_id.clone(),
+                target.cwd.clone(),
+                target.mcp_servers.clone(),
+            )
             .await
         {
             Ok(_) => Ok(Some(session_id)),
@@ -4036,6 +4073,8 @@ struct LoadResumeSessionPayload {
     cwd: String,
     #[serde(default)]
     conversation_id: Option<String>,
+    #[serde(default)]
+    mcp_servers: Vec<agent_client_protocol::schema::v1::McpServer>,
 }
 
 async fn handle_load_session(
@@ -4063,7 +4102,7 @@ async fn handle_load_session(
     let session_id = parsed.session_id.clone();
     let load_conversation_id = parsed.conversation_id.clone();
     match acp
-        .load_session(&agent_id, parsed.session_id, parsed.cwd)
+        .load_session(&agent_id, parsed.session_id, parsed.cwd, parsed.mcp_servers)
         .await
     {
         Ok(outcome) => {
@@ -4109,7 +4148,7 @@ async fn handle_resume_session(
     let session_id = parsed.session_id.clone();
     let resume_conversation_id = parsed.conversation_id.clone();
     match acp
-        .resume_session(&agent_id, parsed.session_id, parsed.cwd)
+        .resume_session(&agent_id, parsed.session_id, parsed.cwd, parsed.mcp_servers)
         .await
     {
         Ok(outcome) => {
@@ -6470,6 +6509,7 @@ mod tests {
             "set_config_option",
             "spawn_agent",
             "kill_agent",
+            "set_permission_policy",
             "switch_project",
         ] {
             let reply = handle_sync(

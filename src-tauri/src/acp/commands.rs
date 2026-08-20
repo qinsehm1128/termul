@@ -13,7 +13,7 @@ use agent_client_protocol::schema::v1::{
 use serde_json::json;
 use tauri::State;
 
-use crate::acp::config::{require_config_id, AgentConfig, AgentId, SessionId};
+use crate::acp::config::{require_config_id, AgentConfig, AgentId, PermissionPolicy, SessionId};
 use crate::acp::manager::{
     AcpManager, NewSessionOutcome, SessionCreationContext, SessionReopenOutcome, SpawnOutcome,
 };
@@ -50,6 +50,15 @@ pub async fn acp_kill_agent(
 #[tauri::command]
 pub async fn acp_list_agents(manager: State<'_, Arc<AcpManager>>) -> Result<Vec<AgentId>, String> {
     Ok(manager.list_agents())
+}
+
+#[tauri::command]
+pub fn acp_set_permission_policy(
+    manager: State<'_, Arc<AcpManager>>,
+    agent_id: AgentId,
+    policy: PermissionPolicy,
+) -> Result<(), String> {
+    manager.set_permission_policy(&agent_id, policy)
 }
 
 /// Create a new session. `mcpServers` is passed through to `session/new` as-is.
@@ -117,9 +126,12 @@ pub async fn acp_load_session(
     session_id: SessionId,
     cwd: String,
     conversation_id: Option<String>,
+    mcp_servers: Option<Vec<McpServer>>,
 ) -> Result<SessionReopenOutcome, String> {
     let session_id_str = session_id.0.clone();
-    let outcome = manager.load_session(&agent_id, session_id, cwd).await?;
+    let outcome = manager
+        .load_session(&agent_id, session_id, cwd, mcp_servers.unwrap_or_default())
+        .await?;
     // Reopened sessions never went through creation binding; re-bind so
     // ordered persistence admission resolves the canonical Conversation.
     if let Some(raw) = conversation_id {
@@ -143,9 +155,12 @@ pub async fn acp_resume_session(
     session_id: SessionId,
     cwd: String,
     conversation_id: Option<String>,
+    mcp_servers: Option<Vec<McpServer>>,
 ) -> Result<SessionReopenOutcome, String> {
     let session_id_str = session_id.0.clone();
-    let outcome = manager.resume_session(&agent_id, session_id, cwd).await?;
+    let outcome = manager
+        .resume_session(&agent_id, session_id, cwd, mcp_servers.unwrap_or_default())
+        .await?;
     // Resumed agent sessions never went through creation binding; re-bind so
     // ordered persistence admission can resolve the canonical Conversation.
     if let Some(raw) = conversation_id {

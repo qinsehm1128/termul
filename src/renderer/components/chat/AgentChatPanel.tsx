@@ -13,6 +13,7 @@ import { extractSkillNames } from '@/lib/skill-tokens'
 import { isTauriContext } from '@/lib/tauri-runtime'
 import { getDefaultCwdForProject, getProjectRootPath } from '@/lib/worktree-context'
 import { useAcpMessages, useAcpSession, useAcpStore, usePromptQueue } from '@/stores/acp-store'
+import { useConversationStore } from '@/stores/conversation-store'
 import { isAgentDeadError } from '@/stores/prompt-queue-orchestration'
 import { AgentConnectionLamp } from './AgentConnectionLamp'
 import { AskUserQuestion } from './AskUserQuestion'
@@ -22,6 +23,7 @@ import { ChatMessageList } from './ChatMessageList'
 import { buildTimeline, consolidateThoughtGroups } from './chat-timeline'
 import { PermissionDialog } from './PermissionDialog'
 import { PlanPanel } from './PlanPanel'
+import { ScheduledTaskDraftCard } from './ScheduledTaskDraftCard'
 
 function settingErrorMessage(
   err: unknown,
@@ -95,11 +97,20 @@ export function AgentChatPanel({
   // Available skills (with paths) so retry can re-frame the wire from the
   // token names in the last user message (skill paths are not persisted with
   // the message — see the spec's Never: no new ContentBlock type).
-  // Skills live at {project.path}/.agents/skills/ which is gitignored and
-  // excluded from worktree symlinks, so resolve against the main project root
-  // — not session.cwd which may be a worktree path with no .agents/skills/.
-  const skillsProjectRoot = session ? getProjectRootPath(session.projectId) : undefined
-  const { skills: availableSkills } = useAgentSkills(skillsProjectRoot)
+  // Managed skills belong to the Conversation workspace, independent of the
+  // selected execution target (project root or worktree).
+  const conversationWorkspace = useConversationStore((state) => {
+    const conversationId = session?.conversationId
+    if (!conversationId) return undefined
+    return (
+      state.detailsById[conversationId]?.conversation.workspaceCwd ??
+      state.summariesById[conversationId]?.workspaceCwd
+    )
+  })
+  const skillsRoot =
+    conversationWorkspace ??
+    (session ? (getProjectRootPath(session.projectId) ?? session.cwd) : undefined)
+  const { skills: availableSkills } = useAgentSkills(skillsRoot)
   const imageCapable = useAcpStore((s) =>
     session ? Boolean(s.agents[session.agentId]?.capabilities?.promptCapabilities?.image) : false
   )
@@ -111,6 +122,7 @@ export function AgentChatPanel({
   const commands = useAcpStore((s) => s.commands[sessionId] ?? EMPTY_COMMANDS)
   const toolCalls = useAcpStore((s) => s.toolCalls[sessionId] ?? EMPTY_TOOL_CALLS)
   const plan = useAcpStore((s) => s.plans[sessionId] ?? EMPTY_PLAN)
+  const scheduledTaskDraft = useAcpStore((s) => s.scheduledTaskDrafts?.[sessionId])
   // The oldest pending permission for THIS session (resolve one to reveal the next).
   const pendingPermission = useAcpStore(
     useShallow(
@@ -551,6 +563,7 @@ export function AgentChatPanel({
         onDismiss={() => setDismissedError(session.lastError)}
       />
       <PlanPanel key={`plan-${session.id}`} entries={plan} />
+      {scheduledTaskDraft ? <ScheduledTaskDraftCard task={scheduledTaskDraft} /> : null}
       <ChatMessageList
         items={timeline}
         sessionId={session.id}
@@ -565,7 +578,7 @@ export function AgentChatPanel({
       ) : (
         <ChatInputBar
           session={session}
-          projectRoot={skillsProjectRoot}
+          projectRoot={skillsRoot}
           busy={session.activeTurn}
           disabled={isClosed}
           imageCapable={imageCapable}
