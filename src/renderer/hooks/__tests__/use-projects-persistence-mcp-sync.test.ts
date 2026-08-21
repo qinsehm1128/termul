@@ -73,7 +73,9 @@ describe('useProjectsAutoSave MCP sync on project switch (CAP-7)', () => {
 
     useProjectStore.setState({
       projects: [],
+      groups: [],
       activeProjectId: 'warmup',
+      activeGroupId: null,
       isLoaded: true
     })
   })
@@ -90,6 +92,14 @@ describe('useProjectsAutoSave MCP sync on project switch (CAP-7)', () => {
     await act(async () => {
       useProjectStore.setState({
         projects: [{ id: 'p1', name: 'P1', color: 'blue', path: '/p1' }],
+        groups: [
+          {
+            id: 'group-1',
+            name: 'Workspace',
+            projectIds: ['p1'],
+            preferredProjectId: 'p1'
+          }
+        ],
         activeProjectId: 'p1'
       })
     })
@@ -97,6 +107,15 @@ describe('useProjectsAutoSave MCP sync on project switch (CAP-7)', () => {
     await waitFor(() => {
       expect(syncProjectsMock).toHaveBeenCalled()
     })
+    expect(syncProjectsMock).toHaveBeenLastCalledWith(expect.any(Array), 'p1', [
+      {
+        id: 'group-1',
+        name: 'Workspace',
+        projectIds: ['p1'],
+        color: null,
+        preferredProjectId: 'p1'
+      }
+    ])
 
     await waitFor(() => {
       expect(syncMcpRegistryToProjectFile).toHaveBeenCalledTimes(1)

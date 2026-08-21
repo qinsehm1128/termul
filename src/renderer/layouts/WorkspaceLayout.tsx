@@ -1,7 +1,7 @@
 import type { ShellInfo } from '@shared/types/ipc.types'
 import type { SFTPEntry } from '@shared/types/ssh.types'
 import { motion } from 'framer-motion'
-import { X } from 'lucide-react'
+import { FolderGit2, SquareTerminal, X } from 'lucide-react'
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
@@ -21,6 +21,13 @@ import {
   SidebarToggleButton,
   titlebarNoDragStyle
 } from '@/components/TitlebarPanelToggles'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle
+} from '@/components/ui/dialog'
 import { Sheet, SheetContent } from '@/components/ui/sheet'
 import { Skeleton } from '@/components/ui/skeleton'
 import { PaneRenderer } from '@/components/workspace/PaneRenderer'
@@ -37,6 +44,7 @@ import {
 } from '@/hooks/use-command-history'
 import {
   persistState,
+  restoreProjectGroupWorkspace,
   restoreProjectWorkspace,
   subscribeProjectWorkspaceRestored,
   useEditorPersistence
@@ -65,6 +73,7 @@ import {
   windowApi
 } from '@/lib/api'
 import { browserTabHide, browserTabShow } from '@/lib/browser-api'
+import { getColorClasses } from '@/lib/colors'
 import { isSaveFileShortcut, requestSaveEditorFile } from '@/lib/editor-save'
 import { logFrontendError } from '@/lib/log-api'
 import { isMac, macOsTitlebarStripClass } from '@/lib/platform'
@@ -187,6 +196,10 @@ function getShortcutTargetContext(target: EventTarget | null): {
 const macOsTrafficLightClearance = 'w-[80px] shrink-0'
 function MacOsTitlebarStrip(): React.JSX.Element | null {
   const activeProject = useActiveProject()
+  const activeGroupName = useProjectStore((state) => {
+    if (!state.activeGroupId) return null
+    return state.groups.find((group) => group.id === state.activeGroupId)?.name ?? null
+  })
 
   if (!isMac) return null
 
@@ -205,9 +218,9 @@ function MacOsTitlebarStrip(): React.JSX.Element | null {
         <SidebarToggleButton />
       </div>
 
-      {activeProject && (
+      {(activeGroupName || activeProject) && (
         <span className="absolute left-1/2 -translate-x-1/2 text-sm text-muted-foreground pointer-events-none select-none truncate max-w-[50%]">
-          {activeProject.name}
+          {activeGroupName ?? activeProject?.name}
         </span>
       )}
 
@@ -252,6 +265,10 @@ export default function WorkspaceLayout(): React.JSX.Element {
   const [closingTerminalIds, setClosingTerminalIds] = useState<string[]>([])
   const [dirtyCloseFilePath, setDirtyCloseFilePath] = useState<string | null>(null)
   const [isCommandHistoryOpen, setIsCommandHistoryOpen] = useState(false)
+  const [pendingTerminalRoot, setPendingTerminalRoot] = useState<{
+    paneId: string
+    shellName?: string
+  } | null>(null)
   const [isAppCloseDialogOpen, setIsAppCloseDialogOpen] = useState(false)
   // Mobile-only full-width Sheet rendering GitPanel (single-column mobile branch).
   const [gitSheetOpen, setGitSheetOpen] = useState(false)
@@ -268,19 +285,36 @@ export default function WorkspaceLayout(): React.JSX.Element {
   const confirmTerminalClose = useConfirmTerminalClose()
   const projects = useProjects()
   const activeProject = useActiveProject()
+  const activeGroupId = useProjectStore((state) => state.activeGroupId) ?? null
   const activeProjectId = useActiveProjectId()
+  const groups = useProjectStore((state) => state.groups) ?? []
+  const activeGroup = useMemo(
+    () => groups.find((group) => group.id === activeGroupId),
+    [activeGroupId, groups]
+  )
+  const activeGroupProjects = useMemo(() => {
+    if (!activeGroup) return []
+    const projectsById = new Map(projects.map((project) => [project.id, project]))
+    return activeGroup.projectIds.flatMap((projectId) => {
+      const project = projectsById.get(projectId)
+      return project && project.isArchived !== true && project.path ? [project] : []
+    })
+  }, [activeGroup, projects])
+  const editorPersistenceScopeKey = activeGroupId ? `group-${activeGroupId}` : activeProjectId
   const activeConversationId = useConversationStore((state) => state.activeConversationId)
   const activeConversation = useConversationStore((state) =>
     activeConversationId ? state.summariesById[activeConversationId] : undefined
   )
   const {
     selectProject,
+    selectGroup,
     addProject,
     updateProject,
     deleteProject,
     archiveProject,
     restoreProject,
-    reorderProjects
+    reorderProjects,
+    updateGroup
   } = useProjectActions()
 
   const terminals = useTerminals()
@@ -476,6 +510,29 @@ export default function WorkspaceLayout(): React.JSX.Element {
     },
     [location.pathname, navigate, selectProject, selectSSHProfile]
   )
+  const handleSelectGroup = useCallback(
+    (groupId: string) => {
+      const group = groups.find((candidate) => candidate.id === groupId)
+      if (!group) return
+      useWorkspaceStore.getState().hideAgentLauncher()
+      selectGroup(groupId)
+      selectSSHProfile(null)
+      enteredProjectRef.current = null
+      projectTerminalDismissedRef.current = false
+      if (location.pathname !== '/') {
+        setProjectEnterNonce((nonce) => nonce + 1)
+        navigate('/')
+        return
+      }
+      void restoreProjectGroupWorkspace(groupId, group.projectIds).then((restored) => {
+        useConversationStore.getState().setActiveConversationId(null)
+        if (!restored) useWorkspaceStore.getState().resetLayout()
+        enteredProjectRef.current = null
+        setProjectEnterNonce((nonce) => nonce + 1)
+      })
+    },
+    [groups, location.pathname, navigate, selectGroup, selectSSHProfile]
+  )
   const activeTab = useActiveTab()
   const paneRoot = usePaneRoot()
   const fullscreenPaneId = useFullscreenPaneId()
@@ -535,9 +592,16 @@ export default function WorkspaceLayout(): React.JSX.Element {
   useEffect(() => {
     const persistBeforeUnload = () => {
       if (!activeProjectId) return
-      void saveTerminalLayout(activeProjectId).catch((error) => {
-        console.warn('Failed to persist terminal layout before reload:', error)
-      })
+      persistState(editorPersistenceScopeKey)
+      const terminalProjectIds =
+        activeGroupProjects.length > 0
+          ? activeGroupProjects.map((project) => project.id)
+          : [activeProjectId]
+      for (const projectId of terminalProjectIds) {
+        void saveTerminalLayout(projectId).catch((error) => {
+          console.warn('Failed to persist terminal layout before reload:', error)
+        })
+      }
       // R4: force-flush a non-debounced snapshot of every live ACP session's
       // cached payload on refresh unload so the durable copy is at worst one
       // turn behind (never truncated by a live-window trim). Best-effort: a
@@ -561,17 +625,37 @@ export default function WorkspaceLayout(): React.JSX.Element {
       window.removeEventListener('beforeunload', persistBeforeUnload)
       window.removeEventListener('pagehide', persistBeforeUnload)
     }
-  }, [activeProjectId])
+  }, [activeGroupProjects, activeProjectId, editorPersistenceScopeKey])
 
   // Worktree shortcut handlers
   useWorktreeShortcuts()
 
   // Sync file explorer root path and register project root watcher when project changes
-  // biome-ignore lint/correctness/useExhaustiveDependencies: activeProject?.path covers the only property used
   useEffect(() => {
+    if (activeGroupId) {
+      const groupScopeKey = `group:${activeGroupId}:${activeGroupProjects
+        .map((project) => `${project.id}:${project.path}`)
+        .join('|')}`
+      if (groupScopeKey === prevProjectIdRef.current) return
+      if (watchedRootPathRef.current) {
+        filesystemApi.unwatchDirectory(watchedRootPathRef.current)
+        watchedRootPathRef.current = null
+      }
+      useFileExplorerStore.getState().setRoots(
+        activeGroupProjects.map((project) => ({
+          projectId: project.id,
+          name: project.name,
+          path: project.path ?? ''
+        })),
+        activeProject?.path
+      )
+      prevProjectIdRef.current = groupScopeKey
+      return
+    }
+
     const nextRootPathCandidate = activeProject?.path
     if (
-      !activeProject ||
+      !activeProjectId ||
       typeof nextRootPathCandidate !== 'string' ||
       nextRootPathCandidate === ''
     ) {
@@ -659,13 +743,25 @@ export default function WorkspaceLayout(): React.JSX.Element {
     return () => {
       cancelled = true
     }
-  }, [activeProject?.path, activeProjectId])
+  }, [activeGroupId, activeGroupProjects, activeProject?.path, activeProjectId])
 
   // The file tree follows the open Conversation's workspace directory while in
   // the Conversation area, and the active project elsewhere. Project switches
   // keep their dedicated effect above; this one only owns scope transitions.
   useEffect(() => {
     const inConversationScope = location.pathname.startsWith('/c/')
+    if (!inConversationScope && activeGroupId) {
+      useFileExplorerStore.getState().setRoots(
+        activeGroupProjects.map((project) => ({
+          projectId: project.id,
+          name: project.name,
+          path: project.path ?? ''
+        })),
+        activeProject?.path
+      )
+      watchedRootPathRef.current = null
+      return
+    }
     const desiredRoot = inConversationScope
       ? (activeConversation?.workspaceCwd ?? '')
       : (activeProject?.path ?? '')
@@ -690,11 +786,32 @@ export default function WorkspaceLayout(): React.JSX.Element {
     return () => {
       cancelled = true
     }
-  }, [location.pathname, activeConversation?.workspaceCwd, activeProject?.path])
+  }, [
+    location.pathname,
+    activeConversation?.workspaceCwd,
+    activeGroupId,
+    activeGroupProjects,
+    activeProject?.path
+  ])
 
   // Editor state persistence
   useEditorPersistence(
-    isConversationAreaPath(location.pathname) || activeConversationId ? '' : activeProjectId
+    isConversationAreaPath(location.pathname) || activeConversationId
+      ? ''
+      : editorPersistenceScopeKey,
+    activeGroupId
+      ? {
+          projectIds: activeGroupProjects.map((project) => project.id),
+          rootPaths: activeGroupProjects.flatMap((project) => (project.path ? [project.path] : [])),
+          manifestProjectId: null,
+          notificationProjectId: activeProjectId
+        }
+      : {
+          projectIds: activeProjectId ? [activeProjectId] : [],
+          rootPaths: activeProject?.path ? [activeProject.path] : [],
+          manifestProjectId: activeProjectId || null,
+          notificationProjectId: activeProjectId
+        }
   )
 
   // SessionWorkspace is keyed only by canonical ConversationId. The legacy
@@ -1113,18 +1230,24 @@ export default function WorkspaceLayout(): React.JSX.Element {
 
   // Terminal creation callbacks - defined before keyboard shortcut useEffect
   const handleCreateTerminalInPane = useCallback(
-    async (paneId: string, shellName?: string) => {
+    async (paneId: string, shellName?: string, targetProjectId?: string) => {
       // Terminals are Conversation-scoped only inside an open Conversation;
       // the regular project workspace keeps scope-less project terminals.
       const inConversationScope =
         location.pathname.startsWith('/c/') && Boolean(activeConversationId)
+      if (!inConversationScope && activeGroupProjects.length > 1 && !targetProjectId) {
+        setPendingTerminalRoot({ paneId, shellName })
+        return
+      }
+      const terminalProjectId = targetProjectId ?? activeProjectId
+      const terminalProject = projects.find((project) => project.id === terminalProjectId)
       const cwd = inConversationScope
         ? (activeConversation?.workspaceCwd ?? getDefaultCwdForProject(activeProjectId))
-        : getDefaultCwdForProject(activeProjectId)
+        : getDefaultCwdForProject(terminalProjectId)
 
-      const result = await spawnTerminalInPane(paneId, activeProjectId, cwd, {
-        shell: shellName || activeProject?.defaultShell || appDefaultShell || undefined,
-        envVars: activeProject?.envVars,
+      const result = await spawnTerminalInPane(paneId, terminalProjectId, cwd, {
+        shell: shellName || terminalProject?.defaultShell || appDefaultShell || undefined,
+        envVars: terminalProject?.envVars,
         maxTerminalsPerProject: maxTerminals,
         conversationId: inConversationScope ? (activeConversationId ?? undefined) : undefined
       })
@@ -1136,14 +1259,14 @@ export default function WorkspaceLayout(): React.JSX.Element {
       }
     },
     [
-      activeProject?.defaultShell,
-      activeProject?.envVars,
       activeConversation?.workspaceCwd,
       activeConversationId,
+      activeGroupProjects,
       activeProjectId,
       appDefaultShell,
       location.pathname,
-      maxTerminals
+      maxTerminals,
+      projects
     ]
   )
 
@@ -2017,6 +2140,73 @@ export default function WorkspaceLayout(): React.JSX.Element {
         onCreateProject={addProject}
       />
 
+      <Dialog
+        open={pendingTerminalRoot !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingTerminalRoot(null)
+        }}
+      >
+        <DialogContent className="max-w-xl">
+          <DialogHeader>
+            <DialogTitle>
+              {runtimeT('workspace', 'multiRoot.terminalTitle', 'Choose terminal project')}
+            </DialogTitle>
+            <DialogDescription>
+              {runtimeT(
+                'workspace',
+                'multiRoot.terminalDescription',
+                'Choose a project to create the terminal immediately.'
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-[min(420px,60vh)] space-y-2 overflow-y-auto pr-1">
+            {activeGroupProjects.map((project) => {
+              const color = getColorClasses(project.color)
+              return (
+                <button
+                  key={project.id}
+                  type="button"
+                  className="group flex w-full items-center gap-3 rounded-lg border border-border/70 bg-secondary/20 px-3 py-3 text-left transition-colors hover:border-primary/45 hover:bg-secondary/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  aria-label={`${project.name}: ${project.path}`}
+                  onClick={() => {
+                    const pending = pendingTerminalRoot
+                    if (!pending) return
+                    if (activeGroupId) {
+                      updateGroup(activeGroupId, { preferredProjectId: project.id })
+                    }
+                    setPendingTerminalRoot(null)
+                    void handleCreateTerminalInPane(pending.paneId, pending.shellName, project.id)
+                  }}
+                >
+                  <span
+                    className={cn(
+                      'flex size-9 shrink-0 items-center justify-center rounded-md bg-background/70',
+                      color.text
+                    )}
+                    aria-hidden="true"
+                  >
+                    <FolderGit2 size={18} />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm font-medium text-foreground">
+                      {project.name}
+                    </span>
+                    <span className="mt-0.5 block truncate text-xs text-muted-foreground">
+                      {project.path}
+                    </span>
+                  </span>
+                  <SquareTerminal
+                    size={17}
+                    className="shrink-0 text-muted-foreground transition-colors group-hover:text-primary"
+                    aria-hidden="true"
+                  />
+                </button>
+              )
+            })}
+          </div>
+        </DialogContent>
+      </Dialog>
+
       {isThemePickerOpen && (
         <Suspense fallback={null}>
           <ThemePicker />
@@ -2295,6 +2485,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
                       projects={projects}
                       activeProjectId={activeProjectId}
                       onSelectProject={handleSelectProject}
+                      onSelectGroup={handleSelectGroup}
                       onNewProject={() => setIsNewProjectModalOpen(true)}
                       onUpdateProject={updateProject}
                       onDeleteProject={deleteProject}

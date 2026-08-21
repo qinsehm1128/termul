@@ -10,7 +10,8 @@ import type {
   IpcResult,
   TerminalApi,
   TerminalResumeGrant,
-  TerminalResumeRequest
+  TerminalResumeRequest,
+  TerminalScopedDataCallback
 } from '@shared/types/ipc.types'
 import { isTauriContext } from './tauri-runtime'
 import {
@@ -30,6 +31,19 @@ export function resumeTerminal(
   request: TerminalResumeRequest
 ): Promise<IpcResult<TerminalResumeGrant>> {
   return terminalApi.resume(request)
+}
+
+/** Subscribe directly to one PTY, falling back to transport-wide filtering. */
+export function subscribeTerminalData(
+  terminalId: string,
+  callback: TerminalScopedDataCallback
+): () => void {
+  if (terminalApi.onDataForTerminal) {
+    return terminalApi.onDataForTerminal(terminalId, callback)
+  }
+  return terminalApi.onData((candidateId, data) => {
+    if (candidateId === terminalId) callback(data)
+  })
 }
 
 export function addRendererRef(terminalId: string, rendererId: string): Promise<IpcResult<void>> {

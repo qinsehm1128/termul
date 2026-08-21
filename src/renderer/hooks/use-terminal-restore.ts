@@ -284,8 +284,10 @@ async function resolveShellToPath(shell: string): Promise<string> {
  * Hook to restore terminals when switching projects
  * Loads persisted terminal layout and creates terminal instances
  */
-export function useTerminalRestore(): void {
-  const activeProjectId = useProjectStore((state) => state.activeProjectId)
+export function useTerminalRestore(projectIdOverride?: string | null): void {
+  const storeActiveProjectId = useProjectStore((state) => state.activeProjectId)
+  const activeProjectId =
+    projectIdOverride === undefined ? storeActiveProjectId : (projectIdOverride ?? '')
   const previousProjectIdRef = useRef<string>('')
   // FIX #4: Use Set instead of boolean to track multiple restoring projects
   const isRestoringRef = useRef<Set<string>>(new Set())

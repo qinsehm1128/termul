@@ -185,7 +185,9 @@ pub async fn set_default_project(
 mod tests {
     use super::*;
     use crate::acp::{AcpManager, FileProjectRegistry};
-    use crate::web::project_registry::{seed_from_file, ProjectRegistry, ProjectSummary};
+    use crate::web::project_registry::{
+        seed_from_file, ProjectGroupSummary, ProjectRegistry, ProjectSummary,
+    };
     use crate::web::sink::WsRelaySink;
     use crate::web::test_pty_manager;
     use axum::body::Body;
@@ -257,15 +259,26 @@ mod tests {
         }
     }
 
+    fn group(id: &str, project_ids: &[&str], preferred: Option<&str>) -> ProjectGroupSummary {
+        ProjectGroupSummary {
+            id: id.to_string(),
+            name: format!("Group {id}"),
+            project_ids: project_ids.iter().map(|id| (*id).to_string()).collect(),
+            color: Some("purple".to_string()),
+            preferred_project_id: preferred.map(str::to_string),
+        }
+    }
+
     #[tokio::test]
     async fn projects_returns_synced_list() {
         let registry = Arc::new(ProjectRegistry::new());
-        registry.set(
+        registry.set_with_groups(
             vec![
                 summary("p-1", Some("/a"), false, true),
                 summary("p-2", Some("/b"), false, false),
                 summary("p-old", Some("/c"), true, false),
             ],
+            vec![group("g-1", &["p-2", "p-1"], Some("p-2"))],
             Some("p-1".to_string()),
         );
         let app = axum::Router::new()
@@ -290,6 +303,9 @@ mod tests {
         assert!(parsed.success);
         let data = parsed.data.expect("data");
         assert_eq!(data.projects.len(), 3);
+        assert_eq!(data.groups.len(), 1);
+        assert_eq!(data.groups[0].project_ids, ["p-2", "p-1"]);
+        assert_eq!(data.groups[0].preferred_project_id.as_deref(), Some("p-2"));
         assert_eq!(data.default_project_id.as_deref(), Some("p-1"));
         assert_eq!(data.projects[0].id, "p-1");
         assert!(data.projects[0].is_default);
@@ -328,7 +344,9 @@ mod tests {
         let parsed: IpcBody<ProjectListPayload> =
             serde_json::from_slice(&body).expect("parse body");
         assert!(parsed.success);
-        assert!(parsed.data.unwrap().projects.is_empty());
+        let data = parsed.data.unwrap();
+        assert!(data.projects.is_empty());
+        assert!(data.groups.is_empty());
     }
 
     /// Minimal std-only temp dir (reuses `web::config`'s pid+nanos pattern —

@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Switch } from '@/components/ui/switch'
-import { toProjectSummaries } from '@/hooks/use-projects-persistence'
+import { toProjectGroupSummaries, toProjectSummaries } from '@/hooks/use-projects-persistence'
 import { useSshTranslation } from '@/hooks/use-ssh-translation'
 import { remoteServerApi, syncProjects } from '@/lib/api'
 import { cn } from '@/lib/utils'
@@ -57,12 +57,13 @@ export function RemoteAccessPopover(): React.JSX.Element {
         // path in `useProjectsAutoSave` keeps it in sync on later mutations).
         // No env-var values cross the wire — redact-by-omission.
         if (enable) {
-          const { projects, activeProjectId } = useProjectStore.getState()
+          const { projects, groups, activeProjectId } = useProjectStore.getState()
           // Await + inspect: a failed seed leaves the web client without a
           // project list until the next desktop mutation re-syncs — surface it.
           const syncResult = await syncProjects(
             toProjectSummaries(projects, activeProjectId),
-            activeProjectId || null
+            activeProjectId || null,
+            toProjectGroupSummaries(groups)
           )
           if (!syncResult.success) {
             toast.error(t('remote.seedProjectsFailed', { error: syncResult.error }))

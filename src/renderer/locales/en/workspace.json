@@ -4,6 +4,10 @@
   "projects": {
     "title": "Projects"
   },
+  "multiRoot": {
+    "terminalTitle": "Choose terminal project",
+    "terminalDescription": "Select a project to create a terminal from its root immediately."
+  },
   "loading": "Loading...",
   "noProjectsTitle": "No Projects Yet",
   "noProjectsDescription": "Create your first project to organize your terminals, snapshots, and commands",

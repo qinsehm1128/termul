@@ -18,6 +18,7 @@
 //! (desktop-hosted push — the desktop user IS the host operator, so their
 //! active selection IS the default for new clients).
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -53,6 +54,28 @@ pub struct ProjectSummary {
     pub is_default: bool,
 }
 
+/// A project-group summary exposed to the web/remote client.
+///
+/// Group membership is display/navigation metadata only. It never participates
+/// in cwd resolution or the singleton `project_root` containment boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectGroupSummary {
+    /// Stable group id.
+    pub id: String,
+    /// Display name.
+    pub name: String,
+    /// Ordered ids of projects in this group.
+    #[serde(default)]
+    pub project_ids: Vec<String>,
+    /// Optional group color token.
+    #[serde(default)]
+    pub color: Option<String>,
+    /// Preferred project within `project_ids`, when valid.
+    #[serde(default)]
+    pub preferred_project_id: Option<String>,
+}
+
 /// `GET /projects` response payload (wrapped in `IpcResult<T>` by the handler).
 ///
 /// Mirrors `src/shared/types/web-projects.types.ts` `ProjectListPayload`.
@@ -61,6 +84,9 @@ pub struct ProjectSummary {
 pub struct ProjectListPayload {
     /// Non-archived + archived summaries (the web list shows both, archived greyed).
     pub projects: Vec<ProjectSummary>,
+    /// Project-group summaries. Defaults empty for payloads from older hosts.
+    #[serde(default)]
+    pub groups: Vec<ProjectGroupSummary>,
     /// The host's default project id (seeds a new web client's initial
     /// `activeProjectId`), or `None` when none is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,6 +118,7 @@ pub struct ProjectSwitchContext {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct RegistryData {
     projects: Vec<ProjectSummary>,
+    groups: Vec<ProjectGroupSummary>,
     default_project_id: Option<String>,
 }
 
@@ -138,13 +165,44 @@ impl ProjectRegistry {
     /// **CAP-1:** after the mutation lands, rebinds `AppState.project_root`
     /// (via the registered handle) to the new default's canonical path so the
     /// containment boundary follows the active project without a restart.
-    pub fn set(&self, mut projects: Vec<ProjectSummary>, default_id: Option<String>) {
+    pub fn set(&self, projects: Vec<ProjectSummary>, default_id: Option<String>) {
+        self.set_with_groups(projects, Vec::new(), default_id);
+    }
+
+    /// Replace the project + group mirror atomically.
+    ///
+    /// Unknown project ids are removed from group membership. A preferred id
+    /// is retained only when it remains a member of that group. This
+    /// normalization keeps stale renderer data from reaching browser clients;
+    /// groups remain navigation-only and do not affect cwd/root resolution.
+    pub fn set_with_groups(
+        &self,
+        mut projects: Vec<ProjectSummary>,
+        mut groups: Vec<ProjectGroupSummary>,
+        default_id: Option<String>,
+    ) {
         for project in &mut projects {
             project.is_default = default_id.as_deref() == Some(project.id.as_str());
+        }
+        let project_ids: HashSet<&str> =
+            projects.iter().map(|project| project.id.as_str()).collect();
+        for group in &mut groups {
+            let mut seen = HashSet::new();
+            group
+                .project_ids
+                .retain(|id| project_ids.contains(id.as_str()) && seen.insert(id.clone()));
+            if group
+                .preferred_project_id
+                .as_ref()
+                .is_some_and(|id| !group.project_ids.contains(id))
+            {
+                group.preferred_project_id = None;
+            }
         }
         {
             let mut g = self.inner.lock();
             g.projects = projects;
+            g.groups = groups;
             g.default_project_id = default_id;
         }
         self.rebind_project_root();
@@ -157,6 +215,7 @@ impl ProjectRegistry {
         let g = self.inner.lock();
         ProjectListPayload {
             projects: g.projects.clone(),
+            groups: g.groups.clone(),
             default_project_id: g.default_project_id.clone(),
         }
     }
@@ -495,12 +554,27 @@ mod tests {
         }
     }
 
+    fn group(
+        id: &str,
+        project_ids: &[&str],
+        preferred_project_id: Option<&str>,
+    ) -> ProjectGroupSummary {
+        ProjectGroupSummary {
+            id: id.to_string(),
+            name: format!("Group {id}"),
+            project_ids: project_ids.iter().map(|id| (*id).to_string()).collect(),
+            color: Some("purple".to_string()),
+            preferred_project_id: preferred_project_id.map(str::to_string),
+        }
+    }
+
     #[test]
     fn snapshot_defaults_to_empty() {
         let reg = ProjectRegistry::new();
         assert!(reg.is_empty());
         let snap = reg.snapshot();
         assert!(snap.projects.is_empty());
+        assert!(snap.groups.is_empty());
         assert_eq!(snap.default_project_id, None);
     }
 
@@ -523,6 +597,70 @@ mod tests {
         let snap2 = reg.snapshot();
         assert_eq!(snap2.projects[0].id, "p-3");
         assert_eq!(snap2.default_project_id, None);
+    }
+
+    #[test]
+    fn set_with_groups_prunes_invalid_membership_and_preferred_ids() {
+        let reg = ProjectRegistry::new();
+        reg.set_with_groups(
+            vec![
+                sample("p-1", Some("/a"), false),
+                sample("p-2", Some("/b"), false),
+            ],
+            vec![
+                group("g-1", &["p-1", "missing", "p-1", "p-2"], Some("p-2")),
+                group("g-2", &["p-1"], Some("missing")),
+                group("g-3", &["missing"], Some("missing")),
+            ],
+            Some("p-1".to_string()),
+        );
+
+        let snap = reg.snapshot();
+        assert_eq!(snap.default_project_id.as_deref(), Some("p-1"));
+        assert_eq!(snap.groups.len(), 3);
+        assert_eq!(snap.groups[0].project_ids, ["p-1", "p-2"]);
+        assert_eq!(snap.groups[0].preferred_project_id.as_deref(), Some("p-2"));
+        assert_eq!(snap.groups[1].project_ids, ["p-1"]);
+        assert_eq!(snap.groups[1].preferred_project_id, None);
+        assert!(snap.groups[2].project_ids.is_empty());
+        assert_eq!(snap.groups[2].preferred_project_id, None);
+    }
+
+    #[test]
+    fn project_list_payload_defaults_groups_for_older_wire_data() {
+        let payload: ProjectListPayload = serde_json::from_value(serde_json::json!({
+            "projects": [{
+                "id": "p-1",
+                "name": "Proj p-1",
+                "color": "blue",
+                "path": "/a",
+                "isArchived": false,
+                "isDefault": true
+            }],
+            "defaultProjectId": "p-1"
+        }))
+        .expect("deserialize pre-groups payload");
+
+        assert!(payload.groups.is_empty());
+        assert_eq!(payload.default_project_id.as_deref(), Some("p-1"));
+    }
+
+    #[test]
+    fn project_group_summary_defaults_optional_fields() {
+        let summary: ProjectGroupSummary = serde_json::from_value(serde_json::json!({
+            "id": "g-1",
+            "name": "Group g-1",
+            "projectIds": ["p-1"]
+        }))
+        .expect("deserialize group without optional metadata");
+
+        assert_eq!(summary.project_ids, ["p-1"]);
+        assert_eq!(summary.color, None);
+        assert_eq!(summary.preferred_project_id, None);
+
+        let value = serde_json::to_value(summary).expect("serialize group defaults");
+        assert!(value["color"].is_null());
+        assert!(value["preferredProjectId"].is_null());
     }
 
     #[test]

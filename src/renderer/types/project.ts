@@ -29,6 +29,7 @@ export interface ProjectGroup {
   id: string
   name: string
   projectIds: string[]
+  preferredProjectId?: string
   isCollapsed?: boolean
   color?: ProjectColor
 }

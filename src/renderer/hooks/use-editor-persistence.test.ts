@@ -315,6 +315,35 @@ describe('useEditorPersistence', () => {
     })
   })
 
+  it('restores expanded dirs from every root in a group workspace', async () => {
+    mockPersistenceRead.mockResolvedValue({
+      success: true,
+      data: {
+        openFiles: [],
+        activeFilePath: null,
+        expandedDirs: ['/projects/a/src', '/projects/b/docs', '/outside/path'],
+        activeTabId: null
+      }
+    })
+
+    renderHook(() =>
+      useEditorPersistence('group-workspace', {
+        projectIds: ['project-a', 'project-b'],
+        rootPaths: ['/projects/a', '/projects/b'],
+        manifestProjectId: null,
+        notificationProjectId: 'project-a'
+      })
+    )
+
+    await waitFor(() => {
+      expect(mockPersistenceRead).toHaveBeenCalledWith('editor-state/group-workspace')
+      expect(mockExplorerState.restoreExpandedDirs).toHaveBeenCalledWith([
+        '/projects/a/src',
+        '/projects/b/docs'
+      ])
+    })
+  })
+
   it('ignores legacy fileExplorerVisible in persisted payload', async () => {
     mockExplorerState.isVisible = true
 

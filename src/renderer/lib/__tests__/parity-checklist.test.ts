@@ -322,6 +322,7 @@ const P1_DOMAINS: DomainCheck[] = [
       'resize',
       'kill',
       'onData',
+      'onDataForTerminal',
       'onExit',
       // CAP-3 reclaimable leases: attach/rotate/revoke must exist on the
       // Tauri adapter — pins desktop↔web terminal parity.
@@ -1124,6 +1125,15 @@ describe('Parity Checklist Automation', () => {
       expect(content).toMatch(/projectId:\s*string/)
     })
 
+    it('shared project-list contract carries group summaries with stable defaults', () => {
+      const content = readFileSync(SharedTypes, 'utf-8')
+      expect(content).toMatch(/export\s+interface\s+ProjectGroupSummary\b/)
+      expect(content).toMatch(/projectIds:\s*string\[\]/)
+      expect(content).toMatch(/color:\s*string\s*\|\s*null/)
+      expect(content).toMatch(/preferredProjectId:\s*string\s*\|\s*null/)
+      expect(content).toMatch(/groups:\s*ProjectGroupSummary\[\]/)
+    })
+
     it('tauri-remote-api.ts exports setHostDefaultProject + invokes set_host_default_project', () => {
       expect(existsSync(TauriRemoteApi), 'tauri-remote-api.ts should exist').toBe(true)
       const content = readFileSync(TauriRemoteApi, 'utf-8')
@@ -1133,6 +1143,8 @@ describe('Parity Checklist Automation', () => {
       // host default in desktop-hosted mode — same value, new param name).
       expect(content).toMatch(/defaultProjectId:\s*string\s*\|\s*null/)
       expect(content).not.toMatch(/activeProjectId:\s*string\s*\|\s*null/)
+      expect(content).toMatch(/groups:\s*ProjectGroupSummary\[\]\s*=\s*\[\]/)
+      expect(content).toMatch(/payload:\s*\{\s*projects,\s*groups,\s*defaultProjectId\s*\}/)
     })
 
     it('web-server-api.ts exposes setDefaultProject hitting POST /projects/default', () => {

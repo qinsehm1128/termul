@@ -228,6 +228,7 @@ vi.mock('@/components/ui/context-menu', async () => {
 beforeEach(() => {
   useConversationStore.getState().reset()
   useTerminalStore.setState({ terminals: [], activeTerminalId: '', ptyIdIndex: new Map() })
+  useProjectStore.setState({ groups: [], activeGroupId: null })
   mockGetAvailableShells.mockReset()
   mockGetAvailableShells.mockResolvedValue({
     success: true,
@@ -974,7 +975,7 @@ describe('ProjectSidebar Project Search', () => {
 describe('ProjectSidebar Folder Grouping', () => {
   beforeEach(() => {
     // Reset groups in the store before each test
-    useProjectStore.setState({ groups: [] })
+    useProjectStore.setState({ groups: [], activeGroupId: null })
   })
 
   it('should render active projects grouped under folder section when groups are configured', () => {
@@ -1031,8 +1032,102 @@ describe('ProjectSidebar Folder Grouping', () => {
 
     renderWithRouter()
 
-    const folderHeader = screen.getByRole('button', { name: /My Folder/i })
+    const folderHeader = screen.getByRole('button', { name: 'My Folder' })
     const iconContainer = folderHeader.querySelector('.text-project-purple')
     expect(iconContainer).toBeInTheDocument()
+  })
+
+  it('selects a group from its header without toggling collapse', () => {
+    const onSelectGroup = vi.fn()
+    useProjectStore.setState({
+      groups: [
+        {
+          id: 'group-1',
+          name: 'My Folder',
+          projectIds: ['1'],
+          isCollapsed: false
+        }
+      ]
+    })
+
+    renderWithRouter({ onSelectGroup })
+    fireEvent.click(screen.getByRole('button', { name: 'My Folder' }))
+
+    expect(onSelectGroup).toHaveBeenCalledWith('group-1')
+    expect(useProjectStore.getState().groups[0].isCollapsed).toBe(false)
+  })
+
+  it('uses the store selector without changing the current route', () => {
+    useProjectStore.setState({
+      projects: mockProjects,
+      groups: [
+        {
+          id: 'group-1',
+          name: 'My Folder',
+          projectIds: ['1', '2'],
+          preferredProjectId: '2',
+          isCollapsed: false
+        }
+      ],
+      activeProjectId: '1',
+      activeGroupId: null
+    })
+
+    render(
+      <MemoryRouter initialEntries={['/settings']}>
+        <ProjectSidebar {...defaultProps} />
+        <LocationProbe />
+      </MemoryRouter>
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'My Folder' }))
+
+    expect(useProjectStore.getState().activeGroupId).toBe('group-1')
+    expect(useProjectStore.getState().activeProjectId).toBe('2')
+    expect(screen.getByTestId('location-probe')).toHaveTextContent('/settings')
+  })
+
+  it('toggles collapse only from the dedicated chevron control', () => {
+    const onSelectGroup = vi.fn()
+    useProjectStore.setState({
+      groups: [
+        {
+          id: 'group-1',
+          name: 'My Folder',
+          projectIds: ['1'],
+          isCollapsed: false
+        }
+      ]
+    })
+
+    renderWithRouter({ onSelectGroup })
+    fireEvent.click(screen.getByTestId('project-group-chevron-group-1'))
+
+    expect(useProjectStore.getState().groups[0].isCollapsed).toBe(true)
+    expect(onSelectGroup).not.toHaveBeenCalled()
+  })
+
+  it('exposes and styles the active group instead of its preferred project row', () => {
+    useProjectStore.setState({
+      groups: [
+        {
+          id: 'group-1',
+          name: 'My Folder',
+          projectIds: ['1'],
+          preferredProjectId: '1',
+          isCollapsed: false
+        }
+      ],
+      activeProjectId: '1',
+      activeGroupId: 'group-1'
+    })
+
+    renderWithRouter()
+
+    expect(screen.getByRole('button', { name: 'My Folder' })).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    )
+    expect(screen.getByTestId('project-group-group-1')).toHaveClass('bg-sidebar-accent')
+    expect(screen.getByTestId('project-item-1').querySelector('[aria-current]')).toBeNull()
   })
 })

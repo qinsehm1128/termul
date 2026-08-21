@@ -196,6 +196,10 @@ export function AgentLauncher({
   const loadMcpTools = useAcpStore((s) => s.loadMcpTools)
   const activeProjectId = useProjectStore((s) => s.activeProjectId)
   const projects = useProjectStore((s) => s.projects)
+  const activeGroupId = useProjectStore((s) => s.activeGroupId)
+  const activeGroup = useProjectStore((s) =>
+    s.activeGroupId ? s.groups.find((group) => group.id === s.activeGroupId) : undefined
+  )
   const activeProject = useActiveProject()
   const activeConversationId = useConversationStore((state) => state.activeConversationId)
   const activeConversation = useConversationStore((state) =>
@@ -240,6 +244,12 @@ export function AgentLauncher({
   const selectedProjectId = conversationProjectId ?? activeProjectId
   const selectedProject =
     projects.find((project) => project.id === selectedProjectId) ?? activeProject
+  const activeGroupProjects = activeGroup
+    ? activeGroup.projectIds.flatMap((projectId) => {
+        const project = projects.find((candidate) => candidate.id === projectId)
+        return project && project.isArchived !== true && project.path ? [project] : []
+      })
+    : []
   const projectLabel =
     executionTarget.kind === 'workspace'
       ? t('launcher.workspaceFallback', 'your Conversation workspace')
@@ -291,6 +301,19 @@ export function AgentLauncher({
       worktreePath: '',
       worktreeBranch: baseBranch ?? selectedProject?.gitBranch ?? ''
     })
+  }
+  const setGroupProject = (projectId: string): void => {
+    const project = activeGroupProjects.find((candidate) => candidate.id === projectId)
+    if (!project) return
+    const context = defaultProjectContext(project)
+    if (!context) return
+    setExecutionTarget(context.executionTarget)
+    setProjectAttachment(context.projectAttachment)
+    if (activeGroupId) {
+      useProjectStore.getState().updateGroup(activeGroupId, {
+        preferredProjectId: project.id
+      })
+    }
   }
   const [baseBranch, setBaseBranch] = useState<string | null>(null)
   const [baseBranchInfo, setBaseBranchInfo] = useState<BaseBranchInfo | null>(null)
@@ -1813,6 +1836,25 @@ export function AgentLauncher({
               data-agent-launcher-context-strip="true"
               className="relative z-0 mx-auto -mt-4 flex w-[calc(100%-2.75rem)] min-w-0 items-center justify-between gap-2 rounded-b-2xl border border-t-0 border-border/60 bg-card/60 px-2 pb-1 pt-5"
             >
+              {!activeConversation && activeGroupProjects.length > 1 && (
+                <Select value={selectedProjectId ?? ''} onValueChange={setGroupProject}>
+                  <SelectTrigger
+                    aria-label={t('launcher.projectRoot', 'Project root')}
+                    className="h-7 min-h-7 min-w-0 max-w-44 shrink gap-1.5 border-0 bg-transparent px-2.5 py-0 text-xs font-medium text-muted-foreground/70 hover:bg-accent/40 hover:text-foreground/80 focus:outline-none focus:ring-0 focus:ring-offset-0 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 data-[state=open]:bg-accent/40 [&>svg]:h-3.5 [&>svg]:w-3.5 [&>svg]:opacity-70"
+                  >
+                    <Folder className="size-3.5 shrink-0" />
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {activeGroupProjects.map((project) => (
+                      <SelectItem key={project.id} value={project.id}>
+                        {project.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
+
               <Select
                 value={isolationMode}
                 onValueChange={(value) =>

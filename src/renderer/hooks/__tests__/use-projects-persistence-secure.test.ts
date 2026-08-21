@@ -67,7 +67,9 @@ describe('use-projects-persistence secure storage integration', () => {
 
     useProjectStore.setState({
       projects: [],
+      groups: [],
       activeProjectId: '',
+      activeGroupId: null,
       isLoaded: true
     })
 

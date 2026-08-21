@@ -1,4 +1,4 @@
-import { AlertCircle, Check, Clock3, FolderGit2, Home, Loader2 } from 'lucide-react'
+import { AlertCircle, Check, Clock3, FolderGit2, FolderTree, Home, Loader2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
@@ -15,7 +15,7 @@ import { isTauriContext } from '@/lib/tauri-runtime'
 import { webServerProjects } from '@/lib/web-server-api'
 import { useAcpStore } from '@/stores/acp-store'
 import { useProjectStore } from '@/stores/project-store'
-import type { Project } from '@/types/project'
+import type { Project, ProjectGroup } from '@/types/project'
 
 interface ProjectSwitcherDrawerProps {
   open: boolean
@@ -44,7 +44,9 @@ export function ProjectSwitcherDrawer({
 }: ProjectSwitcherDrawerProps): React.JSX.Element {
   const { t } = useTranslation('projects')
   const projects = useProjectStore((s) => s.projects)
+  const groups = useProjectStore((s) => s.groups ?? [])
   const activeProjectId = useProjectStore((s) => s.activeProjectId)
+  const activeGroupId = useProjectStore((s) => s.activeGroupId)
   const switchProject = useAcpStore((s) => s.switchProject)
   const queuedProjectSwitchId = useAcpStore((s) => s.queuedProjectSwitchId)
   const failedProjectSwitchId = useAcpStore((s) => s.failedProjectSwitchId)
@@ -75,6 +77,33 @@ export function ProjectSwitcherDrawer({
       // (e.g. "no_agent" → "switch_project requires a live agent; …"). Surface
       // the failure inline too — toasts are easy to miss on mobile.
       setFailedProjectSwitch(project.id)
+      toast.error(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSwitchingId(null)
+    }
+  }
+
+  async function handleSwitchGroup(group: ProjectGroup): Promise<void> {
+    if (switchingId !== null) return
+    const projectById = new Map(projects.map((project) => [project.id, project]))
+    const preferred = group.preferredProjectId
+      ? projectById.get(group.preferredProjectId)
+      : undefined
+    const target =
+      preferred && preferred.isArchived !== true && preferred.path
+        ? preferred
+        : group.projectIds
+            .map((projectId) => projectById.get(projectId))
+            .find((project) => project?.isArchived !== true && project?.path)
+    if (!target) return
+    setSwitchingId(`group:${group.id}`)
+    try {
+      const outcome = await switchProject(target.id)
+      if (outcome.status === 'completed' || outcome.status === 'selected') {
+        useProjectStore.getState().selectGroup(group.id)
+        onOpenChange(false)
+      }
+    } catch (err) {
       toast.error(err instanceof Error ? err.message : String(err))
     } finally {
       setSwitchingId(null)
@@ -126,6 +155,49 @@ export function ProjectSwitcherDrawer({
           <SheetDescription className="sr-only">{t('projectsDrawerDescription')}</SheetDescription>
         </SheetHeader>
         <div className="min-h-0 flex-1 overflow-auto p-2">
+          {groups.length > 0 && (
+            <div className="mb-2 border-b border-border/60 pb-2">
+              <p className="px-2 pb-1 text-xs font-medium text-muted-foreground">{t('groups')}</p>
+              <ul className="flex flex-col gap-0.5">
+                {groups.map((group) => {
+                  const isActive = group.id === activeGroupId
+                  const isSwitching = switchingId === `group:${group.id}`
+                  const hasRoot = group.projectIds.some((projectId) => {
+                    const project = projects.find((candidate) => candidate.id === projectId)
+                    return project?.isArchived !== true && !!project?.path
+                  })
+                  return (
+                    <li key={group.id}>
+                      <button
+                        type="button"
+                        disabled={!hasRoot || switchingId !== null}
+                        aria-current={isActive ? 'true' : undefined}
+                        onClick={() => void handleSwitchGroup(group)}
+                        className={[
+                          'flex w-full min-w-0 items-center gap-2 rounded px-2 py-2 text-left text-sm transition-colors',
+                          isActive ? 'bg-primary/20' : 'hover:bg-sidebar-accent/50',
+                          !hasRoot || switchingId !== null
+                            ? 'cursor-not-allowed opacity-50'
+                            : 'cursor-pointer'
+                        ].join(' ')}
+                      >
+                        <FolderTree size={14} className="shrink-0 text-primary" />
+                        <span className="min-w-0 flex-1 truncate">{group.name}</span>
+                        <span className="text-xs text-muted-foreground">
+                          {group.projectIds.length}
+                        </span>
+                        {isSwitching ? (
+                          <Loader2 size={14} className="animate-spin" />
+                        ) : isActive ? (
+                          <Check size={14} className="text-primary" />
+                        ) : null}
+                      </button>
+                    </li>
+                  )
+                })}
+              </ul>
+            </div>
+          )}
           {projects.length === 0 ? (
             <p className="px-2 py-4 text-sm text-muted-foreground">{t('noProjectsAvailable')}</p>
           ) : (

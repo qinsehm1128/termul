@@ -46,7 +46,8 @@ vi.mock('@/stores/acp-store', () => ({
 }))
 
 vi.mock('@/hooks/use-projects-persistence', () => ({
-  toProjectSummaries: vi.fn(() => [])
+  toProjectSummaries: vi.fn(() => []),
+  toProjectGroupSummaries: vi.fn(() => [])
 }))
 
 vi.mock('@/lib/acp-history-persistence', () => ({

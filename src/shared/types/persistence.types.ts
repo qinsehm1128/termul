@@ -125,6 +125,7 @@ export interface PersistedProjectData {
   projects: PersistedProject[]
   groups?: PersistedProjectGroup[]
   activeProjectId: string
+  activeGroupId?: string | null
   updatedAt: string // ISO timestamp
 }
 
@@ -132,6 +133,7 @@ export interface PersistedProjectGroup {
   id: string
   name: string
   projectIds: string[]
+  preferredProjectId?: string
   isCollapsed?: boolean
   color?: string
 }

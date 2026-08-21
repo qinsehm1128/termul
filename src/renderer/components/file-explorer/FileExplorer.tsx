@@ -1,17 +1,22 @@
 import type { DirectoryEntry } from '@shared/types/filesystem.types'
 import {
+  ChevronDown,
+  ChevronRight,
   ChevronsDownUp,
   FilePlus,
+  FolderGit2,
   FolderPlus,
   LoaderCircle,
   RefreshCw,
   Search,
+  SquareTerminal,
   X
 } from 'lucide-react'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { clipboardApi, filesystemApi, openerApi } from '@/lib/api'
+import { openTerminalAtCwd } from '@/lib/terminal-spawn'
 import { cn } from '@/lib/utils'
 import { useEditorStore } from '@/stores/editor-store'
 import {
@@ -20,7 +25,6 @@ import {
   useFileExplorerStore
 } from '@/stores/file-explorer-store'
 import { useProjectStore } from '@/stores/project-store'
-import { useTerminalStore } from '@/stores/terminal-store'
 import { editorTabId, useWorkspaceStore } from '@/stores/workspace-store'
 import { FileTreeContextMenuContent } from './FileTreeContextMenu'
 import { FileTreeNodeWrapper } from './FileTreeNode'
@@ -44,12 +48,15 @@ interface FileExplorerProps {
 
 export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.Element {
   const { t } = useTranslation('workspace')
-  const { t: projectT } = useTranslation('projects')
   const {
+    roots: rawRoots,
     rootPath,
+    expandedDirs,
     directoryContents,
+    loadingDirs,
     isVisible,
     rootLoadError,
+    rootLoadErrors: rawRootLoadErrors,
     selectedPaths,
     clipboard,
     searchQuery,
@@ -62,6 +69,8 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
     searchFailedFiles,
     searchLastCompletedQuery
   } = useFileExplorer()
+  const roots = rawRoots ?? []
+  const rootLoadErrors = rawRootLoadErrors ?? new Map()
   const {
     toggleDirectory,
     selectPath,
@@ -76,6 +85,7 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
     collapseAll,
     refreshDirectory,
     refreshTree,
+    setFocusedRoot,
     setRootLoadError,
     setSearchQuery,
     searchInRoot,
@@ -116,6 +126,7 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
   const headerCreateInFlightRef = useRef(false)
 
   const rootEntries = rootPath ? directoryContents.get(rootPath) : undefined
+  const isMultiRoot = roots.length > 1
   const normalizedSearchQuery = searchQuery ?? ''
   const safeSearchResults = searchResults ?? []
   const safeSearchFileNameMatches = searchFileNameMatches ?? []
@@ -250,12 +261,28 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
     [applyResizedWidth, explorerWidth, side]
   )
 
-  // Auto-expand root directory on mount
+  // Auto-expand every project root in a multi-root group.
   useEffect(() => {
-    if (rootPath && !directoryContents.has(rootPath) && !rootLoadError) {
-      toggleDirectory(rootPath)
+    const activeRoots =
+      roots.length > 0 ? roots : rootPath ? [{ projectId: '', name: '', path: rootPath }] : []
+    for (const root of activeRoots) {
+      if (!directoryContents.has(root.path) && !rootLoadErrors.has(root.path)) {
+        void toggleDirectory(root.path)
+      }
     }
-  }, [rootPath, directoryContents, rootLoadError, toggleDirectory])
+  }, [roots, rootPath, directoryContents, rootLoadErrors, toggleDirectory])
+
+  const handleOpenRootTerminal = useCallback(
+    async (projectId: string, cwd: string): Promise<void> => {
+      const outcome = await openTerminalAtCwd(projectId, cwd)
+      if (outcome.status === 'spawn-failed') {
+        toast.error(outcome.error ?? t('errors.createTerminal'))
+      } else if (outcome.status === 'no-pane') {
+        toast.error(t('errors.createTerminal'))
+      }
+    },
+    [t]
+  )
 
   useEffect(() => {
     resetSearch()
@@ -895,18 +922,29 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
   const getFileLabel = useCallback(
     (filePath: string) => {
       const normalizedFilePath = filePath.replace(/\\/g, '/')
-      const normalizedRootPath = (rootPath ?? '').replace(/\\/g, '/')
+      const owningRoot = roots
+        .filter((root) => {
+          const normalizedRoot = root.path.replace(/\\/g, '/')
+          return (
+            normalizedFilePath === normalizedRoot ||
+            normalizedFilePath.startsWith(`${normalizedRoot}/`)
+          )
+        })
+        .sort((left, right) => right.path.length - left.path.length)[0]
+      const normalizedRootPath = (owningRoot?.path ?? rootPath ?? '').replace(/\\/g, '/')
       const fileName = normalizedFilePath.split('/').pop() ?? normalizedFilePath
-      const relativePath = normalizedRootPath
+      const rootRelativePath = normalizedRootPath
         ? normalizedFilePath.replace(`${normalizedRootPath}/`, '')
         : normalizedFilePath
+      const relativePath =
+        roots.length > 1 && owningRoot ? `${owningRoot.name}/${rootRelativePath}` : rootRelativePath
       const folderPath = relativePath.includes('/')
         ? relativePath.slice(0, relativePath.lastIndexOf('/'))
         : ''
 
       return { fileName, folderPath, relativePath }
     },
-    [rootPath]
+    [rootPath, roots]
   )
 
   const renderHighlightedLine = useCallback(
@@ -949,28 +987,23 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
 
   // Open terminal in directory
   const handleOpenInTerminal = useCallback(
-    (dirPath: string) => {
-      const activeProjectId = useProjectStore.getState().activeProjectId
-      if (!activeProjectId) {
+    async (dirPath: string) => {
+      const owningRoot = roots
+        .filter((root) => dirPath === root.path || dirPath.startsWith(`${root.path}/`))
+        .sort((left, right) => right.path.length - left.path.length)[0]
+      const projectId = owningRoot?.projectId || useProjectStore.getState().activeProjectId
+      if (!projectId) {
         toast.error(t('fileExplorer.noActiveProject'))
         return
       }
-
-      const terminalStore = useTerminalStore.getState()
-      try {
-        terminalStore.addTerminal(
-          projectT('fileContext.defaultTerminalName'),
-          activeProjectId,
-          'powershell',
-          dirPath
-        )
-      } catch (error) {
-        const message =
-          error instanceof Error ? error.message : t('fileExplorer.failedOpenTerminal')
-        toast.error(message)
+      const outcome = await openTerminalAtCwd(projectId, dirPath)
+      if (outcome.status === 'spawn-failed') {
+        toast.error(outcome.error ?? t('fileExplorer.failedOpenTerminal'))
+      } else if (outcome.status === 'no-pane') {
+        toast.error(t('fileExplorer.failedOpenTerminal'))
       }
     },
-    [projectT, t]
+    [roots, t]
   )
 
   // Open with external app
@@ -1149,13 +1182,13 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
 
       {/* Tree / Search Results */}
       <div className="flex-1 overflow-y-auto overflow-x-hidden py-1">
-        {!rootPath && (
+        {roots.length === 0 && !rootPath && (
           <div className="px-3 py-4 text-sm text-muted-foreground">
             {t('fileExplorer.noProject')}
           </div>
         )}
 
-        {rootPath && rootLoadError && (
+        {!isMultiRoot && rootPath && rootLoadError && (
           <div className="px-3 py-4 space-y-2">
             <p className="text-sm text-red-400">{t('fileExplorer.loadFailed')}</p>
             <p className="text-xs text-muted-foreground break-words">{rootLoadError.message}</p>
@@ -1168,11 +1201,12 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
           </div>
         )}
 
-        {rootPath && !rootEntries && !rootLoadError && (
+        {!isMultiRoot && rootPath && !rootEntries && !rootLoadError && (
           <div className="px-3 py-4 text-sm text-muted-foreground">{t('fileExplorer.loading')}</div>
         )}
 
-        {rootPath &&
+        {!isMultiRoot &&
+          rootPath &&
           rootEntries &&
           !rootLoadError &&
           (!isSearchActive ||
@@ -1190,6 +1224,90 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
               renderContextMenu={renderFileTreeContextMenu}
             />
           ))}
+
+        {isMultiRoot &&
+          !isSearchActive &&
+          roots.map((root) => {
+            const entries = directoryContents.get(root.path)
+            const error = rootLoadErrors.get(root.path)
+            const expanded = expandedDirs.has(root.path)
+            const loading = loadingDirs.has(root.path)
+            const focused = rootPath === root.path
+            return (
+              <section
+                key={`${root.projectId}:${root.path}`}
+                data-testid={`file-root-${root.projectId}`}
+              >
+                <div
+                  className={cn(
+                    'group flex h-8 min-w-0 items-center gap-1 border-b border-border/40 px-1.5 text-sm',
+                    focused ? 'bg-accent/70 text-accent-foreground' : 'hover:bg-secondary/40'
+                  )}
+                >
+                  <button
+                    type="button"
+                    className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+                    aria-expanded={expanded}
+                    onClick={() => {
+                      setFocusedRoot(root.path)
+                      void toggleDirectory(root.path)
+                    }}
+                  >
+                    <span className="flex h-4 w-4 shrink-0 items-center justify-center">
+                      {loading ? (
+                        <LoaderCircle size={12} className="animate-spin" />
+                      ) : expanded ? (
+                        <ChevronDown size={12} />
+                      ) : (
+                        <ChevronRight size={12} />
+                      )}
+                    </span>
+                    <FolderGit2 size={14} className="shrink-0 text-primary/80" />
+                    <span className="truncate font-medium">{root.name}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-secondary hover:text-foreground group-hover:opacity-100 focus:opacity-100"
+                    title={t('tabs.terminal')}
+                    aria-label={`${t('tabs.terminal')}: ${root.name}`}
+                    onClick={() => void handleOpenRootTerminal(root.projectId, root.path)}
+                  >
+                    <SquareTerminal size={13} />
+                  </button>
+                </div>
+
+                {error ? (
+                  <div className="space-y-2 border-b border-border/40 px-4 py-3">
+                    <p className="text-xs text-red-400">{error.message}</p>
+                    <button
+                      type="button"
+                      className="text-xs text-primary hover:underline"
+                      onClick={() => void toggleDirectory(root.path)}
+                    >
+                      {t('fileExplorer.retry')}
+                    </button>
+                  </div>
+                ) : expanded && entries ? (
+                  entries.map((entry) => (
+                    <FileTreeNodeWrapper
+                      key={entry.path}
+                      entry={entry}
+                      depth={1}
+                      onToggle={toggleDirectory}
+                      onSelect={handleSelect}
+                      onContextMenu={handleContextMenu}
+                      onClick={handleNodeClick}
+                      renderContextMenu={renderFileTreeContextMenu}
+                    />
+                  ))
+                ) : !entries && loading ? (
+                  <div className="px-6 py-2 text-xs text-muted-foreground">
+                    {t('fileExplorer.loading')}
+                  </div>
+                ) : null}
+              </section>
+            )
+          })}
 
         {rootPath && !rootLoadError && isSearchActive && (
           <div className="space-y-1.5 px-2 py-1.5">

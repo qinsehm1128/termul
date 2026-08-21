@@ -146,7 +146,8 @@ vi.mock('@/lib/terminal-api', async () => {
   const { vi: v } = await import('vitest')
   return {
     addRendererRef: v.fn().mockResolvedValue({ success: true }),
-    removeRendererRef: v.fn().mockResolvedValue({ success: true })
+    removeRendererRef: v.fn().mockResolvedValue({ success: true }),
+    subscribeTerminalData: v.fn(() => v.fn())
   }
 })
 

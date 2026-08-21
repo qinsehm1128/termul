@@ -550,6 +550,30 @@ describe('WebTerminalClient frame handling & request lifecycle', () => {
     client.dispose()
   })
 
+  it('delivers data only to scoped subscribers for the matching terminal', async () => {
+    vi.useFakeTimers()
+    const client = new WebTerminalClient(
+      'ws://test/terminal/ws',
+      FakeWebSocket as unknown as typeof WebSocket
+    )
+    const internals = client as unknown as ClientInternals
+    const matching = vi.fn()
+    const unrelated = vi.fn()
+    const offMatching = client.onDataForTerminal('t1', matching)
+    const offUnrelated = client.onDataForTerminal('t2', unrelated)
+
+    await client.connect()
+    internals.socket.emit({ type: 'data', terminalId: 't1', seq: 1, data: [1, 2, 3] })
+
+    expect(matching).toHaveBeenCalledTimes(1)
+    expect(Array.from(matching.mock.calls[0][0] as Uint8Array)).toEqual([1, 2, 3])
+    expect(unrelated).not.toHaveBeenCalled()
+
+    offMatching()
+    offUnrelated()
+    client.dispose()
+  })
+
   it('resolves a request with the matching reply data (round-trip)', async () => {
     vi.useFakeTimers()
     const client = new WebTerminalClient(

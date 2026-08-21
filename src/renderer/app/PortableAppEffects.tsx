@@ -1,4 +1,5 @@
 import { useEffect } from 'react'
+import { useShallow } from 'zustand/shallow'
 import { useUpdateToast } from '@/components/UpdateAvailableToast'
 import { useAcpAgents } from '@/hooks/use-acp-agents'
 import { useAcpHistory } from '@/hooks/use-acp-history'
@@ -32,15 +33,36 @@ import { useUpdateCheck } from '@/hooks/use-updater'
 import { useVisibilityState } from '@/hooks/use-visibility-state'
 import { useTerminalAutoSave } from '@/hooks/useTerminalAutoSave'
 import { initNotificationPermissions } from '@/lib/tauri-notification-api'
+import { useProjectStore } from '@/stores/project-store'
 
 /** Portable application effects, mounted in this fixed order by every renderer root. */
-export function PortableAppEffects(): null {
+function ProjectTerminalRestoreEffect({ projectId }: { projectId: string }): null {
+  useTerminalRestore(projectId)
+  return null
+}
+
+/** Portable application effects, mounted in this fixed order by every renderer root. */
+export function PortableAppEffects(): React.JSX.Element | null {
+  const activeGroupId = useProjectStore((state) => state.activeGroupId)
+  const groupTerminalProjectIds = useProjectStore(
+    useShallow((state) => {
+      if (!state.activeGroupId) return []
+      const group = state.groups.find((candidate) => candidate.id === state.activeGroupId)
+      if (!group) return []
+      const availableIds = new Set(
+        state.projects
+          .filter((project) => project.isArchived !== true && !!project.path)
+          .map((project) => project.id)
+      )
+      return group.projectIds.filter((projectId) => availableIds.has(projectId))
+    })
+  )
   useTerminalAutoSave()
   useSessionWorkspaceBootstrap()
   useConversationHostBootstrap()
   useConversationLifecycle()
   useTerminalResourceLifecycle()
-  useTerminalRestore()
+  useTerminalRestore(activeGroupId ? null : undefined)
   useCrashRecovery()
   useTerminalDetachedOutput()
   useCwd()
@@ -75,5 +97,12 @@ export function PortableAppEffects(): null {
     void initNotificationPermissions()
   }, [])
 
-  return null
+  if (!activeGroupId) return null
+  return (
+    <>
+      {groupTerminalProjectIds.map((projectId) => (
+        <ProjectTerminalRestoreEffect key={projectId} projectId={projectId} />
+      ))}
+    </>
+  )
 }

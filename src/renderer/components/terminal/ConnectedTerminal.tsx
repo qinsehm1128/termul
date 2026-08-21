@@ -8,7 +8,6 @@ import { memo, useCallback, useEffect, useImperativeHandle, useMemo, useRef, use
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import '@xterm/xterm/css/xterm.css'
-import { WebLinksAddon } from '@xterm/addon-web-links'
 import { useShallow } from 'zustand/shallow'
 import {
   ContextMenu,
@@ -27,7 +26,7 @@ import { openTerminalUrl } from '@/lib/browser/terminal-url-navigation'
 import { buildTerminalPathLinks, openFilePathFromTerminal } from '@/lib/file-path-links'
 import { logFrontendError } from '@/lib/log-api'
 import { isMac, isPlatformModifier } from '@/lib/platform'
-import { addRendererRef, removeRendererRef } from '@/lib/terminal-api'
+import { addRendererRef, removeRendererRef, subscribeTerminalData } from '@/lib/terminal-api'
 import {
   getOrCreateProjectContinuityCorrelation,
   recordTerminalContinuityEvent
@@ -359,10 +358,7 @@ function ConnectedTerminalComponent({
   onBoundToStoreTerminalRef.current = onBoundToStoreTerminal
   const spawnOptionsRef = useRef(spawnOptions)
   spawnOptionsRef.current = spawnOptions
-  const initialScrollbackRef = useRef(initialScrollback)
-  initialScrollbackRef.current = initialScrollback
-  // R3: keep the latest captured modes in a ref so the second init path
-  // (window-recovery spawnTerminal) reads the current value.
+  // R3: keep the latest captured modes available to asynchronous replay work.
   const initialModesRef = useRef(initialModes)
   initialModesRef.current = initialModes
   const currentLineRef = useRef<string>('')
@@ -486,10 +482,6 @@ function ConnectedTerminalComponent({
       await terminalApi.write(ptyId, '\x16')
     }
   })
-  const copySelectionRef = useRef(copySelection)
-  copySelectionRef.current = copySelection
-  const pasteFromClipboardRef = useRef(pasteFromClipboard)
-  pasteFromClipboardRef.current = pasteFromClipboard
 
   useEffect(() => {
     if (externalTerminalId) ptyIdRef.current = externalTerminalId
@@ -612,24 +604,31 @@ function ConnectedTerminalComponent({
     // If found, reuse it (preserves scrollback, alt buffer, cursor, etc.)
     // and skip both terminal.open() and transcript replay.
     const cacheKey = externalTerminalId || undefined
-    const cachedTerminal = cacheKey ? takeCachedTerminal(cacheKey) : undefined
+    const cachedSession = cacheKey ? takeCachedTerminal(cacheKey) : undefined
 
     let terminal: Terminal
-    if (cachedTerminal) {
+    let fitAddon: FitAddon
+    let searchAddon: SearchAddon
+    if (cachedSession) {
       devLog(`[ConnectedTerminal] RESTORED cached terminal`, {
         cacheKey
       })
-      terminal = cachedTerminal
+      terminal = cachedSession.terminal
+      fitAddon = cachedSession.fitAddon
+      searchAddon = cachedSession.searchAddon
       applyThemeToTerminal(terminal, getActiveTerminalTheme())
+      terminal.options.cursorBlink = terminalOptions.cursorBlink
     } else {
       terminal = new Terminal(terminalOptions)
+      fitAddon = new FitAddon()
+      terminal.loadAddon(fitAddon)
+      searchAddon = new SearchAddon()
+      terminal.loadAddon(searchAddon)
     }
     terminalRef.current = terminal
     setTerminalInstance(terminal)
-
-    const fitAddon = new FitAddon()
     fitAddonRef.current = fitAddon
-    terminal.loadAddon(fitAddon)
+    searchAddonRef.current = searchAddon
 
     const handleFilePathActivate = async (event: MouseEvent, uri: string): Promise<void> => {
       if (!event.ctrlKey && !event.metaKey) {
@@ -682,12 +681,7 @@ function ConnectedTerminalComponent({
       }
     })
 
-    // Load search addon
-    const searchAddon = new SearchAddon()
-    searchAddonRef.current = searchAddon
-    terminal.loadAddon(searchAddon)
-
-    if (cachedTerminal) {
+    if (cachedSession) {
       // Reattach the preserved xterm element to the new container.
       // This avoids losing scrollback, alt-buffer, and cursor state.
       if (containerRef.current && terminal.element) {
@@ -855,7 +849,7 @@ function ConnectedTerminalComponent({
           webglAddonRef.current = null
           // Mark context as lost for recovery decisions
           webglContextLostRef.current = true
-          if (!shouldUseWebglRenderer(rendererPreferenceRef.current)) {
+          if (!isVisibleRef.current || !shouldUseWebglRenderer(rendererPreferenceRef.current)) {
             webglContextLostRef.current = false
             return
           }
@@ -905,7 +899,7 @@ function ConnectedTerminalComponent({
       }
     }
 
-    if (shouldUseWebglRenderer(rendererPreferenceRef.current)) {
+    if (isVisibleRef.current && shouldUseWebglRenderer(rendererPreferenceRef.current)) {
       loadWebglAddon(terminal)
     }
     // Store reference for recovery handlers to use
@@ -931,7 +925,7 @@ function ConnectedTerminalComponent({
     // Set up IPC listeners BEFORE spawning to avoid missing data
     // Cache ptyId -> terminalId mapping to avoid repeated store lookups
     let cachedTerminalId: string | null = null
-    cleanupDataListenerRef.current = terminalApi.onData((id: string, data: Uint8Array) => {
+    const handleTerminalOutput = (id: string, data: Uint8Array): void => {
       if (id === ptyIdRef.current && terminalRef.current) {
         terminalRef.current.write(data)
         // Resolve terminal record ID (cached to avoid linear scan)
@@ -975,7 +969,12 @@ function ConnectedTerminalComponent({
           }, 2000)
         }
       }
-    })
+    }
+    cleanupDataListenerRef.current = externalTerminalId
+      ? subscribeTerminalData(externalTerminalId, (data) =>
+          handleTerminalOutput(externalTerminalId, data)
+        )
+      : terminalApi.onData(handleTerminalOutput)
 
     cleanupExitListenerRef.current = terminalApi.onExit(
       (id: string, exitCode: number, signal?: number) => {
@@ -1257,7 +1256,7 @@ function ConnectedTerminalComponent({
           externalTerminalId
         )
         try {
-          if (cachedTerminal) {
+          if (cachedSession) {
             // Cached terminal already has full state — skip transcript/scrollback replay.
             // Still consume the transcript to prevent unbounded growth.
             if (transcript) {
@@ -1416,7 +1415,7 @@ function ConnectedTerminalComponent({
       const terminalStillInStore =
         cacheKey && useTerminalStore.getState().findTerminalByPtyId(cacheKey)
       if (terminalStillInStore) {
-        cacheTerminal(cacheKey, terminal)
+        cacheTerminal(cacheKey, { terminal, fitAddon, searchAddon })
       } else {
         terminal.dispose()
       }
@@ -1453,11 +1452,36 @@ function ConnectedTerminalComponent({
       return
     }
 
-    if (terminalRef.current && loadWebglAddonRef.current && !webglAddonRef.current) {
+    if (
+      isVisibleRef.current &&
+      terminalRef.current &&
+      loadWebglAddonRef.current &&
+      !webglAddonRef.current
+    ) {
       webglRecoveryAttemptsRef.current = 0
       loadWebglAddonRef.current(terminalRef.current)
     }
   }, [disposeWebglAddon, rendererPreference])
+
+  // Hidden tabs keep their xterm buffer and PTY attachment, but release the
+  // scarce WebGL context. The DOM renderer continues maintaining terminal
+  // state while hidden; WebGL is restored when the tab becomes visible.
+  useEffect(() => {
+    if (!isVisible) {
+      disposeWebglAddon()
+      return
+    }
+
+    if (
+      shouldUseWebglRenderer(rendererPreferenceRef.current) &&
+      terminalRef.current &&
+      loadWebglAddonRef.current &&
+      !webglAddonRef.current
+    ) {
+      webglRecoveryAttemptsRef.current = 0
+      loadWebglAddonRef.current(terminalRef.current)
+    }
+  }, [disposeWebglAddon, isVisible])
 
   // Trigger fit + PTY resize when terminal becomes visible
   // Uses the two-stage resize pipeline via forceResizeFit,
@@ -1590,7 +1614,7 @@ function ConnectedTerminalComponent({
     let recoveryTimeoutId: ReturnType<typeof setTimeout> | null = null
 
     const handleVisibilityChange = (): void => {
-      if (document.visibilityState === 'visible') {
+      if (document.visibilityState === 'visible' && isVisibleRef.current) {
         // Clear any pending timeout before scheduling new one
         if (recoveryTimeoutId) {
           clearTimeout(recoveryTimeoutId)
@@ -1641,6 +1665,7 @@ function ConnectedTerminalComponent({
     let recoveryTimeoutId: ReturnType<typeof setTimeout> | null = null
 
     const cleanup = systemApi.onPowerResume(() => {
+      if (!isVisibleRef.current) return
       // Clear any pending timeout before scheduling new one
       if (recoveryTimeoutId) {
         clearTimeout(recoveryTimeoutId)
@@ -1691,279 +1716,6 @@ function ConnectedTerminalComponent({
     if (shouldDebugLog) console.log(...args)
   }
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: intentionally narrow deps; a full list would recreate the terminal instance on every render
-  useEffect(() => {
-    if (!containerRef.current || !targetId) return
-    if (didInitRef.current) return
-    let disposed = false
-    didInitRef.current = true
-    initializedTerminalIdRef.current = targetId
-    const terminalOptions = {
-      ...getTerminalOptions(navigator.platform),
-      fontFamily,
-      fontSize,
-      scrollback: bufferSize
-    }
-    const terminal = new Terminal(terminalOptions)
-    terminalRef.current = terminal
-    setTerminalInstance(terminal)
-    const fitAddon = new FitAddon()
-    fitAddonRef.current = fitAddon
-    terminal.loadAddon(fitAddon)
-    terminal.loadAddon(new WebLinksAddon())
-    const searchAddon = new SearchAddon()
-    searchAddonRef.current = searchAddon
-    terminal.loadAddon(searchAddon)
-    terminal.open(containerRef.current)
-    terminal.attachCustomKeyEventHandler((event: KeyboardEvent) => {
-      if (event.type !== 'keydown') return true
-
-      const shortcuts = shortcutsRef.current
-
-      if (isAppOwnedTerminalShortcut(event, shortcuts)) {
-        if (isMac && event.ctrlKey && !event.metaKey) {
-          return true
-        }
-        return false
-      }
-
-      const clipboardModifier = isPlatformModifier(event)
-
-      if (clipboardModifier) {
-        const now = Date.now()
-        if (now - lastClipboardOpRef.current < CLIPBOARD_RATE_LIMIT_MS) return false
-        switch (event.key.toLowerCase()) {
-          case 'c':
-            if (terminal.hasSelection()) {
-              event.preventDefault()
-              lastClipboardOpRef.current = now
-              void copySelectionRef.current()
-              return false
-            }
-            return true
-          case 'v':
-            // F1: same non-secure-context guard as the primary handler — in a
-            // non-secure context (HTTP+bare-IP — GH-588), `navigator.clipboard`
-            // is undefined and the facade's paste-event fallback can't fire
-            // because preventDefault() here would suppress the very paste event
-            // it waits on. Degrade to xterm's native paste (the browser paste
-            // event on xterm's helper textarea); the secure-context path keeps
-            // the bracketed + sanitized paste via the facade (pasteFromClipboard).
-            if (typeof navigator !== 'undefined' && typeof navigator.clipboard === 'undefined') {
-              lastClipboardOpRef.current = now
-              return true
-            }
-            event.preventDefault()
-            lastClipboardOpRef.current = now
-            void pasteFromClipboardRef.current()
-            return false
-          case 'a':
-            terminal.selectAll()
-            return false
-        }
-      }
-      if (trapTerminalTabFocusNavigation(event)) {
-        return true
-      }
-      return true
-    })
-    const loadWebglAddon = (term: Terminal, _isRecovery: boolean = false): void => {
-      if (
-        !shouldUseWebglRenderer(rendererPreferenceRef.current) ||
-        webglAddonRef.current ||
-        webglRecoveryAttemptsRef.current >= MAX_WEBGL_RECOVERY_ATTEMPTS
-      )
-        return
-      try {
-        const webglAddon = new WebglAddon()
-        webglAddon.onContextLoss(() => {
-          webglAddon.dispose()
-          webglAddonRef.current = null
-          webglContextLostRef.current = true
-          webglRecoveryAttemptsRef.current++
-          if (webglRecoveryTimeoutRef.current) clearTimeout(webglRecoveryTimeoutRef.current)
-          webglRecoveryTimeoutRef.current = setTimeout(() => {
-            webglRecoveryTimeoutRef.current = null
-            loadWebglAddon(term, true)
-          }, WEBGL_CONTEXT_LOSS_RECOVERY_DELAY_MS)
-        })
-        term.loadAddon(webglAddon)
-        webglAddonRef.current = webglAddon
-        webglContextLostRef.current = false
-      } catch {
-        webglRecoveryAttemptsRef.current++
-      }
-    }
-    if (shouldUseWebglRenderer(rendererPreferenceRef.current)) loadWebglAddon(terminal)
-    loadWebglAddonRef.current = loadWebglAddon
-    requestAnimationFrame(() => performFit(true))
-    if (autoFocus) terminal.focus()
-    const resizeObserver = new ResizeObserver(() => requestAnimationFrame(() => performFit()))
-    resizeObserver.observe(containerRef.current)
-    const dataDisposable = terminal.onData(handleTerminalData)
-    const resizeDisposable = terminal.onResize(({ cols, rows }) => handlePtyResize(cols, rows))
-    cleanupDataListenerRef.current = terminalApi.onData((id: string, data: Uint8Array) => {
-      if (id === ptyIdRef.current && terminalRef.current) {
-        terminalRef.current.write(data)
-        const now = Date.now()
-        const terminalRecord = useTerminalStore.getState().findTerminalByPtyId(id)
-        if (terminalRecord) {
-          if (now - lastActivityUpdateRef.current >= ACTIVITY_DEBOUNCE_MS) {
-            useTerminalStore.getState().updateTerminalActivityBatch(terminalRecord.id, true, now)
-            lastActivityUpdateRef.current = now
-          } else {
-            pendingActivityUpdateRef.current = { id: terminalRecord.id }
-          }
-          if (activityTimeoutRef.current) clearTimeout(activityTimeoutRef.current)
-          const termId = terminalRecord.id
-          activityTimeoutRef.current = setTimeout(() => {
-            if (pendingActivityUpdateRef.current) {
-              useTerminalStore
-                .getState()
-                .updateTerminalActivityBatch(pendingActivityUpdateRef.current.id, false, Date.now())
-              pendingActivityUpdateRef.current = null
-            } else {
-              useTerminalStore.getState().updateTerminalActivityBatch(termId, false, Date.now())
-            }
-            activityTimeoutRef.current = null
-            lastActivityUpdateRef.current = 0
-          }, 2000)
-        }
-      }
-    })
-    cleanupExitListenerRef.current = terminalApi.onExit(
-      (pId: string, exitCode: number, signal?: number) => {
-        if (pId === ptyIdRef.current) {
-          if (targetId)
-            useTerminalStore.getState().setTerminalHealthStatus(targetId, 'disconnected')
-          if (onExitRef.current) onExitRef.current(exitCode, signal)
-        }
-      }
-    )
-    const spawnTerminal = async (): Promise<void> => {
-      performFit(true)
-      if (!externalTerminalId) {
-        if (!autoSpawn || spawnInFlightRef.current || ptyIdRef.current) return
-        spawnInFlightRef.current = true
-        try {
-          const currentSpawnOptions = spawnOptionsRef.current
-          const result = await terminalApi.spawn({
-            ...currentSpawnOptions,
-            shell: currentSpawnOptions?.shell || undefined,
-            cols: terminal.cols || 80,
-            rows: terminal.rows || 24
-          })
-          if (result.success) {
-            ptyIdRef.current = result.data.id
-            useTerminalStore.getState().setRendererAttached(result.data.id, true)
-            void addRendererRef(result.data.id, instanceIdRef.current)
-            registerTerminal(result.data.id, terminal)
-            const transcript = useTerminalStore.getState().peekTranscript(result.data.id)
-            if (transcript) {
-              // R3: replay captured modes before the (possibly trimmed) transcript.
-              terminal.write(buildRehydrateSequences(initialModesRef.current))
-              terminal.write(transcript)
-              useTerminalStore.getState().consumeTranscript(result.data.id)
-            } else if (initialScrollbackRef.current?.length)
-              restoreScrollback(terminal, initialScrollbackRef.current, initialModesRef.current)
-            if (onSpawnedRef.current) onSpawnedRef.current(result.data.id)
-            if (onBoundToStoreTerminalRef.current) onBoundToStoreTerminalRef.current(result.data.id)
-            // CAP-3: capture the issued lease (in-memory only), after the
-            // store record's ptyId binding so the scan finds it.
-            if (result.data.claim) {
-              useTerminalStore.getState().setTerminalClaim(result.data.id, result.data.claim)
-            }
-          } else {
-            const cleanupFailure = recordTerminalCleanupFailure(result)
-            if (cleanupFailure) setCleanupRecoveryId(cleanupFailure.terminalId)
-            if (onErrorRef.current) {
-              onErrorRef.current(
-                cleanupFailure ? tRef.current('cleanup.quarantined') : result.error
-              )
-            }
-          }
-        } catch (err) {
-          if (onErrorRef.current)
-            onErrorRef.current(
-              err instanceof Error ? err.message : tRef.current('errors.spawnFailed')
-            )
-        } finally {
-          spawnInFlightRef.current = false
-        }
-      } else {
-        const { attached, stale } = await attachResumedTerminalRenderer(
-          externalTerminalId,
-          storeTerminalId,
-          instanceIdRef.current
-        )
-        if (!attached) {
-          if (!stale && !disposed && onErrorRef.current) {
-            onErrorRef.current(tRef.current('resume.disconnectedTitle'))
-          }
-          return
-        }
-        if (disposed) {
-          useTerminalStore.getState().setRendererAttached(externalTerminalId, false)
-          void removeRendererRef(externalTerminalId, instanceIdRef.current)
-          return
-        }
-        rendererRefAttachedRef.current = true
-        registerTerminal(externalTerminalId, terminal)
-        const transcript = useTerminalStore.getState().peekTranscript(externalTerminalId)
-        if (transcript) {
-          // R3: replay captured modes before the (possibly trimmed) transcript.
-          terminal.write(buildRehydrateSequences(initialModesRef.current))
-          terminal.write(transcript)
-          useTerminalStore.getState().consumeTranscript(externalTerminalId)
-        } else if (initialScrollbackRef.current?.length)
-          restoreScrollback(terminal, initialScrollbackRef.current, initialModesRef.current)
-        if (onBoundToStoreTerminalRef.current) onBoundToStoreTerminalRef.current(externalTerminalId)
-      }
-    }
-    spawnTerminal()
-    return () => {
-      disposed = true
-      const tId = ptyIdRef.current || externalTerminalId
-      if (tId && terminalRef.current) {
-        captureScrollPosition(tId)
-        if (!externalTerminalId || rendererRefAttachedRef.current) {
-          useTerminalStore.getState().setRendererAttached(tId, false)
-          void removeRendererRef(tId, instanceId)
-        }
-        rendererRefAttachedRef.current = false
-      }
-      if (ptyIdRef.current) unregisterTerminal(ptyIdRef.current)
-      else if (externalTerminalId) unregisterTerminal(externalTerminalId)
-      resizeObserver.disconnect()
-      dataDisposable.dispose()
-      resizeDisposable.dispose()
-      if (cleanupDataListenerRef.current) cleanupDataListenerRef.current()
-      if (cleanupExitListenerRef.current) cleanupExitListenerRef.current()
-
-      clearTerminalActivityOnUnmount()
-      disposeWebglAddon()
-      terminal.dispose()
-      terminalRef.current = null
-      setTerminalInstance(null)
-      didInitRef.current = false
-      initializedTerminalIdRef.current = undefined
-    }
-  }, [
-    targetId,
-    autoSpawn,
-    rendererPreference,
-    fontFamily,
-    fontSize,
-    bufferSize,
-    instanceId,
-    externalTerminalId,
-    autoFocus,
-    handleTerminalData,
-    handlePtyResize,
-    disposeWebglAddon,
-    clearTerminalActivityOnUnmount
-  ])
-
   const isCrashed = healthStatus === 'crashed'
   const cleanupStageLabel = cleanupRecovery
     ? t(`cleanup.stages.${cleanupRecovery.cleanupStage}`)
@@ -1973,6 +1725,7 @@ function ConnectedTerminalComponent({
     <ContextMenu>
       <ContextMenuTrigger asChild>
         <div className="relative w-full h-full group overflow-hidden">
+          {/* biome-ignore lint/a11y/noStaticElementInteractions lint/a11y/useKeyWithClickEvents: xterm owns the focusable textarea; this wrapper only forwards pointer focus. */}
           <div
             className={`w-full h-full bg-terminal-bg px-4 py-0.5 pb-1 ${className}`}
             onClick={handleContainerClick}

@@ -228,8 +228,9 @@ Object.defineProperty(window, 'api', {
 
 import { clipboardApi, systemApi, terminalApi } from '@/lib/api'
 import { openFilePathFromTerminal } from '@/lib/file-path-links'
-import { addRendererRef, removeRendererRef } from '@/lib/terminal-api'
+import { addRendererRef, removeRendererRef, subscribeTerminalData } from '@/lib/terminal-api'
 import { ConnectedTerminal } from './ConnectedTerminal'
+import { clearTerminalCache, disposeCachedTerminal, hasCachedTerminal } from './terminal-cache'
 
 const { mockRecordTerminalContinuityEvent, mockGetOrCreateProjectContinuityCorrelation } =
   vi.hoisted(() => ({
@@ -340,7 +341,8 @@ vi.mock('@/stores/terminal-store', () => ({
 
 vi.mock('@/lib/terminal-api', () => ({
   addRendererRef: vi.fn().mockResolvedValue({ success: true, data: undefined }),
-  removeRendererRef: vi.fn().mockResolvedValue({ success: true, data: undefined })
+  removeRendererRef: vi.fn().mockResolvedValue({ success: true, data: undefined }),
+  subscribeTerminalData: vi.fn(() => vi.fn())
 }))
 
 describe('ConnectedTerminal', () => {
@@ -348,6 +350,7 @@ describe('ConnectedTerminal', () => {
   let getBoundingClientRectSpy: ReturnType<typeof vi.spyOn>
 
   beforeEach(() => {
+    clearTerminalCache()
     vi.clearAllMocks()
     mockRecordTerminalContinuityEvent.mockReset()
     mockGetOrCreateProjectContinuityCorrelation.mockReset()
@@ -581,7 +584,38 @@ describe('ConnectedTerminal', () => {
     })
   })
 
-  it.skip('should clean up terminal listeners on unmount without creating extra registrations', async () => {
+  it('should use a PTY-scoped data subscription for an external terminal', async () => {
+    render(<ConnectedTerminal terminalId="external-123" />)
+
+    await vi.waitFor(() => {
+      expect(subscribeTerminalData).toHaveBeenCalledWith('external-123', expect.any(Function))
+    })
+    expect(vi.mocked(terminalApi).onData).not.toHaveBeenCalled()
+  })
+
+  it('should reuse the cached terminal session and addons after remount', async () => {
+    const first = render(<ConnectedTerminal terminalId="external-cached" />)
+    await vi.waitFor(() => {
+      expect(addRendererRef).toHaveBeenCalledWith(
+        'external-cached',
+        expect.stringMatching(/^conn-/)
+      )
+    })
+
+    first.unmount()
+    expect(mockTerminalConstructor).toHaveBeenCalledTimes(1)
+    expect(mockTerminalInstance.dispose).not.toHaveBeenCalled()
+
+    const second = render(<ConnectedTerminal terminalId="external-cached" />)
+    await vi.waitFor(() => {
+      expect(addRendererRef).toHaveBeenCalledTimes(2)
+    })
+
+    expect(mockTerminalConstructor).toHaveBeenCalledTimes(1)
+    second.unmount()
+  })
+
+  it('should clean up terminal listeners on unmount without creating extra registrations', async () => {
     const { unmount } = render(<ConnectedTerminal />)
 
     await vi.waitFor(() => {
@@ -593,10 +627,13 @@ describe('ConnectedTerminal', () => {
 
     unmount()
 
-    expect(mockTerminalInstance.dispose).toHaveBeenCalledTimes(1)
+    expect(mockTerminalInstance.dispose).not.toHaveBeenCalled()
+    expect(hasCachedTerminal('terminal-123')).toBe(true)
     expect(removeRendererRef).toHaveBeenCalledWith('terminal-123', expect.stringMatching(/^conn-/))
     expect(vi.mocked(terminalApi).onData).toHaveBeenCalledTimes(1)
     expect(vi.mocked(terminalApi).onExit).toHaveBeenCalledTimes(1)
+    expect(disposeCachedTerminal('terminal-123')).toBe(true)
+    expect(mockTerminalInstance.dispose).toHaveBeenCalledTimes(1)
   })
 
   it('should not spawn terminal when external ID provided', async () => {
@@ -842,9 +879,7 @@ describe('ConnectedTerminal', () => {
     })
   })
 
-  // Skipped: This test has timing issues with async component initialization
-  // The test would need significant refactoring to properly test the IPC data flow
-  it.skip('should write PTY data to terminal when ID matches', async () => {
+  it('should write PTY data to terminal when ID matches', async () => {
     const { unmount } = render(<ConnectedTerminal />)
 
     await vi.waitFor(() => {
@@ -858,10 +893,11 @@ describe('ConnectedTerminal', () => {
     expect(capturedDataCallback).toBeTruthy()
 
     // Manually call the callback to verify it works
-    capturedDataCallback!('terminal-123', new TextEncoder().encode('Hello World'))
+    const bytes = new TextEncoder().encode('Hello World')
+    capturedDataCallback!('terminal-123', bytes)
 
     // The callback should have called terminal.write
-    expect(mockTerminalInstance.write).toHaveBeenCalledWith('Hello World')
+    expect(mockTerminalInstance.write).toHaveBeenCalledWith(bytes)
 
     unmount()
   })
@@ -1817,9 +1853,44 @@ describe('ConnectedTerminal', () => {
         expect(vi.mocked(terminalApi).spawn).toHaveBeenCalled()
       })
 
-      // loadAddon is called for FitAddon, WebLinksAddon, SearchAddon, WebglAddon
+      // loadAddon is called for FitAddon, SearchAddon, and WebglAddon
       expect(mockTerminalInstance.loadAddon).toHaveBeenCalled()
       expect(webglAddonCreateCount).toBe(1)
+    })
+
+    it('should release WebGL while hidden and restore it when visible again', async () => {
+      const { rerender } = render(<ConnectedTerminal isVisible={true} />)
+
+      await vi.waitFor(() => {
+        expect(vi.mocked(terminalApi).spawn).toHaveBeenCalled()
+      })
+      const visibleWebgl = lastCreatedWebglInstance
+      expect(visibleWebgl).toBeTruthy()
+
+      rerender(<ConnectedTerminal isVisible={false} />)
+      await vi.waitFor(() => {
+        expect(visibleWebgl?.dispose).toHaveBeenCalledTimes(1)
+      })
+      expect(webglAddonCreateCount).toBe(1)
+
+      rerender(<ConnectedTerminal isVisible={true} />)
+      await vi.waitFor(() => {
+        expect(webglAddonCreateCount).toBe(2)
+      })
+    })
+
+    it('should defer WebGL allocation until a hidden terminal becomes visible', async () => {
+      const { rerender } = render(<ConnectedTerminal isVisible={false} />)
+
+      await vi.waitFor(() => {
+        expect(vi.mocked(terminalApi).spawn).toHaveBeenCalled()
+      })
+      expect(webglAddonCreateCount).toBe(0)
+
+      rerender(<ConnectedTerminal isVisible={true} />)
+      await vi.waitFor(() => {
+        expect(webglAddonCreateCount).toBe(1)
+      })
     })
 
     it('should stop recovery after max attempts exhausted', async () => {
@@ -1862,7 +1933,7 @@ describe('ConnectedTerminal', () => {
       }
     })
 
-    it.skip('should dispose WebGL and skip recovery after switching renderer preference to canvas', async () => {
+    it('should dispose WebGL and skip recovery after switching renderer preference to dom', async () => {
       vi.useFakeTimers()
       const { rerender } = render(<ConnectedTerminal className="renderer-auto" />)
 
@@ -1873,8 +1944,8 @@ describe('ConnectedTerminal', () => {
       expect(webglAddonCreateCount).toBe(1)
       expect(lastCreatedWebglInstance?.dispose).not.toHaveBeenCalled()
 
-      rendererPreferenceSpy.mockReturnValue('canvas')
-      rerender(<ConnectedTerminal className="renderer-canvas" />)
+      vi.mocked(useTerminalRenderer).mockReturnValue('dom')
+      rerender(<ConnectedTerminal className="renderer-dom" />)
 
       await vi.waitFor(() => {
         expect(lastCreatedWebglInstance?.dispose).toHaveBeenCalled()
@@ -2058,7 +2129,7 @@ describe('ConnectedTerminal', () => {
       expect(mockFitAddonInstance.fit).not.toHaveBeenCalled()
     })
 
-    it.skip('should remove visibilitychange listener on unmount', async () => {
+    it('should remove visibilitychange listener on unmount', async () => {
       const removeEventListenerSpy = vi.spyOn(document, 'removeEventListener')
 
       const { unmount } = render(<ConnectedTerminal />)
@@ -2470,7 +2541,7 @@ describe('ConnectedTerminal', () => {
   })
 
   describe('Power resume recovery', () => {
-    it.skip('should subscribe to power resume events', async () => {
+    it('should subscribe to power resume events', async () => {
       render(<ConnectedTerminal />)
 
       await vi.waitFor(() => {
@@ -2509,7 +2580,7 @@ describe('ConnectedTerminal', () => {
       vi.useRealTimers()
     })
 
-    it.skip('should cleanup power resume subscription on unmount', async () => {
+    it('should cleanup power resume subscription on unmount', async () => {
       const cleanupFn = vi.fn()
       ;(systemApi.onPowerResume as ReturnType<typeof vi.fn>).mockReturnValue(cleanupFn)
 

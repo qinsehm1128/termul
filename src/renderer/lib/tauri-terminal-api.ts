@@ -13,6 +13,7 @@ import type {
   TerminalGitStatusChangedCallback,
   TerminalResumeGrant,
   TerminalResumeRequest,
+  TerminalScopedDataCallback,
   TerminalSpawnOptions
 } from '@shared/types/ipc.types'
 import { Channel, type InvokeArgs, invoke } from '@tauri-apps/api/core'
@@ -229,20 +230,35 @@ function captureStackTrace(): string {
  * It maintains the same interface as the Electron preload script for easy migration.
  */
 export function createTauriTerminalApi(): TerminalApi {
-  // Per-terminal data callback stored between onData registration and spawn
+  // Global observers support transcript capture; visible terminal renderers
+  // use the scoped map so each PTY chunk reaches only its owning renderer.
   const dataCallbacks = new Set<TerminalDataCallback>()
+  const scopedDataCallbacks = new Map<string, Set<TerminalScopedDataCallback>>()
+
+  const dispatchTerminalData = (terminalId: string, bytes: Uint8Array): void => {
+    for (const callback of dataCallbacks) {
+      try {
+        callback(terminalId, bytes)
+      } catch (error) {
+        console.error('[BinaryChannel] Error in global terminal data callback:', error)
+      }
+    }
+
+    const scopedCallbacks = scopedDataCallbacks.get(terminalId)
+    if (!scopedCallbacks) return
+    for (const callback of scopedCallbacks) {
+      try {
+        callback(bytes)
+      } catch (error) {
+        console.error('[BinaryChannel] Error in scoped terminal data callback:', error)
+      }
+    }
+  }
 
   const createTerminalDataChannel = (terminalId: string): Channel<ArrayBuffer> => {
     const onData = new Channel<ArrayBuffer>()
     onData.onmessage = (buf: ArrayBuffer) => {
-      const bytes = new Uint8Array(buf)
-      for (const callback of dataCallbacks) {
-        try {
-          callback(terminalId, bytes)
-        } catch (error) {
-          console.error('[BinaryChannel] Error in terminal data callback:', error)
-        }
-      }
+      dispatchTerminalData(terminalId, new Uint8Array(buf))
     }
     return onData
   }
@@ -376,13 +392,7 @@ export function createTauriTerminalApi(): TerminalApi {
 
         if (capturedTerminalId) {
           // Normal path: we know the terminal ID
-          for (const callback of dataCallbacks) {
-            try {
-              callback(capturedTerminalId, bytes)
-            } catch (err) {
-              console.error('[BinaryChannel] Error in data callback:', err)
-            }
-          }
+          dispatchTerminalData(capturedTerminalId, bytes)
         } else {
           // Data arrived before spawn result — buffer it
           pendingBuffer.push(bytes)
@@ -400,13 +410,7 @@ export function createTauriTerminalApi(): TerminalApi {
         // Flush any buffered data that arrived before we knew the terminal ID
         if (pendingBuffer.length > 0) {
           for (const bytes of pendingBuffer) {
-            for (const callback of dataCallbacks) {
-              try {
-                callback(capturedTerminalId, bytes)
-              } catch (err) {
-                console.error('[BinaryChannel] Error in buffered data callback:', err)
-              }
-            }
+            dispatchTerminalData(capturedTerminalId, bytes)
           }
           pendingBuffer = []
         }
@@ -531,6 +535,24 @@ export function createTauriTerminalApi(): TerminalApi {
       dataCallbacks.add(callback)
       return () => {
         dataCallbacks.delete(callback)
+      }
+    },
+
+    onDataForTerminal(terminalId: string, callback: TerminalScopedDataCallback): () => void {
+      let callbacks = scopedDataCallbacks.get(terminalId)
+      if (!callbacks) {
+        callbacks = new Set()
+        scopedDataCallbacks.set(terminalId, callbacks)
+      }
+      callbacks.add(callback)
+
+      return () => {
+        const current = scopedDataCallbacks.get(terminalId)
+        if (!current) return
+        current.delete(callback)
+        if (current.size === 0) {
+          scopedDataCallbacks.delete(terminalId)
+        }
       }
     },
 

@@ -13,6 +13,7 @@ import type {
   TerminalGitStatusChangedCallback,
   TerminalResumeGrant,
   TerminalResumeRequest,
+  TerminalScopedDataCallback,
   TerminalSpawnOptions
 } from '@shared/types/ipc.types'
 import {
@@ -96,6 +97,7 @@ export class WebTerminalClient {
   private readonly pending = new Map<string, Pending>()
   private readonly trackers = new Map<string, TerminalTracker>()
   private readonly dataCallbacks = new Set<TerminalDataCallback>()
+  private readonly scopedDataCallbacks = new Map<string, Set<TerminalScopedDataCallback>>()
   private readonly exitCallbacks = new Set<TerminalExitCallback>()
   private readonly cwdCallbacks = new Set<TerminalCwdChangedCallback>()
   private readonly branchCallbacks = new Set<TerminalGitBranchChangedCallback>()
@@ -435,6 +437,23 @@ export class WebTerminalClient {
     this.dataCallbacks.add(callback)
     return () => this.dataCallbacks.delete(callback)
   }
+  onDataForTerminal(terminalId: string, callback: TerminalScopedDataCallback): () => void {
+    let callbacks = this.scopedDataCallbacks.get(terminalId)
+    if (!callbacks) {
+      callbacks = new Set()
+      this.scopedDataCallbacks.set(terminalId, callbacks)
+    }
+    callbacks.add(callback)
+
+    return () => {
+      const current = this.scopedDataCallbacks.get(terminalId)
+      if (!current) return
+      current.delete(callback)
+      if (current.size === 0) {
+        this.scopedDataCallbacks.delete(terminalId)
+      }
+    }
+  }
   onExit(callback: TerminalExitCallback): () => void {
     this.exitCallbacks.add(callback)
     return () => this.exitCallbacks.delete(callback)
@@ -462,6 +481,8 @@ export class WebTerminalClient {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
     this.rejectPending()
     this.socket?.close()
+    this.dataCallbacks.clear()
+    this.scopedDataCallbacks.clear()
   }
 
   private handleFrame(text: string): void {
@@ -486,6 +507,10 @@ export class WebTerminalClient {
       }
       const bytes = Uint8Array.from(frame.data)
       for (const callback of this.dataCallbacks) callback(frame.terminalId, bytes)
+      const scopedCallbacks = this.scopedDataCallbacks.get(frame.terminalId)
+      if (scopedCallbacks) {
+        for (const callback of scopedCallbacks) callback(bytes)
+      }
       return
     }
     if (frame.type === 'replay') {
@@ -771,6 +796,7 @@ export function createWebTerminalApi(): TerminalApi {
       return result
     },
     onData: (callback) => client.onData(callback),
+    onDataForTerminal: (terminalId, callback) => client.onDataForTerminal(terminalId, callback),
     onExit: (callback) => client.onExit(callback),
     onCwdChanged: (callback) => client.onCwd(callback),
     getCwd: (terminalId) => client.request('get_cwd', { terminalId }),

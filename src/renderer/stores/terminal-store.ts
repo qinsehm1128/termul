@@ -9,6 +9,7 @@ import {
 } from '@shared/types/web-terminal-protocol.types'
 import { create } from 'zustand'
 import { useShallow } from 'zustand/shallow'
+import { disposeCachedTerminal } from '@/components/terminal/terminal-cache'
 import { i18n } from '@/i18n'
 import { formatNumber } from '@/i18n/format'
 import { logFrontendError } from '@/lib/log-api'
@@ -184,6 +185,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
 
     const newIndex = new Map(ptyIdIndex)
     if (closedTerminal?.ptyId) {
+      disposeCachedTerminal(closedTerminal.ptyId)
       newIndex.delete(closedTerminal.ptyId)
     }
 

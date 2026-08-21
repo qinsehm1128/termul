@@ -3924,11 +3924,12 @@ pub async fn remote_server_status(
     Ok(IpcResult::success(remote_state.status()))
 }
 
-/// Push the desktop renderer's current project list into the in-memory
+/// Push the desktop renderer's current project + group list into the in-memory
 /// `ProjectRegistry` (Epic-4 bridge) and broadcast a `projects_changed` WS event
 /// so connected web clients refetch `GET /projects`. Called by the renderer
 /// on server-start success + on every project-store mutation while the server
-/// runs. No env-var values cross the wire — `ProjectSummary` redacts-by-omission.
+/// runs. Group state is navigation-only; no env-var values cross the wire —
+/// `ProjectSummary` redacts-by-omission.
 ///
 /// In desktop-hosted mode the desktop's `activeProjectId` IS the host default
 /// (the desktop user is the host operator), so it is pushed as `defaultProjectId`.
@@ -3939,6 +3940,8 @@ pub async fn remote_server_status(
 pub struct SyncProjectsPayload {
     pub projects: Vec<crate::web::ProjectSummary>,
     #[serde(default)]
+    pub groups: Vec<crate::web::ProjectGroupSummary>,
+    #[serde(default)]
     pub default_project_id: Option<String>,
 }
 
@@ -3948,8 +3951,20 @@ pub async fn remote_sync_projects(
     project_registry: State<'_, Arc<crate::web::ProjectRegistry>>,
     ws_relay: State<'_, Arc<crate::web::WsRelaySink>>,
 ) -> Result<IpcResult<()>, String> {
-    project_registry.set(payload.projects, payload.default_project_id.clone());
+    let project_count = payload.projects.len();
+    let group_count = payload.groups.len();
+    project_registry.set_with_groups(
+        payload.projects,
+        payload.groups,
+        payload.default_project_id.clone(),
+    );
     crate::web::broadcast_projects_changed(ws_relay.inner(), payload.default_project_id.as_deref());
+    log::info!(
+        target: "termul::remote_sync_projects",
+        "operation=remote_sync_projects stable_code=OK projects={} groups={}",
+        project_count,
+        group_count
+    );
     Ok(IpcResult::success(()))
 }
 
@@ -6963,6 +6978,60 @@ mod tests {
         assert!(!body.contains("Path validation failed for '{}'"));
         assert!(!body.contains("Path validated: {} -> {}"));
         let _ = validate_project_path("/definitely-missing-termul-path-xyz");
+    }
+}
+
+#[cfg(test)]
+mod remote_sync_projects_tests {
+    use super::SyncProjectsPayload;
+
+    #[test]
+    fn sync_payload_defaults_groups_for_older_desktop_clients() {
+        let payload: SyncProjectsPayload = serde_json::from_value(serde_json::json!({
+            "projects": [{
+                "id": "p-1",
+                "name": "Project",
+                "color": "blue",
+                "path": "/tmp/project",
+                "isArchived": false,
+                "isDefault": true
+            }],
+            "defaultProjectId": "p-1"
+        }))
+        .expect("deserialize legacy sync payload");
+
+        assert!(payload.groups.is_empty());
+        assert_eq!(payload.default_project_id.as_deref(), Some("p-1"));
+    }
+
+    #[test]
+    fn sync_payload_deserializes_project_groups() {
+        let payload: SyncProjectsPayload = serde_json::from_value(serde_json::json!({
+            "projects": [{
+                "id": "p-1",
+                "name": "Project",
+                "color": "blue",
+                "path": "/tmp/project",
+                "isArchived": false,
+                "isDefault": true
+            }],
+            "groups": [{
+                "id": "g-1",
+                "name": "Favorites",
+                "projectIds": ["p-1"],
+                "color": "purple",
+                "preferredProjectId": "p-1"
+            }],
+            "defaultProjectId": "p-1"
+        }))
+        .expect("deserialize group-aware sync payload");
+
+        assert_eq!(payload.groups.len(), 1);
+        assert_eq!(payload.groups[0].project_ids, ["p-1"]);
+        assert_eq!(
+            payload.groups[0].preferred_project_id.as_deref(),
+            Some("p-1")
+        );
     }
 }
 

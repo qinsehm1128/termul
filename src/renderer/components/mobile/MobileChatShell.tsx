@@ -89,6 +89,11 @@ export function MobileChatShell({
   const navigate = useNavigate()
   const activeProject = useActiveProject()
   const projects = useProjectStore((state) => state.projects)
+  const activeGroupName = useProjectStore((state) =>
+    state.activeGroupId
+      ? (state.groups.find((group) => group.id === state.activeGroupId)?.name ?? null)
+      : null
+  )
 
   // Active tab — return the stable Tab object reference held in the store
   // tree. Stable references compare with Object.is, so no `useShallow` is
@@ -174,9 +179,10 @@ export function MobileChatShell({
   const headerTitle = useMemo(() => {
     if (activeTerminal?.name) return activeTerminal.name
     if (sessionTitle) return sessionTitle
+    if (activeGroupName) return activeGroupName
     if (activeProject?.name) return activeProject.name
     return 'Termul'
-  }, [activeTerminal?.name, sessionTitle, activeProject?.name])
+  }, [activeTerminal?.name, sessionTitle, activeGroupName, activeProject?.name])
 
   const closeDrawer = (): void => setDrawerOpen(false)
 

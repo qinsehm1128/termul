@@ -83,6 +83,7 @@ interface ProjectSidebarProps {
   projects: Project[]
   activeProjectId: string
   onSelectProject: (id: string) => void
+  onSelectGroup?: (id: string) => void
   onNewProject: () => void
   onUpdateProject: (id: string, updates: Partial<Project>) => void
   onDeleteProject: (id: string) => void
@@ -98,6 +99,7 @@ export function ProjectSidebar({
   projects,
   activeProjectId,
   onSelectProject,
+  onSelectGroup,
   onNewProject,
   onUpdateProject,
   onDeleteProject,
@@ -112,6 +114,7 @@ export function ProjectSidebar({
   const navigate = useNavigate()
   const {
     selectProject,
+    selectGroup,
     addProject,
     addGroup,
     removeGroup,
@@ -123,7 +126,9 @@ export function ProjectSidebar({
     updateGroup
   } = useProjectActions()
   const storeGroups = useProjectStore((state) => state.groups)
+  const activeGroupId = useProjectStore((state) => state.activeGroupId)
   const groups = useMemo(() => storeGroups ?? [], [storeGroups])
+  const handleSelectGroup = onSelectGroup ?? selectGroup
 
   // Reconcile stored worktrees against actual git state (detects orphaned entries)
   useWorktreeReconciler(activeProjectId)
@@ -879,6 +884,7 @@ export function ProjectSidebar({
                 {visibleGroups.map((groupEntry) => {
                   const { group, projects: gpProjects } = groupEntry
                   const isCollapsed = group.isCollapsed
+                  const isActiveGroup = activeGroupId === group.id
                   return (
                     <Reorder.Item
                       key={group.id}
@@ -892,72 +898,113 @@ export function ProjectSidebar({
                         <ContextMenu>
                           <ContextMenuTrigger asChild>
                             <div
-                              onClick={() => toggleGroupCollapse(group.id)}
                               onContextMenu={handleGroupContextMenu}
-                              role="button"
-                              tabIndex={0}
-                              onKeyDown={(e) => {
-                                if (e.key === 'Enter' || e.key === ' ') {
-                                  e.preventDefault()
-                                  toggleGroupCollapse(group.id)
-                                }
-                              }}
+                              role="group"
+                              aria-label={group.name}
                               className={cn(
-                                'w-full flex items-center h-7 px-1.5 hover:bg-sidebar-accent/50 rounded transition-colors text-left cursor-pointer select-none',
+                                'w-full flex items-center h-7 px-1.5 hover:bg-sidebar-accent/50 rounded transition-colors text-left select-none',
+                                isActiveGroup &&
+                                  'bg-sidebar-accent ring-1 ring-inset ring-primary/30',
                                 activeDragOverGroupId === group.id &&
                                   'bg-primary/20 border border-primary/50'
                               )}
                               data-group-id={group.id}
+                              data-testid={`project-group-${group.id}`}
                             >
-                              <span className="h-5 w-5 inline-flex items-center justify-center flex-shrink-0 mr-0.5">
+                              <button
+                                type="button"
+                                onClick={(event) => {
+                                  event.stopPropagation()
+                                  toggleGroupCollapse(group.id)
+                                }}
+                                className="h-5 w-5 inline-flex items-center justify-center flex-shrink-0 mr-0.5 rounded focus:outline-none focus-visible:ring-1 focus-visible:ring-primary"
+                                aria-expanded={!isCollapsed}
+                                aria-label={t(
+                                  isCollapsed ? 'expandGroupAria' : 'collapseGroupAria',
+                                  {
+                                    name: group.name,
+                                    defaultValue: `${isCollapsed ? 'Expand' : 'Collapse'} ${group.name}`
+                                  }
+                                )}
+                                data-testid={`project-group-chevron-${group.id}`}
+                              >
                                 {isCollapsed ? (
                                   <ChevronRight size={12} className="text-muted-foreground" />
                                 ) : (
                                   <ChevronDown size={12} className="text-muted-foreground" />
                                 )}
-                              </span>
-                              <span
-                                className={cn(
-                                  'mr-1.5 flex-shrink-0 inline-flex items-center',
-                                  group.color
-                                    ? getColorClasses(group.color).text
-                                    : 'text-primary/80'
-                                )}
-                              >
-                                {isCollapsed ? <Folder size={13} /> : <FolderOpen size={13} />}
-                              </span>
+                              </button>
                               {editingGroupId === group.id ? (
-                                <input
-                                  type="text"
-                                  value={editGroupName}
-                                  onChange={(e) => setEditGroupName(e.target.value)}
-                                  onKeyDown={(e) => {
-                                    if (e.key === 'Enter') {
+                                <div className="flex min-w-0 flex-1 items-center self-stretch">
+                                  <span
+                                    className={cn(
+                                      'mr-1.5 flex-shrink-0 inline-flex items-center',
+                                      group.color
+                                        ? getColorClasses(group.color).text
+                                        : 'text-primary/80'
+                                    )}
+                                  >
+                                    {isCollapsed ? <Folder size={13} /> : <FolderOpen size={13} />}
+                                  </span>
+                                  <input
+                                    type="text"
+                                    value={editGroupName}
+                                    onChange={(e) => setEditGroupName(e.target.value)}
+                                    onKeyDown={(e) => {
+                                      if (e.key === 'Enter') {
+                                        if (editGroupName.trim()) {
+                                          renameGroup(group.id, editGroupName.trim())
+                                        }
+                                        setEditingGroupId(null)
+                                      } else if (e.key === 'Escape') {
+                                        setEditingGroupId(null)
+                                      }
+                                      e.stopPropagation()
+                                    }}
+                                    onBlur={() => {
                                       if (editGroupName.trim()) {
                                         renameGroup(group.id, editGroupName.trim())
                                       }
                                       setEditingGroupId(null)
-                                    } else if (e.key === 'Escape') {
-                                      setEditingGroupId(null)
-                                    }
-                                  }}
-                                  onBlur={() => {
-                                    if (editGroupName.trim()) {
-                                      renameGroup(group.id, editGroupName.trim())
-                                    }
-                                    setEditingGroupId(null)
-                                  }}
-                                  className="flex-1 min-w-0 bg-sidebar-accent border border-border rounded px-1 py-0.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary mr-2"
-                                  onClick={(e) => e.stopPropagation()}
-                                />
+                                    }}
+                                    className="flex-1 min-w-0 bg-sidebar-accent border border-border rounded px-1 py-0.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary mr-2"
+                                    onClick={(e) => e.stopPropagation()}
+                                  />
+                                  <span className="text-xs text-muted-foreground/60 px-2 font-normal">
+                                    {gpProjects.length}
+                                  </span>
+                                </div>
                               ) : (
-                                <span className="text-sm font-medium text-sidebar-foreground truncate flex-1">
-                                  {group.name}
-                                </span>
+                                <button
+                                  type="button"
+                                  onClick={() => handleSelectGroup(group.id)}
+                                  className="flex min-w-0 flex-1 items-center self-stretch cursor-pointer"
+                                  aria-pressed={isActiveGroup}
+                                  aria-label={group.name}
+                                >
+                                  <span
+                                    className={cn(
+                                      'mr-1.5 flex-shrink-0 inline-flex items-center',
+                                      group.color
+                                        ? getColorClasses(group.color).text
+                                        : 'text-primary/80'
+                                    )}
+                                  >
+                                    {isCollapsed ? <Folder size={13} /> : <FolderOpen size={13} />}
+                                  </span>
+                                  <span
+                                    className={cn(
+                                      'text-sm font-medium truncate flex-1',
+                                      isActiveGroup ? 'text-foreground' : 'text-sidebar-foreground'
+                                    )}
+                                  >
+                                    {group.name}
+                                  </span>
+                                  <span className="text-xs text-muted-foreground/60 px-2 font-normal">
+                                    {gpProjects.length}
+                                  </span>
+                                </button>
                               )}
-                              <span className="text-xs text-muted-foreground/60 px-2 font-normal">
-                                {gpProjects.length}
-                              </span>
                             </div>
                           </ContextMenuTrigger>
                           {renderGroupContextMenu(group.id)}
@@ -1030,7 +1077,9 @@ export function ProjectSidebar({
                                 >
                                   <ProjectItem
                                     project={project}
-                                    isActive={project.id === activeProjectId}
+                                    isActive={
+                                      activeGroupId === null && project.id === activeProjectId
+                                    }
                                     isEditing={editingId === project.id}
                                     editName={editName}
                                     shortcut={
@@ -1120,7 +1169,7 @@ export function ProjectSidebar({
                       >
                         <ProjectItem
                           project={project}
-                          isActive={project.id === activeProjectId}
+                          isActive={activeGroupId === null && project.id === activeProjectId}
                           isEditing={editingId === project.id}
                           editName={editName}
                           shortcut={

@@ -138,15 +138,33 @@ function normalizePath(path: string): string {
   return path.replace(/\\/g, '/')
 }
 
-function filterExpandedDirsByRoot(expandedDirs: string[], rootPath?: string): string[] {
-  if (!rootPath) {
+function filterExpandedDirsByRoots(expandedDirs: string[], rootPaths: readonly string[]): string[] {
+  if (rootPaths.length === 0) {
     return []
   }
 
-  const normalizedRoot = normalizePath(rootPath)
+  const normalizedRoots = rootPaths.map(normalizePath)
   return expandedDirs
     .map((dir) => normalizePath(dir))
-    .filter((dir) => dir === normalizedRoot || dir.startsWith(`${normalizedRoot}/`))
+    .filter((dir) => normalizedRoots.some((root) => dir === root || dir.startsWith(`${root}/`)))
+}
+
+async function loadPersistedTerminalsForProjects(
+  projectIds: readonly string[]
+): Promise<PersistedTerminalLayout | null> {
+  const layouts = await Promise.all(
+    projectIds.map((projectId) => loadPersistedTerminals(projectId))
+  )
+  const available = layouts.filter((layout): layout is PersistedTerminalLayout => layout !== null)
+  if (available.length === 0) return null
+  return {
+    activeTerminalId: available.find((layout) => layout.activeTerminalId)?.activeTerminalId ?? null,
+    terminals: available.flatMap((layout) => layout.terminals),
+    updatedAt: available.reduce(
+      (latest, layout) => (layout.updatedAt > latest ? layout.updatedAt : latest),
+      available[0].updatedAt
+    )
+  }
 }
 
 // Serialize pane tree for persistence with both editor and terminal tabs
@@ -523,10 +541,29 @@ export function deserializePaneTree(persisted: PersistedPaneNodeInput): PaneNode
   }
 }
 
-export function useEditorPersistence(projectId: string): void {
+export interface EditorPersistenceScopeOptions {
+  /** Projects whose terminals belong to this pane layout. */
+  projectIds?: readonly string[]
+  /** Filesystem roots whose expanded-directory state may be restored. */
+  rootPaths?: readonly string[]
+  /** Host manifests remain project-only; group scopes disable this bridge. */
+  manifestProjectId?: string | null
+  /** Project id emitted to project-entry listeners after restoration. */
+  notificationProjectId?: string
+}
+
+export function useEditorPersistence(
+  projectId: string,
+  options: EditorPersistenceScopeOptions = {}
+): void {
   const isRestoringRef = useRef(false)
   const prevProjectIdRef = useRef('')
   const restoreRunIdRef = useRef(0)
+  const projectIdsKey = (options.projectIds ?? [projectId]).join('\u0000')
+  const rootPathsKey = (options.rootPaths ?? []).join('\u0000')
+  const manifestProjectId =
+    options.manifestProjectId === undefined ? projectId : options.manifestProjectId
+  const notificationProjectId = options.notificationProjectId ?? projectId
 
   // Restore state when project changes
   useEffect(() => {
@@ -545,12 +582,22 @@ export function useEditorPersistence(projectId: string): void {
     }
 
     async function restore(): Promise<void> {
+      const scopedProjectIds = projectIdsKey ? projectIdsKey.split('\u0000') : []
+      const scopedRootPaths =
+        rootPathsKey.length > 0
+          ? rootPathsKey.split('\u0000')
+          : scopedProjectIds.flatMap((id) => {
+              const path = useProjectStore
+                .getState()
+                .projects.find((project) => project.id === id)?.path
+              return path ? [path] : []
+            })
       isRestoringRef.current = true
       // Guard the manifest writer for the entire restore window so a half-built
       // tree (mid open-files loop, mid pane rebuild) is never persisted as the
       // new host manifest. The terminal-restore guard already covers PTY
       // reattachment; this mirrors it for the manifest's portable projection.
-      setManifestRestoreInProgress(projectId, true)
+      if (manifestProjectId) setManifestRestoreInProgress(manifestProjectId, true)
       try {
         // Persist old project state before clearing
         if (oldProjectId) {
@@ -572,7 +619,9 @@ export function useEditorPersistence(projectId: string): void {
           // No persisted renderer-local editor state. A host manifest may still
           // exist (cross-client: this client never opened the project before).
           // Consult the manifest; if absent, start fresh.
-          const manifestRestored = await loadWorkspaceManifest(projectId)
+          const manifestRestored = manifestProjectId
+            ? await loadWorkspaceManifest(manifestProjectId)
+            : false
           if (isStale()) {
             return
           }
@@ -587,11 +636,10 @@ export function useEditorPersistence(projectId: string): void {
         // Restore expanded dirs for this project root
         const explorerStore = useFileExplorerStore.getState()
 
-        const rootPath = useProjectStore
-          .getState()
-          .projects.find((project) => project.id === projectId)?.path
-
-        const filteredExpandedDirs = filterExpandedDirsByRoot(persisted.expandedDirs, rootPath)
+        const filteredExpandedDirs = filterExpandedDirsByRoots(
+          persisted.expandedDirs,
+          scopedRootPaths
+        )
         explorerStore.setExpandedDirs(new Set(filteredExpandedDirs))
 
         // Restore open files
@@ -649,7 +697,9 @@ export function useEditorPersistence(projectId: string): void {
         // restore (CAP-5 contract decision) — they survive only in the legacy
         // editorStateKey.paneLayout path. The manifestRestoreInProgress guard
         // set at the top of restore() covers this load + tree build.
-        const manifestRestored = await loadWorkspaceManifest(projectId)
+        const manifestRestored = manifestProjectId
+          ? await loadWorkspaceManifest(manifestProjectId)
+          : false
         if (isStale()) {
           return
         }
@@ -662,8 +712,12 @@ export function useEditorPersistence(projectId: string): void {
             const openFilePaths = new Set(useEditorStore.getState().openFiles.keys())
             const liveProjectTerminals = useTerminalStore
               .getState()
-              .terminals.filter((terminal) => terminal.projectId === projectId && !!terminal.ptyId)
-            const persistedTerminalLayout = await loadPersistedTerminals(projectId)
+              .terminals.filter(
+                (terminal) =>
+                  scopedProjectIds.includes(terminal.projectId ?? '') && !!terminal.ptyId
+              )
+            const persistedTerminalLayout =
+              await loadPersistedTerminalsForProjects(scopedProjectIds)
             if (isStale()) {
               return
             }
@@ -691,9 +745,9 @@ export function useEditorPersistence(projectId: string): void {
       } finally {
         if (restoreRunIdRef.current === restoreRunId) {
           isRestoringRef.current = false
-          setManifestRestoreInProgress(projectId, false)
+          if (manifestProjectId) setManifestRestoreInProgress(manifestProjectId, false)
           if (!cancelled && prevProjectIdRef.current === projectId) {
-            notifyProjectWorkspaceRestored(projectId)
+            notifyProjectWorkspaceRestored(notificationProjectId)
           }
         } else if (prevProjectIdRef.current !== projectId) {
           // Superseded by a run for a DIFFERENT project: that run owns its own
@@ -701,7 +755,7 @@ export function useEditorPersistence(projectId: string): void {
           // forever (blocking manifest writes for it until the user returns).
           // The same-project supersession is still owned by the newer run
           // (handled by the branch above when it completes).
-          setManifestRestoreInProgress(projectId, false)
+          if (manifestProjectId) setManifestRestoreInProgress(manifestProjectId, false)
         }
       }
     }
@@ -711,7 +765,7 @@ export function useEditorPersistence(projectId: string): void {
     return () => {
       cancelled = true
     }
-  }, [projectId])
+  }, [projectId, projectIdsKey, rootPathsKey, manifestProjectId, notificationProjectId])
 
   // Save state on changes (debounced) - coalesced across all store subscriptions
   useEffect(() => {
@@ -751,17 +805,22 @@ export function useEditorPersistence(projectId: string): void {
   }, [projectId])
 }
 
-/** Reload the project pane tree after leaving a Conversation workspace. */
-export async function restoreProjectWorkspace(projectId: string): Promise<boolean> {
-  if (!projectId) return false
-  const result = await persistenceApi.read<PersistedEditorState>(editorStateKey(projectId))
+async function restoreWorkspaceScope(
+  scopeKey: string,
+  projectIds: readonly string[],
+  manifestProjectId?: string
+): Promise<boolean> {
+  if (!scopeKey) return false
+  const result = await persistenceApi.read<PersistedEditorState>(editorStateKey(scopeKey))
   if (result.success && result.data?.paneLayout) {
     const restoredTree = stripAgentChatTabs(deserializePaneTree(result.data.paneLayout))
     const openFilePaths = new Set(useEditorStore.getState().openFiles.keys())
     const liveProjectTerminals = useTerminalStore
       .getState()
-      .terminals.filter((terminal) => terminal.projectId === projectId && !!terminal.ptyId)
-    const persistedTerminalLayout = await loadPersistedTerminals(projectId)
+      .terminals.filter(
+        (terminal) => projectIds.includes(terminal.projectId ?? '') && !!terminal.ptyId
+      )
+    const persistedTerminalLayout = await loadPersistedTerminalsForProjects(projectIds)
     const cleanTree = reconcileTerminalTabs(
       restoredTree,
       openFilePaths,
@@ -771,8 +830,20 @@ export async function restoreProjectWorkspace(projectId: string): Promise<boolea
     useWorkspaceStore.getState().loadProjectWorkspace(cleanTree, result.data.activePaneId)
     return getAllLeafPanes(cleanTree).some((leaf) => leaf.tabs.length > 0)
   }
-  const manifestRestored = await loadWorkspaceManifest(projectId)
-  return manifestRestored
+  return manifestProjectId ? loadWorkspaceManifest(manifestProjectId) : false
+}
+
+/** Reload the project pane tree after leaving a Conversation workspace. */
+export async function restoreProjectWorkspace(projectId: string): Promise<boolean> {
+  return restoreWorkspaceScope(projectId, [projectId], projectId)
+}
+
+/** Reload the local pane tree owned by a multi-root project group. */
+export async function restoreProjectGroupWorkspace(
+  groupId: string,
+  projectIds: readonly string[]
+): Promise<boolean> {
+  return restoreWorkspaceScope(`group-${groupId}`, projectIds)
 }
 
 export function persistState(projectId: string): void {

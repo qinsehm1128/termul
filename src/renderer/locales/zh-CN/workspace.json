@@ -4,6 +4,10 @@
   "projects": {
     "title": "项目"
   },
+  "multiRoot": {
+    "terminalTitle": "选择终端项目",
+    "terminalDescription": "点击项目即可立即从对应根目录创建终端。"
+  },
   "loading": "加载中...",
   "noProjectsTitle": "暂无项目",
   "noProjectsDescription": "创建第一个项目，以整理终端、快照和命令",

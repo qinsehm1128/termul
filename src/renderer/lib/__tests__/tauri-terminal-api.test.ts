@@ -325,6 +325,43 @@ describe('tauri-terminal-api', () => {
       off()
     })
 
+    it('routes binary channel output only to matching scoped subscribers', async () => {
+      const { api } = await loadApi()
+      mockInvoke.mockResolvedValue({
+        success: true,
+        data: {
+          id: 'terminal-1752-1',
+          shell: 'pwsh',
+          cwd: 'C:/dev/project',
+          pid: 4242,
+          cols: 120,
+          rows: 32,
+          latestSeq: 1,
+          gap: false
+        }
+      })
+      const global = vi.fn()
+      const matching = vi.fn()
+      const unrelated = vi.fn()
+      const offGlobal = api.onData(global)
+      const offMatching = api.onDataForTerminal?.('terminal-1752-1', matching)
+      const offUnrelated = api.onDataForTerminal?.('terminal-other', unrelated)
+
+      await api.attach('terminal-1752-1', 'lease-claim-64-hex', 0)
+      const channel = mockInvoke.mock.calls[0][1].onData as unknown as ChannelLike
+      channel.onmessage?.(new Uint8Array([104, 105]).buffer)
+
+      expect(global).toHaveBeenCalledTimes(1)
+      expect(global).toHaveBeenCalledWith('terminal-1752-1', expect.any(Uint8Array))
+      expect(matching).toHaveBeenCalledTimes(1)
+      expect(matching).toHaveBeenCalledWith(expect.any(Uint8Array))
+      expect(unrelated).not.toHaveBeenCalled()
+
+      offGlobal()
+      offMatching?.()
+      offUnrelated?.()
+    })
+
     it('never presents an id-only attach: empty claim fails without an invoke', async () => {
       const { api } = await loadApi()
 

@@ -283,6 +283,7 @@ export type AcpInstallIpcChannels = {
 // Terminal data callback — receives binary data as Uint8Array (via Tauri Channel)
 // Previously received string via event emitter; migrated to binary Channel API in ADR-002.2
 export type TerminalDataCallback = (terminalId: string, data: Uint8Array) => void
+export type TerminalScopedDataCallback = (data: Uint8Array) => void
 export type TerminalExitCallback = (terminalId: string, exitCode: number, signal?: number) => void
 export type TerminalCwdChangedCallback = (terminalId: string, cwd: string) => void
 export type TerminalGitBranchChangedCallback = (terminalId: string, branch: string | null) => void
@@ -402,6 +403,12 @@ export interface TerminalApi {
   /** @deprecated compatibility alias for terminate. */
   kill: (terminalId: string) => Promise<IpcResult<void>>
   onData: (callback: TerminalDataCallback) => () => void
+  /**
+   * Subscribe to one terminal without delivering unrelated PTY chunks to the
+   * renderer. Optional for third-party/test adapters; callers may fall back to
+   * `onData` filtering.
+   */
+  onDataForTerminal?: (terminalId: string, callback: TerminalScopedDataCallback) => () => void
   onExit: (callback: TerminalExitCallback) => () => void
   onCwdChanged: (callback: TerminalCwdChangedCallback) => () => void
   getCwd: (terminalId: string) => Promise<IpcResult<string | null>>
