@@ -5,9 +5,9 @@ import { afterAll, describe, expect, it } from 'vitest'
 /**
  * Terminal Performance Benchmark Suite
  *
- * These benchmarks establish a measurable baseline for xterm 5.5 heavy-output
- * performance. They are designed to be repeatable and comparable against future
- * xterm 6.1 migration validation.
+ * These benchmarks establish a measurable baseline for the pinned xterm 6.1
+ * beta heavy-output path. Run them in a real browser/WebView environment;
+ * JSDOM does not provide the canvas implementation xterm requires.
  *
  * Benchmark philosophy:
  * - Measure terminal.write() throughput under representative workloads
@@ -117,12 +117,12 @@ const hasCanvas =
   typeof HTMLCanvasElement.prototype.getContext === 'function' &&
   typeof OffscreenCanvas !== 'undefined'
 
-describe.skipIf(!hasCanvas)('Terminal performance baseline (xterm 5.5)', () => {
+describe.skipIf(!hasCanvas)('Terminal performance baseline (xterm 6.1 beta)', () => {
   const results: BenchmarkResult[] = []
 
   afterAll(() => {
     // Print summary table after all benchmarks run
-    console.log('\n=== Termul xterm 5.5 Baseline Benchmark Results ===\n')
+    console.log('\n=== Termul xterm 6.1 Beta Baseline Benchmark Results ===\n')
     console.log('| Benchmark | Lines | Chars | Duration (ms) | Lines/sec | Chars/sec |')
     console.log('|-----------|------:|------:|--------------:|----------:|----------:|')
     for (const r of results) {

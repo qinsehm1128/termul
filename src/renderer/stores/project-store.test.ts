@@ -22,7 +22,9 @@ describe('project-store', () => {
           gitBranch: 'develop'
         }
       ],
-      activeProjectId: '1'
+      groups: [],
+      activeProjectId: '1',
+      activeGroupId: null
     })
   })
 
@@ -61,6 +63,72 @@ describe('project-store', () => {
 
       expect(project1?.isActive).toBe(false)
       expect(project2?.isActive).toBe(true)
+    })
+
+    it('exits group scope and remembers the selected member as preferred', () => {
+      useProjectStore.setState({
+        groups: [
+          {
+            id: 'group-1',
+            name: 'Group',
+            projectIds: ['1', '2'],
+            preferredProjectId: '1'
+          }
+        ],
+        activeGroupId: 'group-1'
+      })
+
+      useProjectStore.getState().selectProject('2')
+
+      const state = useProjectStore.getState()
+      expect(state.activeProjectId).toBe('2')
+      expect(state.activeGroupId).toBeNull()
+      expect(state.groups[0].preferredProjectId).toBe('2')
+    })
+  })
+
+  describe('selectGroup', () => {
+    it('activates the group and selects its preferred non-archived project', () => {
+      useProjectStore.setState({
+        groups: [
+          {
+            id: 'group-1',
+            name: 'Group',
+            projectIds: ['1', '2'],
+            preferredProjectId: '2'
+          }
+        ]
+      })
+
+      useProjectStore.getState().selectGroup('group-1')
+
+      const state = useProjectStore.getState()
+      expect(state.activeGroupId).toBe('group-1')
+      expect(state.activeProjectId).toBe('2')
+      expect(state.projects.find((project) => project.id === '2')?.isActive).toBe(true)
+    })
+
+    it('repairs an archived preference to the first selectable member', () => {
+      useProjectStore.setState((state) => ({
+        projects: state.projects.map((project) =>
+          project.id === '1' ? { ...project, isArchived: true } : project
+        ),
+        groups: [
+          {
+            id: 'group-1',
+            name: 'Group',
+            projectIds: ['1', '2'],
+            preferredProjectId: '1'
+          }
+        ]
+      }))
+
+      useProjectStore.getState().selectGroup('group-1')
+
+      const state = useProjectStore.getState()
+      expect(state.activeGroupId).toBe('group-1')
+      expect(state.activeProjectId).toBe('2')
+      expect(state.groups[0].preferredProjectId).toBe('2')
     })
   })
 
@@ -215,6 +283,28 @@ describe('project-store', () => {
       const { activeProjectId } = useProjectStore.getState()
       expect(activeProjectId).toBe('1')
     })
+
+    it('restores a valid persisted group scope and repairs its preferred project', () => {
+      const projects = [
+        { id: '1', name: 'Archived', color: 'cyan' as const, isArchived: true },
+        { id: '2', name: 'Selectable', color: 'red' as const }
+      ]
+      const groups = [
+        {
+          id: 'group-1',
+          name: 'Group',
+          projectIds: ['1', '2'],
+          preferredProjectId: '1'
+        }
+      ]
+
+      useProjectStore.getState().setProjects(projects, '1', groups, 'group-1')
+
+      const state = useProjectStore.getState()
+      expect(state.activeGroupId).toBe('group-1')
+      expect(state.activeProjectId).toBe('2')
+      expect(state.groups[0].preferredProjectId).toBe('2')
+    })
   })
 
   describe('reorderProjects', () => {
@@ -323,6 +413,68 @@ describe('project-store', () => {
       // Project '1' is deleted, so project '2' should be the active one
       expect(projects.find((p) => p.id === '1')).toBeUndefined()
       expect(activeProjectId).toBe('2')
+    })
+
+    it('clears group scope when the active group is removed but projects are kept', () => {
+      useProjectStore.setState({
+        groups: [{ id: 'group1', name: 'My Group', projectIds: ['1'] }],
+        activeProjectId: '1',
+        activeGroupId: 'group1'
+      })
+
+      useProjectStore.getState().removeGroup('group1', false)
+
+      const state = useProjectStore.getState()
+      expect(state.activeGroupId).toBeNull()
+      expect(state.activeProjectId).toBe('1')
+    })
+  })
+
+  describe('group invariant repair', () => {
+    it('repairs the active and preferred member when the selected project is deleted', () => {
+      useProjectStore.setState({
+        groups: [
+          {
+            id: 'group1',
+            name: 'My Group',
+            projectIds: ['1', '2'],
+            preferredProjectId: '1'
+          }
+        ],
+        activeProjectId: '1',
+        activeGroupId: 'group1'
+      })
+
+      useProjectStore.getState().deleteProject('1')
+
+      const state = useProjectStore.getState()
+      expect(state.activeGroupId).toBe('group1')
+      expect(state.activeProjectId).toBe('2')
+      expect(state.groups[0].preferredProjectId).toBe('2')
+    })
+
+    it('repairs source and target preferences when moving the active member', () => {
+      useProjectStore.setState({
+        groups: [
+          {
+            id: 'source',
+            name: 'Source',
+            projectIds: ['1', '2'],
+            preferredProjectId: '2'
+          },
+          { id: 'target', name: 'Target', projectIds: [] }
+        ],
+        activeProjectId: '2',
+        activeGroupId: 'source'
+      })
+
+      useProjectStore.getState().moveProjectToGroup('2', 'target')
+
+      const state = useProjectStore.getState()
+      expect(state.activeGroupId).toBe('source')
+      expect(state.activeProjectId).toBe('1')
+      expect(state.groups.find((group) => group.id === 'source')?.preferredProjectId).toBe('1')
+      expect(state.groups.find((group) => group.id === 'target')?.preferredProjectId).toBe('2')
     })
   })
 })

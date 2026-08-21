@@ -19,10 +19,11 @@ use agent_client_protocol::schema::v1::{
 
 use crate::acp::config::AgentId;
 use crate::acp::events::{
-    self, ChunkRole, CommandsUpdateEvent, ConfigOptionsUpdateEvent, MessageChunkEvent,
-    ModeUpdateEvent, PlanUpdateEvent, SessionInfoUpdateEvent, ToolCallEvent, ToolCallUpdateEvent,
-    UsageCostEvent, UsageUpdateEvent,
+    self, ChunkRole, CommandsUpdateEvent, ConfigOptionsUpdateEvent, DeliveryError, DeliveryReceipt,
+    MessageChunkEvent, ModeUpdateEvent, PlanUpdateEvent, SessionInfoUpdateEvent, ToolCallEvent,
+    ToolCallUpdateEvent, UsageCostEvent, UsageUpdateEvent,
 };
+use crate::conversation::ConversationPersistenceAdapter;
 use crate::web::EventSink;
 
 /// Cursor ACP extension: when present on `clientCapabilities._meta`, Cursor
@@ -68,10 +69,7 @@ pub fn client_capabilities(allow_terminal: bool) -> ClientCapabilities {
 /// `None` the absolute path is resolved directly (no longer denied). `root`
 /// remains in the signature as the session `cwd` for future relative-path
 /// resolution; it is not used for containment.
-async fn scope_to_workspace(
-    requested: &Path,
-    _root: Option<&Path>,
-) -> Result<PathBuf, acp::Error> {
+async fn scope_to_workspace(requested: &Path, _root: Option<&Path>) -> Result<PathBuf, acp::Error> {
     if !requested.is_absolute() {
         return Err(acp::Error::invalid_params()
             .data(format!("path must be absolute: {}", requested.display())));
@@ -103,10 +101,8 @@ async fn scope_to_workspace(
             Err(_) => match ancestor.parent() {
                 Some(parent) if parent != ancestor => ancestor = parent,
                 _ => {
-                    return Err(acp::Error::invalid_params().data(format!(
-                        "path cannot be resolved: {}",
-                        requested.display()
-                    )));
+                    return Err(acp::Error::invalid_params()
+                        .data(format!("path cannot be resolved: {}", requested.display())));
                 }
             },
         }
@@ -189,11 +185,12 @@ pub async fn handle_write_text_file(
 /// payload struct is built first and then borrowed, so `session_id` moves into
 /// the struct once and the `sid` borrows from it — no extra clone, no borrow
 /// conflict (serialize-once-fan-out-N is preserved by [`events::fan_out`]).
-pub fn emit_session_update(
+pub async fn emit_session_update(
     sinks: &[Arc<dyn EventSink>],
+    persistence: Option<&ConversationPersistenceAdapter>,
     agent_id: &AgentId,
     notification: SessionNotification,
-) {
+) -> Result<DeliveryReceipt, DeliveryError> {
     let session_id = crate::acp::config::SessionId::from(notification.session_id);
 
     match notification.update {
@@ -204,32 +201,31 @@ pub fn emit_session_update(
                 role: ChunkRole::User,
                 content: chunk.content,
             };
-            events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_MESSAGE_CHUNK, &event);
+            return events::deliver(
+                sinks,
+                persistence,
+                Some(event.session_id.0.as_str()),
+                events::EVENT_MESSAGE_CHUNK,
+                &event,
+            )
+            .await;
         }
         SessionUpdate::AgentMessageChunk(chunk) => {
-            let preview = match &chunk.content {
-                agent_client_protocol::schema::v1::ContentBlock::Text(text) => {
-                    let t: &str = text.text.as_ref();
-                    if t.chars().count() > 40 {
-                        let truncated: String = t.chars().take(40).collect();
-                        format!("{truncated}…")
-                    } else {
-                        t.to_string()
-                    }
-                }
-                other => format!("{other:?}"),
-            };
-            log::debug!(
-                "[acp] agent {agent_id} session {} agent_message_chunk: {preview}",
-                session_id.0
-            );
+            // Message/transcript content is never written to operational logs.
             let event = MessageChunkEvent {
                 agent_id: agent_id.clone(),
                 session_id,
                 role: ChunkRole::Agent,
                 content: chunk.content,
             };
-            events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_MESSAGE_CHUNK, &event);
+            return events::deliver(
+                sinks,
+                persistence,
+                Some(event.session_id.0.as_str()),
+                events::EVENT_MESSAGE_CHUNK,
+                &event,
+            )
+            .await;
         }
         SessionUpdate::AgentThoughtChunk(chunk) => {
             let event = MessageChunkEvent {
@@ -238,7 +234,14 @@ pub fn emit_session_update(
                 role: ChunkRole::Thought,
                 content: chunk.content,
             };
-            events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_MESSAGE_CHUNK, &event);
+            return events::deliver(
+                sinks,
+                persistence,
+                Some(event.session_id.0.as_str()),
+                events::EVENT_MESSAGE_CHUNK,
+                &event,
+            )
+            .await;
         }
         SessionUpdate::ToolCall(tool_call) => {
             let event = ToolCallEvent {
@@ -246,7 +249,14 @@ pub fn emit_session_update(
                 session_id,
                 tool_call,
             };
-            events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_TOOL_CALL, &event);
+            return events::deliver(
+                sinks,
+                persistence,
+                Some(event.session_id.0.as_str()),
+                events::EVENT_TOOL_CALL,
+                &event,
+            )
+            .await;
         }
         SessionUpdate::ToolCallUpdate(update) => {
             let event = ToolCallUpdateEvent {
@@ -254,7 +264,14 @@ pub fn emit_session_update(
                 session_id,
                 update,
             };
-            events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_TOOL_CALL_UPDATE, &event);
+            return events::deliver(
+                sinks,
+                persistence,
+                Some(event.session_id.0.as_str()),
+                events::EVENT_TOOL_CALL_UPDATE,
+                &event,
+            )
+            .await;
         }
         SessionUpdate::Plan(plan) => {
             // ACP agent-plan: each update is a full replace; forward verbatim.
@@ -264,7 +281,14 @@ pub fn emit_session_update(
                 session_id,
                 plan,
             };
-            events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_PLAN_UPDATE, &event);
+            return events::deliver(
+                sinks,
+                persistence,
+                Some(event.session_id.0.as_str()),
+                events::EVENT_PLAN_UPDATE,
+                &event,
+            )
+            .await;
         }
         SessionUpdate::AvailableCommandsUpdate(update) => {
             let event = CommandsUpdateEvent {
@@ -272,7 +296,14 @@ pub fn emit_session_update(
                 session_id,
                 available_commands: update.available_commands,
             };
-            events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_COMMANDS_UPDATE, &event);
+            return events::deliver(
+                sinks,
+                persistence,
+                Some(event.session_id.0.as_str()),
+                events::EVENT_COMMANDS_UPDATE,
+                &event,
+            )
+            .await;
         }
         SessionUpdate::CurrentModeUpdate(update) => {
             let event = ModeUpdateEvent {
@@ -281,7 +312,14 @@ pub fn emit_session_update(
                 current_mode_id: update.current_mode_id,
                 available_modes: Vec::new(),
             };
-            events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_MODE_UPDATE, &event);
+            return events::deliver(
+                sinks,
+                persistence,
+                Some(event.session_id.0.as_str()),
+                events::EVENT_MODE_UPDATE,
+                &event,
+            )
+            .await;
         }
         SessionUpdate::ConfigOptionUpdate(update) => {
             let event = ConfigOptionsUpdateEvent {
@@ -289,7 +327,14 @@ pub fn emit_session_update(
                 session_id,
                 config_options: update.config_options,
             };
-            events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_CONFIG_OPTIONS_UPDATE, &event);
+            return events::deliver(
+                sinks,
+                persistence,
+                Some(event.session_id.0.as_str()),
+                events::EVENT_CONFIG_OPTIONS_UPDATE,
+                &event,
+            )
+            .await;
         }
         SessionUpdate::SessionInfoUpdate(update) => {
             // `title` is `MaybeUndefined<String>`: Undefined = not sent (skip),
@@ -302,7 +347,14 @@ pub fn emit_session_update(
                         session_id,
                         title: None,
                     };
-                    events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_SESSION_INFO_UPDATE, &event);
+                    return events::deliver(
+                        sinks,
+                        persistence,
+                        Some(event.session_id.0.as_str()),
+                        events::EVENT_SESSION_INFO_UPDATE,
+                        &event,
+                    )
+                    .await;
                 }
                 Some(Some(t)) => {
                     let event = SessionInfoUpdateEvent {
@@ -310,7 +362,14 @@ pub fn emit_session_update(
                         session_id,
                         title: Some(t.clone()),
                     };
-                    events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_SESSION_INFO_UPDATE, &event);
+                    return events::deliver(
+                        sinks,
+                        persistence,
+                        Some(event.session_id.0.as_str()),
+                        events::EVENT_SESSION_INFO_UPDATE,
+                        &event,
+                    )
+                    .await;
                 }
             }
         }
@@ -326,17 +385,24 @@ pub fn emit_session_update(
                 size: update.size,
                 cost,
             };
-            events::fan_out(sinks, Some(event.session_id.0.as_str()), events::EVENT_USAGE_UPDATE, &event);
+            return events::deliver(
+                sinks,
+                persistence,
+                Some(event.session_id.0.as_str()),
+                events::EVENT_USAGE_UPDATE,
+                &event,
+            )
+            .await;
         }
         // Any future (non_exhaustive) variants have no dedicated event;
         // ignore them — but log so a silently-dropped update can be diagnosed
         // instead of vanishing.
-        ref other => {
-            log::debug!(
-                "[acp] agent {agent_id} sent an unhandled session/update variant: {other:?}"
-            );
+        _ => {
+            log::debug!("[acp] agent {agent_id} sent an unhandled session/update variant");
         }
     }
+
+    Ok(DeliveryReceipt::empty(sinks.len()))
 }
 
 #[cfg(test)]
@@ -495,14 +561,18 @@ mod tests {
         std::fs::write(&path, "a\r\nb\r\nc\r\n").unwrap();
 
         // Take all three lines starting at line 1: must be byte-identical.
-        let req = ReadTextFileRequest::new("sess", &path).line(1u32).limit(3u32);
+        let req = ReadTextFileRequest::new("sess", &path)
+            .line(1u32)
+            .limit(3u32);
         let resp = handle_read_text_file(&req, Some(workspace.as_path()))
             .await
             .unwrap();
         assert_eq!(resp.content, "a\r\nb\r\nc\r\n");
 
         // Take the middle line: keep its CRLF terminator.
-        let req = ReadTextFileRequest::new("sess", &path).line(2u32).limit(1u32);
+        let req = ReadTextFileRequest::new("sess", &path)
+            .line(2u32)
+            .limit(1u32);
         let resp = handle_read_text_file(&req, Some(workspace.as_path()))
             .await
             .unwrap();

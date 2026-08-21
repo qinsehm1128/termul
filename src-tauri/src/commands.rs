@@ -3,8 +3,11 @@ use crate::migrations::{
     MigrationInfo, MigrationManager, MigrationRecord, MigrationResult, SchemaVersion,
 };
 use crate::path_validation;
-use crate::pty::claims::RotatedClaim;
-use crate::pty::manager::{SpawnedTerminal, TerminalAttachResult};
+use crate::pty::claims::{ClaimError, RotatedClaim};
+use crate::pty::manager::{
+    SpawnedTerminal, TerminalAttachResult, TerminalCleanupFailure, TerminalCleanupStage,
+    TerminalReplay, TerminalResumeGrant, TerminalResumeRequest, TerminalSpawnIntentV1,
+};
 use crate::pty::{PtyManager, SpawnOptions};
 use crate::remote;
 use crate::trackers::{
@@ -50,9 +53,9 @@ fn validate_project_path(path: &str) -> Result<PathBuf, String> {
     let path_buf = PathBuf::from(path);
 
     // Canonicalize to resolve symlinks and relative paths
-    let canonical = path_buf.canonicalize().map_err(|e| {
-        log::warn!("[Security] Path validation failed for '{}': {}", path, e);
-        format!("Invalid or inaccessible path: {}", e)
+    let canonical = path_buf.canonicalize().map_err(|_| {
+        log::warn!("[Security] operation=validate_project_path stable_code=PATH_VALIDATION_FAILED");
+        "Invalid or inaccessible path".to_string()
     })?;
 
     // On Windows, `canonicalize()` returns a verbatim (`\\?\…`) path. That prefix
@@ -62,13 +65,28 @@ fn validate_project_path(path: &str) -> Result<PathBuf, String> {
     let canonical_str = canonical.to_string_lossy();
     let simplified = path_validation::strip_verbatim_prefix(&canonical_str).into_owned();
 
-    log::debug!("[Security] Path validated: {} -> {}", path, simplified);
+    log::debug!("[Security] operation=validate_project_path stable_code=OK");
     Ok(PathBuf::from(simplified))
 }
 
 /// Macro to validate a path and convert it to a String, returning early with an IpcResult error if validation fails.
+pub(crate) fn require_host_admission<T>() -> Result<(), IpcResult<T>> {
+    crate::host_admission::HostAdmission::global()
+        .check()
+        .map_err(|code| IpcResult::error("host is shutting down", code))
+}
+
 macro_rules! validate_and_stringify {
-    ($path:expr) => {
+    ($path:expr) => {{
+        if crate::host_admission::HostAdmission::global()
+            .check()
+            .is_err()
+        {
+            return Ok(IpcResult::error(
+                "host is shutting down",
+                crate::host_admission::HOST_SHUTTING_DOWN,
+            ));
+        }
         match validate_project_path($path) {
             Ok(validated) => match validated.to_str() {
                 Some(s) => s.to_string(),
@@ -81,7 +99,7 @@ macro_rules! validate_and_stringify {
             },
             Err(e) => return Ok(IpcResult::error(e, "PATH_VALIDATION_FAILED")),
         }
-    };
+    }};
 }
 
 /// IPC Result pattern
@@ -114,6 +132,90 @@ impl<T> IpcResult<T> {
             error: Some(error.into()),
             code: Some(code.into()),
         }
+    }
+}
+
+/// Safe terminal cleanup/compound detail shared by Tauri and terminal WebSocket responses.
+/// The outer `IpcResult.code` distinguishes ordinary termination from compound rollback; this
+/// payload carries only the stable primary code, exact cleanup stage, and recoverable identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TerminalResourceFailureV1 {
+    pub terminal_id: String,
+    pub primary_code: String,
+    pub cleanup_stage: TerminalCleanupStage,
+}
+
+impl TerminalResourceFailureV1 {
+    fn from_cleanup(primary_code: impl Into<String>, failure: TerminalCleanupFailure) -> Self {
+        Self {
+            terminal_id: failure.terminal_id,
+            primary_code: primary_code.into(),
+            cleanup_stage: failure.stage,
+        }
+    }
+
+    fn wire_detail(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| {
+            format!(
+                "{{\"terminalId\":\"redacted\",\"primaryCode\":\"{}\",\"cleanupStage\":\"{}\"}}",
+                self.primary_code,
+                self.cleanup_stage.as_str()
+            )
+        })
+    }
+}
+
+/// Durably schedule Conversation migration maintenance for the next process bootstrap. This
+/// command never acquires live mutation authority, opens stores, or touches PTYs/routes.
+#[tauri::command]
+pub fn conversation_migration_control(
+    request: crate::conversation::MigrationMaintenanceRequestV1,
+    control: State<'_, Arc<crate::conversation::ConversationMigrationControlService>>,
+) -> Result<IpcResult<crate::conversation::MigrationMaintenanceScheduleReceiptV1>, String> {
+    Ok(conversation_migration_control_inner(
+        control.inner().as_ref(),
+        request,
+    ))
+}
+
+fn conversation_migration_control_inner(
+    control: &crate::conversation::ConversationMigrationControlService,
+    request: crate::conversation::MigrationMaintenanceRequestV1,
+) -> IpcResult<crate::conversation::MigrationMaintenanceScheduleReceiptV1> {
+    match control.request(request) {
+        Ok(receipt) => IpcResult::success(receipt),
+        Err(error) => IpcResult::error(error.detail, error.code.as_str()),
+    }
+}
+
+#[cfg(test)]
+mod conversation_migration_control_tests {
+    use chrono::Utc;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::conversation::{
+        ConversationMigrationControlService, MigrationMaintenanceAction,
+        MigrationMaintenanceRequestV1,
+    };
+
+    #[test]
+    fn conversation_migration_control_schedules_restart_without_live_resources() {
+        let temp = tempfile::tempdir().unwrap();
+        let control = ConversationMigrationControlService::new(temp.path()).unwrap();
+        let request = MigrationMaintenanceRequestV1 {
+            action: MigrationMaintenanceAction::Rollback,
+            request_id: Uuid::new_v4().to_string(),
+            requested_at_utc: Utc::now(),
+            approval_receipt: None,
+        };
+        let result = conversation_migration_control_inner(&control, request.clone());
+        assert!(result.success);
+        let receipt = result.data.unwrap();
+        assert!(receipt.restart_required);
+        assert_eq!(receipt.code, "MIGRATION_RESTART_REQUIRED");
+        assert_eq!(control.pending().unwrap(), Some(request));
     }
 }
 
@@ -232,17 +334,150 @@ pub fn read_attachment_bytes(path: String) -> Result<Response, String> {
 ///
 /// CAP-3: the response carries the terminal info PLUS the issued `claim`
 /// credential (flattened camelCase, same shape as the web `spawn` reply).
-/// This is the only issuance path.
+/// This is the initial issuance path; authenticated resume and explicit
+/// rotation can later replace the claim.
 #[tauri::command]
 pub async fn terminal_spawn(
     options: SpawnOptions,
     on_data: Channel<Response>,
     pty_manager: State<'_, Arc<PtyManager>>,
+    workspace: State<'_, Arc<crate::conversation::SessionWorkspaceService>>,
 ) -> Result<IpcResult<SpawnedTerminal>, String> {
-    match pty_manager.spawn(options, Some(on_data)).await {
-        Ok(spawned) => Ok(IpcResult::success(spawned)),
-        Err(e) => Ok(IpcResult::error(e, "SPAWN_FAILED")),
+    Ok(terminal_spawn_resource(
+        options,
+        Some(on_data),
+        pty_manager.inner(),
+        workspace.inner(),
+    )
+    .await)
+}
+
+pub(crate) async fn terminal_spawn_resource(
+    options: SpawnOptions,
+    on_data: Option<Channel<Response>>,
+    pty_manager: &Arc<PtyManager>,
+    workspace: &Arc<crate::conversation::SessionWorkspaceService>,
+) -> IpcResult<SpawnedTerminal> {
+    terminal_spawn_resource_impl(options, on_data, pty_manager, workspace).await
+}
+
+/// Remote-only spawn path. The wire payload is already narrowed to
+/// [`TerminalSpawnIntentV1`]; `PtyManager` derives every executable, shell,
+/// environment, and cwd value from the host-owned Conversation record.
+pub(crate) async fn terminal_spawn_intent_resource(
+    intent: TerminalSpawnIntentV1,
+    conversation: &crate::conversation::ConversationRecordV2,
+    pty_manager: &Arc<PtyManager>,
+    workspace: &Arc<crate::conversation::SessionWorkspaceService>,
+) -> IpcResult<SpawnedTerminal> {
+    let conversation_id = intent.conversation_id;
+    if let Err(error) = workspace.ensure_terminal_ref_writable(conversation_id, true) {
+        log::warn!(
+            "[terminal-command] remote spawn admission rejected conversation_id={} code={}",
+            conversation_id,
+            error.code.as_str()
+        );
+        return IpcResult::error(error.detail, error.code.as_str());
     }
+
+    let spawned = match pty_manager
+        .spawn_for_conversation(intent, conversation, None)
+        .await
+    {
+        Ok(spawned) => spawned,
+        Err(error) if error.ends_with("scope is unauthorized") => {
+            return IpcResult::error("Unauthorized", "UNAUTHORIZED")
+        }
+        Err(error) => return IpcResult::error(error, "SPAWN_FAILED"),
+    };
+    commit_terminal_spawn_resource(spawned, conversation_id, pty_manager, workspace).await
+}
+
+async fn terminal_spawn_resource_impl(
+    options: SpawnOptions,
+    on_data: Option<Channel<Response>>,
+    pty_manager: &Arc<PtyManager>,
+    workspace: &Arc<crate::conversation::SessionWorkspaceService>,
+) -> IpcResult<SpawnedTerminal> {
+    if let Err(error) = require_host_admission() {
+        return error;
+    }
+    let is_ephemeral_ssh = options.kind.as_deref() == Some("ssh");
+    // Scope-less durable terminals (regular project workspace) spawn without a
+    // SessionWorkspace resource; conversation-scoped terminals keep admission.
+    let conversation_id = if is_ephemeral_ssh {
+        None
+    } else {
+        match options.conversation_id {
+            Some(conversation_id) => {
+                if let Err(error) = workspace.ensure_terminal_ref_writable(conversation_id, true) {
+                    log::warn!(
+                        "[terminal-command] durable spawn admission rejected conversation_id={} code={}",
+                        conversation_id,
+                        error.code.as_str()
+                    );
+                    return IpcResult::error(error.detail, error.code.as_str());
+                }
+                Some(conversation_id)
+            }
+            None => None,
+        }
+    };
+
+    let spawned = match pty_manager.spawn(options, on_data).await {
+        Ok(spawned) => spawned,
+        Err(error) => return IpcResult::error(error, "SPAWN_FAILED"),
+    };
+    let Some(conversation_id) = conversation_id else {
+        return IpcResult::success(spawned);
+    };
+    commit_terminal_spawn_resource(spawned, conversation_id, pty_manager, workspace).await
+}
+
+async fn commit_terminal_spawn_resource(
+    spawned: SpawnedTerminal,
+    conversation_id: crate::conversation::ConversationId,
+    pty_manager: &Arc<PtyManager>,
+    workspace: &Arc<crate::conversation::SessionWorkspaceService>,
+) -> IpcResult<SpawnedTerminal> {
+    if let Err(primary) = workspace
+        .add_terminal_ref(conversation_id, &spawned.info.id)
+        .await
+    {
+        let primary_code = primary.code.as_str();
+        match pty_manager.terminate(&spawned.info.id).await {
+            Ok(_) => {
+                log::warn!(
+                    "[terminal-command] spawn ref failed and PTY rollback completed terminal_id={} primary_code={} cleanup_stage=complete stable_result={}",
+                    spawned.info.id,
+                    primary_code,
+                    primary_code
+                );
+                return IpcResult::error(primary.detail, primary_code);
+            }
+            Err(cleanup) => {
+                let failure = TerminalResourceFailureV1::from_cleanup(primary_code, cleanup);
+                log::error!(
+                    "[terminal-command] compound spawn rollback failed terminal_id={} primary_code={} cleanup_stage={} stable_result={}",
+                    failure.terminal_id,
+                    failure.primary_code,
+                    failure.cleanup_stage,
+                    crate::conversation::TERMINAL_RESOURCE_ROLLBACK_FAILED
+                );
+                return IpcResult::error(
+                    failure.wire_detail(),
+                    crate::conversation::TERMINAL_RESOURCE_ROLLBACK_FAILED,
+                );
+            }
+        }
+    }
+
+    log::info!(
+        "[terminal-command] spawn resource committed conversation_id={} terminal_id={} code=OK",
+        conversation_id,
+        spawned.info.id
+    );
+    IpcResult::success(spawned)
 }
 
 /// Milliseconds between claim-generation checks in a desktop attach forwarder.
@@ -316,6 +551,93 @@ mod forwarder_teardown_tests {
     }
 }
 
+/// Validate the passive SessionWorkspace reference and rotate a one-time claim
+/// for a matching live PTY. Every missing, unknown, corrupt, or mismatched case
+/// collapses to the same data-free [`ClaimError`].
+pub(crate) async fn terminal_resume_resource(
+    request: &TerminalResumeRequest,
+    pty_manager: &Arc<PtyManager>,
+    workspace: &Arc<crate::conversation::SessionWorkspaceService>,
+) -> Result<(TerminalResumeGrant, TerminalReplay), ClaimError> {
+    let has_passive_ref = match workspace.load(request.conversation_id).await {
+        Ok(crate::conversation::SessionWorkspaceLoadOutcome::Loaded { workspace }) => {
+            workspace.resources.iter().any(|resource| {
+                matches!(
+                    resource,
+                    crate::conversation::SessionWorkspaceResourceDescriptor::Terminal {
+                        terminal_id,
+                        conversation_id,
+                        ..
+                    } if terminal_id == &request.terminal_id
+                        && *conversation_id == request.conversation_id
+                )
+            })
+        }
+        Ok(
+            crate::conversation::SessionWorkspaceLoadOutcome::Missing { .. }
+            | crate::conversation::SessionWorkspaceLoadOutcome::RecoveryRequired { .. },
+        )
+        | Err(_) => false,
+    };
+    if !has_passive_ref {
+        log::warn!(
+            "[terminal-resume] denied conversation_id={} terminal_id={} code=UNAUTHORIZED",
+            request.conversation_id,
+            request.terminal_id
+        );
+        return Err(ClaimError);
+    }
+
+    pty_manager.resume_for_conversation(
+        request.conversation_id,
+        &request.terminal_id,
+        request.last_seq,
+    )
+}
+
+/// Resume a passive terminal reference after a cold desktop renderer start.
+/// The local Tauri invoke boundary is trusted, but the exact Conversation and
+/// terminal scope is still validated before the old claim generation rotates.
+#[tauri::command]
+pub async fn terminal_resume(
+    request: TerminalResumeRequest,
+    on_data: Channel<Response>,
+    pty_manager: State<'_, Arc<PtyManager>>,
+    workspace: State<'_, Arc<crate::conversation::SessionWorkspaceService>>,
+) -> Result<IpcResult<TerminalResumeGrant>, String> {
+    let (grant, replay) =
+        match terminal_resume_resource(&request, pty_manager.inner(), workspace.inner()).await {
+            Ok(value) => value,
+            Err(_) => return Ok(IpcResult::error("Unauthorized", "UNAUTHORIZED")),
+        };
+
+    // Rotation invalidates any predecessor forwarder. Abort the local tracked
+    // handle immediately rather than waiting for its generation-check tick.
+    if let Some((_, forwarder)) = lock_forwarders().remove(&request.terminal_id) {
+        forwarder.abort();
+    }
+    for chunk in &replay.chunks {
+        if on_data.send(Response::new(chunk.data.clone())).is_err() {
+            log::warn!(
+                "[terminal-resume] replay channel closed conversation_id={} terminal_id={} latest_seq={} gap={}",
+                request.conversation_id,
+                request.terminal_id,
+                grant.terminal.latest_seq,
+                grant.terminal.gap
+            );
+            break;
+        }
+    }
+    log::info!(
+        "[terminal-resume] desktop grant delivered conversation_id={} terminal_id={} latest_seq={} gap={}",
+        request.conversation_id,
+        request.terminal_id,
+        grant.terminal.latest_seq,
+        grant.terminal.gap
+    );
+    Ok(IpcResult::success(grant))
+}
+
 /// Attach to a terminal's output stream with a claim credential (CAP-3).
 ///
 /// Verification is the gate: `terminalId` + valid `claim` + `lastSeq`. Any
@@ -337,6 +659,9 @@ pub async fn terminal_attach(
     on_data: Channel<Response>,
     pty_manager: State<'_, Arc<PtyManager>>,
 ) -> Result<IpcResult<TerminalAttachResult>, String> {
+    if let Err(error) = require_host_admission() {
+        return Ok(error);
+    }
     // Capture the generation BEFORE verifying (TOCTOU-safe ordering): if a
     // rotate/revoke lands between capture and verify, verify fails (the
     // credential was invalidated) and we reject; if it lands after verify, the
@@ -430,6 +755,7 @@ pub async fn terminal_attach(
             }
         }
     });
+    crate::host_admission::HostAdmission::global().track_abort(handle.abort_handle());
 
     if !handle.is_finished() {
         let mut forwarders = lock_forwarders();
@@ -519,16 +845,159 @@ pub async fn terminal_resize(
     }
 }
 
-/// Kill a terminal
+/// Close one renderer view without touching the PTY, claim, or passive workspace ref.
+#[tauri::command]
+pub async fn terminal_close_view(terminal_id: String) -> Result<IpcResult<()>, String> {
+    if let Some((_, forwarder)) = lock_forwarders().remove(&terminal_id) {
+        forwarder.abort();
+    }
+    log::info!("[terminal-command] close-view terminal_id={terminal_id}");
+    Ok(IpcResult::success(()))
+}
+
+/// Explicitly terminate a terminal resource. This is the destructive path.
+#[tauri::command]
+pub async fn terminal_terminate(
+    terminal_id: String,
+    pty_manager: State<'_, Arc<PtyManager>>,
+    workspace: State<'_, Arc<crate::conversation::SessionWorkspaceService>>,
+) -> Result<IpcResult<()>, String> {
+    Ok(terminal_terminate_resource(&terminal_id, pty_manager.inner(), workspace.inner()).await)
+}
+
+pub(crate) async fn terminal_terminate_resource(
+    terminal_id: &str,
+    pty_manager: &Arc<PtyManager>,
+    workspace: &Arc<crate::conversation::SessionWorkspaceService>,
+) -> IpcResult<()> {
+    let mut scope = pty_manager
+        .get(terminal_id)
+        .filter(|instance| instance.workspace_ref_tracked)
+        .map(|instance| instance.conversation_id);
+    if pty_manager.get(terminal_id).is_none() {
+        return IpcResult::success(());
+    }
+    if let Some(conversation_id) = scope {
+        match terminate_workspace_scope(workspace, conversation_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                log::info!(
+                    "[terminal-command] terminate skips missing workspace conversation_id={} terminal_id={}",
+                    conversation_id,
+                    terminal_id
+                );
+                scope = None;
+            }
+            Err(error) => {
+                log::warn!(
+                    "[terminal-command] terminate admission rejected conversation_id={} terminal_id={} code={}",
+                    conversation_id,
+                    terminal_id,
+                    error.code.as_str()
+                );
+                return IpcResult::error(error.detail, error.code.as_str());
+            }
+        }
+    }
+
+    if let Err(cleanup) = pty_manager.terminate(terminal_id).await {
+        let failure = TerminalResourceFailureV1::from_cleanup(
+            crate::conversation::TERMINAL_TERMINATE_FAILED,
+            cleanup,
+        );
+        log::warn!(
+            "[terminal-command] terminate cleanup failed terminal_id={} primary_code={} cleanup_stage={} stable_result={}",
+            failure.terminal_id,
+            failure.primary_code,
+            failure.cleanup_stage,
+            crate::conversation::TERMINAL_TERMINATE_FAILED
+        );
+        return IpcResult::error(
+            failure.wire_detail(),
+            crate::conversation::TERMINAL_TERMINATE_FAILED,
+        );
+    }
+    if let Some((_, forwarder)) = lock_forwarders().remove(terminal_id) {
+        forwarder.abort();
+    }
+    if let Some(conversation_id) = scope {
+        if let Err(error) = workspace
+            .remove_terminal_ref_after_termination(conversation_id, terminal_id)
+            .await
+        {
+            if is_missing_conversation_workspace_error(&error) {
+                log::info!(
+                    "[terminal-command] terminate ignores missing workspace after kill conversation_id={} terminal_id={}",
+                    conversation_id,
+                    terminal_id
+                );
+            } else {
+                log::warn!(
+                    "[terminal-command] terminate ref cleanup failed conversation_id={} terminal_id={} code={}",
+                    conversation_id,
+                    terminal_id,
+                    error.code.as_str()
+                );
+                return IpcResult::error(error.detail, error.code.as_str());
+            }
+        }
+    }
+    log::info!("[terminal-command] terminated terminal_id={terminal_id}");
+    IpcResult::success(())
+}
+
+fn is_missing_conversation_workspace_error(
+    error: &crate::conversation::SessionWorkspaceError,
+) -> bool {
+    use crate::conversation::SessionWorkspaceErrorCode;
+    if error.code == SessionWorkspaceErrorCode::ConversationNotFound {
+        return true;
+    }
+    if error.code != SessionWorkspaceErrorCode::SessionWorkspaceRecoveryRequired {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(&error.detail)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("primaryCode")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .is_some_and(|code| code == "CONVERSATION_NOT_FOUND")
+}
+
+/// Returns `Ok(true)` when the Conversation still owns a workspace ref,
+/// `Ok(false)` when it was never persisted (scope-less project terminals).
+async fn terminate_workspace_scope(
+    workspace: &Arc<crate::conversation::SessionWorkspaceService>,
+    conversation_id: crate::conversation::ConversationId,
+) -> Result<bool, crate::conversation::SessionWorkspaceError> {
+    match workspace.load(conversation_id).await {
+        Ok(crate::conversation::SessionWorkspaceLoadOutcome::Missing { .. }) => Ok(false),
+        Ok(_) => workspace
+            .ensure_terminal_ref_writable(conversation_id, false)
+            .map(|()| true)
+            .or_else(|error| {
+                if is_missing_conversation_workspace_error(&error) {
+                    Ok(false)
+                } else {
+                    Err(error)
+                }
+            }),
+        Err(error) if is_missing_conversation_workspace_error(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+/// Deprecated compatibility alias; identical to `terminal_terminate`.
 #[tauri::command]
 pub async fn terminal_kill(
     terminal_id: String,
     pty_manager: State<'_, Arc<PtyManager>>,
+    workspace: State<'_, Arc<crate::conversation::SessionWorkspaceService>>,
 ) -> Result<IpcResult<()>, String> {
-    match pty_manager.kill(&terminal_id).await {
-        Ok(()) => Ok(IpcResult::success(())),
-        Err(e) => Ok(IpcResult::error(e, "KILL_FAILED")),
-    }
+    terminal_terminate(terminal_id, pty_manager, workspace).await
 }
 
 /// Get the current working directory for a terminal
@@ -1835,8 +2304,8 @@ fn reap_rg_child_after_stdout(
     child: &mut Child,
     stdout_stopped_early: bool,
 ) -> Option<std::process::ExitStatus> {
-    if stdout_stopped_early {
-        let _ = child.kill();
+    if stdout_stopped_early && child.kill().is_err() {
+        log::warn!("[search-process] cleanup_stage=kill stable_result=FAILED");
     }
     child.wait().ok()
 }
@@ -2234,8 +2703,12 @@ pub async fn search_content_cancel(
     let mut guard = search_processes().lock().map_err(|e| e.to_string())?;
     if let Some(child_handle) = guard.remove(&request.search_id) {
         if let Ok(mut child) = child_handle.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
+            if child.kill().is_err() {
+                log::warn!("[search-process] kind=content cleanup_stage=kill stable_result=FAILED");
+            }
+            if child.wait().is_err() {
+                log::warn!("[search-process] kind=content cleanup_stage=wait stable_result=FAILED");
+            }
         }
     }
     Ok(IpcResult::success(()))
@@ -2356,7 +2829,16 @@ pub async fn search_file_names_stream(
     let stdout = match child.stdout.take() {
         Some(s) => s,
         None => {
-            let _ = child.kill().ok();
+            if child.kill().is_err() {
+                log::warn!(
+                    "[search-process] kind=file_name cleanup_stage=kill stable_result=FAILED"
+                );
+            }
+            if child.wait().is_err() {
+                log::warn!(
+                    "[search-process] kind=file_name cleanup_stage=wait stable_result=FAILED"
+                );
+            }
             let _ = app_handle.emit(
                 "search-file-names-done",
                 SearchFileNamesDoneEvent {
@@ -2571,8 +3053,16 @@ pub async fn search_file_names_cancel(
         .map_err(|e| e.to_string())?;
     if let Some(child_handle) = guard.remove(&request.search_id) {
         if let Ok(mut child) = child_handle.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
+            if child.kill().is_err() {
+                log::warn!(
+                    "[search-process] kind=file_name cleanup_stage=kill stable_result=FAILED"
+                );
+            }
+            if child.wait().is_err() {
+                log::warn!(
+                    "[search-process] kind=file_name cleanup_stage=wait stable_result=FAILED"
+                );
+            }
         }
     }
     Ok(IpcResult::success(()))
@@ -3224,11 +3714,11 @@ pub async fn ssh_create_askpass(password: String) -> Result<IpcResult<String>, S
     // ensuring secrets don't persist on disk if the helper is never invoked.
     let cleanup_script = script_path.clone();
     let cleanup_password = password_path.clone();
-    tokio::spawn(async move {
+    crate::host_admission::HostAdmission::global().track(tokio::spawn(async move {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         let _ = std::fs::remove_file(&cleanup_password);
         let _ = std::fs::remove_file(&cleanup_script);
-    });
+    }));
 
     // Path includes the OS temp dir (often the username); keep it out of the
     // user-attachable info log (issue #244 AC#6). Full path stays at debug.
@@ -3316,6 +3806,7 @@ pub async fn remote_server_start(
     pty_manager: State<'_, Arc<PtyManager>>,
     ws_relay: State<'_, Arc<crate::web::WsRelaySink>>,
     remote_state: State<'_, Arc<remote::RemoteServerState>>,
+    conversation: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
     project_registry: State<'_, Arc<crate::web::ProjectRegistry>>,
     workspace_manifest_store: State<'_, HostWorkspaceManifestStore>,
     acp_catalog_store: State<'_, HostAcpCatalogStore>,
@@ -3365,6 +3856,7 @@ pub async fn remote_server_start(
                 ws_relay.inner().clone(),
                 project_registry.inner().clone(),
                 bind_mode,
+                Some(conversation.inner().clone()),
                 workspace_manifest,
                 acp_catalog,
                 acp_install,
@@ -3379,6 +3871,7 @@ pub async fn remote_server_start(
                 ws_relay.inner().clone(),
                 project_registry.inner().clone(),
                 bind_mode,
+                Some(conversation.inner().clone()),
                 workspace_manifest,
                 acp_catalog,
                 acp_install,
@@ -3451,11 +3944,12 @@ pub async fn remote_server_status(
     Ok(IpcResult::success(remote_state.status()))
 }
 
-/// Push the desktop renderer's current project list into the in-memory
+/// Push the desktop renderer's current project + group list into the in-memory
 /// `ProjectRegistry` (Epic-4 bridge) and broadcast a `projects_changed` WS event
 /// so connected web clients refetch `GET /projects`. Called by the renderer
 /// on server-start success + on every project-store mutation while the server
-/// runs. No env-var values cross the wire — `ProjectSummary` redacts-by-omission.
+/// runs. Group state is navigation-only; no env-var values cross the wire —
+/// `ProjectSummary` redacts-by-omission.
 ///
 /// In desktop-hosted mode the desktop's `activeProjectId` IS the host default
 /// (the desktop user is the host operator), so it is pushed as `defaultProjectId`.
@@ -3466,6 +3960,8 @@ pub async fn remote_server_status(
 pub struct SyncProjectsPayload {
     pub projects: Vec<crate::web::ProjectSummary>,
     #[serde(default)]
+    pub groups: Vec<crate::web::ProjectGroupSummary>,
+    #[serde(default)]
     pub default_project_id: Option<String>,
 }
 
@@ -3475,8 +3971,20 @@ pub async fn remote_sync_projects(
     project_registry: State<'_, Arc<crate::web::ProjectRegistry>>,
     ws_relay: State<'_, Arc<crate::web::WsRelaySink>>,
 ) -> Result<IpcResult<()>, String> {
-    project_registry.set(payload.projects, payload.default_project_id.clone());
+    let project_count = payload.projects.len();
+    let group_count = payload.groups.len();
+    project_registry.set_with_groups(
+        payload.projects,
+        payload.groups,
+        payload.default_project_id.clone(),
+    );
     crate::web::broadcast_projects_changed(ws_relay.inner(), payload.default_project_id.as_deref());
+    log::info!(
+        target: "termul::remote_sync_projects",
+        "operation=remote_sync_projects stable_code=OK projects={} groups={}",
+        project_count,
+        group_count
+    );
     Ok(IpcResult::success(()))
 }
 
@@ -3724,7 +4232,22 @@ pub(crate) async fn sync_mcp_registry_to_project_file(
 /// open `SessionPersistence` at startup (degraded live-only mode); commands
 /// must treat absence as empty history, never crash.
 #[derive(Default)]
-pub struct HostHistoryStore(pub Option<Arc<crate::acp::SessionPersistence>>);
+pub struct HostHistoryStore {
+    pub conversation: Option<Arc<crate::conversation::ConversationPersistenceAdapter>>,
+    pub legacy_read_only: Option<Arc<crate::acp::SessionPersistence>>,
+}
+
+impl HostHistoryStore {
+    pub fn conversation(
+        adapter: Arc<crate::conversation::ConversationPersistenceAdapter>,
+        legacy_read_only: Option<Arc<crate::acp::SessionPersistence>>,
+    ) -> Self {
+        Self {
+            conversation: Some(adapter),
+            legacy_read_only,
+        }
+    }
+}
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -3760,6 +4283,11 @@ fn host_entry_to_desktop(
         discovered: entry.discovered,
         worktree_path: entry.worktree_path,
         worktree_branch: entry.worktree_branch,
+        conversation_id: crate::conversation::ConversationId::parse_path_component(
+            &entry.storage_key,
+        )
+        .ok()
+        .map(|id| id.to_string()),
     }
 }
 
@@ -3772,13 +4300,28 @@ pub async fn acp_history_list(
     // The legacy flag still gates the renderer's one-time KV wipe migration;
     // the session list itself is host-owned now.
     let legacy_import_complete = store.list().1;
-    let sessions = match &host.0 {
-        Some(persistence) => persistence
+    let sessions = if let Some(persistence) = &host.conversation {
+        persistence
+            .list_sessions()
+            .into_iter()
+            .map(|entry| {
+                let mut desktop = host_entry_to_desktop(entry);
+                if desktop.conversation_id.is_none() {
+                    desktop.conversation_id = persistence
+                        .conversation_id_for_history_binding(&desktop.id)
+                        .map(|id| id.to_string());
+                }
+                desktop
+            })
+            .collect()
+    } else if let Some(persistence) = &host.legacy_read_only {
+        persistence
             .list_sessions()
             .into_iter()
             .map(host_entry_to_desktop)
-            .collect(),
-        None => Vec::new(),
+            .collect()
+    } else {
+        Vec::new()
     };
     log::info!("[acp-history] list success sessions={}", sessions.len());
     Ok(IpcResult::success(DesktopChatHistoryList {
@@ -3787,39 +4330,208 @@ pub async fn acp_history_list(
     }))
 }
 
+const ACP_HISTORY_COMPAT_ENCODED_BYTE_CEILING: usize = 4_194_304;
+
+fn charge_acp_history_encoded_bytes(
+    current: usize,
+    record: &impl serde::Serialize,
+) -> Result<usize, &'static str> {
+    let added = crate::conversation::contracts::encoded_json_len_bounded(
+        record,
+        crate::conversation::MAX_CONVERSATION_RECORD_BYTES,
+    )
+    .ok_or("CONVERSATION_RECORD_TOO_LARGE")?;
+    let total = current.saturating_add(added);
+    if total > ACP_HISTORY_COMPAT_ENCODED_BYTE_CEILING {
+        Err(crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED)
+    } else {
+        Ok(total)
+    }
+}
+
+fn materialize_acp_history_with_ceiling(
+    persistence: &crate::conversation::ConversationPersistenceAdapter,
+    session_id: &str,
+) -> Result<
+    (
+        crate::acp::session_persistence::SessionMetadata,
+        Vec<crate::acp::session_persistence::PersistedEventRecord>,
+    ),
+    crate::conversation::ConversationPersistenceError,
+> {
+    let (_conversation_id, metadata, target_last_seq) =
+        persistence.history_metadata(session_id, "acp_history_get")?;
+    let mut cursor = 0u64;
+    let mut records = Vec::new();
+    let mut encoded_bytes = 0usize;
+    while cursor < target_last_seq {
+        let remaining =
+            crate::conversation::MAX_COMPAT_HISTORY_RECORDS.saturating_sub(records.len());
+        let limit = remaining.saturating_add(1).clamp(
+            crate::conversation::MIN_CONVERSATION_HISTORY_PAGE_LIMIT,
+            crate::conversation::MAX_CONVERSATION_HISTORY_PAGE_LIMIT,
+        );
+        let page = persistence.history_page_at(session_id, cursor, limit, Some(target_last_seq))?;
+        if page.records.len() > remaining {
+            return Err(crate::conversation::ConversationPersistenceError {
+                code: crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED,
+                operation: "acp_history_get",
+                detail:
+                    "history exceeds the compatibility materialization limit; use bounded pages"
+                        .to_string(),
+            });
+        }
+        for record in &page.records {
+            encoded_bytes =
+                charge_acp_history_encoded_bytes(encoded_bytes, record).map_err(|code| {
+                    crate::conversation::ConversationPersistenceError {
+                        code,
+                        operation: "acp_history_get",
+                        detail: "history exceeds the 4194304-byte compatibility ceiling"
+                            .to_string(),
+                    }
+                })?;
+        }
+        records.extend(page.records.into_iter().map(|record| {
+            crate::acp::session_persistence::PersistedEventRecord {
+                schema_version: record.schema_version,
+                session_id: record.session_id,
+                seq: record.seq,
+                type_: record.type_,
+                recorded_at: record.recorded_at,
+                payload: record.payload,
+            }
+        }));
+        if page.next_cursor <= cursor && !page.complete {
+            return Err(crate::conversation::ConversationPersistenceError {
+                code: "CONVERSATION_READ_FAILED",
+                operation: "acp_history_get",
+                detail: "history page cursor did not advance".to_string(),
+            });
+        }
+        cursor = page.next_cursor;
+        if page.complete {
+            break;
+        }
+    }
+    Ok((metadata, records))
+}
+
+fn acp_history_get_inner(
+    session_id: &str,
+    host: &HostHistoryStore,
+) -> IpcResult<Option<serde_json::Value>> {
+    let Some(persistence) = &host.conversation else {
+        return IpcResult::success(None);
+    };
+    match materialize_acp_history_with_ceiling(persistence, session_id) {
+        Ok((metadata, records)) => {
+            let payload =
+                crate::acp::session_payload::materialize_session_payload(&metadata, &records);
+            match serde_json::to_value(&payload) {
+                Ok(value) => IpcResult::success(Some(value)),
+                Err(_) => IpcResult::error(
+                    "failed to encode Conversation history",
+                    "CONVERSATION_READ_FAILED",
+                ),
+            }
+        }
+        Err(error) if error.code == "CONVERSATION_NOT_FOUND" => IpcResult::success(None),
+        Err(error) => {
+            if error.code == crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED {
+                log::warn!(
+                    "[acp-history] compatibility paging required code={} encoded_ceiling={}",
+                    error.code,
+                    ACP_HISTORY_COMPAT_ENCODED_BYTE_CEILING
+                );
+            }
+            IpcResult::error("failed to read Conversation history", error.code)
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn acp_history_get(
     session_id: String,
     host: State<'_, HostHistoryStore>,
 ) -> Result<IpcResult<Option<serde_json::Value>>, String> {
-    let log_session_id = sanitize_log_field(&session_id);
-    log::info!("[acp-history] get start session_id={}", log_session_id);
-    let Some(persistence) = host.0.as_ref().map(Arc::clone) else {
-        log::info!("[acp-history] get not_found session_id={}", log_session_id);
-        return Ok(IpcResult::success(None));
+    log::info!(
+        "[acp-history] get start session_id={}",
+        sanitize_log_field(&session_id)
+    );
+    let persistence = host.inner().conversation.clone();
+    let legacy_read_only = host.inner().legacy_read_only.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        acp_history_get_inner(
+            &session_id,
+            &HostHistoryStore {
+                conversation: persistence,
+                legacy_read_only,
+            },
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?;
+    Ok(result)
+}
+
+async fn acp_history_get_page_inner(
+    session_id: &str,
+    after_seq: u64,
+    limit: usize,
+    target_last_seq: Option<u64>,
+    host: &HostHistoryStore,
+) -> IpcResult<crate::conversation::ConversationHistoryPageV1> {
+    let Some(persistence) = &host.conversation else {
+        return IpcResult::error(
+            "Conversation history service is unavailable",
+            "CONVERSATION_SERVICE_UNAVAILABLE",
+        );
     };
-    match persistence.session_payload_async(&session_id).await {
-        Ok(payload) => {
-            log::info!("[acp-history] get success session_id={}", log_session_id);
-            let value = serde_json::to_value(&payload).map_err(|error| error.to_string())?;
-            Ok(IpcResult::success(Some(value)))
-        }
-        Err(crate::acp::SessionPersistenceError::SessionNotFound) => {
-            log::info!("[acp-history] get not_found session_id={}", log_session_id);
-            Ok(IpcResult::success(None))
+    match persistence
+        .history_page_blocking(session_id.to_string(), after_seq, limit, target_last_seq)
+        .await
+    {
+        Ok(page) => {
+            log::info!(
+                "[acp-history] page success session_id={} after_seq={} next_cursor={} target_last_seq={} limit={} count={} complete={}",
+                sanitize_log_field(session_id),
+                after_seq,
+                page.next_cursor,
+                page.target_last_seq,
+                limit,
+                page.records.len(),
+                page.complete
+            );
+            IpcResult::success(page)
         }
         Err(error) => {
-            log::error!(
-                "[acp-history] get failure session_id={} error={}",
-                log_session_id,
-                error
+            log::warn!(
+                "[acp-history] page rejected session_id={} after_seq={} target_last_seq={} limit={} code={}",
+                sanitize_log_field(session_id),
+                after_seq,
+                target_last_seq.unwrap_or(0),
+                limit,
+                error.code
             );
-            Ok(IpcResult::error(
-                error.to_string(),
-                "ACP_HISTORY_GET_FAILED",
-            ))
+            IpcResult::error("failed to read Conversation history page", error.code)
         }
     }
+}
+
+/// Exact Desktop bounded-history command consumed by `acpHistoryApi.getPage`.
+#[tauri::command]
+pub async fn acp_history_get_page(
+    session_id: String,
+    after_seq: u64,
+    limit: usize,
+    target_last_seq: Option<u64>,
+    host: State<'_, HostHistoryStore>,
+) -> Result<IpcResult<crate::conversation::ConversationHistoryPageV1>, String> {
+    Ok(
+        acp_history_get_page_inner(&session_id, after_seq, limit, target_last_seq, host.inner())
+            .await,
+    )
 }
 
 /// Legacy write path (renderer wipe-migration only). Live sessions are authored
@@ -3835,34 +4547,12 @@ pub async fn acp_history_save(
     host: State<'_, HostHistoryStore>,
     ws_relay: State<'_, Arc<crate::web::WsRelaySink>>,
 ) -> Result<IpcResult<()>, String> {
-    let log_session_id = sanitize_log_field(&session_id);
-    log::info!("[acp-history] save start session_id={}", log_session_id);
-    let task_store = store.inner().clone();
-    let task_id = session_id.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || task_store.save(&task_id, payload))
-        .await
-        .map_err(|error| error.to_string())?;
-    match result {
-        Ok(()) => {
-            if let Some(persistence) = &host.0 {
-                crate::acp::import_chat_history(persistence, store.inner()).await;
-            }
-            crate::web::broadcast_chat_history_changed(ws_relay.inner());
-            log::info!("[acp-history] save success session_id={}", log_session_id);
-            Ok(IpcResult::success(()))
-        }
-        Err(error) => {
-            log::error!(
-                "[acp-history] save failure session_id={} error={}",
-                log_session_id,
-                error
-            );
-            Ok(IpcResult::error(
-                error.to_string(),
-                "ACP_HISTORY_SAVE_FAILED",
-            ))
-        }
-    }
+    let _ = (session_id, payload, store, host, ws_relay);
+    log::warn!("[acp-history] legacy mutation rejected code=LEGACY_STORE_READ_ONLY");
+    Ok(IpcResult::error(
+        "legacy chat history is read-only after Conversation bootstrap",
+        "LEGACY_STORE_READ_ONLY",
+    ))
 }
 
 #[tauri::command]
@@ -3871,54 +4561,21 @@ pub async fn acp_history_delete(
     host: State<'_, HostHistoryStore>,
     ws_relay: State<'_, Arc<crate::web::WsRelaySink>>,
 ) -> Result<IpcResult<()>, String> {
-    let log_session_id = sanitize_log_field(&session_id);
-    log::info!("[acp-history] delete start session_id={}", log_session_id);
-    match &host.0 {
-        Some(persistence) => match persistence.delete_session(&session_id).await {
-            Ok(()) => {
-                crate::web::broadcast_chat_history_changed(ws_relay.inner());
-                log::info!("[acp-history] delete success session_id={}", log_session_id);
-                Ok(IpcResult::success(()))
-            }
-            Err(error) => {
-                log::error!(
-                    "[acp-history] delete failure session_id={} error={}",
-                    log_session_id,
-                    error
-                );
-                Ok(IpcResult::error(
-                    error.to_string(),
-                    "ACP_HISTORY_DELETE_FAILED",
-                ))
-            }
-        },
-        // Degraded live-only mode: there is no durable history to delete.
-        None => Ok(IpcResult::success(())),
-    }
+    let _ = (session_id, host, ws_relay);
+    log::warn!("[acp-history] legacy mutation rejected code=LEGACY_STORE_READ_ONLY");
+    Ok(IpcResult::error(
+        "legacy chat history is read-only after Conversation bootstrap",
+        "LEGACY_STORE_READ_ONLY",
+    ))
 }
 
 #[tauri::command]
 pub async fn acp_history_flush(
     store: State<'_, Arc<crate::acp::ChatHistoryStore>>,
 ) -> Result<IpcResult<()>, String> {
-    log::info!("[acp-history] flush start");
-    let task_store = store.inner().clone();
-    let result = tauri::async_runtime::spawn_blocking(move || task_store.flush())
-        .await
-        .map_err(|error| error.to_string())?;
-    match result {
-        Ok(()) => {
-            log::info!("[acp-history] flush success");
-            Ok(IpcResult::success(()))
-        }
-        Err(error) => {
-            log::error!("[acp-history] flush failure error={}", error);
-            Ok(IpcResult::error(
-                error.to_string(),
-                "ACP_HISTORY_FLUSH_FAILED",
-            ))
-        }
-    }
+    let _ = store;
+    log::info!("[acp-history] ConversationRepository appends are already durable");
+    Ok(IpcResult::success(()))
 }
 
 #[tauri::command]
@@ -3927,33 +4584,12 @@ pub async fn acp_history_mark_legacy_import_complete(
     host: State<'_, HostHistoryStore>,
     ws_relay: State<'_, Arc<crate::web::WsRelaySink>>,
 ) -> Result<IpcResult<()>, String> {
-    log::info!("[acp-history] legacy marker start");
-    let task_store = store.inner().clone();
-    let result =
-        tauri::async_runtime::spawn_blocking(move || task_store.mark_legacy_import_complete())
-            .await
-            .map_err(|error| error.to_string())?;
-    match result {
-        Ok(()) => {
-            // The wipe migration may just have written new legacy entries;
-            // converge the host store incrementally (idempotent).
-            if let Some(persistence) = &host.0 {
-                let imported = crate::acp::import_chat_history(persistence, store.inner()).await;
-                if imported > 0 {
-                    crate::web::broadcast_chat_history_changed(ws_relay.inner());
-                }
-            }
-            log::info!("[acp-history] legacy marker success");
-            Ok(IpcResult::success(()))
-        }
-        Err(error) => {
-            log::error!("[acp-history] legacy marker failure error={}", error);
-            Ok(IpcResult::error(
-                error.to_string(),
-                "ACP_HISTORY_MIGRATION_FAILED",
-            ))
-        }
-    }
+    let _ = (store, host, ws_relay);
+    log::warn!("[acp-history] legacy mutation rejected code=LEGACY_STORE_READ_ONLY");
+    Ok(IpcResult::error(
+        "legacy chat history is read-only after Conversation bootstrap",
+        "LEGACY_STORE_READ_ONLY",
+    ))
 }
 
 /// Legacy-store read used ONLY by the renderer's one-time KV wipe migration,
@@ -4445,7 +5081,599 @@ pub fn log_frontend_error(
 }
 
 // ============================================================================
-// Workspace Manifest Commands (CAP-5 / Story 5)
+// Conversation application commands (shared Tauri/HTTP/WS service)
+// ============================================================================
+
+fn conversation_application_failure<T>(
+    error: crate::conversation::ConversationApplicationError,
+) -> IpcResult<T> {
+    log::warn!(
+        "[conversation-command] operation={} conversation_id={} code={}",
+        error.operation,
+        error
+            .conversation_id
+            .map_or_else(|| "none".to_string(), |value| value.to_string()),
+        error.code
+    );
+    IpcResult::error(error.detail, error.code)
+}
+
+fn parse_conversation_id<T>(
+    value: &str,
+) -> Result<crate::conversation::ConversationId, IpcResult<T>> {
+    crate::conversation::ConversationId::parse_path_component(value)
+        .map_err(|error| IpcResult::error(error.to_string(), "CONVERSATION_INVALID_ID"))
+}
+
+pub(crate) fn conversation_host_status_inner(
+    service: &crate::conversation::ConversationApplicationService,
+) -> IpcResult<crate::conversation::ConversationHostStatus> {
+    match service.host_status() {
+        Ok(outcome) => IpcResult::success(outcome),
+        Err(error) => conversation_application_failure(error),
+    }
+}
+
+#[tauri::command]
+pub fn conversation_host_status(
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::ConversationHostStatus>, String> {
+    Ok(conversation_host_status_inner(service.inner()))
+}
+
+pub(crate) fn conversation_list_inner(
+    service: &crate::conversation::ConversationApplicationService,
+) -> IpcResult<Vec<crate::conversation::ConversationRecordV2>> {
+    IpcResult::success(service.list_conversations())
+}
+
+#[tauri::command]
+pub fn conversation_list(
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<Vec<crate::conversation::ConversationRecordV2>>, String> {
+    Ok(conversation_list_inner(service.inner()))
+}
+
+pub(crate) fn conversation_get_inner(
+    service: &crate::conversation::ConversationApplicationService,
+    conversation_id: &str,
+) -> IpcResult<crate::conversation::ConversationRecordV2> {
+    let conversation_id = match parse_conversation_id(conversation_id) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    match service.get_conversation(conversation_id) {
+        Ok(outcome) => IpcResult::success(outcome),
+        Err(error) => conversation_application_failure(error),
+    }
+}
+
+#[tauri::command]
+pub fn conversation_get(
+    conversation_id: String,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::ConversationRecordV2>, String> {
+    Ok(conversation_get_inner(service.inner(), &conversation_id))
+}
+
+#[tauri::command]
+pub async fn conversation_rename(
+    conversation_id: String,
+    title: String,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::ConversationRecordV2>, String> {
+    let conversation_id = match parse_conversation_id(&conversation_id) {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    Ok(
+        match service.rename_conversation(conversation_id, title).await {
+            Ok(record) => IpcResult::success(record),
+            Err(error) => IpcResult::error(error.detail, error.code),
+        },
+    )
+}
+
+pub(crate) async fn conversation_open_inner(
+    service: &crate::conversation::ConversationApplicationService,
+    conversation_id: &str,
+) -> IpcResult<crate::conversation::ConversationOpenOutcome> {
+    if let Err(error) = require_host_admission() {
+        return error;
+    }
+    let conversation_id = match parse_conversation_id(conversation_id) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    match service.open_conversation(conversation_id).await {
+        Ok(outcome) => IpcResult::success(outcome),
+        Err(error) => conversation_application_failure(error),
+    }
+}
+
+#[tauri::command]
+pub async fn conversation_open(
+    conversation_id: String,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::ConversationOpenOutcome>, String> {
+    Ok(conversation_open_inner(service.inner(), &conversation_id).await)
+}
+
+pub(crate) fn conversation_resolve_legacy_id_inner(
+    service: &crate::conversation::ConversationApplicationService,
+    request: serde_json::Value,
+) -> IpcResult<crate::conversation::LegacyConversationResolution> {
+    let request: crate::conversation::LegacyConversationKey = match serde_json::from_value(request)
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return IpcResult::error(
+                format!("payload validation failed: {error}"),
+                "VALIDATION_ERROR",
+            )
+        }
+    };
+    match service.resolve_legacy_conversation_id(request) {
+        Ok(outcome) => IpcResult::success(outcome),
+        Err(error) => conversation_application_failure(error),
+    }
+}
+
+#[tauri::command]
+pub fn conversation_resolve_legacy_id(
+    request: serde_json::Value,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::LegacyConversationResolution>, String> {
+    Ok(conversation_resolve_legacy_id_inner(
+        service.inner(),
+        request,
+    ))
+}
+
+#[tauri::command]
+pub async fn session_workspace_get(
+    conversation_id: String,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::SessionWorkspaceLoadOutcome>, String> {
+    let conversation_id = match parse_conversation_id(&conversation_id) {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    Ok(match service.get_workspace(conversation_id).await {
+        Ok(outcome) => IpcResult::success(outcome),
+        Err(error) => conversation_application_failure(error),
+    })
+}
+
+#[tauri::command]
+pub async fn session_workspace_write(
+    conversation_id: String,
+    based_revision: Option<u64>,
+    workspace: serde_json::Value,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::SessionWorkspaceWriteOutcome>, String> {
+    if let Err(error) = require_host_admission() {
+        return Ok(error);
+    }
+    let conversation_id = match parse_conversation_id(&conversation_id) {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    let workspace: crate::conversation::SessionWorkspaceV1 = match serde_json::from_value(workspace)
+    {
+        Ok(workspace) => workspace,
+        Err(error) => {
+            return Ok(IpcResult::error(
+                format!("payload validation failed: {error}"),
+                "VALIDATION_ERROR",
+            ))
+        }
+    };
+    Ok(
+        match service
+            .write_workspace(conversation_id, based_revision, workspace)
+            .await
+        {
+            Ok(outcome) => IpcResult::success(outcome),
+            Err(error) => conversation_application_failure(error),
+        },
+    )
+}
+
+pub(crate) async fn conversation_recovery_resolve_inner(
+    service: &crate::conversation::ConversationApplicationService,
+    request: serde_json::Value,
+) -> IpcResult<crate::conversation::migration::RecoveryActionResult> {
+    let request: crate::conversation::migration::ResolveRecoveryItemRequest =
+        match serde_json::from_value(request) {
+            Ok(request) => request,
+            Err(error) => {
+                return IpcResult::error(
+                    format!("payload validation failed: {error}"),
+                    "VALIDATION_ERROR",
+                )
+            }
+        };
+    match service.resolve_recovery_item(request).await {
+        Ok(outcome) => IpcResult::success(outcome),
+        Err(error) => conversation_application_failure(error),
+    }
+}
+
+#[tauri::command]
+pub async fn conversation_recovery_resolve(
+    app: AppHandle,
+    request: serde_json::Value,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::migration::RecoveryActionResult>, String> {
+    let outcome = conversation_recovery_resolve_inner(service.inner(), request).await;
+    if outcome.success {
+        let _ = app.emit("conversation:host-status", ());
+    }
+    Ok(outcome)
+}
+
+pub(crate) async fn conversation_attach_project_inner(
+    service: &crate::conversation::ConversationApplicationService,
+    conversation_id: &str,
+    expected_revision: u64,
+    attachment: serde_json::Value,
+) -> IpcResult<crate::conversation::ConversationAggregateMutationOutcome> {
+    if let Err(error) = require_host_admission() {
+        return error;
+    }
+    let conversation_id = match parse_conversation_id(conversation_id) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let attachment: crate::conversation::ProjectAttachment =
+        match serde_json::from_value(attachment) {
+            Ok(value) => value,
+            Err(error) => {
+                return IpcResult::error(
+                    format!("payload validation failed: {error}"),
+                    "VALIDATION_ERROR",
+                )
+            }
+        };
+    match service
+        .attach_project(conversation_id, expected_revision, attachment)
+        .await
+    {
+        Ok(outcome) => IpcResult::success(outcome),
+        Err(error) => conversation_application_failure(error),
+    }
+}
+
+#[tauri::command]
+pub async fn conversation_attach_project(
+    app: AppHandle,
+    conversation_id: String,
+    expected_revision: u64,
+    attachment: serde_json::Value,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::ConversationAggregateMutationOutcome>, String> {
+    let outcome = conversation_attach_project_inner(
+        service.inner(),
+        &conversation_id,
+        expected_revision,
+        attachment,
+    )
+    .await;
+    if outcome.success {
+        let _ = app.emit("conversation:aggregate", outcome.data.as_ref());
+    }
+    Ok(outcome)
+}
+
+pub(crate) async fn conversation_detach_project_inner(
+    service: &crate::conversation::ConversationApplicationService,
+    conversation_id: &str,
+    expected_revision: u64,
+) -> IpcResult<crate::conversation::ConversationAggregateMutationOutcome> {
+    if let Err(error) = require_host_admission() {
+        return error;
+    }
+    let conversation_id = match parse_conversation_id(conversation_id) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    match service
+        .detach_project(conversation_id, expected_revision)
+        .await
+    {
+        Ok(outcome) => IpcResult::success(outcome),
+        Err(error) => conversation_application_failure(error),
+    }
+}
+
+#[tauri::command]
+pub async fn conversation_detach_project(
+    app: AppHandle,
+    conversation_id: String,
+    expected_revision: u64,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::ConversationAggregateMutationOutcome>, String> {
+    let outcome =
+        conversation_detach_project_inner(service.inner(), &conversation_id, expected_revision)
+            .await;
+    if outcome.success {
+        let _ = app.emit("conversation:aggregate", outcome.data.as_ref());
+    }
+    Ok(outcome)
+}
+
+pub(crate) async fn conversation_update_execution_target_inner(
+    service: &crate::conversation::ConversationApplicationService,
+    conversation_id: &str,
+    expected_revision: u64,
+    execution_target: serde_json::Value,
+) -> IpcResult<crate::conversation::ConversationAggregateMutationOutcome> {
+    if let Err(error) = require_host_admission() {
+        return error;
+    }
+    let conversation_id = match parse_conversation_id(conversation_id) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let execution_target: crate::conversation::ExecutionTarget =
+        match serde_json::from_value(execution_target) {
+            Ok(value) => value,
+            Err(error) => {
+                return IpcResult::error(
+                    format!("payload validation failed: {error}"),
+                    "VALIDATION_ERROR",
+                )
+            }
+        };
+    match service
+        .update_execution_target(conversation_id, expected_revision, execution_target)
+        .await
+    {
+        Ok(outcome) => IpcResult::success(outcome),
+        Err(error) => conversation_application_failure(error),
+    }
+}
+
+#[tauri::command]
+pub async fn conversation_update_execution_target(
+    app: AppHandle,
+    conversation_id: String,
+    expected_revision: u64,
+    execution_target: serde_json::Value,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::ConversationAggregateMutationOutcome>, String> {
+    let outcome = conversation_update_execution_target_inner(
+        service.inner(),
+        &conversation_id,
+        expected_revision,
+        execution_target,
+    )
+    .await;
+    if outcome.success {
+        let _ = app.emit("conversation:aggregate", outcome.data.as_ref());
+    }
+    Ok(outcome)
+}
+
+async fn run_conversation_lifecycle_command(
+    app: &AppHandle,
+    _conversation_id: String,
+    operation: impl std::future::Future<
+        Output = crate::conversation::application::Result<
+            crate::conversation::ConversationLifecycleOutcome,
+        >,
+    >,
+) -> Result<IpcResult<crate::conversation::ConversationLifecycleOutcome>, String> {
+    match operation.await {
+        Ok(outcome) => {
+            let _ = app.emit("conversation:lifecycle", &outcome);
+            Ok(IpcResult::success(outcome))
+        }
+        Err(error) => Ok(conversation_application_failure(error)),
+    }
+}
+
+#[tauri::command]
+pub async fn conversation_detach_binding(
+    app: AppHandle,
+    conversation_id: String,
+    expected_revision: u64,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::ConversationLifecycleOutcome>, String> {
+    let id = match parse_conversation_id(&conversation_id) {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    run_conversation_lifecycle_command(
+        &app,
+        conversation_id,
+        service.detach_binding(id, expected_revision),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn conversation_rebind_detached_binding(
+    app: AppHandle,
+    conversation_id: String,
+    expected_revision: u64,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::ConversationLifecycleOutcome>, String> {
+    let id = match parse_conversation_id(&conversation_id) {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    run_conversation_lifecycle_command(
+        &app,
+        conversation_id,
+        service.rebind_binding(id, expected_revision),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn conversation_suspend_binding(
+    app: AppHandle,
+    conversation_id: String,
+    expected_revision: u64,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::ConversationLifecycleOutcome>, String> {
+    let id = match parse_conversation_id(&conversation_id) {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    run_conversation_lifecycle_command(
+        &app,
+        conversation_id,
+        service.suspend_binding(id, expected_revision),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn conversation_replace_binding(
+    app: AppHandle,
+    conversation_id: String,
+    expected_revision: u64,
+    request: serde_json::Value,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::ConversationLifecycleOutcome>, String> {
+    let id = match parse_conversation_id(&conversation_id) {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    let request: crate::conversation::PrepareConversationRequest =
+        match serde_json::from_value(request) {
+            Ok(value) => value,
+            Err(error) => {
+                return Ok(IpcResult::error(
+                    format!("payload validation failed: {error}"),
+                    "VALIDATION_ERROR",
+                ))
+            }
+        };
+    run_conversation_lifecycle_command(
+        &app,
+        conversation_id,
+        service.replace_binding(id, request, expected_revision),
+    )
+    .await
+}
+
+async fn retire_deleted_binding_if_updated(
+    relay: &crate::web::WsRelaySink,
+    current_session_id: Option<&str>,
+    outcome: &crate::conversation::ConversationLifecycleOutcome,
+) -> Result<(), String> {
+    if matches!(
+        outcome,
+        crate::conversation::ConversationLifecycleOutcome::Updated {
+            action: crate::conversation::ConversationLifecycleAction::DeleteConversation,
+            ..
+        }
+    ) {
+        if let Some(session_id) = current_session_id {
+            relay.retire_session(session_id).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn conversation_delete_with_retirement(
+    service: &crate::conversation::ConversationApplicationService,
+    relay: &crate::web::WsRelaySink,
+    conversation_id: crate::conversation::ConversationId,
+    expected_revision: u64,
+) -> IpcResult<crate::conversation::ConversationLifecycleOutcome> {
+    if let Err(error) = require_host_admission() {
+        return error;
+    }
+    let current_session_id = match service
+        .writer()
+        .repository()
+        .current_binding(conversation_id)
+    {
+        Ok(binding) => binding.map(|binding| binding.agent_session_id),
+        Err(_) => {
+            return IpcResult::error(
+                "failed to resolve Conversation binding before delete",
+                "CONVERSATION_RECOVERY_REQUIRED",
+            )
+        }
+    };
+    match service
+        .delete_conversation(conversation_id, expected_revision)
+        .await
+    {
+        Ok(outcome) => {
+            if let Err(code) =
+                retire_deleted_binding_if_updated(relay, current_session_id.as_deref(), &outcome)
+                    .await
+            {
+                log::error!(
+                    "[conversation-retirement] operation=tauri_delete code={} conversation_id={}",
+                    code,
+                    conversation_id
+                );
+                return IpcResult::error(
+                    "Conversation auxiliary retirement failed",
+                    "CONVERSATION_RETIREMENT_FAILED",
+                );
+            }
+            IpcResult::success(outcome)
+        }
+        Err(error) => conversation_application_failure(error),
+    }
+}
+
+#[tauri::command]
+pub async fn conversation_delete(
+    app: AppHandle,
+    conversation_id: String,
+    expected_revision: u64,
+    remove_workspace: Option<bool>,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+    relay: State<'_, Arc<crate::web::WsRelaySink>>,
+) -> Result<IpcResult<crate::conversation::ConversationLifecycleOutcome>, String> {
+    let id = match parse_conversation_id(&conversation_id) {
+        Ok(value) => value,
+        Err(error) => return Ok(error),
+    };
+    let workspace_cwd = service
+        .get_conversation(id)
+        .ok()
+        .map(|record| record.workspace_cwd);
+    let outcome =
+        conversation_delete_with_retirement(service.inner(), relay.inner(), id, expected_revision)
+            .await;
+    if outcome.success {
+        if remove_workspace == Some(true) {
+            if let Some(path) = workspace_cwd.filter(|path| !path.trim().is_empty()) {
+                // User-confirmed recursive removal of the Conversation workspace
+                // directory; best-effort so a locked file cannot veto the delete.
+                if let Err(error) = std::fs::remove_dir_all(&path) {
+                    log::warn!(
+                        "[conversation-delete] workspace removal failed conversation_id={} path={} error={error}",
+                        conversation_id,
+                        path
+                    );
+                } else {
+                    log::info!(
+                        "[conversation-delete] workspace removed conversation_id={} path={}",
+                        conversation_id,
+                        path
+                    );
+                }
+            }
+        }
+        let _ = app.emit("conversation:lifecycle", outcome.data.as_ref());
+    }
+    Ok(outcome)
+}
+
+// ============================================================================
+// Workspace Manifest Commands (legacy read-only compatibility)
 // ============================================================================
 //
 // Host-owned versioned workspace manifests — one per project, atomically
@@ -4600,6 +5828,9 @@ pub async fn workspace_manifest_write(
     manifest: serde_json::Value,
     store: State<'_, HostWorkspaceManifestStore>,
 ) -> Result<IpcResult<crate::acp::WriteOutcome>, String> {
+    if let Err(error) = require_host_admission() {
+        return Ok(error);
+    }
     let log_project_id = sanitize_log_field(&project_id);
     log::info!(
         "[workspace-manifest] write start project_id={} based_revision={:?}",
@@ -4662,6 +5893,9 @@ pub async fn workspace_manifest_delete(
     project_id: String,
     store: State<'_, HostWorkspaceManifestStore>,
 ) -> Result<IpcResult<()>, String> {
+    if let Err(error) = require_host_admission() {
+        return Ok(error);
+    }
     let log_project_id = sanitize_log_field(&project_id);
     log::info!(
         "[workspace-manifest] delete start project_id={}",
@@ -4714,6 +5948,350 @@ mod tests {
         assert_eq!(result.code, Some("TEST_ERROR".to_string()));
     }
 
+    #[tokio::test]
+    async fn terminal_spawn_compound_rollback() {
+        use crate::conversation::{
+            parse_created_at_utc, ConversationCreator, ConversationLifecycleState,
+            ConversationMutation, ConversationRecordV2, ConversationWriter, CreationPartition,
+            ExecutionTarget, SessionWorkspaceLoadOutcome, SessionWorkspaceService,
+            CONVERSATION_SCHEMA_VERSION, TERMINAL_RESOURCE_ROLLBACK_FAILED,
+        };
+        use crate::pty::manager::{
+            ScriptedCleanupDriver, TerminalCleanupStage, TerminalLifecycleState,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let (repository, _) =
+            crate::conversation::ConversationRepository::open(base.join("conversations/v2"))
+                .unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
+        let conversation_id =
+            crate::conversation::ConversationId::parse("018f7a1c-1b4d-7c8a-9f01-0123456789ab")
+                .unwrap();
+        let created_at = parse_created_at_utc("2026-08-15T09:45:15.123Z").unwrap();
+        writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: base.to_string_lossy().into_owned(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::Ready,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
+                },
+                ConversationMutation::CreateConversation,
+            )
+            .await
+            .unwrap();
+        let workspace = Arc::new(SessionWorkspaceService::new(writer));
+        repository.fail_next_workspace_replace();
+        let pty = crate::web::test_pty_manager();
+        let cleanup_driver = Arc::new(ScriptedCleanupDriver::default());
+        cleanup_driver.fail_once(TerminalCleanupStage::Kill);
+        pty.install_cleanup_driver(cleanup_driver);
+        let result = terminal_spawn_resource(
+            SpawnOptions {
+                conversation_id: Some(conversation_id),
+                cwd: Some(base.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            None,
+            &pty,
+            &workspace,
+        )
+        .await;
+
+        assert!(!result.success);
+        assert_eq!(
+            result.code.as_deref(),
+            Some(TERMINAL_RESOURCE_ROLLBACK_FAILED)
+        );
+        let failure: TerminalResourceFailureV1 =
+            serde_json::from_str(result.error.as_deref().unwrap()).unwrap();
+        assert_eq!(failure.primary_code, "CONVERSATION_DURABILITY_FAILED");
+        assert_eq!(failure.cleanup_stage, TerminalCleanupStage::Kill);
+        assert_eq!(
+            pty.terminal_lifecycle_state(&failure.terminal_id),
+            Some(TerminalLifecycleState::Quarantined)
+        );
+        assert_eq!(pty.active_terminal_slot_count(), 1);
+        assert!(pty.get(&failure.terminal_id).is_some());
+        assert!(matches!(
+            workspace.load(conversation_id).await.unwrap(),
+            SessionWorkspaceLoadOutcome::Missing { .. }
+        ));
+        pty.terminate(&failure.terminal_id).await.unwrap();
+        assert_eq!(pty.active_terminal_slot_count(), 0);
+
+        let production = include_str!("commands.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        for forbidden in ["claim=", "env=", "argv=", "terminal_output="] {
+            assert!(!production.contains(forbidden));
+        }
+        let removed_test_override = ["rollback", "result", "override"].join("_");
+        assert!(!production.contains(&removed_test_override));
+    }
+
+    #[tokio::test]
+    async fn terminal_terminate_returns_exact_cleanup_stage_and_keeps_identity() {
+        use crate::conversation::{
+            ConversationRepository, ConversationWriter, SessionWorkspaceService,
+        };
+        use crate::pty::manager::{
+            ScriptedCleanupDriver, TerminalCleanupStage, TerminalLifecycleState,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let (repository, _) = ConversationRepository::open(base.join("private")).unwrap();
+        let workspace = Arc::new(SessionWorkspaceService::new(ConversationWriter::for_test(
+            repository,
+        )));
+        let pty = crate::web::test_pty_manager();
+        let spawned = pty
+            .spawn(
+                SpawnOptions {
+                    cwd: Some(base.to_string_lossy().into_owned()),
+                    kind: Some("ssh".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let terminal_id = spawned.info.id;
+        let cleanup_driver = Arc::new(ScriptedCleanupDriver::default());
+        cleanup_driver.fail_once(TerminalCleanupStage::Wait);
+        pty.install_cleanup_driver(cleanup_driver);
+
+        let result = terminal_terminate_resource(&terminal_id, &pty, &workspace).await;
+        assert!(!result.success);
+        assert_eq!(
+            result.code.as_deref(),
+            Some(crate::conversation::TERMINAL_TERMINATE_FAILED)
+        );
+        let failure: TerminalResourceFailureV1 =
+            serde_json::from_str(result.error.as_deref().unwrap()).unwrap();
+        assert_eq!(failure.terminal_id, terminal_id);
+        assert_eq!(
+            failure.primary_code,
+            crate::conversation::TERMINAL_TERMINATE_FAILED
+        );
+        assert_eq!(failure.cleanup_stage, TerminalCleanupStage::Wait);
+        assert_eq!(
+            pty.terminal_lifecycle_state(&terminal_id),
+            Some(TerminalLifecycleState::Quarantined)
+        );
+        assert_eq!(pty.active_terminal_slot_count(), 1);
+
+        let retry = terminal_terminate_resource(&terminal_id, &pty, &workspace).await;
+        assert!(retry.success, "retry failed: {:?}", retry.error);
+        assert!(pty.get(&terminal_id).is_none());
+        assert_eq!(pty.active_terminal_slot_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_terminate_succeeds_for_scope_less_project_terminal() {
+        use crate::conversation::{
+            ConversationRepository, ConversationWriter, SessionWorkspaceService,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let (repository, _) = ConversationRepository::open(base.join("private")).unwrap();
+        let workspace = Arc::new(SessionWorkspaceService::new(ConversationWriter::for_test(
+            repository,
+        )));
+        let pty = crate::web::test_pty_manager();
+        let spawned = pty
+            .spawn(
+                SpawnOptions {
+                    cwd: Some(base.to_string_lossy().into_owned()),
+                    project_id: Some("project-1".to_string()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !pty.get(&spawned.info.id)
+                .expect("spawned project terminal")
+                .workspace_ref_tracked
+        );
+
+        let result = terminal_terminate_resource(&spawned.info.id, &pty, &workspace).await;
+        assert!(result.success, "terminate failed: {:?}", result.error);
+        assert!(pty.get(&spawned.info.id).is_none());
+        assert_eq!(pty.active_terminal_slot_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_terminate_succeeds_when_tracked_conversation_is_missing() {
+        use crate::conversation::{
+            ConversationId, ConversationRepository, ConversationWriter, SessionWorkspaceService,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let (repository, _) = ConversationRepository::open(base.join("private")).unwrap();
+        let workspace = Arc::new(SessionWorkspaceService::new(ConversationWriter::for_test(
+            repository,
+        )));
+        let pty = crate::web::test_pty_manager();
+        let orphan_conversation = ConversationId::new_v4();
+        let spawned = pty
+            .spawn(
+                SpawnOptions {
+                    conversation_id: Some(orphan_conversation),
+                    cwd: Some(base.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(
+            pty.get(&spawned.info.id)
+                .expect("spawned orphan-scoped terminal")
+                .workspace_ref_tracked
+        );
+
+        let result = terminal_terminate_resource(&spawned.info.id, &pty, &workspace).await;
+        assert!(
+            result.success,
+            "terminate should kill PTY when conversation is missing: {:?}",
+            result.error
+        );
+        assert!(pty.get(&spawned.info.id).is_none());
+        assert_eq!(pty.active_terminal_slot_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_resume_requires_passive_ref_and_returns_grant() {
+        use crate::conversation::{
+            parse_created_at_utc, ConversationCreator, ConversationLifecycleState,
+            ConversationMutation, ConversationRecordV2, ConversationWriter, CreationPartition,
+            ExecutionTarget, SessionWorkspaceService, CONVERSATION_SCHEMA_VERSION,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let (repository, _) =
+            crate::conversation::ConversationRepository::open(base.join("conversations/v2"))
+                .unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
+        let conversation_id =
+            crate::conversation::ConversationId::parse("018f7a1c-1b4d-7c8a-9f01-0123456789ab")
+                .unwrap();
+        let created_at = parse_created_at_utc("2026-08-15T09:45:15.123Z").unwrap();
+        writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: base.to_string_lossy().into_owned(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::Ready,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
+                },
+                ConversationMutation::CreateConversation,
+            )
+            .await
+            .unwrap();
+        let workspace = Arc::new(SessionWorkspaceService::new(writer));
+        let pty = crate::web::test_pty_manager();
+
+        // A live PTY without the passive descriptor is not resumable and its
+        // original claim remains untouched.
+        let untracked = pty
+            .spawn(
+                SpawnOptions {
+                    conversation_id: Some(conversation_id),
+                    cwd: Some(base.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let denied = TerminalResumeRequest {
+            conversation_id,
+            terminal_id: untracked.info.id.clone(),
+            last_seq: 0,
+        };
+        assert!(matches!(
+            terminal_resume_resource(&denied, &pty, &workspace).await,
+            Err(ClaimError)
+        ));
+        assert!(pty
+            .verify_claim(&untracked.info.id, &untracked.claim)
+            .is_ok());
+        pty.terminate(&untracked.info.id).await.unwrap();
+
+        // The shared spawn resource path commits the passive ref. Resume then
+        // rotates the handoff without spawning or terminating the PTY.
+        let spawned = terminal_spawn_resource(
+            SpawnOptions {
+                conversation_id: Some(conversation_id),
+                cwd: Some(base.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            None,
+            &pty,
+            &workspace,
+        )
+        .await;
+        assert!(spawned.success, "spawn failed: {:?}", spawned.error);
+        let spawned = spawned.data.unwrap();
+        let request = TerminalResumeRequest {
+            conversation_id,
+            terminal_id: spawned.info.id.clone(),
+            last_seq: 0,
+        };
+        let (grant, _replay) = terminal_resume_resource(&request, &pty, &workspace)
+            .await
+            .unwrap();
+        assert_eq!(grant.terminal.id, spawned.info.id);
+        assert!(pty.get(&spawned.info.id).is_some());
+        assert_eq!(
+            pty.verify_claim(&spawned.info.id, &spawned.claim),
+            Err(ClaimError)
+        );
+        assert!(pty.verify_claim(&spawned.info.id, &grant.claim).is_ok());
+
+        let workspace_bytes = repository
+            .read_workspace_bytes(conversation_id)
+            .unwrap()
+            .expect("spawn committed a passive workspace ref");
+        let workspace_json = String::from_utf8(workspace_bytes).unwrap();
+        assert!(!workspace_json.contains(&spawned.claim));
+        assert!(!workspace_json.contains(&grant.claim));
+        assert!(!workspace_json.contains("\"claim\""));
+
+        let terminated = terminal_terminate_resource(&spawned.info.id, &pty, &workspace).await;
+        assert!(
+            terminated.success,
+            "terminate failed: {:?}",
+            terminated.error
+        );
+    }
+
     /// The host-owned list maps `SessionIndexEntry` (camelCase wire) into the
     /// renderer's `ChatHistoryIndexEntry` shape unchanged by the ownership
     /// transfer: `config:<id>` namespaces collapse back to the bare config id,
@@ -4750,6 +6328,34 @@ mod tests {
         assert_eq!(desktop.created_at, 10);
         assert_eq!(desktop.last_activity_at, 20);
         assert_eq!(desktop.message_count, 3);
+        assert!(desktop.conversation_id.is_none());
+
+        let bound = crate::acp::SessionIndexEntry {
+            storage_key: "018f7a1c-1b4d-7c8a-9f01-0123456789ab".to_string(),
+            session_id: "opaque/session".to_string(),
+            stable_agent_namespace: Some("config:claude".to_string()),
+            runtime_agent_id: Some("runtime-1".to_string()),
+            project_id: None,
+            cwd: "/work".to_string(),
+            title: Some("Bound".to_string()),
+            title_source: None,
+            created_at: 10,
+            last_activity_at: 20,
+            status: crate::acp::PersistedSessionStatus::Closed,
+            message_count: 2,
+            tool_count: 0,
+            last_seq: 2,
+            discovered: false,
+            resume_eligible: true,
+            worktree_path: None,
+            worktree_branch: None,
+        };
+        let bound_desktop = host_entry_to_desktop(bound);
+        assert_eq!(
+            bound_desktop.conversation_id.as_deref(),
+            Some("018f7a1c-1b4d-7c8a-9f01-0123456789ab")
+        );
+        assert_eq!(bound_desktop.id, "opaque/session");
         assert!(matches!(
             desktop.status,
             crate::acp::ChatHistoryStatus::Active
@@ -4787,6 +6393,337 @@ mod tests {
             desktop.status,
             crate::acp::ChatHistoryStatus::Error
         ));
+    }
+
+    #[tokio::test]
+    async fn acp_history_get_page_contract() {
+        use crate::conversation::{
+            AgentSessionBinding, AgentSessionBindingState, ConversationCreator,
+            ConversationEventRecordV2, ConversationEventType, ConversationLifecycleState,
+            ConversationMutation, ConversationPersistenceAdapter, ConversationRecordV2,
+            ConversationWriter, CreationPartition, ExecutionTarget, LegacyConversationReader,
+            ReaderPrecedence, AGENT_SESSION_BINDING_SCHEMA_VERSION, CONVERSATION_SCHEMA_VERSION,
+        };
+        use chrono::Utc;
+        use std::io::{BufWriter, Write};
+        use uuid::Uuid;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let private = root.join("private");
+        let workspace_path = root.join("workspace");
+        std::fs::create_dir_all(&workspace_path).unwrap();
+        let workspace_path = workspace_path.canonicalize().unwrap();
+        let (repository, _) =
+            crate::conversation::ConversationRepository::open(private.clone()).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
+        let conversation_id =
+            crate::conversation::ConversationId::parse("33333333-3333-4333-8333-333333333333")
+                .unwrap();
+        let created_at = Utc::now();
+        let record = ConversationRecordV2 {
+            schema_version: CONVERSATION_SCHEMA_VERSION,
+            conversation_id,
+            created_at_utc: created_at,
+            creation_partition: CreationPartition::from_created_at(created_at),
+            workspace_cwd: workspace_path.to_string_lossy().into_owned(),
+            execution_target: ExecutionTarget::Workspace,
+            project_attachment: None,
+            lifecycle_state: ConversationLifecycleState::Ready,
+            last_seq: 0,
+            created_by: ConversationCreator::Termul,
+            title: None,
+            title_source: None,
+        };
+        writer
+            .create_conversation(record.clone(), ConversationMutation::CreateConversation)
+            .await
+            .unwrap();
+        writer
+            .bind_agent_session(
+                conversation_id,
+                AgentSessionBinding {
+                    schema_version: AGENT_SESSION_BINDING_SCHEMA_VERSION,
+                    binding_id: Uuid::new_v4(),
+                    agent_session_id: "opaque/desktop-page".to_string(),
+                    runtime_agent_id: "runtime".to_string(),
+                    stable_agent_namespace: "stable".to_string(),
+                    execution_cwd: workspace_path.to_string_lossy().into_owned(),
+                    bound_at_utc: created_at,
+                    state: AgentSessionBindingState::Active,
+                },
+                created_at,
+            )
+            .await
+            .unwrap();
+        let directory = private
+            .join(&record.creation_partition.path)
+            .join(conversation_id.to_string());
+        drop(writer);
+        drop(repository);
+
+        let messages = std::fs::OpenOptions::new()
+            .append(true)
+            .open(directory.join(crate::conversation::event_log::MESSAGES_FILE))
+            .unwrap();
+        let mut messages = BufWriter::new(messages);
+        for seq in 2..=1_051_u64 {
+            let event = ConversationEventRecordV2::new(
+                conversation_id,
+                seq,
+                created_at,
+                ConversationEventType::MessageChunk,
+                serde_json::json!({"marker": seq}),
+            );
+            serde_json::to_writer(&mut messages, &event).unwrap();
+            messages.write_all(b"\n").unwrap();
+        }
+        messages.flush().unwrap();
+        drop(messages);
+
+        let (repository, _) = crate::conversation::ConversationRepository::open(private).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
+        let reader = Arc::new(crate::conversation::ConversationReader::new(
+            Arc::clone(&repository),
+            LegacyConversationReader::default(),
+            ReaderPrecedence::ConversationV2Only,
+        ));
+        let adapter = Arc::new(ConversationPersistenceAdapter::new(writer, reader));
+        let host = HostHistoryStore::conversation(adapter, None);
+
+        let result = acp_history_get_page_inner("opaque/desktop-page", 17, 250, None, &host).await;
+        assert!(result.success, "page error: {:?}", result.error);
+        let page = result.data.unwrap();
+        assert_eq!(page.schema_version, 1);
+        assert_eq!(page.records.len(), 250);
+        assert_eq!(page.records.first().unwrap().seq, 18);
+        assert_eq!(page.records.last().unwrap().seq, 267);
+        assert_eq!(page.next_cursor, 267);
+        assert!(!page.complete);
+        assert_eq!(page.target_last_seq, 1_051);
+        assert_eq!(
+            serde_json::to_value(&page).unwrap(),
+            serde_json::json!({
+                "schemaVersion": 1,
+                "records": page.records,
+                "nextCursor": 267,
+                "complete": false,
+                "targetLastSeq": 1_051
+            })
+        );
+
+        for invalid_limit in [0, 1_001] {
+            let invalid =
+                acp_history_get_page_inner("opaque/desktop-page", 0, invalid_limit, None, &host)
+                    .await;
+            assert!(!invalid.success);
+            assert_eq!(invalid.code.as_deref(), Some("VALIDATION_ERROR"));
+        }
+        let invalid_cursor =
+            acp_history_get_page_inner("opaque/desktop-page", 1_052, 17, None, &host).await;
+        assert!(!invalid_cursor.success);
+        assert_eq!(invalid_cursor.code.as_deref(), Some("VALIDATION_ERROR"));
+
+        let compatibility = acp_history_get_inner("opaque/desktop-page", &host);
+        assert!(!compatibility.success);
+        assert_eq!(
+            compatibility.code.as_deref(),
+            Some(crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn desktop_exit_drain_failure_blocks_clean_success() {
+        use crate::conversation::{
+            AgentSessionBinding, AgentSessionBindingState, ConversationCreator,
+            ConversationLifecycleState, ConversationMutation, ConversationPersistenceAdapter,
+            ConversationRecordV2, ConversationWriter, CreationPartition, ExecutionTarget,
+            LegacyConversationReader, ReaderPrecedence, AGENT_SESSION_BINDING_SCHEMA_VERSION,
+            CONVERSATION_SCHEMA_VERSION,
+        };
+        use crate::web::sink::{AcpEvent, EventSink};
+        use chrono::Utc;
+        use uuid::Uuid;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let private = root.join("private");
+        let workspace = root.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let (repository, _) = crate::conversation::ConversationRepository::open(private).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
+        let conversation_id = crate::conversation::ConversationId::new_v4();
+        let created_at = Utc::now();
+        writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: workspace.to_string_lossy().into_owned(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::InitializingAgent,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
+                },
+                ConversationMutation::CreateConversation,
+            )
+            .await
+            .unwrap();
+        writer
+            .bind_agent_session(
+                conversation_id,
+                AgentSessionBinding {
+                    schema_version: AGENT_SESSION_BINDING_SCHEMA_VERSION,
+                    binding_id: Uuid::new_v4(),
+                    agent_session_id: "desktop-exit-session".to_string(),
+                    runtime_agent_id: "runtime".to_string(),
+                    stable_agent_namespace: "stable".to_string(),
+                    execution_cwd: workspace.to_string_lossy().into_owned(),
+                    bound_at_utc: created_at,
+                    state: AgentSessionBindingState::Active,
+                },
+                created_at,
+            )
+            .await
+            .unwrap();
+        let reader = Arc::new(crate::conversation::ConversationReader::new(
+            Arc::clone(&repository),
+            LegacyConversationReader::default(),
+            ReaderPrecedence::ConversationV2Only,
+        ));
+        let adapter = Arc::new(ConversationPersistenceAdapter::new(writer, reader));
+        let relay = Arc::new(crate::web::WsRelaySink::with_conversation_persistence(
+            32, adapter, None,
+        ));
+        relay
+            .emit(&AcpEvent {
+                sid: Some("desktop-exit-session".to_string()),
+                type_: "acp:message_chunk",
+                payload: serde_json::json!({"ordinal": 1}),
+            })
+            .unwrap();
+        let ordered = relay
+            .ordered_conversation_persistence()
+            .expect("ordered Conversation persistence");
+        let duplicate = ordered
+            .submit(
+                "desktop-exit-session",
+                1,
+                "message_chunk",
+                serde_json::json!({"ordinal": 2}),
+            )
+            .expect_err("duplicate source sequence must open a retained failure circuit");
+        assert_eq!(duplicate.code, "CONVERSATION_SOURCE_SEQUENCE_INVALID");
+        assert_eq!(
+            ordered
+                .health("desktop-exit-session")
+                .unwrap()
+                .unwrap()
+                .last_error_code,
+            Some("CONVERSATION_SOURCE_SEQUENCE_INVALID")
+        );
+        let relay_sink: Arc<dyn EventSink> = relay.clone();
+        let acp = Arc::new(crate::acp::AcpManager::new(vec![relay_sink]));
+        let agent_id = crate::acp::AgentId("desktop-exit-agent".to_string());
+        let (observed, _receiver) = std::sync::mpsc::sync_channel(1);
+        acp.install_test_agent_for_new_session(agent_id.clone(), observed);
+
+        let outcome = crate::stop_desktop_producers_and_drain(
+            Some(&acp),
+            Some(&relay),
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(!outcome.clean_success());
+        assert_eq!(outcome.conversation_drain_attempts, 1);
+        assert_eq!(outcome.catalog_flush_attempts, 1);
+        assert!(outcome
+            .failures
+            .contains(&crate::web::CONVERSATION_PERSISTENCE_DRAIN_FAILED));
+        assert!(!outcome
+            .failures
+            .contains(&crate::web::CONVERSATION_CATALOG_FLUSH_FAILED));
+        assert!(
+            acp.stable_agent_namespace(&agent_id).is_err(),
+            "producers must stop before the failed drain returns"
+        );
+
+        let source = include_str!("lib.rs");
+        let start = source
+            .find("pub(crate) async fn stop_desktop_producers_and_drain(")
+            .unwrap();
+        let end = source[start..]
+            .find("static CLEANUP_DONE")
+            .map(|offset| start + offset)
+            .unwrap();
+        let body = &source[start..end];
+        assert_eq!(
+            body.matches(".shutdown_conversation_persistence_until(deadline)")
+                .count(),
+            1
+        );
+        assert!(
+            body.find("timeout_at(deadline, acp_manager.stop_producers())")
+                .unwrap()
+                < body
+                    .find(".shutdown_conversation_persistence_until(deadline)")
+                    .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn tauri_conversation_delete_retires_on_success_and_retains_on_blocked_or_error() {
+        use crate::conversation::{
+            ConversationLifecycleAction, ConversationLifecycleErrorCode,
+            ConversationLifecycleOutcome, ConversationLifecycleState,
+        };
+
+        let relay = crate::web::WsRelaySink::new();
+        let conversation_id = crate::conversation::ConversationId::new_v4();
+        relay
+            .turn_watermark()
+            .mark_seen("tauri-delete", "turn-retained");
+        let blocked = ConversationLifecycleOutcome::Blocked {
+            action: ConversationLifecycleAction::DeleteConversation,
+            conversation_id,
+            revision: 7,
+            code: ConversationLifecycleErrorCode::ConversationLiveResources,
+            blockers: Vec::new(),
+        };
+        retire_deleted_binding_if_updated(&relay, Some("tauri-delete"), &blocked)
+            .await
+            .unwrap();
+        assert!(relay
+            .turn_watermark()
+            .is_seen("tauri-delete", "turn-retained"));
+        let simulated_error: Result<(), &str> = Err("delete failed");
+        assert!(simulated_error.is_err());
+        assert!(relay
+            .turn_watermark()
+            .is_seen("tauri-delete", "turn-retained"));
+
+        let updated = ConversationLifecycleOutcome::Updated {
+            action: ConversationLifecycleAction::DeleteConversation,
+            conversation_id,
+            previous_revision: 7,
+            revision: 8,
+            workspace_cwd: "/opaque/workspace".to_string(),
+            lifecycle_state: ConversationLifecycleState::Deleted,
+            current_binding: None,
+            previous_agent_session_id: Some("tauri-delete".to_string()),
+        };
+        retire_deleted_binding_if_updated(&relay, Some("tauri-delete"), &updated)
+            .await
+            .unwrap();
+        assert!(!relay
+            .turn_watermark()
+            .is_seen("tauri-delete", "turn-retained"));
     }
 
     #[test]
@@ -5031,6 +6968,90 @@ mod tests {
             search_id: "search-1".to_string(),
         };
         assert_eq!(req.search_id, "search-1");
+    }
+
+    #[test]
+    fn late_tauri_mutator_returns_host_shutting_down() {
+        crate::host_admission::HostAdmission::global().close();
+        let err = require_host_admission::<()>().expect_err("closed admission rejects mutators");
+        assert_eq!(
+            err.code.as_deref(),
+            Some(crate::host_admission::HOST_SHUTTING_DOWN)
+        );
+        crate::host_admission::HostAdmission::global().reopen_for_tests();
+        assert!(require_host_admission::<()>().is_ok());
+    }
+
+    #[test]
+    fn validate_project_path_logs_no_raw_path_or_identifier() {
+        let source = include_str!("commands.rs");
+        let start = source
+            .find("fn validate_project_path(path: &str)")
+            .expect("validator exists");
+        let end = source[start..]
+            .find("pub(crate) fn require_host_admission")
+            .map(|offset| start + offset)
+            .unwrap_or(start + 1600);
+        let body = &source[start..end];
+        assert!(body.contains("stable_code=PATH_VALIDATION_FAILED"));
+        assert!(body.contains("stable_code=OK"));
+        assert!(!body.contains("Path validation failed for '{}'"));
+        assert!(!body.contains("Path validated: {} -> {}"));
+        let _ = validate_project_path("/definitely-missing-termul-path-xyz");
+    }
+}
+
+#[cfg(test)]
+mod remote_sync_projects_tests {
+    use super::SyncProjectsPayload;
+
+    #[test]
+    fn sync_payload_defaults_groups_for_older_desktop_clients() {
+        let payload: SyncProjectsPayload = serde_json::from_value(serde_json::json!({
+            "projects": [{
+                "id": "p-1",
+                "name": "Project",
+                "color": "blue",
+                "path": "/tmp/project",
+                "isArchived": false,
+                "isDefault": true
+            }],
+            "defaultProjectId": "p-1"
+        }))
+        .expect("deserialize legacy sync payload");
+
+        assert!(payload.groups.is_empty());
+        assert_eq!(payload.default_project_id.as_deref(), Some("p-1"));
+    }
+
+    #[test]
+    fn sync_payload_deserializes_project_groups() {
+        let payload: SyncProjectsPayload = serde_json::from_value(serde_json::json!({
+            "projects": [{
+                "id": "p-1",
+                "name": "Project",
+                "color": "blue",
+                "path": "/tmp/project",
+                "isArchived": false,
+                "isDefault": true
+            }],
+            "groups": [{
+                "id": "g-1",
+                "name": "Favorites",
+                "projectIds": ["p-1"],
+                "color": "purple",
+                "preferredProjectId": "p-1"
+            }],
+            "defaultProjectId": "p-1"
+        }))
+        .expect("deserialize group-aware sync payload");
+
+        assert_eq!(payload.groups.len(), 1);
+        assert_eq!(payload.groups[0].project_ids, ["p-1"]);
+        assert_eq!(
+            payload.groups[0].preferred_project_id.as_deref(),
+            Some("p-1")
+        );
     }
 }
 

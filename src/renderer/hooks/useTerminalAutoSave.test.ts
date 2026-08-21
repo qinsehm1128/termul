@@ -14,6 +14,7 @@ const { mockRecordTerminalContinuityEvent } = vi.hoisted(() => ({
 import type { TerminalModes } from '@shared/types/ipc.types'
 import type { Terminal } from '@/types/project'
 import type { PersistedTerminal } from '../../shared/types/persistence.types'
+import { useSessionWorkspaceSyncStore } from '../stores/session-workspace-sync-store'
 import { useTerminalStore } from '../stores/terminal-store'
 import { extractScrollback, getTerminalModes } from '../utils/terminal-registry'
 
@@ -52,6 +53,9 @@ describe('useTerminalAutoSave', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mockRecordTerminalContinuityEvent.mockReset()
+    useSessionWorkspaceSyncStore
+      .getState()
+      .setActiveConversationId('018f7a1c-1b4d-7c8a-9f01-0123456789ab')
   })
 
   describe('setTerminalRestoreInProgress', () => {

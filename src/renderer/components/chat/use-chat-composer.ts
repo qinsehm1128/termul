@@ -96,14 +96,12 @@ export interface UseChatComposerArgs {
   disabled: boolean
   onSetConfig: (configId: string, valueId: string) => void | Promise<void>
   onSetMode: (modeId: string) => void | Promise<void>
-  /** Reserved for model-row parity (the model chip routes native ACP models
-   * through `onSetModel` when `modelSource === 'models'`). Slash-menu model
-   * rows currently flow through the `config` branch → `onSetConfig`, matching
-   * the canonical `ChatInputBar` behavior; these fields are kept on the
-   * interface so a future model-row divergence can land without reshaping it. */
+  /** Native ACP `session/set_model` path. Slash-menu model rows use this when
+   * `modelSource === 'models'`; config-advertised model rows still go through
+   * `onSetConfig` with the agent-advertised option id. */
   onSetModel?: (modelId: string) => void | Promise<void>
   modelOption?: SessionConfigOption | null
-  modelSource?: 'models' | 'config'
+  modelSource?: 'models' | 'config' | null
   /** Mention-menu state from `useComposerMentions`. The hook calls
    * `mentions.update` after programmatic splices (the editor's live
    * `onCaretChange` feeds it on natural typing). */
@@ -208,6 +206,9 @@ export function useChatComposer(args: UseChatComposerArgs): UseChatComposerResul
     disabled,
     onSetConfig,
     onSetMode,
+    onSetModel,
+    modelOption,
+    modelSource,
     mentions,
     scheduleRestoreCaret
   } = args
@@ -228,8 +229,15 @@ export function useChatComposer(args: UseChatComposerArgs): UseChatComposerResul
     // `buildSlashSections` reads the active i18n instance through `runtimeT`.
     // Reading this value makes an already-open menu rebuild when that instance changes language.
     void slashMenuLanguage
-    return buildSlashSections({ commands, configOptions, modes, skills, filter })
-  }, [slashOpen, commands, configOptions, modes, skills, filter, slashMenuLanguage])
+    return buildSlashSections({
+      commands,
+      configOptions,
+      modes,
+      skills,
+      filter,
+      modelOption
+    })
+  }, [slashOpen, commands, configOptions, modes, skills, filter, slashMenuLanguage, modelOption])
   // Pills are real DOM nodes now, so there is no transparent-text overlay to
   // gate. `hasSkillToken` is still exposed for hosts that branch on whether the
   // value carries a skill (e.g. placeholder copy).
@@ -307,14 +315,30 @@ export function useChatComposer(args: UseChatComposerArgs): UseChatComposerResul
       if (item.kind === 'config') {
         // AgentChatPanel's setters toast then rethrow; swallow here so the
         // already-surfaced failure doesn't become an unhandled rejection.
-        void Promise.resolve(onSetConfig(item.configId, item.valueId)).catch(() => {})
+        const nativeModel =
+          modelSource === 'models' && modelOption != null && item.configId === modelOption.id
+        const result = nativeModel
+          ? onSetModel?.(item.valueId)
+          : onSetConfig(item.configId, item.valueId)
+        void Promise.resolve(result).catch(() => {})
       } else {
         void Promise.resolve(onSetMode(item.modeId)).catch(() => {})
       }
       setValue('')
       mentions.update('', 0)
     },
-    [value, onSetConfig, onSetMode, setValue, editorRef, mentions, scheduleRestoreCaret]
+    [
+      value,
+      onSetConfig,
+      onSetMode,
+      onSetModel,
+      modelOption,
+      modelSource,
+      setValue,
+      editorRef,
+      mentions,
+      scheduleRestoreCaret
+    ]
   )
 
   const onSlashOrMentionKeyDown = useCallback(

@@ -11,6 +11,9 @@ import type {
   TerminalExitCodeChangedCallback,
   TerminalGitBranchChangedCallback,
   TerminalGitStatusChangedCallback,
+  TerminalResumeGrant,
+  TerminalResumeRequest,
+  TerminalScopedDataCallback,
   TerminalSpawnOptions
 } from '@shared/types/ipc.types'
 import { Channel, type InvokeArgs, invoke } from '@tauri-apps/api/core'
@@ -50,11 +53,14 @@ type SharedListenerEntry<T> = {
  */
 const IPC_COMMANDS = {
   SPAWN: 'terminal_spawn',
+  RESUME: 'terminal_resume',
   ATTACH: 'terminal_attach',
   ROTATE_CLAIM: 'terminal_rotate_claim',
   REVOKE_CLAIM: 'terminal_revoke_claim',
   WRITE: 'terminal_write',
   RESIZE: 'terminal_resize',
+  CLOSE_VIEW: 'terminal_close_view',
+  TERMINATE: 'terminal_terminate',
   KILL: 'terminal_kill',
   GET_CWD: 'terminal_get_cwd',
   GET_GIT_BRANCH: 'terminal_get_git_branch',
@@ -224,8 +230,61 @@ function captureStackTrace(): string {
  * It maintains the same interface as the Electron preload script for easy migration.
  */
 export function createTauriTerminalApi(): TerminalApi {
-  // Per-terminal data callback stored between onData registration and spawn
+  // Global observers support transcript capture; visible terminal renderers
+  // use the scoped map so each PTY chunk reaches only its owning renderer.
   const dataCallbacks = new Set<TerminalDataCallback>()
+  const scopedDataCallbacks = new Map<string, Set<TerminalScopedDataCallback>>()
+
+  const dispatchTerminalData = (terminalId: string, bytes: Uint8Array): void => {
+    for (const callback of dataCallbacks) {
+      try {
+        callback(terminalId, bytes)
+      } catch (error) {
+        console.error('[BinaryChannel] Error in global terminal data callback:', error)
+      }
+    }
+
+    const scopedCallbacks = scopedDataCallbacks.get(terminalId)
+    if (!scopedCallbacks) return
+    for (const callback of scopedCallbacks) {
+      try {
+        callback(bytes)
+      } catch (error) {
+        console.error('[BinaryChannel] Error in scoped terminal data callback:', error)
+      }
+    }
+  }
+
+  const createTerminalDataChannel = (terminalId: string): Channel<ArrayBuffer> => {
+    const onData = new Channel<ArrayBuffer>()
+    onData.onmessage = (buf: ArrayBuffer) => {
+      dispatchTerminalData(terminalId, new Uint8Array(buf))
+    }
+    return onData
+  }
+
+  const attachTerminal = async (
+    terminalId: string,
+    claim: string,
+    lastSeq: number
+  ): Promise<IpcResult<TerminalAttachResult>> => {
+    if (!claim) {
+      return { success: false, error: 'Unauthorized', code: 'UNAUTHORIZED' }
+    }
+
+    const onData = createTerminalDataChannel(terminalId)
+    const result = await invokeIpc<TerminalAttachResult>(IPC_COMMANDS.ATTACH, {
+      terminalId,
+      claim,
+      lastSeq,
+      onData
+    })
+    if (!result.success) {
+      onData.onmessage = () => {}
+    }
+    return result
+  }
+
   const _registerListener = <T>(
     eventName: string,
     callback: (payload: T) => void,
@@ -333,13 +392,7 @@ export function createTauriTerminalApi(): TerminalApi {
 
         if (capturedTerminalId) {
           // Normal path: we know the terminal ID
-          for (const callback of dataCallbacks) {
-            try {
-              callback(capturedTerminalId, bytes)
-            } catch (err) {
-              console.error('[BinaryChannel] Error in data callback:', err)
-            }
-          }
+          dispatchTerminalData(capturedTerminalId, bytes)
         } else {
           // Data arrived before spawn result — buffer it
           pendingBuffer.push(bytes)
@@ -357,13 +410,7 @@ export function createTauriTerminalApi(): TerminalApi {
         // Flush any buffered data that arrived before we knew the terminal ID
         if (pendingBuffer.length > 0) {
           for (const bytes of pendingBuffer) {
-            for (const callback of dataCallbacks) {
-              try {
-                callback(capturedTerminalId, bytes)
-              } catch (err) {
-                console.error('[BinaryChannel] Error in buffered data callback:', err)
-              }
-            }
+            dispatchTerminalData(capturedTerminalId, bytes)
           }
           pendingBuffer = []
         }
@@ -377,6 +424,51 @@ export function createTauriTerminalApi(): TerminalApi {
     },
 
     /**
+     * Resume a passive SessionWorkspace reference, then attach from the
+     * returned replay watermark so this method resolves only after live output
+     * continuity is installed. Neither operation spawns or terminates a PTY.
+     */
+    async resume(request: TerminalResumeRequest): Promise<IpcResult<TerminalResumeGrant>> {
+      const replayChannel = createTerminalDataChannel(request.terminalId)
+      const resumed = await invokeIpc<TerminalResumeGrant>(IPC_COMMANDS.RESUME, {
+        request,
+        onData: replayChannel
+      })
+      if (!resumed.success) {
+        replayChannel.onmessage = () => {}
+        return {
+          success: false,
+          error: resumed.code === 'UNAUTHORIZED' ? 'Unauthorized' : 'Terminal resume failed',
+          code: resumed.code
+        }
+      }
+      if (resumed.data.terminal.id !== request.terminalId || !resumed.data.claim) {
+        replayChannel.onmessage = () => {}
+        return {
+          success: false,
+          error: 'Terminal resume failed',
+          code: 'NETWORK_ERROR'
+        }
+      }
+
+      const attached = await attachTerminal(
+        resumed.data.terminal.id,
+        resumed.data.claim,
+        resumed.data.terminal.latestSeq
+      )
+      if (!attached.success) {
+        replayChannel.onmessage = () => {}
+        return {
+          success: false,
+          error: attached.code === 'UNAUTHORIZED' ? 'Unauthorized' : 'Terminal resume failed',
+          code: attached.code
+        }
+      }
+
+      return resumed
+    },
+
+    /**
      * CAP-3: attach to a terminal's output stream with terminalId + claim +
      * lastSeq. The host verifies the credential BEFORE any replay; every
      * verification failure resolves to the generic UNAUTHORIZED error with no
@@ -384,38 +476,7 @@ export function createTauriTerminalApi(): TerminalApi {
      * channel (parity with the spawn channel), and the response's `latestSeq`
      * is the desktop reattach cursor.
      */
-    async attach(
-      terminalId: string,
-      claim: string,
-      lastSeq: number
-    ): Promise<IpcResult<TerminalAttachResult>> {
-      // Never present an id-only attach — the credential is the gate.
-      if (!claim) {
-        return { success: false, error: 'Unauthorized', code: 'UNAUTHORIZED' }
-      }
-      const on_data = new Channel<ArrayBuffer>()
-      on_data.onmessage = (buf: ArrayBuffer) => {
-        const bytes = new Uint8Array(buf)
-        for (const callback of dataCallbacks) {
-          try {
-            callback(terminalId, bytes)
-          } catch (err) {
-            console.error('[BinaryChannel] Error in attach data callback:', err)
-          }
-        }
-      }
-      const result = await invokeIpc<TerminalAttachResult>(IPC_COMMANDS.ATTACH, {
-        terminalId,
-        claim,
-        lastSeq,
-        onData: on_data
-      })
-      if (!result.success) {
-        // Rejected (or failed) — release the channel so it cannot leak.
-        on_data.onmessage = () => {}
-      }
-      return result
-    },
+    attach: attachTerminal,
 
     /**
      * CAP-3: possession-based rotation — the returned credential replaces the
@@ -446,11 +507,21 @@ export function createTauriTerminalApi(): TerminalApi {
       return invokeIpc<void>(IPC_COMMANDS.RESIZE, { terminalId, cols, rows })
     },
 
-    /**
-     * Kill terminal PTY
-     */
+    /** Close one renderer view; the PTY and claim survive. */
+    async closeView(terminalId: string): Promise<IpcResult<void>> {
+      return invokeIpc<void>(IPC_COMMANDS.CLOSE_VIEW, { terminalId })
+    },
+
+    /** Explicitly terminate the PTY resource. Structured cleanup failures pass through unchanged. */
+    async terminate(terminalId: string): Promise<IpcResult<void>> {
+      const result = await invokeIpc<void>(IPC_COMMANDS.TERMINATE, { terminalId })
+      return result
+    },
+
+    /** @deprecated compatibility alias for terminate. */
     async kill(terminalId: string): Promise<IpcResult<void>> {
-      return invokeIpc<void>(IPC_COMMANDS.KILL, { terminalId })
+      const result = await invokeIpc<void>(IPC_COMMANDS.KILL, { terminalId })
+      return result
     },
 
     /**
@@ -464,6 +535,24 @@ export function createTauriTerminalApi(): TerminalApi {
       dataCallbacks.add(callback)
       return () => {
         dataCallbacks.delete(callback)
+      }
+    },
+
+    onDataForTerminal(terminalId: string, callback: TerminalScopedDataCallback): () => void {
+      let callbacks = scopedDataCallbacks.get(terminalId)
+      if (!callbacks) {
+        callbacks = new Set()
+        scopedDataCallbacks.set(terminalId, callbacks)
+      }
+      callbacks.add(callback)
+
+      return () => {
+        const current = scopedDataCallbacks.get(terminalId)
+        if (!current) return
+        current.delete(callback)
+        if (current.size === 0) {
+          scopedDataCallbacks.delete(terminalId)
+        }
       }
     },
 

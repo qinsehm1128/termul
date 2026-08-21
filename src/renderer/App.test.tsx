@@ -1,17 +1,86 @@
-import { render, waitFor } from '@testing-library/react'
+import { render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { useProjectStore } from '@/stores/project-store'
 import { useUpdaterStore } from '@/stores/updater-store'
 import { CONTEXT_BAR_SETTINGS_KEY } from '@/types/settings'
 import App from './App'
 
-const { mockContextBarSettingsRead } = vi.hoisted(() => ({
-  mockContextBarSettingsRead: vi.fn()
+const {
+  mockContextBarSettingsRead,
+  mockSessionWorkspaceBootstrap,
+  mockConversationHostBootstrap,
+  mockConversationLifecycle,
+  mockTerminalResourceLifecycle
+} = vi.hoisted(() => ({
+  mockContextBarSettingsRead: vi.fn(),
+  mockSessionWorkspaceBootstrap: vi.fn(),
+  mockConversationHostBootstrap: vi.fn(),
+  mockConversationLifecycle: vi.fn(),
+  mockTerminalResourceLifecycle: vi.fn()
+}))
+
+vi.mock('@/components/workspace/PaneRenderer', () => ({
+  PaneRenderer: () => <div data-testid="pane-renderer" />
+}))
+
+vi.mock('@/components/conversation/ConversationRoute', () => ({
+  ConversationRoute: () => <div data-testid="canonical-conversation-route" />
+}))
+
+vi.mock('@/components/ChatRoute', () => ({
+  ChatRoute: ({ sourceKind }: { sourceKind: string }) => (
+    <div data-testid="legacy-conversation-route" data-source-kind={sourceKind} />
+  )
+}))
+
+vi.mock('@/components/DirectoryPicker', () => ({
+  DirectoryPicker: () => <div data-testid="web-directory-picker" />
+}))
+
+vi.mock('@/lib/tauri-runtime', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/tauri-runtime')>()),
+  isTauriContext: () => false
+}))
+
+vi.mock('./hooks/use-session-workspace-sync', () => ({
+  useSessionWorkspaceBootstrap: mockSessionWorkspaceBootstrap,
+  useSessionWorkspaceSync: vi.fn(),
+  resolveSessionWorkspaceConflict: vi.fn(),
+  resolveSessionWorkspaceRecovery: vi.fn()
+}))
+
+vi.mock('./hooks/use-conversation-host-bootstrap', () => ({
+  useConversationHostBootstrap: mockConversationHostBootstrap
+}))
+
+vi.mock('@/components/conversation/ConversationHostStatus', () => ({
+  ConversationHostStatus: () => <div data-testid="conversation-host-status" />
+}))
+
+vi.mock('@/components/conversation/ConversationRecoveryPanel', () => ({
+  ConversationRecoveryPanel: () => (
+    <aside aria-label="Conversation recovery" data-testid="conversation-recovery-panel">
+      <button type="button">Inspect preserved source</button>
+      <button type="button">Associate conversation</button>
+      <button type="button">Start empty workspace</button>
+      <button type="button">Dismiss preserved source</button>
+    </aside>
+  )
+}))
+
+vi.mock('./hooks/use-conversation-lifecycle', () => ({
+  useConversationLifecycle: mockConversationLifecycle
+}))
+
+vi.mock('./hooks/use-terminal-resource-lifecycle', () => ({
+  useTerminalResourceLifecycle: mockTerminalResourceLifecycle
 }))
 
 vi.mock('./hooks/use-context-bar-settings', () => ({
   useContextBarSettings: () => {
     void mockContextBarSettingsRead(CONTEXT_BAR_SETTINGS_KEY)
-  }
+  },
+  useUpdateContextBarSetting: () => vi.fn(async () => undefined)
 }))
 
 const { mockUseVisibilityState } = vi.hoisted(() => ({
@@ -58,6 +127,12 @@ vi.mock('./hooks/use-terminal-exit-notification', () => ({
 vi.mock('./hooks/use-remote-projects', () => ({
   useRemoteProjects: mockUseRemoteProjects
 }))
+
+vi.mock('./hooks/use-acp-listeners', () => ({ useAcpListeners: () => undefined }))
+vi.mock('./hooks/use-acp-agents', () => ({ useAcpAgents: () => undefined }))
+vi.mock('./hooks/use-acp-history', () => ({ useAcpHistory: () => undefined }))
+vi.mock('./hooks/use-acp-session-resume', () => ({ useAcpSessionResume: () => undefined }))
+vi.mock('./hooks/use-acp-mcp', () => ({ useAcpMcp: () => undefined }))
 
 vi.mock('./hooks/use-whats-new', () => ({
   useWhatsNew: mockUseWhatsNew
@@ -151,7 +226,9 @@ const mockApi = {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  window.location.hash = '#/'
   vi.stubGlobal('api', mockApi)
+  useProjectStore.setState({ projects: [], groups: [], activeProjectId: '', isLoaded: true })
   useUpdaterStore.setState({
     updateAvailable: false,
     version: null,
@@ -175,6 +252,21 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
+const RECOVERY_ACTION_LABELS = [
+  'Inspect preserved source',
+  'Associate conversation',
+  'Start empty workspace',
+  'Dismiss preserved source'
+] as const
+
+function expectSingleRecoveryOwner(): void {
+  expect(screen.getAllByRole('complementary', { name: 'Conversation recovery' })).toHaveLength(1)
+  expect(screen.getAllByTestId('conversation-recovery-panel')).toHaveLength(1)
+  for (const label of RECOVERY_ACTION_LABELS) {
+    expect(screen.getAllByRole('button', { name: label })).toHaveLength(1)
+  }
+}
+
 describe('App Component', () => {
   it('should render without crashing', () => {
     render(<App />)
@@ -186,14 +278,25 @@ describe('App Component', () => {
     // App renders and providers work - verify by checking rendered content exists
     expect(document.body.innerHTML.length).toBeGreaterThan(0)
   })
+
+  it('keeps the browser-only directory picker around the shared portable shell', () => {
+    render(<App />)
+
+    expect(document.querySelector('[data-testid="web-directory-picker"]')).not.toBeNull()
+    expect(mockSessionWorkspaceBootstrap).toHaveBeenCalled()
+  })
 })
 
 describe('App Routes', () => {
-  it('should render WorkspaceDashboard on root path', () => {
+  it('renders the regular project workspace through the production WorkspaceLayout at root', async () => {
     render(<App />)
-    // WorkspaceDashboard should be rendered by default
-    // Check for presence of rendered content (indicates route matched)
-    expect(document.body.innerHTML).toBeTruthy()
+
+    expect(await screen.findByTestId('pane-renderer')).toBeVisible()
+    expect(
+      screen.queryByRole('heading', { name: 'Your Conversation workspace' })
+    ).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'New Chat' })).not.toBeInTheDocument()
+    expectSingleRecoveryOwner()
   })
 
   it('loads context bar settings on mount', async () => {
@@ -207,6 +310,53 @@ describe('App Routes', () => {
   it('wires app visibility tracking at app scope', () => {
     render(<App />)
     expect(mockUseVisibilityState).toHaveBeenCalled()
+  })
+
+  it('mounts the portable SessionWorkspace bootstrap at the web root', () => {
+    render(<App />)
+    expect(mockSessionWorkspaceBootstrap).toHaveBeenCalled()
+  })
+
+  it('mounts shared Conversation creation and recovery wiring at the web root', () => {
+    render(<App />)
+    expect(mockConversationHostBootstrap).toHaveBeenCalled()
+    expect(document.querySelector('[data-testid="conversation-host-status"]')).not.toBeNull()
+    expectSingleRecoveryOwner()
+  })
+
+  it('mounts Conversation lifecycle reconciliation at the web root', () => {
+    render(<App />)
+    expect(mockConversationLifecycle).toHaveBeenCalled()
+  })
+
+  it('mounts terminal resource reconciliation at the web root', () => {
+    render(<App />)
+    expect(mockTerminalResourceLifecycle).toHaveBeenCalled()
+  })
+
+  it('registers the canonical Conversation route in the web root', async () => {
+    window.location.hash = '#/c/018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+    render(<App />)
+
+    await waitFor(() => {
+      expect(document.querySelector('[data-testid="canonical-conversation-route"]')).not.toBeNull()
+    })
+  })
+
+  it.each([
+    ['session', 'legacyAgentSessionId'],
+    ['storage', 'legacyStorageKey'],
+    ['history', 'legacyChatHistoryId']
+  ])('registers the legacy %s resolver route in the web root', async (route, sourceKind) => {
+    window.location.hash = `#/legacy/${route}/opaque-value`
+    render(<App />)
+
+    await waitFor(() => {
+      expect(document.querySelector('[data-testid="legacy-conversation-route"]')).toHaveAttribute(
+        'data-source-kind',
+        sourceKind
+      )
+    })
   })
 })
 
@@ -293,25 +443,25 @@ describe('App CAP-3 resilience wiring (web entry)', () => {
   it('calls useWhatsNew in the App body', () => {
     render(<App />)
 
-    expect(mockUseWhatsNew).toHaveBeenCalledTimes(1)
+    expect(mockUseWhatsNew).toHaveBeenCalled()
   })
 
-  it('mounts useCrashRecovery in AppEffects', () => {
+  it('mounts useCrashRecovery in PortableAppEffects', () => {
     render(<App />)
 
-    expect(mockUseCrashRecovery).toHaveBeenCalledTimes(1)
+    expect(mockUseCrashRecovery).toHaveBeenCalled()
   })
 
-  it('mounts useTerminalExitNotification in AppEffects', () => {
+  it('mounts useTerminalExitNotification in PortableAppEffects', () => {
     render(<App />)
 
-    expect(mockUseTerminalExitNotification).toHaveBeenCalledTimes(1)
+    expect(mockUseTerminalExitNotification).toHaveBeenCalled()
   })
 
-  it('mounts useRemoteProjects in AppEffects', () => {
+  it('mounts useRemoteProjects in PortableAppEffects', () => {
     render(<App />)
 
-    expect(mockUseRemoteProjects).toHaveBeenCalledTimes(1)
+    expect(mockUseRemoteProjects).toHaveBeenCalled()
   })
 
   it('calls initNotificationPermissions on mount (useEffect [])', async () => {

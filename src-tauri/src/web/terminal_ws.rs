@@ -1,36 +1,51 @@
 //! Dedicated interactive terminal websocket.
 //!
-//! This endpoint intentionally stays separate from the ACP relay. Authentication
-//! is not implemented yet; never expose it to an untrusted network. All
-//! operations are project-scoped: a connection may only interact with terminals
-//! whose `project_id` it has been authorized for via spawn, claim-gated attach,
-//! or companion `watch` after `list`.
-//!
-//! `list` + `watch` are the companion-viewer path (Orca-style): enumerate live
-//! host PTYs for a project and subscribe to scrollback/output without rotating
-//! the desktop claim. `attach` remains CAP-3 claim-gated.
+//! This endpoint intentionally stays separate from the ACP relay. The shared
+//! router admits it only after bearer capability middleware succeeds. All
+//! operations are Conversation-scoped: `conversationId` is the primary PTY
+//! ownership/claim scope. `projectId` is optional attribution only.
+//! Companion clients can enumerate project-attributed PTYs with `list` and
+//! subscribe without rotating the desktop claim with `watch`; the bearer
+//! principal and current claim generation still fence passive output.
 
-use std::collections::{HashMap, HashSet};
+use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use parking_lot::RwLock;
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::response::IntoResponse;
+use axum::Extension;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+#[cfg(test)]
 use crate::pty::manager::SpawnOptions;
+use crate::pty::manager::{TerminalReplay, TerminalResumeRequest, TerminalSpawnIntentV1};
+use crate::web::auth::{
+    auth_error_response, RemoteAccessAuthority, RemoteAuthError, RemoteCapability, RemotePrincipal,
+};
 use crate::web::ws::AppState;
 
 const MAX_RECONNECT_FRAMES: usize = 64;
+const ATTACH_GENERATION_CHECK_MS: u64 = 250;
+const BINARY_SUBPROTOCOL: &str = "termul-terminal-v2.binary";
+const BINARY_FRAME_MAGIC: &[u8; 4] = b"TML2";
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum BinaryOutputKind {
+    Live = 1,
+    Replay = 2,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Request {
     id: String,
     #[serde(rename = "type")]
@@ -39,14 +54,104 @@ struct Request {
     payload: Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AuthorizedTerminalScope {
+    conversation_id: crate::conversation::ConversationId,
+    claim_generation: Option<u64>,
+    cleanup_only: bool,
+}
+
+type AuthorizedTerminals = Arc<RwLock<HashMap<String, AuthorizedTerminalScope>>>;
+
 pub async fn terminal_ws_upgrade(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    Extension(principal): Extension<RemotePrincipal>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| run(socket, state))
+    if let Err(error) = authorize_terminal_upgrade(&authority, &principal, &headers) {
+        warn!(
+            target: "termul::web::terminal_ws",
+            principal_class = ?principal.authority_source(),
+            stable_code = error.code(),
+            "terminal WebSocket upgrade rejected by authentication policy"
+        );
+        return auth_error_response(error);
+    }
+    info!(
+        target: "termul::web::terminal_ws",
+        principal_class = ?principal.authority_source(),
+        stable_code = "OK",
+        "terminal WebSocket upgrade authenticated"
+    );
+    let binary_output = supports_binary_subprotocol(&headers);
+    let ws = if binary_output {
+        ws.protocols([BINARY_SUBPROTOCOL])
+    } else {
+        ws
+    };
+    info!(
+        target: "termul::web::terminal_ws",
+        binary_output,
+        "terminal WebSocket output protocol selected"
+    );
+    ws.on_upgrade(move |socket| run(socket, state, authority, principal, binary_output))
+        .into_response()
 }
 
-async fn run(socket: WebSocket, state: AppState) {
+fn supports_binary_subprotocol(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|protocol| protocol.trim() == BINARY_SUBPROTOCOL)
+}
+
+fn authorize_terminal_upgrade(
+    authority: &RemoteAccessAuthority,
+    principal: &RemotePrincipal,
+    headers: &HeaderMap,
+) -> Result<(), RemoteAuthError> {
+    authority.verify_origin(headers.get(axum::http::header::ORIGIN))?;
+    authority.authorize(principal, RemoteCapability::Mutate)
+}
+
+fn principal_generation_mismatch(
+    authority: &RemoteAccessAuthority,
+    principal: &RemotePrincipal,
+) -> bool {
+    let current = authority.generation_state();
+    !current.active || current.generation != principal.generation()
+}
+
+fn should_forward_passive(authority: &RemoteAccessAuthority, principal_generation: u64) -> bool {
+    let current = authority.generation_state();
+    current.active && current.generation == principal_generation
+}
+
+async fn abort_and_join_connection_tasks(
+    event_task: tokio::task::JoinHandle<()>,
+    attachments: HashMap<String, tokio::task::JoinHandle<()>>,
+) {
+    event_task.abort();
+    for task in attachments.values() {
+        task.abort();
+    }
+    let _ = event_task.await;
+    for task in attachments.into_values() {
+        let _ = task.await;
+    }
+}
+
+async fn run(
+    socket: WebSocket,
+    state: AppState,
+    authority: Arc<RemoteAccessAuthority>,
+    principal: RemotePrincipal,
+    binary_output: bool,
+) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::channel::<Message>(MAX_RECONNECT_FRAMES);
 
@@ -58,37 +163,48 @@ async fn run(socket: WebSocket, state: AppState) {
         }
     });
 
-    // Per-connection authorization: terminal IDs this socket may operate on.
-    // Shared with the event-forwarding task so it can see updates.
-    let authorized: Arc<RwLock<HashSet<String>>> =
-        Arc::new(RwLock::new(HashSet::new()));
+    // Per-connection authorization: exact terminal + Conversation + claim
+    // generation scopes this socket may operate on. The generation binding is
+    // essential: a resume/rotate on another connection must revoke every
+    // derived write/query/event capability here, not only the output stream.
+    // Shared with the event-forwarding task so it sees rotations immediately.
+    let authorized: AuthorizedTerminals = Arc::new(RwLock::new(HashMap::new()));
     // Per-terminal output forwarding tasks.
     let attachments: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
 
-    info!("[terminal-ws] client connected (authentication deferred)");
+    info!("[terminal-ws] client connected after router authentication");
 
     let event_tx = tx.clone();
     let event_state = state.clone();
     let event_authorized = authorized.clone();
+    let event_authority = Arc::clone(&authority);
+    let event_principal_generation = principal.generation();
     let mut event_rx = event_state.terminal_events.subscribe();
+    let mut generation_rx = authority.subscribe_generation();
     let event_task = tokio::spawn(async move {
         loop {
             match event_rx.recv().await {
                 Ok(event) => {
+                    if !should_forward_passive(&event_authority, event_principal_generation) {
+                        break;
+                    }
                     let terminal_id = event.terminal_id().to_string();
-                    // Only forward events for terminals this connection is
-                    // authorized to see.
-                    if !event_authorized.read().contains(&terminal_id) {
+                    // Only forward events while the exact Conversation scope
+                    // and claim generation authorized for this connection are
+                    // still live. A cross-connection resume/rotate/revoke
+                    // invalidates event visibility as well as terminal output.
+                    if live_authorized_terminal_scope(&event_state, &event_authorized, &terminal_id)
+                        .is_none()
+                    {
                         continue;
                     }
-                    let payload = serde_json::to_value(&event)
-                        .unwrap_or_else(|_| json!({}));
-                    if send_json(
-                        &event_tx,
-                        json!({ "type": "event", "payload": payload }),
-                    )
-                    .await
-                    .is_err()
+                    if !should_forward_passive(&event_authority, event_principal_generation) {
+                        break;
+                    }
+                    let payload = serde_json::to_value(&event).unwrap_or_else(|_| json!({}));
+                    if send_json(&event_tx, json!({ "type": "event", "payload": payload }))
+                        .await
+                        .is_err()
                     {
                         break;
                     }
@@ -104,63 +220,148 @@ async fn run(socket: WebSocket, state: AppState) {
     let mut ctx = ConnectionContext {
         authorized: authorized.clone(),
         attachments,
+        binary_output,
     };
 
-    while let Some(frame) = stream.next().await {
-        let Ok(message) = frame else { break };
-        let Message::Text(text) = message else { continue };
-        let request = match serde_json::from_str::<Request>(&text) {
-            Ok(request) => request,
-            Err(error) => {
-                let _ = send_error(&tx, "malformed", "VALIDATION_ERROR", error.to_string()).await;
-                continue;
+    loop {
+        if principal_generation_mismatch(&authority, &principal) {
+            info!(
+                target: "termul::web::terminal_ws",
+                generation = principal.generation(),
+                lifecycle_phase = "generation_mismatch",
+                stable_code = "OK",
+                "terminal WebSocket closing after authority generation change"
+            );
+            break;
+        }
+        tokio::select! {
+            changed = generation_rx.changed() => {
+                if changed.is_err() || principal_generation_mismatch(&authority, &principal) {
+                    info!(
+                        target: "termul::web::terminal_ws",
+                        generation = principal.generation(),
+                        lifecycle_phase = "generation_mismatch",
+                        stable_code = "OK",
+                        "terminal WebSocket closing after authority generation change"
+                    );
+                    break;
+                }
             }
-        };
-        let id = request.id.clone();
-        let op_type = request.type_.clone();
-        info!("[terminal-ws] request start type={op_type} id={id}");
-        match handle(request, &state, &tx, &mut ctx).await {
-            Ok(data) => {
-                info!("[terminal-ws] request success type={op_type} id={id}");
-                let _ = send_json(&tx, json!({ "id": id, "success": true, "data": data })).await;
-            }
-            Err((code, message)) => {
-                warn!("[terminal-ws] request failed type={op_type} id={id} code={code}");
-                let _ = send_error(&tx, &id, code, message).await;
+            frame = stream.next() => {
+                let Some(frame) = frame else { break };
+                let Ok(message) = frame else { break };
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                if principal_generation_mismatch(&authority, &principal) {
+                    break;
+                }
+                let request = match serde_json::from_str::<Request>(&text) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        let _ = send_error(&tx, "malformed", "VALIDATION_ERROR", error.to_string()).await;
+                        continue;
+                    }
+                };
+                let id = request.id.clone();
+                let op_type = request.type_.clone();
+                info!("[terminal-ws] request start type={op_type}");
+                match handle(request, &state, &authority, &principal, &tx, &mut ctx).await {
+                    Ok(data) => {
+                        info!("[terminal-ws] request success type={op_type}");
+                        let _ = send_json(&tx, json!({ "id": id, "success": true, "data": data })).await;
+                    }
+                    Err((code, message)) => {
+                        warn!("[terminal-ws] request failed type={op_type} code={code}");
+                        let _ = send_error(&tx, &id, code, message).await;
+                    }
+                }
             }
         }
     }
 
-    // Cleanup: abort all output forwarding tasks. PTYs are preserved.
-    event_task.abort();
-    for task in ctx.attachments.values() {
-        task.abort();
-    }
-    info!("[terminal-ws] client disconnected; {} PTY(s) preserved", ctx.authorized.read().len());
+    // Cleanup: abort and join event/attachment tasks. PTYs are preserved.
+    let attachments = std::mem::take(&mut ctx.attachments);
+    abort_and_join_connection_tasks(event_task, attachments).await;
+    info!(
+        "[terminal-ws] client disconnected; {} PTY(s) preserved",
+        ctx.authorized.read().len()
+    );
     drop(tx);
     let _ = write_task.await;
 }
 
 struct ConnectionContext {
-    /// Terminal IDs this connection is authorized to operate on.
-    authorized: Arc<RwLock<HashSet<String>>>,
+    /// Exact terminal → Conversation + claim-generation scopes authorized on
+    /// this connection.
+    authorized: AuthorizedTerminals,
     /// Per-terminal output forwarding tasks (terminal_id -> task).
     attachments: HashMap<String, tokio::task::JoinHandle<()>>,
+    /// True only when the client requested and negotiated the v2 binary output subprotocol.
+    binary_output: bool,
 }
 
 impl ConnectionContext {
-    fn authorize(&mut self, terminal_id: &str) {
-        self.authorized.write().insert(terminal_id.to_string());
+    fn authorize(
+        &mut self,
+        terminal_id: &str,
+        conversation_id: crate::conversation::ConversationId,
+        claim_generation: u64,
+    ) {
+        self.authorized.write().insert(
+            terminal_id.to_string(),
+            AuthorizedTerminalScope {
+                conversation_id,
+                claim_generation: Some(claim_generation),
+                cleanup_only: false,
+            },
+        );
     }
 
+    fn authorize_cleanup(
+        &mut self,
+        terminal_id: &str,
+        conversation_id: crate::conversation::ConversationId,
+    ) {
+        self.authorized.write().insert(
+            terminal_id.to_string(),
+            AuthorizedTerminalScope {
+                conversation_id,
+                claim_generation: None,
+                cleanup_only: true,
+            },
+        );
+    }
+
+    fn scope(&self, terminal_id: &str) -> Option<AuthorizedTerminalScope> {
+        self.authorized.read().get(terminal_id).copied()
+    }
+
+    fn has_live_authorization(&self, state: &AppState) -> bool {
+        let scopes = self
+            .authorized
+            .read()
+            .iter()
+            .map(|(terminal_id, scope)| (terminal_id.clone(), *scope))
+            .collect::<Vec<_>>();
+        scopes.into_iter().any(|(terminal_id, scope)| {
+            terminal_authorization_is_live(state, &terminal_id, scope).is_some()
+        })
+    }
+
+    #[cfg(test)]
     fn is_authorized(&self, terminal_id: &str) -> bool {
-        self.authorized.read().contains(terminal_id)
+        self.authorized.read().contains_key(terminal_id)
     }
 
-    fn detach(&mut self, terminal_id: &str) {
+    fn close_view(&mut self, terminal_id: &str) {
         if let Some(task) = self.attachments.remove(terminal_id) {
             task.abort();
         }
+    }
+
+    fn detach(&mut self, terminal_id: &str) {
+        self.close_view(terminal_id);
         self.authorized.write().remove(terminal_id);
     }
 }
@@ -168,35 +369,108 @@ impl ConnectionContext {
 async fn handle(
     request: Request,
     state: &AppState,
+    authority: &Arc<RemoteAccessAuthority>,
+    principal: &RemotePrincipal,
     tx: &mpsc::Sender<Message>,
     ctx: &mut ConnectionContext,
 ) -> Result<Value, (&'static str, String)> {
+    authority
+        .authorize(principal, RemoteCapability::Mutate)
+        .map_err(|_| unauthorized_error("principal"))?;
+
     match request.type_.as_str() {
         "spawn" => {
-            let options: SpawnOptions = serde_json::from_value(request.payload)
-                .map_err(|e| ("VALIDATION_ERROR", e.to_string()))?;
-            // Require project_id so the terminal is scoped — do not default
-            // to a literal that any client can target.
-            if options.project_id.as_deref().filter(|s| !s.is_empty()).is_none() {
-                return Err((
-                    "VALIDATION_ERROR",
-                    "spawn requires a non-empty projectId".to_string(),
-                ));
-            }
+            let intent: TerminalSpawnIntentV1 = serde_json::from_value(request.payload)
+                .map_err(|error| ("VALIDATION_ERROR", error.to_string()))?;
+            let conversation_id = intent.conversation_id;
+            let cwd_source = match intent.cwd_source {
+                crate::pty::manager::TerminalCwdSource::Workspace => "workspace",
+                crate::pty::manager::TerminalCwdSource::ExecutionTarget => "executionTarget",
+            };
             info!(
-                "[terminal-ws] spawn requested project_id={}",
-                options.project_id.as_deref().unwrap_or("?")
+                "[terminal-ws] spawn requested conversation_id={} project_attribution_present={} cwd_source={}",
+                conversation_id,
+                intent.project_id.is_some(),
+                cwd_source
             );
-            // CAP-3: spawn is the only issuance path. The reply carries the
-            // flattened info + claim (same camelCase shape as desktop).
-            let spawned = state
+
+            let conversation = terminal_conversation_service(state)?;
+            let record = conversation
+                .get_conversation(conversation_id)
+                .map_err(|error| {
+                    (
+                        terminal_resource_code(Some(error.code.as_str())),
+                        error.detail,
+                    )
+                })?;
+            let workspace = conversation.session_workspace();
+            let result = crate::commands::terminal_spawn_intent_resource(
+                intent, &record, &state.pty, &workspace,
+            )
+            .await;
+            if !result.success {
+                let code = terminal_resource_code(result.code.as_deref());
+                let error = result
+                    .error
+                    .unwrap_or_else(|| "terminal spawn failed".to_string());
+                retain_compound_cleanup_authorization(state, ctx, code, &error);
+                return Err((code, error));
+            }
+            let spawned = result.data.expect("successful terminal spawn has data");
+            debug_assert_eq!(
+                state
+                    .pty
+                    .get(&spawned.info.id)
+                    .map(|instance| instance.conversation_id),
+                Some(conversation_id)
+            );
+            let generation = state
                 .pty
-                .spawn(options, None)
-                .await
-                .map_err(|e| ("SPAWN_FAILED", e))?;
-            ctx.authorize(&spawned.info.id);
-            info!("[terminal-ws] spawn success terminal_id={}", spawned.info.id);
-            serde_json::to_value(spawned).map_err(|e| ("SPAWN_FAILED", e.to_string()))
+                .claim_generation(&spawned.info.id)
+                .ok_or_else(|| unauthorized_error(&spawned.info.id))?;
+            ctx.authorize(&spawned.info.id, conversation_id, generation);
+            info!(
+                "[terminal-ws] spawn success conversation_id={} terminal_id={} cwd_source={}",
+                conversation_id, spawned.info.id, cwd_source
+            );
+            serde_json::to_value(spawned).map_err(|error| ("SPAWN_FAILED", error.to_string()))
+        }
+        "resume" => {
+            let resume: TerminalResumeRequest = serde_json::from_value(request.payload)
+                .map_err(|error| ("VALIDATION_ERROR", error.to_string()))?;
+            if resume.terminal_id.trim().is_empty() {
+                return Err(("VALIDATION_ERROR", "missing terminalId".to_string()));
+            }
+            let workspace = terminal_workspace_service(state)?;
+            let (grant, replay) =
+                crate::commands::terminal_resume_resource(&resume, &state.pty, &workspace)
+                    .await
+                    .map_err(|_| unauthorized_error(&resume.terminal_id))?;
+            let generation = replay
+                .claim_generation
+                .ok_or_else(|| unauthorized_error(&resume.terminal_id))?;
+            ctx.authorize(&resume.terminal_id, resume.conversation_id, generation);
+            install_replay_forwarder(
+                &resume.terminal_id,
+                replay,
+                generation,
+                state,
+                PassiveForwardAuth {
+                    authority,
+                    principal_generation: principal.generation(),
+                },
+                tx,
+                ctx,
+            )
+            .await?;
+            info!(
+                "[terminal-ws] resume success conversation_id={} terminal_id={} latest_seq={} gap={}",
+                resume.conversation_id,
+                resume.terminal_id,
+                grant.terminal.latest_seq,
+                grant.terminal.gap
+            );
+            serde_json::to_value(grant).map_err(|error| ("NETWORK_ERROR", error.to_string()))
         }
         "list" => {
             let project_id = string_field(&request.payload, "projectId")?;
@@ -204,7 +478,7 @@ async fn handle(
                 .pty
                 .get_all()
                 .into_iter()
-                .filter(|instance| instance.project_matches(project_id))
+                .filter(|instance| instance.is_active() && instance.project_matches(project_id))
                 .map(|instance| {
                     let cwd = state
                         .cwd_tracker
@@ -224,34 +498,31 @@ async fn handle(
             let terminal_id = string_field(&request.payload, "terminalId")?.to_string();
             let last_seq = request.payload["lastSeq"].as_u64().unwrap_or(0);
             info!("[terminal-ws] watch requested terminal_id={terminal_id}");
-            bind_output_stream(
+            bind_companion_output_stream(
                 state,
+                authority,
+                principal,
                 tx,
                 ctx,
                 terminal_id,
                 last_seq,
-                StreamGate::CompanionWatch,
             )
             .await
         }
         "write" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
-            if !ctx.is_authorized(terminal_id) {
-                return Err(("UNAUTHORIZED", format!("Not authorized for terminal {terminal_id}")));
-            }
+            authorized_terminal_scope(state, ctx, terminal_id)?;
             let data = string_field(&request.payload, "data")?;
             state
                 .pty
                 .write(terminal_id, data)
                 .await
                 .map(|_| Value::Null)
-                .map_err(|e| ("WRITE_FAILED", e))
+                .map_err(|error| ("WRITE_FAILED", error))
         }
         "resize" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
-            if !ctx.is_authorized(terminal_id) {
-                return Err(("UNAUTHORIZED", format!("Not authorized for terminal {terminal_id}")));
-            }
+            authorized_terminal_scope(state, ctx, terminal_id)?;
             let cols = u16_field(&request.payload, "cols")?;
             let rows = u16_field(&request.payload, "rows")?;
             state
@@ -259,27 +530,26 @@ async fn handle(
                 .resize(terminal_id, cols, rows)
                 .await
                 .map(|_| Value::Null)
-                .map_err(|e| ("RESIZE_FAILED", e))
+                .map_err(|error| ("RESIZE_FAILED", error))
         }
-        "kill" => {
+        "terminate" | "kill" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
-            // Idempotent kill: if the terminal is already gone, treat as success
-            // so a lost reply or double-close doesn't leave an uncloseable tab.
-            if state.pty.get(terminal_id).is_none() {
-                ctx.detach(terminal_id);
-                return Ok(Value::Null);
+            let scope = authorized_terminal_cleanup_scope(state, ctx, terminal_id)?;
+            let workspace = terminal_workspace_service(state)?;
+            let result =
+                crate::commands::terminal_terminate_resource(terminal_id, &state.pty, &workspace)
+                    .await;
+            if !result.success {
+                return Err((
+                    terminal_resource_code(result.code.as_deref()),
+                    result
+                        .error
+                        .unwrap_or_else(|| "terminal termination failed".to_string()),
+                ));
             }
-            // Force-kill: bypass the desktop is_hidden deferral so web close
-            // actually terminates the process. Desktop behavior is unchanged.
-            state
-                .pty
-                .force_kill(terminal_id)
-                .await
-                .map(|_| {
-                    ctx.detach(terminal_id);
-                    Value::Null
-                })
-                .map_err(|e| ("KILL_FAILED", e))
+            debug_assert!(state.pty.get(terminal_id).is_none(), "scope={scope}");
+            ctx.detach(terminal_id);
+            Ok(Value::Null)
         }
         "attach" => {
             let terminal_id = string_field(&request.payload, "terminalId")?.to_string();
@@ -289,17 +559,56 @@ async fn handle(
             // hidden). A missing or empty claim is NOT a shape error: it flows
             // through verification like any bad credential (contract: "missing/
             // invalid claim" collapses into the one generic error).
-            let claim = request.payload["claim"].as_str().unwrap_or("").to_string();
+            let claim = request.payload["claim"].as_str().unwrap_or("");
             let last_seq = request.payload["lastSeq"].as_u64().unwrap_or(0);
-            bind_output_stream(
+
+            // Capture the generation BEFORE verifying (TOCTOU-safe ordering,
+            // same as the desktop command): captured-first means a rotate/
+            // revoke landing mid-handshake either fails verification or leaves
+            // the attachment task holding a stale generation it terminates on.
+            let generation = state
+                .pty
+                .claim_generation(&terminal_id)
+                .ok_or_else(|| unauthorized_error(&terminal_id))?;
+            if state.pty.verify_claim(&terminal_id, claim).is_err() {
+                return Err(unauthorized_error(&terminal_id));
+            }
+            let Some(instance) = state.pty.get(&terminal_id) else {
+                // Verified a heartbeat ago but gone now — same generic error.
+                return Err(unauthorized_error(&terminal_id));
+            };
+            if state.pty.claim_generation(&terminal_id) != Some(generation) {
+                // A resume/rotate/revoke won after verification. Never derive
+                // connection authorization from the invalidated generation.
+                return Err(unauthorized_error(&terminal_id));
+            }
+            // The credential is the gate now (same-connection prior
+            // authorization no longer is): verified attach authorizes the
+            // connection for write/resize/events on this exact terminal scope
+            // only while this claim generation remains current.
+            ctx.authorize(&terminal_id, instance.conversation_id, generation);
+
+            // Sequenced replay: only unseen chunks, with gap detection.
+            let replay = instance.subscribe_from(last_seq);
+            let attach_result = state.pty.build_attach_result(&instance, &replay);
+            install_replay_forwarder(
+                &terminal_id,
+                replay,
+                generation,
                 state,
+                PassiveForwardAuth {
+                    authority,
+                    principal_generation: principal.generation(),
+                },
                 tx,
                 ctx,
-                terminal_id,
-                last_seq,
-                StreamGate::Claim { claim },
             )
-            .await
+            .await?;
+
+            // Shared attach result — byte-identical camelCase shape to the
+            // desktop `terminal_attach` response (no claim key, ever).
+            serde_json::to_value(attach_result)
+                .map_err(|error| ("NETWORK_ERROR", error.to_string()))
         }
         "rotate_claim" => {
             // CAP-3: possession of the current credential yields a fresh one
@@ -345,72 +654,71 @@ async fn handle(
         "detach" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
             ctx.detach(terminal_id);
+            info!("[terminal-ws] detached terminal_id={terminal_id}");
+            Ok(Value::Null)
+        }
+        "close_view" => {
+            let terminal_id = string_field(&request.payload, "terminalId")?;
+            authorized_terminal_scope(state, ctx, terminal_id)?;
+            // Abort output first but retain authorization long enough for the
+            // renderer component's unmount cleanup to remove its backend ref.
+            // That cleanup then sends `detach`, which drops authorization.
+            ctx.close_view(terminal_id);
+            info!("[terminal-ws] close-view terminal_id={terminal_id}");
             Ok(Value::Null)
         }
         "get_cwd" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
-            if !ctx.is_authorized(terminal_id) {
-                return Err(("UNAUTHORIZED", format!("Not authorized for terminal {terminal_id}")));
-            }
+            authorized_terminal_scope(state, ctx, terminal_id)?;
             Ok(json!(state.cwd_tracker.get_cwd(terminal_id)))
         }
         "get_git_branch" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
-            if !ctx.is_authorized(terminal_id) {
-                return Err(("UNAUTHORIZED", format!("Not authorized for terminal {terminal_id}")));
-            }
+            authorized_terminal_scope(state, ctx, terminal_id)?;
             Ok(json!(state.git_tracker.get_branch(terminal_id)))
         }
         "get_git_status" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
-            if !ctx.is_authorized(terminal_id) {
-                return Err(("UNAUTHORIZED", format!("Not authorized for terminal {terminal_id}")));
-            }
+            authorized_terminal_scope(state, ctx, terminal_id)?;
             Ok(json!(state.git_tracker.get_status(terminal_id)))
         }
         "get_exit_code" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
-            if !ctx.is_authorized(terminal_id) {
-                return Err(("UNAUTHORIZED", format!("Not authorized for terminal {terminal_id}")));
-            }
+            authorized_terminal_scope(state, ctx, terminal_id)?;
             Ok(json!(state.exit_code_tracker.get_exit_code(terminal_id)))
         }
         "add_renderer_ref" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
-            if !ctx.is_authorized(terminal_id) {
-                return Err(("UNAUTHORIZED", format!("Not authorized for terminal {terminal_id}")));
-            }
+            authorized_terminal_scope(state, ctx, terminal_id)?;
             state
                 .pty
                 .add_renderer_ref(terminal_id, string_field(&request.payload, "rendererId")?)
                 .map(|_| Value::Null)
-                .map_err(|e| ("TERMINAL_NOT_FOUND", e))
+                .map_err(|error| ("TERMINAL_NOT_FOUND", error))
         }
         "remove_renderer_ref" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
-            if !ctx.is_authorized(terminal_id) {
-                return Err(("UNAUTHORIZED", format!("Not authorized for terminal {terminal_id}")));
-            }
+            authorized_terminal_scope(state, ctx, terminal_id)?;
             state
                 .pty
                 .remove_renderer_ref(terminal_id, string_field(&request.payload, "rendererId")?)
                 .map(|_| Value::Null)
-                .map_err(|e| ("TERMINAL_NOT_FOUND", e))
+                .map_err(|error| ("TERMINAL_NOT_FOUND", error))
         }
         "set_protected" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
-            if !ctx.is_authorized(terminal_id) {
-                return Err(("UNAUTHORIZED", format!("Not authorized for terminal {terminal_id}")));
-            }
+            authorized_terminal_scope(state, ctx, terminal_id)?;
             let protected = request.payload["protected"].as_bool().unwrap_or(true);
             state.pty.set_protected(terminal_id, protected);
             Ok(Value::Null)
         }
         "update_orphan_detection" => {
-            // Global setting — require at least one authorized terminal to
-            // prevent arbitrary clients from changing lifecycle policy.
-            if ctx.authorized.read().is_empty() {
-                return Err(("UNAUTHORIZED", "Not authorized to update orphan detection".to_string()));
+            // Global setting — require at least one *currently live* exact
+            // terminal authorization. A stale entry left behind by a
+            // cross-connection claim rotation must not retain lifecycle-policy
+            // authority.
+            if !ctx.has_live_authorization(state) {
+                return Err(unauthorized_error("orphan-detection"));
             }
             let enabled = request.payload["enabled"].as_bool().unwrap_or(true);
             let timeout = request.payload["timeout"]
@@ -431,60 +739,148 @@ async fn handle(
     }
 }
 
-enum StreamGate {
-    /// CAP-3: desktop/web holders present the spawn-issued claim. Rotate/revoke
-    /// severs this stream via generation.
-    Claim { claim: String },
-    /// Companion viewer: no claim, no generation teardown. Desktop keeps its
-    /// exclusive claim; the phone only fans out of the same broadcast.
-    CompanionWatch,
+fn terminal_authorization_is_live(
+    state: &AppState,
+    terminal_id: &str,
+    expected: AuthorizedTerminalScope,
+) -> Option<crate::conversation::ConversationId> {
+    if expected.cleanup_only {
+        return None;
+    }
+    let instance = state.pty.get(terminal_id).filter(|instance| {
+        instance.is_active() && instance.conversation_matches(expected.conversation_id)
+    })?;
+    (state.pty.claim_generation(terminal_id) == expected.claim_generation)
+        .then_some(instance.conversation_id)
 }
 
-async fn bind_output_stream(
+fn terminal_cleanup_authorization_is_live(
     state: &AppState,
+    terminal_id: &str,
+    expected: AuthorizedTerminalScope,
+) -> Option<crate::conversation::ConversationId> {
+    let instance = state
+        .pty
+        .get(terminal_id)
+        .filter(|instance| instance.conversation_matches(expected.conversation_id))?;
+    match instance.lifecycle_state() {
+        crate::pty::manager::TerminalLifecycleState::Active => (!expected.cleanup_only
+            && state.pty.claim_generation(terminal_id) == expected.claim_generation)
+            .then_some(instance.conversation_id),
+        crate::pty::manager::TerminalLifecycleState::Terminating
+        | crate::pty::manager::TerminalLifecycleState::Quarantined => {
+            Some(instance.conversation_id)
+        }
+        crate::pty::manager::TerminalLifecycleState::Removed => None,
+    }
+}
+
+fn live_authorized_terminal_scope(
+    state: &AppState,
+    authorized: &AuthorizedTerminals,
+    terminal_id: &str,
+) -> Option<crate::conversation::ConversationId> {
+    let expected = authorized.read().get(terminal_id).copied()?;
+    terminal_authorization_is_live(state, terminal_id, expected)
+}
+
+fn authorized_terminal_scope(
+    state: &AppState,
+    ctx: &ConnectionContext,
+    terminal_id: &str,
+) -> Result<crate::conversation::ConversationId, (&'static str, String)> {
+    let expected = ctx
+        .scope(terminal_id)
+        .ok_or_else(|| unauthorized_error(terminal_id))?;
+    terminal_authorization_is_live(state, terminal_id, expected)
+        .ok_or_else(|| unauthorized_error(terminal_id))
+}
+
+fn authorized_terminal_cleanup_scope(
+    state: &AppState,
+    ctx: &ConnectionContext,
+    terminal_id: &str,
+) -> Result<crate::conversation::ConversationId, (&'static str, String)> {
+    let expected = ctx
+        .scope(terminal_id)
+        .ok_or_else(|| unauthorized_error(terminal_id))?;
+    terminal_cleanup_authorization_is_live(state, terminal_id, expected)
+        .ok_or_else(|| unauthorized_error(terminal_id))
+}
+
+fn retain_compound_cleanup_authorization(
+    state: &AppState,
+    ctx: &mut ConnectionContext,
+    code: &'static str,
+    error: &str,
+) {
+    if code != crate::conversation::TERMINAL_RESOURCE_ROLLBACK_FAILED {
+        return;
+    }
+    let Ok(failure) = serde_json::from_str::<crate::commands::TerminalResourceFailureV1>(error)
+    else {
+        return;
+    };
+    let Some(instance) = state.pty.get(&failure.terminal_id).filter(|instance| {
+        instance.lifecycle_state() == crate::pty::manager::TerminalLifecycleState::Quarantined
+    }) else {
+        return;
+    };
+    ctx.authorize_cleanup(&failure.terminal_id, instance.conversation_id);
+    info!(
+        "[terminal-ws] cleanup recovery retained terminal_id={} primary_code={} cleanup_stage={}",
+        failure.terminal_id, failure.primary_code, failure.cleanup_stage
+    );
+}
+
+struct PassiveForwardAuth<'a> {
+    authority: &'a Arc<RemoteAccessAuthority>,
+    principal_generation: u64,
+}
+
+async fn install_replay_forwarder(
+    terminal_id: &str,
+    replay: TerminalReplay,
+    generation: u64,
+    state: &AppState,
+    forward_auth: PassiveForwardAuth<'_>,
     tx: &mpsc::Sender<Message>,
     ctx: &mut ConnectionContext,
-    terminal_id: String,
-    last_seq: u64,
-    gate: StreamGate,
-) -> Result<Value, (&'static str, String)> {
-    let hold_generation = match &gate {
-        StreamGate::Claim { claim } => {
-            // Capture generation BEFORE verify (TOCTOU-safe, same as desktop).
-            let generation = state.pty.claim_generation(&terminal_id);
-            if state.pty.verify_claim(&terminal_id, claim).is_err() {
-                return Err(unauthorized_error(&terminal_id));
-            }
-            Some(generation)
+) -> Result<(), (&'static str, String)> {
+    // Never release replay bytes for a claim generation already invalidated by
+    // a concurrent resume/rotate/revoke.
+    authorized_terminal_scope(state, ctx, terminal_id)?;
+    if !should_forward_passive(forward_auth.authority, forward_auth.principal_generation) {
+        return Err(unauthorized_error(terminal_id));
+    }
+
+    let snapshot = state.terminal_events.snapshot(terminal_id);
+    let binary_output = ctx.binary_output;
+    let chunk_payloads = if binary_output {
+        for chunk in &replay.chunks {
+            send_binary_output(
+                tx,
+                BinaryOutputKind::Replay,
+                terminal_id,
+                chunk.seq,
+                &chunk.data,
+            )
+            .await
+            .map_err(|error| ("NETWORK_ERROR", error))?;
         }
-        StreamGate::CompanionWatch => None,
-    };
-
-    let Some(instance) = state.pty.get(&terminal_id) else {
-        return match gate {
-            StreamGate::Claim { .. } => Err(unauthorized_error(&terminal_id)),
-            StreamGate::CompanionWatch => {
-                Err(("TERMINAL_NOT_FOUND", "terminal not found".to_string()))
-            }
-        };
-    };
-
-    ctx.authorize(&terminal_id);
-
-    let replay = instance.subscribe_from(last_seq);
-    let attach_result = state.pty.build_attach_result(&instance, &replay);
-    let snapshot = state.terminal_events.snapshot(&terminal_id);
-
-    let chunk_payloads: Vec<Value> = replay
-        .chunks
-        .iter()
-        .map(|chunk| {
-            json!({
-                "seq": chunk.seq,
-                "data": chunk.data.iter().map(|b| *b as u64).collect::<Vec<u64>>()
+        Vec::new()
+    } else {
+        replay
+            .chunks
+            .iter()
+            .map(|chunk| {
+                json!({
+                    "seq": chunk.seq,
+                    "data": chunk.data.iter().map(|byte| *byte as u64).collect::<Vec<u64>>()
+                })
             })
-        })
-        .collect();
+            .collect()
+    };
     send_json(
         tx,
         json!({
@@ -493,70 +889,155 @@ async fn bind_output_stream(
             "chunks": chunk_payloads,
             "gap": replay.gap,
             "latestSeq": replay.latest_seq,
-            "snapshot": serde_json::to_value(&snapshot).unwrap_or(json!({}))
+            "snapshot": serde_json::to_value(&snapshot).unwrap_or_else(|_| json!({}))
         }),
     )
     .await
-    .map_err(|e| ("NETWORK_ERROR", e))?;
+    .map_err(|error| ("NETWORK_ERROR", error))?;
 
-    if let Some(previous) = ctx.attachments.remove(&terminal_id) {
+    // Rotation may have landed while the replay frame was back-pressured.
+    // Refuse to install any live forwarder for the stale generation.
+    authorized_terminal_scope(state, ctx, terminal_id)?;
+
+    if let Some(previous) = ctx.attachments.remove(terminal_id) {
         previous.abort();
     }
     let output_tx = tx.clone();
-    let attached_id = terminal_id.clone();
-    let pty = state.pty.clone();
+    let attached_id = terminal_id.to_string();
+    let pty = Arc::clone(&state.pty);
+    let attached_authority = Arc::clone(forward_auth.authority);
+    let principal_generation = forward_auth.principal_generation;
     let task = tokio::spawn(async move {
         let mut receiver = replay.receiver;
         let mut current_seq = replay.latest_seq;
+        let mut tick =
+            tokio::time::interval(std::time::Duration::from_millis(ATTACH_GENERATION_CHECK_MS));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.tick().await;
+
         loop {
-            if let Some(generation) = hold_generation {
-                if crate::commands::forwarder_should_terminate(
-                    generation,
+            if !should_forward_passive(&attached_authority, principal_generation)
+                || crate::commands::forwarder_should_terminate(
+                    Some(generation),
                     pty.claim_generation(&attached_id),
-                ) {
-                    info!(
-                        "[terminal-ws] attachment terminating (claim invalidated) terminal_id={attached_id}"
-                    );
-                    break;
-                }
+                )
+            {
+                info!(
+                    "[terminal-ws] attachment terminating (claim invalidated) terminal_id={attached_id}"
+                );
+                break;
             }
-            match receiver.recv().await {
-                Ok(chunk) => {
-                    current_seq = chunk.seq;
-                    let data: Vec<u64> = chunk.data.iter().map(|b| *b as u64).collect();
-                    if send_json(
-                        &output_tx,
-                        json!({
-                            "type": "data",
-                            "terminalId": attached_id,
-                            "seq": current_seq,
-                            "data": data
-                        }),
-                    )
-                    .await
-                    .is_err()
-                    {
-                        break;
+            tokio::select! {
+                received = receiver.recv() => {
+                    match received {
+                        Ok(chunk) => {
+                            // A rotation may land while recv() is pending. Check
+                            // again before forwarding so an old holder receives
+                            // no post-rotation terminal bytes.
+                            if !should_forward_passive(&attached_authority, principal_generation)
+                                || crate::commands::forwarder_should_terminate(
+                                    Some(generation),
+                                    pty.claim_generation(&attached_id),
+                                )
+                            {
+                                break;
+                            }
+                            current_seq = chunk.seq;
+                            let sent = if binary_output {
+                                send_binary_output(
+                                    &output_tx,
+                                    BinaryOutputKind::Live,
+                                    &attached_id,
+                                    current_seq,
+                                    &chunk.data,
+                                )
+                                .await
+                            } else {
+                                let data: Vec<u64> =
+                                    chunk.data.iter().map(|byte| *byte as u64).collect();
+                                send_json(
+                                    &output_tx,
+                                    json!({
+                                        "type": "data",
+                                        "terminalId": attached_id,
+                                        "seq": current_seq,
+                                        "data": data
+                                    }),
+                                )
+                                .await
+                            };
+                            if sent.is_err() {
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            if crate::commands::forwarder_should_terminate(
+                                Some(generation),
+                                pty.claim_generation(&attached_id),
+                            ) {
+                                break;
+                            }
+                            warn!(
+                                "[terminal-ws] output receiver lagged by {skipped} for {attached_id}"
+                            );
+                            let _ = send_json(
+                                &output_tx,
+                                json!({
+                                    "type": "gap",
+                                    "terminalId": attached_id,
+                                    "lastSeq": current_seq
+                                }),
+                            )
+                            .await;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!("[terminal-ws] output receiver lagged by {skipped} for {attached_id}");
-                    let _ = send_json(
-                        &output_tx,
-                        json!({
-                            "type": "gap",
-                            "terminalId": attached_id,
-                            "lastSeq": current_seq
-                        }),
-                    )
-                    .await;
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                _ = tick.tick() => {}
             }
         }
     });
-    ctx.attachments.insert(terminal_id, task);
-    serde_json::to_value(attach_result).map_err(|e| ("NETWORK_ERROR", e.to_string()))
+    ctx.attachments.insert(terminal_id.to_string(), task);
+    Ok(())
+}
+
+async fn bind_companion_output_stream(
+    state: &AppState,
+    authority: &Arc<RemoteAccessAuthority>,
+    principal: &RemotePrincipal,
+    tx: &mpsc::Sender<Message>,
+    ctx: &mut ConnectionContext,
+    terminal_id: String,
+    last_seq: u64,
+) -> Result<Value, (&'static str, String)> {
+    let generation = state
+        .pty
+        .claim_generation(&terminal_id)
+        .ok_or_else(|| ("TERMINAL_NOT_FOUND", "terminal not found".to_string()))?;
+    let instance = state
+        .pty
+        .get(&terminal_id)
+        .filter(|instance| instance.is_active())
+        .ok_or_else(|| ("TERMINAL_NOT_FOUND", "terminal not found".to_string()))?;
+
+    ctx.authorize(&terminal_id, instance.conversation_id, generation);
+    let replay = instance.subscribe_from(last_seq);
+    let attach_result = state.pty.build_attach_result(&instance, &replay);
+    install_replay_forwarder(
+        &terminal_id,
+        replay,
+        generation,
+        state,
+        PassiveForwardAuth {
+            authority,
+            principal_generation: principal.generation(),
+        },
+        tx,
+        ctx,
+    )
+    .await?;
+
+    serde_json::to_value(attach_result).map_err(|error| ("NETWORK_ERROR", error.to_string()))
 }
 
 fn terminal_display_title(cwd: &str, shell: &str) -> String {
@@ -586,6 +1067,46 @@ fn live_terminal_summary(
     })
 }
 
+fn terminal_conversation_service(
+    state: &AppState,
+) -> Result<Arc<crate::conversation::ConversationApplicationService>, (&'static str, String)> {
+    state.conversation.clone().ok_or_else(|| {
+        (
+            "CONVERSATION_SERVICE_UNAVAILABLE",
+            "Conversation application service is unavailable".to_string(),
+        )
+    })
+}
+
+fn terminal_workspace_service(
+    state: &AppState,
+) -> Result<Arc<crate::conversation::SessionWorkspaceService>, (&'static str, String)> {
+    terminal_conversation_service(state).map(|conversation| conversation.session_workspace())
+}
+
+fn terminal_resource_code(code: Option<&str>) -> &'static str {
+    match code {
+        Some(crate::conversation::TERMINAL_RESOURCE_ROLLBACK_FAILED) => {
+            crate::conversation::TERMINAL_RESOURCE_ROLLBACK_FAILED
+        }
+        Some(crate::conversation::TERMINAL_TERMINATE_FAILED) => {
+            crate::conversation::TERMINAL_TERMINATE_FAILED
+        }
+        Some("CONVERSATION_INVALID_ID") => "CONVERSATION_INVALID_ID",
+        Some("CONVERSATION_NOT_FOUND") => "CONVERSATION_NOT_FOUND",
+        Some("CONVERSATION_CONFLICT") => "CONVERSATION_CONFLICT",
+        Some("CONVERSATION_RECOVERY_REQUIRED") => "CONVERSATION_RECOVERY_REQUIRED",
+        Some("CONVERSATION_DURABILITY_FAILED") => "CONVERSATION_DURABILITY_FAILED",
+        Some("LEGACY_COMPATIBILITY_READ_ONLY") => "LEGACY_COMPATIBILITY_READ_ONLY",
+        Some("SESSION_WORKSPACE_RECOVERY_REQUIRED") => "SESSION_WORKSPACE_RECOVERY_REQUIRED",
+        Some("SESSION_WORKSPACE_UNAVAILABLE") => "SESSION_WORKSPACE_UNAVAILABLE",
+        Some("VALIDATION_ERROR") => "VALIDATION_ERROR",
+        Some("UNAUTHORIZED") => "UNAUTHORIZED",
+        Some("SPAWN_FAILED") => "SPAWN_FAILED",
+        _ => "SESSION_WORKSPACE_UNAVAILABLE",
+    }
+}
+
 fn string_field<'a>(value: &'a Value, key: &str) -> Result<&'a str, (&'static str, String)> {
     value[key]
         .as_str()
@@ -611,6 +1132,38 @@ fn u16_field(value: &Value, key: &str) -> Result<u16, (&'static str, String)> {
         .ok_or_else(|| ("VALIDATION_ERROR", format!("invalid {key}")))
 }
 
+fn encode_binary_output_frame(
+    kind: BinaryOutputKind,
+    terminal_id: &str,
+    seq: u64,
+    data: &[u8],
+) -> Result<Vec<u8>, String> {
+    let terminal_id = terminal_id.as_bytes();
+    let terminal_id_len = u16::try_from(terminal_id.len())
+        .map_err(|_| "terminal id is too long for binary output frame".to_string())?;
+    let mut frame = Vec::with_capacity(15 + terminal_id.len() + data.len());
+    frame.extend_from_slice(BINARY_FRAME_MAGIC);
+    frame.push(kind as u8);
+    frame.extend_from_slice(&terminal_id_len.to_be_bytes());
+    frame.extend_from_slice(&seq.to_be_bytes());
+    frame.extend_from_slice(terminal_id);
+    frame.extend_from_slice(data);
+    Ok(frame)
+}
+
+async fn send_binary_output(
+    tx: &mpsc::Sender<Message>,
+    kind: BinaryOutputKind,
+    terminal_id: &str,
+    seq: u64,
+    data: &[u8],
+) -> Result<(), String> {
+    let frame = encode_binary_output_frame(kind, terminal_id, seq, data)?;
+    tx.send(Message::Binary(frame.into()))
+        .await
+        .map_err(|_| "terminal websocket closed".to_string())
+}
+
 async fn send_json(tx: &mpsc::Sender<Message>, value: Value) -> Result<(), String> {
     tx.send(Message::Text(value.to_string().into()))
         .await
@@ -634,10 +1187,343 @@ async fn send_error(
 mod tests {
     use super::*;
 
+    fn conversation_id() -> crate::conversation::ConversationId {
+        crate::conversation::ConversationId::parse("018f7a1c-1b4d-7c8a-9f01-0123456789ab").unwrap()
+    }
+
     #[test]
     fn validates_numeric_dimensions() {
         assert_eq!(u16_field(&json!({ "cols": 80 }), "cols"), Ok(80));
         assert!(u16_field(&json!({ "cols": 0 }), "cols").is_err());
+    }
+
+    #[test]
+    fn binary_output_requires_explicit_subprotocol_negotiation() {
+        let mut headers = HeaderMap::new();
+        assert!(!supports_binary_subprotocol(&headers));
+
+        headers.insert(
+            axum::http::header::SEC_WEBSOCKET_PROTOCOL,
+            axum::http::HeaderValue::from_static("legacy, termul-terminal-v2.binary"),
+        );
+        assert!(supports_binary_subprotocol(&headers));
+    }
+
+    #[test]
+    fn binary_output_frame_uses_stable_big_endian_envelope() {
+        let frame = encode_binary_output_frame(
+            BinaryOutputKind::Replay,
+            "pty-1",
+            0x0102_0304_0506_0708,
+            &[0, 0xff, b'A'],
+        )
+        .unwrap();
+
+        assert_eq!(&frame[0..4], b"TML2");
+        assert_eq!(frame[4], BinaryOutputKind::Replay as u8);
+        assert_eq!(u16::from_be_bytes([frame[5], frame[6]]), 5);
+        assert_eq!(
+            u64::from_be_bytes(frame[7..15].try_into().unwrap()),
+            0x0102_0304_0506_0708
+        );
+        assert_eq!(&frame[15..20], b"pty-1");
+        assert_eq!(&frame[20..], &[0, 0xff, b'A']);
+    }
+
+    #[tokio::test]
+    async fn spawn_compound_rollback() {
+        use crate::conversation::{
+            parse_created_at_utc, ConversationCreator, ConversationLifecycleState,
+            ConversationMutation, ConversationRecordV2, ConversationWriter, CreationPartition,
+            ExecutionTarget, SessionWorkspaceLoadOutcome, SessionWorkspaceService,
+            CONVERSATION_SCHEMA_VERSION, TERMINAL_RESOURCE_ROLLBACK_FAILED,
+        };
+        use crate::pty::manager::{
+            ScriptedCleanupDriver, TerminalCleanupStage, TerminalLifecycleState,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let (repository, _) =
+            crate::conversation::ConversationRepository::open(base.join("conversations/v2"))
+                .unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
+        let conversation_id =
+            crate::conversation::ConversationId::parse("018f7a1c-1b4d-7c8a-9f01-0123456789ab")
+                .unwrap();
+        let created_at = parse_created_at_utc("2026-08-15T09:45:15.123Z").unwrap();
+        writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: base.to_string_lossy().into_owned(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::Ready,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
+                },
+                ConversationMutation::CreateConversation,
+            )
+            .await
+            .unwrap();
+        let workspace = Arc::new(SessionWorkspaceService::new(writer));
+        repository.fail_next_workspace_replace();
+        let pty = crate::web::test_pty_manager();
+        let cleanup_driver = Arc::new(ScriptedCleanupDriver::default());
+        cleanup_driver.fail_once(TerminalCleanupStage::Kill);
+        pty.install_cleanup_driver(cleanup_driver);
+        let result = crate::commands::terminal_spawn_resource(
+            SpawnOptions {
+                conversation_id: Some(conversation_id),
+                cwd: Some(base.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+            None,
+            &pty,
+            &workspace,
+        )
+        .await;
+
+        assert_eq!(
+            terminal_resource_code(result.code.as_deref()),
+            TERMINAL_RESOURCE_ROLLBACK_FAILED
+        );
+        let failure: crate::commands::TerminalResourceFailureV1 =
+            serde_json::from_str(result.error.as_deref().unwrap()).unwrap();
+        assert_eq!(failure.primary_code, "CONVERSATION_DURABILITY_FAILED");
+        assert_eq!(failure.cleanup_stage, TerminalCleanupStage::Kill);
+        assert_eq!(
+            pty.terminal_lifecycle_state(&failure.terminal_id),
+            Some(TerminalLifecycleState::Quarantined)
+        );
+        assert!(matches!(
+            workspace.load(conversation_id).await.unwrap(),
+            SessionWorkspaceLoadOutcome::Missing { .. }
+        ));
+
+        let mut state = terminal_test_state();
+        state.pty = Arc::clone(&pty);
+        let mut ctx = ConnectionContext {
+            authorized: Arc::new(RwLock::new(HashMap::new())),
+            attachments: HashMap::new(),
+            binary_output: false,
+        };
+        retain_compound_cleanup_authorization(
+            &state,
+            &mut ctx,
+            TERMINAL_RESOURCE_ROLLBACK_FAILED,
+            result.error.as_deref().unwrap(),
+        );
+        assert_eq!(
+            authorized_terminal_cleanup_scope(&state, &ctx, &failure.terminal_id),
+            Ok(conversation_id)
+        );
+        assert_eq!(
+            authorized_terminal_scope(&state, &ctx, &failure.terminal_id),
+            Err(unauthorized_error(&failure.terminal_id))
+        );
+
+        pty.terminate(&failure.terminal_id).await.unwrap();
+    }
+
+    #[test]
+    fn spawn_intent_rejects_raw_and_unknown_fields() {
+        let valid = json!({
+            "conversationId": conversation_id(),
+            "projectId": "project-1",
+            "cwdSource": "workspace",
+            "cols": 80,
+            "rows": 24
+        });
+        let intent: TerminalSpawnIntentV1 = serde_json::from_value(valid.clone()).unwrap();
+        assert_eq!(intent.conversation_id, conversation_id());
+
+        for (field, value) in [
+            ("program", json!("/bin/sh")),
+            ("args", json!(["-c", "never"])),
+            ("env", json!({ "SECRET": "never" })),
+            ("cwd", json!("/caller/path")),
+            ("shell", json!("caller-shell")),
+            ("kind", json!("agent")),
+            ("unknown", json!(true)),
+        ] {
+            let mut payload = valid.clone();
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_string(), value);
+            assert!(
+                serde_json::from_value::<TerminalSpawnIntentV1>(payload).is_err(),
+                "raw/unknown field must be rejected: {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_request_rejects_spawn_authority_fields() {
+        let valid = json!({
+            "conversationId": conversation_id(),
+            "terminalId": "terminal-1",
+            "lastSeq": 7
+        });
+        let resume: TerminalResumeRequest = serde_json::from_value(valid.clone()).unwrap();
+        assert_eq!(resume.last_seq, 7);
+
+        for field in ["program", "args", "env", "cwd", "shell", "projectId"] {
+            let mut payload = valid.clone();
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_string(), json!("forbidden"));
+            assert!(
+                serde_json::from_value::<TerminalResumeRequest>(payload).is_err(),
+                "resume authority field must be rejected: {field}"
+            );
+        }
+    }
+
+    fn terminal_test_state() -> AppState {
+        let pty = crate::web::test_pty_manager();
+        AppState {
+            acp: Arc::new(crate::acp::AcpManager::new(vec![])),
+            terminal_events: pty.terminal_events(),
+            cwd_tracker: pty.cwd_tracker(),
+            git_tracker: pty.git_tracker(),
+            exit_code_tracker: pty.exit_code_tracker(),
+            pty,
+            relay: Arc::new(crate::web::sink::WsRelaySink::new()),
+            registry: Arc::new(crate::web::project_registry::ProjectRegistry::new()),
+            registry_persistence: None,
+            projects_file: None,
+            history_mode: crate::web::ws::HistoryMode::LiveOnly,
+            conversation: None,
+            workspace_manifest: None,
+            acp_catalog: None,
+            acp_install: None,
+            store: None,
+            project_root: Arc::new(parking_lot::RwLock::new(std::path::PathBuf::new())),
+        }
+    }
+
+    fn terminal_authority() -> Arc<RemoteAccessAuthority> {
+        let authority = RemoteAccessAuthority::for_tests("terminal-access-token");
+        authority
+            .set_public_origin(url::Url::parse("https://terminal.example.test").unwrap())
+            .unwrap();
+        Arc::new(authority)
+    }
+
+    fn terminal_auth_app(authority: Arc<RemoteAccessAuthority>) -> axum::Router {
+        axum::Router::new()
+            .route("/terminal/ws", axum::routing::get(terminal_ws_upgrade))
+            .with_state(terminal_test_state())
+            .layer(axum::middleware::from_fn(
+                crate::web::auth::capability_middleware,
+            ))
+            .layer(Extension(
+                crate::web::auth::RemoteRouteClass::TerminalWebSocket,
+            ))
+            .layer(Extension(crate::web::auth::IngressProvenance::PublicTunnel))
+            .layer(Extension(authority))
+    }
+
+    fn terminal_upgrade_request(
+        authorization: Option<&str>,
+        origin: Option<&str>,
+        peer: std::net::SocketAddr,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut builder = axum::http::Request::builder()
+            .method(axum::http::Method::GET)
+            .uri("/terminal/ws")
+            .header(axum::http::header::CONNECTION, "upgrade")
+            .header(axum::http::header::UPGRADE, "websocket")
+            .header("sec-websocket-version", "13")
+            .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .extension(axum::extract::ConnectInfo(peer));
+        if let Some(authorization) = authorization {
+            builder = builder.header(axum::http::header::AUTHORIZATION, authorization);
+        }
+        if let Some(origin) = origin {
+            builder = builder.header(axum::http::header::ORIGIN, origin);
+        }
+        builder.body(axum::body::Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn resume_requires_authenticated_scope() {
+        use tower::ServiceExt;
+
+        let _boundary_log_test_guard = crate::web::auth::test_tracing::lock().await;
+
+        let peer = std::net::SocketAddr::from(([192, 0, 2, 10], 43123));
+        let allowed_origin = "https://terminal.example.test";
+
+        let missing = terminal_auth_app(terminal_authority())
+            .oneshot(terminal_upgrade_request(None, Some(allowed_origin), peer))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let wrong = terminal_auth_app(terminal_authority())
+            .oneshot(terminal_upgrade_request(
+                Some("Bearer wrong"),
+                Some(allowed_origin),
+                peer,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), axum::http::StatusCode::UNAUTHORIZED);
+
+        let authority = terminal_authority();
+        let principal = authority.verify_bearer("terminal-access-token").unwrap();
+        let mut allowed_headers = HeaderMap::new();
+        allowed_headers.insert(
+            axum::http::header::ORIGIN,
+            axum::http::HeaderValue::from_static("https://terminal.example.test"),
+        );
+        assert!(authorize_terminal_upgrade(&authority, &principal, &allowed_headers).is_ok());
+
+        let mut wrong_headers = HeaderMap::new();
+        wrong_headers.insert(
+            axum::http::header::ORIGIN,
+            axum::http::HeaderValue::from_static("https://evil.example.test"),
+        );
+        assert_eq!(
+            authorize_terminal_upgrade(&authority, &principal, &wrong_headers),
+            Err(RemoteAuthError::InvalidOrigin)
+        );
+        assert_eq!(
+            authorize_terminal_upgrade(&authority, &principal, &HeaderMap::new()),
+            Err(RemoteAuthError::InvalidOrigin)
+        );
+
+        let rate_limited_app = terminal_auth_app(terminal_authority());
+        for attempt in 1..=6 {
+            let response = rate_limited_app
+                .clone()
+                .oneshot(terminal_upgrade_request(
+                    Some("Bearer wrong"),
+                    Some(allowed_origin),
+                    peer,
+                ))
+                .await
+                .unwrap();
+            let expected = if attempt == 6 {
+                axum::http::StatusCode::TOO_MANY_REQUESTS
+            } else {
+                axum::http::StatusCode::UNAUTHORIZED
+            };
+            assert_eq!(response.status(), expected, "attempt={attempt}");
+        }
+
+        let source = include_str!("terminal_ws.rs");
+        assert!(source.contains("Extension(principal): Extension<RemotePrincipal>"));
     }
 
     #[test]
@@ -657,16 +1543,85 @@ mod tests {
     }
 
     #[test]
-    fn context_authorize_and_detach_roundtrip() {
+    fn context_close_view_preserves_authorization_until_detach() {
         let mut ctx = ConnectionContext {
-            authorized: Arc::new(RwLock::new(HashSet::new())),
+            authorized: Arc::new(RwLock::new(HashMap::new())),
             attachments: HashMap::new(),
+            binary_output: false,
         };
-        ctx.authorize("t1");
+        ctx.authorize("t1", conversation_id(), 7);
         assert!(ctx.is_authorized("t1"));
         assert!(!ctx.is_authorized("t2"));
+
+        ctx.close_view("t1");
+        assert!(ctx.is_authorized("t1"));
+
         ctx.detach("t1");
         assert!(!ctx.is_authorized("t1"));
+    }
+
+    #[tokio::test]
+    async fn claim_rotation_revokes_all_connection_scope_without_terminating_pty() {
+        let state = terminal_test_state();
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let conversation_id = conversation_id();
+        let spawned = state
+            .pty
+            .spawn(
+                SpawnOptions {
+                    conversation_id: Some(conversation_id),
+                    cwd: Some(cwd.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let terminal_id = spawned.info.id.clone();
+        let generation = state.pty.claim_generation(&terminal_id).unwrap();
+        let mut ctx = ConnectionContext {
+            authorized: Arc::new(RwLock::new(HashMap::new())),
+            attachments: HashMap::new(),
+            binary_output: false,
+        };
+        ctx.authorize(&terminal_id, conversation_id, generation);
+
+        assert_eq!(
+            authorized_terminal_scope(&state, &ctx, &terminal_id),
+            Ok(conversation_id)
+        );
+        assert_eq!(
+            live_authorized_terminal_scope(&state, &ctx.authorized, &terminal_id),
+            Some(conversation_id)
+        );
+        assert!(ctx.has_live_authorization(&state));
+
+        let successor = state
+            .pty
+            .rotate_claim(&terminal_id, &spawned.claim)
+            .unwrap();
+
+        assert_eq!(
+            authorized_terminal_scope(&state, &ctx, &terminal_id),
+            Err(unauthorized_error(&terminal_id))
+        );
+        assert_eq!(
+            live_authorized_terminal_scope(&state, &ctx.authorized, &terminal_id),
+            None
+        );
+        assert!(!ctx.has_live_authorization(&state));
+        assert!(
+            state.pty.get(&terminal_id).is_some(),
+            "rotation preserves PTY"
+        );
+        assert!(state
+            .pty
+            .verify_claim(&terminal_id, &spawned.claim)
+            .is_err());
+        assert!(state.pty.verify_claim(&terminal_id, &successor).is_ok());
+
+        state.pty.terminate(&terminal_id).await.unwrap();
     }
 
     #[test]
@@ -698,22 +1653,22 @@ mod tests {
         // terminal id (no input echo — nothing distinguishes failure causes).
         assert_eq!(message, "Unauthorized");
         assert_eq!(unauthorized_error("t1"), unauthorized_error("t2"));
-        assert_ne!(code, "TERMINAL_NOT_FOUND", "existence-leaking code must not return");
+        assert_ne!(
+            code, "TERMINAL_NOT_FOUND",
+            "existence-leaking code must not return"
+        );
     }
 
     #[tokio::test]
     async fn connection_detach_aborts_attachment_and_clears_authorization() {
         // This test pins the ConnectionContext::detach PRIMITIVE the teardown
         // relies on: aborting the attachment task and clearing authorization.
-        // It does NOT drive handle() — the handler wiring (rotate_claim/
-        // revoke_claim calling ctx.detach, plus the cross-connection
-        // generation teardown inside attachment tasks) requires a live
-        // PtyManager seam and is covered in CI integration, not here.
         let mut ctx = ConnectionContext {
-            authorized: Arc::new(RwLock::new(HashSet::new())),
+            authorized: Arc::new(RwLock::new(HashMap::new())),
             attachments: HashMap::new(),
+            binary_output: false,
         };
-        ctx.authorize("t1");
+        ctx.authorize("t1", conversation_id(), 7);
 
         // A live attachment task mimicking the output forwarder.
         let task = tokio::spawn(async {
@@ -734,8 +1689,76 @@ mod tests {
 
     #[test]
     fn companion_title_uses_cwd_basename_then_shell() {
-        assert_eq!(terminal_display_title("/Users/qs/project/me/termul", "zsh"), "termul");
+        assert_eq!(
+            terminal_display_title("/Users/qs/project/me/termul", "zsh"),
+            "termul"
+        );
         assert_eq!(terminal_display_title("/", "zsh"), "zsh");
         assert_eq!(terminal_display_title("", "bash"), "bash");
+    }
+
+    #[test]
+    fn disconnect_cleanup_and_detach_are_non_destructive() {
+        let source = include_str!("terminal_ws.rs");
+        let run = source
+            .split("async fn run")
+            .nth(1)
+            .and_then(|tail| tail.split("struct ConnectionContext").next())
+            .expect("run body");
+        let stripped = strip_comments(run);
+        for forbidden in [".kill(", "force_kill", ".terminate(", "kill_all"] {
+            assert!(
+                !stripped.contains(forbidden),
+                "run disconnect cleanup must not call {forbidden}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_ws_event_and_attachment_close_on_generation_mismatch() {
+        let authority = Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token"));
+        let principal = RemotePrincipal::for_tests(1);
+        assert!(
+            !principal_generation_mismatch(&authority, &principal),
+            "fresh test authority must match principal generation 1"
+        );
+        let event_task = tokio::spawn(async {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+        let mut attachments = HashMap::new();
+        attachments.insert(
+            "t1".to_string(),
+            tokio::spawn(async {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                }
+            }),
+        );
+        let receipt = authority.retire_generation(1);
+        assert!(receipt.credential_invalidated || !authority.generation_state().active);
+        assert!(principal_generation_mismatch(&authority, &principal));
+        abort_and_join_connection_tasks(event_task, attachments).await;
+    }
+
+    #[test]
+    fn terminal_ws_passive_forward_rechecks_generation_before_send() {
+        let authority = RemoteAccessAuthority::for_tests("test-remote-access-token");
+        assert!(should_forward_passive(&authority, 1));
+        let _ = authority.retire_generation(1);
+        assert!(
+            !should_forward_passive(&authority, 1),
+            "passive forward must refuse after generation retirement"
+        );
+        assert!(!should_forward_passive(&authority, 99));
+    }
+
+    fn strip_comments(source: &str) -> String {
+        source
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }

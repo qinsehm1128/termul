@@ -26,16 +26,16 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Weak};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthMethod, AuthenticateRequest, CancelNotification, CloseSessionRequest,
     ContentBlock, EnvVariable, InitializeRequest, ListSessionsResponse, LoadSessionRequest,
-    LoadSessionResponse, McpServer, McpServerStdio, NewSessionRequest, PromptRequest,
-    RequestPermissionOutcome, RequestPermissionResponse, ResumeSessionRequest,
-    ResumeSessionResponse, SelectedPermissionOutcome, SessionConfigOption,
+    LoadSessionResponse, McpServer, McpServerStdio, NewSessionRequest, PermissionOption,
+    PermissionOptionKind, PromptRequest, RequestPermissionOutcome, RequestPermissionResponse,
+    ResumeSessionRequest, ResumeSessionResponse, SelectedPermissionOutcome, SessionConfigOption,
     SetSessionConfigOptionRequest, SetSessionModeRequest, StopReason,
 };
 use agent_client_protocol::schema::ProtocolVersion;
@@ -46,17 +46,24 @@ use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::acp::client;
-use crate::acp::config::{AgentConfig, AgentId, SessionId};
+use crate::acp::config::{AgentConfig, AgentId, PermissionPolicy, SessionId};
 use crate::acp::events::{
     self, AgentCrashedEvent, AgentDisconnectedEvent, AgentErrorEvent, AgentSpawnedEvent,
-    AuthMethodInfo, ConfigOptionsUpdateEvent, PromptCompleteEvent, SessionClosedEvent,
-    SessionCreatedEvent, SessionInfoUpdateEvent, SessionModelState,
+    AuthMethodInfo, ConfigOptionsUpdateEvent, FanOutError, FanOutReceipt, PromptCompleteEvent,
+    SessionClosedEvent, SessionCreatedEvent, SessionInfoUpdateEvent, SessionModelState,
 };
 use crate::acp::session::DriverState;
 use crate::acp::session_persistence::{
     is_protected_title_source, normalize_title, PersistedSessionStatus, SessionPersistence,
     SessionRegistration, TitleSource,
 };
+use crate::conversation::{
+    AgentBindingResult, AgentCompensationFailure, AgentSessionBinding, ConversationCreationService,
+    ConversationId, ConversationPersistenceAdapter, ExecutionTarget, PrepareConversationRequest,
+    PreparedConversation, ProjectAttachment, ACP_COMPENSATION_FAILED,
+    PROJECT_ATTACHMENT_SCHEMA_VERSION,
+};
+use crate::web::sink::CONVERSATION_PERSISTENCE_REJECTED;
 use crate::web::EventSink;
 
 /// How long to wait for the agent to answer `initialize` before treating the
@@ -516,6 +523,13 @@ where
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewSessionOutcome {
+    pub persistence: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<ConversationId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_cwd: Option<String>,
     pub session_id: SessionId,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modes: Option<agent_client_protocol::schema::v1::SessionModeState>,
@@ -530,6 +544,9 @@ pub struct NewSessionOutcome {
 pub struct SessionCreationContext {
     pub project_id: Option<String>,
     pub ephemeral: bool,
+    pub conversation_id: Option<ConversationId>,
+    pub project_attachment: Option<ProjectAttachment>,
+    pub execution_target: Option<ExecutionTarget>,
     /// Worktree path the agent runs in (CAP-3). When set, the durable record
     /// carries it so relaunch reattaches without a second `git worktree add`
     /// and the chat indicator (CAP-6) survives reload. State isolation still
@@ -622,16 +639,19 @@ enum AcpCommand {
         ephemeral: bool,
         worktree_path: Option<String>,
         worktree_branch: Option<String>,
+        binding_gate: Option<watch::Receiver<Option<Result<(), String>>>>,
         reply: oneshot::Sender<Result<NewSessionOutcome, String>>,
     },
     LoadSession {
         session_id: SessionId,
         cwd: String,
+        mcp_servers: Vec<McpServer>,
         reply: oneshot::Sender<Result<SessionReopenOutcome, String>>,
     },
     ResumeSession {
         session_id: SessionId,
         cwd: String,
+        mcp_servers: Vec<McpServer>,
         reply: oneshot::Sender<Result<SessionReopenOutcome, String>>,
     },
     CloseSession {
@@ -760,6 +780,7 @@ struct AgentEntry {
     /// driver thread's teardown can tell an intentional kill (silent) from a
     /// spontaneous crash (emits `acp:agent_disconnected`). See L4.
     killed: Arc<AtomicBool>,
+    permission_policy: Arc<Mutex<PermissionPolicy>>,
 }
 
 /// Manages all ACP agents, mirroring the `PtyManager` ownership pattern.
@@ -778,10 +799,176 @@ struct AgentEntry {
 /// Tauri-aware). No code under `src-tauri/src/acp/` may call `app.emit("acp:..")`
 /// directly (AC7); all emission goes through [`events::fan_out`] against
 /// `self.sinks`.
+type ReplacementGateSender = watch::Sender<Option<Result<(), String>>>;
+
+type ReplacementGates = HashMap<String, ReplacementGateSender>;
+const MAX_FAILURE_CIRCUIT_ENTRIES: usize = 256;
+const FAILURE_CIRCUIT_TTL_SECS: u64 = 900;
+
+#[derive(Debug, Clone, Copy)]
+struct CircuitEntry {
+    code: &'static str,
+    opened_at: std::time::Instant,
+}
+
+struct SessionDeliveryCircuitMap {
+    entries: HashMap<String, CircuitEntry>,
+}
+
+impl SessionDeliveryCircuitMap {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    fn prune(&mut self, now: std::time::Instant) {
+        self.entries.retain(|_, entry| {
+            now.duration_since(entry.opened_at).as_secs() < FAILURE_CIRCUIT_TTL_SECS
+        });
+    }
+
+    fn get(&mut self, session_id: &str) -> Option<&'static str> {
+        self.prune(std::time::Instant::now());
+        self.entries.get(session_id).map(|entry| entry.code)
+    }
+
+    fn insert(&mut self, session_id: String, code: &'static str) {
+        let now = std::time::Instant::now();
+        self.prune(now);
+        if !self.entries.contains_key(&session_id) && self.len() >= MAX_FAILURE_CIRCUIT_ENTRIES {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.opened_at)
+                .map(|(key, _)| key.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(
+            session_id,
+            CircuitEntry {
+                code,
+                opened_at: now,
+            },
+        );
+    }
+
+    fn contains_key(&mut self, session_id: &str) -> bool {
+        self.get(session_id).is_some()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+type SessionDeliveryCircuits = Arc<Mutex<SessionDeliveryCircuitMap>>;
+
+#[cfg(test)]
+fn circuit_map_insert_for_tests(
+    circuits: &SessionDeliveryCircuits,
+    session_id: &str,
+    code: &'static str,
+    opened_at: std::time::Instant,
+) {
+    circuits
+        .lock()
+        .entries
+        .insert(session_id.to_string(), CircuitEntry { code, opened_at });
+}
+
+fn fan_out_session<P: Serialize>(
+    sinks: &[Arc<dyn EventSink>],
+    circuits: &SessionDeliveryCircuits,
+    session_id: &str,
+    type_: &'static str,
+    payload: &P,
+) -> Result<FanOutReceipt, FanOutError> {
+    if let Some(source_code) = circuits.lock().get(session_id) {
+        return Err(FanOutError::circuit_open(source_code));
+    }
+    let result = events::fan_out(sinks, Some(session_id), type_, payload);
+    if let Err(error) = &result {
+        if error.should_open_session_circuit() {
+            circuits.lock().insert(
+                session_id.to_string(),
+                error
+                    .source_code
+                    .unwrap_or(CONVERSATION_PERSISTENCE_REJECTED),
+            );
+            log::error!(
+                "[acp] session delivery circuit opened code={} source_code={}",
+                error.code,
+                error.source_code.unwrap_or("UNKNOWN")
+            );
+        }
+    }
+    result
+}
+
+async fn fan_out_session_committed<P: Serialize>(
+    sinks: &[Arc<dyn EventSink>],
+    circuits: &SessionDeliveryCircuits,
+    persistence: Option<&ConversationPersistenceAdapter>,
+    session_id: &str,
+    type_: &'static str,
+    payload: &P,
+) -> Result<events::DeliveryReceipt, events::DeliveryError> {
+    if let Some(source_code) = circuits.lock().get(session_id) {
+        return Err(events::DeliveryError::circuit_open(source_code));
+    }
+    let result = events::deliver(sinks, persistence, Some(session_id), type_, payload).await;
+    if let Err(error) = &result {
+        if error.should_open_session_circuit() {
+            circuits.lock().insert(
+                session_id.to_string(),
+                error
+                    .source_code
+                    .unwrap_or(CONVERSATION_PERSISTENCE_REJECTED),
+            );
+            log::error!(
+                "[acp] session delivery circuit opened code={} source_code={}",
+                error.code,
+                error.source_code.unwrap_or("UNKNOWN")
+            );
+        }
+    }
+    result
+}
+
+fn log_delivery_error(operation: &'static str, error: &FanOutError) {
+    log::warn!(
+        "[acp] event delivery degraded operation={} code={} source_code={} delivered_count={}",
+        operation,
+        error.code,
+        error.source_code.unwrap_or("NONE"),
+        error.delivered_count
+    );
+}
+
+fn log_delivery_ticket_error(operation: &'static str, error: &events::DeliveryError) {
+    log::warn!(
+        "[acp] event delivery degraded operation={} code={} source_code={} class={:?} delivered_count={}",
+        operation,
+        error.code,
+        error.source_code.unwrap_or("NONE"),
+        error.class,
+        error.delivered_count
+    );
+}
+
 pub struct AcpManager {
     sinks: Vec<Arc<dyn EventSink>>,
     agents: Arc<Mutex<HashMap<AgentId, AgentEntry>>>,
     persistence: Option<Arc<SessionPersistence>>,
+    conversation_creation: Option<Arc<ConversationCreationService>>,
+    conversation_persistence: Option<Arc<ConversationPersistenceAdapter>>,
+    pty_manager: Mutex<Option<Weak<crate::pty::PtyManager>>>,
+    /// Replacement `session_created` gates keyed by provisional opaque session id. The provider
+    /// result is not renderer-visible until canonical `binding_replaced` commits.
+    replacement_gates: Mutex<ReplacementGates>,
     /// Per-agent "warmup done" guard for the first-prompt cold-start
     /// workaround (pi-acp issue #94). A visibility-churn re-entry of
     /// `NewSession` for an agent whose warmup already completed (or is still
@@ -850,12 +1037,45 @@ pub(crate) async fn record_local_title(
         Some(event.session_id.0.as_str()),
         events::EVENT_SESSION_INFO_UPDATE,
         &event,
-    );
+    )
+    .map_err(|error| {
+        log_delivery_error("record_local_title", &error);
+        error.code.to_string()
+    })?;
     log::info!(
         "[acp-title] title persisted and broadcast for session {session_id} (seq={next_seq}, title_len={} chars)",
         title.chars().count()
     );
     Ok(())
+}
+
+fn stable_conversation_code(code: crate::conversation::ConversationErrorCode) -> String {
+    serde_json::to_value(code)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "CONVERSATION_RECOVERY_REQUIRED".to_string())
+}
+
+fn compensation_provider_close_code(detail: &str) -> String {
+    if detail.contains("does not support session/close") {
+        "ACP_CLOSE_UNSUPPORTED"
+    } else {
+        "ACP_CLOSE_FAILED"
+    }
+    .to_string()
+}
+
+fn log_compensation_failure(operation: &'static str, failure: &AgentCompensationFailure) {
+    log::error!(
+        "[acp-compensation] operation={} conversation_id={} primary_code={} provider_close_code={} failure_record_code={} recovery_marker_code={} recovery_record_code={}",
+        operation,
+        failure.conversation_id,
+        failure.primary_code,
+        failure.provider_close_code.as_deref().unwrap_or("OK"),
+        failure.failure_record_code.as_deref().unwrap_or("OK"),
+        failure.recovery_marker_code.as_deref().unwrap_or("OK"),
+        failure.recovery_record_code.as_deref().unwrap_or("OK")
+    );
 }
 
 impl AcpManager {
@@ -874,6 +1094,10 @@ impl AcpManager {
             sinks,
             agents: Arc::new(Mutex::new(HashMap::new())),
             persistence: None,
+            conversation_creation: None,
+            conversation_persistence: None,
+            pty_manager: Mutex::new(None),
+            replacement_gates: Mutex::new(HashMap::new()),
             warmup_done: Arc::new(Mutex::new(HashSet::new())),
             host_plan_server,
         }
@@ -893,6 +1117,35 @@ impl AcpManager {
             sinks,
             agents: Arc::new(Mutex::new(HashMap::new())),
             persistence: Some(persistence),
+            conversation_creation: None,
+            conversation_persistence: None,
+            pty_manager: Mutex::new(None),
+            replacement_gates: Mutex::new(HashMap::new()),
+            warmup_done: Arc::new(Mutex::new(HashSet::new())),
+            host_plan_server,
+        }
+    }
+
+    /// Create a manager backed exclusively by the canonical Conversation repository.
+    #[must_use]
+    pub fn with_conversation_services(
+        sinks: Vec<Arc<dyn EventSink>>,
+        creation: Arc<ConversationCreationService>,
+        persistence: Arc<ConversationPersistenceAdapter>,
+    ) -> Self {
+        let host_plan_server =
+            crate::acp::host_mcp::parent::HostPlanServer::start_with_conversation_persistence(
+                sinks.clone(),
+                Arc::clone(&persistence),
+            );
+        Self {
+            sinks,
+            agents: Arc::new(Mutex::new(HashMap::new())),
+            persistence: None,
+            conversation_creation: Some(creation),
+            conversation_persistence: Some(persistence),
+            pty_manager: Mutex::new(None),
+            replacement_gates: Mutex::new(HashMap::new()),
             warmup_done: Arc::new(Mutex::new(HashSet::new())),
             host_plan_server,
         }
@@ -903,6 +1156,64 @@ impl AcpManager {
         self.persistence.clone()
     }
 
+    #[must_use]
+    pub fn conversation_creation(&self) -> Option<Arc<ConversationCreationService>> {
+        self.conversation_creation.clone()
+    }
+
+    /// Resolve a currently connected runtime agent by its durable renderer config id.
+    ///
+    /// Scheduled tasks persist only the stable config id, never launch environment
+    /// values or credentials. A host can therefore execute a task only while the
+    /// matching agent is connected; otherwise the run is recorded as
+    /// `AGENT_UNAVAILABLE` and may be retried explicitly after the agent starts.
+    #[must_use]
+    pub fn find_agent_by_config_id(&self, config_id: &str) -> Option<AgentId> {
+        let namespace = format!("config:{}", config_id.trim());
+        self.agents.lock().iter().find_map(|(agent_id, entry)| {
+            (entry.stable_namespace.as_deref() == Some(namespace.as_str()))
+                .then(|| agent_id.clone())
+        })
+    }
+
+    pub fn set_scheduled_tasks(&self, service: &Arc<crate::scheduled_tasks::ScheduledTaskService>) {
+        self.host_plan_server.set_scheduled_tasks(service);
+    }
+
+    #[must_use]
+    pub fn scheduled_tasks(&self) -> Option<Arc<crate::scheduled_tasks::ScheduledTaskService>> {
+        self.host_plan_server.scheduled_tasks()
+    }
+
+    #[must_use]
+    pub fn conversation_id_for_current_session(
+        &self,
+        agent_session_id: &str,
+    ) -> Option<ConversationId> {
+        self.conversation_persistence
+            .as_ref()
+            .and_then(|adapter| adapter.conversation_id_for_current_binding(agent_session_id))
+    }
+
+    pub fn register_conversation_binding(
+        &self,
+        agent_session_id: &str,
+        conversation_id: ConversationId,
+    ) {
+        if let Some(adapter) = &self.conversation_persistence {
+            adapter.register_binding(agent_session_id, conversation_id);
+        }
+    }
+
+    pub fn set_pty_manager(&self, pty: &Arc<crate::pty::PtyManager>) {
+        *self.pty_manager.lock() = Some(Arc::downgrade(pty));
+    }
+
+    #[must_use]
+    pub fn pty_manager(&self) -> Option<Arc<crate::pty::PtyManager>> {
+        self.pty_manager.lock().as_ref().and_then(Weak::upgrade)
+    }
+
     /// Spawn an ACP agent: launch the subprocess, complete `initialize`, and
     /// register the agent. Emits `acp:agent_spawned` on success. Returns a
     /// [`SpawnOutcome`] carrying the authoritative capabilities, auth methods,
@@ -910,6 +1221,18 @@ impl AcpManager {
     /// synchronously from the response (CAP-4: the spawn response — not the
     /// async event — is the source of truth).
     pub async fn spawn(&self, config: AgentConfig) -> Result<SpawnOutcome, String> {
+        let config = match tokio::task::spawn_blocking({
+            let config = config.clone();
+            move || crate::acp::npm_local::materialize_npx_config(config)
+        })
+        .await
+        {
+            Ok(next) => next,
+            Err(error) => {
+                log::warn!("[acp-npm] materialize join failed: {error}");
+                config
+            }
+        };
         self.spawn_with_sinks(config, self.sinks.clone()).await
     }
 
@@ -938,6 +1261,7 @@ impl AcpManager {
         // `Err(_)` with no detail; the driver records the real error here so we
         // can surface it instead of a generic "did not initialize" message.
         let start_error = Arc::new(Mutex::new(None::<String>));
+        let permission_policy = Arc::new(Mutex::new(config.permission_policy));
 
         let thread_agent_id = agent_id.clone();
         let thread_config = config.clone();
@@ -946,8 +1270,10 @@ impl AcpManager {
         let thread_killed = killed.clone();
         let thread_start_error = start_error.clone();
         let thread_persistence = self.persistence.clone();
+        let thread_conversation_persistence = self.conversation_persistence.clone();
         let thread_warmup_done = self.warmup_done.clone();
         let thread_host_plan_server = self.host_plan_server.clone();
+        let thread_permission_policy = permission_policy.clone();
         let stable_namespace = stable_agent_namespace(&config);
 
         let join_handle = std::thread::Builder::new()
@@ -957,6 +1283,7 @@ impl AcpManager {
                     thread_config,
                     sinks,
                     thread_host_plan_server,
+                    thread_permission_policy,
                     thread_agent_id,
                     command_rx,
                     init_tx,
@@ -965,6 +1292,7 @@ impl AcpManager {
                     thread_killed,
                     thread_start_error,
                     thread_persistence,
+                    thread_conversation_persistence,
                     thread_warmup_done,
                 );
             })
@@ -1016,6 +1344,7 @@ impl AcpManager {
                     stable_namespace: stable_namespace.clone(),
                     join_handle: Some(join_handle),
                     killed,
+                    permission_policy,
                 },
             );
         }
@@ -1028,7 +1357,10 @@ impl AcpManager {
         // `agent_spawned` is agent-level (no session yet) → sid = None. The event
         // stays for observers; the spawn response is now the authoritative source
         // of capabilities + authMethods + stableNamespace.
-        events::fan_out(&self.sinks, None, events::EVENT_AGENT_SPAWNED, &event);
+        if let Err(error) = events::fan_out(&self.sinks, None, events::EVENT_AGENT_SPAWNED, &event)
+        {
+            log_delivery_error("agent_spawned", &error);
+        }
 
         // Log success at the host boundary with the agent id and auth-method ids
         // (never credentials). One line per spawn so a missing method list or an
@@ -1071,6 +1403,25 @@ impl AcpManager {
             .ok_or_else(|| format!("unknown agent: {agent_id}"))
     }
 
+    pub fn set_permission_policy(
+        &self,
+        agent_id: &AgentId,
+        policy: PermissionPolicy,
+    ) -> Result<(), String> {
+        let policy_ref = self
+            .agents
+            .lock()
+            .get(agent_id)
+            .map(|entry| entry.permission_policy.clone())
+            .ok_or_else(|| format!("unknown agent: {agent_id}"))?;
+        *policy_ref.lock() = policy;
+        log::info!(
+            "[acp-permission] boundary=policy_updated agent_id={} policy={policy:?}",
+            agent_id.0
+        );
+        Ok(())
+    }
+
     /// Resolve the stable agent namespace (config id or safe fallback) for a
     /// live agent. Returns `Ok(Some(namespace))` when the agent has a stable
     /// namespace, `Ok(None)` when it has none, or `Err` when the agent is
@@ -1100,6 +1451,99 @@ impl AcpManager {
         .await
     }
 
+    /// Create a replacement provider session without mutating canonical Conversation state.
+    /// ConversationLifecycleService calls this only after lastSeq CAS succeeds and appends the
+    /// replacement binding before publishing the returned session as canonical.
+    pub async fn create_replacement_session(
+        &self,
+        previous_binding: &AgentSessionBinding,
+        prepared: &PreparedConversation,
+    ) -> Result<AgentBindingResult, String> {
+        let agent_id = AgentId(previous_binding.runtime_agent_id.clone());
+        let (caps, stable_agent_namespace) = self
+            .agents
+            .lock()
+            .get(&agent_id)
+            .map(|entry| (entry.capabilities.clone(), entry.stable_namespace.clone()))
+            .ok_or_else(|| format!("unknown agent: {agent_id}"))?;
+        let (port, token, provisional_sid) = self.host_plan_server.register_session(&agent_id.0);
+        let internal = build_internal_plan_stdio(&agent_id.0, port, &token, &provisional_sid);
+        if let Err(error) = gate_mcp_servers(&caps, &internal) {
+            self.host_plan_server.unregister_by_token(&token);
+            return Err(error);
+        }
+        let tx = self.command_tx(&agent_id)?;
+        let (binding_gate_tx, binding_gate_rx) = watch::channel(None);
+        let outcome = send_command(&tx, |reply| AcpCommand::NewSession {
+            cwd: prepared.execution_cwd.clone(),
+            mcp_servers: internal,
+            stable_agent_namespace: stable_agent_namespace.clone(),
+            runtime_agent_id: agent_id.0.clone(),
+            project_id: None,
+            ephemeral: false,
+            worktree_path: None,
+            worktree_branch: None,
+            binding_gate: Some(binding_gate_rx),
+            reply,
+        })
+        .await;
+        match outcome {
+            Ok(outcome) => {
+                self.host_plan_server
+                    .bind_session(&token, &outcome.session_id.0);
+                self.replacement_gates
+                    .lock()
+                    .insert(outcome.session_id.0.clone(), binding_gate_tx);
+                Ok(AgentBindingResult {
+                    agent_session_id: outcome.session_id.0,
+                    runtime_agent_id: agent_id.0,
+                    stable_agent_namespace: stable_agent_namespace
+                        .unwrap_or_else(|| previous_binding.stable_agent_namespace.clone()),
+                })
+            }
+            Err(error) => {
+                let _ = binding_gate_tx.send(Some(Err("ACP_REPLACE_FAILED".to_string())));
+                self.host_plan_server.unregister_by_token(&token);
+                Err(error)
+            }
+        }
+    }
+
+    /// Publish a replacement provider session only after canonical binding history commits.
+    pub fn commit_replacement_session(&self, agent_session_id: &str) {
+        if let Some(gate) = self.replacement_gates.lock().remove(agent_session_id) {
+            let _ = gate.send(Some(Ok(())));
+        }
+    }
+
+    /// Suppress a provisional replacement event before checked provider cleanup.
+    pub async fn abort_replacement_session(
+        &self,
+        binding: &AgentSessionBinding,
+    ) -> Result<(), String> {
+        if let Some(gate) = self
+            .replacement_gates
+            .lock()
+            .remove(&binding.agent_session_id)
+        {
+            let _ = gate.send(Some(Err("CONVERSATION_RECOVERY_REQUIRED".to_string())));
+        }
+        self.close_conversation_session(binding).await
+    }
+
+    /// Capability-aware close used by ConversationLifecycleService. It does not mutate canonical
+    /// bindings; the service appends `binding_suspended` only after this succeeds.
+    pub async fn close_conversation_session(
+        &self,
+        binding: &AgentSessionBinding,
+    ) -> Result<(), String> {
+        self.close_session(
+            &AgentId(binding.runtime_agent_id.clone()),
+            SessionId::new(binding.agent_session_id.clone()),
+        )
+        .await
+    }
+
     pub async fn new_session_with_context(
         &self,
         agent_id: &AgentId,
@@ -1114,20 +1558,87 @@ impl AcpManager {
             .map(|entry| (entry.capabilities.clone(), entry.stable_namespace.clone()))
             .ok_or_else(|| format!("unknown agent: {agent_id}"))?;
 
-        // Host-injected `plan` MCP tool: prepend a self-spawned stdio
-        // child to every non-ephemeral session's mcp_servers so the agent
-        // discovers + calls it as a first-class tool (see `host_mcp::mod` +
-        // spec `spec-acp-host-todo-plan-tool.md`). The real ACP session_id
-        // isn't known until the response, so register with a provisional id
-        // now + bind after `session/new` returns. If session creation fails,
-        // evict the token so it doesn't leak (CodeRabbit #6).
+        let mut prepared = None;
+        let mut binding_gate_tx = None;
+        let mut binding_gate_rx = None;
+        let execution_cwd = if context.ephemeral {
+            cwd.clone()
+        } else if let Some(creation) = &self.conversation_creation {
+            let execution_target = context.execution_target.clone().unwrap_or_else(|| {
+                if let (Some(project_id), Some(worktree_path), Some(worktree_branch)) = (
+                    context.project_id.clone(),
+                    context.worktree_path.clone(),
+                    context.worktree_branch.clone(),
+                ) {
+                    ExecutionTarget::Worktree {
+                        project_id,
+                        worktree_path,
+                        worktree_branch,
+                    }
+                } else if let Some(project_id) = context.project_id.clone() {
+                    ExecutionTarget::ProjectRoot {
+                        project_id,
+                        project_root: cwd.clone(),
+                    }
+                } else {
+                    ExecutionTarget::Workspace
+                }
+            });
+            let project_attachment = context.project_attachment.clone().or_else(|| {
+                context
+                    .project_id
+                    .clone()
+                    .map(|project_id| ProjectAttachment {
+                        schema_version: PROJECT_ATTACHMENT_SCHEMA_VERSION,
+                        project_id,
+                        attached_at_utc: chrono::Utc::now(),
+                        project_path_snapshot: cwd.clone(),
+                        worktree_path: context.worktree_path.clone(),
+                        worktree_branch: context.worktree_branch.clone(),
+                    })
+            });
+            let request = PrepareConversationRequest {
+                schema_version: crate::conversation::PREPARE_CONVERSATION_SCHEMA_VERSION,
+                conversation_id: context.conversation_id,
+                project_attachment,
+                execution_target,
+            };
+            let value = creation
+                .prepare_conversation(request)
+                .await
+                .map_err(|error| error.to_string())?;
+            log::info!(
+                "[conversation-creation] prepared before ACP conversation_id={}",
+                value.conversation_id
+            );
+            let (tx, rx) = watch::channel(None);
+            binding_gate_tx = Some(tx);
+            binding_gate_rx = Some(rx);
+            let execution_cwd = value.execution_cwd.clone();
+            prepared = Some(value);
+            execution_cwd
+        } else {
+            return Err("CONVERSATION_BOOTSTRAP_REQUIRED: non-ephemeral creation has no ConversationCreationService".to_string());
+        };
+
+        if let Some(prepared) = prepared.as_ref() {
+            let provider_key = stable_agent_namespace
+                .as_deref()
+                .and_then(|value| value.strip_prefix("config:"))
+                .unwrap_or(agent_id.0.as_str());
+            crate::skills::ConversationSkillProvisioner::new()
+                .provision(std::path::Path::new(&prepared.workspace_cwd), provider_key)
+                .map_err(|error| format!("SCHEDULED_TASK_SKILL_PROVISION_FAILED: {error}"))?;
+        }
+
+        // Host-injected `plan` MCP tool: prepend a self-spawned stdio child to every
+        // non-ephemeral session. The provisional token is rebound after durable binding.
         let (combined_mcp_servers, plan_token): (Vec<McpServer>, Option<String>) = if !context
             .ephemeral
         {
             let (port, token, provisional_sid) =
                 self.host_plan_server.register_session(&agent_id.0);
             let internal = build_internal_plan_stdio(&agent_id.0, port, &token, &provisional_sid);
-            // Prepend so the internal server is first in the agent's tool list.
             let mut combined = internal;
             combined.extend(mcp_servers);
             (combined, Some(token))
@@ -1135,11 +1646,14 @@ impl AcpManager {
             (mcp_servers, None)
         };
 
+        let stable_for_binding = stable_agent_namespace
+            .clone()
+            .unwrap_or_else(|| agent_id.0.clone());
         let outcome = async {
             gate_mcp_servers(&caps, &combined_mcp_servers)?;
             let tx = self.command_tx(agent_id)?;
             send_command(&tx, |reply| AcpCommand::NewSession {
-                cwd,
+                cwd: execution_cwd,
                 mcp_servers: combined_mcp_servers,
                 stable_agent_namespace,
                 runtime_agent_id: agent_id.0.clone(),
@@ -1147,6 +1661,7 @@ impl AcpManager {
                 ephemeral: context.ephemeral,
                 worktree_path: context.worktree_path,
                 worktree_branch: context.worktree_branch,
+                binding_gate: binding_gate_rx,
                 reply,
             })
             .await
@@ -1154,23 +1669,139 @@ impl AcpManager {
         .await;
 
         match outcome {
-            Ok(outcome) => {
-                // Bind the real session_id to the plan token so the parent can
-                // emit plan_update for the right session when the agent calls
-                // plan.
+            Ok(mut outcome) => {
+                if let Some(prepared) = prepared {
+                    let bind_result = self
+                        .conversation_creation
+                        .as_ref()
+                        .expect("prepared only when creation service exists")
+                        .complete_agent_binding(
+                            prepared.conversation_id,
+                            AgentBindingResult {
+                                agent_session_id: outcome.session_id.0.clone(),
+                                runtime_agent_id: agent_id.0.clone(),
+                                stable_agent_namespace: stable_for_binding,
+                            },
+                        )
+                        .await;
+                    match bind_result {
+                        Ok(_) => {
+                            if let Some(adapter) = &self.conversation_persistence {
+                                adapter.register_binding(
+                                    &outcome.session_id.0,
+                                    prepared.conversation_id,
+                                );
+                            }
+                            if let Some(tx) = binding_gate_tx {
+                                let _ = tx.send(Some(Ok(())));
+                            }
+                            outcome.persistence = "conversation";
+                            outcome.conversation_id = Some(prepared.conversation_id);
+                            outcome.workspace_cwd = Some(prepared.workspace_cwd);
+                            outcome.execution_cwd = Some(prepared.execution_cwd);
+                            log::info!(
+                                "[conversation-creation] binding durable conversation_id={}",
+                                prepared.conversation_id
+                            );
+                        }
+                        Err(error) => {
+                            if let Some(tx) = binding_gate_tx {
+                                let _ = tx.send(Some(Err("CONVERSATION_BIND_FAILED".to_string())));
+                            }
+                            if let Some(token) = plan_token {
+                                self.host_plan_server.unregister_by_token(&token);
+                            }
+                            let provider_close_code = self
+                                .close_session(agent_id, outcome.session_id.clone())
+                                .await
+                                .err()
+                                .map(|detail| compensation_provider_close_code(&detail));
+                            let creation = self
+                                .conversation_creation
+                                .as_ref()
+                                .expect("prepared only when creation service exists");
+                            let failure_record_code = creation
+                                .record_agent_creation_failure(
+                                    prepared.conversation_id,
+                                    "CONVERSATION_BIND_FAILED",
+                                    "canonical agent binding could not be persisted",
+                                )
+                                .await
+                                .err()
+                                .map(|failure| stable_conversation_code(failure.code));
+                            if provider_close_code.is_some() || failure_record_code.is_some() {
+                                let failure = creation
+                                    .record_agent_compensation_failure(
+                                        prepared.conversation_id,
+                                        "CONVERSATION_BIND_FAILED",
+                                        provider_close_code.as_deref(),
+                                        failure_record_code.as_deref(),
+                                        None,
+                                    )
+                                    .await;
+                                log_compensation_failure("new_session_bind", &failure);
+                                return Err(failure.wire_error());
+                            }
+                            log::error!(
+                                "[conversation-creation] binding durability failed conversation_id={} primary_code=CONVERSATION_BIND_FAILED repository_code={}",
+                                prepared.conversation_id,
+                                stable_conversation_code(error.code)
+                            );
+                            return Err(
+                                "CONVERSATION_BIND_FAILED: canonical agent binding could not be persisted"
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
                 if let Some(token) = plan_token {
                     self.host_plan_server
                         .bind_session(&token, &outcome.session_id.0);
                 }
                 Ok(outcome)
             }
-            Err(e) => {
-                // Evict the registered token on failure so it doesn't leak +
-                // the provisional id can't be reused by a later session.
+            Err(error) => {
+                let mut compensation_failure = None;
+                if let Some(prepared) = prepared {
+                    if let Some(creation) = &self.conversation_creation {
+                        if let Err(failure) = creation
+                            .record_agent_creation_failure(
+                                prepared.conversation_id,
+                                "ACP_SESSION_NEW_FAILED",
+                                "agent session creation failed",
+                            )
+                            .await
+                        {
+                            let failure_record_code = stable_conversation_code(failure.code);
+                            let compound = creation
+                                .record_agent_compensation_failure(
+                                    prepared.conversation_id,
+                                    "ACP_SESSION_NEW_FAILED",
+                                    None,
+                                    Some(&failure_record_code),
+                                    None,
+                                )
+                                .await;
+                            log_compensation_failure("new_session_create", &compound);
+                            compensation_failure = Some(compound);
+                        }
+                    }
+                    if let Some(tx) = binding_gate_tx {
+                        let code = if compensation_failure.is_some() {
+                            ACP_COMPENSATION_FAILED
+                        } else {
+                            "ACP_SESSION_NEW_FAILED"
+                        };
+                        let _ = tx.send(Some(Err(code.to_string())));
+                    }
+                }
                 if let Some(token) = plan_token {
                     self.host_plan_server.unregister_by_token(&token);
                 }
-                Err(e)
+                match compensation_failure {
+                    Some(failure) => Err(failure.wire_error()),
+                    None => Err(error),
+                }
             }
         }
     }
@@ -1181,16 +1812,24 @@ impl AcpManager {
         agent_id: &AgentId,
         session_id: SessionId,
         cwd: String,
+        mcp_servers: Vec<McpServer>,
     ) -> Result<SessionReopenOutcome, String> {
         let caps = self.capabilities(agent_id)?;
         gate_load_session(&caps)?;
         let tx = self.command_tx(agent_id)?;
-        send_command(&tx, |reply| AcpCommand::LoadSession {
+        let (mcp_servers, host_token) =
+            self.prepare_reopen_mcp_servers(agent_id, &session_id, mcp_servers)?;
+        let outcome = send_command(&tx, |reply| AcpCommand::LoadSession {
             session_id,
             cwd,
+            mcp_servers,
             reply,
         })
-        .await
+        .await;
+        if outcome.is_err() {
+            self.host_plan_server.unregister_by_token(&host_token);
+        }
+        outcome
     }
 
     /// Resume a session. Gated on the agent's `sessionCapabilities.resume`.
@@ -1199,16 +1838,51 @@ impl AcpManager {
         agent_id: &AgentId,
         session_id: SessionId,
         cwd: String,
+        mcp_servers: Vec<McpServer>,
     ) -> Result<SessionReopenOutcome, String> {
         let caps = self.capabilities(agent_id)?;
         gate_resume_session(&caps)?;
         let tx = self.command_tx(agent_id)?;
-        send_command(&tx, |reply| AcpCommand::ResumeSession {
+        let (mcp_servers, host_token) =
+            self.prepare_reopen_mcp_servers(agent_id, &session_id, mcp_servers)?;
+        let outcome = send_command(&tx, |reply| AcpCommand::ResumeSession {
             session_id,
             cwd,
+            mcp_servers,
             reply,
         })
-        .await
+        .await;
+        if outcome.is_err() {
+            self.host_plan_server.unregister_by_token(&host_token);
+        }
+        outcome
+    }
+
+    fn prepare_reopen_mcp_servers(
+        &self,
+        agent_id: &AgentId,
+        session_id: &SessionId,
+        configured_mcp_servers: Vec<McpServer>,
+    ) -> Result<(Vec<McpServer>, String), String> {
+        // Reopen requests carry the complete MCP set. Replace any previous
+        // in-process route for this session before issuing a fresh credential.
+        self.host_plan_server.unregister_session(&session_id.0);
+        let (port, token, provisional_sid) = self.host_plan_server.register_session(&agent_id.0);
+        self.host_plan_server.bind_session(&token, &session_id.0);
+        let mut combined = build_internal_plan_stdio(&agent_id.0, port, &token, &provisional_sid);
+        let configured_count = configured_mcp_servers.len();
+        combined.extend(configured_mcp_servers);
+        if let Err(error) = gate_mcp_servers(&self.capabilities(agent_id)?, &combined) {
+            self.host_plan_server.unregister_by_token(&token);
+            return Err(error);
+        }
+        log::info!(
+            "[host-mcp] boundary=session_reopen_injected agent_id={} configured_count={} total_count={}",
+            agent_id.0,
+            configured_count,
+            combined.len()
+        );
+        Ok((combined, token))
     }
 
     /// Close a session. Gated on the agent's `sessionCapabilities.close`.
@@ -1503,8 +2177,10 @@ impl AcpManager {
         Ok(())
     }
 
-    /// Kill all agents and surface join/persistence durability failures.
-    pub async fn kill_all_checked(&self) -> Result<(), String> {
+    /// Stop every ACP producer and join its driver before any host persistence drain begins.
+    /// This method intentionally does not flush a store; standalone shutdown composes it ahead of
+    /// relay and catalog barriers under one outer deadline.
+    pub async fn stop_producers(&self) -> Result<(), String> {
         let entries: Vec<(AgentId, AgentEntry)> = {
             let mut agents = self.agents.lock();
             agents.drain().collect()
@@ -1519,19 +2195,10 @@ impl AcpManager {
                 handles.push(handle);
             }
         }
-
         if handles.is_empty() {
-            if let Some(persistence) = &self.persistence {
-                persistence
-                    .flush_all()
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
             return Ok(());
         }
 
-        // Bounded join across all threads so app exit can't hang on one stuck
-        // agent. We join concurrently and cap the total wait at JOIN_TIMEOUT.
         let join_all = tokio::task::spawn_blocking(move || {
             for handle in handles {
                 let _ = handle.join();
@@ -1541,6 +2208,12 @@ impl AcpManager {
             .await
             .map_err(|_| format!("agent shutdown exceeded {JOIN_TIMEOUT:?}"))?
             .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Kill all agents and surface join/persistence durability failures.
+    pub async fn kill_all_checked(&self) -> Result<(), String> {
+        self.stop_producers().await?;
         if let Some(persistence) = &self.persistence {
             persistence
                 .flush_all()
@@ -1548,6 +2221,75 @@ impl AcpManager {
                 .map_err(|error| error.to_string())?;
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_agent_for_new_session(
+        &self,
+        agent_id: AgentId,
+        observed: std::sync::mpsc::SyncSender<(String, bool)>,
+    ) {
+        self.install_test_agent_for_new_session_with_close_result(agent_id, observed, Ok(()));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_test_agent_for_new_session_with_close_result(
+        &self,
+        agent_id: AgentId,
+        observed: std::sync::mpsc::SyncSender<(String, bool)>,
+        close_result: Result<(), String>,
+    ) {
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(command) = command_rx.recv().await {
+                match command {
+                    AcpCommand::NewSession {
+                        cwd,
+                        ephemeral,
+                        mut binding_gate,
+                        reply,
+                        ..
+                    } => {
+                        let exists = PathBuf::from(&cwd).is_dir();
+                        let _ = observed.send((cwd.clone(), exists));
+                        let _ = reply.send(Ok(NewSessionOutcome {
+                            persistence: if ephemeral {
+                                "ephemeral"
+                            } else {
+                                "conversation"
+                            },
+                            conversation_id: None,
+                            workspace_cwd: None,
+                            execution_cwd: None,
+                            session_id: SessionId::new("opaque/fake-session"),
+                            modes: None,
+                            models: None,
+                            config_options: None,
+                        }));
+                        if let Some(gate) = binding_gate.as_mut() {
+                            while gate.borrow().is_none() && gate.changed().await.is_ok() {}
+                        }
+                    }
+                    AcpCommand::CloseSession { reply, .. } => {
+                        let _ = reply.send(close_result.clone());
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let mut capabilities = AgentCapabilities::default();
+        capabilities.session_capabilities.close = Some(Default::default());
+        self.agents.lock().insert(
+            agent_id,
+            AgentEntry {
+                command_tx,
+                capabilities,
+                stable_namespace: Some("config:test".to_string()),
+                join_handle: None,
+                killed: Arc::new(AtomicBool::new(false)),
+                permission_policy: Arc::new(Mutex::new(PermissionPolicy::Ask)),
+            },
+        );
     }
 
     #[cfg(test)]
@@ -1597,6 +2339,7 @@ impl AcpManager {
                 stable_namespace: None,
                 join_handle: None,
                 killed: Arc::new(AtomicBool::new(false)),
+                permission_policy: Arc::new(Mutex::new(PermissionPolicy::Ask)),
             },
         );
     }
@@ -1660,13 +2403,20 @@ impl AcpManager {
                                     stop_reason,
                                     turn_id,
                                 };
-                                events::fan_out(
+                                match events::fan_out(
                                     &prompt_sinks,
                                     Some(&session_id.0),
                                     events::EVENT_PROMPT_COMPLETE,
                                     &event,
-                                );
-                                let _ = reply.send(Ok(stop_reason));
+                                ) {
+                                    Ok(_) => {
+                                        let _ = reply.send(Ok(stop_reason));
+                                    }
+                                    Err(error) => {
+                                        log_delivery_error("test_prompt_complete", &error);
+                                        let _ = reply.send(Err(error.code.to_string()));
+                                    }
+                                }
                             });
                             released = true;
                         } else {
@@ -1692,6 +2442,7 @@ impl AcpManager {
                 stable_namespace: None,
                 join_handle: None,
                 killed: Arc::new(AtomicBool::new(false)),
+                permission_policy: Arc::new(Mutex::new(PermissionPolicy::Ask)),
             },
         );
         (release_tx, entered_rx)
@@ -1886,6 +2637,17 @@ async fn join_thread_bounded(handle: JoinHandle<()>) {
     }
 }
 
+fn preferred_allow_option(options: &[PermissionOption]) -> Option<&PermissionOption> {
+    options
+        .iter()
+        .find(|option| option.kind == PermissionOptionKind::AllowAlways)
+        .or_else(|| {
+            options
+                .iter()
+                .find(|option| option.kind == PermissionOptionKind::AllowOnce)
+        })
+}
+
 /// Entry point for an agent's dedicated driver thread.
 ///
 /// Builds a current-thread Tokio runtime and drives the ACP connection to
@@ -1899,6 +2661,7 @@ fn run_agent(
     config: AgentConfig,
     sinks: Vec<Arc<dyn EventSink>>,
     host_plan_server: Arc<crate::acp::host_mcp::parent::HostPlanServer>,
+    permission_policy: Arc<Mutex<PermissionPolicy>>,
     agent_id: AgentId,
     command_rx: mpsc::UnboundedReceiver<AcpCommand>,
     init_tx: oneshot::Sender<Result<InitOutcome, String>>,
@@ -1907,6 +2670,7 @@ fn run_agent(
     killed: Arc<AtomicBool>,
     start_error: Arc<Mutex<Option<String>>>,
     persistence: Option<Arc<SessionPersistence>>,
+    conversation_persistence: Option<Arc<ConversationPersistenceAdapter>>,
     warmup_done: Arc<Mutex<HashSet<AgentId>>>,
 ) {
     // True once `initialize` succeeded and the agent was surfaced to the
@@ -1935,12 +2699,14 @@ fn run_agent(
         config,
         sinks.clone(),
         host_plan_server.clone(),
+        permission_policy,
         agent_id.clone(),
         command_rx,
         init_tx,
         spawned.clone(),
         driver_state.clone(),
         persistence.clone(),
+        conversation_persistence,
         warmup_done.clone(),
     ));
 
@@ -2035,12 +2801,14 @@ fn run_agent(
                 agent_id: agent_id.clone(),
                 session_id: SessionId::new(session),
             };
-            events::fan_out(
+            if let Err(error) = events::fan_out(
                 &sinks,
                 Some(event.session_id.0.as_str()),
                 events::EVENT_SESSION_CLOSED,
                 &event,
-            );
+            ) {
+                log_delivery_error("session_closed", &error);
+            }
         }
 
         if let Err(message) = result {
@@ -2053,7 +2821,10 @@ fn run_agent(
                 session_id: None,
                 message: message.clone(),
             };
-            events::fan_out(&sinks, None, events::EVENT_AGENT_CRASHED, &crashed);
+            if let Err(error) = events::fan_out(&sinks, None, events::EVENT_AGENT_CRASHED, &crashed)
+            {
+                log_delivery_error("agent_crashed", &error);
+            }
 
             let event = AgentErrorEvent {
                 agent_id: agent_id.clone(),
@@ -2061,12 +2832,17 @@ fn run_agent(
                 message,
             };
             // Teardown error is agent-level (no session) → sid = None.
-            events::fan_out(&sinks, None, events::EVENT_AGENT_ERROR, &event);
+            if let Err(error) = events::fan_out(&sinks, None, events::EVENT_AGENT_ERROR, &event) {
+                log_delivery_error("agent_error", &error);
+            }
         }
 
         let event = AgentDisconnectedEvent { agent_id };
         // Agent-level lifecycle event → sid = None.
-        events::fan_out(&sinks, None, events::EVENT_AGENT_DISCONNECTED, &event);
+        if let Err(error) = events::fan_out(&sinks, None, events::EVENT_AGENT_DISCONNECTED, &event)
+        {
+            log_delivery_error("agent_disconnected", &error);
+        }
     }
 }
 
@@ -2076,69 +2852,60 @@ async fn drive_connection(
     config: AgentConfig,
     sinks: Vec<Arc<dyn EventSink>>,
     host_plan_server: Arc<crate::acp::host_mcp::parent::HostPlanServer>,
+    permission_policy: Arc<Mutex<PermissionPolicy>>,
     agent_id: AgentId,
     command_rx: mpsc::UnboundedReceiver<AcpCommand>,
     init_tx: oneshot::Sender<Result<InitOutcome, String>>,
     spawned: Arc<AtomicBool>,
     driver_state: Arc<Mutex<DriverState>>,
     persistence: Option<Arc<SessionPersistence>>,
+    conversation_persistence: Option<Arc<ConversationPersistenceAdapter>>,
     warmup_done: Arc<Mutex<HashSet<AgentId>>>,
 ) -> Result<(), String> {
-    // Forward the agent subprocess's stdio to the log at `debug` (opt-in via
-    // `RUST_LOG`). stderr is where agents print auth/login prompts and runtime
-    // errors, so it is logged verbatim. stdin/stdout carry the JSON-RPC protocol
-    // trace which can include `authenticate` payloads (API keys, OAuth tokens),
-    // so by default those are redacted to direction + byte length — enough to
-    // confirm streaming/traffic without writing secrets to disk.
-    //
-    // Set `TERMUL_ACP_TRACE_RAW=1` to log the full stdin/stdout JSON-RPC bodies
-    // (diagnostics only — may write secrets to the log; never enable in normal
-    // use). Combine with a debug log level to see the trace.
+    // Agent stderr and JSON-RPC/terminal streams can carry credentials, paths, prompts, and
+    // transcript bytes. Operational logging records direction and byte count only; there is no
+    // raw-trace escape hatch.
     let debug_agent_id = agent_id.clone();
-    let trace_raw = std::env::var("TERMUL_ACP_TRACE_RAW")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
     let agent = agent_client_protocol::AcpAgent::new(config.to_mcp_server()).with_debug(
-        move |line: &str, direction: LineDirection| match direction {
-            LineDirection::Stderr => {
-                log::debug!("[acp] {debug_agent_id} stderr {line}");
-            }
-            LineDirection::Stdin => {
-                if trace_raw {
-                    log::debug!("[acp] {debug_agent_id} -> {line}");
-                } else {
-                    log::debug!("[acp] {debug_agent_id} -> ({} bytes)", line.len());
-                }
-            }
-            LineDirection::Stdout => {
-                if trace_raw {
-                    log::debug!("[acp] {debug_agent_id} <- {line}");
-                } else {
-                    log::debug!("[acp] {debug_agent_id} <- ({} bytes)", line.len());
-                }
-            }
+        move |line: &str, direction: LineDirection| {
+            let stream = match direction {
+                LineDirection::Stderr => "stderr",
+                LineDirection::Stdin => "stdin",
+                LineDirection::Stdout => "stdout",
+            };
+            log::debug!(
+                "[acp] {debug_agent_id} stream={stream} bytes={}",
+                line.len()
+            );
         },
     );
 
     // Per-handler clones (handlers must be `Send` and may be called repeatedly).
     // Each handler gets its own clone of the sink fan-out; `Arc` clones are
-    // cheap and `Vec::clone` is N Arc clones (N is tiny: 1 sink in desktop mode
-    // today, 2 once Story 1.10 adds the shared-live WS sink).
+    // cheap and `Vec::clone` is N Arc clones. A durable rejection opens only
+    // the affected session's producer circuit; other sessions on this agent remain live.
+    let delivery_circuits: SessionDeliveryCircuits =
+        Arc::new(Mutex::new(SessionDeliveryCircuitMap::new()));
     let notif_sinks = sinks.clone();
     let notif_agent_id = agent_id.clone();
     let notif_state = driver_state.clone();
+    let notif_circuits = Arc::clone(&delivery_circuits);
     // AD-8: capture persistence into the notification closure so the host can
     // gate `session_info_update` fan-out on `title_source`. When a background
     // title (`BackgroundGenerated`) or a future local alias (`LocalAlias`) owns
     // the title, a native agent `session_info_update` is suppressed here (the
     // durable defense in `append_record` is the second layer).
     let notif_persistence = persistence.clone();
+    let notif_conversation_persistence = conversation_persistence.clone();
     let perm_sinks = sinks.clone();
     let perm_agent_id = agent_id.clone();
     let perm_state = driver_state.clone();
+    let perm_circuits = Arc::clone(&delivery_circuits);
+    let perm_policy = permission_policy;
     let question_sinks = sinks.clone();
     let question_agent_id = agent_id.clone();
     let question_state = driver_state.clone();
+    let question_circuits = Arc::clone(&delivery_circuits);
     let read_state = driver_state.clone();
     let write_state = driver_state.clone();
 
@@ -2163,6 +2930,7 @@ async fn drive_connection(
 
     // Clones moved into the command loop (`main_fn`).
     let loop_sinks = sinks.clone();
+    let loop_delivery_circuits = Arc::clone(&delivery_circuits);
     let loop_host_plan_server = host_plan_server;
     let loop_agent_id = agent_id.clone();
     let loop_state = driver_state.clone();
@@ -2175,6 +2943,13 @@ async fn drive_connection(
         .on_receive_notification(
             async move |notification: agent_client_protocol::schema::v1::SessionNotification, _cx| {
                 let session_id = notification.session_id.0.to_string();
+                if notif_circuits.lock().contains_key(&session_id) {
+                    log::debug!(
+                        "[acp] dropped update for circuit-broken session code={}",
+                        CONVERSATION_PERSISTENCE_REJECTED
+                    );
+                    return Ok(());
+                }
                 // Any inbound session/update is agent activity — nudge the
                 // active turn's idle deadline so a streaming turn never hits
                 // the idle timeout. Best-effort: a no-op when no turn is
@@ -2217,7 +2992,27 @@ async fn drive_connection(
                     );
                     return Ok(());
                 }
-                client::emit_session_update(&notif_sinks, &notif_agent_id, notification);
+                if let Err(error) = client::emit_session_update(
+                    &notif_sinks,
+                    notif_conversation_persistence.as_deref(),
+                    &notif_agent_id,
+                    notification,
+                )
+                .await
+                {
+                    if error.is_retryable() {
+                        // Backpressure cancels only the current turn; draining capacity admits a
+                        // later submission and never opens a permanent session circuit.
+                        notif_state.lock().signal_cancel(&session_id);
+                    } else if error.should_open_session_circuit() {
+                        notif_circuits.lock().insert(
+                            session_id.clone(),
+                            error.source_code.unwrap_or(CONVERSATION_PERSISTENCE_REJECTED),
+                        );
+                        notif_state.lock().signal_cancel(&session_id);
+                    }
+                    log_delivery_ticket_error("session_update", &error);
+                }
                 Ok(())
             },
             agent_client_protocol::on_receive_notification!(),
@@ -2239,6 +3034,35 @@ async fn drive_connection(
                     ));
                     return Ok(());
                 }
+                let active_policy = *perm_policy.lock();
+                log::info!(
+                    "[acp-permission] boundary=request_received agent_id={} session_id={} policy={active_policy:?} option_count={}",
+                    perm_agent_id.0,
+                    session_string,
+                    options.len()
+                );
+                if active_policy == PermissionPolicy::AllowAll {
+                    if let Some(option) = preferred_allow_option(&options) {
+                        log::info!(
+                            "[acp-permission] boundary=auto_allowed agent_id={} session_id={} option_kind={:?}",
+                            perm_agent_id.0,
+                            session_string,
+                            option.kind
+                        );
+                        let _ = responder.respond(RequestPermissionResponse::new(
+                            RequestPermissionOutcome::Selected(SelectedPermissionOutcome::new(
+                                option.option_id.clone(),
+                            )),
+                        ));
+                        return Ok(());
+                    }
+                    log::warn!(
+                        "[acp-permission] boundary=auto_allow_unavailable agent_id={} session_id={} option_count={}",
+                        perm_agent_id.0,
+                        session_string,
+                        options.len()
+                    );
+                }
                 // A permission request is agent activity — the turn is waiting
                 // on user input, not wedged. Nudge the idle deadline so a
                 // user-input wait doesn't false-fire the idle timeout.
@@ -2258,12 +3082,20 @@ async fn drive_connection(
                     tool_call,
                     options,
                 };
-                events::fan_out(
+                if let Err(error) = fan_out_session(
                     &perm_sinks,
-                    Some(event.session_id.0.as_str()),
+                    &perm_circuits,
+                    event.session_id.0.as_str(),
                     events::EVENT_PERMISSION_REQUEST,
                     &event,
-                );
+                ) {
+                    if let Some(permission) = perm_state.lock().take_permission(&event.request_id) {
+                        let _ = permission.responder.respond(RequestPermissionResponse::new(
+                            RequestPermissionOutcome::Cancelled,
+                        ));
+                    }
+                    log_delivery_error("permission_request", &error);
+                }
                 Ok(())
             },
             agent_client_protocol::on_receive_request!(),
@@ -2305,12 +3137,21 @@ async fn drive_connection(
                         })
                         .collect(),
                 };
-                events::fan_out(
+                if let Err(error) = fan_out_session(
                     &question_sinks,
-                    Some(event.session_id.0.as_str()),
+                    &question_circuits,
+                    event.session_id.0.as_str(),
                     events::EVENT_QUESTION_REQUEST,
                     &event,
-                );
+                ) {
+                    if let Some(question) = question_state.lock().take_question(&event.question_id) {
+                        let _ = question.responder.respond(serde_json::json!({
+                            "questionId": event.question_id,
+                            "cancelled": true,
+                        }));
+                    }
+                    log_delivery_error("question_request", &error);
+                }
                 Ok(())
             },
             agent_client_protocol::on_receive_request!(),
@@ -2530,12 +3371,14 @@ async fn drive_connection(
                 command_rx,
                 init_tx,
                 loop_sinks,
+                loop_delivery_circuits,
                 loop_host_plan_server,
                 loop_agent_id,
                 loop_state,
                 loop_spawned,
                 allow_terminal,
                 persistence,
+                conversation_persistence,
                 loop_warmup_done,
             )
             .await;
@@ -2557,12 +3400,14 @@ async fn run_command_loop(
     mut command_rx: mpsc::UnboundedReceiver<AcpCommand>,
     init_tx: oneshot::Sender<Result<InitOutcome, String>>,
     sinks: Vec<Arc<dyn EventSink>>,
+    delivery_circuits: SessionDeliveryCircuits,
     host_plan_server: Arc<crate::acp::host_mcp::parent::HostPlanServer>,
     agent_id: AgentId,
     driver_state: Arc<Mutex<DriverState>>,
     spawned: Arc<AtomicBool>,
     allow_terminal: bool,
     persistence: Option<Arc<SessionPersistence>>,
+    conversation_persistence: Option<Arc<ConversationPersistenceAdapter>>,
     warmup_done: Arc<Mutex<HashSet<AgentId>>>,
 ) -> Result<(), agent_client_protocol::Error> {
     // Step 1: handshake, bounded by INIT_TIMEOUT so a silent agent can never
@@ -2636,6 +3481,7 @@ async fn run_command_loop(
                 ephemeral,
                 worktree_path,
                 worktree_branch,
+                mut binding_gate,
                 reply,
             } => {
                 let slot = reply_slot(reply);
@@ -2643,6 +3489,7 @@ async fn run_command_loop(
                 let req_cx = cx.clone();
                 let close_cx = cx.clone();
                 let req_sinks = sinks.clone();
+                let req_delivery_circuits = Arc::clone(&delivery_circuits);
                 let req_agent_id = agent_id.clone();
                 let req_state = driver_state.clone();
                 let req_persistence = persistence.clone();
@@ -2841,8 +3688,15 @@ async fn run_command_loop(
                                     .set_model_config_id(session_id.0.clone(), id);
                             }
 
-                            let event = SessionCreatedEvent {
-                                agent_id: req_agent_id,
+                            let outcome = NewSessionOutcome {
+                                persistence: if ephemeral {
+                                    "ephemeral"
+                                } else {
+                                    "conversation"
+                                },
+                                conversation_id: None,
+                                workspace_cwd: None,
+                                execution_cwd: None,
                                 session_id: session_id.clone(),
                                 modes: response.modes.clone(),
                                 models: events::models_from_config_options(
@@ -2850,23 +3704,47 @@ async fn run_command_loop(
                                 ),
                                 config_options: response.config_options.clone(),
                             };
-                            events::fan_out(
+                            // Return the opaque ACP response to the manager, then hold the
+                            // renderer-visible success event until the manager has durably bound
+                            // it to the pre-created Conversation.
+                            send_reply(&task_slot, Ok(outcome));
+                            if let Some(gate) = binding_gate.as_mut() {
+                                loop {
+                                    if let Some(result) = gate.borrow().clone() {
+                                        if let Err(error) = result {
+                                            log::error!(
+                                                "[conversation-creation] session-created event suppressed code={error}"
+                                            );
+                                            return;
+                                        }
+                                        break;
+                                    }
+                                    if gate.changed().await.is_err() {
+                                        log::error!(
+                                            "[conversation-creation] binding gate dropped before durable bind"
+                                        );
+                                        return;
+                                    }
+                                }
+                            }
+                            let event = SessionCreatedEvent {
+                                agent_id: req_agent_id,
+                                session_id,
+                                modes: response.modes,
+                                models: events::models_from_config_options(
+                                    response.config_options.as_deref(),
+                                ),
+                                config_options: response.config_options,
+                            };
+                            if let Err(error) = fan_out_session(
                                 &req_sinks,
-                                Some(event.session_id.0.as_str()),
+                                &req_delivery_circuits,
+                                event.session_id.0.as_str(),
                                 events::EVENT_SESSION_CREATED,
                                 &event,
-                            );
-                            send_reply(
-                                &task_slot,
-                                Ok(NewSessionOutcome {
-                                    session_id,
-                                    modes: response.modes,
-                                    models: events::models_from_config_options(
-                                        response.config_options.as_deref(),
-                                    ),
-                                    config_options: response.config_options,
-                                }),
-                            );
+                            ) {
+                                log_delivery_error("session_created", &error);
+                            }
                         }
                         Ok(Err(e)) => send_reply(&task_slot, Err(e.to_string())),
                         Err(_) => {
@@ -2886,6 +3764,7 @@ async fn run_command_loop(
             AcpCommand::LoadSession {
                 session_id,
                 cwd,
+                mcp_servers,
                 reply,
             } => {
                 let slot = reply_slot(reply);
@@ -2914,7 +3793,8 @@ async fn run_command_loop(
                     // Bounded like session/new: a wedged agent must not park the
                     // renderer's reconnect forever (the reply sender would be
                     // held indefinitely).
-                    let request = LoadSessionRequest::new(&session_id, cwd.clone());
+                    let request =
+                        LoadSessionRequest::new(&session_id, cwd.clone()).mcp_servers(mcp_servers);
                     let result = run_session_reopen(
                         "session/load",
                         &session_id.0,
@@ -2930,6 +3810,7 @@ async fn run_command_loop(
             AcpCommand::ResumeSession {
                 session_id,
                 cwd,
+                mcp_servers,
                 reply,
             } => {
                 let slot = reply_slot(reply);
@@ -2949,7 +3830,8 @@ async fn run_command_loop(
                             );
                         }
                     }
-                    let request = ResumeSessionRequest::new(&session_id, cwd.clone());
+                    let request = ResumeSessionRequest::new(&session_id, cwd.clone())
+                        .mcp_servers(mcp_servers);
                     let result = run_session_reopen(
                         "session/resume",
                         &session_id.0,
@@ -3058,10 +3940,12 @@ async fn run_command_loop(
                 let task_slot = slot.clone();
                 let turn_cx = cx.clone();
                 let turn_sinks = sinks.clone();
+                let turn_delivery_circuits = Arc::clone(&delivery_circuits);
                 let turn_agent_id = agent_id.clone();
                 let turn_plan_server = host_plan_server.clone();
                 let turn_state = driver_state.clone();
                 let turn_persistence = persistence.clone();
+                let turn_conversation_persistence = conversation_persistence.clone();
                 let turn_session = session_id.clone();
                 let log_session = session_id.clone();
                 // Register before spawning so an immediate `plan` call is
@@ -3156,12 +4040,20 @@ async fn run_command_loop(
                                 stop_reason,
                                 turn_id: turn_turn_id.clone(),
                             };
-                            events::fan_out(
+                            if let Err(error) = fan_out_session_committed(
                                 &turn_sinks,
-                                Some(event.session_id.0.as_str()),
+                                &turn_delivery_circuits,
+                                turn_conversation_persistence.as_deref(),
+                                event.session_id.0.as_str(),
                                 events::EVENT_PROMPT_COMPLETE,
                                 &event,
-                            );
+                            )
+                            .await
+                            {
+                                log_delivery_ticket_error("prompt_complete", &error);
+                                send_reply(&task_slot, Err(error.code.to_string()));
+                                return Ok(());
+                            }
                             if !is_ephemeral {
                                 if let Some(persistence) = &turn_persistence {
                                     if let Err(error) =
@@ -3186,12 +4078,17 @@ async fn run_command_loop(
                                 message: message.clone(),
                             };
                             // Turn-scoped error → sid is the session id.
-                            events::fan_out(
-                                &turn_sinks,
-                                event.session_id.as_ref().map(|s| s.0.as_str()),
-                                events::EVENT_AGENT_ERROR,
-                                &event,
-                            );
+                            if let Some(session_id) = event.session_id.as_ref() {
+                                if let Err(error) = fan_out_session(
+                                    &turn_sinks,
+                                    &turn_delivery_circuits,
+                                    session_id.0.as_str(),
+                                    events::EVENT_AGENT_ERROR,
+                                    &event,
+                                ) {
+                                    log_delivery_error("turn_agent_error", &error);
+                                }
+                            }
                             if !is_ephemeral {
                                 if let Some(persistence) = &turn_persistence {
                                     if let Some(session_id) = event.session_id.as_ref() {
@@ -3421,6 +4318,7 @@ async fn run_command_loop(
                 let task_slot = slot.clone();
                 let req_cx = cx.clone();
                 let req_sinks = sinks.clone();
+                let req_delivery_circuits = Arc::clone(&delivery_circuits);
                 let req_agent_id = agent_id.clone();
                 let req_state = driver_state.clone();
                 spawn_request(&cx, slot, async move {
@@ -3446,13 +4344,23 @@ async fn run_command_loop(
                                 session_id,
                                 config_options: response.config_options.clone(),
                             };
-                            events::fan_out(
+                            match fan_out_session(
                                 &req_sinks,
-                                Some(event.session_id.0.as_str()),
+                                &req_delivery_circuits,
+                                event.session_id.0.as_str(),
                                 events::EVENT_CONFIG_OPTIONS_UPDATE,
                                 &event,
-                            );
-                            send_reply(&task_slot, Ok(()));
+                            ) {
+                                Ok(_) => send_reply(&task_slot, Ok(())),
+                                Err(error) if error.is_unbound_session() => {
+                                    log_delivery_error("set_model", &error);
+                                    send_reply(&task_slot, Ok(()));
+                                }
+                                Err(error) => {
+                                    log_delivery_error("set_model", &error);
+                                    send_reply(&task_slot, Err(error.code.to_string()));
+                                }
+                            }
                         }
                         Err(e) => send_reply(&task_slot, Err(e.to_string())),
                     }
@@ -3469,6 +4377,7 @@ async fn run_command_loop(
                 let task_slot = slot.clone();
                 let req_cx = cx.clone();
                 let req_sinks = sinks.clone();
+                let req_delivery_circuits = Arc::clone(&delivery_circuits);
                 let req_agent_id = agent_id.clone();
                 let req_state = driver_state.clone();
                 spawn_request(&cx, slot, async move {
@@ -3493,13 +4402,23 @@ async fn run_command_loop(
                                 session_id,
                                 config_options: response.config_options.clone(),
                             };
-                            events::fan_out(
+                            match fan_out_session(
                                 &req_sinks,
-                                Some(event.session_id.0.as_str()),
+                                &req_delivery_circuits,
+                                event.session_id.0.as_str(),
                                 events::EVENT_CONFIG_OPTIONS_UPDATE,
                                 &event,
-                            );
-                            send_reply(&task_slot, Ok(response.config_options));
+                            ) {
+                                Ok(_) => send_reply(&task_slot, Ok(response.config_options)),
+                                Err(error) if error.is_unbound_session() => {
+                                    log_delivery_error("set_config_option", &error);
+                                    send_reply(&task_slot, Ok(response.config_options));
+                                }
+                                Err(error) => {
+                                    log_delivery_error("set_config_option", &error);
+                                    send_reply(&task_slot, Err(error.code.to_string()));
+                                }
+                            }
                         }
                         Err(e) => send_reply(&task_slot, Err(e.to_string())),
                     }
@@ -3637,6 +4556,7 @@ mod tests {
                 "secret-two".to_string(),
             )]),
             allow_terminal: false,
+            permission_policy: PermissionPolicy::Ask,
         };
         let namespace = stable_agent_namespace(&config).unwrap();
         config.name = "example agent".to_string();
@@ -3658,6 +4578,53 @@ mod tests {
         assert_eq!(stable_agent_namespace(&config), None);
     }
 
+    #[test]
+    fn allow_all_prefers_persistent_then_one_time_allow_options() {
+        let once = PermissionOption::new("once", "Allow once", PermissionOptionKind::AllowOnce);
+        let always =
+            PermissionOption::new("always", "Always allow", PermissionOptionKind::AllowAlways);
+        let reject = PermissionOption::new("reject", "Reject", PermissionOptionKind::RejectAlways);
+
+        assert_eq!(
+            preferred_allow_option(&[once.clone(), always.clone()])
+                .map(|option| option.option_id.to_string())
+                .as_deref(),
+            Some("always")
+        );
+        assert_eq!(
+            preferred_allow_option(&[reject.clone(), once])
+                .map(|option| option.option_id.to_string())
+                .as_deref(),
+            Some("once")
+        );
+        assert!(preferred_allow_option(&[reject]).is_none());
+    }
+
+    #[test]
+    fn live_permission_policy_updates_without_restarting_agent() {
+        let manager = AcpManager::new(vec![]);
+        let agent_id = AgentId::new();
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        let policy = Arc::new(Mutex::new(PermissionPolicy::Ask));
+        manager.agents.lock().insert(
+            agent_id.clone(),
+            AgentEntry {
+                command_tx,
+                capabilities: AgentCapabilities::default(),
+                stable_namespace: Some("config:test".to_string()),
+                join_handle: None,
+                killed: Arc::new(AtomicBool::new(false)),
+                permission_policy: policy.clone(),
+            },
+        );
+
+        manager
+            .set_permission_policy(&agent_id, PermissionPolicy::AllowAll)
+            .unwrap();
+
+        assert_eq!(*policy.lock(), PermissionPolicy::AllowAll);
+    }
+
     #[tokio::test]
     async fn owns_session_queries_authoritative_agent_driver_state() {
         let manager = AcpManager::new(vec![]);
@@ -3671,6 +4638,7 @@ mod tests {
                 stable_namespace: None,
                 join_handle: None,
                 killed: Arc::new(AtomicBool::new(false)),
+                permission_policy: Arc::new(Mutex::new(PermissionPolicy::Ask)),
             },
         );
         let requested = SessionId::new("owned-session");
@@ -3688,6 +4656,91 @@ mod tests {
             .await
             .unwrap());
         responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn conversation_compensation_double_failure_persists_actionable_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("state");
+        let bootstrap = crate::conversation::ConversationBootstrap::run(
+            crate::conversation::HostConversationRoots::desktop(
+                state_root.clone(),
+                temp.path().join("visible"),
+            ),
+            crate::conversation::MigrationHostMode::Desktop,
+        )
+        .unwrap();
+        bootstrap.repository.fail_next_agent_binding_appends(2);
+        let manager = Arc::new(AcpManager::with_conversation_services(
+            Vec::new(),
+            Arc::clone(&bootstrap.creation),
+            Arc::clone(&bootstrap.persistence_adapter),
+        ));
+        let agent_id = AgentId("fake-agent".to_string());
+        let (observed_tx, _observed_rx) = std::sync::mpsc::sync_channel(1);
+        manager.install_test_agent_for_new_session_with_close_result(
+            agent_id.clone(),
+            observed_tx,
+            Err("provider close leaked SUPER_SECRET=do-not-return".to_string()),
+        );
+
+        let error = manager
+            .new_session_with_context(
+                &agent_id,
+                temp.path()
+                    .join("ignored-cwd")
+                    .to_string_lossy()
+                    .into_owned(),
+                Vec::new(),
+                SessionCreationContext {
+                    execution_target: Some(ExecutionTarget::Workspace),
+                    ..SessionCreationContext::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        let failure = AgentCompensationFailure::from_wire_error(&error)
+            .expect("double failure must return the stable compound receipt");
+        assert_eq!(failure.primary_code, "CONVERSATION_BIND_FAILED");
+        assert_eq!(
+            failure.provider_close_code.as_deref(),
+            Some("ACP_CLOSE_FAILED")
+        );
+        assert_eq!(
+            failure.failure_record_code.as_deref(),
+            Some("CONVERSATION_DURABILITY_FAILED")
+        );
+        assert!(failure.recovery_id.is_some());
+        assert!(!error.contains("SUPER_SECRET"));
+        assert!(!error.contains("opaque/fake-session"));
+
+        let record = bootstrap.repository.list_conversations().remove(0);
+        assert_eq!(record.conversation_id, failure.conversation_id);
+        assert_eq!(
+            record.lifecycle_state,
+            crate::conversation::ConversationLifecycleState::RecoveryRequired
+        );
+        assert!(bootstrap
+            .repository
+            .current_binding(record.conversation_id)
+            .unwrap()
+            .is_none());
+
+        let recovery_bytes = std::fs::read(
+            state_root
+                .join("conversation-migrations")
+                .join("workspace-recovery-v1")
+                .join(crate::conversation::migration::RECOVERY_ITEMS_FILE),
+        )
+        .unwrap();
+        let recovery: crate::conversation::migration::RecoveryQueueV1 =
+            serde_json::from_slice(&recovery_bytes).unwrap();
+        assert_eq!(recovery.items.len(), 1);
+        assert_eq!(recovery.items[0].recovery_id, failure.recovery_id.unwrap());
+        let serialized = String::from_utf8(recovery_bytes).unwrap();
+        assert!(serialized.contains("acpCompensationFailed"));
+        assert!(!serialized.contains("SUPER_SECRET"));
+        assert!(!serialized.contains("opaque/fake-session"));
     }
 
     /// Capability gating exercises the *real* gate functions used by
@@ -3713,6 +4766,83 @@ mod tests {
             gate_list_sessions(&caps).is_err(),
             "default agent must not advertise session/list"
         );
+    }
+
+    #[tokio::test]
+    async fn reopen_methods_prepend_internal_mcp_to_configured_servers() {
+        let manager = AcpManager::new(vec![]);
+        let agent_id = AgentId::new();
+        let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+        let mut capabilities = AgentCapabilities::default();
+        capabilities.load_session = true;
+        capabilities.session_capabilities.resume = Some(Default::default());
+        manager.agents.lock().insert(
+            agent_id.clone(),
+            AgentEntry {
+                command_tx,
+                capabilities,
+                stable_namespace: Some("config:test".to_string()),
+                join_handle: None,
+                killed: Arc::new(AtomicBool::new(false)),
+                permission_policy: Arc::new(Mutex::new(PermissionPolicy::Ask)),
+            },
+        );
+        let configured = McpServer::Stdio(McpServerStdio::new(
+            "configured".to_string(),
+            PathBuf::from("/bin/echo"),
+        ));
+        let capture = tokio::spawn(async move {
+            let mut received = Vec::new();
+            for _ in 0..2 {
+                let command = command_rx.recv().await.unwrap();
+                let (mcp_servers, reply) = match command {
+                    AcpCommand::ResumeSession {
+                        mcp_servers, reply, ..
+                    }
+                    | AcpCommand::LoadSession {
+                        mcp_servers, reply, ..
+                    } => (mcp_servers, reply),
+                    _ => panic!("unexpected ACP command"),
+                };
+                received.push(mcp_servers);
+                reply
+                    .send(Ok(SessionReopenOutcome {
+                        modes: None,
+                        models: None,
+                        config_options: None,
+                    }))
+                    .unwrap();
+            }
+            received
+        });
+
+        manager
+            .resume_session(
+                &agent_id,
+                SessionId::new("resume-session"),
+                "/workspace".to_string(),
+                vec![configured.clone()],
+            )
+            .await
+            .unwrap();
+        manager
+            .load_session(
+                &agent_id,
+                SessionId::new("load-session"),
+                "/workspace".to_string(),
+                vec![configured],
+            )
+            .await
+            .unwrap();
+
+        for servers in capture.await.unwrap() {
+            assert_eq!(servers.len(), 2);
+            assert_eq!(serde_json::to_value(&servers[0]).unwrap()["name"], "termul");
+            assert_eq!(
+                serde_json::to_value(&servers[1]).unwrap()["name"],
+                "configured"
+            );
+        }
     }
 
     /// The rejection path must NOT enqueue any command (agent never contacted).
@@ -4344,5 +5474,28 @@ mod tests {
             !warmup_should_run(&warmup_done, &agent_id),
             "a post-completion trigger must skip (agent is done)"
         );
+    }
+
+    #[test]
+    fn circuit_and_watermark_entries_respect_ttl_and_cardinality() {
+        let circuits = Arc::new(Mutex::new(SessionDeliveryCircuitMap::new()));
+        for ordinal in 0..(MAX_FAILURE_CIRCUIT_ENTRIES + 8) {
+            circuits
+                .lock()
+                .insert(format!("session-{ordinal}"), "TEST_FATAL");
+        }
+        assert!(circuits.lock().len() <= MAX_FAILURE_CIRCUIT_ENTRIES);
+        let expired = std::time::Instant::now()
+            - std::time::Duration::from_secs(FAILURE_CIRCUIT_TTL_SECS + 1);
+        circuit_map_insert_for_tests(&circuits, "expired", "TEST_FATAL", expired);
+        assert!(circuits.lock().get("expired").is_none());
+
+        let watermark = crate::web::permissions::TurnWatermark::new();
+        for ordinal in 0..32 {
+            watermark.mark_seen("ttl-session", &format!("turn-{ordinal}"));
+        }
+        assert!(watermark.is_seen("ttl-session", "turn-31"));
+        watermark.forget_session("ttl-session");
+        assert!(!watermark.is_seen("ttl-session", "turn-31"));
     }
 }

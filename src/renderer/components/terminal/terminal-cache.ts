@@ -10,17 +10,42 @@
  * for TUI apps running in the alt buffer.
  *
  * Usage:
- *   On unmount:  cacheTerminal(ptyId, terminal)
- *   On remount:  takeCachedTerminal(ptyId) → Terminal | undefined
+ *   On unmount:  cacheTerminal(ptyId, { terminal, fitAddon, searchAddon })
+ *   On remount:  takeCachedTerminal(ptyId) → CachedTerminalSession | undefined
  */
 
+import type { FitAddon } from '@xterm/addon-fit'
+import type { SearchAddon } from '@xterm/addon-search'
 import type { Terminal } from '@xterm/xterm'
 
-/** Map of PTY ID → cached Terminal instance. */
-const cache = new Map<string, Terminal>()
+export interface CachedTerminalSession {
+  terminal: Terminal
+  fitAddon: FitAddon
+  searchAddon: SearchAddon
+}
+
+const MAX_CACHED_TERMINALS = 20
+
+/** Map of PTY ID → cached xterm session, ordered from oldest to newest. */
+const cache = new Map<string, CachedTerminalSession>()
+
+function disposeSession(session: CachedTerminalSession): void {
+  try {
+    session.terminal.dispose()
+  } catch {
+    // Already disposed in another lifecycle path.
+  }
+}
+
+function evictOldestSession(): void {
+  const oldest = cache.entries().next().value as [string, CachedTerminalSession] | undefined
+  if (!oldest) return
+  cache.delete(oldest[0])
+  disposeSession(oldest[1])
+}
 
 /**
- * Store a terminal in the cache and detach its DOM element.
+ * Store a terminal and its persistent addons, then detach its DOM element.
  * Call this in the cleanup (unmount) path instead of terminal.dispose().
  *
  * If a terminal is already cached for the same PTY ID (which can happen
@@ -31,42 +56,43 @@ const cache = new Map<string, Terminal>()
  * live renderer of focus / keystrokes — visible to users as "terminal
  * freezes after rapid switching".
  */
-export function cacheTerminal(ptyId: string, terminal: Terminal): void {
+export function cacheTerminal(ptyId: string, session: CachedTerminalSession): void {
   const existing = cache.get(ptyId)
-  if (existing && existing !== terminal) {
+  if (existing && existing.terminal !== session.terminal) {
     // Different instance already cached for this PTY — dispose the old
     // one to release its WebGL context, addons, and DOM node.
-    try {
-      existing.dispose()
-    } catch {
-      // Already disposed in some other path — ignore.
-    }
+    disposeSession(existing)
     cache.delete(ptyId)
-  } else if (existing === terminal) {
-    // Same instance re-cached — only ensure DOM is detached.
-    terminal.element?.remove()
+  } else if (existing?.terminal === session.terminal) {
+    // Same session re-cached — refresh its recency and ensure DOM is detached.
+    cache.delete(ptyId)
+    session.terminal.element?.remove()
+    cache.set(ptyId, session)
     return
   }
 
   // Detach the xterm element from the DOM so it doesn't linger in the
   // old container. The element is preserved for reattachment later.
-  terminal.element?.remove()
+  session.terminal.element?.remove()
 
-  cache.set(ptyId, terminal)
+  cache.set(ptyId, session)
+  while (cache.size > MAX_CACHED_TERMINALS) {
+    evictOldestSession()
+  }
 }
 
 /**
- * Retrieve and remove a cached terminal.
+ * Retrieve and remove a cached terminal session.
  * Returns undefined if no cached terminal exists for this PTY ID.
- * The caller is responsible for reattaching the element via:
- *   container.appendChild(terminal.element!)
+ * The caller is responsible for reattaching the terminal element via:
+ *   container.appendChild(session.terminal.element!)
  */
-export function takeCachedTerminal(ptyId: string): Terminal | undefined {
-  const terminal = cache.get(ptyId)
-  if (terminal) {
+export function takeCachedTerminal(ptyId: string): CachedTerminalSession | undefined {
+  const session = cache.get(ptyId)
+  if (session) {
     cache.delete(ptyId)
   }
-  return terminal
+  return session
 }
 
 /**
@@ -76,9 +102,21 @@ export function hasCachedTerminal(ptyId: string): boolean {
   return cache.has(ptyId)
 }
 
+/** Dispose one cached renderer after its terminal resource is explicitly closed. */
+export function disposeCachedTerminal(ptyId: string): boolean {
+  const session = cache.get(ptyId)
+  if (!session) return false
+  cache.delete(ptyId)
+  disposeSession(session)
+  return true
+}
+
 /**
  * Clear all cached terminals — useful for testing or app-wide cleanup.
  */
 export function clearTerminalCache(): void {
+  for (const session of cache.values()) {
+    disposeSession(session)
+  }
   cache.clear()
 }

@@ -42,7 +42,9 @@ describe('use-projects-persistence', () => {
 
     useProjectStore.setState({
       projects: [],
+      groups: [],
       activeProjectId: '',
+      activeGroupId: null,
       isLoaded: false
     })
   })
@@ -127,5 +129,65 @@ describe('use-projects-persistence', () => {
         ]
       })
     ])
+    expect(useProjectStore.getState().activeGroupId).toBeNull()
+  })
+
+  it('persists and restores active group scope with its preferred project', async () => {
+    useProjectStore.setState({
+      projects: [
+        { id: 'project-1', name: 'First', color: 'blue' },
+        { id: 'project-2', name: 'Second', color: 'green' }
+      ],
+      groups: [
+        {
+          id: 'group-1',
+          name: 'Workspace',
+          projectIds: ['project-1', 'project-2'],
+          preferredProjectId: 'project-2'
+        }
+      ],
+      activeProjectId: 'project-2',
+      activeGroupId: 'group-1',
+      isLoaded: true
+    })
+
+    const { result, unmount } = renderHook(() => usePersistProjectsImmediate())
+    await result.current()
+
+    expect(mockPersistenceWrite).toHaveBeenCalledWith(
+      PersistenceKeys.projects,
+      expect.objectContaining({
+        activeProjectId: 'project-2',
+        activeGroupId: 'group-1',
+        groups: [
+          expect.objectContaining({
+            id: 'group-1',
+            preferredProjectId: 'project-2'
+          })
+        ]
+      })
+    )
+    unmount()
+
+    mockPersistenceRead.mockResolvedValue({
+      success: true,
+      data: mockPersistenceWrite.mock.calls.at(-1)?.[1]
+    })
+    useProjectStore.setState({
+      projects: [],
+      groups: [],
+      activeProjectId: '',
+      activeGroupId: null,
+      isLoaded: false
+    })
+
+    renderHook(() => useProjectsLoader())
+
+    await waitFor(() => {
+      expect(useProjectStore.getState().isLoaded).toBe(true)
+    })
+    expect(useProjectStore.getState().activeGroupId).toBe('group-1')
+    expect(useProjectStore.getState().activeProjectId).toBe('project-2')
+    expect(useProjectStore.getState().groups[0].preferredProjectId).toBe('project-2')
   })
 })

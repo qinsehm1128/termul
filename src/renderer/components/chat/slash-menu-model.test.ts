@@ -249,4 +249,73 @@ describe('buildSlashSections', () => {
       buildSlashSections({ commands: [], configOptions: [], modes: null, filter: '' })
     ).toEqual([])
   })
+
+  it('flattens grouped model options into leaf slash rows', () => {
+    const grouped = {
+      id: 'model',
+      name: 'Model',
+      category: 'model',
+      type: 'select',
+      currentValue: 'claude-sonnet-4',
+      options: [
+        {
+          group: 'claude',
+          name: 'Claude',
+          options: [
+            { value: 'claude-sonnet-4', name: 'Sonnet 4' },
+            { value: 'claude-opus-4', name: 'Opus 4' }
+          ]
+        }
+      ]
+    } as unknown as SessionConfigOption
+    const sections = buildSlashSections({
+      commands: [],
+      configOptions: [grouped],
+      modes: null,
+      filter: ''
+    })
+    const model = sections.find((s) => s.id === 'config:model')
+    expect(model?.items).toEqual([
+      {
+        kind: 'config',
+        configId: 'model',
+        valueId: 'claude-sonnet-4',
+        label: 'Sonnet 4',
+        description: null,
+        selected: true
+      },
+      {
+        kind: 'config',
+        configId: 'model',
+        valueId: 'claude-opus-4',
+        label: 'Opus 4',
+        description: null,
+        selected: false
+      }
+    ])
+  })
+
+  it('injects a synthesized modelOption when configOptions have no model', () => {
+    const modelOption: SessionConfigOption = {
+      id: 'model',
+      name: 'Model',
+      category: 'model',
+      type: 'select',
+      currentValue: 'm1',
+      options: [
+        { value: 'm1', name: 'One' },
+        { value: 'm2', name: 'Two' }
+      ]
+    }
+    const sections = buildSlashSections({
+      commands: [],
+      configOptions: [],
+      modes: null,
+      filter: '',
+      modelOption
+    })
+    const model = sections.find((s) => s.id === 'config:model')
+    expect(model?.items).toHaveLength(2)
+    expect((model?.items[1] as SlashConfigItem).valueId).toBe('m2')
+  })
 })

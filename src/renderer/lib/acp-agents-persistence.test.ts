@@ -85,6 +85,18 @@ describe('validateAgentConfig', () => {
   it('accepts undefined args/env/allowTerminal', () => {
     expect(validateAgentConfig({ name: 'H', command: 'node' }).valid).toBe(true)
   })
+  it('accepts known permission policies and rejects unknown values', () => {
+    expect(
+      validateAgentConfig({ name: 'H', command: 'node', permissionPolicy: 'allow_all' }).valid
+    ).toBe(true)
+    const result = validateAgentConfig({
+      name: 'H',
+      command: 'node',
+      permissionPolicy: 'yolo' as 'ask'
+    })
+    expect(result.valid).toBe(false)
+    expect(result.errors.join(' ')).toContain('permissionPolicy')
+  })
   it('translates validation errors in Simplified Chinese', async () => {
     const previousLanguage = i18n.language
     await i18n.changeLanguage('zh-CN')
@@ -133,7 +145,8 @@ describe('load/save agent configs', () => {
         command: 'gemini',
         args: [],
         env: {},
-        allowTerminal: false
+        allowTerminal: false,
+        permissionPolicy: 'ask'
       }
     ]
     ;(persistenceApi.read as ReturnType<typeof vi.fn>).mockResolvedValue({

@@ -231,6 +231,11 @@ export function useAppSettingsLoader(): void {
       } catch (error) {
         console.error('Failed to apply ACP first-prompt warmup timeout:', error)
       }
+      try {
+        await acpApi.setPreferLocalNpmInstall(settings.acpPreferLocalNpmInstall)
+      } catch (error) {
+        console.error('Failed to apply ACP local npm install preference:', error)
+      }
     }
     load()
   }, [setSettings])
@@ -331,6 +336,11 @@ export function useResetAppSettings(): () => Promise<void> {
       await acpApi.setFirstPromptWarmupTimeout(DEFAULT_APP_SETTINGS.acpFirstPromptWarmupSecs)
     } catch (error) {
       console.error('Failed to clear ACP first-prompt warmup timeout on reset:', error)
+    }
+    try {
+      await acpApi.setPreferLocalNpmInstall(DEFAULT_APP_SETTINGS.acpPreferLocalNpmInstall)
+    } catch (error) {
+      console.error('Failed to reset ACP local npm install preference:', error)
     }
   }, [resetToDefaults])
 }

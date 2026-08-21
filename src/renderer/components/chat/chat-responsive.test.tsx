@@ -51,7 +51,8 @@ vi.mock('@/stores/acp-store', () => ({
     }),
   useAcpMessages: () => [],
   useSessionUsage: () => null,
-  useAgentIdentity: () => ({ name: 'Cursor', templateId: 'cursor' })
+  useAgentIdentity: () => ({ name: 'Cursor', templateId: 'cursor' }),
+  useSessionAgentIdentity: () => ({ name: 'Cursor', templateId: 'cursor' })
 }))
 
 type ObserverEntry = { target: Element; contentRect: { width: number } }

@@ -36,7 +36,7 @@ optimized_for_llm: false
 - **Linting/formatting:** **Biome `2.4.16`** — NOT ESLint. `bun run lint|check|format|ci`. (Only `landing/` ships an eslint config; the main app does not.)
 - **UI/state:** Tailwind CSS **v4** (`@tailwindcss/postcss ^4`, `@tailwindcss/typography`), Zustand `^5.0.9`, TanStack React Query `^5.83.0`, TanStack React Virtual `^3.14.9`, Radix UI + shadcn (`shadcn ^4.12.0` dev), `class-variance-authority`, `clsx`, `tailwind-merge`, `lucide-react`, `framer-motion ^12.25.0`.
 - **Routing:** React Router DOM `^6.30.1` using **hash-router** patterns (both entries).
-- **Terminal stack:** `@xterm/xterm ^6.1.0-beta.216` (+ addon-fit/search/serialize/web-links/webgl beta), `tauri-pty ^0.1`; Rust `portable-pty 0.9`.
+- **Terminal stack:** `@xterm/xterm ^6.1.0-beta.216` (+ addon-fit/search/webgl beta); Rust `portable-pty 0.9` with the in-tree `PtyManager`.
 - **Forms/validation:** React Hook Form `^7.61.1`, `@hookform/resolvers ^3.10.0`, Zod `^3.25.76`.
 - **ACP / AI:** `agent-client-protocol 0.12` (vendored 0.12.1 at `src-tauri/vendor/`), `tauri-plugin-mcp-bridge 0.9`, `ai ^7.0.4`, BlockNote `^0.46.2`, CodeMirror 6, streamdown `2.5.0`, mermaid `^11.14.0`.
 - **Remote server stack (Rust):** Axum `0.8` (ws), `tower-http 0.6` (cors/fs/trace), `rust-embed 8.12` (embeds `dist-web/`), `reqwest 0.13` (rustls), `tokio 1` (full), `parking_lot 0.12`, `keyring 3.6` (OS-native per target), `ssh2 0.9`.

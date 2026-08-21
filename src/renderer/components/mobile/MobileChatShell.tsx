@@ -11,14 +11,19 @@ import {
   RotateCcw,
   Search,
   Settings,
+  SlidersHorizontal,
   TerminalSquare,
+  Trash2,
   X
 } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useNavigate } from 'react-router-dom'
+import { useShallow } from 'zustand/shallow'
+import { ConversationLifecycleActions } from '@/components/chat/ChatHistoryEntryRow'
 import { ChatHistoryTab } from '@/components/chat/ChatHistoryTab'
 import { ProjectSwitcherDrawer } from '@/components/chat/ProjectSwitcherDrawer'
+import { ExecutionTargetPicker } from '@/components/conversation/ExecutionTargetPicker'
 import { TermulMark } from '@/components/TermulMark'
 import { Button } from '@/components/ui/button'
 import {
@@ -30,7 +35,8 @@ import {
 } from '@/components/ui/sheet'
 import { isTauriContext } from '@/lib/tauri-runtime'
 import { useAcpStore } from '@/stores/acp-store'
-import { useActiveProject } from '@/stores/project-store'
+import { useConversationStore } from '@/stores/conversation-store'
+import { useActiveProject, useProjectStore } from '@/stores/project-store'
 import { useTerminalStore } from '@/stores/terminal-store'
 import { getAllLeafPanes, useWorkspaceStore } from '@/stores/workspace-store'
 import { MobileFileExplorer } from './MobileFileExplorer'
@@ -40,7 +46,7 @@ interface MobileChatShellProps {
   children: React.ReactNode
   /** Opens the New Agent Chat launcher. */
   onNewChat: () => void
-  /** Whether a new chat can be started (active project has a path). */
+  /** Whether a new chat can be started. Conversation creation does not require a project. */
   canNewChat?: boolean
   /** Opens the command palette overlay (mounted in WorkspaceLayout appModals). */
   onOpenCommandPalette?: () => void
@@ -50,6 +56,7 @@ interface MobileChatShellProps {
   onOpenGitHistory?: () => void
   onNewTerminal?: () => void
   onCloseTerminal?: (terminalId: string, tabId: string) => void
+  onTerminateTerminal?: (terminalId: string, tabId?: string) => void
   onRenameTerminal?: (terminalId: string, name: string) => void
   onRestartTerminal?: (terminalId: string) => void
 }
@@ -62,12 +69,13 @@ interface MobileChatShellProps {
 export function MobileChatShell({
   children,
   onNewChat,
-  canNewChat = false,
+  canNewChat = true,
   onOpenCommandPalette,
   onOpenGitChanges,
   onOpenGitHistory,
   onNewTerminal,
   onCloseTerminal,
+  onTerminateTerminal,
   onRenameTerminal,
   onRestartTerminal
 }: MobileChatShellProps): React.JSX.Element {
@@ -75,10 +83,17 @@ export function MobileChatShell({
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [projectsOpen, setProjectsOpen] = useState(false)
   const [filesOpen, setFilesOpen] = useState(false)
+  const [targetOpen, setTargetOpen] = useState(false)
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const navigate = useNavigate()
   const activeProject = useActiveProject()
+  const projects = useProjectStore((state) => state.projects)
+  const activeGroupName = useProjectStore((state) =>
+    state.activeGroupId
+      ? (state.groups.find((group) => group.id === state.activeGroupId)?.name ?? null)
+      : null
+  )
 
   // Active tab — return the stable Tab object reference held in the store
   // tree. Stable references compare with Object.is, so no `useShallow` is
@@ -98,6 +113,7 @@ export function MobileChatShell({
   const activeTerminal = useTerminalStore((s) =>
     activeTerminalId ? s.terminals.find((terminal) => terminal.id === activeTerminalId) : undefined
   )
+  const allTerminals = useTerminalStore(useShallow((state) => state.terminals))
 
   // Terminal tabs across ALL leaf panes. Derive via useMemo from the stable
   // `root` reference so the wrapper objects are only rebuilt when the tree
@@ -112,7 +128,37 @@ export function MobileChatShell({
     )
   }, [workspaceRoot])
 
-  const activeSessionId = activeTab?.type === 'agent-chat' ? activeTab.sessionId : null
+  const activeConversationId = useConversationStore((state) => state.activeConversationId)
+  const activeConversation = useConversationStore((state) =>
+    activeConversationId ? state.summariesById[activeConversationId] : undefined
+  )
+  const [mobileTarget, setMobileTarget] = useState(
+    activeConversation?.executionTarget ?? {
+      kind: 'workspace' as const
+    }
+  )
+  const [mobileAttachment, setMobileAttachment] = useState(
+    activeConversation?.projectAttachment ?? null
+  )
+
+  useEffect(() => {
+    if (!activeConversation) return
+    setMobileTarget(activeConversation.executionTarget)
+    setMobileAttachment(activeConversation.projectAttachment)
+  }, [activeConversation])
+
+  const activeSessionId = useAcpStore((state) => {
+    if (activeTab?.type !== 'agent-chat') return null
+    if (activeTab.sessionId) return activeTab.sessionId
+    const conversationId = activeTab.conversationId ?? activeConversationId
+    if (!conversationId) return null
+    return (
+      Object.values(state.sessions).find((session) => session.conversationId === conversationId)
+        ?.id ??
+      state.sessionIndex.find((entry) => entry.conversationId === conversationId)?.id ??
+      null
+    )
+  })
 
   const sessionTitle = useAcpStore((s) => {
     if (!activeSessionId) return null
@@ -120,13 +166,23 @@ export function MobileChatShell({
     if (live) return live
     return s.sessionIndex.find((e) => e.id === activeSessionId)?.title ?? null
   })
+  const conversationTerminals = useMemo(
+    () =>
+      activeConversationId
+        ? allTerminals.filter((terminal) => terminal.conversationId === activeConversationId)
+        : terminalTabs
+            .map(({ tab }) => allTerminals.find((terminal) => terminal.id === tab.terminalId))
+            .filter((terminal): terminal is NonNullable<typeof terminal> => Boolean(terminal)),
+    [activeConversationId, allTerminals, terminalTabs]
+  )
 
   const headerTitle = useMemo(() => {
     if (activeTerminal?.name) return activeTerminal.name
     if (sessionTitle) return sessionTitle
+    if (activeGroupName) return activeGroupName
     if (activeProject?.name) return activeProject.name
     return 'Termul'
-  }, [activeTerminal?.name, sessionTitle, activeProject?.name])
+  }, [activeTerminal?.name, sessionTitle, activeGroupName, activeProject?.name])
 
   const closeDrawer = (): void => setDrawerOpen(false)
 
@@ -249,24 +305,46 @@ export function MobileChatShell({
               variant="ghost"
               size="icon"
               className="size-10 shrink-0"
-              aria-label={t('chatShell.closeTerminal')}
+              aria-label={t('chatShell.closeTerminalView')}
               onClick={() => onCloseTerminal?.(activeTab.terminalId, activeTab.id)}
             >
               <X size={20} />
             </Button>
           </>
         ) : (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="size-10 shrink-0"
-            aria-label={t('chatShell.newChat')}
-            disabled={!canNewChat}
-            onClick={onNewChat}
-          >
-            <MessageSquarePlus size={20} />
-          </Button>
+          <>
+            {activeConversationId && activeConversation && (
+              <>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="size-10 shrink-0"
+                  aria-label={t('chatShell.executionTarget')}
+                  aria-expanded={targetOpen}
+                  onClick={() => setTargetOpen(true)}
+                >
+                  <SlidersHorizontal size={18} />
+                </Button>
+                <ConversationLifecycleActions
+                  conversationId={activeConversationId}
+                  title={sessionTitle ?? t('chatShell.chats')}
+                  className="size-10 opacity-100 after:inset-0"
+                />
+              </>
+            )}
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="size-10 shrink-0"
+              aria-label={t('chatShell.newChat')}
+              disabled={!canNewChat}
+              onClick={onNewChat}
+            >
+              <MessageSquarePlus size={20} />
+            </Button>
+          </>
         )}
       </header>
 
@@ -366,39 +444,49 @@ export function MobileChatShell({
                 <Plus size={16} />
               </Button>
             </div>
-            {terminalTabs.length === 0 ? (
+            {conversationTerminals.length === 0 ? (
               <p className="px-2 py-2 text-xs text-muted-foreground">
                 {t('chatShell.noOpenTerminals')}
               </p>
             ) : (
-              terminalTabs.map(({ tab, paneId }) => {
-                const terminal = useTerminalStore
-                  .getState()
-                  .terminals.find((item) => item.id === tab.terminalId)
-                const isActive = tab.id === activeTab?.id
-                const isRenaming = renamingId === tab.terminalId
+              conversationTerminals.map((terminal) => {
+                const tabEntry = terminalTabs.find((entry) => entry.tab.terminalId === terminal.id)
+                const isActive = tabEntry?.tab.id === activeTab?.id
+                const isRenaming = renamingId === terminal.id
+                const isHidden = terminal.viewState !== 'visible' || !tabEntry
                 return (
-                  <div key={tab.id} className="flex items-center gap-1">
+                  <div key={terminal.id} className="flex items-center gap-1">
                     <Button
                       type="button"
                       variant={isActive ? 'secondary' : 'ghost'}
-                      className="h-10 flex-1 justify-start gap-2"
-                      onClick={() => selectTerminal(paneId, tab.id)}
+                      className="h-11 min-w-0 flex-1 justify-start gap-2"
+                      onClick={() => {
+                        if (tabEntry) selectTerminal(tabEntry.paneId, tabEntry.tab.id)
+                        else {
+                          useWorkspaceStore.getState().reopenTerminalView(terminal.id)
+                          closeDrawer()
+                        }
+                      }}
                     >
                       <TerminalSquare size={16} />
-                      <span className="truncate">{terminal?.name ?? t('chatShell.terminal')}</span>
+                      <span className="truncate">{terminal.name}</span>
+                      {isHidden && (
+                        <span className="ml-auto text-[10px] text-muted-foreground">
+                          {t('chatShell.reopenTerminal')}
+                        </span>
+                      )}
                     </Button>
                     {isRenaming ? (
                       <input
                         type="text"
                         value={renameValue}
-                        onChange={(e) => setRenameValue(e.target.value)}
+                        onChange={(event) => setRenameValue(event.target.value)}
                         onBlur={confirmRename}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') confirmRename()
-                          if (e.key === 'Escape') setRenamingId(null)
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter') confirmRename()
+                          if (event.key === 'Escape') setRenamingId(null)
                         }}
-                        className="h-8 w-24 rounded border border-border bg-background px-2 text-xs"
+                        className="h-11 w-24 rounded border border-border bg-background px-2 text-xs"
                         autoFocus
                       />
                     ) : (
@@ -407,28 +495,36 @@ export function MobileChatShell({
                           type="button"
                           variant="ghost"
                           size="icon"
-                          className="size-8 shrink-0"
+                          className="size-11 shrink-0"
                           aria-label={t('chatShell.renameTerminal')}
-                          onClick={() =>
-                            startRename(tab.terminalId, terminal?.name ?? t('chatShell.terminal'))
-                          }
+                          onClick={() => startRename(terminal.id, terminal.name)}
                         >
                           <Pencil size={14} />
                         </Button>
                       )
                     )}
-                    {onCloseTerminal && (
+                    {!isHidden && tabEntry && onCloseTerminal && (
                       <Button
                         type="button"
                         variant="ghost"
                         size="icon"
-                        className="size-8 shrink-0"
-                        aria-label={t('chatShell.closeTerminal')}
-                        onClick={() => {
-                          onCloseTerminal(tab.terminalId, tab.id)
-                        }}
+                        className="size-11 shrink-0"
+                        aria-label={t('chatShell.closeTerminalView')}
+                        onClick={() => onCloseTerminal(terminal.id, tabEntry.tab.id)}
                       >
                         <X size={14} />
+                      </Button>
+                    )}
+                    {onTerminateTerminal && (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className="size-11 shrink-0 text-destructive hover:text-destructive"
+                        aria-label={t('chatShell.terminateTerminal')}
+                        onClick={() => onTerminateTerminal(terminal.id, tabEntry?.tab.id)}
+                      >
+                        <Trash2 size={14} />
                       </Button>
                     )}
                   </div>
@@ -440,6 +536,28 @@ export function MobileChatShell({
           <div className="min-h-0 flex-1 overflow-hidden">
             <ChatHistoryTab onSessionOpened={closeDrawer} />
           </div>
+        </SheetContent>
+      </Sheet>
+
+      <Sheet open={targetOpen} onOpenChange={setTargetOpen}>
+        <SheetContent side="bottom" className="max-h-[85dvh] overflow-y-auto">
+          <SheetHeader className="text-left">
+            <SheetTitle>{t('chatShell.executionTarget')}</SheetTitle>
+            <SheetDescription>{t('chatShell.executionTargetDescription')}</SheetDescription>
+          </SheetHeader>
+          {activeConversation ? (
+            <div className="mt-4">
+              <ExecutionTargetPicker
+                projects={projects}
+                value={mobileTarget}
+                attachment={mobileAttachment}
+                conversation={activeConversation}
+                workspaceCwd={activeConversation.workspaceCwd}
+                onChange={setMobileTarget}
+                onAttachmentChange={setMobileAttachment}
+              />
+            </div>
+          ) : null}
         </SheetContent>
       </Sheet>
 

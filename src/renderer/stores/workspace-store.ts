@@ -1,8 +1,13 @@
 import { create } from 'zustand'
 import { useShallow } from 'zustand/shallow'
-import { navigateToChatSession } from '@/lib/router-navigate'
+import {
+  clearChatRoute,
+  navigateToChatSession,
+  navigateToConversation
+} from '@/lib/router-navigate'
 import { randomUUID } from '@/lib/uuid'
 import { useTerminalStore } from '@/stores/terminal-store'
+import { isOpenTerminalView } from '@/types/project'
 import type {
   DropPosition,
   LeafNode,
@@ -11,12 +16,16 @@ import type {
   SplitNode
 } from '@/types/workspace.types'
 
+export type AgentChatTab =
+  | { type: 'agent-chat'; id: string; conversationId: string; sessionId?: never }
+  | { type: 'agent-chat'; id: string; sessionId: string; conversationId?: never }
+
 export type WorkspaceTab =
   | { type: 'terminal'; id: string; terminalId: string }
   | { type: 'editor'; id: string; filePath: string }
   | { type: 'browser'; id: string; browserTabId: string }
   | { type: 'git'; id: string; cwd: string }
-  | { type: 'agent-chat'; id: string; sessionId: string }
+  | AgentChatTab
   | { type: 'git-history'; id: string; cwd: string }
 
 // CRITICAL: Global lock to prevent syncTerminalTabs from running multiple times concurrently
@@ -180,15 +189,19 @@ export interface WorkspaceState {
 
   // New tab helpers
   addTerminalTab: (terminalId: string, targetPaneId?: string) => void
+  closeTerminalView: (terminalId: string) => void
+  reopenTerminalView: (terminalId: string, targetPaneId?: string) => void
   ensureTerminalTab: (terminalId: string, targetPaneId?: string, makeActive?: boolean) => void
   addEditorTab: (filePath: string, targetPaneId?: string) => void
   addBrowserTab: (browserTabId: string, targetPaneId?: string) => void
-  addAgentChatTab: (sessionId: string, targetPaneId?: string) => void
+  addAgentChatTab: (sessionId: string, targetPaneId?: string, navigate?: boolean) => void
   /**
    * Swap a launch-placeholder chat tab to the real ACP session id without
    * leaving a duplicate tab behind.
    */
   remapAgentChatSession: (fromSessionId: string, toSessionId: string, targetPaneId?: string) => void
+  /** Remove only the renderer chat view and route. Never touches ACP, history, or terminals. */
+  closeChatView: (sessionId: string) => void
   removeTab: (tabId: string) => void
   getNextTabId: (direction: 1 | -1) => string | null
 }
@@ -205,8 +218,16 @@ function editorTabId(filePath: string): string {
   return `edit-${filePath}`
 }
 
-function agentChatTabId(sessionId: string): string {
-  return `chat-${sessionId}`
+function agentChatTabId(conversationId: string): string {
+  return `chat-${conversationId}`
+}
+
+export function agentChatConversationId(tab: AgentChatTab): string | null {
+  return tab.conversationId ?? null
+}
+
+export function legacyAgentChatSessionId(tab: AgentChatTab): string | null {
+  return tab.sessionId ?? null
 }
 
 function resolveFullscreenPaneId(root: PaneNode, fullscreenPaneId: string | null): string | null {
@@ -626,7 +647,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => {
         agentLauncherPaneId: agentLauncherPaneId === paneId ? null : agentLauncherPaneId
       })
       if (tab && tab.type === 'agent-chat') {
-        navigateToChatSession(tab.sessionId)
+        if (tab.conversationId) navigateToConversation(tab.conversationId)
+        else if (tab.sessionId) navigateToChatSession(tab.sessionId)
       }
     },
 
@@ -754,6 +776,17 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => {
       get().addTabToPane(paneId, tab)
     },
 
+    closeTerminalView: (terminalId: string): void => {
+      const tabId = terminalTabId(terminalId)
+      const pane = findPaneContainingTab(get().root, tabId)
+      if (pane) void get().closeTab(pane.id, tabId)
+    },
+
+    reopenTerminalView: (terminalId: string, targetPaneId?: string): void => {
+      useTerminalStore.getState().reopenTerminalView(terminalId)
+      get().addTerminalTab(terminalId, targetPaneId)
+    },
+
     ensureTerminalTab: (
       terminalId: string,
       targetPaneId?: string,
@@ -828,12 +861,16 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => {
       get().addTabToPane(paneId, tab)
     },
 
-    addAgentChatTab: (sessionId: string, targetPaneId?: string): void => {
-      const id = agentChatTabId(sessionId)
+    addAgentChatTab: (
+      conversationId: string,
+      targetPaneId?: string,
+      shouldNavigate: boolean = true
+    ): void => {
+      const id = agentChatTabId(conversationId)
       const { root, activePaneId, agentLauncherPaneId } = get()
       const paneId = targetPaneId ?? activePaneId
 
-      navigateToChatSession(sessionId)
+      if (shouldNavigate) navigateToConversation(conversationId)
 
       const existing = findPaneContainingTab(root, id)
       if (existing) {
@@ -846,50 +883,41 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => {
         return
       }
 
-      const tab: WorkspaceTab = { type: 'agent-chat', id, sessionId }
+      const tab: WorkspaceTab = { type: 'agent-chat', id, conversationId }
       get().addTabToPane(paneId, tab)
     },
 
     remapAgentChatSession: (fromSessionId, toSessionId, targetPaneId?: string): void => {
-      if (fromSessionId === toSessionId) {
-        get().addAgentChatTab(toSessionId, targetPaneId)
-        return
-      }
-      const fromId = agentChatTabId(fromSessionId)
-      const toId = agentChatTabId(toSessionId)
-      const { root, agentLauncherPaneId } = get()
-      const pane = findPaneContainingTab(root, fromId)
-      if (!pane) {
-        get().addAgentChatTab(toSessionId, targetPaneId)
-        return
-      }
-      const { fullscreenPaneId } = get()
-      const nextRoot = updateLeaf(root, pane.id, (leaf) => {
-        const tabs = leaf.tabs.map((tab) => {
-          if (tab.id !== fromId || tab.type !== 'agent-chat') return tab
-          return { type: 'agent-chat' as const, id: toId, sessionId: toSessionId }
-        })
-        // Drop a pre-existing destination tab to avoid duplicates after remap.
-        const deduped = tabs.filter(
-          (tab, index, all) =>
-            !(
-              tab.type === 'agent-chat' &&
-              tab.id === toId &&
-              all.findIndex((t) => t.id === toId) !== index
-            )
+      if (fromSessionId === toSessionId) return
+      const { root } = get()
+      const legacyPane = getAllLeafPanes(root).find((leaf) =>
+        leaf.tabs.some((tab) => tab.type === 'agent-chat' && tab.sessionId === fromSessionId)
+      )
+      if (!legacyPane) return
+      const nextRoot = updateLeaf(root, legacyPane.id, (leaf) => ({
+        ...leaf,
+        tabs: leaf.tabs.map((tab) =>
+          tab.type === 'agent-chat' && tab.sessionId === fromSessionId
+            ? { ...tab, sessionId: toSessionId }
+            : tab
         )
-        return {
-          ...leaf,
-          tabs: deduped,
-          activeTabId: leaf.activeTabId === fromId ? toId : leaf.activeTabId
-        }
-      })
-      set({
-        root: nextRoot,
-        activePaneId: resolveActivePaneId(fullscreenPaneId, pane.id),
-        agentLauncherPaneId: agentLauncherPaneId === pane.id ? null : agentLauncherPaneId
-      })
-      navigateToChatSession(toSessionId)
+      }))
+      set({ root: nextRoot, activePaneId: targetPaneId ?? legacyPane.id })
+    },
+
+    closeChatView: (conversationId: string): void => {
+      const tabId = agentChatTabId(conversationId)
+      const { root } = get()
+      const pane = findPaneContainingTab(root, tabId)
+      if (pane) {
+        void get().closeTab(pane.id, tabId)
+      }
+      if (
+        window.location.hash === `#/c/${encodeURIComponent(conversationId)}` ||
+        window.location.hash === `#/legacy/session/${encodeURIComponent(conversationId)}`
+      ) {
+        clearChatRoute()
+      }
     },
 
     removeTab: (tabId: string): void => {
@@ -929,36 +957,27 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => {
         let newRoot = root
         let didChange = false
 
+        const shouldKeepTerminalTab = (tab: WorkspaceTab): boolean => {
+          if (tab.type !== 'terminal') return true
+          if (terminalTabIds.has(tab.id)) return true
+          if (!tab.terminalId) return false
+          const record = terminalStore.terminals.find((term) => term.id === tab.terminalId)
+          // Hidden close-view records stay in the store on purpose. Do not keep
+          // or recreate their tabs — that makes the first close look like it failed.
+          if (!record || !isOpenTerminalView(record)) return false
+          // Preserve pending spawns that exist in the store but have no ptyId yet.
+          return !record.ptyId
+        }
+
         // Remove orphaned terminal tabs from all panes.
-        // A tab is orphaned only when its terminalId is NOT in the store at all.
-        // Tabs whose terminal exists but lacks a ptyId are "pending" and must
-        // be preserved to avoid the MOUNT/UNMOUNT cascade described in the
-        // agent-launcher-spawn-issue investigation.
+        // A tab is orphaned when its terminal is gone, hidden, or not in the
+        // visible sync set. Pending records without a ptyId are kept.
         for (const leaf of allLeaves) {
-          const hasOrphans = leaf.tabs.some(
-            (t) =>
-              t.type === 'terminal' &&
-              !terminalTabIds.has(t.id) &&
-              // Preserve tabs for terminals that exist in the store (even without
-              // a ptyId). These are pending initialization and will sync once
-              // the PTY is assigned.
-              (t.terminalId
-                ? !terminalStore.terminals.some((term) => term.id === t.terminalId)
-                : true)
-          )
+          const hasOrphans = leaf.tabs.some((t) => !shouldKeepTerminalTab(t))
           if (hasOrphans) {
             didChange = true
             newRoot = updateLeaf(newRoot, leaf.id, (l) => {
-              const newTabs = l.tabs.filter(
-                (t) =>
-                  t.type !== 'terminal' ||
-                  terminalTabIds.has(t.id) ||
-                  // Keep pending terminals whose store record exists but ptyId
-                  // hasn't been assigned yet.
-                  (t.terminalId
-                    ? terminalStore.terminals.some((term) => term.id === t.terminalId)
-                    : false)
-              )
+              const newTabs = l.tabs.filter((t) => shouldKeepTerminalTab(t))
               let newActive = l.activeTabId
               if (newActive && !newTabs.some((t) => t.id === newActive)) {
                 newActive = newTabs.length > 0 ? newTabs[newTabs.length - 1].id : null
@@ -978,6 +997,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => {
         })
 
         for (const tid of terminalIds) {
+          const record = terminalStore.terminals.find((term) => term.id === tid)
+          if (record && !isOpenTerminalView(record)) continue
           const id = terminalTabId(tid)
           if (!existingTerminalIds.has(id)) {
             didChange = true
@@ -1253,6 +1274,8 @@ export function usePaneRoot(): PaneNode {
 export function useWorkspaceActions(): Pick<
   WorkspaceState,
   | 'addTerminalTab'
+  | 'closeTerminalView'
+  | 'reopenTerminalView'
   | 'addEditorTab'
   | 'addBrowserTab'
   | 'addAgentChatTab'
@@ -1280,6 +1303,8 @@ export function useWorkspaceActions(): Pick<
   return useWorkspaceStore(
     useShallow((state) => ({
       addTerminalTab: state.addTerminalTab,
+      closeTerminalView: state.closeTerminalView,
+      reopenTerminalView: state.reopenTerminalView,
       addEditorTab: state.addEditorTab,
       addBrowserTab: state.addBrowserTab,
       addAgentChatTab: state.addAgentChatTab,

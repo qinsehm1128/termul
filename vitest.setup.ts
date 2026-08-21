@@ -125,7 +125,24 @@ class IntersectionObserverMock {
 window.IntersectionObserver = IntersectionObserverMock as unknown as typeof IntersectionObserver
 
 vi.mock('@tauri-apps/api/core', () => ({
-  invoke: vi.fn()
+  invoke: vi.fn(async (command: string) => {
+    if (command === 'conversation_host_status') {
+      return {
+        success: true,
+        data: {
+          hostKind: 'desktop',
+          state: 'ready',
+          code: 'CONVERSATION_HOST_READY',
+          migrationPhase: 'finalized',
+          readerPrecedence: 'conversationV2Only',
+          recoveryItemCount: 0,
+          recoveryItems: []
+        }
+      }
+    }
+    if (command === 'conversation_list') return { success: true, data: [] }
+    return undefined
+  })
 }))
 
 vi.mock('@tauri-apps/api/event', () => ({

@@ -133,6 +133,9 @@ jobs:
       - name: Install Bun dependencies
         run: bun install --frozen-lockfile
 
+      - name: Check conversation-first guardrails
+        run: bun run check:conversation-first
+
       - name: Biome (lint + format + imports)
         run: bun run ci
 
@@ -173,6 +176,71 @@ jobs:
           src/renderer/assets/agent-icons/acp/
           src-tauri/src/acp_registry_snapshot.rs
 
+  conversation-native-durability:
+    name: Conversation Native Durability (${{ matrix.platform }})
+    if: github.event.action != 'edited'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ubuntu-22.04
+          - platform: macos
+            os: macos-latest
+          - platform: windows
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            libdbus-1-dev \
+            patchelf
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Validate locked Rust metadata
+        working-directory: src-tauri
+        run: cargo metadata --locked --format-version 1
+
+      - name: Cache Rust
+        uses: swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          workspaces: src-tauri
+          cache-on-failure: true
+
+      - name: Durable filesystem replacement matrix
+        working-directory: src-tauri
+        run: cargo test --locked conversation::durable_fs
+
+      - name: Migration recovery matrix
+        working-directory: src-tauri
+        run: cargo test --locked conversation::migration
+
+      - name: Repository recovery matrix
+        working-directory: src-tauri
+        run: cargo test --locked conversation::repository
+
+      - name: SessionWorkspace recovery matrix
+        working-directory: src-tauri
+        run: cargo test --locked conversation::session_workspace
+
+      - name: Native replacement and restart matrix
+        working-directory: src-tauri
+        run: cargo test --locked conversation::native_durability_tests
+
   rust-checks:
     name: Rust Checks
     if: github.event.action != 'edited'
@@ -199,6 +267,10 @@ jobs:
         with:
           components: clippy
 
+      - name: Validate locked Rust metadata
+        working-directory: src-tauri
+        run: cargo metadata --locked --format-version 1
+
       - name: Cache Rust
         uses: swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
@@ -224,17 +296,21 @@ jobs:
       - name: Assert dist-web/index.html exists
         run: test -f dist-web/index.html && test -s dist-web/index.html
 
+      - name: Conversation-first semantic Rust guard
+        working-directory: src-tauri
+        run: cargo test --locked --test conversation_first_guardrails
+
       - name: Cargo check
         working-directory: src-tauri
-        run: cargo check --all-targets
+        run: cargo check --locked --all-targets
 
       - name: Cargo test
         working-directory: src-tauri
-        run: cargo test
+        run: cargo test --locked
 
       - name: Cargo clippy
         working-directory: src-tauri
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
   web-build:
     name: Web Client Build
@@ -284,6 +360,12 @@ jobs:
 
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          components: clippy
+
+      - name: Validate locked Rust metadata
+        working-directory: src-tauri
+        run: cargo metadata --locked --format-version 1
 
       - name: Cache Rust
         uses: swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
@@ -312,11 +394,11 @@ jobs:
 
       - name: Build termul-server (native host)
         working-directory: src-tauri
-        run: cargo build --bin termul-server --features standalone-server
+        run: cargo build --locked --bin termul-server --features standalone-server
 
       - name: Clippy termul-server (feature on)
         working-directory: src-tauri
-        run: cargo clippy --bin termul-server --features standalone-server -- -D warnings
+        run: cargo clippy --locked --bin termul-server --features standalone-server -- -D warnings
 
   rust-windows-check:
     name: Rust Windows Smoke Check
@@ -333,6 +415,10 @@ jobs:
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
+
+      - name: Validate locked Rust metadata
+        working-directory: src-tauri
+        run: cargo metadata --locked --format-version 1
 
       - name: Cache Rust
         uses: swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
@@ -357,16 +443,28 @@ jobs:
 
       - name: Cargo check
         working-directory: src-tauri
-        run: cargo check --all-targets
+        run: cargo check --locked --all-targets
+
+      - name: Windows token owner, DACL, and reparse security gate
+        working-directory: src-tauri
+        run: cargo test --locked web::auth::tests::windows_token_descriptor_rejects_foreign_owner_null_dacl_and_broad_allow_ace -- --exact
 
       - name: Build termul-server (Windows host)
         working-directory: src-tauri
-        run: cargo build --bin termul-server --features standalone-server
+        run: cargo build --locked --bin termul-server --features standalone-server
 
   build-check:
     name: Verify Tauri Frontend Build
     if: github.event.action != 'edited'
-    needs: [validate, rust-checks, rust-windows-check, web-build, standalone-server-build]
+    needs:
+      [
+        validate,
+        conversation-native-durability,
+        rust-checks,
+        rust-windows-check,
+        web-build,
+        standalone-server-build
+      ]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

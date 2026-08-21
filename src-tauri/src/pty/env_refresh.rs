@@ -27,11 +27,7 @@ fn get_path_from_map(env: &HashMap<String, String>) -> String {
 
 #[cfg(target_os = "windows")]
 fn set_path_in_map(env: &mut HashMap<String, String>, value: String) {
-    if let Some(existing_key) = env
-        .keys()
-        .find(|k| k.eq_ignore_ascii_case("path"))
-        .cloned()
-    {
+    if let Some(existing_key) = env.keys().find(|k| k.eq_ignore_ascii_case("path")).cloned() {
         env.remove(&existing_key);
     }
     env.insert("Path".to_string(), value);
@@ -184,7 +180,11 @@ fn probe_unix_login_path() -> Option<String> {
 
 /// Apply a refreshed PATH to `env`, preserving custom overrides already present.
 pub fn apply_fresh_path(env: &mut HashMap<String, String>) {
-    let delimiter = if cfg!(target_os = "windows") { ';' } else { ':' };
+    let delimiter = if cfg!(target_os = "windows") {
+        ';'
+    } else {
+        ':'
+    };
 
     let inherited = {
         #[cfg(target_os = "windows")]
@@ -216,23 +216,31 @@ pub fn apply_fresh_path(env: &mut HashMap<String, String>) {
     env.insert("PATH".to_string(), merged);
 }
 
-/// Whether an interactive shell spawn should pass a login-shell flag.
+/// Startup flags so profile + rc files load the same way as Ghostty / Terminal.app.
+/// bash/zsh need both login (`-l`) and interactive (`-i`); otherwise `.zshrc` is skipped.
 // Only invoked from the non-Windows PTY spawn path; on Windows it is exercised
 // solely by unit tests, so a non-test Windows build sees it as unused.
 #[cfg_attr(windows, allow(dead_code))]
-pub fn shell_wants_login_arg(shell_path: &str) -> Option<&'static str> {
+pub fn shell_startup_args(shell_path: &str) -> &'static [&'static str] {
     let name = Path::new(shell_path)
         .file_name()
-        .and_then(|s| s.to_str())?
-        .to_ascii_lowercase();
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
 
     match name.as_str() {
-        "bash" | "zsh" => Some("-l"),
-        "fish" => Some("-l"),
+        "bash" | "zsh" => &["-l", "-i"],
+        "fish" => &["-l"],
         #[cfg(not(target_os = "windows"))]
-        "pwsh" | "powershell" => Some("-Login"),
-        _ => None,
+        "pwsh" | "powershell" => &["-Login"],
+        _ => &[],
     }
+}
+
+/// Whether an interactive shell spawn should pass a login-shell flag.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn shell_wants_login_arg(shell_path: &str) -> Option<&'static str> {
+    shell_startup_args(shell_path).first().copied()
 }
 
 #[cfg(test)]
@@ -241,11 +249,7 @@ mod tests {
 
     #[test]
     fn merge_dedupes_case_insensitively_on_windows_style() {
-        let merged = merge_path_segments(
-            r"C:\Tools;C:\App",
-            r"C:\tools;C:\Extra",
-            ';',
-        );
+        let merged = merge_path_segments(r"C:\Tools;C:\App", r"C:\tools;C:\Extra", ';');
         assert_eq!(merged, r"C:\Tools;C:\App;C:\Extra");
     }
 
@@ -263,10 +267,12 @@ mod tests {
 
     #[test]
     fn shell_login_arg_for_bash() {
-        assert_eq!(
-            shell_wants_login_arg("/usr/bin/bash"),
-            Some("-l")
-        );
+        assert_eq!(shell_wants_login_arg("/usr/bin/bash"), Some("-l"));
+    }
+
+    #[test]
+    fn shell_startup_args_for_zsh_are_login_and_interactive() {
+        assert_eq!(shell_startup_args("/opt/homebrew/bin/zsh"), ["-l", "-i"]);
     }
 
     #[test]

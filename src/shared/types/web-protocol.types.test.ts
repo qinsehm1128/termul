@@ -1,8 +1,17 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  assertConversationHistoryPage,
+  assertConversationHistoryPageRequest,
+  CONVERSATION_APPLICATION_ERROR_CODES,
+  type ConversationHistoryPageV1,
+  ConversationHistoryPageValidationError,
+  conversationHistoryPageEncodedBytes,
+  type GetSessionPayloadPageRequest,
   isHumanRelayedCap,
   isOsFulfilledCap,
+  MAX_CONVERSATION_HISTORY_PAGE_BYTES,
+  MAX_CONVERSATION_HISTORY_PAGE_LIMIT,
   type ReliabilityTier,
   WS_ERROR_CODES,
   WS_EVENT_TIERS,
@@ -21,8 +30,8 @@ import {
 } from './web-protocol.types'
 
 describe('web-protocol.types — event/request type registries (AC2)', () => {
-  it('exports exactly 22 event types including durable user prompts', () => {
-    expect(WS_EVENT_TYPES).toHaveLength(22)
+  it('exports exactly 23 event types including Conversation lifecycle events', () => {
+    expect(WS_EVENT_TYPES).toHaveLength(23)
     // The 16 from events.rs (prefix-dropped) + auth_required.
     const expected16FromEvents = [
       'agent_spawned',
@@ -53,14 +62,16 @@ describe('web-protocol.types — event/request type registries (AC2)', () => {
     expect(WS_EVENT_TYPES).toContain('user_prompt')
     // Epic-4 bridge: desktop chat-history live push (agent-level, seq 0).
     expect(WS_EVENT_TYPES).toContain('chat_history_changed')
+    expect(WS_EVENT_TYPES).toContain('conversation_lifecycle')
     expect(WS_REQUEST_TYPES).toContain('list_persisted_sessions')
     expect(WS_REQUEST_TYPES).toContain('open_persisted_session')
     expect(WS_REQUEST_TYPES).toContain('get_session_payload')
+    expect(WS_REQUEST_TYPES).toContain('get_session_payload_page')
   })
 
-  it('exports exactly 33 request types including discovered-session promotion', () => {
-    expect(WS_REQUEST_TYPES).toHaveLength(33)
-    const expected = [
+  it('exports exactly 51 request types including persistence and Conversation-first operations', () => {
+    expect(WS_REQUEST_TYPES).toHaveLength(51)
+    expect(WS_REQUEST_TYPES).toEqual([
       'send_prompt',
       'cancel_prompt',
       'set_config_option',
@@ -78,6 +89,7 @@ describe('web-protocol.types — event/request type registries (AC2)', () => {
       'spawn_agent',
       'kill_agent',
       'list_agents',
+      'set_permission_policy',
       'switch_project',
       'authenticate',
       // ACP agent `authenticate` method (agent-advertised auth, e.g.
@@ -88,6 +100,8 @@ describe('web-protocol.types — event/request type registries (AC2)', () => {
       'list_persisted_sessions',
       'open_persisted_session',
       'get_session_payload',
+      'get_session_payload_page',
+      'recover_session_snapshot',
       'get_session_cursor',
       // CAP-6 / Story 8: host-owned ACP catalog resolution.
       'list_acp_catalog',
@@ -97,19 +111,180 @@ describe('web-protocol.types — event/request type registries (AC2)', () => {
       // Issue #613: server-side generic key-value store.
       'store_read',
       'store_write',
-      'store_delete'
-    ]
-    for (const name of expected) {
-      expect(WS_REQUEST_TYPES).toContain(name)
-    }
-    // create_session maps to acp_new_session, NOT acp_create_session.
-    expect(WS_REQUEST_TYPES).toContain('create_session')
+      'store_delete',
+      'detach_binding',
+      'rebind_binding',
+      'suspend_binding',
+      'replace_binding',
+      'delete_conversation',
+      'conversation_host_status',
+      'list_conversations',
+      'get_conversation',
+      'open_conversation',
+      'resolve_legacy_conversation_id',
+      'get_session_workspace',
+      'write_session_workspace',
+      'resolve_recovery_item',
+      'attach_project',
+      'detach_project',
+      'update_execution_target'
+    ])
   })
 
   it('event and request type namespaces are disjoint', () => {
     for (const e of WS_EVENT_TYPES) {
       expect(WS_REQUEST_TYPES).not.toContain(e)
     }
+  })
+})
+
+describe('web-protocol.types — bounded history page contract', () => {
+  const page: ConversationHistoryPageV1 = {
+    schemaVersion: 1,
+    records: [
+      {
+        schemaVersion: 1,
+        sessionId: 's-1',
+        seq: 18,
+        type: 'message_chunk',
+        recordedAt: 1_766_000_000_018,
+        payload: { role: 'agent', content: { type: 'text', text: 'ok' } }
+      }
+    ],
+    nextCursor: 18,
+    complete: false,
+    targetLastSeq: 42
+  }
+
+  it('pins first-page omission, continuation target, exact camelCase result, and payload identity', () => {
+    const firstRequest: GetSessionPayloadPageRequest = {
+      sessionId: 's-1',
+      afterSeq: 0,
+      limit: 250
+    }
+    const continuationRequest: GetSessionPayloadPageRequest = {
+      sessionId: 's-1',
+      afterSeq: 17,
+      limit: 250,
+      targetLastSeq: 42
+    }
+    expect(firstRequest).not.toHaveProperty('targetLastSeq')
+    expect(continuationRequest).toEqual({
+      sessionId: 's-1',
+      afterSeq: 17,
+      limit: 250,
+      targetLastSeq: 42
+    })
+    assertConversationHistoryPageRequest(
+      continuationRequest.afterSeq,
+      continuationRequest.limit,
+      continuationRequest.targetLastSeq
+    )
+    assertConversationHistoryPage(page, continuationRequest)
+    expect(CONVERSATION_APPLICATION_ERROR_CODES).toContain('CONVERSATION_HISTORY_PAGING_REQUIRED')
+    expect(page).toEqual({
+      schemaVersion: 1,
+      records: [
+        {
+          schemaVersion: 1,
+          sessionId: 's-1',
+          seq: 18,
+          type: 'message_chunk',
+          recordedAt: 1_766_000_000_018,
+          payload: { role: 'agent', content: { type: 'text', text: 'ok' } }
+        }
+      ],
+      nextCursor: 18,
+      complete: false,
+      targetLastSeq: 42
+    })
+  })
+
+  it.each([
+    0,
+    -1,
+    1.5,
+    MAX_CONVERSATION_HISTORY_PAGE_LIMIT + 1
+  ])('rejects invalid limit %s before request allocation', (limit) => {
+    expect(() => assertConversationHistoryPageRequest(0, limit)).toThrow(
+      ConversationHistoryPageValidationError
+    )
+  })
+
+  it.each([-1, 1.5, Number.POSITIVE_INFINITY])('rejects invalid cursor %s', (afterSeq) => {
+    expect(() => assertConversationHistoryPageRequest(afterSeq, 250)).toThrow(
+      ConversationHistoryPageValidationError
+    )
+  })
+
+  it.each([
+    -1,
+    1.5,
+    Number.POSITIVE_INFINITY
+  ])('rejects invalid targetLastSeq %s before transport allocation', (targetLastSeq) => {
+    expect(() => assertConversationHistoryPageRequest(0, 250, targetLastSeq)).toThrow(
+      ConversationHistoryPageValidationError
+    )
+  })
+
+  it('accepts canonical cursor gaps whose payload-free markers still advance nextCursor', () => {
+    const gapped: ConversationHistoryPageV1 = {
+      schemaVersion: 1,
+      records: [
+        { ...page.records[0], seq: 18 },
+        { ...page.records[0], seq: 20, recordedAt: 20 }
+      ],
+      nextCursor: 21,
+      complete: true,
+      targetLastSeq: 21
+    }
+    expect(() =>
+      assertConversationHistoryPage(gapped, {
+        sessionId: 's-1',
+        afterSeq: 17,
+        limit: 250,
+        targetLastSeq: 21
+      })
+    ).not.toThrow()
+  })
+
+  it('rejects a decoded page above the exact 4 MiB bound before publication', () => {
+    const oversized: ConversationHistoryPageV1 = {
+      schemaVersion: 1,
+      records: [
+        {
+          ...page.records[0],
+          payload: { text: 'x'.repeat(MAX_CONVERSATION_HISTORY_PAGE_BYTES) }
+        }
+      ],
+      nextCursor: 18,
+      complete: true,
+      targetLastSeq: 18
+    }
+    expect(() => conversationHistoryPageEncodedBytes(oversized)).toThrow(/encoded limit/)
+  })
+
+  it('rejects cross-session pages, cursor regression, target drift, and invalid completion', () => {
+    expect(() =>
+      assertConversationHistoryPage(page, { sessionId: 's-2', afterSeq: 17, limit: 250 })
+    ).toThrow(/another session/)
+    expect(() =>
+      assertConversationHistoryPage(page, { sessionId: 's-1', afterSeq: 18, limit: 250 })
+    ).toThrow(/did not advance/)
+    expect(() =>
+      assertConversationHistoryPage(page, {
+        sessionId: 's-1',
+        afterSeq: 17,
+        limit: 250,
+        targetLastSeq: 43
+      })
+    ).toThrow(/changed/)
+    expect(() =>
+      assertConversationHistoryPage(
+        { ...page, complete: true },
+        { sessionId: 's-1', afterSeq: 17, limit: 250 }
+      )
+    ).toThrow(/complete flag/)
   })
 })
 

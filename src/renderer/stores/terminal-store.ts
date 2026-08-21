@@ -1,7 +1,19 @@
+import type { IpcResult, TerminalResumeGrant } from '@shared/types/ipc.types'
+import type {
+  TerminalResourceDescriptor,
+  TerminalResourceHydrationStatus
+} from '@shared/types/session-workspace.types'
+import {
+  readTerminalResourceFailure,
+  type TerminalCleanupRecoveryInput
+} from '@shared/types/web-terminal-protocol.types'
 import { create } from 'zustand'
 import { useShallow } from 'zustand/shallow'
+import { disposeCachedTerminal } from '@/components/terminal/terminal-cache'
 import { i18n } from '@/i18n'
 import { formatNumber } from '@/i18n/format'
+import { logFrontendError } from '@/lib/log-api'
+import { terminalApi } from '@/lib/terminal-api'
 import type { GitStatus, Terminal, TerminalHealthStatus } from '@/types/project'
 import { useProjectStore } from './project-store'
 
@@ -10,6 +22,13 @@ export const HIDDEN_BUFFER_TRUNCATION_DELAY = 15 * 60 * 1000 // 15 minutes
 export const TRUNCATED_BUFFER_SIZE = 5000
 export const MAX_TRANSCRIPT_CHARS = 1_500_000
 const LINE_BREAK_PATTERN = /\r\n|\r|\n/
+const terminalResumeInFlight = new Map<string, Promise<IpcResult<void>>>()
+const terminalCleanupRetryInFlight = new Map<string, Promise<boolean>>()
+
+export interface TerminalCleanupRecovery extends TerminalCleanupRecoveryInput {
+  retrying: boolean
+  retryFailed: boolean
+}
 
 // ADR-004.4: descriptive-only agent metadata applied to a Terminal record.
 export interface TerminalAgentMetadata {
@@ -39,6 +58,8 @@ export interface TerminalState {
   activeTerminalId: string
   // Index for O(1) ptyId lookups
   ptyIdIndex: Map<string, string>
+  /** Secret-free cleanup-only records keyed by the retained host terminal id. */
+  cleanupRecoveries: Record<string, TerminalCleanupRecovery>
 
   // Actions
   selectTerminal: (id: string) => void
@@ -47,12 +68,24 @@ export interface TerminalState {
     projectId: string,
     shell?: Terminal['shell'],
     cwd?: string,
-    pendingScrollback?: string[]
+    pendingScrollback?: string[],
+    conversationId?: string
   ) => Terminal
   closeTerminal: (id: string, projectId: string) => void
+  closeTerminalView: (id: string) => Promise<boolean>
+  reopenTerminalView: (id: string) => void
+  terminateTerminalResource: (id: string) => Promise<boolean>
+  recordTerminalCleanupFailure: (result: IpcResult<unknown>) => TerminalCleanupRecoveryInput | null
+  retryTerminalCleanup: (terminalId: string) => Promise<boolean>
   renameTerminal: (id: string, name: string) => void
   reorderTerminals: (projectId: string, orderedIds: string[]) => void
   setTerminals: (terminals: Terminal[]) => void
+  hydrateTerminalResource: (
+    descriptor: TerminalResourceDescriptor,
+    grant?: TerminalResumeGrant,
+    projectId?: string
+  ) => void
+  resumeTerminalResource: (id: string) => Promise<IpcResult<void>>
   setTerminalPtyId: (id: string, ptyId: string) => boolean
   setTerminalClaim: (ptyId: string, claim: string | undefined) => void
   findTerminalByPtyId: (ptyId: string) => Terminal | undefined
@@ -77,6 +110,7 @@ export interface TerminalState {
   /** @deprecated Use updateTerminalActivityBatch instead */
   updateTerminalLastActivityTimestamp: (id: string, timestamp: number) => void
   restartTerminal: (id: string) => void
+  restartTerminalResource: (id: string) => Promise<boolean>
   updateTerminalActivityBatch: (id: string, hasActivity: boolean, timestamp: number) => void
   clearTerminalPtyId: (ptyId: string) => void
   truncateHiddenTerminalBuffers: () => void
@@ -89,6 +123,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
   terminals: [],
   activeTerminalId: '',
   ptyIdIndex: new Map(),
+  cleanupRecoveries: {},
 
   selectTerminal: (id: string): void => {
     set((state) => ({
@@ -102,7 +137,8 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
     projectId: string,
     shell: Terminal['shell'] = 'powershell',
     cwd?: string,
-    pendingScrollback?: string[]
+    pendingScrollback?: string[],
+    suppliedConversationId?: string
   ): Terminal => {
     // Check global terminal limit
     const { terminals } = get()
@@ -117,8 +153,13 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
       )
     }
 
+    // Scope-less project terminals carry no Conversation id; only terminals
+    // created inside an open Conversation are conversation-scoped.
+    const conversationId = suppliedConversationId
+
     const newTerminal: Terminal = {
       id: Date.now().toString(),
+      conversationId,
       name,
       projectId,
       shell,
@@ -126,6 +167,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
       output: [],
       pendingScrollback,
       healthStatus: 'running',
+      viewState: 'visible',
       isHidden: false
     }
     set((state) => ({
@@ -143,6 +185,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
 
     const newIndex = new Map(ptyIdIndex)
     if (closedTerminal?.ptyId) {
+      disposeCachedTerminal(closedTerminal.ptyId)
       newIndex.delete(closedTerminal.ptyId)
     }
 
@@ -156,6 +199,160 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
             ? ''
             : activeTerminalId
     })
+  },
+
+  closeTerminalView: async (id: string): Promise<boolean> => {
+    const terminal = get().terminals.find((candidate) => candidate.id === id)
+    if (!terminal) return false
+    if (terminal.ptyId) {
+      const result = await terminalApi.closeView(terminal.ptyId)
+      if (!result.success) {
+        // Close-view is a local UI hide. The PTY is supposed to keep running,
+        // so a detach/forwarder failure must not block removing the tab.
+        void logFrontendError({
+          level: 'warn',
+          source: 'terminal-store.close-view',
+          message: `code=${result.code ?? 'CLOSE_VIEW_FAILED'} terminalId=${terminal.ptyId}`
+        })
+      }
+    }
+    set((state) => ({
+      terminals: state.terminals.map((candidate) =>
+        candidate.id === id
+          ? { ...candidate, viewState: 'hidden', isHidden: true, hiddenSince: Date.now() }
+          : candidate
+      ),
+      activeTerminalId: state.activeTerminalId === id ? '' : state.activeTerminalId
+    }))
+    return true
+  },
+
+  reopenTerminalView: (id: string): void => {
+    set((state) => ({
+      terminals: state.terminals.map((candidate) =>
+        candidate.id === id
+          ? {
+              ...candidate,
+              viewState: 'visible',
+              isHidden: false,
+              hiddenSince: undefined
+            }
+          : candidate
+      ),
+      activeTerminalId: id
+    }))
+  },
+
+  terminateTerminalResource: async (id: string): Promise<boolean> => {
+    const terminal = get().terminals.find((candidate) => candidate.id === id)
+    if (!terminal) return false
+    if (terminal.ptyId) {
+      const result = await terminalApi.terminate(terminal.ptyId)
+      if (!result.success) {
+        get().recordTerminalCleanupFailure(result)
+        return false
+      }
+      set((state) => {
+        if (!(terminal.ptyId! in state.cleanupRecoveries)) return state
+        const cleanupRecoveries = { ...state.cleanupRecoveries }
+        delete cleanupRecoveries[terminal.ptyId!]
+        return { cleanupRecoveries }
+      })
+    }
+    get().closeTerminal(id, terminal.projectId ?? '')
+    return true
+  },
+
+  recordTerminalCleanupFailure: (
+    result: IpcResult<unknown>
+  ): TerminalCleanupRecoveryInput | null => {
+    const failure = readTerminalResourceFailure(result)
+    if (!failure) return null
+    set((state) => ({
+      cleanupRecoveries: {
+        ...state.cleanupRecoveries,
+        [failure.terminalId]: {
+          ...failure,
+          retrying: false,
+          retryFailed: false
+        }
+      }
+    }))
+    return failure
+  },
+
+  retryTerminalCleanup: (terminalId: string): Promise<boolean> => {
+    const existing = terminalCleanupRetryInFlight.get(terminalId)
+    if (existing) return existing
+    if (!get().cleanupRecoveries[terminalId]) return Promise.resolve(false)
+
+    set((state) => ({
+      cleanupRecoveries: {
+        ...state.cleanupRecoveries,
+        [terminalId]: {
+          ...state.cleanupRecoveries[terminalId],
+          retrying: true,
+          retryFailed: false
+        }
+      }
+    }))
+
+    const task = (async (): Promise<boolean> => {
+      let result: IpcResult<void>
+      try {
+        result = await terminalApi.terminate(terminalId)
+      } catch {
+        result = { success: false, error: 'Terminal cleanup retry failed', code: 'NETWORK_ERROR' }
+      }
+
+      if (result.success) {
+        set((state) => {
+          const cleanupRecoveries = { ...state.cleanupRecoveries }
+          delete cleanupRecoveries[terminalId]
+          const ptyIdIndex = new Map(state.ptyIdIndex)
+          ptyIdIndex.delete(terminalId)
+          const terminals = state.terminals.filter((terminal) => terminal.ptyId !== terminalId)
+          const removedIds = new Set(
+            state.terminals
+              .filter((terminal) => terminal.ptyId === terminalId)
+              .map((terminal) => terminal.id)
+          )
+          return {
+            cleanupRecoveries,
+            ptyIdIndex,
+            terminals,
+            activeTerminalId: removedIds.has(state.activeTerminalId) ? '' : state.activeTerminalId
+          }
+        })
+        return true
+      }
+
+      const decoded = readTerminalResourceFailure(result)
+      set((state) => {
+        const retained = state.cleanupRecoveries[terminalId]
+        if (!retained) return state
+        return {
+          cleanupRecoveries: {
+            ...state.cleanupRecoveries,
+            [terminalId]: {
+              ...(decoded?.terminalId === terminalId ? decoded : retained),
+              retrying: false,
+              retryFailed: true
+            }
+          }
+        }
+      })
+      return false
+    })()
+
+    terminalCleanupRetryInFlight.set(terminalId, task)
+    const clearInFlight = (): void => {
+      if (terminalCleanupRetryInFlight.get(terminalId) === task) {
+        terminalCleanupRetryInFlight.delete(terminalId)
+      }
+    }
+    void task.then(clearInFlight, clearInFlight)
+    return task
   },
 
   renameTerminal: (id: string, name: string): void => {
@@ -183,6 +380,142 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
       if (t.ptyId) newIndex.set(t.ptyId, t.id)
     }
     set({ terminals, ptyIdIndex: newIndex })
+  },
+
+  /**
+   * Materialize a passive SessionWorkspace terminal descriptor in renderer
+   * memory. This action never spawns, terminates, or otherwise claims PTY
+   * ownership; it only reconciles the renderer record and its ptyId index.
+   */
+  hydrateTerminalResource: (
+    descriptor: TerminalResourceDescriptor,
+    grant?: TerminalResumeGrant,
+    projectId?: string
+  ): void => {
+    const recordId = descriptor.terminalRecordId ?? descriptor.terminalId
+    const fallbackProjectId = projectId ?? useProjectStore.getState().activeProjectId
+
+    set((state) => {
+      const byRecord = state.terminals.find((terminal) => terminal.id === recordId)
+      const indexedOwner = state.ptyIdIndex.get(descriptor.terminalId)
+      const byPty = indexedOwner
+        ? state.terminals.find((terminal) => terminal.id === indexedOwner)
+        : state.terminals.find((terminal) => terminal.ptyId === descriptor.terminalId)
+      const base = byRecord ?? byPty
+      const firstIndex = state.terminals.findIndex(
+        (terminal) => terminal.id === recordId || terminal.ptyId === descriptor.terminalId
+      )
+      const healthStatus: TerminalResourceHydrationStatus = grant ? 'running' : 'disconnected'
+      const hydrated: Terminal = {
+        ...base,
+        id: recordId,
+        conversationId: descriptor.conversationId,
+        ptyId: descriptor.terminalId,
+        name:
+          base?.name ??
+          i18n.t('resume.restoredName', {
+            ns: 'terminal',
+            defaultValue: 'Restored terminal'
+          }),
+        projectId: base?.projectId ?? fallbackProjectId,
+        shell: grant?.terminal.shell ?? base?.shell ?? 'shell',
+        cwd: grant?.terminal.cwd ?? base?.cwd,
+        healthStatus,
+        resumeCursor: grant?.terminal.latestSeq ?? base?.resumeCursor,
+        claim: grant?.claim,
+        viewState: base?.viewState ?? 'visible',
+        isHidden: base?.isHidden ?? false,
+        rendererAttachmentCount: base?.rendererAttachmentCount ?? 0
+      }
+
+      const terminals = state.terminals.filter(
+        (terminal) => terminal.id !== recordId && terminal.ptyId !== descriptor.terminalId
+      )
+      terminals.splice(firstIndex >= 0 ? firstIndex : terminals.length, 0, hydrated)
+
+      const nextIndex = new Map<string, string>()
+      for (const terminal of terminals) {
+        if (terminal.ptyId) nextIndex.set(terminal.ptyId, terminal.id)
+      }
+
+      return {
+        terminals,
+        ptyIdIndex: nextIndex,
+        activeTerminalId:
+          state.activeTerminalId === byPty?.id || state.activeTerminalId === byRecord?.id
+            ? recordId
+            : state.activeTerminalId
+      }
+    })
+  },
+
+  /**
+   * Ensure a hydrated terminal has a fresh host-authorized resume grant. A
+   * running record with an in-memory claim is already reconciled and returns
+   * immediately; all other records use the narrow resume path and never spawn.
+   */
+  resumeTerminalResource: (id: string): Promise<IpcResult<void>> => {
+    const existing = terminalResumeInFlight.get(id)
+    if (existing) return existing
+
+    const task = (async (): Promise<IpcResult<void>> => {
+      const terminal = get().terminals.find((candidate) => candidate.id === id)
+      if (!terminal?.ptyId) {
+        return { success: false, error: 'Terminal unavailable', code: 'TERMINAL_NOT_FOUND' }
+      }
+      // Scope-less project terminals already hold the spawn-issued claim.
+      // Requiring a Conversation id here closes them on mount and blanks the pane.
+      if (terminal.healthStatus === 'running' && terminal.claim) {
+        return { success: true, data: undefined }
+      }
+      if (!terminal.conversationId) {
+        return { success: false, error: 'Terminal unavailable', code: 'TERMINAL_NOT_FOUND' }
+      }
+
+      const descriptor: TerminalResourceDescriptor = {
+        kind: 'terminal',
+        terminalId: terminal.ptyId,
+        terminalRecordId: terminal.id,
+        conversationId: terminal.conversationId
+      }
+      let result: IpcResult<TerminalResumeGrant>
+      try {
+        result = await terminalApi.resume({
+          conversationId: terminal.conversationId,
+          terminalId: terminal.ptyId,
+          lastSeq: terminal.resumeCursor ?? 0
+        })
+      } catch {
+        result = { success: false, error: 'Terminal resume failed', code: 'NETWORK_ERROR' }
+      }
+
+      const current = get().terminals.find((candidate) => candidate.id === id)
+      if (
+        !current ||
+        current.ptyId !== terminal.ptyId ||
+        current.conversationId !== terminal.conversationId
+      ) {
+        return { success: false, error: 'Terminal resume failed', code: 'NETWORK_ERROR' }
+      }
+
+      if (result.success && result.data.terminal.id === terminal.ptyId && result.data.claim) {
+        get().hydrateTerminalResource(descriptor, result.data, terminal.projectId)
+        return { success: true, data: undefined }
+      }
+
+      get().hydrateTerminalResource(descriptor, undefined, terminal.projectId)
+      if (result.success) {
+        return { success: false, error: 'Terminal resume failed', code: 'NETWORK_ERROR' }
+      }
+      return result
+    })()
+
+    terminalResumeInFlight.set(id, task)
+    const clearInFlight = (): void => {
+      if (terminalResumeInFlight.get(id) === task) terminalResumeInFlight.delete(id)
+    }
+    void task.then(clearInFlight, clearInFlight)
+    return task
   },
 
   setTerminalPtyId: (id: string, ptyId: string): boolean => {
@@ -462,6 +795,7 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
 
         return {
           ...t,
+          viewState: isHidden ? 'hidden' : 'visible',
           isHidden,
           hiddenSince: isHidden ? Date.now() : undefined
         }
@@ -522,35 +856,93 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
   },
 
   restartTerminal: (id: string): void => {
+    // Compatibility action for legacy callers that only reset renderer state.
+    // User-facing restart paths use restartTerminalResource below so the live
+    // PTY is explicitly terminated and re-spawned in the same Conversation.
+    set((state) => ({
+      terminals: state.terminals.map((terminal) =>
+        terminal.id === id
+          ? {
+              ...terminal,
+              healthStatus: 'running',
+              transcript: undefined,
+              pendingScrollback: undefined,
+              pendingModes: undefined
+            }
+          : terminal
+      ),
+      activeTerminalId: id
+    }))
+  },
+
+  restartTerminalResource: async (id: string): Promise<boolean> => {
+    const terminal = get().terminals.find((candidate) => candidate.id === id)
+    if (!terminal?.ptyId) return false
+
+    const terminated = await terminalApi.terminate(terminal.ptyId)
+    if (!terminated.success) {
+      get().recordTerminalCleanupFailure(terminated)
+      return false
+    }
+
+    const previousPtyId = terminal.ptyId
     set((state) => {
-      const terminal = state.terminals.find((t) => t.id === id)
-      if (!terminal) return state
-      const newPtyId = `restart-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`
-      const newIndex = new Map(state.ptyIdIndex)
-      if (terminal.ptyId) {
-        newIndex.delete(terminal.ptyId)
-      }
-      newIndex.set(newPtyId, id)
+      const nextIndex = new Map(state.ptyIdIndex)
+      nextIndex.delete(previousPtyId)
       return {
-        terminals: state.terminals.map((t) =>
-          t.id === id
+        terminals: state.terminals.map((candidate) =>
+          candidate.id === id
             ? {
-                ...t,
-                ptyId: newPtyId,
-                // CAP-3: the old lease belonged to the old PTY — clear it; a
-                // fresh claim is issued when the restart re-spawns.
+                ...candidate,
+                ptyId: undefined,
                 claim: undefined,
+                resumeCursor: undefined,
+                healthStatus: 'crashed'
+              }
+            : candidate
+        ),
+        ptyIdIndex: nextIndex
+      }
+    })
+
+    const spawned = await terminalApi.spawn({
+      ...(terminal.conversationId ? { conversationId: terminal.conversationId } : {}),
+      projectId: terminal.projectId,
+      shell: terminal.agentProgram ? undefined : terminal.shell,
+      cwd: terminal.cwd,
+      kind: terminal.kind ?? 'shell',
+      program: terminal.agentProgram,
+      args: terminal.agentArgs
+    })
+    if (!spawned.success) return false
+
+    set((state) => {
+      if (!state.terminals.some((candidate) => candidate.id === id)) return state
+      const nextIndex = new Map(state.ptyIdIndex)
+      nextIndex.set(spawned.data.id, id)
+      return {
+        terminals: state.terminals.map((candidate) =>
+          candidate.id === id
+            ? {
+                ...candidate,
+                ptyId: spawned.data.id,
+                claim: spawned.data.claim,
+                resumeCursor: 0,
                 healthStatus: 'running',
+                viewState: 'visible',
+                isHidden: false,
+                hiddenSince: undefined,
                 transcript: undefined,
                 pendingScrollback: undefined,
                 pendingModes: undefined
               }
-            : t
+            : candidate
         ),
-        ptyIdIndex: newIndex,
+        ptyIdIndex: nextIndex,
         activeTerminalId: id
       }
     })
+    return true
   },
 
   updateTerminalActivityBatch: (id: string, hasActivity: boolean, timestamp: number): void => {
@@ -569,7 +961,9 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
         terminals: state.terminals.map((t) =>
           // CAP-3: the claim is bound to the PTY — dropping the ptyId drops
           // the lease with it.
-          t.ptyId === ptyId ? { ...t, ptyId: undefined, claim: undefined } : t
+          t.ptyId === ptyId
+            ? { ...t, ptyId: undefined, claim: undefined, resumeCursor: undefined }
+            : t
         ),
         ptyIdIndex: newIndex
       }
@@ -633,27 +1027,25 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
   },
 
   cleanupProjectTerminals: (projectId: string): void => {
-    set((state) => {
-      const removedTerminals = state.terminals.filter((t) => t.projectId === projectId)
-      const remainingTerminals = state.terminals.filter((t) => t.projectId !== projectId)
-      const newIndex = new Map(state.ptyIdIndex)
-
-      for (const terminal of removedTerminals) {
-        if (terminal.ptyId) {
-          newIndex.delete(terminal.ptyId)
-        }
-      }
-
-      return {
-        terminals: remainingTerminals,
-        ptyIdIndex: newIndex,
-        activeTerminalId: state.terminals.some(
-          (t) => t.id === state.activeTerminalId && t.projectId === projectId
-        )
-          ? ''
-          : state.activeTerminalId
-      }
-    })
+    // Project removal/navigation is not PTY termination. Preserve Conversation
+    // terminal records and claims; only hide their renderer views.
+    set((state) => ({
+      terminals: state.terminals.map((terminal) =>
+        terminal.projectId === projectId
+          ? {
+              ...terminal,
+              viewState: 'hidden',
+              isHidden: true,
+              hiddenSince: terminal.hiddenSince ?? Date.now()
+            }
+          : terminal
+      ),
+      activeTerminalId: state.terminals.some(
+        (terminal) => terminal.id === state.activeTerminalId && terminal.projectId === projectId
+      )
+        ? ''
+        : state.activeTerminalId
+    }))
   },
 
   getTerminalCount: (): number => {
@@ -680,6 +1072,16 @@ export function useTerminals(): Terminal[] {
   )
 }
 
+export function useConversationTerminals(conversationId: string | null): Terminal[] {
+  return useTerminalStore(
+    useShallow((state) =>
+      conversationId
+        ? state.terminals.filter((terminal) => terminal.conversationId === conversationId)
+        : []
+    )
+  )
+}
+
 export function useAllTerminals(): Terminal[] {
   return useTerminalStore(useShallow((state) => state.terminals))
 }
@@ -703,6 +1105,12 @@ export function useTerminalActions(): Pick<
   | 'selectTerminal'
   | 'addTerminal'
   | 'closeTerminal'
+  | 'closeTerminalView'
+  | 'reopenTerminalView'
+  | 'terminateTerminalResource'
+  | 'recordTerminalCleanupFailure'
+  | 'retryTerminalCleanup'
+  | 'restartTerminalResource'
   | 'renameTerminal'
   | 'reorderTerminals'
   | 'updateTerminalCwd'
@@ -721,6 +1129,12 @@ export function useTerminalActions(): Pick<
       selectTerminal: state.selectTerminal,
       addTerminal: state.addTerminal,
       closeTerminal: state.closeTerminal,
+      closeTerminalView: state.closeTerminalView,
+      reopenTerminalView: state.reopenTerminalView,
+      terminateTerminalResource: state.terminateTerminalResource,
+      recordTerminalCleanupFailure: state.recordTerminalCleanupFailure,
+      retryTerminalCleanup: state.retryTerminalCleanup,
+      restartTerminalResource: state.restartTerminalResource,
       renameTerminal: state.renameTerminal,
       reorderTerminals: state.reorderTerminals,
       updateTerminalCwd: state.updateTerminalCwd,
@@ -749,7 +1163,7 @@ export function useProjectsWithActivity(): string[] {
         // Indikator menyala jika:
         // 1. Ada aktivitas output (hasActivity)
         // 2. Sedang proses awal loading/spawn (status running tapi PTY belum siap)
-        if (t.hasActivity || (t.healthStatus === 'running' && !t.ptyId)) {
+        if (t.projectId && (t.hasActivity || (t.healthStatus === 'running' && !t.ptyId))) {
           activeProjectIds.add(t.projectId)
         }
       }
@@ -766,7 +1180,7 @@ export function useProjectsWithErrors(): Set<string> {
     useShallow((state) => {
       const errorProjectIds = new Set<string>()
       for (const t of state.terminals) {
-        if (t.healthStatus === 'crashed' || t.healthStatus === 'disconnected') {
+        if (t.projectId && (t.healthStatus === 'crashed' || t.healthStatus === 'disconnected')) {
           errorProjectIds.add(t.projectId)
         }
       }

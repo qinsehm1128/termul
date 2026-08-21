@@ -19,7 +19,14 @@
 
 import { existsSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { ts } from '@ts-morph/common'
 import { describe, expect, it } from 'vitest'
+import { parse as parseYaml } from 'yaml'
+import {
+  checkConversationFirstGuardrails,
+  type GuardFinding,
+  loadRepositorySources
+} from '../../../../scripts/check-conversation-first-guardrails'
 
 // Type definitions for our test data
 interface DomainCheck {
@@ -37,6 +44,12 @@ interface DomainCheck {
  */
 const LIB_DIR = join(__dirname, '..')
 const TESTS_DIR = __dirname
+let semanticRepositoryFindingsCache: GuardFinding[] | undefined
+
+function semanticRepositoryFindings(): GuardFinding[] {
+  semanticRepositoryFindingsCache ??= checkConversationFirstGuardrails(loadRepositorySources())
+  return semanticRepositoryFindingsCache
+}
 
 /**
  * Helper to check if a file exists
@@ -62,6 +75,110 @@ function fileContains(relativePath: string, pattern: RegExp): boolean {
   if (!existsSync(absolutePath)) return false
   const content = readFileSync(absolutePath, 'utf-8')
   return pattern.test(content)
+}
+
+interface ImportedSymbol {
+  module: string
+  exported: string
+}
+
+function parseTypeScript(path: string): ts.SourceFile {
+  const content = readFileSync(path, 'utf-8')
+  return ts.createSourceFile(
+    path,
+    content,
+    ts.ScriptTarget.Latest,
+    true,
+    path.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS
+  )
+}
+
+function importedSymbols(sourceFile: ts.SourceFile): Map<string, ImportedSymbol> {
+  const imports = new Map<string, ImportedSymbol>()
+  for (const statement of sourceFile.statements) {
+    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier))
+      continue
+    const module = statement.moduleSpecifier.text
+    const bindings = statement.importClause?.namedBindings
+    if (bindings && ts.isNamedImports(bindings)) {
+      for (const element of bindings.elements) {
+        imports.set(element.name.text, {
+          module,
+          exported: element.propertyName?.text ?? element.name.text
+        })
+      }
+    }
+  }
+  return imports
+}
+
+function hasImportedCall(
+  sourceFile: ts.SourceFile,
+  module: string,
+  exported: string,
+  member?: string
+): boolean {
+  const imports = importedSymbols(sourceFile)
+  let found = false
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node)) {
+      if (ts.isIdentifier(node.expression)) {
+        const symbol = imports.get(node.expression.text)
+        if (symbol?.module === module && symbol.exported === exported && member === undefined) {
+          found = true
+        }
+      } else if (ts.isPropertyAccessExpression(node.expression)) {
+        const receiver = node.expression.expression
+        if (ts.isIdentifier(receiver)) {
+          const symbol = imports.get(receiver.text)
+          if (
+            symbol?.module === module &&
+            symbol.exported === exported &&
+            node.expression.name.text === member
+          ) {
+            found = true
+          }
+        }
+      }
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(sourceFile)
+  return found
+}
+
+function hasImportedJsx(sourceFile: ts.SourceFile, module: string, exported: string): boolean {
+  const imports = importedSymbols(sourceFile)
+  let found = false
+  const visit = (node: ts.Node): void => {
+    if (
+      (ts.isJsxOpeningElement(node) || ts.isJsxSelfClosingElement(node)) &&
+      ts.isIdentifier(node.tagName)
+    ) {
+      const symbol = imports.get(node.tagName.text)
+      if (symbol?.module === module && symbol.exported === exported) found = true
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(sourceFile)
+  return found
+}
+
+function hasCallNamed(sourceFile: ts.SourceFile, name: string): boolean {
+  let found = false
+  const visit = (node: ts.Node): void => {
+    if (ts.isCallExpression(node)) {
+      const called = ts.isIdentifier(node.expression)
+        ? node.expression.text
+        : ts.isPropertyAccessExpression(node.expression)
+          ? node.expression.name.text
+          : ''
+      if (called === name) found = true
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(sourceFile)
+  return found
 }
 
 /**
@@ -123,6 +240,33 @@ function apiBridgeUsesTauriAdapter(exportName: string, tauriAdapterFile: string)
  */
 const P0_DOMAINS: DomainCheck[] = [
   {
+    domain: 'Conversation',
+    priority: 'P0',
+    tauriAdapterFile: 'tauri-conversation-api.ts',
+    adapterExportName: 'createTauriConversationApi',
+    methods: [
+      'getHostStatus',
+      'listConversations',
+      'getConversation',
+      'openConversation',
+      'resolveLegacyConversationId',
+      'attachProject',
+      'detachProject',
+      'updateExecutionTarget'
+    ],
+    apiBridgeExport: 'conversationApi',
+    testFile: 'conversation-parity-golden.test.ts'
+  },
+  {
+    domain: 'SessionWorkspace',
+    priority: 'P0',
+    tauriAdapterFile: 'tauri-session-workspace-api.ts',
+    adapterExportName: 'createTauriSessionWorkspaceApi',
+    methods: ['getWorkspace', 'writeWorkspace', 'resolveRecovery'],
+    apiBridgeExport: 'sessionWorkspaceApi',
+    testFile: 'conversation-parity-golden.test.ts'
+  },
+  {
     domain: 'Session',
     priority: 'P0',
     tauriAdapterFile: 'tauri-session-api.ts',
@@ -144,6 +288,30 @@ const P0_DOMAINS: DomainCheck[] = [
 
 const P1_DOMAINS: DomainCheck[] = [
   {
+    domain: 'ConversationLifecycle',
+    priority: 'P1',
+    tauriAdapterFile: 'conversation-lifecycle-api.ts',
+    adapterExportName: 'createConversationLifecycleApi',
+    methods: [
+      'detachBinding',
+      'rebindDetachedBinding',
+      'suspendBinding',
+      'replaceBinding',
+      'deleteConversation'
+    ],
+    apiBridgeExport: 'conversationApi',
+    testFile: 'conversation-parity-golden.test.ts'
+  },
+  {
+    domain: 'ConversationTerminalResources',
+    priority: 'P1',
+    tauriAdapterFile: 'tauri-session-workspace-api.ts',
+    adapterExportName: 'createTauriSessionWorkspaceApi',
+    methods: ['getWorkspace', 'writeWorkspace'],
+    apiBridgeExport: 'sessionWorkspaceApi',
+    testFile: 'conversation-parity-golden.test.ts'
+  },
+  {
     domain: 'Terminal',
     priority: 'P1',
     tauriAdapterFile: 'tauri-terminal-api.ts',
@@ -154,9 +322,11 @@ const P1_DOMAINS: DomainCheck[] = [
       'resize',
       'kill',
       'onData',
+      'onDataForTerminal',
       'onExit',
       // CAP-3 reclaimable leases: attach/rotate/revoke must exist on the
       // Tauri adapter — pins desktop↔web terminal parity.
+      'resume',
       'attach',
       'rotateClaim',
       'revokeClaim'
@@ -196,6 +366,27 @@ const P1_DOMAINS: DomainCheck[] = [
     methods: ['getManifest', 'writeManifest', 'deleteManifest'],
     apiBridgeExport: 'workspaceManifestApi',
     testFile: 'tauri-workspace-manifest-api.test.ts'
+  },
+  {
+    domain: 'ScheduledTask',
+    priority: 'P1',
+    tauriAdapterFile: 'tauri-scheduled-task-api.ts',
+    adapterExportName: 'createTauriScheduledTaskApi',
+    methods: [
+      'previewSchedule',
+      'listTasks',
+      'getTask',
+      'createDraft',
+      'updateDraft',
+      'activateTask',
+      'pauseTask',
+      'resumeTask',
+      'runNow',
+      'listRuns',
+      'listAudit'
+    ],
+    apiBridgeExport: 'scheduledTaskApi',
+    testFile: '../tauri-scheduled-task-api.test.ts'
   }
 ]
 
@@ -226,7 +417,7 @@ describe('Parity Checklist Automation', () => {
           // Check key methods are implemented
           for (const method of domain.methods) {
             expect(
-              fileContains(domain.tauriAdapterFile, new RegExp(`\\b${method}\\s*\\(`)),
+              fileContains(domain.tauriAdapterFile, new RegExp(`\\b${method}\\s*(?:\\(|:)`)),
               `${domain.tauriAdapterFile} should implement ${method}()`
             ).toBe(true)
           }
@@ -272,7 +463,7 @@ describe('Parity Checklist Automation', () => {
           // Check key methods are implemented
           for (const method of domain.methods) {
             expect(
-              fileContains(domain.tauriAdapterFile, new RegExp(`\\b${method}\\s*\\(`)),
+              fileContains(domain.tauriAdapterFile, new RegExp(`\\b${method}\\s*(?:\\(|:)`)),
               `${domain.tauriAdapterFile} should implement ${method}()`
             ).toBe(true)
           }
@@ -286,21 +477,214 @@ describe('Parity Checklist Automation', () => {
         })
 
         it(`Verified: Test file exists at ${domain.testFile}`, () => {
-          // P1 tests are optional (warn but don't fail)
           const testExists = testFileExists(domain.testFile)
-          if (!testExists) {
-            console.warn(
-              `[WARN] ${domain.domain}: Test file ${domain.testFile} not found (P1 - recommended but not required)`
-            )
+          const releaseRequired =
+            domain.domain === 'ConversationLifecycle' ||
+            domain.domain === 'ConversationTerminalResources'
+          if (releaseRequired) {
+            expect(
+              testExists,
+              `${domain.domain} is a release-required Conversation domain and must have ${domain.testFile}`
+            ).toBe(true)
+          } else {
+            if (!testExists) {
+              console.warn(
+                `[WARN] ${domain.domain}: Test file ${domain.testFile} not found (P1 - recommended but not required)`
+              )
+            }
+            expect(true).toBe(true)
           }
-          // For P1, we just log a warning but the test passes
-          expect(true).toBe(true)
         })
       })
     }
   })
 
+  describe('Conversation renderer root parity', () => {
+    it('requires the dedicated App/TauriApp release parity matrix', () => {
+      const parityPath = join(LIB_DIR, '..', '__tests__', 'renderer-root-parity.test.tsx')
+      expect(existsSync(parityPath), 'renderer-root-parity.test.tsx should exist').toBe(true)
+    })
+
+    it('pins one portable route/effect source consumed by both roots', () => {
+      const app = parseTypeScript(join(LIB_DIR, '..', 'App.tsx'))
+      const tauri = parseTypeScript(join(LIB_DIR, '..', 'TauriApp.tsx'))
+      const portableRouter = parseTypeScript(join(LIB_DIR, '..', 'app', 'portable-router.tsx'))
+      const portableEffects = parseTypeScript(join(LIB_DIR, '..', 'app', 'PortableAppEffects.tsx'))
+
+      for (const root of [app, tauri]) {
+        expect(hasImportedCall(root, '@/app/portable-router', 'createPortableRouter')).toBe(true)
+        expect(hasImportedJsx(root, '@/app/PortableAppEffects', 'PortableAppEffects')).toBe(true)
+        expect(
+          hasImportedJsx(
+            root,
+            '@/components/conversation/ConversationHostStatus',
+            'ConversationHostStatus'
+          )
+        ).toBe(true)
+        expect(
+          hasImportedJsx(
+            root,
+            '@/components/conversation/ConversationRecoveryPanel',
+            'ConversationRecoveryPanel'
+          )
+        ).toBe(true)
+        expect(hasCallNamed(root, 'createHashRouter')).toBe(false)
+      }
+
+      const routes = new Set<string>()
+      const collectRoutes = (node: ts.Node): void => {
+        if (
+          ts.isPropertyAssignment(node) &&
+          (ts.isIdentifier(node.name) || ts.isStringLiteral(node.name)) &&
+          node.name.text === 'path' &&
+          ts.isStringLiteralLike(node.initializer)
+        ) {
+          routes.add(node.initializer.text)
+        }
+        ts.forEachChild(node, collectRoutes)
+      }
+      collectRoutes(portableRouter)
+      for (const route of [
+        'c/:conversationId',
+        'legacy/session/:legacyValue',
+        'legacy/storage/:legacyValue',
+        'legacy/history/:legacyValue',
+        'scheduled-tasks',
+        'snapshots',
+        'settings',
+        'preferences'
+      ]) {
+        expect(routes, `portable router missing ${route}`).toContain(route)
+      }
+      for (const hook of [
+        'useSessionWorkspaceBootstrap',
+        'useConversationHostBootstrap',
+        'useConversationLifecycle',
+        'useTerminalResourceLifecycle',
+        'useTerminalRestore',
+        'usePreventNativeContextMenu'
+      ]) {
+        expect(hasCallNamed(portableEffects, hook), `portable effects missing ${hook}()`).toBe(true)
+      }
+    })
+  })
+
+  describe('Conversation-first release boundary coverage', () => {
+    const REPOSITORY_ROOT = join(LIB_DIR, '..', '..', '..')
+
+    it('requires every P0/P1 Conversation-first domain in the release checklist', () => {
+      expect(ALL_DOMAINS.map((domain) => domain.domain)).toEqual(
+        expect.arrayContaining([
+          'Conversation',
+          'SessionWorkspace',
+          'ConversationLifecycle',
+          'ConversationTerminalResources',
+          'Terminal',
+          'Data Migration'
+        ])
+      )
+    })
+
+    it('uses the executable semantic guard for authenticated remote access and spawn shape', () => {
+      const rules = new Set([
+        'authenticated-remote-access',
+        'remote-terminal-intent',
+        'shared-conversation-id-parser',
+        'history-paging-facade'
+      ])
+      expect(semanticRepositoryFindings().filter((finding) => rules.has(finding.rule))).toEqual([])
+    })
+
+    it('delegates Rust auth, write-admission, and no-teardown proof to the locked syn guard', () => {
+      const guardPath = join(
+        REPOSITORY_ROOT,
+        'src-tauri',
+        'tests',
+        'conversation_first_guardrails.rs'
+      )
+      expect(existsSync(guardPath), 'the Rust semantic integration guard must exist').toBe(true)
+
+      const workflow = parseYaml(
+        readFileSync(join(REPOSITORY_ROOT, '.github/workflows/pr-validation.yml'), 'utf-8')
+      ) as { jobs?: Record<string, { steps?: Array<{ run?: unknown }> }> }
+      const exactGuardRun = 'cargo test --locked --test conversation_first_guardrails'
+      const guardSteps = Object.values(workflow.jobs ?? {})
+        .flatMap((job) => job.steps ?? [])
+        .filter((step) => step.run === exactGuardRun)
+      expect(guardSteps).toHaveLength(1)
+    })
+
+    it('validates native and packaging workflows through parsed semantic guard results', () => {
+      const workflowRules = new Set([
+        'locked-rust-ci',
+        'default-pr-guard',
+        'native-ci-wiring',
+        'stamped-root-lock',
+        'locked-tauri-action',
+        'workflow-yaml'
+      ])
+      expect(
+        semanticRepositoryFindings().filter((finding) => workflowRules.has(finding.rule))
+      ).toEqual([])
+    })
+  })
+
   describe('Regression Prevention', () => {
+    it('keeps core ConversationApi transport-free for workspace and lifecycle domains', () => {
+      const shared = readFileSync(
+        join(LIB_DIR, '..', '..', 'shared', 'types', 'conversation-api.types.ts'),
+        'utf-8'
+      )
+      const tauriCore = readFileSync(join(LIB_DIR, 'tauri-conversation-api.ts'), 'utf-8')
+      const webCore = readFileSync(join(LIB_DIR, 'web-conversation-api.ts'), 'utf-8')
+      const compatibilityFacade = readFileSync(join(LIB_DIR, 'conversation-api.ts'), 'utf-8')
+
+      for (const method of [
+        'getWorkspace',
+        'writeWorkspace',
+        'resolveRecovery',
+        'detachBinding',
+        'rebindDetachedBinding',
+        'suspendBinding',
+        'replaceBinding',
+        'deleteConversation'
+      ]) {
+        expect(shared, `ConversationApi must not declare ${method}`).not.toMatch(
+          new RegExp(`\\b${method}\\s*\\(`)
+        )
+        expect(tauriCore, `Tauri core must not implement ${method}`).not.toMatch(
+          new RegExp(`\\b${method}\\s*(?:\\(|:)`)
+        )
+        expect(webCore, `web core must not implement ${method}`).not.toMatch(
+          new RegExp(`\\b${method}\\s*(?:\\(|:)`)
+        )
+      }
+
+      expect(compatibilityFacade).toMatch(/sessionWorkspaceApi/)
+      expect(compatibilityFacade).toMatch(/conversationLifecycleApi/)
+      expect(compatibilityFacade).toMatch(/tauriConversationApi/)
+      expect(compatibilityFacade).toMatch(/webConversationApi/)
+      expect(compatibilityFacade).toMatch(/createConversationFacadeApi/)
+    })
+
+    it('specialized production facades use the shared ConversationId parser only', () => {
+      const files = [
+        'tauri-conversation-api.ts',
+        'web-conversation-api.ts',
+        'conversation-lifecycle-api.ts',
+        'tauri-session-workspace-api.ts',
+        'web-session-workspace-api.ts',
+        'acp-history-persistence.ts'
+      ]
+      for (const file of files) {
+        const content = readFileSync(join(LIB_DIR, file), 'utf-8')
+        expect(content, `${file} should import shared ConversationId validation`).toMatch(
+          /isConversationId|parseConversationId/
+        )
+        expect(content, `${file} must not own a UUID regex`).not.toMatch(/\^\[0-9a-f\]\\?\{8\}/)
+      }
+    })
+
     it('Session API uses Tauri-only export pattern', () => {
       const apiPath = join(LIB_DIR, 'api.ts')
       const apiContent = readFileSync(apiPath, 'utf-8')
@@ -438,10 +822,10 @@ describe('Parity Checklist Automation', () => {
       const web = readFileSync(WebAdapter, 'utf-8')
       for (const method of ['getManifest', 'writeManifest', 'deleteManifest']) {
         expect(tauri, `tauri-workspace-manifest-api.ts should implement ${method}`).toMatch(
-          new RegExp(`\\b${method}\\s*\\(`)
+          new RegExp(`\\b${method}\\s*(?:\\(|:)`)
         )
         expect(web, `web-workspace-manifest-api.ts should implement ${method}`).toMatch(
-          new RegExp(`\\b${method}\\s*\\(`)
+          new RegExp(`\\b${method}\\s*(?:\\(|:)`)
         )
       }
     })
@@ -568,10 +952,10 @@ describe('Parity Checklist Automation', () => {
       const web = readFileSync(WebAdapter, 'utf-8')
       for (const method of ['listCatalog', 'setCatalogOptIn', 'isCatalogOptedIn']) {
         expect(tauri, `tauri-acp-catalog-api.ts should implement ${method}`).toMatch(
-          new RegExp(`\\b${method}\\s*\\(`)
+          new RegExp(`\\b${method}\\s*(?:\\(|:)`)
         )
         expect(web, `web-acp-catalog-api.ts should implement ${method}`).toMatch(
-          new RegExp(`\\b${method}\\s*\\(`)
+          new RegExp(`\\b${method}\\s*(?:\\(|:)`)
         )
       }
     })
@@ -600,6 +984,27 @@ describe('Parity Checklist Automation', () => {
       const content = readFileSync(protoPath, 'utf-8')
       expect(content).toMatch(/'list_acp_catalog'/)
       expect(content).toMatch(/'set_catalog_opt_in'/)
+    })
+  })
+
+  describe('ACP permission policy parity', () => {
+    const AcpTransport = join(LIB_DIR, 'acp-transport.ts')
+    const ProtoTypes = join(LIB_DIR, '..', '..', 'shared', 'types', 'web-protocol.types.ts')
+    const CommandsRust = join(LIB_DIR, '..', '..', '..', 'src-tauri', 'src', 'acp', 'commands.rs')
+    const WsRust = join(LIB_DIR, '..', '..', '..', 'src-tauri', 'src', 'web', 'ws.rs')
+    const TauriLib = join(LIB_DIR, '..', '..', '..', 'src-tauri', 'src', 'lib.rs')
+
+    it('desktop and web transports expose live permission-policy updates', () => {
+      const transport = readFileSync(AcpTransport, 'utf-8')
+      expect(transport).toMatch(/acp_set_permission_policy/)
+      expect(transport).toMatch(/set_permission_policy/)
+      expect(readFileSync(ProtoTypes, 'utf-8')).toMatch(/'set_permission_policy'/)
+    })
+
+    it('both host entry points route permission-policy updates to AcpManager', () => {
+      expect(readFileSync(CommandsRust, 'utf-8')).toMatch(/acp_set_permission_policy/)
+      expect(readFileSync(WsRust, 'utf-8')).toMatch(/handle_set_permission_policy/)
+      expect(readFileSync(TauriLib, 'utf-8')).toMatch(/acp::commands::acp_set_permission_policy/)
     })
   })
 
@@ -720,6 +1125,15 @@ describe('Parity Checklist Automation', () => {
       expect(content).toMatch(/projectId:\s*string/)
     })
 
+    it('shared project-list contract carries group summaries with stable defaults', () => {
+      const content = readFileSync(SharedTypes, 'utf-8')
+      expect(content).toMatch(/export\s+interface\s+ProjectGroupSummary\b/)
+      expect(content).toMatch(/projectIds:\s*string\[\]/)
+      expect(content).toMatch(/color:\s*string\s*\|\s*null/)
+      expect(content).toMatch(/preferredProjectId:\s*string\s*\|\s*null/)
+      expect(content).toMatch(/groups:\s*ProjectGroupSummary\[\]/)
+    })
+
     it('tauri-remote-api.ts exports setHostDefaultProject + invokes set_host_default_project', () => {
       expect(existsSync(TauriRemoteApi), 'tauri-remote-api.ts should exist').toBe(true)
       const content = readFileSync(TauriRemoteApi, 'utf-8')
@@ -729,6 +1143,8 @@ describe('Parity Checklist Automation', () => {
       // host default in desktop-hosted mode — same value, new param name).
       expect(content).toMatch(/defaultProjectId:\s*string\s*\|\s*null/)
       expect(content).not.toMatch(/activeProjectId:\s*string\s*\|\s*null/)
+      expect(content).toMatch(/groups:\s*ProjectGroupSummary\[\]\s*=\s*\[\]/)
+      expect(content).toMatch(/payload:\s*\{\s*projects,\s*groups,\s*defaultProjectId\s*\}/)
     })
 
     it('web-server-api.ts exposes setDefaultProject hitting POST /projects/default', () => {
@@ -752,13 +1168,22 @@ describe('Parity Checklist Automation', () => {
     const ProtoTypes = join(LIB_DIR, '..', '..', 'shared', 'types', 'web-protocol.types.ts')
     const WsRust = join(LIB_DIR, '..', '..', '..', 'src-tauri', 'src', 'web', 'ws.rs')
 
-    it('acp-history-api.ts exists + calls the host (invoke), never localStorage', () => {
+    it('acp-history-api.ts calls the host through executable invoke nodes, including paging', () => {
       expect(existsSync(HistoryFacade), 'acp-history-api.ts should exist').toBe(true)
+      const facade = parseTypeScript(HistoryFacade)
+      expect(hasCallNamed(facade, 'invoke')).toBe(true)
+      expect(hasCallNamed(facade, 'invokeHistory')).toBe(true)
+      expect(hasCallNamed(facade, 'assertConversationHistoryPage')).toBe(true)
       const content = readFileSync(HistoryFacade, 'utf-8')
-      expect(content).toMatch(/invoke/) // desktop → host Tauri command
-      expect(content).toMatch(/acp_history_list/)
-      expect(content).toMatch(/acp_history_get/)
-      expect(content).not.toMatch(/localStorage(?:\.|\[)/) // host is the authority
+      expect(content).not.toMatch(/localStorage(?:\.|\[)/)
+    })
+
+    it('production history loading calls the desktop and server paging facades as AST nodes', () => {
+      const persistence = parseTypeScript(join(LIB_DIR, 'acp-history-persistence.ts'))
+      expect(
+        hasImportedCall(persistence, '@/lib/acp-history-api', 'acpHistoryApi', 'getPage')
+      ).toBe(true)
+      expect(hasCallNamed(persistence, 'getSessionPayloadPage')).toBe(true)
     })
 
     it('web-protocol.types.ts declares the WS request types list_sessions + get_session_payload', () => {
@@ -866,20 +1291,23 @@ describe('Parity Checklist Automation', () => {
       const facade = readFileSync(TerminalFacade, 'utf-8')
       expect(facade).toMatch(/isTauriContext\(\)/)
       expect(facade).toMatch(/createTauriTerminalApi/)
+      expect(facade).toMatch(/export function resumeTerminal/)
       expect(facade).not.toMatch(/localStorage(?:\.|\[)/)
-      // The Tauri adapter implements attach/rotateClaim/revokeClaim via invoke.
+      // The Tauri adapter implements resume/attach/rotateClaim/revokeClaim via invoke.
       expect(existsSync(TauriTerminalAdapter)).toBe(true)
       const tauri = readFileSync(TauriTerminalAdapter, 'utf-8')
       expect(tauri).toMatch(/invoke/)
-      for (const m of ['attach', 'rotateClaim', 'revokeClaim']) {
+      for (const m of ['resume', 'attach', 'rotateClaim', 'revokeClaim']) {
         expect(tauri, `tauri-terminal-api.ts should implement ${m}`).toMatch(
-          new RegExp(`\\b${m}\\s*\\(`)
+          new RegExp(`\\b${m}\\s*(?:\\(|:)`)
         )
       }
       expect(tauri).not.toMatch(/localStorage(?:\.|\[)/)
       // The web adapter is WS-backed (the host WS is the authority) — no localStorage.
       expect(existsSync(WebTerminalAdapter)).toBe(true)
-      expect(readFileSync(WebTerminalAdapter, 'utf-8')).not.toMatch(/localStorage(?:\.|\[)/)
+      const web = readFileSync(WebTerminalAdapter, 'utf-8')
+      expect(web).toMatch(/\bresume\s*(?:\(|:)/)
+      expect(web).not.toMatch(/localStorage(?:\.|\[)/)
     })
 
     it('use-workspace-manifest-sync reads via workspaceManifestApi.getManifest, never localStorage', () => {
@@ -1079,7 +1507,7 @@ describe('Parity Checklist Automation', () => {
       const content = readFileSync(Facade, 'utf-8')
       for (const method of LAUNCH_FLOW_METHODS) {
         expect(content, `worktree-api.ts should branch ${method}`).toMatch(
-          new RegExp(`\\b${method}\\s*\\(`)
+          new RegExp(`\\b${method}\\s*(?:\\(|:)`)
         )
       }
       // The 7 launch-flow methods must reference `webServerWorktree` (the web branch).
@@ -1242,28 +1670,31 @@ describe('Parity Checklist Automation', () => {
 
     it('TauriApp.tsx wraps root in GlobalContextMenu + mounts the devtools blocker + native-context-menu defense', () => {
       expect(existsSync(TauriApp), 'TauriApp.tsx should exist').toBe(true)
-      const content = readFileSync(TauriApp, 'utf-8')
-      expect(content).toMatch(/GlobalContextMenu/)
-      expect(content).toMatch(/usePreventDevToolsShortcuts/)
-      // P4: the native-context-menu preventDefault hook is re-added as
-      // defense-in-depth (usePreventNativeContextMenu) alongside
-      // <GlobalContextMenu> so portaled overlays don't show the native menu.
-      expect(content).toMatch(/usePreventNativeContextMenu/)
-      // The old hook name must be gone (renamed).
-      expect(content).not.toMatch(/usePreventDefaultContextMenu/)
+      const root = parseTypeScript(TauriApp)
+      const effects = parseTypeScript(join(LIB_DIR, '..', 'app', 'PortableAppEffects.tsx'))
+      expect(hasImportedJsx(root, '@/components/GlobalContextMenu', 'GlobalContextMenu')).toBe(true)
+      expect(
+        hasImportedCall(
+          root,
+          '@/hooks/use-prevent-devtools-shortcuts',
+          'usePreventDevToolsShortcuts'
+        )
+      ).toBe(true)
+      expect(hasCallNamed(effects, 'usePreventNativeContextMenu')).toBe(true)
+      expect(hasCallNamed(effects, 'usePreventDefaultContextMenu')).toBe(false)
     })
 
     it('App.tsx wraps root in GlobalContextMenu + mounts native-context-menu defense (no devtools blocker)', () => {
       expect(existsSync(WebApp), 'App.tsx should exist').toBe(true)
-      const content = readFileSync(WebApp, 'utf-8')
-      expect(content).toMatch(/GlobalContextMenu/)
-      // P4: web also mounts the native-context-menu defense (portal regression).
-      expect(content).toMatch(/usePreventNativeContextMenu/)
-      // Web parity: NO devtools blocker (browser cannot block its own devtools).
-      // Assert no import of the hook (the dashed import path), not the camelCase
-      // name — App.tsx's comment mentions the hook by name for documentation.
-      expect(content).not.toMatch(/from\s+['"]@\/hooks\/use-prevent-devtools-shortcuts['"]/)
-      expect(content).not.toMatch(/usePreventDevToolsShortcuts\(\)/)
+      const root = parseTypeScript(WebApp)
+      const effects = parseTypeScript(join(LIB_DIR, '..', 'app', 'PortableAppEffects.tsx'))
+      expect(hasImportedJsx(root, '@/components/GlobalContextMenu', 'GlobalContextMenu')).toBe(true)
+      expect(hasImportedJsx(root, '@/app/PortableAppEffects', 'PortableAppEffects')).toBe(true)
+      expect(hasCallNamed(effects, 'usePreventNativeContextMenu')).toBe(true)
+      expect(
+        importedSymbols(root).has('usePreventDevToolsShortcuts') ||
+          hasCallNamed(root, 'usePreventDevToolsShortcuts')
+      ).toBe(false)
     })
 
     it('commands.rs cfg-gates browser_tab_open_devtools (debug real, release Err stub)', () => {

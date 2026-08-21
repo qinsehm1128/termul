@@ -20,6 +20,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { usePaneDnd } from '@/hooks/use-pane-dnd'
 import { clipboardApi, shellApi } from '@/lib/api'
 import { browserTabHide, browserTabShow } from '@/lib/browser-api'
+import { isPreferredShell } from '@/lib/shell-api'
 import { cn } from '@/lib/utils'
 import { useAcpStore, useAgentIdentity } from '@/stores/acp-store'
 import { useAnnotationStore } from '@/stores/annotation-store'
@@ -27,7 +28,7 @@ import { useBrowserSessionStore } from '@/stores/browser-session-store'
 import { useEditorStore } from '@/stores/editor-store'
 import { type GitStatusState, useGitStatusStore } from '@/stores/git-status-store'
 import { useTerminalStore } from '@/stores/terminal-store'
-import type { WorkspaceTab } from '@/stores/workspace-store'
+import type { AgentChatTab, WorkspaceTab } from '@/stores/workspace-store'
 import { editorTabId, useLeafCount, useWorkspaceStore } from '@/stores/workspace-store'
 import type { Terminal } from '@/types/project'
 import type { TabReorderPosition } from '@/types/workspace.types'
@@ -191,7 +192,7 @@ function TerminalTabInline({
             }
           }}
           disabled={isClosing}
-          className="ml-auto p-0.5 rounded-md hover:bg-secondary opacity-0 group-hover:opacity-100 transition-opacity disabled:opacity-100 disabled:cursor-wait"
+          className="ml-auto p-0.5 rounded-md text-muted-foreground opacity-70 hover:bg-secondary hover:text-foreground group-hover:opacity-100 transition-opacity disabled:opacity-100 disabled:cursor-wait"
         >
           {isClosing ? <Loader2 size={11} className="animate-spin" /> : <XIcon size={11} />}
         </button>
@@ -519,7 +520,7 @@ function AgentChatTabInline({
   onDragLeave,
   onDrop
 }: {
-  tab: { type: 'agent-chat'; id: string; sessionId: string }
+  tab: AgentChatTab
   isActive: boolean
   isDragging: boolean
   isDropTarget: boolean
@@ -532,16 +533,29 @@ function AgentChatTabInline({
   onDrop: (e: React.DragEvent) => void
 }) {
   const { t } = useTranslation('workspace')
-  const session = useAcpStore((s) => s.sessions[tab.sessionId])
+  const session = useAcpStore((state) => {
+    if (tab.sessionId) return state.sessions[tab.sessionId]
+    return Object.values(state.sessions).find(
+      (candidate) => candidate.conversationId === tab.conversationId
+    )
+  })
   const agentStatus = useAcpStore((s) => (session ? s.agentStatus[session.agentId] : undefined))
-  const isLaunchingSession = useAcpStore((s) => Boolean(s.launchingSessionIds[tab.sessionId]))
+  const isLaunchingSession = useAcpStore((s) =>
+    session ? Boolean(s.launchingSessionIds[session.id]) : false
+  )
   const { name: agentName } = useAgentIdentity(session?.agentId ?? null)
   // The persisted index entry carries the effective title (agent-pushed title,
   // first-message derivation, or "Untitled Chat N"). `session.title` stays null
   // until an event sets it, so fall through to the index entry for the label.
-  const indexTitle = useAcpStore(
-    (s) => s.sessionIndex.find((e) => e.id === tab.sessionId)?.title ?? null
-  )
+  const indexTitle = useAcpStore((state) => {
+    if (tab.conversationId) {
+      return (
+        state.sessionIndex.find((entry) => entry.conversationId === tab.conversationId)?.title ??
+        null
+      )
+    }
+    return state.sessionIndex.find((entry) => entry.id === tab.sessionId)?.title ?? null
+  })
   // Treat in-flight launcher handoff as connected so we don't flash a red
   // disconnected lamp on the optimistic placeholder chat.
   const connected = isLaunchingSession || isAgentConnected(session, agentStatus)
@@ -845,8 +859,8 @@ export function WorkspaceTabBar({
 
   const sortedShells = shells?.available?.slice().sort((a, b) => {
     if (defaultShell) {
-      if (a.name === defaultShell) return -1
-      if (b.name === defaultShell) return 1
+      if (isPreferredShell(a, defaultShell)) return -1
+      if (isPreferredShell(b, defaultShell)) return 1
     }
     return a.displayName.localeCompare(b.displayName)
   })
@@ -982,7 +996,7 @@ export function WorkspaceTabBar({
                     />
                   ) : tab.type === 'agent-chat' ? (
                     <AgentChatTabInline
-                      tab={tab as { type: 'agent-chat'; id: string; sessionId: string }}
+                      tab={tab as AgentChatTab}
                       isActive={tab.id === activeTabId}
                       isDragging={dragging}
                       isDropTarget={isTarget}
@@ -1071,12 +1085,12 @@ export function WorkspaceTabBar({
                         onClick={() => handleSelectShell(shell)}
                         className={cn(
                           'w-full px-2.5 py-1.5 text-left text-2xs hover:bg-secondary flex items-center gap-2 leading-none',
-                          shell.name === defaultShell && 'text-primary'
+                          isPreferredShell(shell, defaultShell) && 'text-primary'
                         )}
                       >
                         <TerminalIcon size={11} />
                         <span className="truncate">{shell.displayName}</span>
-                        {shell.name === defaultShell && (
+                        {isPreferredShell(shell, defaultShell) && (
                           <span className="ml-auto text-3xs text-muted-foreground">
                             {t('tabs.default')}
                           </span>

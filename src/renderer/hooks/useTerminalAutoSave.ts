@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react'
 import { persistenceApi } from '@/lib/api'
+import { logFrontendError } from '@/lib/log-api'
 import { recordTerminalContinuityEvent } from '@/lib/terminal-continuity-instrumentation'
 import type { Terminal } from '@/types/project'
 import type {
@@ -221,27 +222,33 @@ export function useTerminalAutoSave(): void {
         return
       }
 
-      // Only save if we have an active project (use ref to avoid stale closure)
-      const projectId = activeProjectIdRef.current
-      if (!projectId) {
-        return
+      // A multi-root group can show terminals from several projects at once.
+      // Persist every affected project independently; projectId remains the
+      // terminal ownership/security boundary even when the pane layout is shared.
+      const projectIds = new Set<string>()
+      if (activeProjectIdRef.current) projectIds.add(activeProjectIdRef.current)
+      for (const terminal of [...state.terminals, ...prevState.terminals]) {
+        if (terminal.projectId) projectIds.add(terminal.projectId)
       }
 
-      const layout = serializeTerminalsForProject(
-        state.terminals,
-        projectId,
-        state.activeTerminalId
-      )
-
-      // NOTE: syncScrollbackToStore is already called in saveTerminalLayout
-      // before writing to disk, so we skip it here to avoid double writes.
-
-      // Use debounced write via API
-      persistenceApi
-        .writeDebounced(PersistenceKeys.terminals(projectId), layout)
-        .catch((err: unknown) => {
-          console.error('Failed to auto-save terminal layout:', err)
-        })
+      for (const projectId of projectIds) {
+        const layout = serializeTerminalsForProject(
+          state.terminals,
+          projectId,
+          state.activeTerminalId
+        )
+        // NOTE: syncScrollbackToStore is already called in saveTerminalLayout
+        // before writing to disk, so we skip it here to avoid double writes.
+        persistenceApi
+          .writeDebounced(PersistenceKeys.terminals(projectId), layout)
+          .catch((err: unknown) => {
+            void logFrontendError({
+              level: 'error',
+              source: 'terminal-autosave.multi-root',
+              message: `projectId=${projectId} error=${err instanceof Error ? err.message : String(err)}`
+            })
+          })
+      }
     })
 
     return () => {

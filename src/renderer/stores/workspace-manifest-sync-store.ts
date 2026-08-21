@@ -28,8 +28,8 @@ export interface ManifestConflictBody {
 }
 
 export interface WorkspaceManifestSyncState {
-  /** Per-project basedRevision proposed on the next write. null = initial. */
-  basedRevisionByProject: Record<string, number | null>
+  /** Read-only legacy inspection revision cache. Normal workspace sync never reads it. */
+  legacyRevisionByProject: Record<string, number | null>
   /** Currently-surfaced conflict, or null when none. */
   pendingConflict: ManifestConflictBody | null
   /** Per-project restore-in-progress flag (writer cancels while true). */
@@ -45,15 +45,15 @@ export interface WorkspaceManifestSyncState {
 }
 
 export const useWorkspaceManifestSyncStore = create<WorkspaceManifestSyncState>((set, get) => ({
-  basedRevisionByProject: {},
+  legacyRevisionByProject: {},
   pendingConflict: null,
   manifestRestoreInProgressByProject: {},
 
   setBasedRevision: (projectId: string, revision: number | null): void => {
     if (!projectId) return
     set((state) => ({
-      basedRevisionByProject: {
-        ...state.basedRevisionByProject,
+      legacyRevisionByProject: {
+        ...state.legacyRevisionByProject,
         [projectId]: revision
       }
     }))
@@ -62,8 +62,8 @@ export const useWorkspaceManifestSyncStore = create<WorkspaceManifestSyncState>(
   advanceBasedRevision: (projectId: string, nextRevision: number): void => {
     if (!projectId) return
     set((state) => ({
-      basedRevisionByProject: {
-        ...state.basedRevisionByProject,
+      legacyRevisionByProject: {
+        ...state.legacyRevisionByProject,
         [projectId]: nextRevision
       }
     }))
@@ -84,7 +84,7 @@ export const useWorkspaceManifestSyncStore = create<WorkspaceManifestSyncState>(
   },
 
   getBasedRevision: (projectId: string): number | null => {
-    return get().basedRevisionByProject[projectId] ?? null
+    return get().legacyRevisionByProject[projectId] ?? null
   },
 
   hasPendingConflict: (projectId: string): boolean => {

@@ -111,11 +111,6 @@ vi.mock('@xterm/addon-webgl', async () => {
     }
   }
 })
-vi.mock('@xterm/addon-web-links', () => ({
-  WebLinksAddon: class {
-    dispose() {}
-  }
-}))
 
 vi.mock('@/lib/api', async () => {
   const { vi: v } = await import('vitest')
@@ -142,11 +137,12 @@ vi.mock('@/lib/api', async () => {
   }
 })
 
-vi.mock('@/lib/tauri-terminal-api', async () => {
+vi.mock('@/lib/terminal-api', async () => {
   const { vi: v } = await import('vitest')
   return {
     addRendererRef: v.fn().mockResolvedValue({ success: true }),
-    removeRendererRef: v.fn().mockResolvedValue({ success: true })
+    removeRendererRef: v.fn().mockResolvedValue({ success: true }),
+    subscribeTerminalData: v.fn(() => v.fn())
   }
 })
 
@@ -194,9 +190,11 @@ vi.mock('@/hooks/use-terminal-restore', async () => {
 
 vi.mock('@/stores/app-settings-store', () => ({
   useTerminalFontFamily: () => 'monospace',
+  useTerminalSymbolFontFamily: () => '',
   useTerminalFontSize: () => 14,
   useTerminalBufferSize: () => 10000,
-  useTerminalRenderer: () => 'auto'
+  useTerminalRenderer: () => 'auto',
+  useTerminalScreenReaderMode: () => false
 }))
 vi.mock('@/stores/terminal-store', async () => {
   const { vi: v } = await import('vitest')
@@ -204,8 +202,16 @@ vi.mock('@/stores/terminal-store', async () => {
     terminals: [] as Array<{ id: string; healthStatus?: string }>,
     healthStatus: 'running',
     restartTerminal: v.fn(),
+    restartTerminalResource: v.fn(async () => true),
+    resumeTerminalResource: v.fn(async () => ({ success: true, data: undefined })),
     setRendererAttached: v.fn(),
-    findTerminalByPtyId: v.fn(),
+    findTerminalByPtyId: v.fn((ptyId: string) => ({
+      id: ptyId,
+      ptyId,
+      conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+      claim: 'test-memory-grant',
+      healthStatus: 'running'
+    })),
     peekTranscript: v.fn(() => ''),
     consumeTranscript: v.fn(() => ''),
     updateTerminalActivityBatch: v.fn(),

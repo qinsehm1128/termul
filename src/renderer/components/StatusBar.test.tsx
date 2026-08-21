@@ -104,6 +104,20 @@ function renderWithProviders(ui: React.ReactElement) {
 }
 
 describe('StatusBar', () => {
+  describe('theme chrome', () => {
+    it('uses theme status-bar tokens instead of a fixed project accent', () => {
+      const { container } = renderWithProviders(<StatusBar project={mockProject} />)
+      const bar = container.firstElementChild
+
+      expect(bar).toHaveClass('bg-status-bar')
+      expect(bar).toHaveClass('text-status-bar-foreground')
+      expect(bar).toHaveClass('border-border')
+      expect(bar?.className).not.toMatch(
+        /bg-(blue|purple|green|yellow|red|cyan|pink|orange|gray)-600/
+      )
+    })
+  })
+
   describe('conditional rendering based on visibility settings', () => {
     it('should render git branch picker when showGitBranch is true', () => {
       renderWithProviders(<StatusBar project={mockProject} />)

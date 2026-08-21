@@ -139,6 +139,10 @@ keyring = "3.6"
 # Logging
 log = "0.4"
 
+# Kernel-backed cross-platform migration lock. The permanent lock file is diagnostic metadata;
+# ownership is released by the OS when the process/handle terminates.
+fs2 = "0.4"
+
 # Remote terminal server (embedded Axum HTTP + WebSocket)
 # Reuses the existing tokio + hyper 1.x + tower stack already in the dep tree.
 axum = { version = "0.8", features = ["ws"] }
@@ -182,10 +186,13 @@ minisign-verify = "0.2"
 # the minisign `.pub` file text, base64-encoded) so `PublicKey::decode` can
 # parse the raw key the updater verifies against.
 base64 = "0.22"
+cron = "0.17.0"
+chrono-tz = "0.10.4"
 
 [dev-dependencies]
 tauri = { version = "2.0", features = ["test"] }
 tower = { version = "0.5", features = ["util"] }
+syn = { version = "2", features = ["full", "visit"] }
 # Swap/rollback file tests in `server_update` use a temp dir so they never
 # touch the real binary path.
 tempfile = "3"
@@ -198,6 +205,7 @@ keyring = { version = "3.6", features = ["windows-native"] }
 # macOS Keychain and self-contained SSH/OpenSSL linkage for packaged apps
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3.6", features = ["apple-native"] }
+libc = "0.2"
 ssh2 = { version = "0.9", features = ["vendored-openssl"] }
 
 # Preserve the existing system/default SSH native dependency behavior outside
@@ -213,7 +221,15 @@ gtk = "0.18"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
-windows-sys = { version = "0.59", features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
 winapi = { version = "0.3", features = [
     "jobapi2",
     "winbase",

@@ -52,16 +52,19 @@
   "customAcp": {
     "title": "添加自定义 ACP 代理",
     "confirmTitle": "确认执行任意命令",
-    "description": "粘贴 ACP 代理 JSON 配置。仅接受 configId、name、command、args、env 和 allowTerminal 字段；env 值必须使用 $VAR 占位符。",
+    "description": "粘贴 ACP 代理 JSON 配置。仅接受 configId、name、command、args、env、allowTerminal 和 permissionPolicy 字段；env 值必须使用 $VAR 占位符。",
     "confirmDescription": "保存此代理后，它可以执行配置的命令。请在确认前仔细检查。",
     "jsonLabel": "代理配置 JSON",
     "savedHint": "已保存的代理会显示在 ACP 启动器中，并在重启后重新连接会话。可使用“复制 JSON”分享已保存代理。",
     "arbitraryCommandPrompt": "这将在你的设备上执行任意命令。确定要保存此代理吗？",
     "terminalPrompt": "此代理请求 ACP 终端能力，这会允许它在你的设备上执行任意命令。确定要允许吗？",
     "terminalSecondConfirmation": "这是第二次确认：终端能力允许代理在你的设备上运行任意命令。",
+    "permissionPrompt": "此代理请求完全工具权限。Termul 将自动接受允许选项，不再逐次询问。",
+    "permissionSecondConfirmation": "这是单独的权限确认：代理提供的所有允许选项都会被自动接受。",
     "saveAgent": "保存代理",
     "confirmExecute": "确认 — 执行命令",
     "confirmTerminal": "确认 — 允许终端",
+    "confirmPermission": "确认 — 完全允许",
     "saved": "代理“{{name}}”已保存",
     "fields": {
       "name": "名称",
@@ -85,6 +88,7 @@
       "envObject": "env 必须是对象。",
       "envStrings": "env 的值必须是字符串。",
       "allowTerminalBoolean": "allowTerminal 必须是布尔值。",
+      "permissionPolicy": "permissionPolicy 必须是“ask”或“allow_all”。",
       "loadConfigs": "加载代理配置失败",
       "persistConfigs": "保存代理配置失败",
       "rawSecret": "拒绝保存代理“{{name}}”的 env“{{key}}”原始密钥；请将其存入安全存储，并以 ${{key}} 引用"
@@ -172,6 +176,16 @@
     "browse": "浏览",
     "savePath": "保存路径",
     "clearPath": "清除已保存路径",
+    "permissionPolicy": {
+      "allowAll": "完全允许工具请求",
+      "description": "自动选择该 ACP 代理提供的允许选项；代理自身的沙箱仍然有效。",
+      "aria": "完全允许 {{name}} 的权限请求",
+      "confirmTitle": "完全允许这个代理的请求？",
+      "confirmDescription": "{{name}} 之后提出的工具请求将不再逐次询问，可能会修改文件或执行命令。请只对你信任的代理和工作区启用。",
+      "confirm": "启用完全允许",
+      "cancel": "继续逐次询问",
+      "saved": "权限策略已更新"
+    },
     "status": {
       "sessionReady": "会话已就绪",
       "warming": "正在预热…",

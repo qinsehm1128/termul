@@ -125,6 +125,7 @@ vi.mock('@/hooks/use-agent-skills', async () => {
 
 vi.mock('@/stores/acp-store', () => ({
   useAgentIdentity: () => ({ name: 'Cursor', templateId: 'cursor' }),
+  useSessionAgentIdentity: () => ({ name: 'Cursor', templateId: 'cursor' }),
   useSessionUsage: () => null,
   useAcpMessages: () => [],
   // Story 1.8: ChatInputBar reads the global MCP server count for the read-only
@@ -242,6 +243,7 @@ function session(): AcpSession {
     agentId: 'agent-1',
     cwd: '/work',
     projectId: 'p1',
+    conversationId: '11111111-1111-4111-8111-111111111111',
     status: 'active',
     title: null,
     activeTurn: false,
@@ -264,6 +266,11 @@ function session(): AcpSession {
 describe('ChatInputBar config controls', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+  })
+
+  it('shows the last ACP agent when the session has no model option', () => {
+    renderInputBar({ configOptions: [], modes: null })
+    expect(screen.getByTestId('composer-agent-identity')).toHaveTextContent('Cursor')
   })
 
   it('renders worktree context below the composer without keyboard helper text', () => {
@@ -420,6 +427,63 @@ describe('ChatInputBar config controls', () => {
 
     expect(mockSetModel).toHaveBeenCalledWith('openrouter/gpt-5.5')
     expect(mockSetConfig).not.toHaveBeenCalled()
+  })
+
+  it('flattens grouped Claude model options and sends the leaf value id', async () => {
+    const s = session()
+    const configOptions = [
+      {
+        id: 'model',
+        name: 'Model',
+        category: 'model',
+        type: 'select',
+        currentValue: 'claude-sonnet-4',
+        options: [
+          {
+            group: 'claude',
+            name: 'Claude',
+            options: [
+              { value: 'claude-sonnet-4', name: 'Sonnet 4' },
+              { value: 'claude-opus-4', name: 'Opus 4' }
+            ]
+          }
+        ]
+      } as unknown as SessionConfigOption
+    ]
+
+    render(
+      <TooltipProvider>
+        <ChatInputBar
+          session={s}
+          busy={false}
+          disabled={false}
+          onSend={vi.fn()}
+          onSendBlocks={vi.fn()}
+          onCancel={vi.fn()}
+          commands={[]}
+          configOptions={configOptions}
+          modes={s.modes}
+          onSetConfig={mockSetConfig}
+          onSetMode={mockSetMode}
+          onSetModel={mockSetModel}
+        />
+      </TooltipProvider>
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Sonnet 4' }))
+    expect(screen.getByText('Claude')).toBeInTheDocument()
+    clickMenuOption('Opus 4')
+    expect(mockSetConfig).toHaveBeenCalledWith('model', 'claude-opus-4')
+    expect(mockSetModel).not.toHaveBeenCalled()
+  })
+
+  it('shows binding feedback when the session has no conversation id', () => {
+    const s = session()
+    delete s.conversationId
+    renderInputBar({ session: s })
+    expect(screen.getByTestId('unbound-session-notice')).toHaveTextContent(
+      'This conversation has no agent binding.'
+    )
   })
 })
 

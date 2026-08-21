@@ -19,6 +19,7 @@ import { resolveEnvForSpawn } from '@/lib/env-parser'
 import { ensureWorktreeSymlinks } from '@/lib/worktree-context'
 import { useAppSettingsStore } from '@/stores/app-settings-store'
 import { useProjectStore } from '@/stores/project-store'
+import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
 import { useTerminalStore } from '@/stores/terminal-store'
 import { useWorkspaceStore } from '@/stores/workspace-store'
 
@@ -111,6 +112,17 @@ export async function launchAgentInPane(
   }
 
   const project = useProjectStore.getState().projects.find((p) => p.id === projectId)
+  const conversationId = useSessionWorkspaceSyncStore.getState().activeConversationId
+  if (!conversationId) {
+    return {
+      success: false,
+      error: runtimeT(
+        'terminal',
+        'lifecycle.conversationScopeRequired',
+        'Open a Conversation before creating a durable terminal'
+      )
+    }
+  }
 
   try {
     // Ensure worktree symlinks are present when launching into a worktree path.
@@ -134,6 +146,7 @@ export async function launchAgentInPane(
     const { program, args } = buildAgentArgv(def, prompt)
 
     const spawnResult = await terminalApi.spawn({
+      conversationId,
       projectId,
       cwd,
       program,
@@ -169,12 +182,14 @@ export async function launchAgentInPane(
       ...latestTerminals,
       {
         id: terminalId,
+        conversationId,
         name: def.name,
         projectId,
         shell: program,
         cwd,
         output: [],
         healthStatus: 'running',
+        viewState: 'visible',
         isHidden: false,
         ptyId: spawnResult.data.id,
         // ADR-004.4: descriptive-only agent metadata

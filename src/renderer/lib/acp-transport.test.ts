@@ -1,5 +1,9 @@
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import type {
+  ConversationHistoryPageV1,
+  ConversationHistoryRecordV1
+} from '@shared/types/web-protocol.types'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 vi.mock('@/lib/log-api', () => ({
@@ -13,7 +17,9 @@ import {
   _setAcpTransportForTests,
   AcpTransportError,
   createAcpTransport,
+  HISTORY_PAGE_TARGET_TTL_MS,
   isTransientAcpTransportError,
+  MAX_HISTORY_PAGE_TARGETS,
   resolveWsUrl,
   toTauriEventName,
   toWsEventType,
@@ -66,8 +72,16 @@ class FakeWebSocket {
   }
   snapshotEvents: unknown[] = []
   snapshotFailureCodes = new Map<string, string>()
-  /** Session payloads served by `get_session_payload`; unknown ids → not_found. */
+  /** Session payloads served by compatibility `get_session_payload`; unknown ids → not_found. */
   sessionPayloads: Record<string, unknown> = {}
+  /** Raw durable records served by bounded `get_session_payload_page`. */
+  sessionHistoryRecords: Record<string, ConversationHistoryRecordV1[]> = {}
+  historyPageFailureCodes = new Map<string, string>()
+  holdHistoryPages = false
+  heldHistoryPageRequests: Array<{
+    id: string
+    payload: { sessionId: string; afterSeq: number; limit: number; targetLastSeq?: number }
+  }> = []
   reopenOutcome: unknown = {
     modes: {
       currentModeId: 'ask',
@@ -172,17 +186,32 @@ class FakeWebSocket {
       return
     }
     if (req.type === 'create_session') {
-      // Story 1.8 AC3 chat-flow test: reply with a NewSessionOutcome + echo the
-      // client-subscribed session id. Tests assert the transport resolves the
-      // promise with the session id.
-      const payload = req.payload as { agentId: string; cwd: string }
+      // Story 1.8 AC3 chat-flow test: reply with the same discriminated
+      // NewSessionOutcome used by the Tauri command.
+      const payload = req.payload as { agentId: string; cwd: string; ephemeral?: boolean }
       const sessionId = 'sess-chatflow'
       this.emitReply({
         id: req.id,
         ok: true,
-        payload: { sessionId, modes: null, models: null, configOptions: null }
+        payload: payload.ephemeral
+          ? {
+              persistence: 'ephemeral',
+              sessionId,
+              modes: null,
+              models: null,
+              configOptions: null
+            }
+          : {
+              persistence: 'conversation',
+              conversationId: '11111111-1111-4111-8111-111111111111',
+              workspaceCwd: '/visible/Termul/sessions/2026/08/16/conversation',
+              executionCwd: payload.cwd,
+              sessionId,
+              modes: null,
+              models: null,
+              configOptions: null
+            }
       })
-      void payload
       return
     }
     if (req.type === 'dispose_ephemeral_session') {
@@ -296,6 +325,19 @@ class FakeWebSocket {
       this.emitReply({ id: req.id, ok: true, payload: [...this.liveAgents] })
       return
     }
+    if (req.type === 'set_permission_policy') {
+      const payload = req.payload as { agentId?: string; policy?: string }
+      if (!payload.agentId || !this.liveAgents.has(payload.agentId)) {
+        this.emitReply({
+          id: req.id,
+          ok: false,
+          err: { code: 'not_found', message: 'unknown agent' }
+        })
+        return
+      }
+      this.emitReply({ id: req.id, ok: true, payload: {} })
+      return
+    }
     if (req.type === 'kill_agent') {
       const payload = req.payload as { agentId?: string }
       if (!payload.agentId) {
@@ -331,12 +373,68 @@ class FakeWebSocket {
       this.emitReply({ id: req.id, ok: true, payload: {} })
       return
     }
+    if (req.type === 'get_session_payload_page') {
+      const payload = req.payload as {
+        sessionId?: string
+        afterSeq?: number
+        limit?: number
+        targetLastSeq?: number
+      }
+      if (
+        !payload.sessionId ||
+        !Number.isSafeInteger(payload.afterSeq) ||
+        payload.afterSeq! < 0 ||
+        !Number.isSafeInteger(payload.limit) ||
+        payload.limit! < 1 ||
+        payload.limit! > 1_000
+      ) {
+        this.emitReply({
+          id: req.id,
+          ok: false,
+          err: { code: 'VALIDATION_ERROR', message: 'invalid history page request' }
+        })
+        return
+      }
+      const failureCode = this.historyPageFailureCodes.get(payload.sessionId)
+      if (failureCode) {
+        this.emitReply({
+          id: req.id,
+          ok: false,
+          err: { code: failureCode, message: 'history page failed' }
+        })
+        return
+      }
+      const request = {
+        id: req.id,
+        payload: {
+          sessionId: payload.sessionId,
+          afterSeq: payload.afterSeq!,
+          limit: payload.limit!,
+          targetLastSeq: payload.targetLastSeq
+        }
+      }
+      if (this.holdHistoryPages) {
+        this.heldHistoryPageRequests.push(request)
+        return
+      }
+      this.replyHistoryPage(request)
+      return
+    }
     if (req.type === 'get_session_payload') {
-      // Standalone history: serve the registered renderer-shaped payload, or
-      // the server's `not_found` reply for absent ids.
+      // Compatibility only. Large transcripts require the bounded page route.
       const payload = req.payload as { sessionId?: string }
       const stored = payload.sessionId ? this.sessionPayloads[payload.sessionId] : undefined
-      if (stored) {
+      const records = payload.sessionId ? this.sessionHistoryRecords[payload.sessionId] : undefined
+      if (records && records.length > 1_000) {
+        this.emitReply({
+          id: req.id,
+          ok: false,
+          err: {
+            code: 'CONVERSATION_HISTORY_PAGING_REQUIRED',
+            message: 'use bounded history pages'
+          }
+        })
+      } else if (stored) {
         this.emitReply({ id: req.id, ok: true, payload: stored })
       } else {
         this.emitReply({
@@ -352,6 +450,43 @@ class FakeWebSocket {
       ok: false,
       err: { code: 'not_implemented', message: `${req.type} stub` }
     })
+  }
+
+  replyHistoryPage(request: {
+    id: string
+    payload: { sessionId: string; afterSeq: number; limit: number; targetLastSeq?: number }
+  }): void {
+    const records = this.sessionHistoryRecords[request.payload.sessionId]
+    if (!records) {
+      this.emitReply({
+        id: request.id,
+        ok: false,
+        err: { code: 'not_found', message: 'session history not found' }
+      })
+      return
+    }
+    const currentLastSeq = records.at(-1)?.seq ?? 0
+    const targetLastSeq = request.payload.targetLastSeq ?? currentLastSeq
+    if (targetLastSeq > currentLastSeq) {
+      this.emitReply({
+        id: request.id,
+        ok: false,
+        err: { code: 'stale', message: 'pinned history frontier is unavailable' }
+      })
+      return
+    }
+    const pageRecords = records
+      .filter((record) => record.seq > request.payload.afterSeq && record.seq <= targetLastSeq)
+      .slice(0, request.payload.limit)
+    const nextCursor = pageRecords.at(-1)?.seq ?? targetLastSeq
+    const page: ConversationHistoryPageV1 = {
+      schemaVersion: 1,
+      records: pageRecords,
+      nextCursor,
+      complete: nextCursor === targetLastSeq,
+      targetLastSeq
+    }
+    this.emitReply({ id: request.id, ok: true, payload: page })
   }
 
   close(): void {
@@ -440,6 +575,9 @@ describe('WsAcpTransport', () => {
     expect(spawnResult.stableNamespace).toBe('config:test')
     expect(await transport.listAgents()).toEqual(['agent-spawned-1'])
 
+    await expect(
+      transport.setPermissionPolicy(spawnResult.agentId, 'allow_all')
+    ).resolves.toBeUndefined()
     await transport.killAgent(spawnResult.agentId)
     expect(await transport.listAgents()).toEqual([])
 
@@ -516,6 +654,7 @@ describe('WsAcpTransport', () => {
     await transport.setSessionNewTimeout(120)
     await transport.setSessionReopenTimeout(300)
     await transport.setFirstPromptWarmupTimeout(0)
+    await transport.setPreferLocalNpmInstall(false)
 
     expect(sock.sent.length).toBe(sentBefore)
     transport.dispose()
@@ -952,6 +1091,149 @@ describe('WsAcpTransport', () => {
     transport.dispose()
   })
 
+  it('getSessionPayloadPage requests exact 250-record pages and advances the cursor without full reads', async () => {
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+    sock.sessionHistoryRecords['s-paged'] = Array.from({ length: 500 }, (_, index) => ({
+      schemaVersion: 1 as const,
+      sessionId: 's-paged',
+      seq: index + 1,
+      type: index % 2 === 0 ? 'message_chunk' : 'tool_call',
+      recordedAt: index + 1,
+      payload: { marker: index + 1 }
+    }))
+
+    const first = await transport.getSessionPayloadPage('s-paged', 0, 250)
+    sock.sessionHistoryRecords['s-paged'].push(
+      ...Array.from({ length: 50 }, (_, index) => ({
+        schemaVersion: 1 as const,
+        sessionId: 's-paged',
+        seq: 501 + index,
+        type: 'message_chunk',
+        recordedAt: 501 + index,
+        payload: { marker: 501 + index }
+      }))
+    )
+    const second = await transport.getSessionPayloadPage('s-paged', first.nextCursor, 250)
+
+    expect(first.records).toHaveLength(250)
+    expect(first.nextCursor).toBe(250)
+    expect(first.complete).toBe(false)
+    expect(second.records).toHaveLength(250)
+    expect(second.nextCursor).toBe(500)
+    expect(second.complete).toBe(true)
+    const frames = sock.sent.map(
+      (frame) => JSON.parse(frame) as { type: string; payload: Record<string, unknown> }
+    )
+    expect(
+      frames
+        .filter((frame) => frame.type === 'get_session_payload_page')
+        .map(({ type, payload }) => ({ type, payload }))
+    ).toEqual([
+      {
+        type: 'get_session_payload_page',
+        payload: { sessionId: 's-paged', afterSeq: 0, limit: 250 }
+      },
+      {
+        type: 'get_session_payload_page',
+        payload: { sessionId: 's-paged', afterSeq: 250, limit: 250, targetLastSeq: 500 }
+      }
+    ])
+    expect(frames.some((frame) => frame.type === 'get_session_payload')).toBe(false)
+    transport.dispose()
+  })
+
+  it('serializes page requests so each session has at most one in flight', async () => {
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+    sock.sessionHistoryRecords.serial = [1, 2].map((seq) => ({
+      schemaVersion: 1 as const,
+      sessionId: 'serial',
+      seq,
+      type: 'message_chunk',
+      recordedAt: seq,
+      payload: { marker: seq }
+    }))
+    sock.holdHistoryPages = true
+
+    const first = transport.getSessionPayloadPage('serial', 0, 1)
+    const second = transport.getSessionPayloadPage('serial', 1, 1)
+    await vi.waitFor(() => expect(sock.heldHistoryPageRequests).toHaveLength(1))
+    expect(
+      sock.sent
+        .map((frame) => JSON.parse(frame) as { type: string })
+        .filter((frame) => frame.type === 'get_session_payload_page')
+    ).toHaveLength(1)
+
+    sock.replyHistoryPage(sock.heldHistoryPageRequests.shift()!)
+    await expect(first).resolves.toMatchObject({ nextCursor: 1, complete: false })
+    await vi.waitFor(() => expect(sock.heldHistoryPageRequests).toHaveLength(1))
+    sock.replyHistoryPage(sock.heldHistoryPageRequests.shift()!)
+    await expect(second).resolves.toMatchObject({ nextCursor: 2, complete: true })
+    transport.dispose()
+  })
+
+  it.each([
+    [0, 0],
+    [0, -1],
+    [0, 1.5],
+    [0, 1_001],
+    [-1, 250]
+  ])('rejects invalid history request afterSeq=%s limit=%s before sending', async (afterSeq, limit) => {
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+
+    await expect(transport.getSessionPayloadPage('invalid', afterSeq, limit)).rejects.toMatchObject(
+      {
+        code: 'VALIDATION_ERROR'
+      }
+    )
+    expect(
+      sock.sent.some(
+        (frame) => (JSON.parse(frame) as { type: string }).type === 'get_session_payload_page'
+      )
+    ).toBe(false)
+    transport.dispose()
+  })
+
+  it('preserves stable page and compatibility paging-required errors', async () => {
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+    sock.historyPageFailureCodes.set('page-fail', 'CONVERSATION_HISTORY_PAGING_REQUIRED')
+    await expect(transport.getSessionPayloadPage('page-fail', 0, 250)).rejects.toMatchObject({
+      code: 'CONVERSATION_HISTORY_PAGING_REQUIRED'
+    })
+
+    sock.sessionHistoryRecords.compat = Array.from({ length: 1_001 }, (_, index) => ({
+      schemaVersion: 1 as const,
+      sessionId: 'compat',
+      seq: index + 1,
+      type: 'message_chunk',
+      recordedAt: index + 1,
+      payload: {}
+    }))
+    await expect(transport.getSessionPayload('compat')).rejects.toMatchObject({
+      code: 'CONVERSATION_HISTORY_PAGING_REQUIRED'
+    })
+    transport.dispose()
+  })
+
   it('getSessionPayload passes through the materialized SessionPayload', async () => {
     const transport = new WsAcpTransport({
       url: 'ws://test/ws',
@@ -1118,15 +1400,25 @@ describe('WsAcpTransport', () => {
     })
     await transport.connect()
     const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+    const mcpServers = [
+      { type: 'stdio' as const, name: 'files', command: 'node', args: [], env: [] }
+    ]
 
-    const loaded = await transport.loadSession('a1', 's-load', '/work')
-    const resumed = await transport.resumeSession('a1', 's-resume', '/work')
+    const loaded = await transport.loadSession('a1', 's-load', '/work', undefined, mcpServers)
+    const resumed = await transport.resumeSession('a1', 's-resume', '/work', undefined, mcpServers)
 
     expect(loaded).toEqual(sock.reopenOutcome)
     expect(resumed).toEqual(sock.reopenOutcome)
     const types = sock.sent.map((frame) => (JSON.parse(frame) as { type: string }).type)
     expect(types).toContain('load_session')
     expect(types).toContain('resume_session')
+    const reopens = sock.sent
+      .map(
+        (frame) =>
+          JSON.parse(frame) as { type: string; payload: { mcpServers?: typeof mcpServers } }
+      )
+      .filter((frame) => frame.type === 'load_session' || frame.type === 'resume_session')
+    expect(reopens.every((frame) => frame.payload.mcpServers?.[0]?.name === 'files')).toBe(true)
     expect(types.filter((type) => type === 'subscribe')).toHaveLength(2)
     const subscriptions = sock.sent
       .map((frame) => JSON.parse(frame) as { type: string; payload: { lastSeq?: number } })
@@ -1196,6 +1488,80 @@ describe('WsAcpTransport', () => {
     }
     expect(frame.type).toBe('send_prompt')
     expect(frame.payload.turnId).toEqual(expect.any(String))
+    transport.dispose()
+  })
+
+  it('sends project-less Conversation creation with Tauri-parity fields over WS', async () => {
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+    const projectAttachment = {
+      schemaVersion: 1 as const,
+      projectId: 'project-1',
+      attachedAtUtc: '2026-08-16T10:00:00.000Z',
+      projectPathSnapshot: '/project'
+    }
+
+    const outcome = await transport.newSession('a1', '/project', undefined, {
+      conversationId: '11111111-1111-4111-8111-111111111111',
+      projectAttachment,
+      executionTarget: {
+        kind: 'worktree',
+        projectId: 'project-1',
+        worktreePath: '/project-worktree',
+        worktreeBranch: 'chat/example'
+      }
+    })
+    expect(outcome).toMatchObject({
+      persistence: 'conversation',
+      conversationId: '11111111-1111-4111-8111-111111111111',
+      sessionId: 'sess-chatflow'
+    })
+    const frames = sock.sent.map((raw) => JSON.parse(raw) as { type: string; payload: unknown })
+    expect(frames).toContainEqual({
+      id: expect.any(String),
+      type: 'create_session',
+      payload: {
+        agentId: 'a1',
+        cwd: '/project',
+        conversationId: '11111111-1111-4111-8111-111111111111',
+        ephemeral: false,
+        executionTarget: {
+          kind: 'worktree',
+          projectId: 'project-1',
+          worktreePath: '/project-worktree',
+          worktreeBranch: 'chat/example'
+        },
+        mcpServers: undefined,
+        projectAttachment
+      }
+    })
+    transport.dispose()
+  })
+
+  it('omits projectId for a project-less workspace Conversation request', async () => {
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const sock = (transport as unknown as { socket: FakeWebSocket }).socket
+
+    await transport.newSession('a1', '/legacy-cwd')
+    const frame = sock.sent
+      .map((raw) => JSON.parse(raw) as { type: string; payload: Record<string, unknown> })
+      .find((candidate) => candidate.type === 'create_session')
+    expect(frame?.payload).toEqual({
+      agentId: 'a1',
+      cwd: '/legacy-cwd',
+      mcpServers: undefined,
+      ephemeral: false,
+      executionTarget: { kind: 'workspace' }
+    })
+    expect(frame?.payload).not.toHaveProperty('projectId')
     transport.dispose()
   })
 
@@ -1491,6 +1857,65 @@ describe('WsAcpTransport', () => {
 // Story 5.3 (AC3, T6) — transport-level reconnect listener.
 // Verifies the `setReconnectListener` callback fires `true` on
 // `scheduleReconnect` (WS drop) and `false` on `reconnect` success.
+describe('WsAcpTransport generation revocation', () => {
+  it('zeroizes revoked token cancels timers and enters terminal re-pair-required without reconnect', async () => {
+    vi.useFakeTimers()
+    class CountingSocket extends FakeWebSocket {
+      static instances = 0
+      constructor(url: string) {
+        super(url)
+        CountingSocket.instances += 1
+      }
+    }
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      token: 'revoked-secret-token',
+      WebSocketImpl: CountingSocket as unknown as typeof WebSocket
+    })
+    await transport.connect()
+    const internals = transport as unknown as {
+      socket: FakeWebSocket | null
+      remoteAccessToken: string
+      reconnectTimer: ReturnType<typeof setTimeout> | null
+      heartbeatTimer: ReturnType<typeof setInterval> | null
+      reconnectAttempt: number
+      terminalState: unknown
+    }
+    const revokedSocket = internals.socket!
+    internals.reconnectTimer = setTimeout(() => undefined, 5_000)
+    internals.reconnectAttempt = 4
+    revokedSocket.emit({
+      sid: null,
+      seq: 0,
+      type: 'reauthentication_required',
+      payload: { code: 'REAUTHENTICATION_REQUIRED' }
+    })
+    await Promise.resolve()
+
+    expect(internals.remoteAccessToken).toBe('')
+    expect(internals.reconnectTimer).toBeNull()
+    expect(internals.heartbeatTimer).toBeNull()
+    expect(internals.reconnectAttempt).toBe(0)
+    expect(internals.socket).toBeNull()
+    expect(revokedSocket.readyState).toBe(FakeWebSocket.CLOSED)
+    expect(transport.getTerminalState()).toEqual({
+      code: 'REAUTHENTICATION_REQUIRED',
+      rePairRequired: true
+    })
+    expect(JSON.stringify(internals.terminalState)).not.toMatch(
+      /revoked-secret-token|access[_-]?url|bearer|pairing|qr/i
+    )
+    await expect(transport.connect()).rejects.toMatchObject({
+      code: 'REAUTHENTICATION_REQUIRED'
+    })
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(CountingSocket.instances).toBe(1)
+    expect(vi.getTimerCount()).toBe(0)
+    transport.dispose()
+    vi.useRealTimers()
+  })
+})
+
 describe('WsAcpTransport reconnect listener (Story 5.3)', () => {
   afterEach(() => {
     _resetAcpTransportForTests(null)
@@ -2256,20 +2681,31 @@ describe('createAcpTransport selection', () => {
   it('desktop load/resume return the typed Tauri invoke outcome', async () => {
     const { invoke } = await import('@tauri-apps/api/core')
     const outcome = { configOptions: [] }
+    const mcpServers = [
+      { type: 'stdio' as const, name: 'files', command: 'node', args: [], env: [] }
+    ]
     vi.mocked(invoke).mockResolvedValue(outcome)
     const transport = createAcpTransport({ force: 'tauri' })
 
-    await expect(transport.loadSession('a1', 's1', '/work')).resolves.toEqual(outcome)
+    await expect(
+      transport.loadSession('a1', 's1', '/work', undefined, mcpServers)
+    ).resolves.toEqual(outcome)
     expect(invoke).toHaveBeenCalledWith('acp_load_session', {
       agentId: 'a1',
       sessionId: 's1',
-      cwd: '/work'
+      cwd: '/work',
+      conversationId: null,
+      mcpServers
     })
-    await expect(transport.resumeSession('a1', 's1', '/work')).resolves.toEqual(outcome)
+    await expect(
+      transport.resumeSession('a1', 's1', '/work', undefined, mcpServers)
+    ).resolves.toEqual(outcome)
     expect(invoke).toHaveBeenCalledWith('acp_resume_session', {
       agentId: 'a1',
       sessionId: 's1',
-      cwd: '/work'
+      cwd: '/work',
+      conversationId: null,
+      mcpServers
     })
     transport.dispose()
   })
@@ -2283,6 +2719,7 @@ describe('createAcpTransport selection', () => {
       spawnAgent: vi.fn(),
       killAgent: vi.fn(),
       listAgents: vi.fn(),
+      setPermissionPolicy: vi.fn(),
       newSession: vi.fn(),
       loadSession: vi.fn(),
       resumeSession: vi.fn(),
@@ -2324,5 +2761,33 @@ describe('Biome @tauri-apps ban (AC8)', () => {
       o.includes?.some((i) => i.includes('renderer/lib'))
     )
     expect(libOverride).toBeTruthy()
+  })
+})
+
+describe('history page target budget', () => {
+  it('bounds historyPageTargets by cardinality and TTL and clears on dispose', () => {
+    const transport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    const now = Date.now()
+    for (let index = 0; index < MAX_HISTORY_PAGE_TARGETS + 2; index += 1) {
+      transport.rememberHistoryPageTargetForTesting(`s-${index}`, index + 1, now + index)
+    }
+    expect(transport.historyPageTargetSizeForTesting()).toBe(MAX_HISTORY_PAGE_TARGETS)
+
+    const ttlTransport = new WsAcpTransport({
+      url: 'ws://test/ws',
+      WebSocketImpl: FakeWebSocket as unknown as typeof WebSocket
+    })
+    ttlTransport.rememberHistoryPageTargetForTesting(
+      'expired',
+      9,
+      now - HISTORY_PAGE_TARGET_TTL_MS - 1
+    )
+    ttlTransport.rememberHistoryPageTargetForTesting('fresh', 10, now)
+    expect(ttlTransport.historyPageTargetSizeForTesting()).toBe(1)
+    ttlTransport.dispose()
+    expect(ttlTransport.historyPageTargetSizeForTesting()).toBe(0)
   })
 })

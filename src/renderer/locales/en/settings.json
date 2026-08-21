@@ -47,7 +47,11 @@
     "maxTerminalsHint": "Maximum number of terminal tabs allowed per project.",
     "renderer": "Terminal Renderer",
     "rendererHint": "GPU-accelerated rendering for terminal output. WebGL provides best performance. Changes apply to new terminals.",
-    "preview": "Preview"
+    "screenReader": "Screen reader mode",
+    "screenReaderHint": "Expose terminal output to NVDA and VoiceOver. Enable only when needed because accessibility rendering can reduce throughput.",
+    "preview": "Preview",
+    "symbolFont": "Symbol font (terminal icons/glyphs)",
+    "symbolFontHint": "Nerd Font used to render prompt icons and powerline glyphs; Auto picks installed Nerd Fonts."
   },
   "editor": {
     "source": "Source",
@@ -119,7 +123,9 @@
     "sessionReopenTimeout": "Session Reopen Timeout",
     "sessionReopenTimeoutHint": "How long to wait for session/load / session/resume (large histories replay before responding; they may need more). The TERMUL_ACP_SESSION_REOPEN_TIMEOUT_SECS env var still overrides this (operator/diagnostic). Desktop only — the standalone server uses the env var.",
     "firstPromptWarmup": "First-Prompt Warmup Timeout",
-    "firstPromptWarmupHint": "Warmup prompt budget after session/new to absorb agent cold-start stalls; choose Disabled to skip the warmup entirely. The TERMUL_ACP_FIRST_PROMPT_WARMUP_SECS env var still overrides this (operator/diagnostic). Desktop only — the standalone server uses the env var."
+    "firstPromptWarmupHint": "Warmup prompt budget after session/new to absorb agent cold-start stalls; choose Disabled to skip the warmup entirely. The TERMUL_ACP_FIRST_PROMPT_WARMUP_SECS env var still overrides this (operator/diagnostic). Desktop only — the standalone server uses the env var.",
+    "preferLocalNpmInstall": "Install npm agents locally",
+    "preferLocalNpmInstallHint": "On first launch, download npx agents (Claude, Codex, Gemini, Copilot, Qwen, Cline, Auggie) into Termul’s local cache and run that copy afterwards. Turn this off to always use npx. Desktop only — the standalone server uses TERMUL_ACP_PREFER_LOCAL_NPM."
   },
   "mcpServers": {
     "description": "Configure global MCP servers for capability-aware injection into new chats."

@@ -80,6 +80,7 @@
     --surface-darker: 75 10% 8%;
 
     --status-bar: 75 9% 10%;
+    --status-bar-foreground: 53 8% 68%;
 
     /* Shimmer text (transitions.dev) — demo hex defaults */
     --shimmer-dur: 2000ms;

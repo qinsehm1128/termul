@@ -5,11 +5,14 @@ mod acp_registry_snapshot;
 mod agent_registry;
 mod browser_tab_manager;
 mod commands;
+pub mod conversation;
+mod host_admission;
 mod logging;
 mod migrations;
 mod path_validation;
 mod pty;
 mod remote;
+pub mod scheduled_tasks;
 mod secure_storage;
 // Opt-in `termul-server` self-update subsystem. The library module itself is
 // intentionally NOT feature-gated so its full test suite — including signature
@@ -353,19 +356,31 @@ pub use acp::{
     AcpCatalogService, AcpInstallService, AcpManager, ChatHistoryStore, FileProjectRegistry,
     SessionPersistence, WorkspaceManifestService,
 };
+pub fn set_acp_npm_local_root(path: std::path::PathBuf) {
+    acp::npm_local::set_root(path);
+}
 // Host-injected `plan` MCP tool: the `--internal-mcp-plan-server`
 // subcommand branch in `main.rs` + `server_main.rs` reaches `host_mcp::CHILD_ARG`
 // + `host_mcp::child::run()` through this re-export (the `acp` module itself is
 // private). See `acp/host_mcp/mod.rs` + spec `spec-acp-host-todo-plan-tool.md`.
 pub use acp::host_mcp;
+pub use conversation::{
+    AgentSessionBinding, ConversationErrorCode, ConversationId, ConversationLifecycleState,
+    ConversationRecordV2, CreationPartition, ExecutionTarget, ProjectAttachment,
+    TerminalResourceRef,
+};
 pub use pty::PtyManager;
+pub use scheduled_tasks::ScheduledTaskStore;
 pub use trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub};
 // Desktop ACP event sink: wraps the Tauri `AppHandle` so the dispatcher's
 // `Vec<Arc<dyn EventSink>>` fan-out reaches the renderer as `acp:*` events
 // (byte-for-byte unchanged from before Story 1.1). The headless `termul-server`
 // binary (Story 1.2) will instead pass a `WsRelaySink`-backed list with no
 // `AppHandle` at all.
-use web::{PermissionRendezvous, ProjectRegistry, QuestionRendezvous, TauriEventSink, WsRelaySink};
+use web::{
+    PermissionRendezvous, ProjectRegistry, QuestionRendezvous, RemoteAccessAuthority,
+    TauriEventSink, WsRelaySink,
+};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -652,23 +667,34 @@ fn get_available_shells() -> Vec<ShellInfo> {
 
     #[cfg(not(target_os = "windows"))]
     {
-        let candidates = vec![
-            ("bash", "/bin/bash"),
-            ("zsh", "/bin/zsh"),
-            ("zsh", "/usr/bin/zsh"),
-            ("fish", "/bin/fish"),
-            ("fish", "/usr/bin/fish"),
-            ("sh", "/bin/sh"),
-        ];
+        let mut push_unique = |name: &str, path: &str| {
+            if !is_shell_available(path) {
+                return;
+            }
+            if shells
+                .iter()
+                .any(|existing| existing.name == name || existing.path == path)
+            {
+                return;
+            }
+            shells.push(ShellInfo {
+                name: name.to_string(),
+                path: path.to_string(),
+                display_name: shell_display_name(name),
+                args: None,
+            });
+        };
 
-        for (name, path) in candidates {
-            if is_shell_available(path) && !shells.iter().any(|s| s.name == name) {
-                shells.push(ShellInfo {
-                    name: name.to_string(),
-                    path: path.to_string(),
-                    display_name: shell_display_name(name),
-                    args: None,
-                });
+        // Prefer the login SHELL so picking "Zsh" matches Ghostty / Terminal.app.
+        if let Ok(login) = env::var("SHELL") {
+            if let Some(name) = Path::new(&login).file_name().and_then(|s| s.to_str()) {
+                push_unique(name, &login);
+            }
+        }
+
+        for prefix in crate::shell_paths::unix_shell_paths::PREFIXES {
+            for name in ["zsh", "bash", "fish", "sh"] {
+                push_unique(name, &format!("{prefix}/{name}"));
             }
         }
     }
@@ -1244,6 +1270,134 @@ fn export_log_to_default<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result
     Ok(())
 }
 
+const LEGACY_DESKTOP_REMOTE_ACCOUNT: &str = "remote-access-v1";
+const DESKTOP_REMOTE_GENERATION_ACCOUNT: &str = "remote-access-generation-v2";
+
+/// Build a desktop generation authority without accepting any credential persisted by an earlier
+/// process. TASK-002 still owns per-start rotation; this seed exists only to select the desktop
+/// authority source and is removed from the keyring before setup publishes command state.
+fn provision_desktop_remote_authority() -> Result<RemoteAccessAuthority, String> {
+    if crate::secure_storage::keyring_delete(LEGACY_DESKTOP_REMOTE_ACCOUNT).is_err() {
+        log::warn!(
+            "[remote-auth] legacy desktop credential deletion failed stable_code=STALE_CREDENTIAL_DELETE_FAILED"
+        );
+    }
+    crate::secure_storage::keyring_delete(DESKTOP_REMOTE_GENERATION_ACCOUNT)
+        .map_err(|_| "failed to clear the previous desktop credential generation".to_string())?;
+    let (authority, bootstrap_bearer) =
+        RemoteAccessAuthority::issue_or_load_desktop(DESKTOP_REMOTE_GENERATION_ACCOUNT)
+            .map_err(|error| format!("failed to initialize desktop remote authority: {error}"))?;
+    let bootstrap_generation = authority
+        .verify_bearer(&bootstrap_bearer)
+        .map_err(|error| format!("failed to verify desktop authority bootstrap: {error}"))?
+        .generation();
+    authority.invalidate_generation(bootstrap_generation);
+    drop(bootstrap_bearer);
+    crate::secure_storage::keyring_delete(DESKTOP_REMOTE_GENERATION_ACCOUNT)
+        .map_err(|_| "failed to remove the desktop authority bootstrap credential".to_string())?;
+    Ok(authority)
+}
+
+fn clear_desktop_remote_generation() {
+    if crate::secure_storage::keyring_delete(DESKTOP_REMOTE_GENERATION_ACCOUNT).is_err() {
+        log::warn!(
+            "[remote-auth] desktop generation deletion failed stable_code=STALE_CREDENTIAL_DELETE_FAILED"
+        );
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct DesktopExitDurabilityOutcome {
+    pub failures: Vec<&'static str>,
+    pub conversation_drain_attempts: usize,
+    pub catalog_flush_attempts: usize,
+    pub pty_shutdown: Option<crate::pty::manager::PtyShutdownReceipt>,
+}
+
+impl DesktopExitDurabilityOutcome {
+    #[must_use]
+    pub fn clean_success(&self) -> bool {
+        self.failures.is_empty()
+            && self
+                .pty_shutdown
+                .is_none_or(|receipt| receipt.clean_success())
+    }
+}
+
+/// Stop all ACP producers before awaiting the retained Conversation coordinator exactly once.
+/// The caller owns later PTY/browser/legacy-store cleanup and converts any failure into a non-zero
+/// bounded Desktop exit rather than reporting false clean success.
+pub(crate) async fn stop_desktop_producers_and_drain(
+    acp_manager: Option<&AcpManager>,
+    ws_relay: Option<&WsRelaySink>,
+    deadline: tokio::time::Instant,
+) -> DesktopExitDurabilityOutcome {
+    let mut outcome = DesktopExitDurabilityOutcome::default();
+    let producer_stop_failed = match acp_manager {
+        Some(acp_manager) => {
+            match tokio::time::timeout_at(deadline, acp_manager.stop_producers()).await {
+                Ok(Ok(())) => false,
+                Ok(Err(_)) | Err(_) => true,
+            }
+        }
+        None => true,
+    };
+    if producer_stop_failed {
+        log::error!(
+            "[desktop-exit] shutdown_phase=stop_acp_producers stable_code={} result=FAILED",
+            crate::web::ACP_PRODUCER_STOP_FAILED
+        );
+        outcome.failures.push(crate::web::ACP_PRODUCER_STOP_FAILED);
+    }
+
+    outcome.conversation_drain_attempts = 1;
+    let drain_result = match ws_relay {
+        Some(ws_relay) => {
+            ws_relay
+                .shutdown_conversation_persistence_until(deadline)
+                .await
+        }
+        None => Err("Conversation relay is unavailable".to_string()),
+    };
+    if drain_result.is_err() {
+        log::error!(
+            "[desktop-exit] shutdown_phase=drain_conversation_persistence stable_code={} result=FAILED",
+            crate::web::CONVERSATION_PERSISTENCE_DRAIN_FAILED
+        );
+        outcome
+            .failures
+            .push(crate::web::CONVERSATION_PERSISTENCE_DRAIN_FAILED);
+    } else {
+        log::info!(
+            "[desktop-exit] shutdown_phase=drain_conversation_persistence stable_code=OK result=PASS"
+        );
+    }
+
+    outcome.catalog_flush_attempts = 1;
+    let catalog_result = match ws_relay {
+        Some(ws_relay) => ws_relay.flush_catalog_until(deadline).await,
+        None => Err("Conversation relay is unavailable".to_string()),
+    };
+    match catalog_result {
+        Ok(receipt) => log::info!(
+            "[desktop-exit] shutdown_phase=flush_conversation_catalog stable_code=OK result=PASS requested_generation={} flushed_generation={} write_count={}",
+            receipt.requested_generation,
+            receipt.flushed_generation,
+            receipt.write_count
+        ),
+        Err(_) => {
+            log::error!(
+                "[desktop-exit] shutdown_phase=flush_conversation_catalog stable_code={} result=FAILED",
+                crate::web::CONVERSATION_CATALOG_FLUSH_FAILED
+            );
+            outcome
+                .failures
+                .push(crate::web::CONVERSATION_CATALOG_FLUSH_FAILED);
+        }
+    }
+    outcome
+}
+
 static CLEANUP_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 // Claimed synchronously when we enter the async cleanup path and never reset.
 // Prevents a second ExitRequested (e.g. an OS exit signal, or the exit(0) we
@@ -1256,9 +1410,14 @@ static CLEANUP_IN_PROGRESS: std::sync::atomic::AtomicBool =
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Keep the legacy importer linkable for compatibility tests and older internal callers, but
+    // never invoke it after the synchronous Conversation bootstrap cutover.
+    let _legacy_import_compatibility_symbol = crate::acp::import_chat_history;
+
     // Install the panic hook before anything can panic so Rust panics are
     // captured to the log file with a backtrace (issue #244).
     logging::install_panic_hook();
+    logging::install_desktop_tracing_bridge();
 
     let builder = tauri::Builder::default();
 
@@ -1316,6 +1475,55 @@ pub fn run() {
             // channel, session id, and resolved log path on a single line.
             logging::log_startup_banner(&handle);
 
+            // Conversation admission is the first app-managed storage/resource boundary.
+            let app_data_dir = handle
+                .path()
+                .app_data_dir()
+                .map_err(|error| format!("failed to resolve app data directory: {error}"))?;
+            let conversation_workspace_base = std::env::var("TERMUL_CONVERSATION_WORKSPACE_ROOT")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(std::path::PathBuf::from)
+                .or_else(|| handle.path().document_dir().ok().map(|path| path.join("Termul")))
+                .or_else(|| {
+                    log::warn!(
+                        "[conversation-bootstrap] document directory unavailable; using home directory"
+                    );
+                    handle.path().home_dir().ok().map(|path| path.join("Termul"))
+                })
+                .ok_or_else(|| {
+                    "CONVERSATION_ROOT_INVALID: no document or home directory is available"
+                        .to_string()
+                })?;
+            let conversation_bootstrap = crate::conversation::ConversationBootstrap::run(
+                crate::conversation::HostConversationRoots::desktop(
+                    app_data_dir.clone(),
+                    conversation_workspace_base,
+                ),
+                crate::conversation::MigrationHostMode::Desktop,
+            )
+            .map_err(|error| error.to_string())?;
+            log::info!(
+                "[conversation-bootstrap] desktop repository ready phase={:?} precedence={:?} recovery_count={}",
+                conversation_bootstrap.migration_phase,
+                conversation_bootstrap.reader_precedence,
+                conversation_bootstrap.recovery_item_count
+            );
+            app.manage(Arc::clone(&conversation_bootstrap.repository));
+            app.manage(Arc::clone(&conversation_bootstrap.reader));
+            app.manage(Arc::clone(&conversation_bootstrap.creation));
+            app.manage(Arc::clone(&conversation_bootstrap.persistence_adapter));
+            // Publish the exact bootstrap-owned ordering/shutdown authority. Relay construction
+            // below resolves this same core; no second writer task set is admitted.
+            app.manage(Arc::clone(&conversation_bootstrap.ordered_persistence));
+            app.manage(Arc::clone(&conversation_bootstrap.workspace));
+            app.manage(Arc::clone(&conversation_bootstrap.application));
+            let conversation_migration_control = Arc::new(
+                crate::conversation::ConversationMigrationControlService::new(&app_data_dir)
+                    .map_err(|error| error.to_string())?,
+            );
+            app.manage(conversation_migration_control);
+
             // Window chrome is configured before show(). macOS overlay settings
             // live in tauri.conf.json — avoid set_decorations(true) there because
             // it resets hiddenTitle/full-size content view. Win/Linux drop native
@@ -1372,74 +1580,22 @@ pub fn run() {
             // Desktop renderer chat history lives outside tauri-plugin-store so
             // loading unrelated preferences never materializes full transcripts
             // in the WebView. The app-data path is mandatory for safe startup.
-            let chat_history_root = handle
-                .path()
-                .app_data_dir()
-                .map_err(|error| format!("failed to resolve app data directory: {error}"))?
-                .join("acp-chat-history");
-            let chat_history_store = ChatHistoryStore::open(chat_history_root)
+            let chat_history_root = app_data_dir.join("acp-chat-history");
+            let chat_history_store = ChatHistoryStore::open_read_only(chat_history_root)
                 .map_err(|error| format!("failed to open ACP chat history store: {error}"))?;
             log::info!(
                 "[acp-history] store ready path={}",
                 chat_history_store.root().display()
             );
 
-            // Host-owned durable ACP history (CAP-2). The desktop attaches the
-            // same file-backed `SessionPersistence` the standalone server uses,
-            // so every non-ephemeral session becomes durable at the host
-            // event/session layer regardless of which client created it. The
-            // sessions root is desktop-private: NEVER share it with a
-            // standalone `termul-server` on the same machine (two processes on
-            // one JSONL store would corrupt both). The persistence must exist
-            // BEFORE any agent spawn — driver threads clone it at spawn time.
-            let sessions_root = handle
-                .path()
-                .app_data_dir()
-                .map_err(|error| format!("failed to resolve app data directory: {error}"))?
-                .join("acp-sessions");
-            let session_persistence =
-                match tauri::async_runtime::block_on(SessionPersistence::open(
-                    sessions_root.clone(),
-                )) {
-                    Ok(persistence) => {
-                        log::info!(
-                            "[acp-history] host persistence ready path={}",
-                            persistence.root().display()
-                        );
-                        Some(persistence)
-                    }
-                    Err(error) => {
-                        // Degrade, don't crash: history becomes live-only, the
-                        // app must still boot (parity with the store-free web
-                        // negotiation path).
-                        log::error!(
-                            "[acp-history] host persistence unavailable path={} error={error}",
-                            sessions_root.display()
-                        );
-                        None
-                    }
-                };
-            // Idempotent incremental import of legacy renderer-authored
-            // history so existing desktop sessions survive the ownership
-            // transfer. Per-entry fail-open inside; `acp_history_list`
-            // tolerates a partially converged store. Spawned as a background
-            // task so it does NOT block `setup` (the main window is created
-            // immediately) — the import is documented idempotent and safe to
-            // run after setup returns. `app.manage` below takes ownership of
-            // the store; the task holds its own `Arc` clones.
-            if let Some(persistence) = &session_persistence {
-                let persistence = std::sync::Arc::clone(persistence);
-                let chat_history = std::sync::Arc::clone(&chat_history_store);
-                tauri::async_runtime::spawn(async move {
-                    let imported =
-                        crate::acp::import_chat_history(&persistence, &chat_history).await;
-                    if imported > 0 {
-                        log::info!("[acp-history] legacy store imported sessions={imported}");
-                    }
-                });
-            }
+            // ConversationRepository is the sole live history writer after bootstrap.
+            // The legacy `acp-sessions` root was already inventoried/migrated synchronously and
+            // is not opened as a live SessionPersistence store.
             app.manage(chat_history_store);
-            app.manage(commands::HostHistoryStore(session_persistence.clone()));
+            app.manage(commands::HostHistoryStore::conversation(
+                Arc::clone(&conversation_bootstrap.persistence_adapter),
+                None,
+            ));
 
             // CAP-5 / Story 5: open the host-owned workspace-manifests root
             // under `<app_data_dir>/workspace-manifests`. The desktop owns its
@@ -1448,13 +1604,9 @@ pub fn run() {
             // both). `None` degrades to fresh-only mode (the
             // `workspace_manifest_*` commands return `Ok(None)` / idempotent
             // success; the web routes follow suit).
-            let workspace_manifests_root = handle
-                .path()
-                .app_data_dir()
-                .map_err(|error| format!("failed to resolve app data directory: {error}"))?
-                .join("workspace-manifests");
+            let workspace_manifests_root = app_data_dir.join("workspace-manifests");
             let workspace_manifest_service =
-                match tauri::async_runtime::block_on(WorkspaceManifestService::open(
+                match tauri::async_runtime::block_on(WorkspaceManifestService::open_read_only(
                     workspace_manifests_root.clone(),
                 )) {
                     Ok(service) => {
@@ -1529,6 +1681,13 @@ pub fn run() {
                 .app_data_dir()
                 .map_err(|error| format!("failed to resolve app data directory: {error}"))?
                 .join("acp-registry-binaries");
+            crate::acp::npm_local::set_root(
+                handle
+                    .path()
+                    .app_data_dir()
+                    .map_err(|error| format!("failed to resolve app data directory: {error}"))?
+                    .join("acp-npm-packages"),
+            );
             let acp_install_service =
                 match acp_catalog_service.as_ref().zip(Some(acp_install_root.clone())) {
                     Some((catalog, root)) => {
@@ -1582,26 +1741,37 @@ pub fn run() {
             // the desktop's live sessions to a browser/phone over the LAN.
             let mut sinks: Vec<Arc<dyn crate::web::EventSink>> =
                 vec![Arc::new(TauriEventSink::new(handle.clone()))];
-            let (ws_relay, acp_manager) = match &session_persistence {
-                Some(persistence) => {
-                    let relay = Arc::new(WsRelaySink::with_persistence(
-                        4096,
-                        Arc::clone(persistence),
-                    ));
-                    sinks.push(relay.clone());
-                    let manager = Arc::new(AcpManager::with_persistence(
-                        sinks,
-                        Arc::clone(persistence),
-                    ));
-                    (relay, manager)
-                }
-                None => {
-                    let relay = Arc::new(WsRelaySink::new());
-                    sinks.push(relay.clone());
-                    let manager = Arc::new(AcpManager::new(sinks));
-                    (relay, manager)
-                }
-            };
+            let ws_relay = Arc::new(WsRelaySink::with_conversation_persistence(
+                4096,
+                Arc::clone(&conversation_bootstrap.persistence_adapter),
+                None,
+            ));
+            let relay_ordered = ws_relay
+                .ordered_conversation_persistence()
+                .ok_or_else(|| anyhow::anyhow!("desktop relay is missing ordered persistence"))?;
+            if !relay_ordered.shares_authority(&conversation_bootstrap.ordered_persistence) {
+                return Err(anyhow::anyhow!(
+                    "desktop relay did not retain the bootstrap ordering authority"
+                )
+                .into());
+            }
+            sinks.push(ws_relay.clone());
+            let acp_manager = Arc::new(AcpManager::with_conversation_services(
+                sinks,
+                Arc::clone(&conversation_bootstrap.creation),
+                Arc::clone(&conversation_bootstrap.persistence_adapter),
+            ));
+            acp_manager.set_pty_manager(&pty_manager);
+            conversation_bootstrap
+                .application
+                .attach_lifecycle(
+                    crate::conversation::ConversationLifecycleService::from_manager(
+                        Arc::clone(&acp_manager),
+                        Arc::clone(&pty_manager),
+                    )
+                    .map_err(|error| error.to_string())?,
+                )
+                .map_err(|error| error.to_string())?;
             // Attach the server-side permission rendezvous so a phone can
             // respond to `acp:permission_request` over WS. The desktop renderer
             // still responds via the `acp_respond_permission` Tauri command
@@ -1631,6 +1801,31 @@ pub fn run() {
                 tauri::async_runtime::handle().inner().clone(),
             ));
             ws_relay.set_question_rendezvous(question_rendezvous);
+            let scheduled_task_root = app_data_dir.join("scheduled-tasks").join("v1");
+            let scheduled_task_store = Arc::new(
+                crate::scheduled_tasks::ScheduledTaskStore::open_with_legacy_root(
+                    scheduled_task_root.join("catalog"),
+                    Some(scheduled_task_root.join("projects")),
+                )
+                .map_err(|error| format!("failed to open scheduled task store: {error}"))?,
+            );
+            let scheduled_task_executor = Arc::new(
+                crate::scheduled_tasks::AcpScheduledTaskExecutor::new(
+                    Arc::clone(&acp_manager),
+                    Arc::clone(&ws_relay),
+                ),
+            );
+            let scheduled_tasks = crate::scheduled_tasks::ScheduledTaskService::new(
+                scheduled_task_store,
+                scheduled_task_executor,
+            );
+            acp_manager.set_scheduled_tasks(&scheduled_tasks);
+            scheduled_tasks.start_on(tauri::async_runtime::handle().inner());
+            log::info!(
+                "[scheduled-task] boundary=service_started host=desktop root={}",
+                scheduled_tasks.store().root().display()
+            );
+            app.manage(Arc::clone(&scheduled_tasks));
             app.manage(acp_manager);
             app.manage(ws_relay);
 
@@ -1660,8 +1855,17 @@ pub fn run() {
             let migration_manager = Arc::new(MigrationManager::new(handle.clone()));
             app.manage(migration_manager.clone());
 
-            // Create Remote Server State
-            let remote_state = Arc::new(RemoteServerState::new());
+            // TASK-002 owns every shared-live credential generation. Startup rejects/removes
+            // credentials left by previous processes and publishes only the digest authority;
+            // RemoteServerState::start rotates a fresh in-memory lease before admission.
+            let remote_authority = Arc::new(provision_desktop_remote_authority()?);
+            app.manage(Arc::clone(&remote_authority));
+
+            // The shared-live host receives the exact same authority instance
+            // managed above and threads it into the HTTP/ACP WebSocket router.
+            let remote_state = Arc::new(RemoteServerState::with_desktop_authority(
+                remote_authority,
+            ));
             app.manage(remote_state);
             let app_data_dir = handle
                 .path()
@@ -1787,13 +1991,18 @@ pub fn run() {
             export_log_file_command,
             copy_log_contents_command,
             export_log_to_default_command,
+            // Restart-required Conversation migration maintenance
+            commands::conversation_migration_control,
             // Terminal commands
             commands::terminal_spawn,
+            commands::terminal_resume,
             commands::terminal_attach,
             commands::terminal_rotate_claim,
             commands::terminal_revoke_claim,
             commands::terminal_write,
             commands::terminal_resize,
+            commands::terminal_close_view,
+            commands::terminal_terminate,
             commands::terminal_kill,
             commands::terminal_get_cwd,
             commands::terminal_get_git_branch,
@@ -1914,6 +2123,7 @@ pub fn run() {
             acp::commands::acp_spawn_agent,
             acp::commands::acp_kill_agent,
             acp::commands::acp_list_agents,
+            acp::commands::acp_set_permission_policy,
             acp::commands::acp_new_session,
             acp::commands::acp_load_session,
             acp::commands::acp_resume_session,
@@ -1935,6 +2145,7 @@ pub fn run() {
             acp::commands::acp_set_session_new_timeout,
             acp::commands::acp_set_session_reopen_timeout,
             acp::commands::acp_set_first_prompt_warmup_timeout,
+            acp::commands::acp_set_prefer_local_npm_install,
             acp::commands::acp_probe_mcp_server,
             // CAP-6 / Story 8: ACP catalog (host-owned resolution).
             acp::commands::acp_list_catalog,
@@ -1949,6 +2160,20 @@ pub fn run() {
             // Agent Skills (Zed-compatible SKILL.md packages)
             skills::commands::list_agent_skills_cmd,
             skills::commands::read_agent_skill_cmd,
+            // Host-level AI scheduled tasks
+            scheduled_tasks::commands::scheduled_task_preview,
+            scheduled_tasks::commands::scheduled_task_list,
+            scheduled_tasks::commands::scheduled_task_get,
+            scheduled_tasks::commands::scheduled_task_draft_create,
+            scheduled_tasks::commands::scheduled_task_draft_update,
+            scheduled_tasks::commands::scheduled_task_activate,
+            scheduled_tasks::commands::scheduled_task_pause,
+            scheduled_tasks::commands::scheduled_task_resume,
+            scheduled_tasks::commands::scheduled_task_delete,
+            scheduled_tasks::commands::scheduled_task_run_now,
+            scheduled_tasks::commands::scheduled_task_retry_run,
+            scheduled_tasks::commands::scheduled_task_list_runs,
+            scheduled_tasks::commands::scheduled_task_list_audit,
             // Remote server commands
             commands::remote_server_start,
             commands::remote_server_stop,
@@ -1962,6 +2187,7 @@ pub fn run() {
             // Desktop ACP renderer-history storage
             commands::acp_history_list,
             commands::acp_history_get,
+            commands::acp_history_get_page,
             commands::acp_history_save,
             commands::acp_history_delete,
             commands::acp_history_flush,
@@ -1970,7 +2196,27 @@ pub fn run() {
             commands::acp_history_get_legacy,
             // Frontend error forwarding (issue #244)
             commands::log_frontend_error,
-            // Workspace manifest (CAP-5 / Story 5)
+            // Shared Conversation application service
+            commands::conversation_host_status,
+            commands::conversation_list,
+            commands::conversation_get,
+            commands::conversation_rename,
+            commands::conversation_open,
+            commands::conversation_resolve_legacy_id,
+            commands::conversation_attach_project,
+            commands::conversation_detach_project,
+            commands::conversation_update_execution_target,
+            // Per-Conversation SessionWorkspace (Conversation stage 5)
+            commands::session_workspace_get,
+            commands::session_workspace_write,
+            commands::conversation_recovery_resolve,
+            // Explicit Conversation Chat/ACP lifecycle
+            commands::conversation_detach_binding,
+            commands::conversation_rebind_detached_binding,
+            commands::conversation_suspend_binding,
+            commands::conversation_replace_binding,
+            commands::conversation_delete,
+            // Workspace manifest (legacy read-only compatibility)
             commands::workspace_manifest_get,
             commands::workspace_manifest_write,
             commands::workspace_manifest_delete,
@@ -1980,18 +2226,10 @@ pub fn run() {
 
     app.run(|app_handle, event| {
         if let RunEvent::ExitRequested { api, .. } = event {
-            // Cleanup already finished — let the app exit immediately.
             if CLEANUP_DONE.load(std::sync::atomic::Ordering::SeqCst) {
                 return;
             }
-            // Prevent every exit request while the single cleanup task runs.
-            // A re-entrant request must not bypass cleanup through Tauri's
-            // default exit behavior while CLEANUP_IN_PROGRESS is already true.
             api.prevent_exit();
-
-            // Atomically claim the cleanup path. If a previous ExitRequested
-            // already started the async cleanup (not yet done), short-circuit
-            // so we don't spawn a second task racing kill_all()/destroy_all().
             if CLEANUP_IN_PROGRESS
                 .compare_exchange(
                     false,
@@ -2003,6 +2241,7 @@ pub fn run() {
             {
                 return;
             }
+            crate::host_admission::HostAdmission::global().close();
 
             let browser_tab_manager = app_handle
                 .try_state::<Arc<browser_tab_manager::BrowserTabManager>>()
@@ -2013,75 +2252,129 @@ pub fn run() {
             let remote_state = app_handle
                 .try_state::<Arc<RemoteServerState>>()
                 .map(|state| state.inner().clone());
-
             let acp_manager = app_handle
                 .try_state::<Arc<AcpManager>>()
                 .map(|state| state.inner().clone());
+            let ws_relay = app_handle
+                .try_state::<Arc<WsRelaySink>>()
+                .map(|state| state.inner().clone());
+            let scheduled_tasks = app_handle
+                .try_state::<Arc<crate::scheduled_tasks::ScheduledTaskService>>()
+                .map(|state| state.inner().clone());
+            let pty_manager = app_handle
+                .try_state::<Arc<PtyManager>>()
+                .map(|state| state.inner().clone());
+            let app_handle_clone = app_handle.clone();
 
-            if let Some(pty_manager) = app_handle.try_state::<Arc<PtyManager>>() {
-                let pty_manager_clone = pty_manager.inner().clone();
-                let app_handle_clone = app_handle.clone();
+            // The run callback may execute outside a Tokio reactor; Tauri owns this runtime.
+            tauri::async_runtime::spawn(async move {
+                let deadline = tokio::time::Instant::now()
+                    + crate::conversation::DEFAULT_DRAIN_TIMEOUT;
+                crate::host_admission::HostAdmission::global()
+                    .drain_until(deadline)
+                    .await;
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                let connection_receipt =
+                    crate::web::upgraded_connections::UpgradedConnectionRegistry::global()
+                        .join_all(remaining)
+                        .await;
+                log::info!(
+                    "[desktop-exit] shutdown_phase=join_upgraded_connections stable_code=OK active={} failed={} timed_out={}",
+                    connection_receipt.active,
+                    connection_receipt.failed,
+                    connection_receipt.timed_out
+                );
 
-                // Spawn async cleanup task via tauri::async_runtime
-                // (not tokio::spawn directly — the run callback may fire on
-                // a thread without a Tokio reactor, e.g. macOS WKWebView events)
-                tauri::async_runtime::spawn(async move {
-                    if let Some(ssh_manager) = ssh_manager {
-                        ssh_manager.shutdown().await;
+                // Close remote ingress before producer stop. Shared-live remains non-owning and
+                // its stop path never drains Desktop-global Conversation persistence.
+                if let Some(remote_state) = remote_state {
+                    match tokio::time::timeout_at(deadline, remote_state.stop()).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(_)) | Err(_) => log::error!(
+                            "[desktop-exit] shutdown_phase=stop_remote stable_code=REMOTE_STOP_TIMEOUT result=FAILED"
+                        ),
                     }
-                    if let Some(remote_state) = remote_state {
-                        let _ = remote_state.stop().await;
+                }
+
+                if let Some(scheduled_tasks) = scheduled_tasks {
+                    scheduled_tasks
+                        .shutdown(deadline.saturating_duration_since(tokio::time::Instant::now()))
+                        .await;
+                }
+
+                let mut durability = stop_desktop_producers_and_drain(
+                    acp_manager.as_deref(),
+                    ws_relay.as_deref(),
+                    deadline,
+                )
+                .await;
+
+                if let Some(ssh_manager) = ssh_manager {
+                    if tokio::time::timeout_at(deadline, ssh_manager.shutdown())
+                        .await
+                        .is_err()
+                    {
+                        log::error!(
+                            "[desktop-exit] shutdown_phase=shutdown_ssh stable_code=REMOTE_STAGE_TIMEOUT result=FAILED"
+                        );
                     }
-                    pty_manager_clone.kill_all().await;
-                    if let Some(acp_manager) = acp_manager {
-                        // kill_all -> kill_all_checked flushes durable queues;
-                        // shutdown_persistence then stops the writers so the
-                        // host history index is canonical at exit.
-                        acp_manager.kill_all().await;
-                        if let Err(error) = acp_manager.shutdown_persistence().await {
+                }
+                if let Some(pty_manager) = pty_manager {
+                    let receipt = pty_manager.kill_all_until(deadline).await;
+                    log::info!(
+                        "[desktop-exit] shutdown_phase=cleanup_ptys stable_code={} result={} attempted={} succeeded={} failed={} in_flight={} elapsed_ms={}",
+                        if receipt.clean_success() {
+                            "OK"
+                        } else {
+                            crate::web::PTY_CLEANUP_FAILED
+                        },
+                        if receipt.clean_success() { "PASS" } else { "FAILED" },
+                        receipt.attempted,
+                        receipt.succeeded,
+                        receipt.failed,
+                        receipt.in_flight,
+                        receipt.elapsed_ms
+                    );
+                    if !receipt.clean_success() {
+                        durability.failures.push(crate::web::PTY_CLEANUP_FAILED);
+                    }
+                    durability.pty_shutdown = Some(receipt);
+                } else {
+                    log::error!(
+                        "[desktop-exit] shutdown_phase=cleanup_ptys stable_code={} result=FAILED attempted=0 succeeded=0 failed=0 in_flight=0 elapsed_ms=0",
+                        crate::web::PTY_CLEANUP_FAILED
+                    );
+                    durability.failures.push(crate::web::PTY_CLEANUP_FAILED);
+                }
+                let mut clean_exit = durability.clean_success();
+
+                if let Some(acp_manager) = acp_manager {
+                    match tokio::time::timeout_at(deadline, acp_manager.shutdown_persistence()).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) | Err(_) => {
                             log::error!(
-                                "[acp-history] persistence shutdown failed at exit: {error}"
+                                "[desktop-exit] shutdown_phase=shutdown_acp_persistence stable_code={} result=FAILED",
+                                crate::web::ACP_PERSISTENCE_SHUTDOWN_FAILED
                             );
+                            clean_exit = false;
                         }
                     }
-                    if let Some(browser_tab_manager) = browser_tab_manager {
-                        browser_tab_manager.destroy_all();
-                    }
-                    // Mark cleanup as done so the subsequent exit event isn't prevented
-                    CLEANUP_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
-                    // After cleanup completes, allow the app to exit with code 0
-                    app_handle_clone.exit(0);
-                });
-            } else if let Some(acp_manager) = acp_manager {
-                let app_handle_clone = app_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    acp_manager.kill_all().await;
-                    if let Err(error) = acp_manager.shutdown_persistence().await {
-                        log::error!("[acp-history] persistence shutdown failed at exit: {error}");
-                    }
-                    if let Some(browser_tab_manager) = browser_tab_manager {
-                        browser_tab_manager.destroy_all();
-                    }
-                    CLEANUP_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
-                    app_handle_clone.exit(0);
-                });
-            } else {
-                let app_handle_clone = app_handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Some(ssh_manager) = ssh_manager {
-                        ssh_manager.shutdown().await;
-                    }
-                    if let Some(remote_state) = remote_state {
-                        let _ = remote_state.stop().await;
-                    }
-                    if let Some(browser_tab_manager) = browser_tab_manager {
-                        browser_tab_manager.destroy_all();
-                    }
-                    CLEANUP_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
-                    // No PTY or ACP manager, just exit
-                    app_handle_clone.exit(0);
-                });
-            }
+                }
+                if let Some(browser_tab_manager) = browser_tab_manager {
+                    browser_tab_manager.destroy_all();
+                }
+                clear_desktop_remote_generation();
+
+                CLEANUP_DONE.store(true, std::sync::atomic::Ordering::SeqCst);
+                let exit_code = if clean_exit { 0 } else { 1 };
+                log::info!(
+                    "[desktop-exit] shutdown_phase=complete stable_code={} result={} exit_code={}",
+                    if clean_exit { "OK" } else { "DESKTOP_EXIT_DEGRADED" },
+                    if clean_exit { "PASS" } else { "FAILED" },
+                    exit_code
+                );
+                app_handle_clone.exit(exit_code);
+            });
         }
     });
 }
@@ -2089,6 +2382,178 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn desktop_remote_bootstrap_rejects_reusable_legacy_credentials() {
+        let source = include_str!("lib.rs");
+        assert!(!source.contains("issue_or_load_desktop(\"remote-access-v1\")"));
+        let helper_start = source
+            .find("fn provision_desktop_remote_authority()")
+            .expect("desktop authority helper");
+        let helper_end = source[helper_start..]
+            .find("fn clear_desktop_remote_generation()")
+            .map(|offset| helper_start + offset)
+            .expect("desktop authority helper boundary");
+        let helper = &source[helper_start..helper_end];
+        let delete_position = helper
+            .find("keyring_delete(DESKTOP_REMOTE_GENERATION_ACCOUNT)")
+            .expect("previous generation is deleted before bootstrap");
+        let issue_position = helper
+            .find("issue_or_load_desktop(DESKTOP_REMOTE_GENERATION_ACCOUNT)")
+            .expect("generation authority seed");
+        assert!(delete_position < issue_position);
+        let invalidate_position = helper[issue_position..]
+            .find("authority.invalidate_generation(bootstrap_generation)")
+            .map(|offset| issue_position + offset)
+            .expect("bootstrap digest is invalidated before authority publication");
+        let final_delete_position = helper[issue_position..]
+            .rfind("keyring_delete(DESKTOP_REMOTE_GENERATION_ACCOUNT)")
+            .map(|offset| issue_position + offset)
+            .expect("bootstrap keyring material is removed");
+        assert!(issue_position < invalidate_position);
+        assert!(invalidate_position < final_delete_position);
+    }
+
+    #[test]
+    fn desktop_history_page_command_is_registered() {
+        let source = include_str!("lib.rs");
+        let handler_start = source
+            .find(".invoke_handler(tauri::generate_handler![")
+            .expect("production invoke handler start");
+        let handler_tail = &source[handler_start..];
+        let handler_end = handler_tail
+            .find("])\n        .build")
+            .expect("production invoke handler end");
+        let handler = &handler_tail[..handler_end];
+        assert_eq!(
+            handler.matches("commands::acp_history_get_page,").count(),
+            1
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn desktop_catalog_flush_failed_blocks_clean_exit_under_host_deadline_and_later_mutation_responsive(
+    ) {
+        use crate::conversation::{
+            AgentSessionBinding, AgentSessionBindingState, ConversationCreator,
+            ConversationEventType, ConversationLifecycleState, ConversationMutation,
+            ConversationRecordV2, ConversationWriter, CreationPartition, ExecutionTarget,
+            AGENT_SESSION_BINDING_SCHEMA_VERSION, CONVERSATION_SCHEMA_VERSION,
+        };
+        use crate::web::sink::{AcpEvent, EventSink};
+        use chrono::Utc;
+        use serde_json::json;
+        use std::time::Duration;
+        use uuid::Uuid;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bootstrap = crate::conversation::ConversationBootstrap::run(
+            crate::conversation::HostConversationRoots::desktop(
+                temp.path().join("state"),
+                temp.path().join("visible"),
+            ),
+            crate::conversation::MigrationHostMode::Desktop,
+        )
+        .unwrap();
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let conversation_id = crate::conversation::ConversationId::new_v4();
+        let created_at = Utc::now();
+        bootstrap
+            .writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: workspace.to_string_lossy().into_owned(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::InitializingAgent,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
+                },
+                ConversationMutation::CreateConversation,
+            )
+            .await
+            .unwrap();
+        bootstrap
+            .writer
+            .bind_agent_session(
+                conversation_id,
+                AgentSessionBinding {
+                    schema_version: AGENT_SESSION_BINDING_SCHEMA_VERSION,
+                    binding_id: Uuid::new_v4(),
+                    agent_session_id: "desktop-catalog-failure".to_string(),
+                    runtime_agent_id: "runtime-desktop-exit".to_string(),
+                    stable_agent_namespace: "config:desktop-exit".to_string(),
+                    execution_cwd: workspace.to_string_lossy().into_owned(),
+                    bound_at_utc: created_at,
+                    state: AgentSessionBindingState::Active,
+                },
+                created_at,
+            )
+            .await
+            .unwrap();
+
+        let relay = Arc::new(WsRelaySink::with_conversation_persistence(
+            32,
+            Arc::clone(&bootstrap.persistence_adapter),
+            None,
+        ));
+        assert!(relay
+            .ordered_conversation_persistence()
+            .unwrap()
+            .shares_authority(&bootstrap.ordered_persistence));
+        bootstrap.repository.reset_catalog_write_counters();
+        bootstrap.repository.fail_next_catalog_writes(usize::MAX);
+        relay
+            .emit(&AcpEvent {
+                sid: Some("desktop-catalog-failure".to_string()),
+                type_: "acp:message_chunk",
+                payload: json!({"ordinal": 1}),
+            })
+            .unwrap();
+        let pending_generation = bootstrap.repository.catalog_pending_generation();
+        let relay_sink: Arc<dyn EventSink> = relay.clone();
+        let acp = Arc::new(AcpManager::new(vec![relay_sink]));
+
+        let outcome = stop_desktop_producers_and_drain(
+            Some(&acp),
+            Some(&relay),
+            tokio::time::Instant::now() + Duration::from_millis(50),
+        )
+        .await;
+        assert!(!outcome.clean_success());
+        assert_eq!(outcome.conversation_drain_attempts, 1);
+        assert_eq!(outcome.catalog_flush_attempts, 1);
+        assert!(outcome
+            .failures
+            .contains(&crate::web::CONVERSATION_CATALOG_FLUSH_FAILED));
+        assert_eq!(
+            bootstrap.repository.catalog_pending_generation(),
+            pending_generation,
+            "failed final generation remains retryable"
+        );
+
+        let mutation_started = std::time::Instant::now();
+        ConversationWriter::append_event(
+            &bootstrap.writer,
+            conversation_id,
+            Utc::now(),
+            ConversationEventType::MessageChunk,
+            json!({"ordinal": 2}),
+            ConversationMutation::AcpEventAppend,
+        )
+        .await
+        .expect("later canonical mutation remains responsive");
+        assert!(mutation_started.elapsed() < Duration::from_secs(1));
+        assert!(bootstrap.repository.catalog_pending_generation() > pending_generation);
+    }
 
     #[test]
     fn native_ui_labels_cover_supported_languages() {
@@ -2185,6 +2650,26 @@ mod tests {
     fn test_get_available_shells_not_empty() {
         let shells = get_available_shells();
         assert!(!shells.is_empty());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_available_shells_prefer_login_shell_path() {
+        let Ok(login) = env::var("SHELL") else {
+            return;
+        };
+        let Some(name) = Path::new(&login).file_name().and_then(|s| s.to_str()) else {
+            return;
+        };
+        if !Path::new(&login).exists() {
+            return;
+        }
+        let shells = get_available_shells();
+        let listed = shells.iter().find(|shell| shell.name == name);
+        assert_eq!(
+            listed.map(|shell| shell.path.as_str()),
+            Some(login.as_str())
+        );
     }
 
     #[test]

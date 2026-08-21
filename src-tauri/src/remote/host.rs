@@ -32,12 +32,13 @@ use std::sync::Arc;
 use serde::Serialize;
 use tokio::process::Child;
 use tokio::sync::oneshot;
-use tracing::{info, warn};
 
 use crate::acp::{AcpCatalogService, AcpInstallService, AcpManager, WorkspaceManifestService};
 use crate::pty::PtyManager;
+use crate::web::auth::{DesktopCredentialLease, IngressProvenance};
+use crate::web::config::MAX_EVENT_LOG_CAPACITY;
 use crate::web::sink::WsRelaySink;
-use crate::web::{serve_router, ProjectRegistry, ServerConfig};
+use crate::web::{serve_router, ProjectRegistry, RemoteAccessAuthority, ServerConfig};
 
 /// Which network interface(s) the in-process web server binds to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,6 +113,9 @@ pub struct RemoteStatus {
     pub tunnel_url: Option<String>,
     /// Active provider id (`cloudflareQuick` / `cloudflareNamed` / `frp`).
     pub tunnel_provider: Option<String>,
+    /// Credentialed scan/copy URL for the active generation. The raw bearer is
+    /// materialized only in this response from the host-owned in-memory lease.
+    pub access_url: Option<String>,
 }
 
 impl RemoteStatus {
@@ -124,10 +128,16 @@ impl RemoteStatus {
             bind_host: None,
             tunnel_url: None,
             tunnel_provider: None,
+            access_url: None,
         }
     }
 
-    fn running(addr: SocketAddr, bind_mode: RemoteBindMode, tunnel_url: Option<String>) -> Self {
+    fn running(
+        addr: SocketAddr,
+        bind_mode: RemoteBindMode,
+        tunnel_url: Option<String>,
+        credential_lease: Option<&DesktopCredentialLease>,
+    ) -> Self {
         // The desktop-hosted server always binds localhost (the cloudflared
         // quick-tunnel targets it), so `url` is a concrete loopback URL — kept
         // for "open on this machine" diagnostics. The phone-reachable address
@@ -137,6 +147,12 @@ impl RemoteStatus {
         } else {
             Some(format!("http://{}:{}", addr.ip(), addr.port()))
         };
+        let access_url = tunnel_url.as_deref().and_then(|origin| {
+            let lease = credential_lease?;
+            let mut url = url::Url::parse(origin).ok()?;
+            url.set_fragment(Some(&format!("access_token={}", lease.bearer())));
+            Some(url.into())
+        });
         Self {
             running: true,
             url,
@@ -145,6 +161,7 @@ impl RemoteStatus {
             bind_host: Some(bind_mode.display_host().to_string()),
             tunnel_url,
             tunnel_provider: None,
+            access_url,
         }
     }
 
@@ -157,7 +174,7 @@ impl RemoteStatus {
 /// Running server handle — owns the shutdown signal, the serve task handle, and
 /// the bound address.
 struct RemoteServer {
-    shutdown_tx: Option<oneshot::Sender<()>>,
+    shutdown_tx: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
     /// The spawned `axum::serve` task. Stored (not dropped) so `stop()` can
     /// await its graceful drain and `status()` can detect a dead task.
     serve_handle: Option<tokio::task::JoinHandle<()>>,
@@ -177,6 +194,10 @@ struct RemoteServer {
     /// is reaped via `kill_on_drop` — the child is NOT held here directly,
     /// which keeps `status()` sync (no try_wait-across-`.await` dance).
     tunnel_watchdog: Option<tokio::task::JoinHandle<()>>,
+    /// Exactly one raw desktop credential generation, owned only while this
+    /// server is active. The authority stores generation metadata + digest.
+    credential_lease: Option<DesktopCredentialLease>,
+    authority: Arc<RemoteAccessAuthority>,
 }
 
 impl RemoteServer {
@@ -187,14 +208,55 @@ impl RemoteServer {
             .as_ref()
             .is_some_and(tokio::task::JoinHandle::is_finished)
     }
+
+    fn retire_credential(
+        &mut self,
+        lifecycle_phase: &'static str,
+    ) -> crate::web::auth::GenerationRetirementReceipt {
+        let Some(lease) = self.credential_lease.take() else {
+            return crate::web::auth::GenerationRetirementReceipt {
+                generation: 0,
+                credential_invalidated: false,
+                origins_cleared: false,
+                failure_state_cleared: false,
+                keyring_deleted: true,
+                retry_owner: false,
+                stable_codes: Vec::new(),
+            };
+        };
+        let generation = lease.generation();
+        let receipt = self.authority.retire_generation(generation);
+        if receipt.is_clean() {
+            log::info!(
+                target: "termul::remote::host",
+                "operation=generation_retire generation={} lifecycle_phase={} stable_code=OK keyring_deleted={}",
+                generation,
+                lifecycle_phase,
+                receipt.keyring_deleted
+            );
+        } else {
+            if receipt.retry_owner {
+                self.credential_lease = Some(lease);
+            }
+            log::error!(
+                target: "termul::remote::host",
+                "operation=generation_retire generation={} lifecycle_phase={} stable_code=REMOTE_CREDENTIAL_CLEANUP_FAILED keyring_deleted={}",
+                generation,
+                lifecycle_phase,
+                receipt.keyring_deleted
+            );
+        }
+        receipt
+    }
 }
 
 impl Drop for RemoteServer {
     fn drop(&mut self) {
+        self.retire_credential("drop");
         // Best-effort graceful shutdown on drop (e.g. app exit). Signal the
         // serve task to drain; the JoinHandle is left to the runtime to reap
         // (awaiting it in `Drop` isn't possible — `Drop` is sync).
-        if let Some(tx) = self.shutdown_tx.take() {
+        if let Some(tx) = self.shutdown_tx.lock().unwrap().take() {
             let _ = tx.send(());
         }
         // Abort the cloudflared watchdog so the child it owns is reaped via
@@ -208,15 +270,62 @@ impl Drop for RemoteServer {
     }
 }
 
+struct PendingCredentialLease {
+    authority: Arc<RemoteAccessAuthority>,
+    lease: Option<DesktopCredentialLease>,
+}
+
+impl PendingCredentialLease {
+    fn new(authority: Arc<RemoteAccessAuthority>, lease: DesktopCredentialLease) -> Self {
+        Self {
+            authority,
+            lease: Some(lease),
+        }
+    }
+
+    fn into_lease(mut self) -> DesktopCredentialLease {
+        self.lease.take().expect("pending credential lease")
+    }
+}
+
+impl Drop for PendingCredentialLease {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            let _ = self.authority.retire_generation(lease.generation());
+        }
+    }
+}
+
 /// Tauri-managed wrapper tracking the in-process web server's start/stop state.
 pub struct RemoteServerState {
     inner: std::sync::Mutex<Option<RemoteServer>>,
+    lifecycle: tokio::sync::Mutex<()>,
+    authority: Arc<RemoteAccessAuthority>,
 }
 
 impl RemoteServerState {
-    pub fn new() -> Self {
+    pub fn with_desktop_authority(authority: Arc<RemoteAccessAuthority>) -> Self {
         Self {
             inner: std::sync::Mutex::new(None),
+            lifecycle: tokio::sync::Mutex::new(()),
+            authority,
+        }
+    }
+
+    pub fn new() -> Self {
+        #[cfg(test)]
+        {
+            Self {
+                inner: std::sync::Mutex::new(None),
+                lifecycle: tokio::sync::Mutex::new(()),
+                authority: Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token")),
+            }
+        }
+        #[cfg(not(test))]
+        Self {
+            inner: std::sync::Mutex::new(None),
+            lifecycle: tokio::sync::Mutex::new(()),
+            authority: Arc::new(RemoteAccessAuthority::unconfigured()),
         }
     }
 
@@ -257,6 +366,7 @@ impl RemoteServerState {
         ws_relay: Arc<WsRelaySink>,
         registry: Arc<ProjectRegistry>,
         bind_mode: RemoteBindMode,
+        conversation: Option<Arc<crate::conversation::ConversationApplicationService>>,
         workspace_manifest: Option<Arc<WorkspaceManifestService>>,
         acp_catalog: Option<Arc<AcpCatalogService>>,
         acp_install: Option<Arc<AcpInstallService>>,
@@ -267,6 +377,7 @@ impl RemoteServerState {
             ws_relay,
             registry,
             bind_mode,
+            conversation,
             workspace_manifest,
             acp_catalog,
             acp_install,
@@ -288,11 +399,13 @@ impl RemoteServerState {
         ws_relay: Arc<WsRelaySink>,
         registry: Arc<ProjectRegistry>,
         _bind_mode: RemoteBindMode,
+        conversation: Option<Arc<crate::conversation::ConversationApplicationService>>,
         workspace_manifest: Option<Arc<WorkspaceManifestService>>,
         acp_catalog: Option<Arc<AcpCatalogService>>,
         acp_install: Option<Arc<AcpInstallService>>,
         bind_port: u16,
     ) -> Result<RemoteStatus, String> {
+        let _lifecycle = self.lifecycle.lock().await;
         // The built-in cloudflared quick-tunnel forwards to localhost, so the
         // desktop-hosted server always binds localhost regardless of the
         // caller's bind mode — the LAN `all` mode is removed from the popover
@@ -306,6 +419,20 @@ impl RemoteServerState {
                 return Err("Remote server is already running".to_string());
             }
         }
+        let event_log_capacity = ws_relay.event_log_capacity();
+        if !(1..=MAX_EVENT_LOG_CAPACITY).contains(&event_log_capacity) {
+            return Err(format!(
+                "remote event-log capacity must be in 1..={MAX_EVENT_LOG_CAPACITY}"
+            ));
+        }
+        self.authority
+            .set_ingress_provenance(IngressProvenance::PublicTunnel);
+        let pending_credential = PendingCredentialLease::new(
+            Arc::clone(&self.authority),
+            self.authority
+                .rotate_desktop_credential()
+                .map_err(|error| format!("failed to rotate remote credential: {error}"))?,
+        );
 
         // CAP-1 / Story 1: resolve the project-root boundary for the
         // shared-live server from the **active project** (the
@@ -326,27 +453,19 @@ impl RemoteServerState {
         // A transient canonicalization failure on the registry default (deleted
         // between sync and start) falls through to the home fallback rather
         // than refusing to start — the operator can still re-sync the registry
-        // and rebind live. A `warn!` is logged so the operator notices.
+        // and rebind live. A stable warning is emitted without the path/error.
         let project_root = {
-            // 1. Try the registry's default-project path first.
-            let from_registry = registry
-                .default_project_path()
-                .and_then(|p| {
-                    match crate::web::config::resolve_and_validate_project_root(
-                        std::path::Path::new(&p),
-                    ) {
-                        Ok(canonical) => Some(canonical),
-                        Err(e) => {
-                            warn!(
-                                "shared-live: registry default project path '{}' failed \
-                                 canonicalization: {}; falling back to home",
-                                p,
-                                e
-                            );
-                            None
-                        }
+            let from_registry = registry.default_project_path().and_then(|p| {
+                match crate::web::config::resolve_and_validate_project_root(std::path::Path::new(
+                    &p,
+                )) {
+                    Ok(canonical) => Some(canonical),
+                    Err(_) => {
+                        log::warn!(target: "termul::remote::host", "operation=project_root_resolve stable_code=PROJECT_ROOT_INVALID");
+                        None
                     }
-                });
+                }
+            });
             if let Some(root) = from_registry {
                 root
             } else {
@@ -356,12 +475,7 @@ impl RemoteServerState {
                      set $TERMUL_PROJECT_ROOT or ensure $HOME is available"
                         .to_string()
                 })?;
-                warn!(
-                    "shared-live started with no usable registry default; project_root \
-                     fell back to home ({}). /skills, /git/*, /search/content will \
-                     reject any project outside this tree until a project is synced.",
-                    raw_root.display()
-                );
+                log::warn!(target: "termul::remote::host", "operation=shared_live_host stable_code=REJECTED");
                 crate::web::config::resolve_and_validate_project_root(&raw_root).map_err(|e| {
                     format!(
                         "shared-live server refused to start: {e} \
@@ -385,6 +499,7 @@ impl RemoteServerState {
                 .rendezvous()
                 .map(|r| r.disconnect_grace().as_secs())
                 .unwrap_or(15),
+            conversation_workspace_root: project_root.join("Termul"),
             project_root,
             // Desktop-hosted shared-live mode queries the live desktop
             // `AcpManager` via the in-memory renderer-fed registry, NOT a
@@ -402,12 +517,15 @@ impl RemoteServerState {
             // Issue #613: `None` → resolve `<service_account_state_dir>/store.json`
             // at serve time (the shared-live host gets a durable store too).
             store_file: None,
+            remote_access_token_file: None,
+            allowed_origins: Vec::new(),
         };
 
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let shutdown_tx = Arc::new(std::sync::Mutex::new(Some(shutdown_tx)));
         let shutdown = async move {
             let _ = shutdown_rx.await;
-            info!("Shared-live web server shutting down…");
+            log::info!(target: "termul::remote::host", "operation=shared_live_host stable_code=OK");
         };
 
         let (addr, serve_handle) = serve_router(
@@ -423,31 +541,32 @@ impl RemoteServerState {
             None,
             cfg,
             shutdown,
+            conversation,
             workspace_manifest,
             acp_catalog,
             acp_install,
+            Arc::clone(&self.authority),
         )
         .await
         .map_err(|e| format!("Failed to start remote server: {}", e))?;
 
-        let status = RemoteStatus::running(addr, bind_mode, None);
-        info!(
-            "Shared-live web server sharing desktop AcpManager on http://{}",
-            addr
-        );
+        let status = RemoteStatus::running(addr, bind_mode, None, None);
+        log::info!(target: "termul::remote::host", "operation=shared_live_host stable_code=OK");
 
         let mut slot = self.inner.lock().unwrap();
         if slot.is_some() {
             // Lost a concurrent-start race. Signal this spawned task to drain
             // (do NOT drop `shutdown_tx` silently — that would orphan a second
             // server that `remote_server_stop` could never reach).
-            let _ = shutdown_tx.send(());
+            if let Some(tx) = shutdown_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
             // Let the serve task run down before discarding its handle.
             drop(serve_handle);
             return Err("Remote server is already running".to_string());
         }
         *slot = Some(RemoteServer {
-            shutdown_tx: Some(shutdown_tx),
+            shutdown_tx,
             serve_handle: Some(serve_handle),
             addr,
             bind_mode,
@@ -459,6 +578,8 @@ impl RemoteServerState {
             tunnel_provider: None,
             tunnel_dead: None,
             tunnel_watchdog: None,
+            credential_lease: Some(pending_credential.into_lease()),
+            authority: Arc::clone(&self.authority),
         });
         Ok(status)
     }
@@ -470,7 +591,28 @@ impl RemoteServerState {
     /// desktop path too. Does NOT call `AcpManager::kill_all` — the desktop's
     /// live agents survive a shared-live toggle-off.
     pub async fn stop(&self) -> Result<RemoteStatus, String> {
-        let server = { self.inner.lock().unwrap().take() };
+        let _lifecycle = self.lifecycle.lock().await;
+        let receipt = {
+            let mut slot = self.inner.lock().unwrap();
+            match slot.as_mut() {
+                Some(server) => server.retire_credential("stop"),
+                None => return Err("Remote server is not running".to_string()),
+            }
+        };
+        if !receipt.is_clean() {
+            log::error!(
+                target: "termul::remote::host",
+                "operation=shared_live_host lifecycle_phase=stop stable_code=REMOTE_CREDENTIAL_CLEANUP_FAILED generation={} keyring_deleted={} retry_owner={}",
+                receipt.generation,
+                receipt.keyring_deleted,
+                receipt.retry_owner
+            );
+            return Err("REMOTE_CREDENTIAL_CLEANUP_FAILED".to_string());
+        }
+        let server = {
+            let mut slot = self.inner.lock().unwrap();
+            slot.take()
+        };
         match server {
             Some(mut server) => {
                 // Abort the cloudflared watchdog so the owned child is reaped
@@ -489,7 +631,7 @@ impl RemoteServerState {
                 // flushing before the caller proceeds (e.g. app exit →
                 // `kill_all`). `Drop` would only signal; awaiting here enforces
                 // ordering.
-                if let Some(tx) = server.shutdown_tx.take() {
+                if let Some(tx) = server.shutdown_tx.lock().unwrap().take() {
                     let _ = tx.send(());
                 }
                 if let Some(handle) = server.serve_handle.take() {
@@ -497,7 +639,7 @@ impl RemoteServerState {
                     // panic surfaces as `JoinError` — log, don't propagate.
                     if let Err(join_err) = handle.await {
                         if !join_err.is_cancelled() {
-                            warn!("Shared-live serve task ended unexpectedly: {join_err}");
+                            log::warn!(target: "termul::remote::host", "operation=shared_live_host stable_code=REJECTED");
                         }
                     }
                 }
@@ -517,29 +659,76 @@ impl RemoteServerState {
     /// `.await`.
     pub fn status(&self) -> RemoteStatus {
         let mut slot = self.inner.lock().unwrap();
-        let Some(server) = slot.as_mut() else {
-            return RemoteStatus::stopped();
-        };
-        // If the spawned serve task has exited (error/panic), don't keep
-        // reporting `running` with a dead listener — surface stopped so the
-        // UI doesn't lie about a server the phone can't reach.
-        if server.task_finished() {
+        if slot.is_none() {
             return RemoteStatus::stopped();
         }
+        // If the spawned serve task has exited (error/panic), invalidate its
+        // generation before clearing the published server slot.
+        if slot.as_ref().is_some_and(RemoteServer::task_finished) {
+            let mut finished = slot.take().expect("finished server slot");
+            finished.retire_credential("serve_finished");
+            return RemoteStatus::stopped();
+        }
+        let server = slot.as_mut().expect("running server slot");
         // Clear the tunnel URL once the cloudflared watchdog reports the child
         // dead (the public URL no longer routes). Logged once: the flag stays
         // set but `tunnel_url` is cleared here so subsequent polls skip the arm.
         if server
             .tunnel_dead
             .as_ref()
-            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+            .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
             && server.tunnel_url.is_some()
         {
-            warn!("cloudflared tunnel child exited; clearing stale tunnel URL");
-            server.tunnel_url = None;
+            log::warn!(
+                target: "termul::remote::host",
+                "operation=tunnel_watchdog lifecycle_phase=tunnel_death stable_code=TUNNEL_EXITED"
+            );
+            let mut failed = slot.take().expect("dead tunnel server slot");
+            let receipt = failed.retire_credential("tunnel_death");
+            if !receipt.is_clean() {
+                log::error!(
+                    target: "termul::remote::host",
+                    "operation=tunnel_watchdog lifecycle_phase=tunnel_death stable_code=REMOTE_CREDENTIAL_CLEANUP_FAILED generation={} keyring_deleted={} retry_owner={}",
+                    receipt.generation,
+                    receipt.keyring_deleted,
+                    receipt.retry_owner
+                );
+                *slot = Some(failed);
+                return RemoteStatus::running(
+                    slot.as_ref().expect("retry-owned server").addr,
+                    slot.as_ref().expect("retry-owned server").bind_mode,
+                    slot.as_ref()
+                        .expect("retry-owned server")
+                        .tunnel_url
+                        .clone(),
+                    slot.as_ref()
+                        .and_then(|server| server.credential_lease.as_ref()),
+                )
+                .with_provider(
+                    slot.as_ref()
+                        .and_then(|server| server.tunnel_provider.clone()),
+                );
+            }
+            return RemoteStatus::stopped();
         }
-        RemoteStatus::running(server.addr, server.bind_mode, server.tunnel_url.clone())
-            .with_provider(server.tunnel_provider.clone())
+        RemoteStatus::running(
+            server.addr,
+            server.bind_mode,
+            server.tunnel_url.clone(),
+            server.credential_lease.as_ref(),
+        )
+        .with_provider(server.tunnel_provider.clone())
+    }
+
+    fn fail_active_server(&self, lifecycle_phase: &'static str) {
+        let failed = {
+            let mut slot = self.inner.lock().unwrap();
+            if let Some(server) = slot.as_mut() {
+                server.retire_credential(lifecycle_phase);
+            }
+            slot.take()
+        };
+        drop(failed);
     }
 
     /// Attach a started cloudflared quick-tunnel (URL + live child) to the
@@ -563,12 +752,55 @@ impl RemoteServerState {
         provider: &str,
     ) -> Result<(), String> {
         let mut child = Some(child);
+        let parsed_origin = match url::Url::parse(&url) {
+            Ok(origin) => origin,
+            Err(_) => {
+                if let Some(child) = child.as_mut() {
+                    let _ = child.start_kill();
+                }
+                self.fail_active_server("attach_invalid_origin");
+                return Err("cloudflared returned an invalid public Origin".to_string());
+            }
+        };
+        {
+            let slot = self.inner.lock().unwrap();
+            if slot.as_ref().is_none_or(RemoteServer::task_finished) {
+                if let Some(child) = child.as_mut() {
+                    let _ = child.start_kill();
+                }
+                drop(slot);
+                self.fail_active_server("attach_missing_server");
+                return Err("remote server stopped before tunnel attached".to_string());
+            }
+        }
+        if let Err(error) = self.authority.set_public_origin(parsed_origin.clone()) {
+            if let Some(child) = child.as_mut() {
+                let _ = child.start_kill();
+            }
+            self.fail_active_server("attach_origin_policy");
+            return Err(format!("failed to register public Origin: {error}"));
+        }
+        let mut public_origin = parsed_origin;
+        public_origin.set_path("");
+        public_origin.set_query(None);
+        public_origin.set_fragment(None);
+        let public_origin = public_origin.to_string().trim_end_matches('/').to_string();
+
         let mut slot = self.inner.lock().unwrap();
         match slot.as_mut() {
-            Some(server) if !server.task_finished() => {
+            Some(server)
+                if !server.task_finished() && server.credential_lease.as_ref().is_some() =>
+            {
+                let generation = server
+                    .credential_lease
+                    .as_ref()
+                    .expect("active credential lease")
+                    .generation();
                 let child = child.take().expect("child present after take");
                 let dead_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let flag = dead_flag.clone();
+                let authority = Arc::clone(&self.authority);
+                let shutdown_tx = Arc::clone(&server.shutdown_tx);
                 // The watchdog owns the child: `wait()` for natural exit, then
                 // flag death so the next `status()` poll clears the stale URL.
                 // Aborted on `stop()`/`Drop`; at that point the owned child is
@@ -578,19 +810,25 @@ impl RemoteServerState {
                 let watchdog = tokio::spawn(async move {
                     let mut child = child;
                     let _ = child.wait().await;
-                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let _ = authority.retire_generation(generation);
+                    if let Some(tx) = shutdown_tx.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    flag.store(true, std::sync::atomic::Ordering::Release);
                 });
-                server.tunnel_url = Some(url);
+                server.tunnel_url = Some(public_origin);
                 server.tunnel_provider = Some(provider.to_string());
                 server.tunnel_dead = Some(dead_flag);
                 server.tunnel_watchdog = Some(watchdog);
+                log::info!(target: "termul::remote::host", "operation=shared_live_host stable_code=OK");
                 Ok(())
             }
             _ => {
-                // Server gone — kill the orphan we still hold (sync).
-                if let Some(c) = child.as_mut() {
-                    let _ = c.start_kill();
+                if let Some(child) = child.as_mut() {
+                    let _ = child.start_kill();
                 }
+                drop(slot);
+                self.fail_active_server("attach_race");
                 Err("remote server stopped before tunnel attached".to_string())
             }
         }
@@ -670,18 +908,20 @@ mod tests {
         assert_eq!(s.bind_mode, None);
         assert_eq!(s.bind_host, None);
         assert_eq!(s.tunnel_url, None);
+        assert_eq!(s.access_url, None);
     }
 
     #[test]
     fn remote_status_running_localhost_uses_loopback_url() {
         let addr: SocketAddr = "127.0.0.1:5123".parse().unwrap();
-        let s = RemoteStatus::running(addr, RemoteBindMode::Localhost, None);
+        let s = RemoteStatus::running(addr, RemoteBindMode::Localhost, None, None);
         assert!(s.running);
         assert_eq!(s.url.as_deref(), Some("http://127.0.0.1:5123"));
         assert_eq!(s.port, Some(5123));
         assert_eq!(s.bind_mode.as_deref(), Some("localhost"));
         assert_eq!(s.bind_host.as_deref(), Some("127.0.0.1"));
         assert_eq!(s.tunnel_url, None);
+        assert_eq!(s.access_url, None);
     }
 
     #[test]
@@ -691,11 +931,35 @@ mod tests {
             addr,
             RemoteBindMode::Localhost,
             Some("https://foo-bar.trycloudflare.com".to_string()),
+            None,
         );
         assert_eq!(
             s.tunnel_url.as_deref(),
             Some("https://foo-bar.trycloudflare.com")
         );
+        assert_eq!(s.access_url, None);
+    }
+
+    #[test]
+    fn remote_status_materializes_access_url_only_from_active_lease() {
+        let addr: SocketAddr = "127.0.0.1:5123".parse().unwrap();
+        let authority = RemoteAccessAuthority::for_tests("bootstrap-token");
+        let lease = authority.rotate_desktop_credential().unwrap();
+        let expected_fragment = format!("#access_token={}", lease.bearer());
+        let s = RemoteStatus::running(
+            addr,
+            RemoteBindMode::Localhost,
+            Some("https://foo-bar.trycloudflare.com".to_string()),
+            Some(&lease),
+        );
+        assert_eq!(
+            s.tunnel_url.as_deref(),
+            Some("https://foo-bar.trycloudflare.com")
+        );
+        assert!(s
+            .access_url
+            .as_deref()
+            .is_some_and(|url| url.ends_with(&expected_fragment)));
     }
 
     #[test]
@@ -704,12 +968,25 @@ mod tests {
         // address, so `url` is `None` (the UI shows "use this machine's LAN
         // IP:{port}"). Don't fabricate a loopback URL the phone can't reach.
         let addr: SocketAddr = "0.0.0.0:8080".parse().unwrap();
-        let s = RemoteStatus::running(addr, RemoteBindMode::All, None);
+        let s = RemoteStatus::running(addr, RemoteBindMode::All, None, None);
         assert!(s.running);
         assert_eq!(s.url, None, "0.0.0.0 must not fabricate a loopback URL");
         assert_eq!(s.port, Some(8080));
         assert_eq!(s.bind_mode.as_deref(), Some("all"));
         assert_eq!(s.bind_host.as_deref(), Some("0.0.0.0"));
+    }
+
+    #[test]
+    fn pending_serve_failure_guard_invalidates_unpublished_generation() {
+        let authority = Arc::new(RemoteAccessAuthority::for_tests("bootstrap-token"));
+        let lease = authority.rotate_desktop_credential().unwrap();
+        let bearer = lease.bearer().to_string();
+        let pending = PendingCredentialLease::new(Arc::clone(&authority), lease);
+        drop(pending);
+        assert_eq!(
+            authority.verify_bearer(&bearer).unwrap_err(),
+            crate::web::auth::RemoteAuthError::InvalidCredential
+        );
     }
 
     #[tokio::test]
@@ -721,6 +998,52 @@ mod tests {
         let err = state.stop().await;
         assert!(err.is_err(), "stop on an unstarted server must error");
         assert!(!state.status().running);
+    }
+
+    #[tokio::test]
+    async fn stop_returns_remote_credential_cleanup_failed_when_keyring_delete_fails() {
+        let (acp, pty, relay, registry) = lifecycle_fixtures();
+        let authority = Arc::new(
+            crate::web::auth::RemoteAccessAuthority::for_desktop_keyring_tests(
+                "test-remote-access-token",
+                "opaque-task002-account",
+            ),
+        );
+        let state = RemoteServerState::with_desktop_authority(authority);
+        state
+            .start(
+                acp,
+                pty,
+                relay,
+                registry,
+                RemoteBindMode::Localhost,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("desktop keyring host starts");
+        assert!(state.status().running);
+        let (generation, _) = active_credential(&state);
+        crate::secure_storage::fail_next_keyring_deletes_for_tests(1);
+        let error = state
+            .stop()
+            .await
+            .expect_err("keyring delete must fail stop");
+        assert_eq!(error, "REMOTE_CREDENTIAL_CLEANUP_FAILED");
+        assert!(
+            state.status().running,
+            "retry ownership must keep the host slot when keyring delete fails"
+        );
+        let (retry_generation, _) = active_credential(&state);
+        assert_eq!(retry_generation, generation);
+        crate::secure_storage::fail_next_keyring_deletes_for_tests(0);
+        let stopped = state
+            .stop()
+            .await
+            .expect("retry stop succeeds after keyring recovers");
+        assert!(!stopped.running);
     }
 
     /// A real `AcpManager` (zero sinks is legal) + a `WsRelaySink` for the
@@ -737,6 +1060,15 @@ mod tests {
         let relay = Arc::new(WsRelaySink::new());
         let registry = Arc::new(ProjectRegistry::new());
         (acp, pty, relay, registry)
+    }
+
+    fn active_credential(state: &RemoteServerState) -> (u64, String) {
+        let slot = state.inner.lock().unwrap();
+        let lease = slot
+            .as_ref()
+            .and_then(|server| server.credential_lease.as_ref())
+            .expect("active credential lease");
+        (lease.generation(), lease.bearer().to_string())
     }
 
     #[tokio::test]
@@ -757,7 +1089,8 @@ mod tests {
                 None,
                 None,
                 None,
-                )
+                None,
+            )
             .await
             .expect("start on localhost binds an OS-assigned port");
         assert!(status.running, "start returns a running status");
@@ -767,8 +1100,11 @@ mod tests {
             "status reflects running after start"
         );
         assert_eq!(state.status().port, status.port);
+        let (first_generation, first_bearer) = active_credential(&state);
+        assert!(state.authority.verify_bearer(&first_bearer).is_ok());
 
-        // stop drains the serve task (the JoinHandle is awaited) and reports stopped.
+        // stop drains the serve task (the JoinHandle is awaited), invalidates
+        // the active generation, and reports stopped.
         let stopped = state
             .stop()
             .await
@@ -778,8 +1114,12 @@ mod tests {
             !state.status().running,
             "status reflects stopped after stop"
         );
+        assert_eq!(
+            state.authority.verify_bearer(&first_bearer).unwrap_err(),
+            crate::web::auth::RemoteAuthError::InvalidCredential
+        );
 
-        // Restart works (the slot was cleared by stop).
+        // Restart works (the slot was cleared by stop) with a distinct bearer.
         let again = state
             .start(
                 acp.clone(),
@@ -790,10 +1130,19 @@ mod tests {
                 None,
                 None,
                 None,
-                )
+                None,
+            )
             .await
             .expect("restart after stop succeeds");
         assert!(again.running);
+        let (second_generation, second_bearer) = active_credential(&state);
+        assert!(second_generation > first_generation);
+        assert_ne!(second_bearer, first_bearer);
+        assert_eq!(
+            state.authority.verify_bearer(&first_bearer).unwrap_err(),
+            crate::web::auth::RemoteAuthError::InvalidCredential
+        );
+        assert!(state.authority.verify_bearer(&second_bearer).is_ok());
         let _ = state.stop().await;
     }
 
@@ -814,7 +1163,8 @@ mod tests {
                 None,
                 None,
                 None,
-                )
+                None,
+            )
             .await
             .expect("first start succeeds");
 
@@ -828,7 +1178,8 @@ mod tests {
                 None,
                 None,
                 None,
-                )
+                None,
+            )
             .await;
         assert!(
             second.is_err(),
@@ -837,6 +1188,79 @@ mod tests {
         assert!(state.status().running, "the first server is still running");
 
         let _ = state.stop().await;
+    }
+
+    #[tokio::test]
+    async fn remote_server_state_rejects_oversized_event_log_capacity_before_publication() {
+        let (acp, pty, _relay, registry) = lifecycle_fixtures();
+        let state = RemoteServerState::new();
+        let oversized = Arc::new(WsRelaySink::with_log_capacity(MAX_EVENT_LOG_CAPACITY + 1));
+        let error = state
+            .start(
+                acp.clone(),
+                pty.clone(),
+                oversized,
+                registry.clone(),
+                RemoteBindMode::Localhost,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("1..=16384"));
+        assert!(!state.status().running);
+
+        let maximum = Arc::new(WsRelaySink::with_log_capacity(MAX_EVENT_LOG_CAPACITY));
+        let status = state
+            .start(
+                acp,
+                pty,
+                maximum,
+                registry,
+                RemoteBindMode::Localhost,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("maximum bounded capacity is admitted");
+        assert!(status.running);
+        state.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_tunnel_attach_invalidates_generation_before_returning() {
+        let (acp, pty, relay, registry) = lifecycle_fixtures();
+        let state = RemoteServerState::new();
+        state
+            .start(
+                acp,
+                pty,
+                relay,
+                registry,
+                RemoteBindMode::Localhost,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let (_, bearer) = active_credential(&state);
+        let mut command = quick_exit_command();
+        command.kill_on_drop(true);
+        let child = command.spawn().unwrap();
+        assert!(state
+            .attach_tunnel("not a public origin".into(), child)
+            .is_err());
+        assert!(!state.status().running);
+        assert_eq!(
+            state.authority.verify_bearer(&bearer).unwrap_err(),
+            crate::web::auth::RemoteAuthError::InvalidCredential
+        );
     }
 
     #[tokio::test]
@@ -860,7 +1284,8 @@ mod tests {
                 None,
                 None,
                 None,
-                )
+                None,
+            )
             .await
             .expect("start succeeds");
         // The serve task holds `Arc::clone(&acp)`; stop drains it. The desktop
@@ -874,11 +1299,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn status_clears_tunnel_url_when_cloudflared_child_exits() {
-        // The watchdog flips `tunnel_dead` once the child exits; `status()`
-        // then clears `tunnel_url` so the renderer poller drops the stale QR
-        // (it would otherwise offer a link that yields "This site can't be
-        // reached").
+    async fn status_retires_generation_and_listener_when_cloudflared_child_exits() {
+        // Tunnel death ends the entire public generation: the watchdog revokes
+        // the credential, clears Origin/failure state, signals listener drain,
+        // and `status()` removes the server slot.
         let (acp, pty, relay, registry) = lifecycle_fixtures();
         let state = RemoteServerState::new();
         let _ = state
@@ -891,9 +1315,12 @@ mod tests {
                 None,
                 None,
                 None,
-                )
+                None,
+            )
             .await
             .expect("start");
+
+        let (_, bearer) = active_credential(&state);
 
         // Attach a tunnel child that exits almost immediately (cross-platform
         // exit-0). kill_on_drop mirrors the real start_quick_tunnel child.
@@ -904,23 +1331,20 @@ mod tests {
             .attach_tunnel("https://stale.trycloudflare.com".to_string(), child)
             .expect("attach");
 
-        // Poll status until the dead-child path clears the tunnel URL. The
-        // child exits within a few ms; allow up to 1s for the OS + watchdog.
-        let mut cleared = false;
+        // Poll until the dead-child path retires the complete server.
+        let mut stopped = false;
         for _ in 0..20 {
-            let s = state.status();
-            if s.running && s.tunnel_url.is_none() {
-                cleared = true;
+            if !state.status().running {
+                stopped = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        assert!(
-            cleared,
-            "status() must clear tunnel_url once cloudflared exits"
+        assert!(stopped, "tunnel death must retire the shared-live listener");
+        assert_eq!(
+            state.authority.verify_bearer(&bearer).unwrap_err(),
+            crate::web::auth::RemoteAuthError::InvalidCredential
         );
-
-        let _ = state.stop().await;
     }
 
     /// A cross-platform command that exits 0 almost immediately, for the
@@ -1127,11 +1551,9 @@ mod tests {
                 ["config", "user.name", "Test"].as_slice(),
                 ["config", "commit.gpgsign", "false"].as_slice(),
             ] {
-                let out = crate::trackers::GitTracker::run_git_command(
-                    dir_a.to_str().unwrap(),
-                    args,
-                )
-                .expect("git command runs");
+                let out =
+                    crate::trackers::GitTracker::run_git_command(dir_a.to_str().unwrap(), args)
+                        .expect("git command runs");
                 assert!(
                     out.status.success(),
                     "git {:?} failed: {}",
@@ -1175,6 +1597,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .expect("start with a cross-drive project must succeed");
@@ -1183,6 +1606,7 @@ mod tests {
             .url
             .expect("localhost bind produces a loopback URL")
             .clone();
+        let (_, bearer) = active_credential(&state);
 
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
@@ -1193,12 +1617,10 @@ mod tests {
         // The route canonicalizes dir_a and checks it against project_root
         // (which is now dir_a's canonical form, not the home dir). Build the
         // URL with percent-encoding so Windows backslash paths parse correctly.
-        let skills_url_a = format!(
-            "{url}/skills?projectRoot={}",
-            percent_encode_path(&dir_a)
-        );
+        let skills_url_a = format!("{url}/skills?projectRoot={}", percent_encode_path(&dir_a));
         let resp = client
             .get(&skills_url_a)
+            .bearer_auth(&bearer)
             .send()
             .await
             .expect("GET /skills");
@@ -1219,6 +1641,7 @@ mod tests {
         // passed).
         let resp = client
             .post(format!("{url}/git/status"))
+            .bearer_auth(&bearer)
             .json(&serde_json::json!({ "cwd": dir_a.to_string_lossy() }))
             .send()
             .await
@@ -1230,7 +1653,9 @@ mod tests {
         );
         if git_available {
             assert!(
-                body.get("success").and_then(|v| v.as_bool()).unwrap_or(false),
+                body.get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
                 "/git/status should succeed for a git repo, got: {body}"
             );
         }
@@ -1245,12 +1670,10 @@ mod tests {
         );
 
         // GET /skills?projectRoot=dir_b — must succeed with the new boundary.
-        let skills_url_b = format!(
-            "{url}/skills?projectRoot={}",
-            percent_encode_path(&dir_b)
-        );
+        let skills_url_b = format!("{url}/skills?projectRoot={}", percent_encode_path(&dir_b));
         let resp = client
             .get(&skills_url_b)
+            .bearer_auth(&bearer)
             .send()
             .await
             .expect("GET /skills after switch");
@@ -1266,6 +1689,7 @@ mod tests {
         // rebound boundary actually moved (not just widened to cover both).
         let resp = client
             .get(&skills_url_a)
+            .bearer_auth(&bearer)
             .send()
             .await
             .expect("GET /skills old project after switch");

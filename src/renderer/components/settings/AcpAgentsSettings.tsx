@@ -3,9 +3,20 @@ import { useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { CustomAcpAgentDialog, exportAgentConfig } from '@/components/agents/CustomAcpAgentDialog'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle
+} from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
 import { useAcpRegistryCatalog } from '@/hooks/use-acp-registry-catalog'
 import { useResolvedSupportedAcpAgents } from '@/hooks/use-resolved-supported-acp-agents'
 import { findBundledIconByKey, normalizeIconSvg } from '@/lib/agents/agent-icon-catalog'
@@ -145,6 +156,9 @@ interface AgentRowProps {
 function AgentRow({ entry }: AgentRowProps): React.JSX.Element {
   const { t } = useTranslation('agents')
   const warmState = useConfigWarmState(entry.configId)
+  const saveAgentConfig = useAcpStore((s) => s.saveAgentConfig)
+  const [permissionSaving, setPermissionSaving] = useState(false)
+  const [confirmAllowAll, setConfirmAllowAll] = useState(false)
   const iconEntry = useMemo(() => findBundledIconByKey(`acp:${entry.agent.id}`), [entry.agent.id])
 
   const statusBadge: { label: string; tone: 'ready' | 'muted' | 'warn' } = warmState.sessionReady
@@ -189,6 +203,19 @@ function AgentRow({ entry }: AgentRowProps): React.JSX.Element {
         message: `Failed to copy custom agent config "${entry.agent.name}": ${message}`
       })
       toast.error(t('settings.copyFailed'))
+    }
+  }
+
+  const updatePermissionPolicy = async (policy: 'ask' | 'allow_all'): Promise<void> => {
+    if (!entry.config) return
+    setPermissionSaving(true)
+    try {
+      await saveAgentConfig({ ...entry.config, permissionPolicy: policy })
+      toast.success(t('settings.permissionPolicy.saved'))
+    } catch (error) {
+      toast.error(String(error))
+    } finally {
+      setPermissionSaving(false)
     }
   }
 
@@ -237,6 +264,27 @@ function AgentRow({ entry }: AgentRowProps): React.JSX.Element {
                 : entry.unavailableReason}
           </p>
         )}
+        {entry.config && (
+          <div className="mt-2 flex items-start justify-between gap-3 border-t border-border/40 pt-2">
+            <div className="min-w-0">
+              <p className="text-xs font-medium text-foreground">
+                {t('settings.permissionPolicy.allowAll')}
+              </p>
+              <p className="mt-0.5 text-2xs text-muted-foreground">
+                {t('settings.permissionPolicy.description')}
+              </p>
+            </div>
+            <Switch
+              checked={entry.config.permissionPolicy === 'allow_all'}
+              disabled={permissionSaving}
+              aria-label={t('settings.permissionPolicy.aria', { name: entry.agent.name })}
+              onCheckedChange={(checked) => {
+                if (checked) setConfirmAllowAll(true)
+                else void updatePermissionPolicy('ask')
+              }}
+            />
+          </div>
+        )}
         {entry.status === 'ready' &&
           entry.config &&
           entry.config.command !== 'npx' &&
@@ -257,6 +305,25 @@ function AgentRow({ entry }: AgentRowProps): React.JSX.Element {
           </div>
         )}
       </div>
+      <AlertDialog open={confirmAllowAll} onOpenChange={setConfirmAllowAll}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('settings.permissionPolicy.confirmTitle')}</AlertDialogTitle>
+            <AlertDialogDescription>
+              {t('settings.permissionPolicy.confirmDescription', { name: entry.agent.name })}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t('settings.permissionPolicy.cancel')}</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-amber-600 text-white hover:bg-amber-700"
+              onClick={() => void updatePermissionPolicy('allow_all')}
+            >
+              {t('settings.permissionPolicy.confirm')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

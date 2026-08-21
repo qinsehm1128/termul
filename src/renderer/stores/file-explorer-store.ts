@@ -39,6 +39,13 @@ export interface FileExplorerRootError {
   code?: string
 }
 
+/** One registered project root rendered inside a multi-root project group. */
+export interface FileExplorerRoot {
+  projectId: string
+  name: string
+  path: string
+}
+
 export interface FileClipboard {
   type: 'copy' | 'cut'
   paths: string[]
@@ -53,6 +60,9 @@ interface PendingDirectoryCollapse {
 export type WorktreeRootOverride = string | null
 
 export interface FileExplorerState {
+  /** Ordered roots in the active project or project group. */
+  roots: FileExplorerRoot[]
+  /** Focused root used by root-relative actions and as the terminal fallback. */
   rootPath: string | null
   /** Trusted project boundary for search IPC validation */
   scopeRoot: string | null
@@ -66,6 +76,8 @@ export interface FileExplorerState {
   isVisible: boolean
   loadingDirs: Set<string>
   rootLoadError: FileExplorerRootError | null
+  /** Per-root failures; `rootLoadError` mirrors the focused root for compatibility. */
+  rootLoadErrors: Map<string, FileExplorerRootError>
   searchQuery: string
   searchResults: FileSearchResult[]
   searchFileNameMatches: string[] | null
@@ -91,6 +103,8 @@ export interface FileExplorerState {
   refreshingTree: boolean
 
   setRootPath: (path: string | null) => void
+  setRoots: (roots: FileExplorerRoot[], focusedRootPath?: string | null) => void
+  setFocusedRoot: (path: string) => void
   setWorktreeRoot: (path: string | null) => void
   toggleDirectory: (path: string) => Promise<void>
   finalizeDirectoryCollapse: (path: string) => void
@@ -121,6 +135,29 @@ export interface FileExplorerState {
 
 let streamSubscribed = false
 let fileNameStreamSubscribed = false
+let activeSearchRequestId = 0
+const activeContentSearchIds = new Set<string>()
+const activeFileNameSearchIds = new Set<string>()
+
+function cancelActiveSearchStreams(): void {
+  for (const searchId of activeContentSearchIds) {
+    filesystemApi.searchContentStreamCancel(searchId).catch((error) => {
+      console.warn(`[file-explorer] searchContentStreamCancel(${searchId}) failed:`, error)
+    })
+  }
+  for (const searchId of activeFileNameSearchIds) {
+    filesystemApi.searchFileNamesStreamCancel(searchId).catch((error) => {
+      console.warn(`[file-explorer] searchFileNamesStreamCancel(${searchId}) failed:`, error)
+    })
+  }
+  activeContentSearchIds.clear()
+  activeFileNameSearchIds.clear()
+}
+
+function isActiveSearchEvent(searchId: string, requestId: number): boolean {
+  const prefix = `search-${requestId}`
+  return searchId === prefix || searchId.startsWith(`${prefix}:`)
+}
 
 function ensureSearchStreamSubscription(
   set: (partial: Partial<FileExplorerState>) => void,
@@ -131,8 +168,7 @@ function ensureSearchStreamSubscription(
 
   filesystemApi.onSearchContentBatch((event) => {
     const state = get()
-    const activeId = `search-${state.searchRequestId}`
-    if (event.searchId !== activeId) return
+    if (!isActiveSearchEvent(event.searchId, state.searchRequestId)) return
 
     const merged = new Map(state.searchResults.map((file) => [file.filePath, file]))
     for (const file of event.results) merged.set(file.filePath, file)
@@ -145,20 +181,21 @@ function ensureSearchStreamSubscription(
 
   filesystemApi.onSearchContentDone((event) => {
     const state = get()
-    const activeId = `search-${state.searchRequestId}`
-    if (event.searchId !== activeId) return
+    if (!isActiveSearchEvent(event.searchId, state.searchRequestId)) return
+    activeContentSearchIds.delete(event.searchId)
+    const allDone = activeContentSearchIds.size === 0 && activeFileNameSearchIds.size === 0
 
     set({
-      searchLoading: false,
-      searchError: event.error ?? null,
+      searchLoading: !allDone,
+      searchError: event.error ?? state.searchError,
       // Surface the programmatic code so consumers (telemetry, future UI
       // affordances) can distinguish QUERY_TOO_LONG from RG_STREAM_FAILED
       // without parsing the human-readable error string.
       searchErrorCode: event.code ?? null,
-      searchTruncated: event.truncated,
-      searchScannedFiles: event.scannedFiles,
-      searchFailedFiles: event.failedFiles,
-      searchLastCompletedQuery: state.searchQuery.trim()
+      searchTruncated: event.truncated || state.searchTruncated,
+      searchScannedFiles: state.searchScannedFiles + event.scannedFiles,
+      searchFailedFiles: state.searchFailedFiles + event.failedFiles,
+      searchLastCompletedQuery: activeContentSearchIds.size === 0 ? state.searchQuery.trim() : ''
     })
   })
 }
@@ -172,19 +209,21 @@ function ensureFileNameStreamSubscription(
 
   filesystemApi.onSearchFileNamesBatch((event) => {
     const state = get()
-    const activeId = `search-${state.searchRequestId}`
-    if (event.searchId !== activeId) return
+    if (!isActiveSearchEvent(event.searchId, state.searchRequestId)) return
+    const merged = new Set(state.searchFileNameMatches ?? [])
+    for (const file of event.files) merged.add(file.path)
 
     set({
-      searchFileNameMatches: event.files.map((f) => f.path),
+      searchFileNameMatches: Array.from(merged),
       searchTruncated: event.truncated || state.searchTruncated
     })
   })
 
   filesystemApi.onSearchFileNamesDone((event) => {
     const state = get()
-    const activeId = `search-${state.searchRequestId}`
-    if (event.searchId !== activeId) return
+    if (!isActiveSearchEvent(event.searchId, state.searchRequestId)) return
+    activeFileNameSearchIds.delete(event.searchId)
+    const allDone = activeContentSearchIds.size === 0 && activeFileNameSearchIds.size === 0
 
     // Surface backend errors and stop the spinner. Filename and content
     // streams share the same `searchError` / `searchLoading` slot; the
@@ -193,7 +232,7 @@ function ensureFileNameStreamSubscription(
     // fires, so mirroring the error here is safe.
     const next: Partial<FileExplorerState> = {
       searchTruncated: event.truncated || state.searchTruncated,
-      searchLoading: false
+      searchLoading: !allDone
     }
     if (event.error) {
       next.searchError = event.error
@@ -219,6 +258,7 @@ function ensureFileNameStreamSubscription(
 }
 
 export const useFileExplorerStore = create<FileExplorerState>((set, get) => ({
+  roots: [],
   rootPath: null,
   scopeRoot: null,
   worktreeRoot: null,
@@ -230,6 +270,7 @@ export const useFileExplorerStore = create<FileExplorerState>((set, get) => ({
   isVisible: true,
   loadingDirs: new Set<string>(),
   rootLoadError: null,
+  rootLoadErrors: new Map<string, FileExplorerRootError>(),
   searchQuery: '',
   searchResults: [],
   searchFileNameMatches: null,
@@ -247,21 +288,14 @@ export const useFileExplorerStore = create<FileExplorerState>((set, get) => ({
 
   setRootPath: (path: string | null): void => {
     // Unwatch all previously expanded directories
-    const { expandedDirs, searchRequestId } = get()
-    if (searchRequestId > 0) {
-      const sid = `search-${searchRequestId}`
-      filesystemApi.searchContentStreamCancel(sid).catch((e) => {
-        console.warn(`[file-explorer] searchContentStreamCancel(${sid}) failed:`, e)
-      })
-      filesystemApi.searchFileNamesStreamCancel(sid).catch((e) => {
-        console.warn(`[file-explorer] searchFileNamesStreamCancel(${sid}) failed:`, e)
-      })
-    }
+    const { expandedDirs } = get()
+    cancelActiveSearchStreams()
     expandedDirs.forEach((dir) => {
       filesystemApi.unwatchDirectory(dir)
     })
     const normalized = path ? normalizePath(path) : null
     set({
+      roots: normalized ? [{ projectId: '', name: '', path: normalized }] : [],
       rootPath: normalized,
       scopeRoot: normalized,
       expandedDirs: new Set<string>(),
@@ -271,6 +305,7 @@ export const useFileExplorerStore = create<FileExplorerState>((set, get) => ({
       clipboard: null,
       loadingDirs: new Set<string>(),
       rootLoadError: null,
+      rootLoadErrors: new Map<string, FileExplorerRootError>(),
       searchQuery: '',
       searchResults: [],
       searchFileNameMatches: null,
@@ -287,17 +322,70 @@ export const useFileExplorerStore = create<FileExplorerState>((set, get) => ({
     })
   },
 
+  setRoots: (roots: FileExplorerRoot[], focusedRootPath?: string | null): void => {
+    const state = get()
+    cancelActiveSearchStreams()
+    state.expandedDirs.forEach((dir) => {
+      filesystemApi.unwatchDirectory(dir)
+    })
+
+    const seenPaths = new Set<string>()
+    const normalizedRoots = roots.flatMap((root) => {
+      const path = normalizePath(root.path)
+      if (!path || seenPaths.has(path)) return []
+      seenPaths.add(path)
+      return [{ ...root, path }]
+    })
+    const requestedFocus = focusedRootPath ? normalizePath(focusedRootPath) : null
+    const focusedRoot =
+      normalizedRoots.find((root) => root.path === requestedFocus) ?? normalizedRoots[0]
+    const rootPath = focusedRoot?.path ?? null
+
+    set({
+      roots: normalizedRoots,
+      rootPath,
+      scopeRoot: rootPath,
+      worktreeRoot: null,
+      expandedDirs: new Set<string>(),
+      directoryContents: new Map<string, DirectoryEntry[]>(),
+      selectedPaths: new Set<string>(),
+      lastClickedPath: null,
+      clipboard: null,
+      loadingDirs: new Set<string>(),
+      rootLoadError: null,
+      rootLoadErrors: new Map<string, FileExplorerRootError>(),
+      searchQuery: '',
+      searchResults: [],
+      searchFileNameMatches: null,
+      searchLoading: false,
+      searchError: null,
+      searchErrorCode: null,
+      searchTruncated: false,
+      searchScannedFiles: 0,
+      searchFailedFiles: 0,
+      searchRequestId: 0,
+      searchLastCompletedQuery: '',
+      pendingCollapses: new Map<string, PendingDirectoryCollapse>(),
+      suppressTreeAnimations: false
+    })
+  },
+
+  setFocusedRoot: (path: string): void => {
+    const normalized = normalizePath(path)
+    const state = get()
+    if (!state.roots.some((root) => root.path === normalized)) return
+    set({
+      rootPath: normalized,
+      scopeRoot: normalized,
+      rootLoadError: state.rootLoadErrors.get(normalized) ?? null,
+      selectedPaths: new Set<string>(),
+      lastClickedPath: null
+    })
+  },
+
   setWorktreeRoot: (path: string | null): void => {
-    const { scopeRoot, searchRequestId } = get()
-    if (searchRequestId > 0) {
-      const sid = `search-${searchRequestId}`
-      filesystemApi.searchContentStreamCancel(sid).catch((e) => {
-        console.warn(`[file-explorer] searchContentStreamCancel(${sid}) failed:`, e)
-      })
-      filesystemApi.searchFileNamesStreamCancel(sid).catch((e) => {
-        console.warn(`[file-explorer] searchFileNamesStreamCancel(${sid}) failed:`, e)
-      })
-    }
+    const { scopeRoot } = get()
+    cancelActiveSearchStreams()
     const worktreeRoot = path ? normalizePath(path) : null
     set({
       worktreeRoot,
@@ -318,8 +406,10 @@ export const useFileExplorerStore = create<FileExplorerState>((set, get) => ({
 
   toggleDirectory: async (path: string): Promise<void> => {
     const normalized = normalizePath(path)
-    const { expandedDirs, loadingDirs, rootPath } = get()
-    const isRootLoad = rootPath === normalized
+    const { expandedDirs, loadingDirs, roots, rootPath } = get()
+    const isRootLoad =
+      roots.some((root) => root.path === normalized) ||
+      (roots.length === 0 && rootPath === normalized)
 
     if (expandedDirs.has(normalized)) {
       // Collapse: update expanded state immediately; defer content cleanup for exit animation
@@ -363,26 +453,37 @@ export const useFileExplorerStore = create<FileExplorerState>((set, get) => ({
       try {
         const result = await filesystemApi.readDirectory(normalized)
         if (result.success) {
-          const { expandedDirs: currentExpanded, directoryContents: currentContents } = get()
+          const {
+            expandedDirs: currentExpanded,
+            directoryContents: currentContents,
+            rootLoadErrors
+          } = get()
           const newExpanded = new Set(currentExpanded)
           newExpanded.add(normalized)
           const newContents = new Map(currentContents)
           newContents.set(normalized, result.data)
+          const nextRootErrors = new Map(rootLoadErrors)
+          nextRootErrors.delete(normalized)
 
           set({
             expandedDirs: newExpanded,
             directoryContents: newContents,
-            rootLoadError: isRootLoad ? null : get().rootLoadError
+            rootLoadErrors: nextRootErrors,
+            rootLoadError: rootPath === normalized ? null : get().rootLoadError
           })
 
           // Watch this directory for changes (fire-and-forget)
           filesystemApi.watchDirectory(normalized)
         } else if (isRootLoad) {
+          const rootError = {
+            message: result.error,
+            code: result.code
+          }
+          const nextRootErrors = new Map(get().rootLoadErrors)
+          nextRootErrors.set(normalized, rootError)
           set({
-            rootLoadError: {
-              message: result.error,
-              code: result.code
-            }
+            rootLoadErrors: nextRootErrors,
+            rootLoadError: rootPath === normalized ? rootError : get().rootLoadError
           })
         }
       } catch (error) {
@@ -395,11 +496,12 @@ export const useFileExplorerStore = create<FileExplorerState>((set, get) => ({
                   'filesystemErrors.loadProjectFiles',
                   'Failed to load project files'
                 )
+          const rootError = { message, code: 'UNKNOWN_ERROR' }
+          const nextRootErrors = new Map(get().rootLoadErrors)
+          nextRootErrors.set(normalized, rootError)
           set({
-            rootLoadError: {
-              message,
-              code: 'UNKNOWN_ERROR'
-            }
+            rootLoadErrors: nextRootErrors,
+            rootLoadError: rootPath === normalized ? rootError : get().rootLoadError
           })
         }
       } finally {
@@ -415,11 +517,14 @@ export const useFileExplorerStore = create<FileExplorerState>((set, get) => ({
     try {
       const result = await filesystemApi.readDirectory(normalized)
       if (result.success) {
-        const { directoryContents, rootPath } = get()
+        const { directoryContents, rootPath, rootLoadErrors } = get()
         const newContents = new Map(directoryContents)
         newContents.set(normalized, result.data)
+        const nextRootErrors = new Map(rootLoadErrors)
+        nextRootErrors.delete(normalized)
         set({
           directoryContents: newContents,
+          rootLoadErrors: nextRootErrors,
           rootLoadError: rootPath === normalized ? null : get().rootLoadError
         })
       }
@@ -429,17 +534,20 @@ export const useFileExplorerStore = create<FileExplorerState>((set, get) => ({
   },
 
   refreshTree: async (): Promise<void> => {
-    const { rootPath } = get()
-    if (!rootPath || get().refreshingTree) return
+    const { rootPath, roots } = get()
+    if (!rootPath) return
+    const activeRoots =
+      roots.length > 0 ? roots.map((root) => root.path) : rootPath ? [rootPath] : []
+    if (activeRoots.length === 0 || get().refreshingTree) return
 
     set({ refreshingTree: true })
     try {
-      const capturedRoot = rootPath
-      // Only re-read directories that belong to the current root; stale
-      // expanded dirs from a previous worktree override must not be fetched.
+      const capturedScope = `${rootPath}\u0001${activeRoots.join('\u0000')}`
       const dirsToRefresh = new Set<string>([
-        rootPath,
-        ...Array.from(get().expandedDirs).filter((dir) => isPathWithinRoot(dir, rootPath))
+        ...activeRoots,
+        ...Array.from(get().expandedDirs).filter((dir) =>
+          activeRoots.some((root) => isPathWithinRoot(dir, root))
+        )
       ])
 
       // Sequential on purpose: re-check live state before each read so a
@@ -447,8 +555,14 @@ export const useFileExplorerStore = create<FileExplorerState>((set, get) => ({
       // of being overwritten by stale in-flight results.
       for (const dir of dirsToRefresh) {
         const state = get()
-        if (state.rootPath !== capturedRoot) return
-        if (dir !== capturedRoot && !state.expandedDirs.has(dir)) continue
+        const currentRoots =
+          state.roots.length > 0
+            ? state.roots.map((root) => root.path)
+            : state.rootPath
+              ? [state.rootPath]
+              : []
+        if (`${state.rootPath ?? ''}\u0001${currentRoots.join('\u0000')}` !== capturedScope) return
+        if (!currentRoots.includes(dir) && !state.expandedDirs.has(dir)) continue
         await state.refreshDirectory(dir)
       }
     } finally {
@@ -480,7 +594,7 @@ export const useFileExplorerStore = create<FileExplorerState>((set, get) => ({
   selectPathRange: (fromPath: string, toPath: string): void => {
     const normalizedFrom = normalizePath(fromPath)
     const normalizedTo = normalizePath(toPath)
-    const { directoryContents, rootPath, expandedDirs } = get()
+    const { directoryContents, rootPath, roots, expandedDirs } = get()
 
     // Collect all visible paths in order
     const allPaths: string[] = []
@@ -497,8 +611,10 @@ export const useFileExplorerStore = create<FileExplorerState>((set, get) => ({
       }
     }
 
-    if (rootPath) {
-      collectPaths(rootPath)
+    const activeRoots =
+      roots.length > 0 ? roots.map((root) => root.path) : rootPath ? [rootPath] : []
+    for (const root of activeRoots) {
+      collectPaths(root)
     }
 
     // Find indices
@@ -519,7 +635,7 @@ export const useFileExplorerStore = create<FileExplorerState>((set, get) => ({
   },
 
   selectAll: (): void => {
-    const { directoryContents, rootPath, expandedDirs } = get()
+    const { directoryContents, rootPath, roots, expandedDirs } = get()
     const allPaths: string[] = []
 
     function collectPaths(dirPath: string): void {
@@ -534,8 +650,10 @@ export const useFileExplorerStore = create<FileExplorerState>((set, get) => ({
       }
     }
 
-    if (rootPath) {
-      collectPaths(rootPath)
+    const activeRoots =
+      roots.length > 0 ? roots.map((root) => root.path) : rootPath ? [rootPath] : []
+    for (const root of activeRoots) {
+      collectPaths(root)
     }
 
     set({ selectedPaths: new Set(allPaths) })
@@ -655,22 +773,25 @@ export const useFileExplorerStore = create<FileExplorerState>((set, get) => ({
   },
 
   collapseAll: (): void => {
-    const { rootPath, expandedDirs } = get()
+    const { rootPath, roots, expandedDirs } = get()
+    const activeRoots =
+      roots.length > 0 ? roots.map((root) => root.path) : rootPath ? [rootPath] : []
+    const rootSet = new Set(activeRoots)
     // Unwatch all expanded dirs except root
     expandedDirs.forEach((dir) => {
-      if (dir !== rootPath) {
+      if (!rootSet.has(dir)) {
         filesystemApi.unwatchDirectory(dir)
       }
     })
     // Keep only root contents
     const newContents = new Map<string, DirectoryEntry[]>()
-    if (rootPath) {
-      const existing = get().directoryContents.get(rootPath)
-      if (existing) newContents.set(rootPath, existing)
+    for (const root of activeRoots) {
+      const existing = get().directoryContents.get(root)
+      if (existing) newContents.set(root, existing)
     }
     set({
       suppressTreeAnimations: true,
-      expandedDirs: rootPath ? new Set([rootPath]) : new Set<string>(),
+      expandedDirs: new Set(activeRoots),
       directoryContents: newContents,
       pendingCollapses: new Map<string, PendingDirectoryCollapse>()
     })
@@ -702,23 +823,29 @@ export const useFileExplorerStore = create<FileExplorerState>((set, get) => ({
   },
 
   setRootLoadError: (error: FileExplorerRootError | null): void => {
-    set({ rootLoadError: error })
+    const { rootPath, rootLoadErrors } = get()
+    const nextRootErrors = new Map(rootLoadErrors)
+    if (rootPath) {
+      if (error) nextRootErrors.set(rootPath, error)
+      else nextRootErrors.delete(rootPath)
+    }
+    set({ rootLoadError: error, rootLoadErrors: nextRootErrors })
   },
 
   restoreExpandedDirs: async (dirs: string[]): Promise<void> => {
-    const { rootPath } = get()
-    if (!rootPath || dirs.length === 0) return
-
-    const normalizedRoot = normalizePath(rootPath)
+    const { rootPath, roots } = get()
+    const normalizedRoots =
+      roots.length > 0 ? roots.map((root) => root.path) : rootPath ? [normalizePath(rootPath)] : []
+    if (normalizedRoots.length === 0 || dirs.length === 0) return
 
     for (const dir of dirs) {
       const normalizedDir = normalizePath(dir)
 
-      if (normalizedDir === normalizedRoot) {
+      if (normalizedRoots.includes(normalizedDir)) {
         continue
       }
 
-      if (!isPathWithinRoot(normalizedDir, normalizedRoot)) {
+      if (!normalizedRoots.some((root) => isPathWithinRoot(normalizedDir, root))) {
         continue
       }
 
@@ -735,9 +862,24 @@ export const useFileExplorerStore = create<FileExplorerState>((set, get) => ({
   },
 
   searchInRoot: async (query: string, requestId: number): Promise<void> => {
-    const { rootPath, scopeRoot } = get()
-    const searchScopeRoot = scopeRoot ?? rootPath
-    if (!rootPath || !searchScopeRoot) {
+    const { rootPath, roots } = get()
+    if (!rootPath) {
+      set({
+        searchLoading: false,
+        searchError: runtimeT('projects', 'fileContext.noProjectSelected', 'No project selected'),
+        searchErrorCode: null,
+        searchResults: [],
+        searchFileNameMatches: null,
+        searchTruncated: false,
+        searchScannedFiles: 0,
+        searchFailedFiles: 0,
+        searchRequestId: requestId
+      })
+      return
+    }
+    const searchRoots =
+      roots.length > 0 ? roots.map((root) => root.path) : rootPath ? [rootPath] : []
+    if (searchRoots.length === 0) {
       set({
         searchLoading: false,
         searchError: runtimeT('projects', 'fileContext.noProjectSelected', 'No project selected'),
@@ -754,21 +896,7 @@ export const useFileExplorerStore = create<FileExplorerState>((set, get) => ({
 
     const trimmed = query.trim()
     if (!trimmed || trimmed.length < 2) {
-      const activeRequestId = get().searchRequestId
-      if (activeRequestId > 0) {
-        filesystemApi.searchContentStreamCancel(`search-${activeRequestId}`).catch((e) => {
-          console.warn(
-            `[file-explorer] searchContentStreamCancel(search-${activeRequestId}) failed:`,
-            e
-          )
-        })
-        filesystemApi.searchFileNamesStreamCancel(`search-${activeRequestId}`).catch((e) => {
-          console.warn(
-            `[file-explorer] searchFileNamesStreamCancel(search-${activeRequestId}) failed:`,
-            e
-          )
-        })
-      }
+      cancelActiveSearchStreams()
       set({
         searchLoading: false,
         searchError: null,
@@ -786,21 +914,8 @@ export const useFileExplorerStore = create<FileExplorerState>((set, get) => ({
     ensureSearchStreamSubscription(set, get)
     ensureFileNameStreamSubscription(set, get)
 
-    const activeRequestId = get().searchRequestId
-    if (activeRequestId > 0) {
-      filesystemApi.searchContentStreamCancel(`search-${activeRequestId}`).catch((e) => {
-        console.warn(
-          `[file-explorer] searchContentStreamCancel(search-${activeRequestId}) failed:`,
-          e
-        )
-      })
-      filesystemApi.searchFileNamesStreamCancel(`search-${activeRequestId}`).catch((e) => {
-        console.warn(
-          `[file-explorer] searchFileNamesStreamCancel(search-${activeRequestId}) failed:`,
-          e
-        )
-      })
-    }
+    cancelActiveSearchStreams()
+    activeSearchRequestId = requestId
 
     const { searchLastCompletedQuery, searchResults } = get()
     if (
@@ -839,88 +954,57 @@ export const useFileExplorerStore = create<FileExplorerState>((set, get) => ({
       })
     }
 
-    const streamStartPromise = filesystemApi.searchContentStreamStart(
-      `search-${requestId}`,
-      searchScopeRoot,
-      rootPath,
-      trimmed
-    )
-    const fileNameStreamStartPromise = filesystemApi.searchFileNamesStreamStart(
-      `search-${requestId}`,
-      searchScopeRoot,
-      rootPath,
-      trimmed
-    )
+    const starts = searchRoots.map(async (searchRoot, index) => {
+      const searchId =
+        searchRoots.length === 1 ? `search-${requestId}` : `search-${requestId}:${index}`
+      activeContentSearchIds.add(searchId)
+      activeFileNameSearchIds.add(searchId)
+      const [content, fileNames] = await Promise.all([
+        filesystemApi.searchContentStreamStart(searchId, searchRoot, searchRoot, trimmed),
+        filesystemApi.searchFileNamesStreamStart(searchId, searchRoot, searchRoot, trimmed)
+      ])
+      return { searchId, content, fileNames }
+    })
+    const outcomes = await Promise.all(starts)
 
-    const [streamStart, fileNameStreamStart] = await Promise.all([
-      streamStartPromise,
-      fileNameStreamStartPromise
-    ])
-
-    if (get().searchRequestId !== requestId) {
-      if (streamStart.success) {
-        filesystemApi.searchContentStreamCancel(`search-${requestId}`).catch((e) => {
-          console.warn(`[file-explorer] searchContentStreamCancel(search-${requestId}) failed:`, e)
-        })
-      }
-      if (fileNameStreamStart.success) {
-        filesystemApi.searchFileNamesStreamCancel(`search-${requestId}`).catch((e) => {
-          console.warn(
-            `[file-explorer] searchFileNamesStreamCancel(search-${requestId}) failed:`,
-            e
-          )
-        })
-      }
+    if (get().searchRequestId !== requestId || activeSearchRequestId !== requestId) {
+      cancelActiveSearchStreams()
       return
     }
 
-    if (!streamStart.success || !fileNameStreamStart.success) {
-      if (streamStart.success) {
-        filesystemApi.searchContentStreamCancel(`search-${requestId}`).catch((e) => {
-          console.warn(`[file-explorer] searchContentStreamCancel(search-${requestId}) failed:`, e)
-        })
+    const failures: string[] = []
+    for (const outcome of outcomes) {
+      if (!outcome.content.success) {
+        activeContentSearchIds.delete(outcome.searchId)
+        failures.push(outcome.content.error)
       }
-      if (fileNameStreamStart.success) {
-        filesystemApi.searchFileNamesStreamCancel(`search-${requestId}`).catch((e) => {
-          console.warn(
-            `[file-explorer] searchFileNamesStreamCancel(search-${requestId}) failed:`,
-            e
-          )
-        })
+      if (!outcome.fileNames.success) {
+        activeFileNameSearchIds.delete(outcome.searchId)
+        failures.push(outcome.fileNames.error)
       }
-      const error = !streamStart.success
-        ? streamStart.error
-        : !fileNameStreamStart.success
-          ? fileNameStreamStart.error
-          : runtimeT('projects', 'filesystemErrors.searchFailed', 'Search failed')
+      if (outcome.content.success && !outcome.fileNames.success) {
+        void filesystemApi.searchContentStreamCancel(outcome.searchId)
+        activeContentSearchIds.delete(outcome.searchId)
+      }
+      if (!outcome.content.success && outcome.fileNames.success) {
+        void filesystemApi.searchFileNamesStreamCancel(outcome.searchId)
+        activeFileNameSearchIds.delete(outcome.searchId)
+      }
+    }
+    if (failures.length > 0) {
+      const noStreamsRemain =
+        activeContentSearchIds.size === 0 && activeFileNameSearchIds.size === 0
       set({
-        searchLoading: false,
-        searchError: error,
-        searchResults: [],
-        searchFileNameMatches: null,
-        searchTruncated: false,
-        searchScannedFiles: 0,
-        searchFailedFiles: 0
+        searchLoading: !noStreamsRemain,
+        searchError:
+          failures[0] ?? runtimeT('projects', 'filesystemErrors.searchFailed', 'Search failed')
       })
     }
   },
 
   resetSearch: (): void => {
-    const activeRequestId = get().searchRequestId
-    if (activeRequestId > 0) {
-      filesystemApi.searchContentStreamCancel(`search-${activeRequestId}`).catch((e) => {
-        console.warn(
-          `[file-explorer] searchContentStreamCancel(search-${activeRequestId}) failed:`,
-          e
-        )
-      })
-      filesystemApi.searchFileNamesStreamCancel(`search-${activeRequestId}`).catch((e) => {
-        console.warn(
-          `[file-explorer] searchFileNamesStreamCancel(search-${activeRequestId}) failed:`,
-          e
-        )
-      })
-    }
+    cancelActiveSearchStreams()
+    activeSearchRequestId = 0
     // Set filename matches to an empty list synchronously: the tab is hidden
     // while no search is active, but leaving a stale `null` here means a
     // consumer reading the state sees a lie. The next searchInRoot call will
@@ -944,6 +1028,7 @@ export const useFileExplorerStore = create<FileExplorerState>((set, get) => ({
 // Selector hooks
 export function useFileExplorer(): Pick<
   FileExplorerState,
+  | 'roots'
   | 'rootPath'
   | 'expandedDirs'
   | 'directoryContents'
@@ -953,6 +1038,7 @@ export function useFileExplorer(): Pick<
   | 'isVisible'
   | 'loadingDirs'
   | 'rootLoadError'
+  | 'rootLoadErrors'
   | 'searchQuery'
   | 'searchResults'
   | 'searchFileNameMatches'
@@ -965,6 +1051,7 @@ export function useFileExplorer(): Pick<
 > {
   return useFileExplorerStore(
     useShallow((state) => ({
+      roots: state.roots,
       rootPath: state.rootPath,
       expandedDirs: state.expandedDirs,
       directoryContents: state.directoryContents,
@@ -974,6 +1061,7 @@ export function useFileExplorer(): Pick<
       isVisible: state.isVisible,
       loadingDirs: state.loadingDirs,
       rootLoadError: state.rootLoadError,
+      rootLoadErrors: state.rootLoadErrors,
       searchQuery: state.searchQuery,
       searchResults: state.searchResults,
       searchFileNameMatches: state.searchFileNameMatches,
@@ -990,6 +1078,8 @@ export function useFileExplorer(): Pick<
 export function useFileExplorerActions(): Pick<
   FileExplorerState,
   | 'setRootPath'
+  | 'setRoots'
+  | 'setFocusedRoot'
   | 'setWorktreeRoot'
   | 'toggleDirectory'
   | 'finalizeDirectoryCollapse'
@@ -1017,6 +1107,8 @@ export function useFileExplorerActions(): Pick<
   return useFileExplorerStore(
     useShallow((state) => ({
       setRootPath: state.setRootPath,
+      setRoots: state.setRoots,
+      setFocusedRoot: state.setFocusedRoot,
       setWorktreeRoot: state.setWorktreeRoot,
       toggleDirectory: state.toggleDirectory,
       finalizeDirectoryCollapse: state.finalizeDirectoryCollapse,

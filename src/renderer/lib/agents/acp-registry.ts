@@ -158,7 +158,8 @@ export function deriveAgentConfig(agent: RegistryAgent, platformArch: string): D
   const dist = agent.distribution
   const env = (e?: Record<string, string>): Record<string, string> => ({ ...(e ?? {}) })
 
-  // Prefer zero-install runners (npx > uvx) over binaries.
+  // Catalog configs stay `npx -y <package>`. Spawn rewrites them to a
+  // host-owned local install unless the user prefers npx in settings.
   if (dist.npx && isSafePackage(dist.npx.package)) {
     return {
       kind: 'runnable',

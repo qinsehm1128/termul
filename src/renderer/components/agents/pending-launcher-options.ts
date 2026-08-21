@@ -1,3 +1,4 @@
+import { canonicalizeClaudeModelId } from '@/components/chat/chat-input-bar-config'
 import type { SessionConfigOption, SessionModelState, SessionModeState } from '@/lib/acp-api'
 
 /** Launcher selections made against cached options before a live session exists. */
@@ -27,11 +28,12 @@ export function overlayPendingLauncherOptions(input: {
   configOptions: SessionConfigOption[]
 } {
   const { pending } = input
+  const pendingModelId = pending.modelId ? canonicalizeClaudeModelId(pending.modelId) : undefined
   const models =
     input.models == null
       ? null
-      : pending.modelId
-        ? { ...input.models, currentModelId: pending.modelId }
+      : pendingModelId
+        ? { ...input.models, currentModelId: pendingModelId }
         : input.models
   const modes =
     input.modes == null
@@ -44,7 +46,11 @@ export function overlayPendingLauncherOptions(input: {
       ? input.configOptions
       : input.configOptions.map((option) => {
           const next = pending.configValues[option.id]
-          return next == null ? option : { ...option, currentValue: next }
+          if (next == null) return option
+          return {
+            ...option,
+            currentValue: option.category === 'model' ? canonicalizeClaudeModelId(next) : next
+          }
         })
   return { models, modes, configOptions }
 }

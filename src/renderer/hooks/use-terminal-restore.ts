@@ -22,6 +22,7 @@ import type {
 import { useAcpStore } from '../stores/acp-store'
 import { useAppSettingsStore } from '../stores/app-settings-store'
 import { useProjectStore } from '../stores/project-store'
+import { useSessionWorkspaceSyncStore } from '../stores/session-workspace-sync-store'
 import { useTerminalStore } from '../stores/terminal-store'
 import { findPaneContainingTab, terminalTabId, useWorkspaceStore } from '../stores/workspace-store'
 import {
@@ -82,7 +83,7 @@ function cleanupGlobalState(ownerId: string): void {
 async function killOrphanPty(ptyId: string, label: string): Promise<void> {
   try {
     debugLog('SPAWN_TIMEOUT', `Killing orphan PTY [${label}]`, { ptyId })
-    const result = await terminalApi.kill(ptyId)
+    const result = await terminalApi.terminate(ptyId)
     if (!result.success) {
       console.warn(`Failed to kill orphan PTY ${ptyId}:`, result.error)
     }
@@ -144,7 +145,7 @@ async function cleanupSpawnedPtys(
   })
 
   for (const ptyId of ptyIds) {
-    const killResult = await terminalApi.kill(ptyId)
+    const killResult = await terminalApi.terminate(ptyId)
     if (!killResult.success) {
       console.error('Failed to kill cancelled restore PTY:', killResult.error)
     }
@@ -177,7 +178,8 @@ export function printTerminalSummary(): void {
     totalTerminalsInStore: terminalStore.terminals.length,
     terminalsByProject: terminalStore.terminals.reduce(
       (acc, t) => {
-        acc[t.projectId] = (acc[t.projectId] || 0) + 1
+        const scope = t.projectId ?? '<unattributed>'
+        acc[scope] = (acc[scope] || 0) + 1
         return acc
       },
       {} as Record<string, number>
@@ -282,8 +284,10 @@ async function resolveShellToPath(shell: string): Promise<string> {
  * Hook to restore terminals when switching projects
  * Loads persisted terminal layout and creates terminal instances
  */
-export function useTerminalRestore(): void {
-  const activeProjectId = useProjectStore((state) => state.activeProjectId)
+export function useTerminalRestore(projectIdOverride?: string | null): void {
+  const storeActiveProjectId = useProjectStore((state) => state.activeProjectId)
+  const activeProjectId =
+    projectIdOverride === undefined ? storeActiveProjectId : (projectIdOverride ?? '')
   const previousProjectIdRef = useRef<string>('')
   // FIX #4: Use Set instead of boolean to track multiple restoring projects
   const isRestoringRef = useRef<Set<string>>(new Set())
@@ -614,6 +618,9 @@ export function useTerminalRestore(): void {
         debugLog('useTerminalRestore', `RESTORE COMPLETE [${callId}]`, {
           projectId: projectIdToRestore
         })
+        isRestoringRef.current.delete(projectIdToRestore)
+        PROJECT_RESTORE_LOCKS.delete(projectIdToRestore)
+        setTerminalRestoreInProgress(projectIdToRestore, false, restoreOwnerId)
         const idx = RESTORE_CALL_STACK.indexOf(callId)
         if (idx > -1) RESTORE_CALL_STACK.splice(idx, 1)
       }
@@ -669,11 +676,24 @@ function hasValidActiveAgentChatTab(
   if (!activeTab || activeTab.type !== 'agent-chat') return false
 
   const acpState = useAcpStore.getState()
-  return (
-    acpState.sessions[activeTab.sessionId]?.projectId === projectId ||
-    acpState.sessionIndex.some(
-      (entry) => entry.id === activeTab.sessionId && entry.projectId === projectId
+  if (activeTab.conversationId) {
+    return (
+      Object.values(acpState.sessions).some(
+        (session) =>
+          session.conversationId === activeTab.conversationId && session.projectId === projectId
+      ) ||
+      acpState.sessionIndex.some(
+        (entry) =>
+          entry.conversationId === activeTab.conversationId && entry.projectId === projectId
+      )
     )
+  }
+  return Boolean(
+    activeTab.sessionId &&
+      (acpState.sessions[activeTab.sessionId]?.projectId === projectId ||
+        acpState.sessionIndex.some(
+          (entry) => entry.id === activeTab.sessionId && entry.projectId === projectId
+        ))
   )
 }
 
@@ -724,7 +744,7 @@ function reconcilePersistedHistoryIntoLiveTerminals(
 }
 
 function selectTerminalForProject(
-  existingTerminals: Array<{ id: string; name: string; projectId: string }>,
+  existingTerminals: Array<{ id: string; name: string; projectId?: string }>,
   layout: PersistedTerminalLayout | null
 ): string | null {
   if (existingTerminals.length === 0) {
@@ -785,6 +805,7 @@ async function restoreFromLayout(
   isCancelled: () => boolean
 ): Promise<RestoreExecutionResult> {
   const restoreId = `restore-${randomUUID().slice(0, 5)}`
+  const conversationId = useSessionWorkspaceSyncStore.getState().activeConversationId ?? undefined
 
   // FIX #2: Use proper lock acquire/release with owner tracking
   if (!acquireGlobalSpawnLock(restoreId)) {
@@ -830,11 +851,14 @@ async function restoreFromLayout(
     // Create all terminals at once to avoid multiple re-renders
     const newTerminals: Array<{
       id: string
+      conversationId?: string
       name: string
       projectId: string
       shell: string
+      viewState: 'visible'
       cwd?: string
       output: never[]
+      healthStatus?: 'running'
       pendingScrollback?: string[]
       transcript?: string
       // R3: DEC private-mode snapshot replayed before pendingScrollback on mount.
@@ -916,12 +940,14 @@ async function restoreFromLayout(
             const result = await terminalApi.spawn(
               agentSpawnOptions
                 ? {
+                    ...(conversationId ? { conversationId } : {}),
                     projectId,
                     cwd: persistedTerminal.cwd,
                     ...agentSpawnOptions,
                     ...(spawnEnv ? { env: spawnEnv } : {})
                   }
                 : {
+                    ...(conversationId ? { conversationId } : {}),
                     projectId,
                     shell: normalizedShell,
                     cwd: persistedTerminal.cwd,
@@ -975,7 +1001,7 @@ async function restoreFromLayout(
             ptyId: spawnData.id
           })
 
-          const killResult = await terminalApi.kill(spawnData.id)
+          const killResult = await terminalApi.terminate(spawnData.id)
           if (!killResult.success) {
             console.error('Failed to kill cancelled restore PTY:', killResult.error)
           }
@@ -988,11 +1014,14 @@ async function restoreFromLayout(
         idMap.set(persistedTerminal.id, newId)
         newTerminals.push({
           id: newId,
+          ...(conversationId ? { conversationId } : {}),
           name: persistedTerminal.name,
           projectId,
           shell: normalizedShell,
           cwd: persistedTerminal.cwd,
           output: [],
+          healthStatus: 'running',
+          viewState: 'visible',
           pendingScrollback: persistedTerminal.scrollback,
           transcript: persistedTerminal.transcript,
           ptyId: spawnData.id,
@@ -1096,6 +1125,7 @@ async function createDefaultTerminal(
   isCancelled: () => boolean
 ): Promise<RestoreExecutionResult> {
   const defaultId = `default-${randomUUID().slice(0, 5)}`
+  const conversationId = useSessionWorkspaceSyncStore.getState().activeConversationId ?? undefined
 
   // FIX #2: Use proper lock acquire/release with owner tracking
   if (!acquireGlobalSpawnLock(defaultId)) {
@@ -1189,6 +1219,7 @@ async function createDefaultTerminal(
         const result = await terminalApi.spawn({
           shell,
           cwd,
+          ...(conversationId ? { conversationId } : {}),
           projectId,
           ...(hasProjectEnv ? { env } : {})
         })
@@ -1235,7 +1266,7 @@ async function createDefaultTerminal(
           ptyId: spawnData.id
         })
 
-        const killResult = await terminalApi.kill(spawnData.id)
+        const killResult = await terminalApi.terminate(spawnData.id)
         if (!killResult.success) {
           console.error('Failed to kill cancelled default terminal PTY:', killResult.error)
         }
@@ -1263,6 +1294,17 @@ async function createDefaultTerminal(
       shell,
       cwd
     )
+    useTerminalStore.setState((state) => ({
+      terminals: state.terminals.map((terminal) =>
+        terminal.id === newTerminal.id
+          ? {
+              ...terminal,
+              ...(conversationId ? { conversationId } : {}),
+              viewState: 'visible'
+            }
+          : terminal
+      )
+    }))
     terminalStore.setTerminalPtyId(newTerminal.id, spawnData.id)
     // CAP-3: store the issued lease credential (in-memory only).
     if (spawnData.claim) {

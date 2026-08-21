@@ -46,7 +46,8 @@ vi.mock('@/stores/acp-store', () => ({
 }))
 
 vi.mock('@/hooks/use-projects-persistence', () => ({
-  toProjectSummaries: vi.fn(() => [])
+  toProjectSummaries: vi.fn(() => []),
+  toProjectGroupSummaries: vi.fn(() => [])
 }))
 
 vi.mock('@/lib/acp-history-persistence', () => ({
@@ -59,14 +60,34 @@ vi.mock('sonner', () => ({ toast: { error: vi.fn() } }))
 import { syncProjects } from '@/lib/api'
 import { useRemoteStatus } from '@/stores/remote-status-store'
 
+const RAW_CREDENTIAL = 'secret-bootstrap-credential'
+const NEXT_RAW_CREDENTIAL = 'rotated-bootstrap-credential'
 const RUNNING: RemoteStatus = {
   running: true,
   url: 'http://127.0.0.1:5123',
   port: 5123,
   bindMode: 'localhost',
   bindHost: '127.0.0.1',
-  tunnelUrl: 'https://foo-bar.trycloudflare.com'
+  tunnelUrl: 'https://foo-bar.trycloudflare.com',
+  accessUrl: `https://foo-bar.trycloudflare.com/#access_token=${RAW_CREDENTIAL}`
 }
+const STOPPED: RemoteStatus = {
+  running: false,
+  url: null,
+  port: null,
+  bindMode: null,
+  bindHost: null,
+  tunnelUrl: null,
+  accessUrl: null
+}
+const RUNNING_AGAIN: RemoteStatus = {
+  ...RUNNING,
+  port: 6124,
+  url: 'http://127.0.0.1:6124',
+  tunnelUrl: 'https://new-generation.trycloudflare.com',
+  accessUrl: `https://new-generation.trycloudflare.com/#access_token=${NEXT_RAW_CREDENTIAL}`
+}
+const clipboardWrite = vi.fn(async () => undefined)
 
 function renderPopover(): ReturnType<typeof render> {
   return render(
@@ -87,6 +108,10 @@ async function openPopover(): Promise<HTMLElement> {
 beforeEach(() => {
   vi.clearAllMocks()
   vi.mocked(useRemoteStatus).mockReturnValue(null)
+  Object.defineProperty(navigator, 'clipboard', {
+    configurable: true,
+    value: { writeText: clipboardWrite }
+  })
 })
 
 afterEach(() => {
@@ -103,17 +128,84 @@ describe('RemoteAccessPopover', () => {
     expect(screen.queryByText('Copy link')).toBeNull()
   })
 
-  it('renders a QR from tunnelUrl when running (no bind selector, no URL row)', async () => {
+  it('uses only the credentialed accessUrl for QR/copy without displaying the raw credential', async () => {
     vi.mocked(useRemoteStatus).mockReturnValue(RUNNING)
     renderPopover()
     await openPopover()
 
     const qr = screen.getByTestId('qr')
-    expect(qr.getAttribute('data-value')).toBe(RUNNING.tunnelUrl)
+    expect(qr.getAttribute('data-value')).toBe(RUNNING.accessUrl)
+    expect(qr.getAttribute('data-value')).not.toBe(RUNNING.tunnelUrl)
+    expect(screen.queryByText(RAW_CREDENTIAL)).toBeNull()
+    expect(document.body.textContent).not.toContain(RAW_CREDENTIAL)
+
+    const copyButton = screen.getByRole('button', { name: 'Copy tunnel link' })
+    await fireEvent.click(copyButton)
+    await waitFor(() => expect(clipboardWrite).toHaveBeenCalledWith(RUNNING.accessUrl))
+
     // The simplify goal: no bind selector, no open-in-browser text row.
     expect(screen.queryByText('Listen on')).toBeNull()
     expect(screen.queryByText('Open in browser')).toBeNull()
-    expect(screen.getByText('Copy link')).toBeDefined()
+    expect(await screen.findByText('Copied')).toBeDefined()
+  })
+
+  it('renders a newly generated local Desktop access URL and QR after host generation starts', async () => {
+    vi.mocked(useRemoteStatus).mockReturnValue(RUNNING)
+    stopMock.mockResolvedValueOnce({ success: true, data: STOPPED })
+    startMock.mockResolvedValueOnce({ success: true, data: RUNNING_AGAIN })
+    const view = renderPopover()
+    let toggle = await openPopover()
+
+    expect(screen.getByTestId('qr').getAttribute('data-value')).toBe(RUNNING.accessUrl)
+    await fireEvent.click(toggle)
+    await waitFor(() => expect(stopMock).toHaveBeenCalledTimes(1))
+    expect(setStatus).toHaveBeenLastCalledWith(STOPPED)
+
+    vi.mocked(useRemoteStatus).mockReturnValue(STOPPED)
+    view.rerender(
+      <TooltipProvider>
+        <RemoteAccessPopover />
+      </TooltipProvider>
+    )
+    expect(screen.queryByTestId('qr')).toBeNull()
+    expect(document.body.textContent).not.toContain(RAW_CREDENTIAL)
+
+    toggle = screen.getByRole('switch')
+    await fireEvent.click(toggle)
+    await waitFor(() => expect(startMock).toHaveBeenCalledTimes(1))
+    expect(setStatus).toHaveBeenLastCalledWith(RUNNING_AGAIN)
+
+    vi.mocked(useRemoteStatus).mockReturnValue(RUNNING_AGAIN)
+    view.rerender(
+      <TooltipProvider>
+        <RemoteAccessPopover />
+      </TooltipProvider>
+    )
+    const rotatedQr = screen.getByTestId('qr')
+    expect(rotatedQr.getAttribute('data-value')).toBe(RUNNING_AGAIN.accessUrl)
+    expect(rotatedQr.getAttribute('data-value')).not.toBe(RUNNING.accessUrl)
+    expect(document.body.textContent).not.toContain(RAW_CREDENTIAL)
+    expect(document.body.textContent).not.toContain(NEXT_RAW_CREDENTIAL)
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Copy tunnel link' }))
+    await waitFor(() => expect(clipboardWrite).toHaveBeenLastCalledWith(RUNNING_AGAIN.accessUrl))
+    expect(clipboardWrite).not.toHaveBeenCalledWith(RUNNING.accessUrl)
+
+    const revokedPeerFrame = {
+      type: 'reauthentication_required',
+      payload: { code: 'REAUTHENTICATION_REQUIRED' }
+    }
+    expect(JSON.stringify(revokedPeerFrame)).not.toContain(NEXT_RAW_CREDENTIAL)
+    expect(rotatedQr.getAttribute('data-value')).toBe(RUNNING_AGAIN.accessUrl)
+  })
+
+  it('does not fall back to an uncredentialed tunnel URL when accessUrl is explicitly absent', async () => {
+    vi.mocked(useRemoteStatus).mockReturnValue({ ...RUNNING, accessUrl: null })
+    renderPopover()
+    await openPopover()
+
+    expect(screen.queryByTestId('qr')).toBeNull()
+    expect(screen.queryByText('Copy link')).toBeNull()
   })
 
   it('shows an inline error when start fails (no QR)', async () => {

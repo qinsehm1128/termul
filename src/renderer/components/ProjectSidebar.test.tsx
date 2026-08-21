@@ -1,32 +1,20 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter, useLocation } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { SessionIndexEntry } from '@/lib/acp-history-persistence'
-import { useAcpStore } from '@/stores/acp-store'
+import { useConversationStore } from '@/stores/conversation-store'
 import { useProjectStore } from '@/stores/project-store'
+import { useTerminalStore } from '@/stores/terminal-store'
 import { useWorkspaceStore } from '@/stores/workspace-store'
 import type { Project } from '@/types/project'
 import { ProjectSidebar } from './ProjectSidebar'
 
 const {
   mockGetAvailableShells,
-  mockSpawnTerminalInPane,
-  mockActivateAndOpenTerminal,
-  mockOpenTerminalAtCwd,
-  mockAddAgentChatTab,
-  mockOpenHistorySession,
-  mockDeleteHistorySession,
   mockUseProjectsWithActivity,
   mockUseProjectsWithErrors,
   mockUseProjectsWithActiveAgentChat
 } = vi.hoisted(() => ({
   mockGetAvailableShells: vi.fn(),
-  mockSpawnTerminalInPane: vi.fn(),
-  mockActivateAndOpenTerminal: vi.fn(),
-  mockOpenTerminalAtCwd: vi.fn(),
-  mockAddAgentChatTab: vi.fn(),
-  mockOpenHistorySession: vi.fn(),
-  mockDeleteHistorySession: vi.fn(),
   mockUseProjectsWithActivity: vi.fn(),
   mockUseProjectsWithErrors: vi.fn(),
   mockUseProjectsWithActiveAgentChat: vi.fn()
@@ -66,12 +54,6 @@ vi.mock('@/stores/acp-store', async () => {
     useProjectsWithActiveAgentChat: () => mockUseProjectsWithActiveAgentChat()
   }
 })
-
-vi.mock('@/lib/terminal-spawn', () => ({
-  spawnTerminalInPane: mockSpawnTerminalInPane,
-  activateAndOpenTerminal: mockActivateAndOpenTerminal,
-  openTerminalAtCwd: mockOpenTerminalAtCwd
-}))
 
 vi.mock('@/lib/utils', async () => {
   const actual = await vi.importActual('@/lib/utils')
@@ -244,18 +226,10 @@ vi.mock('@/components/ui/context-menu', async () => {
 
 // Setup mock data
 beforeEach(() => {
+  useConversationStore.getState().reset()
+  useTerminalStore.setState({ terminals: [], activeTerminalId: '', ptyIdIndex: new Map() })
+  useProjectStore.setState({ groups: [], activeGroupId: null })
   mockGetAvailableShells.mockReset()
-  mockSpawnTerminalInPane.mockReset()
-  mockSpawnTerminalInPane.mockResolvedValue({ success: true, data: { id: 'term-1' } })
-  mockActivateAndOpenTerminal.mockReset()
-  mockActivateAndOpenTerminal.mockResolvedValue({ status: 'opened', terminalId: 'term-1' })
-  mockOpenTerminalAtCwd.mockReset()
-  mockOpenTerminalAtCwd.mockResolvedValue({ status: 'opened', terminalId: 'term-1' })
-  mockAddAgentChatTab.mockReset()
-  mockOpenHistorySession.mockReset()
-  mockOpenHistorySession.mockResolvedValue(undefined)
-  mockDeleteHistorySession.mockReset()
-  mockDeleteHistorySession.mockResolvedValue(undefined)
   mockGetAvailableShells.mockResolvedValue({
     success: true,
     data: {
@@ -273,18 +247,6 @@ beforeEach(() => {
   mockUseProjectsWithActiveAgentChat.mockReturnValue([])
   mockUseProjectsWithErrors.mockReset()
   mockUseProjectsWithErrors.mockReturnValue(new Set())
-  // Reset chat-history store state to a clean baseline. ProjectChatList reads
-  // `sessionIndex` + the open/delete actions; drive them through spies so the
-  // integration tests stay deterministic without exercising the real reopen.
-  useAcpStore.setState({
-    sessionIndex: [],
-    openHistorySession: mockOpenHistorySession,
-    deleteHistorySession: mockDeleteHistorySession
-  })
-  useWorkspaceStore.setState({
-    activePaneId: 'pane-1',
-    addAgentChatTab: mockAddAgentChatTab
-  })
 })
 
 const mockProjects: Project[] = [
@@ -304,21 +266,17 @@ const defaultProps = {
   onReorderProjects: vi.fn()
 }
 
+function LocationProbe(): React.JSX.Element {
+  const location = useLocation()
+  return <output data-testid="location-probe">{location.pathname}</output>
+}
+
 const renderWithRouter = (props = {}) => {
   return render(
     <MemoryRouter>
       <ProjectSidebar {...defaultProps} {...props} />
     </MemoryRouter>
   )
-}
-
-// The project chat list is collapsed by default and only expands via the
-// chevron, so tests that assert on chat rows must open the section first.
-// `getAllByLabelText` because every project now shows a chevron; [0] is the
-// first project in render order.
-const expandChats = () => {
-  const chevrons = screen.getAllByLabelText('Expand chats')
-  fireEvent.click(chevrons[0])
 }
 
 describe('ProjectSidebar Context Menu', () => {
@@ -538,6 +496,13 @@ describe('ProjectSidebar', () => {
     expect(screen.getByText('Project Two')).toBeInTheDocument()
   })
 
+  it('keeps projects as context only and does not nest Conversation navigation', () => {
+    renderWithRouter()
+
+    expect(screen.queryByLabelText('Search conversations')).not.toBeInTheDocument()
+    expect(screen.queryByText('Refactor sidebar')).not.toBeInTheDocument()
+  })
+
   it('should call onSelectProject when project is clicked', () => {
     const onSelectProject = vi.fn()
     renderWithRouter({ onSelectProject })
@@ -545,6 +510,47 @@ describe('ProjectSidebar', () => {
     fireEvent.click(screen.getByText('Project Two'))
 
     expect(onSelectProject).toHaveBeenCalledWith('2')
+  })
+
+  it('keeps the canonical route, Conversation workspace, and PTY records on project switch', () => {
+    const conversationId = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+    useProjectStore.setState({ projects: mockProjects, activeProjectId: '1' })
+    useConversationStore.setState({ activeConversationId: conversationId })
+    useWorkspaceStore.getState().addAgentChatTab('opaque-runtime-session', undefined, false)
+    const rootBefore = useWorkspaceStore.getState().root
+    useTerminalStore.setState({
+      terminals: [
+        {
+          id: 'terminal-live',
+          conversationId,
+          projectId: '1',
+          name: 'Live',
+          shell: 'bash',
+          ptyId: 'pty-live',
+          healthStatus: 'running',
+          viewState: 'visible',
+          isHidden: false,
+          output: []
+        }
+      ]
+    })
+
+    render(
+      <MemoryRouter initialEntries={[`/c/${conversationId}`]}>
+        <ProjectSidebar
+          {...defaultProps}
+          onSelectProject={(id) => useProjectStore.getState().selectProject(id)}
+        />
+        <LocationProbe />
+      </MemoryRouter>
+    )
+    fireEvent.click(screen.getByText('Project Two'))
+
+    expect(screen.getByTestId('location-probe')).toHaveTextContent(`/c/${conversationId}`)
+    expect(useConversationStore.getState().activeConversationId).toBe(conversationId)
+    expect(useWorkspaceStore.getState().root).toBe(rootBefore)
+    expect(JSON.stringify(useWorkspaceStore.getState().root)).toContain('opaque-runtime-session')
+    expect(useTerminalStore.getState().terminals[0].ptyId).toBe('pty-live')
   })
 
   it('should call onNewProject when header + button is clicked', () => {
@@ -806,82 +812,6 @@ describe('ProjectSidebar Activity Indicator', () => {
   })
 })
 
-describe('ProjectSidebar Project Chat List', () => {
-  const chatEntry = (overrides: Partial<SessionIndexEntry> = {}): SessionIndexEntry => ({
-    id: 'chat-1',
-    agentId: 'agent-1',
-    title: 'Refactor sidebar',
-    cwd: '/repo/main',
-    projectId: '1',
-    createdAt: 1000,
-    lastActivityAt: 2000,
-    messageCount: 5,
-    status: 'active',
-    ...overrides
-  })
-
-  const projectWithChats: Project[] = [
-    { id: '1', name: 'Project One', color: 'blue', gitBranch: 'main' }
-  ]
-
-  it('renders the per-project chat search and chat rows when expanded', () => {
-    useAcpStore.setState({ sessionIndex: [chatEntry()] })
-    renderWithRouter({ projects: projectWithChats, activeProjectId: '1' })
-    expandChats()
-
-    expect(screen.getByLabelText('Search chats')).toBeInTheDocument()
-    expect(screen.getByText('Refactor sidebar')).toBeInTheDocument()
-  })
-
-  it('shows the empty state when the project has no chats', () => {
-    renderWithRouter({ projects: projectWithChats, activeProjectId: '1' })
-    expandChats()
-
-    expect(
-      screen.getByText('No chats yet. Start one with the New Chat button.')
-    ).toBeInTheDocument()
-  })
-
-  it('opens/resumes the chat when a chat row is clicked (no active-worktree sync)', async () => {
-    useAcpStore.setState({ sessionIndex: [chatEntry()] })
-    renderWithRouter({ projects: projectWithChats, activeProjectId: '1' })
-    expandChats()
-
-    fireEvent.click(screen.getByText('Refactor sidebar'))
-
-    await waitFor(() => {
-      expect(mockOpenHistorySession).toHaveBeenCalledWith('chat-1')
-      expect(mockAddAgentChatTab).toHaveBeenCalledWith('chat-1')
-    })
-    // Chat row click must not route through the worktree terminal path.
-    expect(mockActivateAndOpenTerminal).not.toHaveBeenCalled()
-  })
-
-  it('opens a terminal at the chat cwd via openTerminalAtCwd when the terminal icon is clicked', async () => {
-    useAcpStore.setState({ sessionIndex: [chatEntry({ cwd: '/repo/main' })] })
-    renderWithRouter({ projects: projectWithChats, activeProjectId: '1' })
-    expandChats()
-
-    fireEvent.click(screen.getByLabelText('Open terminal for chat Refactor sidebar'))
-
-    await waitFor(() => {
-      expect(mockOpenTerminalAtCwd).toHaveBeenCalledWith('1', '/repo/main')
-    })
-    // The chat terminal icon must not sync activeWorktreeId (no activateAndOpenTerminal).
-    expect(mockActivateAndOpenTerminal).not.toHaveBeenCalled()
-  })
-
-  it('keeps the New Worktree action on the project header context menu', async () => {
-    const projectGit: Project[] = [
-      { id: '1', name: 'Project One', color: 'blue', gitBranch: 'main', isGitRepo: true }
-    ]
-    renderWithRouter({ projects: projectGit, activeProjectId: '1' })
-
-    fireEvent.contextMenu(screen.getByText('Project One'))
-    expect(screen.getByText('New Worktree')).toBeInTheDocument()
-  })
-})
-
 describe('ProjectSidebar Project Search', () => {
   // 8 projects crosses the PROJECT_SEARCH_THRESHOLD so the search UI renders.
   const manyProjects: Project[] = Array.from({ length: 8 }, (_, i) => ({
@@ -1042,63 +972,10 @@ describe('ProjectSidebar Project Search', () => {
   })
 })
 
-describe('ProjectSidebar Chat Search', () => {
-  const projectWithChats: Project[] = [
-    { id: '1', name: 'Project One', color: 'blue', gitBranch: 'main' }
-  ]
-
-  const chats: SessionIndexEntry[] = Array.from({ length: 3 }, (_, i) => ({
-    id: `chat-${i}`,
-    agentId: 'agent-1',
-    title: `Chat ${i}`,
-    cwd: '/repo/main',
-    projectId: '1',
-    createdAt: 1000 + i,
-    lastActivityAt: 2000 + i,
-    messageCount: i,
-    status: 'active' as const
-  }))
-
-  it('shows the per-project chat search box once a project is expanded', () => {
-    useAcpStore.setState({ sessionIndex: chats })
-    renderWithRouter({ projects: projectWithChats, activeProjectId: '1' })
-    expandChats()
-
-    expect(screen.getByLabelText('Search chats')).toBeInTheDocument()
-  })
-
-  it('filters this project chats by title', () => {
-    useAcpStore.setState({ sessionIndex: chats })
-    renderWithRouter({ projects: projectWithChats, activeProjectId: '1' })
-    expandChats()
-
-    fireEvent.change(screen.getByLabelText('Search chats'), {
-      target: { value: 'Chat 1' }
-    })
-
-    expect(screen.getByText('Chat 1')).toBeInTheDocument()
-    expect(screen.queryByText('Chat 0')).not.toBeInTheDocument()
-    expect(screen.queryByText('Chat 2')).not.toBeInTheDocument()
-  })
-
-  it('clears the chat query on Escape', () => {
-    useAcpStore.setState({ sessionIndex: chats })
-    renderWithRouter({ projects: projectWithChats, activeProjectId: '1' })
-    expandChats()
-
-    const input = screen.getByLabelText('Search chats') as HTMLInputElement
-    fireEvent.change(input, { target: { value: 'Chat 1' } })
-    fireEvent.keyDown(input, { key: 'Escape' })
-
-    expect(input.value).toBe('')
-    expect(screen.getByText('Chat 0')).toBeInTheDocument()
-  })
-})
-
 describe('ProjectSidebar Folder Grouping', () => {
   beforeEach(() => {
     // Reset groups in the store before each test
-    useProjectStore.setState({ groups: [] })
+    useProjectStore.setState({ groups: [], activeGroupId: null })
   })
 
   it('should render active projects grouped under folder section when groups are configured', () => {
@@ -1155,8 +1032,102 @@ describe('ProjectSidebar Folder Grouping', () => {
 
     renderWithRouter()
 
-    const folderHeader = screen.getByRole('button', { name: /My Folder/i })
+    const folderHeader = screen.getByRole('button', { name: 'My Folder' })
     const iconContainer = folderHeader.querySelector('.text-project-purple')
     expect(iconContainer).toBeInTheDocument()
+  })
+
+  it('selects a group from its header without toggling collapse', () => {
+    const onSelectGroup = vi.fn()
+    useProjectStore.setState({
+      groups: [
+        {
+          id: 'group-1',
+          name: 'My Folder',
+          projectIds: ['1'],
+          isCollapsed: false
+        }
+      ]
+    })
+
+    renderWithRouter({ onSelectGroup })
+    fireEvent.click(screen.getByRole('button', { name: 'My Folder' }))
+
+    expect(onSelectGroup).toHaveBeenCalledWith('group-1')
+    expect(useProjectStore.getState().groups[0].isCollapsed).toBe(false)
+  })
+
+  it('uses the store selector without changing the current route', () => {
+    useProjectStore.setState({
+      projects: mockProjects,
+      groups: [
+        {
+          id: 'group-1',
+          name: 'My Folder',
+          projectIds: ['1', '2'],
+          preferredProjectId: '2',
+          isCollapsed: false
+        }
+      ],
+      activeProjectId: '1',
+      activeGroupId: null
+    })
+
+    render(
+      <MemoryRouter initialEntries={['/settings']}>
+        <ProjectSidebar {...defaultProps} />
+        <LocationProbe />
+      </MemoryRouter>
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'My Folder' }))
+
+    expect(useProjectStore.getState().activeGroupId).toBe('group-1')
+    expect(useProjectStore.getState().activeProjectId).toBe('2')
+    expect(screen.getByTestId('location-probe')).toHaveTextContent('/settings')
+  })
+
+  it('toggles collapse only from the dedicated chevron control', () => {
+    const onSelectGroup = vi.fn()
+    useProjectStore.setState({
+      groups: [
+        {
+          id: 'group-1',
+          name: 'My Folder',
+          projectIds: ['1'],
+          isCollapsed: false
+        }
+      ]
+    })
+
+    renderWithRouter({ onSelectGroup })
+    fireEvent.click(screen.getByTestId('project-group-chevron-group-1'))
+
+    expect(useProjectStore.getState().groups[0].isCollapsed).toBe(true)
+    expect(onSelectGroup).not.toHaveBeenCalled()
+  })
+
+  it('exposes and styles the active group instead of its preferred project row', () => {
+    useProjectStore.setState({
+      groups: [
+        {
+          id: 'group-1',
+          name: 'My Folder',
+          projectIds: ['1'],
+          preferredProjectId: '1',
+          isCollapsed: false
+        }
+      ],
+      activeProjectId: '1',
+      activeGroupId: 'group-1'
+    })
+
+    renderWithRouter()
+
+    expect(screen.getByRole('button', { name: 'My Folder' })).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    )
+    expect(screen.getByTestId('project-group-group-1')).toHaveClass('bg-sidebar-accent')
+    expect(screen.getByTestId('project-item-1').querySelector('[aria-current]')).toBeNull()
   })
 })

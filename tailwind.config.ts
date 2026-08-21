@@ -78,7 +78,8 @@ export default {
           darker: 'hsl(var(--surface-darker) / <alpha-value>)'
         },
         status: {
-          bar: 'hsl(var(--status-bar) / <alpha-value>)'
+          bar: 'hsl(var(--status-bar) / <alpha-value>)',
+          'bar-foreground': 'hsl(var(--status-bar-foreground) / <alpha-value>)'
         },
         project: {
           blue: 'hsl(var(--project-blue) / <alpha-value>)',

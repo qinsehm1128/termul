@@ -14,10 +14,13 @@ import { logFrontendError } from '@/lib/log-api'
 import { ensureWorktreeSymlinks } from '@/lib/worktree-context'
 import { useAppSettingsStore } from '@/stores/app-settings-store'
 import { useProjectStore } from '@/stores/project-store'
+import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
 import { useTerminalStore } from '@/stores/terminal-store'
 import { useWorkspaceStore } from '@/stores/workspace-store'
 
 export interface SpawnTerminalOptions {
+  /** Override the active Conversation scope (used by restart). */
+  conversationId?: string
   /** Shell path/name. If omitted, resolves from project default → app default. */
   shell?: string
   /** Project environment variables for spawn. */
@@ -46,6 +49,10 @@ export async function spawnTerminalInPane(
 ): Promise<SpawnTerminalResult> {
   const terminalStore = useTerminalStore.getState()
   const workspaceStore = useWorkspaceStore.getState()
+  // Conversation scoping is explicit: callers inside an open Conversation pass
+  // its id; the regular project workspace spawns scope-less terminals and the
+  // host issues an ephemeral scope, keeping projects and chats disentangled.
+  const conversationId = options?.conversationId
 
   // Check per-project terminal limit
   if (options?.maxTerminalsPerProject !== undefined) {
@@ -94,6 +101,7 @@ export async function spawnTerminalInPane(
     const spawnResult = await terminalApi.spawn({
       shell,
       cwd,
+      conversationId,
       projectId,
       ...(hasProjectEnv ? { env } : {})
     })
@@ -120,7 +128,9 @@ export async function spawnTerminalInPane(
       }),
       projectId,
       shell,
-      cwd
+      cwd,
+      undefined,
+      conversationId
     )
 
     // Link PTY ID to terminal record
@@ -202,7 +212,8 @@ export async function openTerminalAtCwd(
 
   const maxTerminalsPerProject = useAppSettingsStore.getState().settings.maxTerminalsPerProject
   const result = await spawnTerminalInPane(paneId, projectId, cwd, {
-    maxTerminalsPerProject
+    maxTerminalsPerProject,
+    conversationId: useSessionWorkspaceSyncStore.getState().activeConversationId ?? undefined
   })
 
   if (result.success) {

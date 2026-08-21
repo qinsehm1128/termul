@@ -20,6 +20,7 @@ import {
   acpRespondPermission,
   acpSendPrompt,
   acpSetConfigOption,
+  acpSetPermissionPolicy,
   acpSpawnAgent,
   onAcpEvent
 } from './acp-api'
@@ -48,13 +49,52 @@ describe('acp-api command wrappers (Tauri transport)', () => {
     expect(result.authMethods).toHaveLength(1)
   })
 
+  it('acpSetPermissionPolicy updates a live desktop agent', async () => {
+    ;(invoke as ReturnType<typeof vi.fn>).mockResolvedValue(undefined)
+    await acpSetPermissionPolicy('agent-1', 'allow_all')
+    expect(invoke).toHaveBeenCalledWith('acp_set_permission_policy', {
+      agentId: 'agent-1',
+      policy: 'allow_all'
+    })
+  })
+
   it('acpNewSession passes agentId, cwd, mcpServers', async () => {
     ;(invoke as ReturnType<typeof vi.fn>).mockResolvedValue({ sessionId: 's1' })
     await acpNewSession('agent-1', '/home/user', [{ type: 'stdio', name: 'fs', command: 'npx' }])
     expect(invoke).toHaveBeenCalledWith('acp_new_session', {
       agentId: 'agent-1',
       cwd: '/home/user',
-      mcpServers: [{ type: 'stdio', name: 'fs', command: 'npx' }]
+      mcpServers: [{ type: 'stdio', name: 'fs', command: 'npx' }],
+      executionTarget: { kind: 'workspace' }
+    })
+  })
+
+  it('acpNewSession forwards retry, attachment, and explicit target fields', async () => {
+    ;(invoke as ReturnType<typeof vi.fn>).mockResolvedValue({
+      persistence: 'conversation',
+      conversationId: '11111111-1111-4111-8111-111111111111',
+      workspaceCwd: '/visible/session',
+      executionCwd: '/project',
+      sessionId: 's1'
+    })
+    const projectAttachment = {
+      schemaVersion: 1 as const,
+      projectId: 'p1',
+      attachedAtUtc: '2026-08-16T10:00:00.000Z',
+      projectPathSnapshot: '/project'
+    }
+    await acpNewSession('agent-1', '/ignored', undefined, {
+      conversationId: '11111111-1111-4111-8111-111111111111',
+      projectAttachment,
+      executionTarget: { kind: 'project_root', projectId: 'p1', projectRoot: '/project' }
+    })
+    expect(invoke).toHaveBeenCalledWith('acp_new_session', {
+      agentId: 'agent-1',
+      cwd: '/ignored',
+      mcpServers: undefined,
+      conversationId: '11111111-1111-4111-8111-111111111111',
+      projectAttachment,
+      executionTarget: { kind: 'project_root', projectId: 'p1', projectRoot: '/project' }
     })
   })
 

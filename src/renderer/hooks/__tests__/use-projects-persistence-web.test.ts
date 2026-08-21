@@ -36,6 +36,7 @@ const payload: ProjectListPayload = {
     { id: 'p1', name: 'Alpha', color: 'blue', path: '/a', isArchived: false, isDefault: true },
     { id: 'p2', name: 'Beta', color: 'gray', path: null, isArchived: true, isDefault: false }
   ],
+  groups: [],
   defaultProjectId: 'p1'
 }
 
@@ -48,6 +49,7 @@ describe('useProjectsLoader (web/remote mode)', () => {
       projects: [],
       groups: [],
       activeProjectId: '',
+      activeGroupId: null,
       isLoaded: false,
       isWorktreeOperationLocked: false
     })
@@ -66,6 +68,39 @@ describe('useProjectsLoader (web/remote mode)', () => {
     // Epic 7: the initial load seeds activeProjectId from the host default.
     expect(useProjectStore.getState().activeProjectId).toBe('p1')
     expect(useProjectStore.getState().projects[1].isArchived).toBe(true)
+  })
+
+  it('mirrors project groups while keeping group activation client-local', async () => {
+    mockList.mockResolvedValue({
+      success: true,
+      data: {
+        ...payload,
+        groups: [
+          {
+            id: 'group-1',
+            name: 'Workspace',
+            projectIds: ['p1', 'p2'],
+            color: 'purple',
+            preferredProjectId: 'p1'
+          }
+        ]
+      }
+    })
+
+    renderHook(() => useProjectsLoader())
+
+    await waitFor(() => {
+      expect(useProjectStore.getState().groups).toHaveLength(1)
+    })
+    expect(useProjectStore.getState().groups[0]).toEqual(
+      expect.objectContaining({
+        id: 'group-1',
+        projectIds: ['p1', 'p2'],
+        color: 'purple',
+        preferredProjectId: 'p1'
+      })
+    )
+    expect(useProjectStore.getState().activeGroupId).toBeNull()
   })
 
   it('initial load seeds activeProjectId from defaultProjectId (Epic 7)', async () => {

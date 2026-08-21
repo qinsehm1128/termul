@@ -104,10 +104,18 @@ export function MobileFileExplorer({
   onOpenChange
 }: MobileFileExplorerProps): React.JSX.Element {
   const { t } = useTranslation('mobile')
-  const { rootPath, directoryContents, loadingDirs, rootLoadError } = useFileExplorer()
-  const { toggleDirectory, refreshDirectory, selectPath } = useFileExplorerActions()
+  const {
+    roots: rawRoots,
+    rootPath,
+    directoryContents,
+    loadingDirs,
+    rootLoadError
+  } = useFileExplorer()
+  const roots = rawRoots ?? []
+  const { toggleDirectory, refreshDirectory, selectPath, setFocusedRoot } = useFileExplorerActions()
   const reducedMotion = useReducedMotion() ?? false
   const projectId = useActiveProjectId()
+  const focusedProjectId = roots.find((root) => root.path === rootPath)?.projectId || projectId
 
   const [currentPath, setCurrentPath] = useState<string | null>(null)
   const [navigationDirection, setNavigationDirection] = useState<NavigationDirection>(0)
@@ -123,8 +131,8 @@ export function MobileFileExplorer({
   const restoredForRootRef = useRef<string | null>(null)
 
   function persistFolder(path: string): void {
-    if (!projectId) return
-    void persistenceApi.write(PersistenceKeys.mobileFileExplorerFolder(projectId), path)
+    if (!focusedProjectId) return
+    void persistenceApi.write(PersistenceKeys.mobileFileExplorerFolder(focusedProjectId), path)
   }
 
   // Restore the last folder the user navigated into (persisted per project)
@@ -141,11 +149,11 @@ export function MobileFileExplorer({
       setCurrentPath(null)
       return
     }
-    const restoreKey = `${projectId ?? ''}:${rootPath}`
+    const restoreKey = `${focusedProjectId ?? ''}:${rootPath}`
     if (restoredForRootRef.current === restoreKey) return
     restoredForRootRef.current = restoreKey
     const normalizedRoot = normalizePath(rootPath)
-    if (!projectId) {
+    if (!focusedProjectId) {
       setCurrentPath(normalizedRoot)
       return
     }
@@ -157,7 +165,7 @@ export function MobileFileExplorer({
     // root on rejection (persistenceApi.read shouldn't reject, but defend it).
     let cancelled = false
     void persistenceApi
-      .read<string>(PersistenceKeys.mobileFileExplorerFolder(projectId))
+      .read<string>(PersistenceKeys.mobileFileExplorerFolder(focusedProjectId))
       .then((res) => {
         if (cancelled) return
         const persisted = res.success ? res.data : null
@@ -169,7 +177,7 @@ export function MobileFileExplorer({
     return () => {
       cancelled = true
     }
-  }, [open, rootPath, projectId])
+  }, [open, rootPath, focusedProjectId])
 
   // Web has no directory watcher, so load whichever folder is currently shown.
   useEffect(() => {
@@ -449,6 +457,27 @@ export function MobileFileExplorer({
           </div>
           <SheetDescription className="sr-only">{t('files.browseDescription')}</SheetDescription>
         </SheetHeader>
+
+        {roots.length > 1 && (
+          <div
+            className="flex shrink-0 gap-1 overflow-x-auto border-b border-border/60 px-2 py-2"
+            role="group"
+            aria-label={t('files.projectFiles')}
+          >
+            {roots.map((root) => (
+              <Button
+                key={`${root.projectId}:${root.path}`}
+                type="button"
+                variant={root.path === rootPath ? 'secondary' : 'ghost'}
+                size="sm"
+                className="h-8 shrink-0"
+                onClick={() => setFocusedRoot(root.path)}
+              >
+                {root.name}
+              </Button>
+            ))}
+          </div>
+        )}
 
         <div className="flex shrink-0 items-center gap-1 border-b border-border/60 px-2 py-1">
           <Button

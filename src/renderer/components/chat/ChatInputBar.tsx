@@ -18,17 +18,24 @@ import { persistenceApi } from '@/lib/api'
 import { registerSessionTempFiles } from '@/lib/attachment-temp-cleanup'
 import { cn } from '@/lib/utils'
 import type { AcpSession, QueuedPrompt } from '@/stores/acp-store'
-import { useAcpMessages, useAcpStore, useAgentIdentity, useSessionUsage } from '@/stores/acp-store'
+import {
+  useAcpMessages,
+  useAcpStore,
+  useSessionAgentIdentity,
+  useSessionUsage
+} from '@/stores/acp-store'
 import { useProjectStore } from '@/stores/project-store'
 import { AgentGlyph } from './AgentGlyph'
 import { ConfigChip, ModeChip } from './AgentHeader'
 import { AttachFilesButton } from './AttachFilesButton'
 import { AttachmentPreviewGroup } from './AttachmentPreviewGroup'
+import { ComposerPill } from './ComposerPill'
 import { ContextUsageIndicator } from './ContextUsageIndicator'
 import { attachmentToBlock, dedupeAttachmentBlocks } from './chat-attachments'
 import {
   extractFastModeOption,
   filterDuplicateModeConfigOptions,
+  normalizeSessionConfigOption,
   partitionConfigOptions,
   resolveModelOption
 } from './chat-input-bar-config'
@@ -38,6 +45,7 @@ import { ChatComposerEditor } from './composer/ChatComposerEditor'
 import { FastModeToggle } from './FastModeToggle'
 import { FileMentionMenu } from './FileMentionMenu'
 import { McpBadge } from './McpBadge'
+import { PermissionPolicyBadge } from './PermissionPolicyBadge'
 import { PromptQueuePanel } from './PromptQueuePanel'
 import { SlashCommandMenu, type SlashMenuHandle } from './SlashCommandMenu'
 import { isSlashTriggerAny } from './slash-menu-model'
@@ -113,8 +121,11 @@ export function ChatInputBar({
   onSendQueuedNow
 }: ChatInputBarProps): React.JSX.Element {
   const { t } = useTranslation('chat')
-  const usableConfigOptions = configOptions.filter((o) => o.options.length > 0)
+  const usableConfigOptions = configOptions
+    .map(normalizeSessionConfigOption)
+    .filter((o) => o.options.length > 0)
   const hasConfigOptions = usableConfigOptions.length > 0
+  const sessionUnbound = !session.conversationId
   // CAP-6: worktree/branch indicator. Short by design: `{branch} · {mode}`
   // (worktree chats show their `chat/*` branch, not the long worktree path —
   // the path stays on the hover tooltip). Current-branch mode falls back to
@@ -148,7 +159,7 @@ export function ChatInputBar({
   const { skills: availableSkills } = useAgentSkills(projectRoot ?? session.cwd)
   const sessionUsage = useSessionUsage(session.id)
   const messages = useAcpMessages(session.id)
-  const { templateId: agentTemplateId } = useAgentIdentity(session.agentId)
+  const { name: agentName, templateId: agentTemplateId } = useSessionAgentIdentity(session)
   // Prefer project/session-scoped MCP context. Older/local sessions without a
   // recorded count retain the existing global-registry fallback.
   const globalMcpCount = useAcpStore((s) => s.mcpServers.length)
@@ -352,13 +363,15 @@ export function ChatInputBar({
     editorRef,
     slashMenuRef,
     commands,
-    configOptions,
+    configOptions: usableConfigOptions,
     modes,
     skills: availableSkills,
     disabled,
     onSetConfig,
     onSetMode,
     onSetModel,
+    modelOption,
+    modelSource,
     mentions,
     scheduleRestoreCaret
   })
@@ -518,6 +531,18 @@ export function ChatInputBar({
       }
     />
   ) : null
+  const agentIdentityChip =
+    !modelChip && agentName ? (
+      <ComposerPill
+        as="span"
+        interactive={false}
+        data-testid="composer-agent-identity"
+        title={agentName}
+      >
+        <AgentGlyph templateId={agentTemplateId} size={13} className="text-muted-foreground" />
+        <span className="truncate">{agentName}</span>
+      </ComposerPill>
+    ) : null
 
   const thoughtChip = thoughtLevel ? (
     <ConfigChip
@@ -586,6 +611,15 @@ export function ChatInputBar({
             className="mb-2 rounded-lg border border-border/60 bg-muted/40 px-3 py-1.5 text-xs text-muted-foreground"
           >
             {t('composer.sessionClosed')}
+          </div>
+        )}
+        {!disabled && sessionUnbound && (
+          <div
+            role="status"
+            data-testid="unbound-session-notice"
+            className="mb-2 rounded-lg border border-border/60 bg-muted/40 px-3 py-1.5 text-xs text-muted-foreground"
+          >
+            {t('lifecycle.errors.CONVERSATION_BINDING_NOT_FOUND')}
           </div>
         )}
         {queue.length > 0 && onRemoveQueued && onSendQueuedNow && (
@@ -667,6 +701,7 @@ export function ChatInputBar({
               <div className="flex min-w-0 items-center gap-2">
                 {canPick && <AttachFilesButton onClick={() => void pickFiles()} />}
                 {mcpBadge}
+                <PermissionPolicyBadge session={session} />
               </div>
               <div
                 className={cn(
@@ -682,7 +717,7 @@ export function ChatInputBar({
                     // unreachable in narrow mode.
                     const agentModesAvailable =
                       session.modes != null && session.modes.availableModes.length > 0
-                    const hasRow1 = agentModesAvailable || Boolean(modelChip)
+                    const hasRow1 = agentModesAvailable || Boolean(modelChip || agentIdentityChip)
                     const hasRow2 = hasConfigOptions
                     if (!hasRow1 && !hasRow2) return null
                     return (
@@ -692,7 +727,7 @@ export function ChatInputBar({
                             className="flex min-w-0 flex-wrap items-center justify-end gap-2"
                             data-composer-toolbar-row="1"
                           >
-                            {modelChip}
+                            {modelChip ?? agentIdentityChip}
                             {agentModeChip}
                           </div>
                         )}
@@ -714,7 +749,7 @@ export function ChatInputBar({
                     className="flex min-w-0 flex-wrap items-center justify-end gap-2.5"
                     data-composer-toolbar-row="single"
                   >
-                    {modelChip}
+                    {modelChip ?? agentIdentityChip}
                     {thoughtChip}
                     {fastModeToggle}
                     {genericChips}

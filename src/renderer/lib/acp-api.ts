@@ -14,6 +14,8 @@
  * normalize it (toast, etc.).
  */
 
+import type { ExecutionTarget, ProjectAttachment } from '@shared/types/conversation.types'
+import type { ScheduledTaskRecordV1 } from '@shared/types/scheduled-task.types'
 import { getAcpTransport } from '@/lib/acp-transport'
 import type { AcpRuntimeAvailability } from '@/lib/agents/supported-acp-agents'
 
@@ -70,6 +72,8 @@ export interface SessionConfigOptionValue {
   value: string
   name: string
   description?: string | null
+  /** Provider/family heading when the agent advertised grouped select options. */
+  group?: string
 }
 
 export interface SessionConfigOption {
@@ -238,6 +242,8 @@ export interface ProbeResult {
 /** Wire type forwarded verbatim to the backend `acp_new_session` command. */
 export type McpServer = McpServerConfig
 
+export type PermissionPolicy = 'ask' | 'allow_all'
+
 export interface AgentConfig {
   /** Stable configured-agent identity used for standalone durable history matching. */
   configId?: string
@@ -247,14 +253,40 @@ export interface AgentConfig {
   env: Record<string, string>
   /** Whether this agent may use the ACP terminal capability (default false). */
   allowTerminal?: boolean
+  /** How Termul handles ACP permission requests for this agent. */
+  permissionPolicy?: PermissionPolicy
 }
 
-export interface NewSessionOutcome {
+export type ConversationExecutionTarget = ExecutionTarget
+export type ConversationProjectAttachment = ProjectAttachment
+
+export interface NewSessionOptions {
+  ephemeral?: boolean
+  projectId?: string
+  worktreePath?: string
+  worktreeBranch?: string
+  conversationId?: string
+  projectAttachment?: ConversationProjectAttachment
+  executionTarget?: ConversationExecutionTarget
+}
+
+type NewSessionCommon = {
   sessionId: SessionId
   modes?: SessionModeState | null
   models?: SessionModelState | null
   configOptions?: SessionConfigOption[] | null
 }
+
+export type NewSessionOutcome =
+  | (NewSessionCommon & {
+      persistence: 'conversation'
+      conversationId: string
+      workspaceCwd: string
+      executionCwd: string
+    })
+  | (NewSessionCommon & {
+      persistence: 'ephemeral'
+    })
 
 /** A session discovered via `session/list` (agent-native session). */
 export interface SessionInfo {
@@ -345,6 +377,11 @@ export interface PlanUpdateEvent {
   agentId: AgentId
   sessionId: SessionId
   plan: Plan
+}
+export interface ScheduledTaskDraftEvent {
+  agentId: AgentId
+  sessionId: SessionId
+  task: ScheduledTaskRecordV1
 }
 export interface CommandsUpdateEvent {
   agentId: AgentId
@@ -462,6 +499,7 @@ export const ACP_EVENTS = {
   toolCall: 'acp:tool_call',
   toolCallUpdate: 'acp:tool_call_update',
   planUpdate: 'acp:plan_update',
+  scheduledTaskDraft: 'acp:scheduled_task_draft',
   commandsUpdate: 'acp:commands_update',
   modeUpdate: 'acp:mode_update',
   configOptionsUpdate: 'acp:config_options_update',
@@ -561,17 +599,18 @@ export async function acpListAgents(): Promise<AgentId[]> {
   return getAcpTransport().listAgents()
 }
 
+export async function acpSetPermissionPolicy(
+  agentId: AgentId,
+  policy: PermissionPolicy
+): Promise<void> {
+  await getAcpTransport().setPermissionPolicy(agentId, policy)
+}
+
 export async function acpNewSession(
   agentId: AgentId,
   cwd: string,
   mcpServers?: McpServer[],
-  options?: {
-    ephemeral?: boolean
-    projectId?: string
-    /** Worktree path + branch (CAP-3) — persisted for the indicator + fallback. */
-    worktreePath?: string
-    worktreeBranch?: string
-  }
+  options?: NewSessionOptions
 ): Promise<NewSessionOutcome> {
   return getAcpTransport().newSession(agentId, cwd, mcpServers, options)
 }
@@ -579,17 +618,21 @@ export async function acpNewSession(
 export async function acpLoadSession(
   agentId: AgentId,
   sessionId: SessionId,
-  cwd: string
+  cwd: string,
+  conversationId?: string,
+  mcpServers?: McpServer[]
 ): Promise<SessionReopenOutcome> {
-  return getAcpTransport().loadSession(agentId, sessionId, cwd)
+  return getAcpTransport().loadSession(agentId, sessionId, cwd, conversationId, mcpServers)
 }
 
 export async function acpResumeSession(
   agentId: AgentId,
   sessionId: SessionId,
-  cwd: string
+  cwd: string,
+  conversationId?: string,
+  mcpServers?: McpServer[]
 ): Promise<SessionReopenOutcome> {
-  return getAcpTransport().resumeSession(agentId, sessionId, cwd)
+  return getAcpTransport().resumeSession(agentId, sessionId, cwd, conversationId, mcpServers)
 }
 
 export async function acpCloseSession(agentId: AgentId, sessionId: SessionId): Promise<void> {
@@ -729,6 +772,12 @@ export async function acpSetFirstPromptWarmupTimeout(secs: number | null): Promi
   await getAcpTransport().setFirstPromptWarmupTimeout(secs)
 }
 
+// Prefer host-owned local npm install for `npx -y` agents, or always use npx.
+// Desktop-only: the WS transport no-ops on the standalone server.
+export async function acpSetPreferLocalNpmInstall(prefer: boolean): Promise<void> {
+  await getAcpTransport().setPreferLocalNpmInstall(prefer)
+}
+
 // --- Event subscription ----------------------------------------------------
 
 /**
@@ -743,6 +792,7 @@ export const acpApi = {
   spawnAgent: acpSpawnAgent,
   killAgent: acpKillAgent,
   listAgents: acpListAgents,
+  setPermissionPolicy: acpSetPermissionPolicy,
   newSession: acpNewSession,
   loadSession: acpLoadSession,
   resumeSession: acpResumeSession,
@@ -763,6 +813,7 @@ export const acpApi = {
   setSessionNewTimeout: acpSetSessionNewTimeout,
   setSessionReopenTimeout: acpSetSessionReopenTimeout,
   setFirstPromptWarmupTimeout: acpSetFirstPromptWarmupTimeout,
+  setPreferLocalNpmInstall: acpSetPreferLocalNpmInstall,
   installRegistryBinary: acpInstallRegistryBinary,
   installAcpAgent: acpInstallAcpAgent,
   probeRuntime: acpProbeRuntime,

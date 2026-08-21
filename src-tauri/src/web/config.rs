@@ -8,6 +8,13 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+use url::Url;
+
+use crate::web::auth::IngressProvenance;
+
+pub const MAX_EVENT_LOG_CAPACITY: usize = 16_384;
+pub const REMOTE_AUTH_CONFIGURATION_REQUIRED: &str = "REMOTE_AUTH_CONFIGURATION_REQUIRED";
+
 /// Resolve the default project-root boundary for the fs_api routes (PR-S4).
 ///
 /// Prefers `$TERMUL_PROJECT_ROOT` when set; otherwise falls back to the
@@ -151,7 +158,8 @@ impl BindMode {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
-    /// Per-session event-log capacity (bounded ring; AC4). Default 4096.
+    /// Per-session event-log capacity (bounded ring; AC4). Default 4096;
+    /// validated to `1..=MAX_EVENT_LOG_CAPACITY` before host admission.
     pub event_log_capacity: usize,
     /// Permission-rendezvous timeout in seconds (Story 1.7 / FR14). On expiry
     /// the pending permission resolves as deny (`Cancelled`). Default 60.
@@ -176,6 +184,9 @@ pub struct ServerConfig {
     pub projects_file: Option<PathBuf>,
     /// Standalone-only durable session root. Desktop shared-live uses `None`.
     pub sessions_dir: Option<PathBuf>,
+    /// Standalone visible Conversation workspace base. CLI wins over the environment; when
+    /// neither is set this is `<project_root>/Termul`.
+    pub conversation_workspace_root: PathBuf,
     /// CAP-5 / Story 5: workspace-manifests root override. `None` means
     /// "use `<service_account_state_dir>/workspace-manifests`" — the
     /// standalone binary resolves this in `server_main.rs` so the
@@ -197,6 +208,31 @@ pub struct ServerConfig {
     /// `serve_router`, so the desktop shared-live path gets a durable store
     /// too (no per-browser localStorage fallback).
     pub store_file: Option<PathBuf>,
+    /// Explicit operator-owned bearer credential file for standalone remote
+    /// access. The file is permission-validated before any router admission.
+    pub remote_access_token_file: Option<PathBuf>,
+    /// Exact normalized browser Origins allowed to open the ACP WebSocket.
+    pub allowed_origins: Vec<Url>,
+}
+
+fn parse_allowed_origin(value: &str) -> Result<Url, ParseCliError> {
+    let parsed = Url::parse(value.trim()).map_err(|_| {
+        ParseCliError::Message("invalid --allowed-origin: expected http(s) Origin".into())
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || parsed.username() != ""
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(ParseCliError::Message(
+            "invalid --allowed-origin: expected scheme://host[:port] without path, query, credentials, or fragment"
+                .into(),
+        ));
+    }
+    Ok(parsed)
 }
 
 impl ServerConfig {
@@ -204,6 +240,16 @@ impl ServerConfig {
     /// a parse error at the CLI layer (callers should validate first).
     pub fn bind_mode(&self) -> Option<BindMode> {
         BindMode::parse(&self.host)
+    }
+
+    /// Host-controlled provenance used for route composition. A loopback bind
+    /// is the local-operator composition; an all-interface bind is public.
+    #[must_use]
+    pub fn ingress_provenance(&self) -> IngressProvenance {
+        match self.bind_mode() {
+            Some(BindMode::Localhost) => IngressProvenance::LocalOperator,
+            Some(BindMode::All) | None => IngressProvenance::PublicTunnel,
+        }
     }
 
     /// Socket address for `TcpListener::bind`.
@@ -231,7 +277,13 @@ impl ServerConfig {
     /// relative `./termul` dir (CWD-dependent, unbounded). A truly unset env
     /// var falls through to the next branch; an empty-string env var now
     /// behaves the same way (the next branch or the temp-dir fallback).
+    /// Resolve the standalone visible Conversation workspace base. CLI wins over the
+    /// environment, which wins over `<project_root>/Termul`.
     #[must_use]
+    pub fn conversation_workspace_root(&self) -> PathBuf {
+        self.conversation_workspace_root.clone()
+    }
+
     pub fn service_account_state_dir(&self) -> PathBuf {
         #[cfg(unix)]
         {
@@ -270,6 +322,28 @@ impl ServerConfig {
         I: IntoIterator<Item = S>,
         S: AsRef<str>,
     {
+        Self::from_args_with_auth_policy(args, true)
+    }
+
+    /// Parse only the state/root settings needed by migration maintenance.
+    /// Token and Origin options remain accepted when supplied, but are not
+    /// required because this mode never opens stores, managers, or listeners.
+    pub fn from_maintenance_args<I, S>(args: I) -> Result<Self, ParseCliError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        Self::from_args_with_auth_policy(args, false)
+    }
+
+    fn from_args_with_auth_policy<I, S>(
+        args: I,
+        require_remote_auth: bool,
+    ) -> Result<Self, ParseCliError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
         let mut host = "127.0.0.1".to_string();
         let mut port: u16 = 8080;
         let mut event_log_capacity: usize = 4096;
@@ -288,6 +362,7 @@ impl ServerConfig {
         // optional $TERMUL_PROJECTS_FILE env var is honored after the loop.
         let mut projects_file: Option<PathBuf> = None;
         let mut sessions_dir: Option<PathBuf> = None;
+        let mut conversation_workspace_root: Option<PathBuf> = None;
         // CAP-5 / Story 5: workspace-manifests root override. `None` means
         // "resolve <state dir>/workspace-manifests at startup" in
         // `server_main.rs`. Parsed but NOT validated against the filesystem
@@ -301,6 +376,8 @@ impl ServerConfig {
         // `None` means resolve `<service_account_state_dir>/store.json` at
         // serve time (the desktop shared-live path never sets this).
         let mut store_file: Option<PathBuf> = None;
+        let mut remote_access_token_file: Option<PathBuf> = None;
+        let mut allowed_origins: Vec<Url> = Vec::new();
 
         let mut iter = args.into_iter().peekable();
         while let Some(arg) = iter.next() {
@@ -343,10 +420,11 @@ impl ServerConfig {
                             value.as_ref()
                         ))
                     })?;
-                    if parsed == 0 {
-                        return Err(ParseCliError::Message(
-                            "invalid --event-log-capacity '0': use a positive integer".into(),
-                        ));
+                    if !(1..=MAX_EVENT_LOG_CAPACITY).contains(&parsed) {
+                        return Err(ParseCliError::Message(format!(
+                            "invalid --event-log-capacity '{}': use 1-{MAX_EVENT_LOG_CAPACITY}",
+                            value.as_ref()
+                        )));
                     }
                     event_log_capacity = parsed;
                 }
@@ -421,11 +499,24 @@ impl ServerConfig {
                     }
                     sessions_dir = Some(PathBuf::from(trimmed));
                 }
-                "--workspace-manifests-dir" => {
+                "--conversation-workspace-root" => {
                     let value = iter.next().ok_or_else(|| {
                         ParseCliError::Message(
-                            "missing value for --workspace-manifests-dir".into(),
+                            "missing value for --conversation-workspace-root".into(),
                         )
+                    })?;
+                    let trimmed = value.as_ref().trim();
+                    if trimmed.is_empty() {
+                        return Err(ParseCliError::Message(
+                            "invalid --conversation-workspace-root '': must be a non-empty path"
+                                .into(),
+                        ));
+                    }
+                    conversation_workspace_root = Some(PathBuf::from(trimmed));
+                }
+                "--workspace-manifests-dir" => {
+                    let value = iter.next().ok_or_else(|| {
+                        ParseCliError::Message("missing value for --workspace-manifests-dir".into())
                     })?;
                     let trimmed = value.as_ref().trim();
                     if trimmed.is_empty() {
@@ -437,9 +528,7 @@ impl ServerConfig {
                 }
                 "--acp-catalog-dir" => {
                     let value = iter.next().ok_or_else(|| {
-                        ParseCliError::Message(
-                            "missing value for --acp-catalog-dir".into(),
-                        )
+                        ParseCliError::Message("missing value for --acp-catalog-dir".into())
                     })?;
                     let trimmed = value.as_ref().trim();
                     if trimmed.is_empty() {
@@ -476,6 +565,29 @@ impl ServerConfig {
                     // file loads as an empty registry, not a fatal error).
                     // Validation of each root's path happens at load.
                     projects_file = Some(PathBuf::from(trimmed));
+                }
+                "--remote-access-token-file" => {
+                    let value = iter.next().ok_or_else(|| {
+                        ParseCliError::Message(
+                            "missing value for --remote-access-token-file".into(),
+                        )
+                    })?;
+                    let trimmed = value.as_ref().trim();
+                    if trimmed.is_empty() {
+                        return Err(ParseCliError::Message(
+                            "invalid --remote-access-token-file: must be a non-empty path".into(),
+                        ));
+                    }
+                    remote_access_token_file = Some(PathBuf::from(trimmed));
+                }
+                "--allowed-origin" => {
+                    let value = iter.next().ok_or_else(|| {
+                        ParseCliError::Message("missing value for --allowed-origin".into())
+                    })?;
+                    let origin = parse_allowed_origin(value.as_ref())?;
+                    if !allowed_origins.contains(&origin) {
+                        allowed_origins.push(origin);
+                    }
                 }
                 other if other.starts_with('-') => {
                     return Err(ParseCliError::Message(format!("unknown option '{other}'")));
@@ -546,6 +658,23 @@ impl ServerConfig {
             )));
         }
 
+        let conversation_workspace_root = conversation_workspace_root
+            .or_else(|| {
+                std::env::var("TERMUL_CONVERSATION_WORKSPACE_ROOT")
+                    .ok()
+                    .filter(|value| !value.trim().is_empty())
+                    .map(PathBuf::from)
+            })
+            .unwrap_or_else(|| project_root.join("Termul"));
+
+        if require_remote_auth && (remote_access_token_file.is_none() || allowed_origins.is_empty())
+        {
+            return Err(ParseCliError::Message(format!(
+                "{REMOTE_AUTH_CONFIGURATION_REQUIRED}: standalone service requires \
+                 --remote-access-token-file and at least one --allowed-origin"
+            )));
+        }
+
         Ok(Self {
             host,
             port,
@@ -555,9 +684,12 @@ impl ServerConfig {
             project_root,
             projects_file,
             sessions_dir: Some(sessions_dir),
+            conversation_workspace_root,
             workspace_manifests_dir,
             acp_catalog_dir,
             store_file,
+            remote_access_token_file,
+            allowed_origins,
         })
     }
 }
@@ -652,6 +784,20 @@ mod tests {
         let _ = std::fs::remove_dir_all(p);
     }
 
+    fn configured_args(extra: &[&str]) -> Vec<String> {
+        extra
+            .iter()
+            .copied()
+            .chain([
+                "--remote-access-token-file",
+                "operator-token",
+                "--allowed-origin",
+                "https://termul.example.test",
+            ])
+            .map(str::to_string)
+            .collect()
+    }
+
     #[test]
     fn bind_mode_parse_and_addrs() {
         assert_eq!(BindMode::parse("localhost"), Some(BindMode::Localhost));
@@ -681,9 +827,12 @@ mod tests {
             project_root: PathBuf::from("/tmp"),
             projects_file: None,
             sessions_dir: None,
+            conversation_workspace_root: PathBuf::from("/tmp/Termul"),
             workspace_manifests_dir: None,
             acp_catalog_dir: None,
             store_file: None,
+            remote_access_token_file: None,
+            allowed_origins: Vec::new(),
         };
         assert_eq!(
             cfg.bind_addr(),
@@ -699,16 +848,53 @@ mod tests {
             project_root: PathBuf::from("/tmp"),
             projects_file: None,
             sessions_dir: None,
+            conversation_workspace_root: PathBuf::from("/tmp/Termul"),
             workspace_manifests_dir: None,
             acp_catalog_dir: None,
             store_file: None,
+            remote_access_token_file: None,
+            allowed_origins: Vec::new(),
         };
         assert_eq!(bad.bind_addr(), None);
     }
 
     #[test]
-    fn from_args_defaults() {
-        let cfg = ServerConfig::from_args(Vec::<&str>::new()).expect("defaults");
+    fn from_args_defaults_fail_closed_without_remote_auth_config() {
+        let error = ServerConfig::from_args(Vec::<&str>::new())
+            .expect_err("default standalone admission must fail closed");
+        assert!(error
+            .to_string()
+            .contains(REMOTE_AUTH_CONFIGURATION_REQUIRED));
+        assert!(error.to_string().contains("--remote-access-token-file"));
+        assert!(error.to_string().contains("--allowed-origin"));
+    }
+
+    #[test]
+    fn maintenance_args_do_not_require_remote_auth_and_remain_local_operator() {
+        let cfg = ServerConfig::from_maintenance_args(Vec::<&str>::new())
+            .expect("maintenance configuration is independent of remote auth");
+        assert!(cfg.remote_access_token_file.is_none());
+        assert!(cfg.allowed_origins.is_empty());
+        assert_eq!(cfg.ingress_provenance(), IngressProvenance::LocalOperator);
+    }
+
+    #[test]
+    fn all_interface_serve_configuration_is_public_tunnel_provenance() {
+        let cfg = ServerConfig::from_args([
+            "--host",
+            "0.0.0.0",
+            "--remote-access-token-file",
+            "operator-token",
+            "--allowed-origin",
+            "https://termul.example.test",
+        ])
+        .unwrap();
+        assert_eq!(cfg.ingress_provenance(), IngressProvenance::PublicTunnel);
+    }
+
+    #[test]
+    fn from_args_with_required_auth_uses_runtime_defaults() {
+        let cfg = ServerConfig::from_args(configured_args(&[])).expect("authenticated defaults");
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, 8080);
         assert_eq!(
@@ -723,10 +909,6 @@ mod tests {
             cfg.permission_reconnect_grace_secs, 60,
             "default reconnect grace is 60s (CAP-4: mobile wake + reconnect chain)"
         );
-        // PR-S4: project_root defaults to $HOME / $USERPROFILE when the env var
-        // is unset. The CI hosts in this repo all set $HOME, so the resolved
-        // value should be non-empty. We don't assert an exact path because the
-        // test environment may differ across platforms.
         assert!(
             !cfg.project_root.as_os_str().is_empty(),
             "default project_root should resolve from $HOME when $TERMUL_PROJECT_ROOT is unset"
@@ -734,10 +916,44 @@ mod tests {
     }
 
     #[test]
-    fn from_args_host_and_port() {
-        let cfg = ServerConfig::from_args(["--host", "0.0.0.0", "--port", "9090"]).expect("parse");
+    fn from_args_rejects_every_bind_mode_without_remote_auth_config() {
+        for args in [
+            vec!["--host", "127.0.0.1", "--port", "9090"],
+            vec!["--host", "0.0.0.0", "--port", "9090"],
+        ] {
+            let error = ServerConfig::from_args(args)
+                .expect_err("standalone admission must fail closed for every bind mode");
+            assert!(error
+                .to_string()
+                .contains(REMOTE_AUTH_CONFIGURATION_REQUIRED));
+            assert!(error.to_string().contains("--remote-access-token-file"));
+            assert!(error.to_string().contains("--allowed-origin"));
+        }
+    }
+
+    #[test]
+    fn from_args_accepts_non_loopback_with_token_file_and_origin() {
+        let cfg = ServerConfig::from_args([
+            "--host",
+            "0.0.0.0",
+            "--port",
+            "9090",
+            "--remote-access-token-file",
+            "/var/lib/termul/remote-access-token",
+            "--allowed-origin",
+            "https://termul.example.test",
+        ])
+        .expect("explicit remote access config parses");
         assert_eq!(cfg.host, "0.0.0.0");
         assert_eq!(cfg.port, 9090);
+        assert_eq!(
+            cfg.remote_access_token_file,
+            Some(PathBuf::from("/var/lib/termul/remote-access-token"))
+        );
+        assert_eq!(
+            cfg.allowed_origins,
+            vec![Url::parse("https://termul.example.test").unwrap()]
+        );
     }
 
     #[test]
@@ -766,11 +982,20 @@ mod tests {
 
     #[test]
     fn from_args_accepts_event_log_capacity() {
-        let cfg = ServerConfig::from_args(["--event-log-capacity", "1024"]).expect("parse");
+        let cfg = ServerConfig::from_args(configured_args(&["--event-log-capacity", "1024"]))
+            .expect("parse");
         assert_eq!(cfg.event_log_capacity, 1024);
         // The other defaults stay intact.
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, 8080);
+    }
+
+    #[test]
+    fn from_args_accepts_max_event_log_capacity() {
+        let max = MAX_EVENT_LOG_CAPACITY.to_string();
+        let cfg = ServerConfig::from_args(configured_args(&["--event-log-capacity", &max]))
+            .expect("maximum bounded capacity must be admitted");
+        assert_eq!(cfg.event_log_capacity, MAX_EVENT_LOG_CAPACITY);
     }
 
     #[test]
@@ -779,6 +1004,14 @@ mod tests {
             ServerConfig::from_args(["--event-log-capacity", "0"]),
             Err(ParseCliError::Message(_))
         ));
+    }
+
+    #[test]
+    fn from_args_rejects_event_log_capacity_above_maximum() {
+        let over = (MAX_EVENT_LOG_CAPACITY + 1).to_string();
+        let error = ServerConfig::from_args(["--event-log-capacity", over.as_str()])
+            .expect_err("oversized relay capacity must fail before admission");
+        assert!(error.to_string().contains("1-16384"));
     }
 
     #[test]
@@ -799,7 +1032,8 @@ mod tests {
 
     #[test]
     fn from_args_accepts_permission_timeout() {
-        let cfg = ServerConfig::from_args(["--permission-timeout", "30"]).expect("parse");
+        let cfg = ServerConfig::from_args(configured_args(&["--permission-timeout", "30"]))
+            .expect("parse");
         assert_eq!(cfg.permission_timeout_secs, 30);
         // Other defaults stay intact.
         assert_eq!(cfg.host, "127.0.0.1");
@@ -809,7 +1043,7 @@ mod tests {
 
     #[test]
     fn from_args_accepts_permission_reconnect_grace() {
-        let cfg = ServerConfig::from_args(["--permission-reconnect-grace", "20"])
+        let cfg = ServerConfig::from_args(configured_args(&["--permission-reconnect-grace", "20"]))
             .expect("parse");
         assert_eq!(cfg.permission_reconnect_grace_secs, 20);
     }
@@ -866,11 +1100,40 @@ mod tests {
     // empty-value tests (mirrors the `--permission-timeout` test pattern).
 
     #[test]
+    fn from_args_accepts_conversation_workspace_root() {
+        let cfg = ServerConfig::from_args(configured_args(&[
+            "--conversation-workspace-root",
+            "/var/lib/termul/conversation-workspaces",
+        ]))
+        .expect("parse");
+        assert_eq!(
+            cfg.conversation_workspace_root,
+            PathBuf::from("/var/lib/termul/conversation-workspaces")
+        );
+    }
+
+    #[test]
+    fn from_args_missing_conversation_workspace_root_value() {
+        assert!(matches!(
+            ServerConfig::from_args(["--conversation-workspace-root"]),
+            Err(ParseCliError::Message(_))
+        ));
+    }
+
+    #[test]
+    fn from_args_rejects_empty_conversation_workspace_root() {
+        assert!(matches!(
+            ServerConfig::from_args(["--conversation-workspace-root", ""]),
+            Err(ParseCliError::Message(_))
+        ));
+    }
+
+    #[test]
     fn from_args_accepts_workspace_manifests_dir() {
-        let cfg = ServerConfig::from_args([
+        let cfg = ServerConfig::from_args(configured_args(&[
             "--workspace-manifests-dir",
             "/var/lib/termul/manifests",
-        ])
+        ]))
         .expect("parse");
         assert_eq!(
             cfg.workspace_manifests_dir,
@@ -899,8 +1162,8 @@ mod tests {
 
     #[test]
     fn from_args_accepts_store_file() {
-        let cfg = ServerConfig::from_args(["--store-file", "/var/lib/termul/store.json"])
-            .expect("parse");
+        let cfg =
+            ServerConfig::from_args(["--store-file", "/var/lib/termul/store.json"]).expect("parse");
         assert_eq!(
             cfg.store_file,
             Some(PathBuf::from("/var/lib/termul/store.json"))
@@ -940,9 +1203,12 @@ mod tests {
             project_root: PathBuf::from("/tmp"),
             projects_file: None,
             sessions_dir: None,
+            conversation_workspace_root: PathBuf::from("/tmp/Termul"),
             workspace_manifests_dir: None,
             acp_catalog_dir: None,
             store_file: None,
+            remote_access_token_file: None,
+            allowed_origins: Vec::new(),
         };
         // We cannot safely mutate the real process env vars in a parallel
         // test runner, so we assert the contract indirectly: the resolved

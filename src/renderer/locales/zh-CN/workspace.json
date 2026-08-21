@@ -4,6 +4,10 @@
   "projects": {
     "title": "项目"
   },
+  "multiRoot": {
+    "terminalTitle": "选择终端项目",
+    "terminalDescription": "点击项目即可立即从对应根目录创建终端。"
+  },
   "loading": "加载中...",
   "noProjectsTitle": "暂无项目",
   "noProjectsDescription": "创建第一个项目，以整理终端、快照和命令",
@@ -22,10 +26,10 @@
     "prompt": "请输入 {{name}} 的密码"
   },
   "closeTerminal": {
-    "title": "关闭终端",
-    "message": "确定要关闭“{{name}}”吗？所有正在运行的进程都将被终止。",
+    "title": "关闭终端视图",
+    "message": "关闭“{{name}}”的视图？终端进程会继续运行，并可重新打开。",
     "thisTerminal": "此终端",
-    "dontAsk": "关闭终端时不再询问"
+    "dontAsk": "关闭终端视图时不再询问"
   },
   "unsaved": {
     "title": "未保存的更改",

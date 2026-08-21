@@ -15,10 +15,17 @@ const mocks = vi.hoisted(() => ({
   createAskpassScript: vi.fn()
 }))
 
+vi.mock('@/stores/session-workspace-sync-store', () => ({
+  useSessionWorkspaceSyncStore: {
+    getState: () => ({ activeConversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab' })
+  }
+}))
+
 vi.mock('@/lib/api', () => ({
   terminalApi: {
     spawn: mocks.spawn,
     write: mocks.write,
+    terminate: mocks.kill,
     kill: mocks.kill
   },
   sshApi: {

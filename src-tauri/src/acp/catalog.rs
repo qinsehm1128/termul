@@ -303,10 +303,7 @@ impl AcpCatalogService {
     /// Resolve the catalog. Returns the cached catalog if fresh (within TTL);
     /// otherwise re-probes + re-computes + re-caches. `refresh=true`
     /// force-refreshes (invalidates the cache + re-probes).
-    pub async fn list_catalog(
-        self: &Arc<Self>,
-        refresh: bool,
-    ) -> Result<AcpCatalog, CatalogError> {
+    pub async fn list_catalog(self: &Arc<Self>, refresh: bool) -> Result<AcpCatalog, CatalogError> {
         // Fast path: return the cached catalog if fresh.
         if !refresh {
             let cache = self.cache.read();
@@ -333,9 +330,7 @@ impl AcpCatalogService {
         match self.read_opt_in_blocking() {
             Ok(enabled) => enabled,
             Err(error) => {
-                log::warn!(
-                    "[acp-catalog] opt-in read failed (defaulting to false): {error}"
-                );
+                log::warn!("[acp-catalog] opt-in read failed (defaulting to false): {error}");
                 false
             }
         }
@@ -412,7 +407,9 @@ impl AcpCatalogService {
         // Optional CDN augmentation (gated on the host-persisted opt-in).
         let mut agents: Vec<CatalogAgent> = bundled
             .iter()
-            .map(|agent| compute_catalog_agent(agent, &host, &platform_arch, CatalogSource::Bundled))
+            .map(|agent| {
+                compute_catalog_agent(agent, &host, &platform_arch, CatalogSource::Bundled)
+            })
             .collect();
 
         let bundled_count = agents.len();
@@ -440,9 +437,9 @@ impl AcpCatalogService {
                         if !acp_registry_snapshot::is_safe_agent_id(&snapshot_agent.id) {
                             continue;
                         }
-                        let Some(distribution) =
-                            acp_registry_snapshot::sanitize_distribution(&snapshot_agent.distribution)
-                        else {
+                        let Some(distribution) = acp_registry_snapshot::sanitize_distribution(
+                            &snapshot_agent.distribution,
+                        ) else {
                             continue;
                         };
                         let entry = BundledAgent {
@@ -614,17 +611,23 @@ fn compute_catalog_agent(
 
     let (runtime_reqs, status) = if has_npx {
         // npx is the preferred distribution.
-        (vec!["npx".to_string()], if host.runtimes.npx {
-            SupportedAcpAgentStatus::Ready
-        } else {
-            SupportedAcpAgentStatus::NeedsRuntime
-        })
+        (
+            vec!["npx".to_string()],
+            if host.runtimes.npx {
+                SupportedAcpAgentStatus::Ready
+            } else {
+                SupportedAcpAgentStatus::NeedsRuntime
+            },
+        )
     } else if has_uvx {
-        (vec!["uvx".to_string()], if host.runtimes.uvx {
-            SupportedAcpAgentStatus::Ready
-        } else {
-            SupportedAcpAgentStatus::NeedsRuntime
-        })
+        (
+            vec!["uvx".to_string()],
+            if host.runtimes.uvx {
+                SupportedAcpAgentStatus::Ready
+            } else {
+                SupportedAcpAgentStatus::NeedsRuntime
+            },
+        )
     } else if has_binary {
         // Binary-only distribution. Look up the platform target.
         let target = dist_obj
@@ -745,7 +748,10 @@ fn is_https_archive_url(url: &str) -> bool {
 /// only installs binary archives), and must NOT override an agent the catalog
 /// resolved `unavailable`/`needs-runtime` (an installed binary whose runtime
 /// disappeared is still installed — its `command` is absolute, not PATH-bound).
-pub fn overlay_installed(catalog: &mut AcpCatalog, installed: &[crate::acp::install::InstalledAgent]) {
+pub fn overlay_installed(
+    catalog: &mut AcpCatalog,
+    installed: &[crate::acp::install::InstalledAgent],
+) {
     if installed.is_empty() {
         return;
     }
@@ -834,8 +840,14 @@ mod tests {
     fn bundled_catalog_includes_known_agents() {
         let agents = parse_bundled_catalog().unwrap();
         let ids: Vec<&str> = agents.iter().map(|a| a.id.as_str()).collect();
-        assert!(ids.contains(&"claude-acp"), "claude-acp must be in the bundled catalog");
-        assert!(ids.contains(&"gemini"), "gemini must be in the bundled catalog");
+        assert!(
+            ids.contains(&"claude-acp"),
+            "claude-acp must be in the bundled catalog"
+        );
+        assert!(
+            ids.contains(&"gemini"),
+            "gemini must be in the bundled catalog"
+        );
     }
 
     // ---- I/O matrix: npx on PATH → ready ----
@@ -847,7 +859,8 @@ mod tests {
             serde_json::json!({ "npx": { "package": "test@1.0.0" } }),
         );
         let host = host_with_runtimes(true, false);
-        let catalog_agent = compute_catalog_agent(&agent, &host, "linux-x86_64", CatalogSource::Bundled);
+        let catalog_agent =
+            compute_catalog_agent(&agent, &host, "linux-x86_64", CatalogSource::Bundled);
         assert_eq!(catalog_agent.status, SupportedAcpAgentStatus::Ready);
         assert_eq!(catalog_agent.runtime_requirements, vec!["npx".to_string()]);
         assert_eq!(catalog_agent.source, CatalogSource::Bundled);
@@ -862,7 +875,8 @@ mod tests {
             serde_json::json!({ "npx": { "package": "test@1.0.0" } }),
         );
         let host = host_with_runtimes(false, false);
-        let catalog_agent = compute_catalog_agent(&agent, &host, "linux-x86_64", CatalogSource::Bundled);
+        let catalog_agent =
+            compute_catalog_agent(&agent, &host, "linux-x86_64", CatalogSource::Bundled);
         assert_eq!(catalog_agent.status, SupportedAcpAgentStatus::NeedsRuntime);
     }
 
@@ -875,7 +889,8 @@ mod tests {
             serde_json::json!({ "uvx": { "package": "test==1.0.0" } }),
         );
         let host = host_with_runtimes(false, true);
-        let catalog_agent = compute_catalog_agent(&agent, &host, "linux-x86_64", CatalogSource::Bundled);
+        let catalog_agent =
+            compute_catalog_agent(&agent, &host, "linux-x86_64", CatalogSource::Bundled);
         assert_eq!(catalog_agent.status, SupportedAcpAgentStatus::Ready);
         assert_eq!(catalog_agent.runtime_requirements, vec!["uvx".to_string()]);
     }
@@ -889,7 +904,8 @@ mod tests {
             serde_json::json!({ "uvx": { "package": "test==1.0.0" } }),
         );
         let host = host_with_runtimes(false, false);
-        let catalog_agent = compute_catalog_agent(&agent, &host, "linux-x86_64", CatalogSource::Bundled);
+        let catalog_agent =
+            compute_catalog_agent(&agent, &host, "linux-x86_64", CatalogSource::Bundled);
         assert_eq!(catalog_agent.status, SupportedAcpAgentStatus::NeedsRuntime);
     }
 
@@ -913,8 +929,12 @@ mod tests {
             }),
         );
         let host = host_with_runtimes(false, false);
-        let catalog_agent = compute_catalog_agent(&agent, &host, "linux-x86_64", CatalogSource::Bundled);
-        assert_eq!(catalog_agent.status, SupportedAcpAgentStatus::InstallRequired);
+        let catalog_agent =
+            compute_catalog_agent(&agent, &host, "linux-x86_64", CatalogSource::Bundled);
+        assert_eq!(
+            catalog_agent.status,
+            SupportedAcpAgentStatus::InstallRequired
+        );
         assert!(!catalog_agent.platform_targets.is_empty());
     }
 
@@ -937,8 +957,12 @@ mod tests {
             }),
         );
         let host = host_with_runtimes(false, false);
-        let catalog_agent = compute_catalog_agent(&agent, &host, "linux-x86_64", CatalogSource::Bundled);
-        assert_eq!(catalog_agent.status, SupportedAcpAgentStatus::InstallRequired);
+        let catalog_agent =
+            compute_catalog_agent(&agent, &host, "linux-x86_64", CatalogSource::Bundled);
+        assert_eq!(
+            catalog_agent.status,
+            SupportedAcpAgentStatus::InstallRequired
+        );
     }
 
     // ---- I/O matrix: binary with archive + EMPTY-string sha256 → install-required ----
@@ -960,8 +984,12 @@ mod tests {
             }),
         );
         let host = host_with_runtimes(false, false);
-        let catalog_agent = compute_catalog_agent(&agent, &host, "linux-x86_64", CatalogSource::Bundled);
-        assert_eq!(catalog_agent.status, SupportedAcpAgentStatus::InstallRequired);
+        let catalog_agent =
+            compute_catalog_agent(&agent, &host, "linux-x86_64", CatalogSource::Bundled);
+        assert_eq!(
+            catalog_agent.status,
+            SupportedAcpAgentStatus::InstallRequired
+        );
     }
 
     // ---- I/O matrix: binary without archive → manual-install ----
@@ -979,7 +1007,8 @@ mod tests {
             }),
         );
         let host = host_with_runtimes(false, false);
-        let catalog_agent = compute_catalog_agent(&agent, &host, "linux-x86_64", CatalogSource::Bundled);
+        let catalog_agent =
+            compute_catalog_agent(&agent, &host, "linux-x86_64", CatalogSource::Bundled);
         assert_eq!(catalog_agent.status, SupportedAcpAgentStatus::ManualInstall);
     }
 
@@ -999,7 +1028,8 @@ mod tests {
             }),
         );
         let host = host_with_runtimes(false, false);
-        let catalog_agent = compute_catalog_agent(&agent, &host, "linux-x86_64", CatalogSource::Bundled);
+        let catalog_agent =
+            compute_catalog_agent(&agent, &host, "linux-x86_64", CatalogSource::Bundled);
         assert_eq!(catalog_agent.status, SupportedAcpAgentStatus::Unavailable);
     }
 
@@ -1096,7 +1126,10 @@ mod tests {
         let installed_agent = by_id.get("installed-bin").unwrap();
         assert_eq!(installed_agent.status, SupportedAcpAgentStatus::Ready);
         let info = installed_agent.installed.as_ref().expect("installed block");
-        assert_eq!(info.command, "/abs/acp-registry-binaries/installed-bin/installed");
+        assert_eq!(
+            info.command,
+            "/abs/acp-registry-binaries/installed-bin/installed"
+        );
         assert_eq!(info.args, vec!["acp".to_string()]);
         // The not-installed agent is untouched.
         let other = by_id.get("not-installed").unwrap();
@@ -1121,9 +1154,7 @@ mod tests {
     #[tokio::test]
     async fn opt_in_persistence_round_trip() {
         let root = temp_dir("opt-in-round-trip");
-        let service = AcpCatalogService::open(root.join("catalog"))
-            .await
-            .unwrap();
+        let service = AcpCatalogService::open(root.join("catalog")).await.unwrap();
         assert!(!service.is_opt_in(), "default opt-in should be false");
         service.set_opt_in(true).unwrap();
         assert!(service.is_opt_in(), "opt-in should be true after set");
@@ -1165,7 +1196,10 @@ mod tests {
     fn set_catalog_opt_in_request_rejects_unknown_fields() {
         let payload = serde_json::json!({ "enabled": true, "extra": "junk" });
         let result: Result<SetCatalogOptInRequest, _> = serde_json::from_value(payload);
-        assert!(result.is_err(), "deny_unknown_fields must reject extra fields");
+        assert!(
+            result.is_err(),
+            "deny_unknown_fields must reject extra fields"
+        );
     }
 
     #[test]
@@ -1180,9 +1214,7 @@ mod tests {
     #[tokio::test]
     async fn list_catalog_caches_within_ttl() {
         let root = temp_dir("cache-ttl");
-        let service = AcpCatalogService::open(root.join("catalog"))
-            .await
-            .unwrap();
+        let service = AcpCatalogService::open(root.join("catalog")).await.unwrap();
         let catalog1 = service.list_catalog(false).await.unwrap();
         let catalog2 = service.list_catalog(false).await.unwrap();
         // Both calls return the same agents (within the TTL the cache is
@@ -1196,9 +1228,7 @@ mod tests {
     #[tokio::test]
     async fn list_catalog_refresh_invalidates_cache() {
         let root = temp_dir("cache-refresh");
-        let service = AcpCatalogService::open(root.join("catalog"))
-            .await
-            .unwrap();
+        let service = AcpCatalogService::open(root.join("catalog")).await.unwrap();
         let catalog1 = service.list_catalog(false).await.unwrap();
         // Force refresh — must not error and must return the same agent count
         // (probes re-run but the bundled catalog is the same).
@@ -1212,9 +1242,7 @@ mod tests {
     #[tokio::test]
     async fn list_catalog_without_opt_in_serves_bundled_only() {
         let root = temp_dir("no-opt-in");
-        let service = AcpCatalogService::open(root.join("catalog"))
-            .await
-            .unwrap();
+        let service = AcpCatalogService::open(root.join("catalog")).await.unwrap();
         let catalog = service.list_catalog(false).await.unwrap();
         // Every agent is bundled (no CDN entries without opt-in).
         for agent in &catalog.agents {
@@ -1226,9 +1254,7 @@ mod tests {
     #[tokio::test]
     async fn list_catalog_with_opt_in_succeeds_and_serves_catalog() {
         let root = temp_dir("opt-in-success");
-        let service = AcpCatalogService::open(root.join("catalog"))
-            .await
-            .unwrap();
+        let service = AcpCatalogService::open(root.join("catalog")).await.unwrap();
         service.set_opt_in(true).unwrap();
         // With opt-in on, the catalog resolves successfully whether the CDN
         // fetch succeeds (registry entries added, tagged `source: 'registry'`)

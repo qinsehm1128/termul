@@ -5,6 +5,7 @@ import { GitBranchPicker } from '@/components/GitBranchPicker'
 import { RemoteAccessPopover } from '@/components/RemoteAccessPopover'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { formatPath, useHomeDirectory } from '@/hooks/use-cwd'
+import { getColorClasses } from '@/lib/colors'
 import { cn } from '@/lib/utils'
 import {
   useShowExitCode,
@@ -22,6 +23,7 @@ interface StatusBarProps {
 
 export function StatusBar({ project }: StatusBarProps): React.JSX.Element {
   const { t } = useTranslation('shell')
+  const projectColor = project ? getColorClasses(project.color) : null
   const activeTerminal = useActiveTerminal()
   const homeDir = useHomeDirectory()
 
@@ -54,7 +56,14 @@ export function StatusBar({ project }: StatusBarProps): React.JSX.Element {
       <div className="flex min-w-0 items-center gap-1">
         {project && (
           <>
-            <StatusItem icon={<Server size={14} />}>
+            <StatusItem
+              icon={
+                <span className="flex items-center gap-1.5">
+                  <span className={cn('size-2 rounded-sm', projectColor?.bg)} aria-hidden="true" />
+                  <Server size={14} />
+                </span>
+              }
+            >
               {project.name.toLowerCase().replace(/\s+/g, '-')}
             </StatusItem>
 
@@ -108,7 +117,7 @@ export function StatusBar({ project }: StatusBarProps): React.JSX.Element {
                   <span
                     className={cn(
                       'w-2 h-2 rounded-full mr-2',
-                      lastExitCode === 0 ? 'bg-green-400' : 'bg-red-400'
+                      lastExitCode === 0 ? 'bg-success' : 'bg-destructive'
                     )}
                   />
                   {t('statusBar.exit', { code: lastExitCode })}
@@ -127,7 +136,7 @@ export function StatusBar({ project }: StatusBarProps): React.JSX.Element {
           <Tooltip>
             <TooltipTrigger asChild>
               <div className="flex items-center">
-                <StatusItem icon={<Download size={14} />} className="text-green-400" />
+                <StatusItem icon={<Download size={14} />} className="text-success" />
               </div>
             </TooltipTrigger>
             <TooltipContent side="top">
@@ -181,7 +190,7 @@ function GitStatusIndicator({
     items.push(
       <Tooltip key="modified">
         <TooltipTrigger asChild>
-          <span className="flex items-center text-yellow-400">
+          <span className="flex items-center text-warning">
             <Pencil size={12} className="mr-0.5" />
             {modified}
           </span>
@@ -195,7 +204,7 @@ function GitStatusIndicator({
     items.push(
       <Tooltip key="staged">
         <TooltipTrigger asChild>
-          <span className="flex items-center text-green-400">
+          <span className="flex items-center text-success">
             <Plus size={12} className="mr-0.5" />
             {staged}
           </span>

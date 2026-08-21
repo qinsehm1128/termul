@@ -26,9 +26,8 @@ export const DEFAULT_TERMINAL_OPTIONS: ITerminalOptions = {
   convertEol: false,
   ignoreBracketedPasteMode: false,
   rightClickSelectsWord: true,
-  // xterm screenReaderMode routes keystrokes through the a11y textarea path, which
-  // can emit duplicate bytes to the PTY (see xtermjs/xterm.js#3467). Default off;
-  // re-enable only when we add an explicit user-facing accessibility setting.
+  // The user-facing accessibility setting overrides this per ConnectedTerminal.
+  // Keep the baseline off to avoid accessibility-tree overhead for most users.
   screenReaderMode: false
 }
 

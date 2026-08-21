@@ -1,16 +1,42 @@
 import { fireEvent, render, screen } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { useConversationStore } from '@/stores/conversation-store'
+import { useTerminalStore } from '@/stores/terminal-store'
 import { MobileChatShell } from './MobileChatShell'
 
-const { mockNavigate, projectRef, tauriRef } = vi.hoisted(() => ({
+const {
+  mockNavigate,
+  mockCloseChatView,
+  mockDetachBinding,
+  mockRebindBinding,
+  mockSuspendBinding,
+  mockReplaceBinding,
+  mockDeleteConversation,
+  projectRef,
+  tauriRef,
+  mockReopenTerminalView
+} = vi.hoisted(() => ({
   mockNavigate: vi.fn(),
+  mockCloseChatView: vi.fn(),
+  mockDetachBinding: vi.fn(),
+  mockRebindBinding: vi.fn(),
+  mockSuspendBinding: vi.fn(),
+  mockReplaceBinding: vi.fn(),
+  mockDeleteConversation: vi.fn(),
   // Mutable so individual tests can flip the active project path (the Git
   // Changes header button is disabled when `activeProject.path` is missing)
   // and the shell into web/remote mode (where the project-switcher button +
   // drawer are mounted).
-  projectRef: { current: { id: 'p1', name: 'Demo', path: '/demo' } as { path?: string } },
-  tauriRef: { current: true as boolean }
+  projectRef: {
+    current: { id: 'p1', name: 'Demo', path: '/demo' } as {
+      id?: string
+      name?: string
+      path?: string
+    }
+  },
+  tauriRef: { current: true as boolean },
+  mockReopenTerminalView: vi.fn()
 }))
 
 vi.mock('react-router-dom', async () => {
@@ -22,7 +48,9 @@ vi.mock('react-router-dom', async () => {
 })
 
 vi.mock('@/stores/project-store', () => ({
-  useActiveProject: () => projectRef.current
+  useActiveProject: () => projectRef.current,
+  useProjectStore: (selector: (state: { projects: unknown[] }) => unknown) =>
+    selector({ projects: projectRef.current.id ? [projectRef.current] : [] })
 }))
 
 vi.mock('@/stores/workspace-store', () => ({
@@ -34,14 +62,36 @@ vi.mock('@/stores/workspace-store', () => ({
       activeTabId: 'tab-1'
     }
   ],
-  useWorkspaceStore: (sel: (s: { root: unknown; activePaneId: string }) => unknown) =>
-    sel({ root: {}, activePaneId: 'pane-1' })
+  useWorkspaceStore: Object.assign(
+    (sel: (s: { root: unknown; activePaneId: string }) => unknown) =>
+      sel({ root: {}, activePaneId: 'pane-1' }),
+    {
+      getState: () => ({
+        activePaneId: 'pane-1',
+        setActiveTab: vi.fn(),
+        reopenTerminalView: mockReopenTerminalView
+      })
+    }
+  )
 }))
 
 vi.mock('@/stores/acp-store', () => ({
-  useAcpStore: (
-    sel: (s: { sessions: Record<string, { title: string }>; sessionIndex: unknown[] }) => unknown
-  ) => sel({ sessions: { s1: { title: 'Hello chat' } }, sessionIndex: [] })
+  useAcpStore: (sel: (s: Record<string, unknown>) => unknown) =>
+    sel({
+      sessions: {
+        s1: {
+          title: 'Hello chat',
+          conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+        }
+      },
+      sessionIndex: [],
+      closeChatView: mockCloseChatView,
+      detachAgentBinding: mockDetachBinding,
+      rebindDetachedBinding: mockRebindBinding,
+      suspendAgentBinding: mockSuspendBinding,
+      replaceAgentBinding: mockReplaceBinding,
+      deleteConversation: mockDeleteConversation
+    })
 }))
 
 vi.mock('@/components/chat/ChatHistoryTab', () => ({
@@ -102,6 +152,30 @@ vi.mock('@/lib/tauri-runtime', () => ({
 describe('MobileChatShell', () => {
   beforeEach(() => {
     mockNavigate.mockReset()
+    mockCloseChatView.mockReset()
+    mockDetachBinding.mockReset()
+    mockRebindBinding.mockReset()
+    mockSuspendBinding.mockReset()
+    mockReplaceBinding.mockReset()
+    mockDeleteConversation.mockReset()
+    mockReopenTerminalView.mockReset()
+    useConversationStore.getState().reset()
+    useConversationStore.getState().replaceSummaries([
+      {
+        schemaVersion: 2,
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        createdAtUtc: '2026-08-15T09:45:15.123Z',
+        creationPartition: { year: 2026, month: 8, day: 15, path: '2026/08/15' },
+        workspaceCwd: '/visible/sessions/2026/08/15/conversation',
+        executionTarget: { kind: 'workspace' },
+        projectAttachment: null,
+        lifecycleState: 'ready',
+        lastSeq: 4,
+        createdBy: 'termul'
+      }
+    ])
+    useConversationStore.getState().setActiveConversationId('018f7a1c-1b4d-7c8a-9f01-0123456789ab')
+    useTerminalStore.setState({ terminals: [], activeTerminalId: '', ptyIdIndex: new Map() })
     tauriRef.current = true
     projectRef.current = { id: 'p1', name: 'Demo', path: '/demo' }
   })
@@ -129,6 +203,55 @@ describe('MobileChatShell', () => {
     expect(screen.getByLabelText('Open menu')).toHaveAttribute('aria-expanded', 'false')
   })
 
+  it('opens the mobile execution-target sheet with immutable Conversation identity', async () => {
+    render(
+      <MemoryRouter>
+        <MobileChatShell onNewChat={vi.fn()} canNewChat>
+          <div>chat body</div>
+        </MobileChatShell>
+      </MemoryRouter>
+    )
+
+    const trigger = screen.getByRole('button', {
+      name: 'Execution target and project context'
+    })
+    expect(trigger).toHaveClass('size-10')
+    fireEvent.click(trigger)
+    expect(
+      await screen.findByText(
+        "Attach or detach project context and change this Conversation's execution target without changing its identity or workspace."
+      )
+    ).toBeInTheDocument()
+    expect(screen.getByLabelText('Execution target')).toHaveTextContent('Conversation workspace')
+    expect(screen.getByText('018f7a1c-1b4d-7c8a-9f01-0123456789ab')).toBeInTheDocument()
+    expect(screen.getByText('2026-08-15T09:45:15.123Z')).toBeInTheDocument()
+    expect(screen.getAllByText('/visible/sessions/2026/08/15/conversation').length).toBeGreaterThan(
+      0
+    )
+  })
+
+  it('exposes touch-sized independent Conversation lifecycle actions for the active chat', () => {
+    render(
+      <MemoryRouter>
+        <MobileChatShell onNewChat={vi.fn()} canNewChat>
+          <div>chat body</div>
+        </MobileChatShell>
+      </MemoryRouter>
+    )
+
+    const actions = screen.getByRole('button', {
+      name: 'Conversation actions for Hello chat'
+    })
+    expect(actions).toHaveClass('size-10')
+    fireEvent.pointerDown(actions, { button: 0, ctrlKey: false })
+    expect(screen.getByText('Close chat view')).toBeInTheDocument()
+    expect(screen.getByText('Detach binding')).toBeInTheDocument()
+    expect(screen.getByText('Rebind detached agent')).toBeInTheDocument()
+    expect(screen.getByText('Suspend agent')).toBeInTheDocument()
+    expect(screen.getByText('Replace agent')).toBeInTheDocument()
+    expect(screen.getByText('Delete conversation')).toBeInTheDocument()
+  })
+
   it('opens the chat drawer and closes it after selecting a session', async () => {
     render(
       <MemoryRouter>
@@ -146,6 +269,23 @@ describe('MobileChatShell', () => {
     fireEvent.click(screen.getByText('Open history chat'))
     expect(screen.queryByText('Open history chat')).not.toBeInTheDocument()
     expect(screen.getByLabelText('Open menu')).toHaveAttribute('aria-expanded', 'false')
+  })
+
+  it('enables project-less New chat by default', () => {
+    projectRef.current = {}
+    const onNewChat = vi.fn()
+    render(
+      <MemoryRouter>
+        <MobileChatShell onNewChat={onNewChat}>
+          <div>chat body</div>
+        </MobileChatShell>
+      </MemoryRouter>
+    )
+
+    const newChat = screen.getByLabelText('New chat')
+    expect(newChat).toBeEnabled()
+    fireEvent.click(newChat)
+    expect(onNewChat).toHaveBeenCalledTimes(1)
   })
 
   it('invokes onNewChat from the header action', () => {
@@ -372,5 +512,51 @@ describe('MobileChatShell', () => {
 
     fireEvent.click(screen.getByLabelText('Open menu'))
     expect(screen.getByLabelText('Git history')).toBeDisabled()
+  })
+  it('lists hidden live Conversation terminals as reopenable and separates close from terminate', () => {
+    useTerminalStore.setState({
+      terminals: [
+        {
+          id: 'terminal-hidden',
+          conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+          projectId: 'p1',
+          name: 'Hidden live terminal',
+          shell: 'bash',
+          ptyId: 'pty-hidden',
+          claim: 'memory-only',
+          viewState: 'hidden',
+          healthStatus: 'running'
+        }
+      ],
+      ptyIdIndex: new Map([['pty-hidden', 'terminal-hidden']])
+    })
+    const onCloseTerminal = vi.fn()
+    const onTerminateTerminal = vi.fn()
+    render(
+      <MemoryRouter>
+        <MobileChatShell
+          onNewChat={vi.fn()}
+          canNewChat
+          onCloseTerminal={onCloseTerminal}
+          onTerminateTerminal={onTerminateTerminal}
+        >
+          <div>chat body</div>
+        </MobileChatShell>
+      </MemoryRouter>
+    )
+
+    fireEvent.click(screen.getByLabelText('Open menu'))
+    const reopen = screen.getByRole('button', { name: /Hidden live terminal.*Reopen/i })
+    expect(reopen).toHaveClass('h-11')
+    fireEvent.click(reopen)
+    expect(mockReopenTerminalView).toHaveBeenCalledWith('terminal-hidden')
+    expect(onCloseTerminal).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByLabelText('Open menu'))
+    const terminate = screen.getByLabelText('Terminate terminal process')
+    expect(terminate).toHaveClass('size-11')
+    fireEvent.click(terminate)
+    expect(onTerminateTerminal).toHaveBeenCalledWith('terminal-hidden', undefined)
+    expect(onCloseTerminal).not.toHaveBeenCalled()
   })
 })

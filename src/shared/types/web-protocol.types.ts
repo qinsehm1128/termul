@@ -78,7 +78,9 @@ export const WS_EVENT_TYPES = [
   // Desktop chat-history live push (Epic-4 bridge — agent-level, seq 0).
   // Fired when the renderer-fed ChatHistoryCache mutates so connected web
   // clients refetch the session index.
-  'chat_history_changed'
+  'chat_history_changed',
+  // Canonical Conversation lifecycle reconciliation (global, sid=null).
+  'conversation_lifecycle'
 ] as const
 
 /** Union of all WS event `type` strings. */
@@ -121,6 +123,7 @@ export const WS_REQUEST_TYPES = [
   'spawn_agent',
   'kill_agent',
   'list_agents',
+  'set_permission_policy',
   'switch_project',
   // WS connection token-gate handshake (pre-auth). Distinct from
   // `authenticate_agent` (the ACP agent method).
@@ -133,6 +136,7 @@ export const WS_REQUEST_TYPES = [
   'list_persisted_sessions',
   'open_persisted_session',
   'get_session_payload',
+  'get_session_payload_page',
   'recover_session_snapshot',
   // R2: lightweight server-authoritative replay cursor (no snapshot payload).
   // Unlike `recover_session_snapshot` (which re-registers a subscription),
@@ -160,11 +164,34 @@ export const WS_REQUEST_TYPES = [
   // `STORE_WRITE_FAILED` / `STORE_DELETE_FAILED` (IO), `VALIDATION_ERROR`.
   'store_read',
   'store_write',
-  'store_delete'
+  'store_delete',
+  // Canonical Conversation lifecycle mutations.
+  'detach_binding',
+  'rebind_binding',
+  'suspend_binding',
+  'replace_binding',
+  'delete_conversation',
+  // Shared Conversation application service operations.
+  'conversation_host_status',
+  'list_conversations',
+  'get_conversation',
+  'open_conversation',
+  'resolve_legacy_conversation_id',
+  'get_session_workspace',
+  'write_session_workspace',
+  'resolve_recovery_item',
+  'attach_project',
+  'detach_project',
+  'update_execution_target'
 ] as const
 
 /** Union of all WS request `type` strings. */
 export type WsRequestType = (typeof WS_REQUEST_TYPES)[number]
+
+/** First-frame credential handshake payload. Never persist or log `token`. */
+export interface AuthenticatePayload {
+  token: string
+}
 
 // ============================================================================
 // Server-side key-value store (issue #613) — request payloads + replies
@@ -187,7 +214,7 @@ export interface StoreDeletePayload {
 }
 
 // ============================================================================
-// Error codes (9) — stable machine strings (AC2)
+// Error codes — stable machine strings (AC2)
 // ============================================================================
 
 /**
@@ -212,7 +239,32 @@ export const WS_ERROR_CODES = {
 } as const
 
 /** Union of all WS error code strings. */
-export type WsErrorCode = (typeof WS_ERROR_CODES)[keyof typeof WS_ERROR_CODES]
+export const CONVERSATION_APPLICATION_ERROR_CODES = [
+  'UNAUTHORIZED',
+  'FORBIDDEN',
+  'RATE_LIMITED',
+  'AUTH_CONFIGURATION_ERROR',
+  'VALIDATION_ERROR',
+  'CONVERSATION_INVALID_ID',
+  'CONVERSATION_NOT_FOUND',
+  'CONVERSATION_CONFLICT',
+  'CONVERSATION_RECOVERY_REQUIRED',
+  'CONVERSATION_DURABILITY_FAILED',
+  'CONVERSATION_LIVE_RESOURCES',
+  'RECOVERY_NOT_FOUND',
+  'MIGRATION_IDEMPOTENCY_CONFLICT',
+  'SESSION_WORKSPACE_UNAVAILABLE',
+  'LEGACY_ID_AMBIGUOUS',
+  'LEGACY_COMPATIBILITY_READ_ONLY',
+  'CONVERSATION_SERVICE_UNAVAILABLE',
+  'ACP_COMPENSATION_FAILED',
+  'CONVERSATION_HISTORY_PAGING_REQUIRED'
+] as const
+
+export type ConversationApplicationErrorCode = (typeof CONVERSATION_APPLICATION_ERROR_CODES)[number]
+export type WsErrorCode =
+  | (typeof WS_ERROR_CODES)[keyof typeof WS_ERROR_CODES]
+  | ConversationApplicationErrorCode
 
 // ============================================================================
 // Reliability tiers (AC5) — single registry mirroring the Rust enum
@@ -265,7 +317,8 @@ export const WS_EVENT_TIERS: Readonly<Record<WsEventType, ReliabilityTier>> = {
   project_switch_completed: WS_RELAY_TIERS.RELIABLE,
   project_switch_failed: WS_RELAY_TIERS.RELIABLE,
   user_prompt: WS_RELAY_TIERS.RELIABLE,
-  chat_history_changed: WS_RELAY_TIERS.RELIABLE
+  chat_history_changed: WS_RELAY_TIERS.RELIABLE,
+  conversation_lifecycle: WS_RELAY_TIERS.RELIABLE
 }
 
 export type HistoryMode = 'server' | 'live_only'
@@ -328,6 +381,207 @@ export interface UserPromptEvent {
   sessionId: string
   turnId?: string
   content: unknown[]
+}
+
+export const CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION = 1 as const
+export const CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION = 1 as const
+export const MIN_CONVERSATION_HISTORY_PAGE_LIMIT = 1 as const
+export const MAX_CONVERSATION_HISTORY_PAGE_LIMIT = 1_000 as const
+export const MAX_CONVERSATION_HISTORY_RECORD_BYTES = 256 * 1024
+export const MAX_CONVERSATION_HISTORY_PAGE_BYTES = 4 * 1024 * 1024
+
+/** Stable renderer-facing event dialect carried in bounded history pages. */
+export interface ConversationHistoryRecordV1 {
+  schemaVersion: typeof CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION
+  sessionId: string
+  seq: number
+  type: string
+  recordedAt: number
+  payload: unknown
+}
+
+/** Exact camelCase page contract shared by Tauri and WebSocket history facades. */
+export interface ConversationHistoryPageV1 {
+  schemaVersion: typeof CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION
+  records: ConversationHistoryRecordV1[]
+  nextCursor: number
+  complete: boolean
+  targetLastSeq: number
+}
+
+export interface GetSessionPayloadPageRequest {
+  sessionId: string
+  afterSeq: number
+  limit: number
+  /** First-page frontier echoed unchanged on every continuation request. */
+  targetLastSeq?: number
+}
+
+export class ConversationHistoryPageValidationError extends Error {
+  readonly code = 'VALIDATION_ERROR'
+
+  constructor(message: string) {
+    super(message)
+    this.name = 'ConversationHistoryPageValidationError'
+  }
+}
+
+function historyValidationFailure(message: string): never {
+  throw new ConversationHistoryPageValidationError(message)
+}
+
+function isHistoryCursor(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0
+}
+
+/** Validate cursor/limit before a transport request or page-sized allocation is created. */
+export function assertConversationHistoryPageRequest(
+  afterSeq: number,
+  limit: number,
+  targetLastSeq?: number
+): void {
+  if (!isHistoryCursor(afterSeq)) {
+    historyValidationFailure('history afterSeq must be a non-negative safe integer')
+  }
+  if (
+    !Number.isSafeInteger(limit) ||
+    limit < MIN_CONVERSATION_HISTORY_PAGE_LIMIT ||
+    limit > MAX_CONVERSATION_HISTORY_PAGE_LIMIT
+  ) {
+    historyValidationFailure('history limit must be an integer between 1 and 1000')
+  }
+  if (targetLastSeq !== undefined) {
+    if (!isHistoryCursor(targetLastSeq)) {
+      historyValidationFailure('history targetLastSeq must be a non-negative safe integer')
+    }
+    if (afterSeq > targetLastSeq) {
+      historyValidationFailure('history afterSeq must not exceed targetLastSeq')
+    }
+  }
+}
+
+const conversationHistoryEncoder = new TextEncoder()
+
+function encodedHistoryJsonBytes(value: unknown, label: string): number {
+  let json: string | undefined
+  try {
+    json = JSON.stringify(value)
+  } catch {
+    historyValidationFailure(`${label} must be serializable JSON`)
+  }
+  if (json === undefined) historyValidationFailure(`${label} must be serializable JSON`)
+  return conversationHistoryEncoder.encode(json).byteLength
+}
+
+/**
+ * Measure one decoded page without constructing a second full-page JSON string. Records are
+ * measured individually and rejected at the canonical 256 KiB record / 4 MiB page bounds before
+ * the renderer accumulator or live store can publish them.
+ */
+export function conversationHistoryPageEncodedBytes(page: ConversationHistoryPageV1): number {
+  const envelopeBytes = encodedHistoryJsonBytes(
+    {
+      schemaVersion: page.schemaVersion,
+      records: [],
+      nextCursor: page.nextCursor,
+      complete: page.complete,
+      targetLastSeq: page.targetLastSeq
+    },
+    'history page'
+  )
+  let totalBytes = envelopeBytes
+  for (let index = 0; index < page.records.length; index += 1) {
+    const recordBytes = encodedHistoryJsonBytes(page.records[index], 'history record')
+    if (recordBytes > MAX_CONVERSATION_HISTORY_RECORD_BYTES) {
+      historyValidationFailure('history record exceeds the 256 KiB encoded limit')
+    }
+    totalBytes += recordBytes + (index === 0 ? 0 : 1)
+    if (totalBytes > MAX_CONVERSATION_HISTORY_PAGE_BYTES) {
+      historyValidationFailure('history page exceeds the 4 MiB encoded limit')
+    }
+  }
+  return totalBytes
+}
+
+/**
+ * Validate an untrusted page without cloning it. A successful caller may return the exact same
+ * object identity it received from the host.
+ */
+export function assertConversationHistoryPage(
+  page: unknown,
+  expected: {
+    sessionId: string
+    afterSeq: number
+    limit: number
+    targetLastSeq?: number
+  }
+): asserts page is ConversationHistoryPageV1 {
+  assertConversationHistoryPageRequest(expected.afterSeq, expected.limit, expected.targetLastSeq)
+  if (!expected.sessionId.trim()) historyValidationFailure('history sessionId must be non-empty')
+  if (typeof page !== 'object' || page === null) {
+    historyValidationFailure('history page must be an object')
+  }
+  const candidate = page as Partial<ConversationHistoryPageV1>
+  if (candidate.schemaVersion !== CONVERSATION_HISTORY_PAGE_SCHEMA_VERSION) {
+    historyValidationFailure('history page schemaVersion is unsupported')
+  }
+  if (!Array.isArray(candidate.records))
+    historyValidationFailure('history records must be an array')
+  if (candidate.records.length > expected.limit) {
+    historyValidationFailure('history page contains more records than requested')
+  }
+  if (!isHistoryCursor(candidate.nextCursor) || !isHistoryCursor(candidate.targetLastSeq)) {
+    historyValidationFailure('history page cursors must be non-negative safe integers')
+  }
+  if (expected.afterSeq > candidate.targetLastSeq) {
+    historyValidationFailure('history cursor is ahead of targetLastSeq')
+  }
+  if (expected.targetLastSeq !== undefined && candidate.targetLastSeq !== expected.targetLastSeq) {
+    historyValidationFailure('history targetLastSeq changed during traversal')
+  }
+  if (
+    candidate.nextCursor < expected.afterSeq ||
+    (candidate.nextCursor === expected.afterSeq && expected.afterSeq < candidate.targetLastSeq)
+  ) {
+    historyValidationFailure('history nextCursor did not advance')
+  }
+  if (candidate.nextCursor > candidate.targetLastSeq) {
+    historyValidationFailure('history nextCursor exceeds targetLastSeq')
+  }
+  if (
+    typeof candidate.complete !== 'boolean' ||
+    candidate.complete !== (candidate.nextCursor === candidate.targetLastSeq)
+  ) {
+    historyValidationFailure('history complete flag disagrees with nextCursor')
+  }
+
+  let previousSeq = expected.afterSeq
+  for (const value of candidate.records) {
+    if (typeof value !== 'object' || value === null) {
+      historyValidationFailure('history record must be an object')
+    }
+    const record = value as Partial<ConversationHistoryRecordV1>
+    if (record.schemaVersion !== CONVERSATION_HISTORY_RECORD_SCHEMA_VERSION) {
+      historyValidationFailure('history record schemaVersion is unsupported')
+    }
+    if (record.sessionId !== expected.sessionId) {
+      historyValidationFailure('history page belongs to another session')
+    }
+    if (
+      !isHistoryCursor(record.seq) ||
+      record.seq <= previousSeq ||
+      record.seq > candidate.nextCursor
+    ) {
+      historyValidationFailure('history records are not strictly ordered')
+    }
+    if (!isHistoryCursor(record.recordedAt)) {
+      historyValidationFailure('history recordedAt must be a non-negative safe integer')
+    }
+    if (typeof record.type !== 'string' || record.type.length === 0) {
+      historyValidationFailure('history record type must be non-empty')
+    }
+    previousSeq = record.seq
+  }
 }
 
 /**

@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Skeleton } from '@/components/ui/skeleton'
 import { shellApi } from '@/lib/api'
+import { isPreferredShell } from '@/lib/shell-api'
 import { cn } from '@/lib/utils'
 
 interface ShellSelectorProps {
@@ -62,8 +63,8 @@ export function ShellSelector({ onSelectShell, defaultShell, className }: ShellS
 
   const sortedShells = shells?.available?.slice().sort((a, b) => {
     if (defaultShell) {
-      if (a.name === defaultShell) return -1
-      if (b.name === defaultShell) return 1
+      if (isPreferredShell(a, defaultShell)) return -1
+      if (isPreferredShell(b, defaultShell)) return 1
     }
     return a.displayName.localeCompare(b.displayName)
   })
@@ -95,12 +96,12 @@ export function ShellSelector({ onSelectShell, defaultShell, className }: ShellS
                   onClick={() => handleSelectShell(shell)}
                   className={cn(
                     'w-full px-3 py-2 text-left text-sm hover:bg-secondary flex items-center gap-2',
-                    shell.name === defaultShell && 'text-primary'
+                    isPreferredShell(shell, defaultShell) && 'text-primary'
                   )}
                 >
                   <Terminal size={14} />
                   <span>{shell.displayName}</span>
-                  {shell.name === defaultShell && (
+                  {isPreferredShell(shell, defaultShell) && (
                     <span className="ml-auto text-xs text-muted-foreground">
                       {t('terminalTabs.default')}
                     </span>

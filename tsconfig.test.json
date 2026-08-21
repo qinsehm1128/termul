@@ -9,6 +9,7 @@
     "src/shared/**/*",
     "vitest.setup.ts",
     "scripts/**/*.test.ts",
+    "scripts/check-conversation-first-guardrails.ts",
     "scripts/validate-pr-body.ts"
   ]
 }

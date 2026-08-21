@@ -13,7 +13,7 @@ use agent_client_protocol::schema::v1::{
 use serde_json::json;
 use tauri::State;
 
-use crate::acp::config::{require_config_id, AgentConfig, AgentId, SessionId};
+use crate::acp::config::{require_config_id, AgentConfig, AgentId, PermissionPolicy, SessionId};
 use crate::acp::manager::{
     AcpManager, NewSessionOutcome, SessionCreationContext, SessionReopenOutcome, SpawnOutcome,
 };
@@ -52,6 +52,15 @@ pub async fn acp_list_agents(manager: State<'_, Arc<AcpManager>>) -> Result<Vec<
     Ok(manager.list_agents())
 }
 
+#[tauri::command]
+pub fn acp_set_permission_policy(
+    manager: State<'_, Arc<AcpManager>>,
+    agent_id: AgentId,
+    policy: PermissionPolicy,
+) -> Result<(), String> {
+    manager.set_permission_policy(&agent_id, policy)
+}
+
 /// Create a new session. `mcpServers` is passed through to `session/new` as-is.
 /// `projectId` (CAP-2 attribution) is optional; the renderer passes the owning
 /// project so the host-owned durable record is project-scoped. `worktreePath` +
@@ -68,8 +77,11 @@ pub async fn acp_new_session(
     project_id: Option<String>,
     worktree_path: Option<String>,
     worktree_branch: Option<String>,
+    conversation_id: Option<String>,
+    project_attachment: Option<crate::conversation::ProjectAttachment>,
+    execution_target: Option<crate::conversation::ExecutionTarget>,
 ) -> Result<NewSessionOutcome, String> {
-    manager
+    let result = manager
         .new_session_with_context(
             &agent_id,
             cwd,
@@ -77,11 +89,33 @@ pub async fn acp_new_session(
             SessionCreationContext {
                 project_id: project_id.filter(|id| !id.trim().is_empty()),
                 ephemeral: ephemeral.unwrap_or(false),
+                conversation_id: conversation_id
+                    .map(|value| crate::conversation::ConversationId::parse(&value))
+                    .transpose()
+                    .map_err(|error| error.to_string())?,
+                project_attachment,
+                execution_target,
                 worktree_path: worktree_path.filter(|p| !p.trim().is_empty()),
                 worktree_branch: worktree_branch.filter(|b| !b.trim().is_empty()),
             },
         )
-        .await
+        .await;
+    if let Err(error) = &result {
+        if let Some(failure) = crate::conversation::AgentCompensationFailure::from_wire_error(error)
+        {
+            log::error!(
+                "[acp-command] operation=new_session conversation_id={} code={} primary_code={} provider_close_code={} failure_record_code={} recovery_marker_code={} recovery_record_code={}",
+                failure.conversation_id,
+                crate::conversation::ACP_COMPENSATION_FAILED,
+                failure.primary_code,
+                failure.provider_close_code.as_deref().unwrap_or("OK"),
+                failure.failure_record_code.as_deref().unwrap_or("OK"),
+                failure.recovery_marker_code.as_deref().unwrap_or("OK"),
+                failure.recovery_record_code.as_deref().unwrap_or("OK")
+            );
+        }
+    }
+    result
 }
 
 /// Load an existing session (requires the agent's `loadSession` capability).
@@ -91,8 +125,27 @@ pub async fn acp_load_session(
     agent_id: AgentId,
     session_id: SessionId,
     cwd: String,
+    conversation_id: Option<String>,
+    mcp_servers: Option<Vec<McpServer>>,
 ) -> Result<SessionReopenOutcome, String> {
-    manager.load_session(&agent_id, session_id, cwd).await
+    let session_id_str = session_id.0.clone();
+    // Register before contacting the agent: load can synchronously emit
+    // session/update notifications, and those must resolve canonical
+    // Conversation persistence during the in-flight request.
+    if let Some(raw) = conversation_id {
+        match crate::conversation::ConversationId::parse(&raw) {
+            Ok(conversation_id) => {
+                manager.register_conversation_binding(&session_id_str, conversation_id)
+            }
+            Err(_) => {
+                log::warn!("[acp-command] load binding skipped: invalid conversationId {raw}");
+            }
+        }
+    }
+    let outcome = manager
+        .load_session(&agent_id, session_id, cwd, mcp_servers.unwrap_or_default())
+        .await?;
+    Ok(outcome)
 }
 
 /// Resume a session (requires the agent's `sessionCapabilities.resume`).
@@ -102,29 +155,88 @@ pub async fn acp_resume_session(
     agent_id: AgentId,
     session_id: SessionId,
     cwd: String,
+    conversation_id: Option<String>,
+    mcp_servers: Option<Vec<McpServer>>,
 ) -> Result<SessionReopenOutcome, String> {
-    manager.resume_session(&agent_id, session_id, cwd).await
+    let session_id_str = session_id.0.clone();
+    // Resume may emit updates before its response, so make the durable route
+    // visible before sending the ACP request.
+    if let Some(raw) = conversation_id {
+        match crate::conversation::ConversationId::parse(&raw) {
+            Ok(conversation_id) => {
+                manager.register_conversation_binding(&session_id_str, conversation_id)
+            }
+            Err(_) => {
+                log::warn!("[acp-command] resume binding skipped: invalid conversationId {raw}");
+            }
+        }
+    }
+    let outcome = manager
+        .resume_session(&agent_id, session_id, cwd, mcp_servers.unwrap_or_default())
+        .await?;
+    Ok(outcome)
 }
 
 /// Close a session (requires the agent's `sessionCapabilities.close`).
 #[tauri::command]
 pub async fn acp_close_session(
     manager: State<'_, Arc<AcpManager>>,
+    pty: State<'_, Arc<crate::pty::PtyManager>>,
+    relay: State<'_, Arc<WsRelaySink>>,
     agent_id: AgentId,
     session_id: SessionId,
 ) -> Result<(), String> {
-    manager.close_session(&agent_id, session_id).await
+    let retirement_id = session_id.0.clone();
+    let result =
+        if let Some(conversation_id) = manager.conversation_id_for_current_session(&session_id.0) {
+            let service = crate::conversation::ConversationLifecycleService::from_manager(
+                manager.inner().clone(),
+                pty.inner().clone(),
+            )
+            .map_err(|error| error.to_string())?;
+            let creation = manager
+                .conversation_creation()
+                .ok_or_else(|| "CONVERSATION_BOOTSTRAP_REQUIRED".to_string())?;
+            let expected_revision = creation
+                .repository()
+                .get_conversation(conversation_id)
+                .map_err(|error| error.to_string())?
+                .last_seq;
+            service
+                .suspend_agent_binding(conversation_id, expected_revision)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        } else {
+            manager.close_session(&agent_id, session_id).await
+        };
+    retire_after_success(result, relay.inner(), &retirement_id).await
 }
 
 #[tauri::command]
 pub async fn acp_dispose_ephemeral_session(
     manager: State<'_, Arc<AcpManager>>,
+    relay: State<'_, Arc<WsRelaySink>>,
     agent_id: AgentId,
     session_id: SessionId,
 ) -> Result<(), String> {
-    manager
+    let retirement_id = session_id.0.clone();
+    let result = manager
         .dispose_ephemeral_session(&agent_id, session_id)
+        .await;
+    retire_after_success(result, relay.inner(), &retirement_id).await
+}
+
+async fn retire_after_success(
+    result: Result<(), String>,
+    relay: &WsRelaySink,
+    session_id: &str,
+) -> Result<(), String> {
+    result?;
+    relay
+        .retire_session(session_id)
         .await
+        .map_err(|code| format!("CONVERSATION_RETIREMENT_FAILED:{code}"))
 }
 
 /// List sessions on an agent (requires `sessionCapabilities.list`).
@@ -233,18 +345,32 @@ pub async fn acp_send_prompt(
         }
     };
     if !ephemeral {
-        if let Err(error) =
-            persist_accepted_prompt(relay.inner(), &agent_id, &session_id, &blocks).await
-        {
-            // Persistence failure rejects dispatch so a transport failure
-            // cannot erase an accepted user message. Log session context only
-            // — never the prompt content.
+        // Sessions without a canonical Conversation binding (legacy reopens
+        // predating rebind-on-resume) have no durable home; dispatch without
+        // history instead of surfacing a red persistence error.
+        let bound = manager
+            .conversation_id_for_current_session(&session_id.0)
+            .is_some();
+        if bound {
+            if let Err(error) =
+                persist_accepted_prompt(relay.inner(), &agent_id, &session_id, &blocks).await
+            {
+                // Persistence failure rejects dispatch so a transport failure
+                // cannot erase an accepted user message. Log session context only
+                // — never the prompt content.
+                log::warn!(
+                    "[acp] failed to persist accepted prompt for session {} (agent {}): {error}",
+                    session_id.0,
+                    agent_id.0
+                );
+                return Err(format!("failed to persist accepted prompt: {error}"));
+            }
+        } else {
             log::warn!(
-                "[acp] failed to persist accepted prompt for session {} (agent {}): {error}",
+                "[acp] accepted prompt not persisted: session {} has no Conversation binding (agent {})",
                 session_id.0,
                 agent_id.0
             );
-            return Err(format!("failed to persist accepted prompt: {error}"));
         }
     }
     // Desktop path: no client turn-id (the renderer's dedup is Tauri-event-
@@ -637,6 +763,16 @@ pub fn acp_set_first_prompt_warmup_timeout(secs: Option<u64>) -> Result<(), Stri
     Ok(())
 }
 
+/// Prefer host-owned local `npm install` for `npx -y` agents (default), or
+/// always launch through npx. Pushed from App Preferences. Desktop-only;
+/// standalone `termul-server` uses `TERMUL_ACP_PREFER_LOCAL_NPM`.
+#[tauri::command]
+pub fn acp_set_prefer_local_npm_install(prefer: bool) -> Result<(), String> {
+    crate::acp::npm_local::set_prefer_local_npm_install(prefer);
+    log::info!("[acp] prefer local npm install: {prefer}");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -734,5 +870,41 @@ mod tests {
 
         persistence.shutdown().await.unwrap();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn tauri_close_retires_on_success_and_retains_on_error() {
+        let relay = WsRelaySink::new();
+        relay.turn_watermark().mark_seen("tauri-close", "turn-1");
+        assert!(
+            retire_after_success(Err("close failed".to_string()), &relay, "tauri-close")
+                .await
+                .is_err()
+        );
+        assert!(relay.turn_watermark().is_seen("tauri-close", "turn-1"));
+
+        retire_after_success(Ok(()), &relay, "tauri-close")
+            .await
+            .unwrap();
+        assert!(!relay.turn_watermark().is_seen("tauri-close", "turn-1"));
+    }
+
+    #[tokio::test]
+    async fn tauri_ephemeral_dispose_retires_on_success_and_retains_on_error() {
+        let relay = WsRelaySink::new();
+        relay
+            .turn_watermark()
+            .mark_seen("tauri-ephemeral", "turn-1");
+        assert!(
+            retire_after_success(Err("dispose failed".to_string()), &relay, "tauri-ephemeral")
+                .await
+                .is_err()
+        );
+        assert!(relay.turn_watermark().is_seen("tauri-ephemeral", "turn-1"));
+
+        retire_after_success(Ok(()), &relay, "tauri-ephemeral")
+            .await
+            .unwrap();
+        assert!(!relay.turn_watermark().is_seen("tauri-ephemeral", "turn-1"));
     }
 }

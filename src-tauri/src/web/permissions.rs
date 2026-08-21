@@ -272,17 +272,17 @@ impl PermissionRendezvous {
     pub fn cancel_disconnect_grace(&self, session_id: &str) {
         if let Some((_, cancel)) = self.disconnect_graces.lock().remove(session_id) {
             let _ = cancel.send(());
-            tracing::info!(session_id, "permission disconnect grace cancelled after resubscribe");
+            tracing::info!(
+                session_id,
+                "permission disconnect grace cancelled after resubscribe"
+            );
         }
     }
 
     /// Arm a bounded last-subscriber grace. Expiry rechecks the relay count;
     /// the original per-ticket timeout remains armed throughout.
-    pub fn schedule_disconnect_grace<F>(
-        self: &Arc<Self>,
-        session_id: String,
-        subscriber_count: F,
-    ) where
+    pub fn schedule_disconnect_grace<F>(self: &Arc<Self>, session_id: String, subscriber_count: F)
+    where
         F: Fn(&str) -> usize + Send + Sync + 'static,
     {
         static GRACE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -306,18 +306,30 @@ impl PermissionRendezvous {
             // schedule may have replaced us while the timeout was expiring.
             let is_latest = {
                 let graces = this.disconnect_graces.lock();
-                graces.get(&session_id).is_some_and(|(gen, _)| *gen == generation)
+                graces
+                    .get(&session_id)
+                    .is_some_and(|(gen, _)| *gen == generation)
             };
             if !is_latest {
-                tracing::info!(session_id, "permission disconnect grace superseded; skipping deny");
+                tracing::info!(
+                    session_id,
+                    "permission disconnect grace superseded; skipping deny"
+                );
                 return;
             }
             this.disconnect_graces.lock().remove(&session_id);
             if subscriber_count(&session_id) != 0 {
-                tracing::info!(session_id, "permission disconnect grace expired with subscriber restored");
+                tracing::info!(
+                    session_id,
+                    "permission disconnect grace expired with subscriber restored"
+                );
                 return;
             }
-            tracing::warn!(session_id, grace_ms = grace.as_millis(), "permission disconnect grace expired; denying pending tickets");
+            tracing::warn!(
+                session_id,
+                grace_ms = grace.as_millis(),
+                "permission disconnect grace expired; denying pending tickets"
+            );
             this.deny_orphaned_session(&session_id).await;
         };
         match &self.handle {
@@ -1143,15 +1155,74 @@ pub enum TurnClaim {
     Busy,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnWatermarkStats {
+    pub completed_sessions: usize,
+    pub completed_turns: usize,
+    pub in_flight_sessions: usize,
+    pub seen_sessions: usize,
+    pub seen_turns: usize,
+}
+
+const MAX_TURN_IDS_PER_SESSION: usize = 1024;
+const TURN_ID_TTL_SECS: u64 = 3600;
+
+#[derive(Debug, Default)]
+struct TimedTurnSet {
+    items: HashMap<String, std::time::Instant>,
+}
+
+impl TimedTurnSet {
+    fn prune(&mut self, now: std::time::Instant) {
+        self.items
+            .retain(|_, opened| now.duration_since(*opened).as_secs() < TURN_ID_TTL_SECS);
+    }
+
+    fn insert(&mut self, turn_id: String) -> bool {
+        let now = std::time::Instant::now();
+        self.prune(now);
+        if self.items.len() >= MAX_TURN_IDS_PER_SESSION && !self.items.contains_key(&turn_id) {
+            if let Some(oldest) = self
+                .items
+                .iter()
+                .min_by_key(|(_, opened)| *opened)
+                .map(|(key, _)| key.clone())
+            {
+                self.items.remove(&oldest);
+            }
+        }
+        self.items.insert(turn_id, now).is_none()
+    }
+
+    fn contains(&mut self, turn_id: &str) -> bool {
+        self.prune(std::time::Instant::now());
+        self.items.contains_key(turn_id)
+    }
+
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn first_id(&self) -> Option<String> {
+        self.items.keys().next().cloned()
+    }
+
+    fn extend<I: IntoIterator<Item = String>>(&mut self, turn_ids: I) {
+        for turn_id in turn_ids {
+            self.insert(turn_id);
+        }
+    }
+}
+
 pub struct TurnWatermark {
     /// `session_id → completed turn ids` reconstructed from durable history and
     /// updated on live completion.
-    completed: Mutex<HashMap<String, std::collections::HashSet<String>>>,
+    completed: Mutex<HashMap<String, TimedTurnSet>>,
     /// `session_id → currently claimed turn id` (empty string for clients that
     /// omit turnId). Claiming is atomic with duplicate/busy rejection.
     in_flight: Mutex<HashMap<String, String>>,
     /// `session_id → set of seen turn-ids` (idempotent event dedup).
-    seen: Mutex<HashMap<String, std::collections::HashSet<String>>>,
+    seen: Mutex<HashMap<String, TimedTurnSet>>,
 }
 
 impl TurnWatermark {
@@ -1181,7 +1252,7 @@ impl TurnWatermark {
     pub fn is_seen(&self, session_id: &str, turn_id: &str) -> bool {
         self.seen
             .lock()
-            .get(session_id)
+            .get_mut(session_id)
             .is_some_and(|set| set.contains(turn_id))
     }
 
@@ -1214,7 +1285,7 @@ impl TurnWatermark {
         self.completed
             .lock()
             .get(session_id)
-            .and_then(|ids| ids.iter().next().cloned())
+            .and_then(TimedTurnSet::first_id)
     }
 
     /// Atomically claim the session turn before persistence. Rejects an already
@@ -1258,11 +1329,26 @@ impl TurnWatermark {
     pub fn is_completed(&self, session_id: &str, turn_id: &str) -> bool {
         self.completed
             .lock()
-            .get(session_id)
+            .get_mut(session_id)
             .is_some_and(|ids| ids.contains(turn_id))
     }
 
-    /// Forget a session's watermark state (on explicit session close).
+    /// Secret-safe bounded-state counters used by relay retirement tests and diagnostics.
+    #[must_use]
+    pub fn stats(&self) -> TurnWatermarkStats {
+        let completed = self.completed.lock();
+        let in_flight = self.in_flight.lock();
+        let seen = self.seen.lock();
+        TurnWatermarkStats {
+            completed_sessions: completed.len(),
+            completed_turns: completed.values().map(TimedTurnSet::len).sum(),
+            in_flight_sessions: in_flight.len(),
+            seen_sessions: seen.len(),
+            seen_turns: seen.values().map(TimedTurnSet::len).sum(),
+        }
+    }
+
+    /// Forget a session's watermark/claim state. Repeated retirement is a no-op.
     pub fn forget_session(&self, session_id: &str) {
         self.completed.lock().remove(session_id);
         self.in_flight.lock().remove(session_id);
@@ -1535,11 +1621,7 @@ mod tests {
                 ]),
             );
             let ok = rdz
-                .try_respond(
-                    client,
-                    "q-multi",
-                    Some(&["a".to_string(), "b".to_string()]),
-                )
+                .try_respond(client, "q-multi", Some(&["a".to_string(), "b".to_string()]))
                 .await;
             assert_eq!(ok, Ok(QuestionRespondOutcome::Resolved));
         });
@@ -1949,10 +2031,16 @@ mod tests {
     fn turn_watermark_forgets_session_state() {
         let wm = TurnWatermark::new();
         wm.mark_seen("sess-1", "turn-a");
+        assert_eq!(wm.claim_turn("sess-1", Some("turn-b")), TurnClaim::Claimed);
         wm.record_completed("sess-1", "turn-a");
+        let before = wm.stats();
+        assert_eq!(before.completed_sessions, 1);
+        assert_eq!(before.seen_sessions, 1);
+        assert_eq!(before.in_flight_sessions, 1);
         wm.forget_session("sess-1");
         assert!(wm.last_completed("sess-1").is_none());
         assert!(!wm.is_seen("sess-1", "turn-a"));
+        assert_eq!(wm.stats(), TurnWatermarkStats::default());
         // Forgetting a non-existent session is a no-op.
         wm.forget_session("never-existed");
     }

@@ -76,8 +76,6 @@
         "@types/dompurify": "^3.0.5",
         "@xterm/addon-fit": "^0.12.0-beta.216",
         "@xterm/addon-search": "^0.17.0-beta.216",
-        "@xterm/addon-serialize": "^0.14.0",
-        "@xterm/addon-web-links": "^0.13.0-beta.216",
         "@xterm/addon-webgl": "^0.20.0-beta.215",
         "@xterm/xterm": "^6.1.0-beta.216",
         "ai": "^7.0.4",
@@ -110,7 +108,6 @@
         "streamdown": "2.5.0",
         "tailwind-merge": "^2.6.0",
         "tailwindcss-animate": "^1.0.7",
-        "tauri-pty": "^0.1",
         "unicode-animations": "^1.0.3",
         "vaul": "^0.9.9",
         "yaml": "^2.9.0",
@@ -906,10 +903,6 @@
     "@xterm/addon-fit": ["@xterm/addon-fit@0.12.0-beta.287", "", { "peerDependencies": { "@xterm/xterm": "^6.1.0-beta.287" } }, "sha512-2MDj+J4x67bjOS/SuBPxSYEWH38NbX6ENV18RbKVOhfRYCX3yERnuHBOrgH9hYdY8rCtsLQmuVgF6cmvCJiV2w=="],
 
     "@xterm/addon-search": ["@xterm/addon-search@0.17.0-beta.287", "", { "peerDependencies": { "@xterm/xterm": "^6.1.0-beta.287" } }, "sha512-nFyUwT/i7i4i1BgqYhQsHIuUGhE18g0KiuoxU6e78n63zGN6RVw5jExvZ8PPa3zVuu/vf8pJ9G9gQs2OmekX4g=="],
-
-    "@xterm/addon-serialize": ["@xterm/addon-serialize@0.14.0", "", {}, "sha512-uteyTU1EkrQa2Ux6P/uFl2fzmXI46jy5uoQMKEOM0fKTyiW7cSn0WrFenHm5vO5uEXX/GpwW/FgILvv3r0WbkA=="],
-
-    "@xterm/addon-web-links": ["@xterm/addon-web-links@0.13.0-beta.287", "", { "peerDependencies": { "@xterm/xterm": "^6.1.0-beta.287" } }, "sha512-1+5+zWtIGBOygy4yB9is0V9PwEZSz2NsRzQyNqGb+7hnTW2PXqvUCjq6GLvyUflHQw8VQ7jXtUuFE+ETVzcx+A=="],
 
     "@xterm/addon-webgl": ["@xterm/addon-webgl@0.20.0-beta.286", "", { "peerDependencies": { "@xterm/xterm": "^6.1.0-beta.287" } }, "sha512-Nvk9Jic7OCXtL1lS1/Ryurkpd2VElO7PCBOf+DEB3ODs9yU+F31sJwQD+LIdZ6GAJ+Atp7LuWHjSNhRv/xSY0w=="],
 
@@ -1963,8 +1956,6 @@
 
     "tapable": ["tapable@2.3.3", "", {}, "sha512-uxc/zpqFg6x7C8vOE7lh6Lbda8eEL9zmVm/PLeTPBRhh1xCgdWaQ+J1CUieGpIfm2HdtsUpRv+HshiasBMcc6A=="],
 
-    "tauri-pty": ["tauri-pty@0.1.1", "", { "dependencies": { "@tauri-apps/api": "2.8.0" } }, "sha512-45Lbcr9nCWhdisszvDkAIeU0e5v8LnsFE8nOI2FF/aKWGuVP3CELqloPa6abTZP6blLmZJflQjQYRace2STNnA=="],
-
     "tiny-invariant": ["tiny-invariant@1.3.3", "", {}, "sha512-+FbBPE1o9QAYvviau/qC5SE3caw21q3xkvWKBtja5vgqOWIHHJ3ioaq1VPfn/Szqctz2bU/oYeKd9/z5BL+PVg=="],
 
     "tinybench": ["tinybench@2.9.0", "", {}, "sha512-0+DUvqWMValLmha6lr4kD8iAMK1HzV0/aKnCtWb9v9641TnP/MFb7Pc2bxoxQjTXAErryXVgUOfv2YqNllqGeg=="],
@@ -2208,8 +2199,6 @@
     "streamdown/tailwind-merge": ["tailwind-merge@3.6.0", "", {}, "sha512-uxL7qAVQriqRQPAyK3pj66VqskWqoZ37PW94jwOTwNfq/z9oyu1V+eqrZqtR2+fCiXdYOZe/Modt8GtvqNzu+w=="],
 
     "strip-ansi/ansi-regex": ["ansi-regex@6.2.2", "", {}, "sha512-Bq3SmSpyFHaWjPk8If9yc6svM8c56dB5BAtW4Qbw5jHTwwXXcTLoRMkpDJp6VL0XzlWaCHTXrkFURMYmD0sLqg=="],
-
-    "tauri-pty/@tauri-apps/api": ["@tauri-apps/api@2.8.0", "", {}, "sha512-ga7zdhbS2GXOMTIZRT0mYjKJtR9fivsXzsyq5U3vjDL0s6DTMwYRm0UHNjzTY5dh4+LSC68Sm/7WEiimbQNYlw=="],
 
     "type-is/content-type": ["content-type@2.0.0", "", {}, "sha512-j/O/d7GcZCyNl7/hwZAb606rzqkyvaDctLmckbxLzHvFBzTJHuGEdodATcP3yIRoDrLHkIATJuvzbFlp/ki2cQ=="],
 

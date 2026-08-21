@@ -9,7 +9,7 @@ vi.mock('@tauri-apps/api/core', () => ({
   invoke: mockInvoke
 }))
 
-import { remoteServerApi, tunnelConfigApi } from './tauri-remote-api'
+import { remoteServerApi, syncProjects, tunnelConfigApi } from './tauri-remote-api'
 
 describe('remoteServerApi', () => {
   beforeEach(() => {
@@ -85,6 +85,7 @@ describe('remoteServerApi', () => {
       expect(result.code).toBe('REMOTE_START_FAILED')
     }
   })
+
   it('tunnelConfigApi.get forwards tunnel_config_get', async () => {
     const ipc: IpcResult<{ provider: 'cloudflareQuick' }> = {
       success: true,
@@ -101,6 +102,47 @@ describe('remoteServerApi', () => {
     await tunnelConfigApi.set({ provider: 'frp', frpServerAddr: '1.2.3.4' })
     expect(mockInvoke).toHaveBeenCalledWith('tunnel_config_set', {
       update: { provider: 'frp', frpServerAddr: '1.2.3.4' }
+    })
+  })
+
+  it('syncProjects transports project groups in the desktop sync payload', async () => {
+    const ipc: IpcResult<void> = { success: true, data: undefined }
+    mockInvoke.mockResolvedValueOnce(ipc)
+    const projects = [
+      {
+        id: 'p-1',
+        name: 'Project',
+        color: 'blue',
+        path: '/tmp/project',
+        isArchived: false,
+        isDefault: true
+      }
+    ]
+    const groups = [
+      {
+        id: 'g-1',
+        name: 'Favorites',
+        projectIds: ['p-1'],
+        color: 'purple',
+        preferredProjectId: 'p-1'
+      }
+    ]
+
+    const result = await syncProjects(projects, 'p-1', groups)
+
+    expect(mockInvoke).toHaveBeenCalledWith('remote_sync_projects', {
+      payload: { projects, groups, defaultProjectId: 'p-1' }
+    })
+    expect(result).toEqual(ipc)
+  })
+
+  it('syncProjects defaults groups to an empty list for existing callers', async () => {
+    mockInvoke.mockResolvedValueOnce({ success: true, data: undefined })
+
+    await syncProjects([], null)
+
+    expect(mockInvoke).toHaveBeenCalledWith('remote_sync_projects', {
+      payload: { projects: [], groups: [], defaultProjectId: null }
     })
   })
 })

@@ -7,7 +7,7 @@ import type {
   TunnelConfigUpdate,
   TunnelConfigView
 } from '@shared/types/ipc.types'
-import type { ProjectSummary } from '@shared/types/web-projects.types'
+import type { ProjectGroupSummary, ProjectSummary } from '@shared/types/web-projects.types'
 import type { PersistedSessionSummary } from '@shared/types/web-protocol.types'
 import { type InvokeArgs, invoke } from '@tauri-apps/api/core'
 import type { StoredMcpServer } from './acp-mcp-persistence'
@@ -76,9 +76,11 @@ export const remoteServerApi: RemoteServerApi = {
 /**
  * Push the desktop renderer's current project list into the in-memory
  * `ProjectRegistry` (Epic-4 bridge) so the web/remote client can read it via
- * `GET /projects`. No env-var values cross the wire — `ProjectSummary` redacts
- * by omission. Call on server-start success + on every project-store mutation
- * while the server runs (a no-op when the server is stopped just returns ok).
+ * `GET /projects`. The payload also carries redacted project-group navigation
+ * metadata; UI-only collapse state stays client-local. No env-var values cross
+ * the wire — `ProjectSummary` redacts by omission. Call on server-start success
+ * + on every project-store mutation while the server runs (a no-op when the
+ * server is stopped just returns ok).
  *
  * In desktop-hosted mode the desktop's `activeProjectId` IS the host default
  * (the desktop user is the host operator), so it is pushed as
@@ -88,10 +90,11 @@ export const remoteServerApi: RemoteServerApi = {
  */
 export async function syncProjects(
   projects: ProjectSummary[],
-  defaultProjectId: string | null
+  defaultProjectId: string | null,
+  groups: ProjectGroupSummary[] = []
 ): Promise<IpcResult<void>> {
   return invokeIpc<void>('remote_sync_projects', {
-    payload: { projects, defaultProjectId }
+    payload: { projects, groups, defaultProjectId }
   })
 }
 

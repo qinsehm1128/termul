@@ -1,5 +1,13 @@
+import {
+  WEB_TERMINAL_BINARY_KIND,
+  WEB_TERMINAL_BINARY_PROTOCOL
+} from '@shared/types/web-terminal-protocol.types'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { resolveTerminalWsUrl, WebTerminalClient } from './web-terminal-api'
+
+vi.mock('@/lib/log-api', () => ({
+  logFrontendError: vi.fn()
+}))
 
 /**
  * Minimal FakeWebSocket for the terminal protocol (`{id,type,payload}` requests
@@ -19,8 +27,12 @@ class FakeWebSocket {
   onerror: ((ev: Event) => void) | null = null
   onclose: ((ev: CloseEvent) => void) | null = null
   sent: string[] = []
+  binaryType: BinaryType = 'blob'
 
-  constructor(public url: string) {
+  constructor(
+    public url: string,
+    public protocols?: string | string[]
+  ) {
     queueMicrotask(() => {
       this.readyState = FakeWebSocket.OPEN
       this.onopen?.(new Event('open'))
@@ -31,8 +43,59 @@ class FakeWebSocket {
     this.sent.push(data)
     const req = JSON.parse(data) as { id: string; type: string; payload: Record<string, unknown> }
     if (req.type === 'spawn') {
+      if (spawnReply === 'compound-failure') {
+        this.emitReply({
+          id: req.id,
+          success: false,
+          error: JSON.stringify({
+            terminalId: 'terminal-recoverable-1',
+            primaryCode: 'CONVERSATION_DURABILITY_FAILED',
+            cleanupStage: 'kill'
+          }),
+          code: 'TERMINAL_RESOURCE_ROLLBACK_FAILED'
+        })
+        return
+      }
       // CAP-3: spawn is the only issuance path — the reply carries the claim.
       this.emitReply({ id: req.id, success: true, data: spawnReplyData })
+      return
+    }
+    if (req.type === 'resume') {
+      if (resumeReply === 'unauthorized') {
+        this.emitReply({
+          id: req.id,
+          success: false,
+          error: 'Unauthorized',
+          code: 'UNAUTHORIZED'
+        })
+        return
+      }
+      queueMicrotask(() => {
+        if (resumeReply === 'ok') {
+          this.emit({
+            type: 'replay',
+            terminalId: req.payload.terminalId,
+            chunks: resumeReplayChunks,
+            gap: false,
+            latestSeq: resumeGrantData.terminal.latestSeq,
+            snapshot: {
+              cwd: resumeGrantData.terminal.cwd,
+              gitBranch: null,
+              gitStatus: null,
+              exitCode: null,
+              exited: false
+            }
+          })
+        }
+        this.emit({
+          id: req.id,
+          success: true,
+          data:
+            resumeReply === 'invalid'
+              ? { ...resumeGrantData, terminal: { ...resumeGrantData.terminal, id: 'wrong-id' } }
+              : resumeGrantData
+        })
+      })
       return
     }
     if (req.type === 'attach') {
@@ -107,6 +170,19 @@ class FakeWebSocket {
       })
       return
     }
+    if ((req.type === 'terminate' || req.type === 'kill') && terminateReply === 'cleanup-failure') {
+      this.emitReply({
+        id: req.id,
+        success: false,
+        error: JSON.stringify({
+          terminalId: req.payload.terminalId,
+          primaryCode: 'TERMINATE_FAILED',
+          cleanupStage: 'flusher_join'
+        }),
+        code: 'TERMINATE_FAILED'
+      })
+      return
+    }
     this.emitReply({ id: req.id, success: true, data: undefined })
   }
 
@@ -119,13 +195,38 @@ class FakeWebSocket {
     this.onmessage?.(new MessageEvent('message', { data: JSON.stringify(obj) }))
   }
 
+  emitBinary(data: ArrayBuffer): void {
+    this.onmessage?.(new MessageEvent('message', { data }))
+  }
+
   emitReply(obj: unknown): void {
     queueMicrotask(() => this.emit(obj))
   }
 }
 
+function encodeBinaryFrame(
+  kind: number,
+  terminalId: string,
+  seq: number,
+  data: number[]
+): ArrayBuffer {
+  const terminalIdBytes = new TextEncoder().encode(terminalId)
+  const buffer = new ArrayBuffer(15 + terminalIdBytes.length + data.length)
+  const bytes = new Uint8Array(buffer)
+  bytes.set([0x54, 0x4d, 0x4c, 0x32, kind], 0)
+  const view = new DataView(buffer)
+  view.setUint16(5, terminalIdBytes.length, false)
+  view.setUint32(7, Math.floor(seq / 0x1_0000_0000), false)
+  view.setUint32(11, seq >>> 0, false)
+  bytes.set(terminalIdBytes, 15)
+  bytes.set(data, 15 + terminalIdBytes.length)
+  return buffer
+}
+
 /** Test knob: make `attach` replies fail with the generic UNAUTHORIZED. */
 let attachReply: 'ok' | 'unauthorized' = 'ok'
+let spawnReply: 'ok' | 'compound-failure' = 'ok'
+let terminateReply: 'ok' | 'cleanup-failure' = 'ok'
 
 /** Test knob: the spawn reply data (CAP-3 issuance carries the claim). */
 let spawnReplyData: Record<string, unknown> = {
@@ -141,12 +242,34 @@ let spawnReplyData: Record<string, unknown> = {
 /** Test knob: credential returned by rotate_claim replies. */
 let rotateReplyClaim = 'rotated-claim-64-hex'
 
+/** Test knobs for authenticated cold resume. */
+let resumeReply: 'ok' | 'unauthorized' | 'invalid' = 'ok'
+let resumeGrantData = {
+  terminal: {
+    id: 't1',
+    shell: 'bash',
+    cwd: '/workspace/resumed',
+    pid: 77,
+    cols: 100,
+    rows: 30,
+    latestSeq: 12,
+    gap: false
+  },
+  claim: 'resume-claim-rotated'
+}
+let resumeReplayChunks = [
+  { seq: 8, data: [114, 101, 112, 108, 97, 121, 45] },
+  { seq: 12, data: [111, 107] }
+]
+
 type Tracker = {
   lastSeq: number
   exited: boolean
   refCount: number
+  streamAttached: boolean
   claim?: string
   disconnected: boolean
+  cleanupOnly: boolean
 }
 
 type ClientInternals = {
@@ -176,6 +299,30 @@ function restoreVisibility(): void {
     value: 'visible'
   })
 }
+
+afterEach(() => {
+  attachReply = 'ok'
+  spawnReply = 'ok'
+  terminateReply = 'ok'
+  resumeReply = 'ok'
+  resumeGrantData = {
+    terminal: {
+      id: 't1',
+      shell: 'bash',
+      cwd: '/workspace/resumed',
+      pid: 77,
+      cols: 100,
+      rows: 30,
+      latestSeq: 12,
+      gap: false
+    },
+    claim: 'resume-claim-rotated'
+  }
+  resumeReplayChunks = [
+    { seq: 8, data: [114, 101, 112, 108, 97, 121, 45] },
+    { seq: 12, data: [111, 107] }
+  ]
+})
 
 /** Find the LAST sent request frame of a given type on a FakeWebSocket. */
 function findSentRequest(
@@ -477,6 +624,95 @@ describe('WebTerminalClient frame handling & request lifecycle', () => {
     client.dispose()
   })
 
+  it('delivers data only to scoped subscribers for the matching terminal', async () => {
+    vi.useFakeTimers()
+    const client = new WebTerminalClient(
+      'ws://test/terminal/ws',
+      FakeWebSocket as unknown as typeof WebSocket
+    )
+    const internals = client as unknown as ClientInternals
+    const matching = vi.fn()
+    const unrelated = vi.fn()
+    const offMatching = client.onDataForTerminal('t1', matching)
+    const offUnrelated = client.onDataForTerminal('t2', unrelated)
+
+    await client.connect()
+    internals.socket.emit({ type: 'data', terminalId: 't1', seq: 1, data: [1, 2, 3] })
+
+    expect(matching).toHaveBeenCalledTimes(1)
+    expect(Array.from(matching.mock.calls[0][0] as Uint8Array)).toEqual([1, 2, 3])
+    expect(unrelated).not.toHaveBeenCalled()
+
+    offMatching()
+    offUnrelated()
+    client.dispose()
+  })
+
+  it('negotiates and decodes binary terminal output without JSON byte arrays', async () => {
+    vi.useFakeTimers()
+    const client = new WebTerminalClient(
+      'ws://test/terminal/ws',
+      FakeWebSocket as unknown as typeof WebSocket
+    )
+    const internals = client as unknown as ClientInternals
+    const matching = vi.fn()
+    const unrelated = vi.fn()
+    client.onDataForTerminal('t1', matching)
+    client.onDataForTerminal('t2', unrelated)
+
+    await client.connect()
+    expect(internals.socket.protocols).toBe(WEB_TERMINAL_BINARY_PROTOCOL)
+    expect(internals.socket.binaryType).toBe('arraybuffer')
+
+    internals.socket.emitBinary(
+      encodeBinaryFrame(WEB_TERMINAL_BINARY_KIND.LIVE, 't1', 4_294_967_299, [0, 0xff, 0x41])
+    )
+
+    expect(matching).toHaveBeenCalledTimes(1)
+    expect(Array.from(matching.mock.calls[0][0] as Uint8Array)).toEqual([0, 0xff, 0x41])
+    expect(unrelated).not.toHaveBeenCalled()
+    expect(internals.trackers.get('t1')?.lastSeq).toBe(4_294_967_299)
+
+    client.dispose()
+  })
+
+  it('ignores malformed binary terminal output frames', async () => {
+    vi.useFakeTimers()
+    const client = new WebTerminalClient(
+      'ws://test/terminal/ws',
+      FakeWebSocket as unknown as typeof WebSocket
+    )
+    const internals = client as unknown as ClientInternals
+    const received = vi.fn()
+    client.onData(received)
+
+    await client.connect()
+    internals.socket.emitBinary(new Uint8Array([1, 2, 3]).buffer)
+
+    expect(received).not.toHaveBeenCalled()
+    client.dispose()
+  })
+
+  it('preserves UTF-8 CJK, emoji, and combining bytes in binary replay frames', async () => {
+    vi.useFakeTimers()
+    const client = new WebTerminalClient(
+      'ws://test/terminal/ws',
+      FakeWebSocket as unknown as typeof WebSocket
+    )
+    const internals = client as unknown as ClientInternals
+    const received = vi.fn()
+    client.onDataForTerminal('unicode', received)
+    const encoded = new TextEncoder().encode('中文 👩🏽‍💻 e\u0301')
+
+    await client.connect()
+    internals.socket.emitBinary(
+      encodeBinaryFrame(WEB_TERMINAL_BINARY_KIND.REPLAY, 'unicode', 7, Array.from(encoded))
+    )
+
+    expect(Array.from(received.mock.calls[0][0] as Uint8Array)).toEqual(Array.from(encoded))
+    client.dispose()
+  })
+
   it('resolves a request with the matching reply data (round-trip)', async () => {
     vi.useFakeTimers()
     const client = new WebTerminalClient(
@@ -541,6 +777,158 @@ describe('WebTerminalClient frame handling & request lifecycle', () => {
         expect(result.data.id).toBe('pty-spawn-1')
         expect(result.data.claim).toBe('issued-claim-64-hex')
       }
+      client.dispose()
+    })
+
+    it('resumes with the exact scoped payload, adopts the rotated grant, and delivers replay without spawning', async () => {
+      vi.useFakeTimers()
+      const { client, internals } = makeClient()
+      const received: number[] = []
+      const off = client.onData((terminalId, bytes) => {
+        expect(terminalId).toBe('t1')
+        received.push(...bytes)
+      })
+
+      const result = await client.resume({
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        terminalId: 't1',
+        lastSeq: 7
+      })
+
+      expect(result).toEqual({ success: true, data: resumeGrantData })
+      const resumeRequest = findSentRequest(internals.socket, 'resume')
+      expect(resumeRequest?.payload).toEqual({
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        terminalId: 't1',
+        lastSeq: 7
+      })
+      expect(findSentRequest(internals.socket, 'spawn')).toBeUndefined()
+      expect(findSentRequest(internals.socket, 'attach')).toBeUndefined()
+      expect(new TextDecoder().decode(Uint8Array.from(received))).toBe('replay-ok')
+      expect(internals.trackers.get('t1')).toMatchObject({
+        claim: 'resume-claim-rotated',
+        lastSeq: 12,
+        refCount: 0,
+        streamAttached: true,
+        disconnected: false,
+        exited: false
+      })
+
+      off()
+      client.dispose()
+    })
+
+    it('collapses a denied resume to generic UNAUTHORIZED and drops the stale tracker grant', async () => {
+      vi.useFakeTimers()
+      const { client, internals } = makeClient()
+      await client.connect()
+      await client.attach('t1', 'old-claim')
+      resumeReply = 'unauthorized'
+
+      const result = await client.resume({
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        terminalId: 't1',
+        lastSeq: 5
+      })
+
+      expect(result).toEqual({ success: false, error: 'Unauthorized', code: 'UNAUTHORIZED' })
+      expect(internals.trackers.get('t1')).toMatchObject({
+        claim: undefined,
+        refCount: 0,
+        streamAttached: false,
+        disconnected: true,
+        exited: false
+      })
+      expect(findSentRequest(internals.socket, 'resume')?.payload).toEqual({
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        terminalId: 't1',
+        lastSeq: 5
+      })
+      expect(findSentRequest(internals.socket, 'spawn')).toBeUndefined()
+
+      client.dispose()
+    })
+
+    it('rejects a stolen predecessor without erasing the newer resume grant', async () => {
+      vi.useFakeTimers()
+      const { client, internals } = makeClient()
+      await client.resume({
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        terminalId: 't1',
+        lastSeq: 0
+      })
+      attachReply = 'unauthorized'
+
+      const rejected = await client.attachWithCursor('t1', 'stolen-pre-resume-claim', 12)
+
+      expect(rejected).toEqual({ success: false, error: 'Unauthorized', code: 'UNAUTHORIZED' })
+      expect(internals.trackers.get('t1')).toMatchObject({
+        claim: 'resume-claim-rotated',
+        lastSeq: 12,
+        refCount: 0,
+        streamAttached: true,
+        disconnected: false
+      })
+      expect(findSentRequest(internals.socket, 'spawn')).toBeUndefined()
+
+      client.dispose()
+    })
+
+    it('reconnects a mounted resumed terminal from its replay cursor without spawning', async () => {
+      vi.useFakeTimers()
+      const { client, internals } = makeClient()
+      await client.resume({
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        terminalId: 't1',
+        lastSeq: 0
+      })
+      const firstSocket = internals.socket
+
+      const mounted = await client.attach('t1')
+      expect(mounted.success).toBe(true)
+      expect(internals.trackers.get('t1')?.refCount).toBe(1)
+      expect(findSentRequest(firstSocket, 'attach')).toBeUndefined()
+
+      firstSocket.close()
+      await vi.advanceTimersByTimeAsync(600)
+      await Promise.resolve()
+
+      expect(internals.socket).not.toBe(firstSocket)
+      expect(findSentRequest(internals.socket, 'attach')?.payload).toEqual({
+        terminalId: 't1',
+        claim: 'resume-claim-rotated',
+        lastSeq: 12
+      })
+      expect(findSentRequest(internals.socket, 'spawn')).toBeUndefined()
+
+      if (internals.reconnectTimer) {
+        clearTimeout(internals.reconnectTimer)
+        internals.reconnectTimer = null
+      }
+      client.dispose()
+    })
+
+    it('fails closed on a mismatched resume grant without adopting it', async () => {
+      vi.useFakeTimers()
+      const { client, internals } = makeClient()
+      resumeReply = 'invalid'
+
+      const result = await client.resume({
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        terminalId: 't1',
+        lastSeq: 0
+      })
+
+      expect(result.success).toBe(false)
+      if (!result.success) expect(result.code).toBe('NETWORK_ERROR')
+      expect(internals.trackers.get('t1')).toMatchObject({
+        claim: undefined,
+        refCount: 0,
+        streamAttached: false,
+        disconnected: true
+      })
+      expect(findSentRequest(internals.socket, 'spawn')).toBeUndefined()
+
       client.dispose()
     })
 
@@ -624,6 +1012,176 @@ describe('WebTerminalClient frame handling & request lifecycle', () => {
       client.dispose()
     })
 
+    it('close-view detaches output while retaining the claim/cursor for explicit reopen', async () => {
+      vi.useFakeTimers()
+      const { client, internals } = makeClient()
+      await client.connect()
+      await client.attach('t1', 'lease-abc')
+      internals.socket.emit({ type: 'data', terminalId: 't1', seq: 9, data: [65] })
+
+      const closed = await client.closeView('t1')
+      expect(closed.success).toBe(true)
+
+      expect(internals.trackers.get('t1')).toMatchObject({
+        claim: 'lease-abc',
+        lastSeq: 9,
+        refCount: 0,
+        disconnected: false
+      })
+      expect(findSentRequest(internals.socket, 'close_view')?.payload).toEqual({ terminalId: 't1' })
+
+      internals.socket.close()
+      await vi.advanceTimersByTimeAsync(600)
+      expect(internals.socket).toBeNull()
+
+      const reopened = await client.attach('t1')
+      expect(reopened.success).toBe(true)
+      expect(internals.trackers.get('t1')?.claim).toBe('lease-abc')
+      client.dispose()
+    })
+
+    it('terminate is a distinct explicit request; kill is compatibility-only', async () => {
+      vi.useFakeTimers()
+      const { client, internals } = makeClient()
+      await client.connect()
+      await client.attach('t1', 'lease-abc')
+
+      const result = await client.request<void>('terminate', { terminalId: 't1' })
+      expect(result.success).toBe(true)
+      expect(findSentRequest(internals.socket, 'terminate')?.payload).toEqual({ terminalId: 't1' })
+      expect(findSentRequest(internals.socket, 'kill')).toBeUndefined()
+      client.removeTracker('t1')
+      expect(internals.trackers.has('t1')).toBe(false)
+      client.dispose()
+    })
+
+    it('preserves cleanup failure detail and retains only the existing id for retry', async () => {
+      vi.useFakeTimers()
+      const { client, internals } = makeClient()
+      await client.connect()
+      await client.attach('t1', 'lease-abc')
+      terminateReply = 'cleanup-failure'
+
+      const result = await client.request<void>('terminate', { terminalId: 't1' })
+
+      expect(result).toEqual({
+        success: false,
+        code: 'TERMINATE_FAILED',
+        error: JSON.stringify({
+          terminalId: 't1',
+          primaryCode: 'TERMINATE_FAILED',
+          cleanupStage: 'flusher_join'
+        })
+      })
+      expect(internals.trackers.get('t1')).toMatchObject({
+        claim: undefined,
+        refCount: 0,
+        streamAttached: false,
+        disconnected: true,
+        cleanupOnly: true,
+        exited: false
+      })
+      expect(findSentRequest(internals.socket, 'spawn')).toBeUndefined()
+      expect(findSentRequest(internals.socket, 'attach')?.payload.terminalId).toBe('t1')
+      client.dispose()
+    })
+
+    it('retries the retained cleanup id once per action and clears only cleanup-only tracking on success', async () => {
+      vi.useFakeTimers()
+      const { client, internals } = makeClient()
+      await client.connect()
+      internals.trackers.set('unrelated-live-terminal', {
+        lastSeq: 9,
+        exited: false,
+        refCount: 0,
+        streamAttached: false,
+        claim: 'unrelated-memory-claim',
+        disconnected: false,
+        cleanupOnly: false
+      })
+      terminateReply = 'cleanup-failure'
+
+      const failed = await client.request<void>('terminate', {
+        terminalId: 'terminal-cleanup-retry'
+      })
+      expect(failed).toEqual({
+        success: false,
+        code: 'TERMINATE_FAILED',
+        error: JSON.stringify({
+          terminalId: 'terminal-cleanup-retry',
+          primaryCode: 'TERMINATE_FAILED',
+          cleanupStage: 'flusher_join'
+        })
+      })
+      expect(internals.trackers.get('terminal-cleanup-retry')).toMatchObject({
+        cleanupOnly: true,
+        claim: undefined,
+        disconnected: true
+      })
+
+      terminateReply = 'ok'
+      const succeeded = await client.request<void>('terminate', {
+        terminalId: 'terminal-cleanup-retry'
+      })
+      if (succeeded.success) client.removeTracker('terminal-cleanup-retry')
+
+      expect(succeeded).toEqual({ success: true, data: undefined })
+      expect(internals.trackers.has('terminal-cleanup-retry')).toBe(false)
+      expect(internals.trackers.get('unrelated-live-terminal')).toMatchObject({
+        claim: 'unrelated-memory-claim',
+        cleanupOnly: false
+      })
+      const sentTypes = internals.socket.sent.map(
+        (raw) => JSON.parse(raw) as { type: string; payload: { terminalId?: string } }
+      )
+      expect(
+        sentTypes.filter(
+          (frame) =>
+            frame.type === 'terminate' && frame.payload.terminalId === 'terminal-cleanup-retry'
+        )
+      ).toHaveLength(2)
+      expect(sentTypes.some((frame) => frame.type === 'spawn')).toBe(false)
+      expect(sentTypes.some((frame) => frame.type === 'attach')).toBe(false)
+
+      client.dispose()
+    })
+
+    it('retains compound rollback terminal identity without attach, reconnect, or respawn', async () => {
+      vi.useFakeTimers()
+      const { client, internals } = makeClient()
+      spawnReply = 'compound-failure'
+
+      const result = await client.request('spawn', {
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        cwdSource: 'workspace',
+        cols: 80,
+        rows: 24
+      })
+
+      expect(result).toEqual({
+        success: false,
+        code: 'TERMINAL_RESOURCE_ROLLBACK_FAILED',
+        error: JSON.stringify({
+          terminalId: 'terminal-recoverable-1',
+          primaryCode: 'CONVERSATION_DURABILITY_FAILED',
+          cleanupStage: 'kill'
+        })
+      })
+      expect(internals.trackers.get('terminal-recoverable-1')).toMatchObject({
+        claim: undefined,
+        refCount: 0,
+        streamAttached: false,
+        disconnected: true,
+        cleanupOnly: true,
+        exited: false
+      })
+      const sentTypes = internals.socket.sent.map(
+        (raw) => (JSON.parse(raw) as { type: string }).type
+      )
+      expect(sentTypes).toEqual(['spawn'])
+      client.dispose()
+    })
+
     it('reconnect re-attaches terminals with a stored claim only', async () => {
       vi.useFakeTimers()
       const { client, internals } = makeClient()
@@ -632,7 +1190,14 @@ describe('WebTerminalClient frame handling & request lifecycle', () => {
       // t1 holds a lease; t3 does not (e.g. a cross-client record without a
       // credential).
       await client.attach('t1', 'lease-abc')
-      internals.trackers.set('t3', { lastSeq: 0, exited: false, refCount: 0, disconnected: false })
+      internals.trackers.set('t3', {
+        lastSeq: 0,
+        exited: false,
+        refCount: 1,
+        streamAttached: false,
+        disconnected: false,
+        cleanupOnly: false
+      })
 
       internals.socket.close()
       await vi.advanceTimersByTimeAsync(600)

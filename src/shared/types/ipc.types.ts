@@ -1,10 +1,75 @@
 // IPC Result pattern from architecture.md
 import type { AcpCatalog } from './acp-catalog.types'
+import type { ConversationId, ConversationRecordV2 } from './conversation.types'
+import type {
+  ConversationHostStatus,
+  ConversationOpenOutcome,
+  LegacyConversationKey,
+  LegacyConversationResolution
+} from './conversation-api.types'
+import type {
+  ConversationLifecycleOutcome,
+  ConversationReplacementRequest
+} from './conversation-lifecycle.types'
+import type {
+  RecoveryActionResult,
+  ResolveRecoveryItemRequest
+} from './conversation-recovery.types'
+import type {
+  SessionWorkspaceLoadOutcome,
+  SessionWorkspaceV1,
+  SessionWorkspaceWriteOutcome
+} from './session-workspace.types'
+import type { ConversationHistoryPageV1, GetSessionPayloadPageRequest } from './web-protocol.types'
 import type { WorkspaceManifest, WriteOutcome } from './workspace-manifest.types'
 
 export type IpcResult<T> =
   | { success: true; data: T }
   | { success: false; error: string; code: string }
+
+export type IpcDataDecoder<T> = (value: unknown) => T
+
+/**
+ * Decode the exact runtime-neutral application envelope used by Tauri and HTTP.
+ *
+ * Only `{ success: true, data }` and `{ success: false, error, code }` are accepted. The supplied
+ * domain decoder runs exactly once for success data; valid objects are returned by identity when
+ * the decoder preserves the data identity.
+ */
+export function decodeIpcResult<T>(value: unknown, decodeData: IpcDataDecoder<T>): IpcResult<T> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new TypeError('IPC result must be an object')
+  }
+  const candidate = value as Record<string, unknown>
+  const keys = Object.keys(candidate)
+  if (candidate.success === true) {
+    if (
+      keys.length !== 2 ||
+      !Object.prototype.hasOwnProperty.call(candidate, 'success') ||
+      !Object.prototype.hasOwnProperty.call(candidate, 'data')
+    ) {
+      throw new TypeError('IPC success envelope must contain exactly success and data')
+    }
+    const data = decodeData(candidate.data)
+    return data === candidate.data ? (value as IpcResult<T>) : { success: true, data }
+  }
+  if (candidate.success === false) {
+    if (
+      keys.length !== 3 ||
+      !Object.prototype.hasOwnProperty.call(candidate, 'success') ||
+      !Object.prototype.hasOwnProperty.call(candidate, 'error') ||
+      !Object.prototype.hasOwnProperty.call(candidate, 'code') ||
+      typeof candidate.error !== 'string' ||
+      candidate.error.trim().length === 0 ||
+      typeof candidate.code !== 'string' ||
+      candidate.code.trim().length === 0
+    ) {
+      throw new TypeError('IPC failure envelope must contain exact non-empty error and code')
+    }
+    return value as IpcResult<T>
+  }
+  throw new TypeError('IPC result success must be a boolean discriminator')
+}
 
 // Terminal spawn options
 export interface TerminalSpawnOptions {
@@ -23,13 +88,11 @@ export interface TerminalSpawnOptions {
   /** argv tail; each element is passed as a discrete, unescaped argument. */
   args?: string[]
   /** Descriptive marker for the session type. Defaults to 'shell'. */
-  kind?: 'shell' | 'agent'
-  /**
-   * Project-scoping id. The web/remote terminal server (terminal_ws.rs)
-   * requires a non-empty projectId on every spawn (project-scoped security);
-   * desktop treats it as optional (SpawnOptions.project_id is Option<String>
-   * with #[serde(default)]). Renderers populate it at project-scoped call sites.
-   */
+  kind?: 'shell' | 'agent' | 'ssh'
+  /** Canonical primary ownership/authorization scope. Required for every
+   * durable user terminal; only explicitly ephemeral SSH terminals omit it. */
+  conversationId?: ConversationId
+  /** Optional attribution/filter only. Never terminal ownership. */
   projectId?: string
   // Index signature to satisfy Tauri's InvokeArgs constraint
   [key: string]: unknown
@@ -75,14 +138,84 @@ export interface TerminalAttachResult {
   gap: boolean
 }
 
+/**
+ * Cold-renderer request for a host-authorized, one-time claim rotation.
+ * The narrow request cannot override spawn authority, cwd, argv, or env.
+ */
+export interface TerminalResumeRequest {
+  conversationId: ConversationId
+  terminalId: string
+  lastSeq: number
+}
+
+/**
+ * Authenticated resume handoff. `claim` is response-only and memory-only; it
+ * must never be added to SessionWorkspace or renderer persistence.
+ */
+export interface TerminalResumeGrant {
+  terminal: TerminalAttachResult
+  claim: string
+}
+
 /** CAP-3 rotate response: the fresh credential. */
 export interface RotatedClaim {
   claim: string
 }
 
 // IPC channel definitions
+export type ConversationIpcChannels = {
+  'conversation:host_status': () => IpcResult<ConversationHostStatus>
+  'conversation:list': () => IpcResult<ConversationRecordV2[]>
+  'conversation:get': (conversationId: ConversationId) => IpcResult<ConversationRecordV2>
+  'conversation:open': (conversationId: ConversationId) => IpcResult<ConversationOpenOutcome>
+  'conversation:resolve_legacy_id': (
+    request: LegacyConversationKey
+  ) => IpcResult<LegacyConversationResolution>
+  'conversation:workspace:get': (
+    conversationId: ConversationId
+  ) => IpcResult<SessionWorkspaceLoadOutcome>
+  'conversation:workspace:write': (
+    conversationId: ConversationId,
+    basedRevision: number | null,
+    workspace: SessionWorkspaceV1
+  ) => IpcResult<SessionWorkspaceWriteOutcome>
+  'conversation:recovery:resolve': (
+    request: ResolveRecoveryItemRequest
+  ) => IpcResult<RecoveryActionResult>
+  'conversation:lifecycle:detach': (
+    conversationId: ConversationId,
+    expectedRevision: number
+  ) => IpcResult<ConversationLifecycleOutcome>
+  'conversation:lifecycle:rebind': (
+    conversationId: ConversationId,
+    expectedRevision: number
+  ) => IpcResult<ConversationLifecycleOutcome>
+  'conversation:lifecycle:suspend': (
+    conversationId: ConversationId,
+    expectedRevision: number
+  ) => IpcResult<ConversationLifecycleOutcome>
+  'conversation:lifecycle:replace': (
+    conversationId: ConversationId,
+    request: ConversationReplacementRequest,
+    expectedRevision: number
+  ) => IpcResult<ConversationLifecycleOutcome>
+  'conversation:lifecycle:delete': (
+    conversationId: ConversationId,
+    expectedRevision: number
+  ) => IpcResult<ConversationLifecycleOutcome>
+}
+
+export type AcpHistoryIpcChannels = {
+  /** Compatibility full-payload command; large histories may return paging-required. */
+  'acp:history:get': (sessionId: string) => IpcResult<unknown | null>
+  'acp:history:get_page': (
+    request: GetSessionPayloadPageRequest
+  ) => IpcResult<ConversationHistoryPageV1>
+}
+
 export type TerminalIpcChannels = {
   'terminal:spawn': (options: TerminalSpawnOptions) => IpcResult<SpawnedTerminal>
+  'terminal:resume': (request: TerminalResumeRequest) => IpcResult<TerminalResumeGrant>
   'terminal:attach': (
     terminalId: string,
     claim: string,
@@ -92,6 +225,9 @@ export type TerminalIpcChannels = {
   'terminal:revoke_claim': (terminalId: string, claim: string) => IpcResult<void>
   'terminal:write': (terminalId: string, data: string) => IpcResult<void>
   'terminal:resize': (terminalId: string, cols: number, rows: number) => IpcResult<void>
+  'terminal:close_view': (terminalId: string) => IpcResult<void>
+  'terminal:terminate': (terminalId: string) => IpcResult<void>
+  /** @deprecated compatibility alias for terminal:terminate */
   'terminal:kill': (terminalId: string) => IpcResult<void>
 }
 
@@ -147,6 +283,7 @@ export type AcpInstallIpcChannels = {
 // Terminal data callback — receives binary data as Uint8Array (via Tauri Channel)
 // Previously received string via event emitter; migrated to binary Channel API in ADR-002.2
 export type TerminalDataCallback = (terminalId: string, data: Uint8Array) => void
+export type TerminalScopedDataCallback = (data: Uint8Array) => void
 export type TerminalExitCallback = (terminalId: string, exitCode: number, signal?: number) => void
 export type TerminalCwdChangedCallback = (terminalId: string, cwd: string) => void
 export type TerminalGitBranchChangedCallback = (terminalId: string, branch: string | null) => void
@@ -237,6 +374,12 @@ export interface GitApi {
 export interface TerminalApi {
   spawn: (options?: TerminalSpawnOptions) => Promise<IpcResult<SpawnedTerminal>>
   /**
+   * Resume a passive SessionWorkspace terminal reference without spawning.
+   * The host validates the Conversation scope, rotates a one-time claim, and
+   * replays from `lastSeq`; the returned claim remains renderer-memory-only.
+   */
+  resume: (request: TerminalResumeRequest) => Promise<IpcResult<TerminalResumeGrant>>
+  /**
    * CAP-3: attach to a terminal's output stream with terminalId + claim +
    * lastSeq. Verification is the gate — any failure (unknown terminal,
    * missing/wrong/revoked credential) resolves to the same generic
@@ -253,8 +396,19 @@ export interface TerminalApi {
   revokeClaim: (terminalId: string, claim: string) => Promise<IpcResult<void>>
   write: (terminalId: string, data: string) => Promise<IpcResult<void>>
   resize: (terminalId: string, cols: number, rows: number) => Promise<IpcResult<void>>
+  /** Close/detach the renderer view without destroying the PTY or claim. */
+  closeView: (terminalId: string) => Promise<IpcResult<void>>
+  /** The sole user-facing destructive terminal resource operation. */
+  terminate: (terminalId: string) => Promise<IpcResult<void>>
+  /** @deprecated compatibility alias for terminate. */
   kill: (terminalId: string) => Promise<IpcResult<void>>
   onData: (callback: TerminalDataCallback) => () => void
+  /**
+   * Subscribe to one terminal without delivering unrelated PTY chunks to the
+   * renderer. Optional for third-party/test adapters; callers may fall back to
+   * `onData` filtering.
+   */
+  onDataForTerminal?: (terminalId: string, callback: TerminalScopedDataCallback) => () => void
   onExit: (callback: TerminalExitCallback) => () => void
   onCwdChanged: (callback: TerminalCwdChangedCallback) => () => void
   getCwd: (terminalId: string) => Promise<IpcResult<string | null>>
@@ -273,6 +427,7 @@ export const IpcErrorCodes = {
   SPAWN_FAILED: 'SPAWN_FAILED',
   WRITE_FAILED: 'WRITE_FAILED',
   RESIZE_FAILED: 'RESIZE_FAILED',
+  TERMINATE_FAILED: 'TERMINATE_FAILED',
   KILL_FAILED: 'KILL_FAILED',
   DIALOG_CANCELED: 'DIALOG_CANCELED',
   VALIDATION_ERROR: 'VALIDATION_ERROR',
@@ -492,6 +647,8 @@ export interface RemoteStatus {
   tunnelUrl: string | null
   /** Active provider id while a tunnel is attached. */
   tunnelProvider?: string | null
+  /** Credentialed scan/copy URL. The credential stays in its fragment and is never displayed alone. */
+  accessUrl?: string | null
 }
 
 // Remote terminal server control API

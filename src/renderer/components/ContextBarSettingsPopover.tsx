@@ -34,7 +34,7 @@ export function ContextBarSettingsPopover(): React.JSX.Element {
     <Popover>
       <PopoverTrigger asChild>
         <button
-          className="flex items-center hover:bg-white/10 px-2 py-0.5 rounded cursor-pointer transition-colors"
+          className="flex cursor-pointer items-center rounded px-2 py-0.5 transition-colors hover:bg-muted hover:text-foreground"
           aria-label={t('contextBar.settings')}
         >
           <Settings size={14} />

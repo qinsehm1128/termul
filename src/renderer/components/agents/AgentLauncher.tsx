@@ -1,3 +1,4 @@
+import type { ExecutionTarget, ProjectAttachment } from '@shared/types/conversation.types'
 import type { LastSelectedAgent, PersistedComposerOptions } from '@shared/types/persistence.types'
 import { PersistenceKeys } from '@shared/types/persistence.types'
 import type { Editor } from '@tiptap/core'
@@ -11,7 +12,7 @@ import {
   GitBranch,
   Loader2
 } from 'lucide-react'
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { toast } from 'sonner'
 import {
   emptyPendingLauncherOptions,
@@ -25,8 +26,10 @@ import { AttachmentPreviewGroup } from '@/components/chat/AttachmentPreviewGroup
 import { ComposerPill } from '@/components/chat/ComposerPill'
 import { attachmentToBlock } from '@/components/chat/chat-attachments'
 import {
+  canonicalizeClaudeModelId,
   extractFastModeOption,
   filterDuplicateModeConfigOptions,
+  normalizeSessionConfigOption,
   partitionConfigOptions,
   resolveModelOption
 } from '@/components/chat/chat-input-bar-config'
@@ -44,6 +47,7 @@ import {
 } from '@/components/chat/use-composer-caret-restore'
 import { useComposerMentions } from '@/components/chat/use-composer-mentions'
 import { useOptimisticSelect } from '@/components/chat/use-optimistic-select'
+import { validateExecutionTarget } from '@/components/conversation/ExecutionTargetPicker'
 import { TermulMark } from '@/components/TermulMark'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -83,6 +87,7 @@ import {
 } from '@/lib/agents/supported-acp-agents'
 import { dialogApi, openerApi, persistenceApi } from '@/lib/api'
 import { registerSessionTempFiles } from '@/lib/attachment-temp-cleanup'
+import { resolveConversationSessionId } from '@/lib/conversation-binding'
 import { logFrontendError } from '@/lib/log-api'
 import { platform as osPlatform } from '@/lib/tauri-os'
 import { isLoopbackWebClient } from '@/lib/tauri-runtime'
@@ -99,13 +104,16 @@ import {
   useAcpSession,
   useAcpStore
 } from '@/stores/acp-store'
+import { useConversationStore } from '@/stores/conversation-store'
 import { useActiveProject, useProjectStore } from '@/stores/project-store'
 import { useWorkspaceStore } from '@/stores/workspace-store'
-import type { Worktree } from '@/types/project'
+import type { Project, Worktree } from '@/types/project'
 
 interface AgentLauncherProps {
   paneId: string
   className?: string
+  /** Invoked once with the canonical ConversationId after a successful launch. */
+  onLaunched?: (conversationId: string) => void
 }
 
 const EMPTY_COMMANDS: [] = []
@@ -123,7 +131,43 @@ export function __resetLauncherSelectionCache(): void {
   cachedConfigId = null
 }
 
-export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.JSX.Element {
+function defaultProjectContext(project: Project | undefined): {
+  executionTarget: ExecutionTarget
+  projectAttachment: ProjectAttachment
+} | null {
+  if (!project?.id || !project.path) return null
+  const activeWorktree = project.activeWorktreeId
+    ? project.worktrees?.find((worktree) => worktree.id === project.activeWorktreeId)
+    : undefined
+  return {
+    executionTarget: activeWorktree
+      ? {
+          kind: 'worktree',
+          projectId: project.id,
+          worktreePath: activeWorktree.path,
+          worktreeBranch: activeWorktree.branch
+        }
+      : {
+          kind: 'project_root',
+          projectId: project.id,
+          projectRoot: project.path
+        },
+    projectAttachment: {
+      schemaVersion: 1,
+      projectId: project.id,
+      attachedAtUtc: new Date().toISOString(),
+      projectPathSnapshot: project.path,
+      worktreePath: activeWorktree?.path ?? null,
+      worktreeBranch: activeWorktree?.branch ?? null
+    }
+  }
+}
+
+export function AgentLauncher({
+  paneId,
+  className,
+  onLaunched
+}: AgentLauncherProps): React.JSX.Element {
   const t = useRuntimeTranslation('agents')
   const [prompt, setPrompt] = useState('')
   const [selectedConfigId, setSelectedConfigId] = useState(() => cachedConfigId ?? '')
@@ -151,11 +195,75 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   const mcpTools = useAcpStore((s) => s.mcpTools) ?? EMPTY_MCP_TOOLS
   const loadMcpTools = useAcpStore((s) => s.loadMcpTools)
   const activeProjectId = useProjectStore((s) => s.activeProjectId)
+  const projects = useProjectStore((s) => s.projects)
+  const activeGroupId = useProjectStore((s) => s.activeGroupId)
+  const activeGroup = useProjectStore((s) =>
+    s.activeGroupId ? s.groups.find((group) => group.id === s.activeGroupId) : undefined
+  )
   const activeProject = useActiveProject()
-  const projectLabel = activeProject?.name ?? t('launcher.folderFallback', 'this folder')
-  const projectRoot = activeProjectId ? getDefaultCwdForProject(activeProjectId) : undefined
-  const projectIsGitRepo = Boolean(activeProject?.isGitRepo)
-  const projectGitBranch = activeProject?.gitBranch ?? null
+  const activeConversationId = useConversationStore((state) => state.activeConversationId)
+  const activeConversation = useConversationStore((state) =>
+    activeConversationId ? state.summariesById[activeConversationId] : undefined
+  )
+  const initialProjectContextRef = useRef(
+    activeConversation ? null : defaultProjectContext(activeProject)
+  )
+  const targetContextInitializedRef = useRef(
+    Boolean(activeConversation || initialProjectContextRef.current)
+  )
+  const [executionTarget, setExecutionTarget] = useState<ExecutionTarget>(
+    () =>
+      activeConversation?.executionTarget ??
+      initialProjectContextRef.current?.executionTarget ?? { kind: 'workspace' }
+  )
+  const [projectAttachment, setProjectAttachment] = useState<ProjectAttachment | null>(
+    () =>
+      activeConversation?.projectAttachment ??
+      initialProjectContextRef.current?.projectAttachment ??
+      null
+  )
+  useEffect(() => {
+    if (targetContextInitializedRef.current) return
+    if (activeConversation) {
+      setExecutionTarget(activeConversation.executionTarget)
+      setProjectAttachment(activeConversation.projectAttachment)
+      targetContextInitializedRef.current = true
+      return
+    }
+    const context = defaultProjectContext(activeProject)
+    if (!context) return
+    setExecutionTarget(context.executionTarget)
+    setProjectAttachment(context.projectAttachment)
+    targetContextInitializedRef.current = true
+    console.info(
+      `[agentLauncher.projectContext] defaulted projectId=${context.projectAttachment.projectId} target=${context.executionTarget.kind}`
+    )
+  }, [activeConversation, activeProject])
+  const explicitProjectId = executionTarget.kind === 'workspace' ? null : executionTarget.projectId
+  const conversationProjectId = explicitProjectId ?? projectAttachment?.projectId ?? null
+  const selectedProjectId = conversationProjectId ?? activeProjectId
+  const selectedProject =
+    projects.find((project) => project.id === selectedProjectId) ?? activeProject
+  const activeGroupProjects = activeGroup
+    ? activeGroup.projectIds.flatMap((projectId) => {
+        const project = projects.find((candidate) => candidate.id === projectId)
+        return project && project.isArchived !== true && project.path ? [project] : []
+      })
+    : []
+  const projectLabel =
+    executionTarget.kind === 'workspace'
+      ? t('launcher.workspaceFallback', 'your Conversation workspace')
+      : (selectedProject?.name ?? t('launcher.folderFallback', 'this folder'))
+  const projectRoot = selectedProjectId ? getDefaultCwdForProject(selectedProjectId) : undefined
+  const workspaceSeedCwd = activeConversation?.workspaceCwd ?? projectRoot ?? '/'
+  const targetCwd =
+    executionTarget.kind === 'workspace'
+      ? workspaceSeedCwd
+      : executionTarget.kind === 'project_root'
+        ? executionTarget.projectRoot
+        : executionTarget.worktreePath || projectRoot || workspaceSeedCwd
+  const projectIsGitRepo = Boolean(selectedProject?.isGitRepo)
+  const projectGitBranch = selectedProject?.gitBranch ?? null
   // CAP-2: isolation mode + base-branch picker. Worktree mode requires a git
   // repo; the selector is hidden on non-repo projects. CAP — Web worktree
   // parity: the worktree mutation routes now ship over HTTP (`web/worktree_api.rs`)
@@ -165,7 +273,48 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   // the desktop (always local) and a loopback web client see it; a non-loopback
   // LAN client does not, avoiding a picker that would fail `FORBIDDEN` at launch.
   const canUseWorktree = projectIsGitRepo && isLoopbackWebClient()
-  const [isolationMode, setIsolationMode] = useState<'current' | 'worktree'>('current')
+  const isolationMode = executionTarget.kind === 'worktree' ? 'worktree' : 'current'
+  const setIsolationMode = (mode: 'current' | 'worktree'): void => {
+    if (mode === 'current') {
+      if (selectedProject?.path) {
+        const context = defaultProjectContext({
+          ...selectedProject,
+          activeWorktreeId: undefined
+        })
+        setExecutionTarget({
+          kind: 'project_root',
+          projectId: selectedProject.id,
+          projectRoot: selectedProject.path
+        })
+        setProjectAttachment(context?.projectAttachment ?? null)
+      } else {
+        setExecutionTarget({ kind: 'workspace' })
+        setProjectAttachment(null)
+      }
+      return
+    }
+    const context = defaultProjectContext(selectedProject)
+    setProjectAttachment(context?.projectAttachment ?? null)
+    setExecutionTarget({
+      kind: 'worktree',
+      projectId: selectedProject?.id ?? '',
+      worktreePath: '',
+      worktreeBranch: baseBranch ?? selectedProject?.gitBranch ?? ''
+    })
+  }
+  const setGroupProject = (projectId: string): void => {
+    const project = activeGroupProjects.find((candidate) => candidate.id === projectId)
+    if (!project) return
+    const context = defaultProjectContext(project)
+    if (!context) return
+    setExecutionTarget(context.executionTarget)
+    setProjectAttachment(context.projectAttachment)
+    if (activeGroupId) {
+      useProjectStore.getState().updateGroup(activeGroupId, {
+        preferredProjectId: project.id
+      })
+    }
+  }
   const [baseBranch, setBaseBranch] = useState<string | null>(null)
   const [baseBranchInfo, setBaseBranchInfo] = useState<BaseBranchInfo | null>(null)
   // Local branch names for the base-branch picker (CAP-2). Sourced from
@@ -176,7 +325,7 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   // Skills live at {project.path}/.agents/skills/ which is gitignored and
   // excluded from worktree symlinks, so resolve against the main project root
   // — not the worktree CWD which has no .agents/skills/.
-  const skillsRoot = activeProjectId ? getProjectRootPath(activeProjectId) : undefined
+  const skillsRoot = selectedProjectId ? getProjectRootPath(selectedProjectId) : undefined
   const { skills } = useAgentSkills(skillsRoot)
   const supportedAgents = useResolvedSupportedAcpAgents(acpConfigs)
 
@@ -194,7 +343,7 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   const selectedConfig = selectedEntry?.config ?? null
   const activeConfigId = selectedConfig?.id ?? ''
   const preparedKey =
-    activeConfigId && projectRoot ? prepareChatKey(activeConfigId, projectRoot, undefined) : null
+    activeConfigId && targetCwd ? prepareChatKey(activeConfigId, targetCwd, undefined) : null
   const preparedSessionId = useAcpStore((s) =>
     preparedKey ? (s.preparedSessions[preparedKey] ?? null) : null
   )
@@ -207,7 +356,7 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   // Resolve the live agent for this config+cwd so an auth failure can offer a
   // Sign-in action driven by the agent's advertised method metadata. A Sign-in
   // button is only meaningful when exactly one method is advertised (P6).
-  const reuseKey = activeConfigId && projectRoot ? agentReuseKey(activeConfigId, projectRoot) : null
+  const reuseKey = activeConfigId && targetCwd ? agentReuseKey(activeConfigId, targetCwd) : null
   const liveAgentId = useAcpStore((s) =>
     reuseKey ? (s.configToLiveAgent?.[reuseKey] ?? null) : null
   )
@@ -242,8 +391,8 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
     canDropPaste
   } = useComposerAttachments({ imageCapable, embedCapable, disabled: composerDisabled })
   const { recents: mentionRecents, pushRecent: pushMentionRecent } = useMentionRecents(
-    activeProjectId,
-    projectRoot
+    selectedProjectId ?? '',
+    targetCwd
   )
   const mentions = useComposerMentions({
     rootPath: projectRoot,
@@ -283,7 +432,9 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   const optionsInteractive = Boolean(draftSession || hasCachedOptions)
   const showModelLoading = !prepareError && isPreparing && !draftSession && !hasCachedModels
 
-  const usableConfigOptions = effectiveConfigOptions.filter((o) => o.options.length > 0)
+  const usableConfigOptions = effectiveConfigOptions
+    .map(normalizeSessionConfigOption)
+    .filter((o) => o.options.length > 0)
   const {
     model,
     thoughtLevel,
@@ -303,8 +454,8 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
     return {
       id: 'options-cache-preview',
       agentId: '',
-      cwd: projectRoot ?? '',
-      projectId: activeProjectId ?? '',
+      cwd: targetCwd,
+      projectId: selectedProjectId ?? '',
       status: 'initializing',
       title: null,
       activeTurn: false,
@@ -318,8 +469,8 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   }, [
     draftSession,
     effectiveModes,
-    projectRoot,
-    activeProjectId,
+    targetCwd,
+    selectedProjectId,
     effectiveModels,
     effectiveConfigOptions,
     cachedOptions?.updatedAt
@@ -347,13 +498,15 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   const handleSetConfig = useCallback(
     async (configId: string, valueId: string) => {
       if (!preparedSessionId) {
+        const resolvedValueId =
+          modelOption?.id === configId ? canonicalizeClaudeModelId(valueId) : valueId
         setPendingOptions((prev) => ({
           ...prev,
-          configValues: { ...prev.configValues, [configId]: valueId }
+          configValues: { ...prev.configValues, [configId]: resolvedValueId }
         }))
         if (activeConfigId) {
           persistComposerOptions(activeConfigId, {
-            configValues: { [configId]: valueId }
+            configValues: { [configId]: resolvedValueId }
           })
         }
         return
@@ -369,16 +522,17 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
         throw err
       }
     },
-    [preparedSessionId, activeConfigId, t]
+    [preparedSessionId, activeConfigId, modelOption?.id, t]
   )
 
   const handleSetModel = useCallback(
     async (valueId: string) => {
       if (!preparedSessionId) {
+        const resolvedModelId = canonicalizeClaudeModelId(valueId)
         if (modelSource === 'models') {
-          setPendingOptions((prev) => ({ ...prev, modelId: valueId }))
+          setPendingOptions((prev) => ({ ...prev, modelId: resolvedModelId }))
           if (activeConfigId) {
-            persistComposerOptions(activeConfigId, { modelId: valueId })
+            persistComposerOptions(activeConfigId, { modelId: resolvedModelId })
           }
           return
         }
@@ -389,13 +543,13 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
         }
         setPendingOptions((prev) => ({
           ...prev,
-          modelId: valueId,
-          configValues: { ...prev.configValues, [modelOption.id]: valueId }
+          modelId: resolvedModelId,
+          configValues: { ...prev.configValues, [modelOption.id]: resolvedModelId }
         }))
         if (activeConfigId) {
           persistComposerOptions(activeConfigId, {
-            modelId: valueId,
-            configValues: { [modelOption.id]: valueId }
+            modelId: resolvedModelId,
+            configValues: { [modelOption.id]: resolvedModelId }
           })
         }
         return
@@ -518,10 +672,11 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
         if (saved.configValues) {
           for (const [cid, vid] of Object.entries(saved.configValues)) {
             const opt = effectiveConfigOptions.find((o) => o.id === cid)
+            const resolvedVid = opt?.category === 'model' ? canonicalizeClaudeModelId(vid) : vid
             // Drop the value when the option is missing OR the value is no
             // longer in the option's advertised values.
-            if (opt && opt.options.some((o) => o.value === vid)) {
-              configValues[cid] = vid
+            if (opt && opt.options.some((o) => o.value === resolvedVid)) {
+              configValues[cid] = resolvedVid
             } else {
               void logFrontendError({
                 level: 'warn',
@@ -531,7 +686,7 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
             }
           }
         }
-        let modelId = saved.modelId
+        let modelId = saved.modelId ? canonicalizeClaudeModelId(saved.modelId) : saved.modelId
         if (modelId) {
           const modelOpt = resolveModelOption(
             partitionConfigOptions(effectiveConfigOptions).model,
@@ -560,18 +715,8 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
         if (modelId || modeId || Object.keys(configValues).length > 0) {
           setPendingOptions({ modelId, modeId, configValues })
         }
-        if (saved.isolationMode === 'worktree' && canUseWorktree && saved.baseBranch) {
-          setIsolationMode('worktree')
-          if (
-            branches.length > 0 &&
-            !branches.includes(saved.baseBranch) &&
-            baseBranchInfo?.defaultBase
-          ) {
-            setBaseBranch(baseBranchInfo.defaultBase)
-          } else {
-            setBaseBranch(saved.baseBranch)
-          }
-        }
+        // Execution targets are always chosen explicitly for each new Conversation.
+        // Persisted composer preferences never retarget the independent workspace.
       } catch {
         // Best-effort — silent failure, launcher shows agent defaults.
       }
@@ -688,7 +833,7 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   }, [isolationMode, baseBranch, branches, baseBranchInfo])
 
   useEffect(() => {
-    if (!activeConfigId || !projectRoot || selectedEntry?.status !== 'ready' || !selectedConfig)
+    if (!activeConfigId || !targetCwd || selectedEntry?.status !== 'ready' || !selectedConfig)
       return
     let cancelled = false
     void (async () => {
@@ -703,7 +848,7 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
         // old launcher-scoped prepareChat — we do NOT cancel on close (a warm
         // session stays ready for the next chat / a project switch-back).
         useAcpStore.getState().setSelectedAgentConfigId(activeConfigId)
-        useAcpStore.getState().retargetWarmPool(activeConfigId, projectRoot, activeProjectId)
+        useAcpStore.getState().retargetWarmPool(activeConfigId, targetCwd, selectedProjectId ?? '')
       } catch (err) {
         console.warn('[acp] failed to retarget warm pool for', activeConfigId, err)
       }
@@ -714,11 +859,11 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   }, [
     activeConfigId,
     acpConfigs,
-    projectRoot,
+    targetCwd,
     saveAgentConfig,
     selectedConfig,
     selectedEntry?.status,
-    activeProjectId
+    selectedProjectId
   ])
 
   const handleSelectAgent = useCallback(
@@ -735,13 +880,13 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
       // Reset worktree isolation + base branch; the restore effect on
       // `[activeConfigId]` will re-seed them from the persisted record for
       // the new agent (or leave them at 'current'/null if no record exists).
-      setIsolationMode('current')
+      if (executionTarget.kind === 'worktree') setExecutionTarget({ kind: 'workspace' })
       setBaseBranch(null)
       setSelectedConfigId(entry.configId)
       persistSelection(entry.configId)
       editorRef.current?.commands.focus(undefined, { scrollIntoView: false })
     },
-    [persistSelection, selectedConfigId]
+    [executionTarget.kind, persistSelection, selectedConfigId]
   )
 
   const handleInstallAgent = useCallback(
@@ -826,11 +971,11 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   )
 
   const handleRetryPrepare = useCallback(() => {
-    if (!activeConfigId || !projectRoot || !preparedKey) return
+    if (!activeConfigId || !targetCwd || !preparedKey) return
     const store = useAcpStore.getState()
     store.cancelPreparedChat(preparedKey)
-    store.prepareChat(activeConfigId, projectRoot, undefined, activeProjectId)
-  }, [activeConfigId, preparedKey, projectRoot, activeProjectId])
+    store.prepareChat(activeConfigId, targetCwd, undefined, selectedProjectId ?? '')
+  }, [activeConfigId, preparedKey, targetCwd, selectedProjectId])
 
   // Run the agent-advertised authenticate for a chosen method, then re-prepare
   // so the session is created now that the provider login is complete. The
@@ -901,8 +1046,9 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   }, [preparedSessionId, pendingOptions, t])
 
   const launch = useCallback(async () => {
-    if (!activeProjectId || !projectRoot) {
-      toast.error(t('launcher.errors.noProject', 'No active project'))
+    const targetError = validateExecutionTarget(executionTarget)
+    if (targetError) {
+      toast.error(t(`launcher.errors.${targetError}`, 'Select a valid execution target'))
       return
     }
     if (!selectedConfig || selectedEntry?.status !== 'ready' || launchInFlightRef.current) return
@@ -914,11 +1060,16 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
     const modelsSnapshot = effectiveModels
     const modesSnapshot = effectiveModes
     const configOptionsSnapshot = effectiveConfigOptions
-    const preparedKeySnapshot = preparedKey
     const configSnapshot = selectedConfig
     const paneSnapshot = paneId
-    const projectIdSnapshot = activeProjectId
-    const projectRootSnapshot = projectRoot
+    const projectIdSnapshot = conversationProjectId ?? ''
+    const projectRootSnapshot = projectRoot ?? ''
+    const targetSnapshot = executionTarget
+    const attachmentSnapshot =
+      projectAttachment ??
+      (targetSnapshot.kind === 'workspace'
+        ? null
+        : (defaultProjectContext(selectedProject)?.projectAttachment ?? null))
     const needsSave = !acpConfigs.some((config) => config.id === selectedConfig.id)
 
     // Build the wire text (skills framed by path under `# Agent Skills`, then
@@ -947,10 +1098,21 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
     // BEFORE opening the chat placeholder so the agent's cwd is the worktree
     // path from the first turn. Branch is `chat/{id}` (deterministic, id-scoped
     // — collision-retry-friendly). Collision-retry appends `-2` once.
-    let worktreePath: string | undefined
-    let worktreeBranch: string | undefined
-    let launchCwd = projectRootSnapshot
-    if (isolationMode === 'worktree' && canUseWorktree) {
+    let worktreePath: string | undefined =
+      targetSnapshot.kind === 'worktree' && targetSnapshot.worktreePath
+        ? targetSnapshot.worktreePath
+        : undefined
+    let worktreeBranch: string | undefined =
+      targetSnapshot.kind === 'worktree' ? targetSnapshot.worktreeBranch : undefined
+    let launchCwd = targetCwd
+    let finalExecutionTarget: ExecutionTarget = targetSnapshot
+    let finalProjectAttachment = attachmentSnapshot
+    if (targetSnapshot.kind === 'worktree' && !worktreePath) {
+      if (!canUseWorktree || !projectRootSnapshot) {
+        toast.error(t('launcher.errors.projectRootRequired', 'Select a Git project'))
+        launchInFlightRef.current = false
+        return
+      }
       if (!baseBranch) {
         toast.error(t('launcher.errors.pickBase', 'Pick a base branch for the worktree'))
         launchInFlightRef.current = false
@@ -1028,6 +1190,19 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
           worktreePath = worktreePathResult
           worktreeBranch = worktreeBranchResult
           launchCwd = worktreePathResult
+          finalExecutionTarget = {
+            kind: 'worktree',
+            projectId: projectIdSnapshot,
+            worktreePath: worktreePathResult,
+            worktreeBranch: worktreeBranchResult
+          }
+          if (attachmentSnapshot) {
+            finalProjectAttachment = {
+              ...attachmentSnapshot,
+              worktreePath: worktreePathResult,
+              worktreeBranch: worktreeBranchResult
+            }
+          }
           // CAP-5: carry over untracked files listed in `.worktree-include`.
           // Symlink/path-escape/already-present defenses run on the host.
           // Best-effort: a copy failure must not orphan the freshly created
@@ -1114,14 +1289,11 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
       setWorktreeCreating(false)
     }
 
-    // Open the chat immediately; ACP spawn/session/send continue in the chat view.
+    // The placeholder is renderer-only. Durable navigation waits for the canonical
+    // ConversationId returned by the facade; opaque ACP SessionId never becomes a tab key.
     const store = useAcpStore.getState()
-    let sessionId =
-      preparedKeySnapshot != null && isolationMode !== 'worktree'
-        ? store.claimPreparedChat(preparedKeySnapshot, projectIdSnapshot)
-        : null
-    let usedPlaceholder = false
-    let seededOptimistic = false
+    let sessionId: string | null = null
+    const usedPlaceholder = true
 
     // Sync first-turn content so the chat can paint like a normal send. The
     // optimistic syncBlocks carry the DISPLAY (token) text so the timeline
@@ -1134,31 +1306,18 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
     } else if (syncTrimmed.length > 0) {
       syncBlocks.push({ type: 'text', text: displayWithCommand })
     }
+    const seededOptimistic = syncBlocks.length > 0
 
-    if (!sessionId) {
-      sessionId = store.createLaunchPlaceholder({
-        cwd: launchCwd,
-        projectId: projectIdSnapshot,
-        models: modelsSnapshot,
-        modes: modesSnapshot,
-        configOptions: configOptionsSnapshot,
-        initialUserBlocks: syncBlocks.length > 0 ? syncBlocks : undefined,
-        worktreePath,
-        worktreeBranch
-      })
-      usedPlaceholder = true
-      seededOptimistic = syncBlocks.length > 0
-    } else if (syncBlocks.length > 0) {
-      store.seedLaunchUserMessage(sessionId, syncBlocks)
-      seededOptimistic = true
-    }
-    useWorkspaceStore.getState().addAgentChatTab(sessionId, paneSnapshot)
-    useWorkspaceStore.getState().hideAgentLauncher()
-    setPendingOptions(emptyPendingLauncherOptions())
-    skillPathsRef.current = {}
-    clearAttachments()
-    resetMentions()
-    setPrompt('')
+    sessionId = store.createLaunchPlaceholder({
+      cwd: launchCwd,
+      projectId: projectIdSnapshot,
+      models: modelsSnapshot,
+      modes: modesSnapshot,
+      configOptions: configOptionsSnapshot,
+      initialUserBlocks: syncBlocks.length > 0 ? syncBlocks : undefined,
+      worktreePath,
+      worktreeBranch
+    })
 
     void (async () => {
       try {
@@ -1172,7 +1331,9 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
         // running-chatbox changes; this catches the pre-launch pending
         // options that never went through a store setter (no prepared session).
         persistComposerOptions(configSnapshot.id, {
-          modelId: pendingSnapshot.modelId,
+          modelId: pendingSnapshot.modelId
+            ? canonicalizeClaudeModelId(pendingSnapshot.modelId)
+            : pendingSnapshot.modelId,
           modeId: pendingSnapshot.modeId,
           configValues:
             Object.keys(pendingSnapshot.configValues).length > 0
@@ -1194,7 +1355,73 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
         }
 
         const liveStore = useAcpStore.getState()
+        let handedOffConversationId: string | null = null
+        const completeCanonicalHandoff = (realSessionId: string): void => {
+          const canonicalConversationId =
+            useAcpStore.getState().sessions[realSessionId]?.conversationId ?? activeConversationId
+          if (!canonicalConversationId) {
+            throw new Error('CONVERSATION_CREATE_FAILED: canonical ConversationId missing')
+          }
+          if (handedOffConversationId === canonicalConversationId) return
+          handedOffConversationId = canonicalConversationId
+          onLaunched?.(canonicalConversationId)
+          useWorkspaceStore.getState().addAgentChatTab(canonicalConversationId, paneSnapshot)
+          useWorkspaceStore.getState().hideAgentLauncher()
+          setPendingOptions(emptyPendingLauncherOptions())
+          skillPathsRef.current = {}
+          clearAttachments()
+          resetMentions()
+          setPrompt('')
+          registerSessionTempFiles(realSessionId, appOwnedPaths)
+          console.info(
+            `[agentLauncher.launch] conversationId=${canonicalConversationId} target=${finalExecutionTarget.kind}${projectIdSnapshot ? ` projectId=${projectIdSnapshot}` : ''}`
+          )
+        }
+
         let realId = sessionId
+        const existingSessionId = activeConversationId
+          ? resolveConversationSessionId(liveStore, activeConversationId)
+          : null
+        const retryableConversationId =
+          activeConversationId &&
+          (activeConversation?.lifecycleState === 'allocating_workspace' ||
+            activeConversation?.lifecycleState === 'initializing_agent' ||
+            activeConversation?.lifecycleState === 'agent_failed')
+            ? activeConversationId
+            : undefined
+        if (existingSessionId) {
+          const live = liveStore.sessions[existingSessionId]
+          if (live && live.status !== 'closed') {
+            liveStore.discardLaunchPlaceholder(sessionId)
+            await liveStore.applyPendingLauncherOptions(
+              existingSessionId,
+              hasPendingLauncherOptions(pendingSnapshot) ? pendingSnapshot : null
+            )
+            if (blocks.length > 0) {
+              await liveStore.sendPromptBlocks(existingSessionId, blocks)
+            }
+            liveStore.clearLaunchingSession(existingSessionId)
+            completeCanonicalHandoff(existingSessionId)
+            return
+          }
+          if (!live || live.status === 'closed') {
+            await liveStore.openHistorySession(existingSessionId)
+          }
+          const afterOpen = useAcpStore.getState().sessions[existingSessionId]
+          if (afterOpen && afterOpen.status !== 'closed') {
+            liveStore.discardLaunchPlaceholder(sessionId)
+            await liveStore.applyPendingLauncherOptions(
+              existingSessionId,
+              hasPendingLauncherOptions(pendingSnapshot) ? pendingSnapshot : null
+            )
+            if (blocks.length > 0) {
+              await liveStore.sendPromptBlocks(existingSessionId, blocks)
+            }
+            liveStore.clearLaunchingSession(existingSessionId)
+            completeCanonicalHandoff(existingSessionId)
+            return
+          }
+        }
         if (usedPlaceholder) {
           realId = await liveStore.finalizeChatLaunch({
             placeholderId: sessionId,
@@ -1205,11 +1432,14 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
             pending: hasPendingLauncherOptions(pendingSnapshot) ? pendingSnapshot : null,
             initialText: null,
             initialBlocks: blocks.length > 0 ? blocks : null,
-            adoptSession: (from, to) => {
-              useWorkspaceStore.getState().remapAgentChatSession(from, to, paneSnapshot)
+            adoptSession: (_placeholderId, realSessionId) => {
+              completeCanonicalHandoff(realSessionId)
             },
             worktreePath,
-            worktreeBranch
+            worktreeBranch,
+            conversationId: retryableConversationId ?? activeConversationId ?? undefined,
+            projectAttachment: finalProjectAttachment ?? undefined,
+            executionTarget: finalExecutionTarget
           })
         } else {
           await liveStore.applyPendingLauncherOptions(
@@ -1223,7 +1453,7 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
           }
           liveStore.clearLaunchingSession(realId)
         }
-        registerSessionTempFiles(realId, appOwnedPaths)
+        completeCanonicalHandoff(realId)
       } catch (err) {
         toast.error(
           err instanceof Error
@@ -1235,8 +1465,12 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
       }
     })()
   }, [
-    activeProjectId,
+    executionTarget,
+    projectAttachment,
     projectRoot,
+    conversationProjectId,
+    targetCwd,
+    selectedProject,
     selectedConfig,
     selectedEntry?.status,
     acpConfigs,
@@ -1248,7 +1482,6 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
     appOwnedTempPaths,
     resetMentions,
     pendingOptions,
-    preparedKey,
     effectiveModels,
     effectiveModes,
     effectiveConfigOptions,
@@ -1257,6 +1490,9 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
     isolationMode,
     canUseWorktree,
     baseBranch,
+    onLaunched,
+    activeConversationId,
+    activeConversation?.lifecycleState,
     t
   ])
 
@@ -1297,6 +1533,7 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
   const canLaunch =
     Boolean(selectedConfig) &&
     selectedEntry?.status === 'ready' &&
+    validateExecutionTarget(executionTarget) === null &&
     (prompt.trim().length > 0 || attachments.length > 0) &&
     // CAP-2: worktree mode requires an explicit base branch before launch —
     // covers detached HEAD (no current) and any case where the picker has
@@ -1336,12 +1573,14 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
         className
       )}
     >
-      <div className="mb-8 flex w-full flex-col items-center gap-4 text-center">
-        <TermulMark size={48} className="text-foreground" />
-        <h1 className="break-words text-3xl font-medium tracking-tight text-foreground md:text-4xl">
-          {t('launcher.heading', 'What should we do in {{project}}?', { project: projectLabel })}
-        </h1>
-      </div>
+      {!activeConversation && (
+        <div className="mb-8 flex w-full flex-col items-center gap-4 text-center">
+          <TermulMark size={48} className="text-foreground" />
+          <h1 className="break-words text-3xl font-medium tracking-tight text-foreground md:text-4xl">
+            {t('launcher.heading', 'What should we do in {{project}}?', { project: projectLabel })}
+          </h1>
+        </div>
+      )}
 
       <div className="flex min-w-0 w-full max-w-4xl flex-col gap-4">
         <div className="relative">
@@ -1455,7 +1694,7 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
                 placeholder={
                   hasCommandToken
                     ? t('launcher.optionalMessage', 'Add a message (optional)…')
-                    : t('launcher.prompt', 'Ask anything.. (@ for files, / for commands)')
+                    : t('launcher.prompt', 'Ask anything… (@ for files, / for commands)')
                 }
                 ariaLabel={t('launcher.promptAria', 'Agent prompt')}
                 autoFocus
@@ -1483,10 +1722,21 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
                   onToggle={(id, enabled) => {
                     void setMcpServerEnabled(id, enabled)
                       .then(() => {
-                        if (!preparedKey || !activeConfigId || !projectRoot) return
+                        // The launcher pre-warms a `session/new` keyed without
+                        // MCP servers; createSession resolved the MCP set from
+                        // the registry AT pre-warm time. A toggle changes that
+                        // registry, so the warm session now holds a stale MCP
+                        // selection. Cancel + re-prepare so the next launch
+                        // resolves MCP from the updated registry.
+                        if (!preparedKey || !activeConfigId || !targetCwd) return
                         const store = useAcpStore.getState()
                         store.cancelPreparedChat(preparedKey)
-                        store.prepareChat(activeConfigId, projectRoot, undefined, activeProjectId)
+                        store.prepareChat(
+                          activeConfigId,
+                          targetCwd,
+                          undefined,
+                          selectedProjectId ?? ''
+                        )
                       })
                       .catch(() => {
                         toast.error(
@@ -1585,6 +1835,25 @@ export function AgentLauncher({ paneId, className }: AgentLauncherProps): React.
               data-agent-launcher-context-strip="true"
               className="relative z-0 mx-auto -mt-4 flex w-[calc(100%-2.75rem)] min-w-0 items-center justify-between gap-2 rounded-b-2xl border border-t-0 border-border/60 bg-card/60 px-2 pb-1 pt-5"
             >
+              {!activeConversation && activeGroupProjects.length > 1 && (
+                <Select value={selectedProjectId ?? ''} onValueChange={setGroupProject}>
+                  <SelectTrigger
+                    aria-label={t('launcher.projectRoot', 'Project root')}
+                    className="h-7 min-h-7 min-w-0 max-w-44 shrink gap-1.5 border-0 bg-transparent px-2.5 py-0 text-xs font-medium text-muted-foreground/70 hover:bg-accent/40 hover:text-foreground/80 focus:outline-none focus:ring-0 focus:ring-offset-0 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 data-[state=open]:bg-accent/40 [&>svg]:h-3.5 [&>svg]:w-3.5 [&>svg]:opacity-70"
+                  >
+                    <Folder className="size-3.5 shrink-0" />
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {activeGroupProjects.map((project) => (
+                      <SelectItem key={project.id} value={project.id}>
+                        {project.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
+
               <Select
                 value={isolationMode}
                 onValueChange={(value) =>
@@ -2032,7 +2301,7 @@ function AcpModelPicker({
   const filteredModels =
     modelOption?.options.filter((value) => {
       if (!normalizedQuery) return true
-      return [value.name, value.value, value.description ?? '']
+      return [value.name, value.value, value.description ?? '', value.group ?? '']
         .join(' ')
         .toLowerCase()
         .includes(normalizedQuery)
@@ -2103,32 +2372,42 @@ function AcpModelPicker({
             )}
             <div data-testid="acp-model-options" className="max-h-[180px] overflow-y-auto pr-1">
               {filteredModels.length > 0 ? (
-                filteredModels.map((value) => (
-                  <button
-                    key={value.value}
-                    type="button"
-                    onPointerDown={(event) => {
-                      if ((event.button ?? 0) !== 0) return
-                      event.preventDefault()
-                      handleSelectModel(value.value)
-                    }}
-                    onClick={() => handleSelectModel(value.value)}
-                    className={cn(
-                      'flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left text-sm text-foreground transition-colors hover:bg-accent hover:text-accent-foreground',
-                      value.value === displayValue && 'bg-accent text-accent-foreground'
-                    )}
-                  >
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate font-medium">{value.name}</span>
-                      {value.description && (
-                        <span className="block text-xs opacity-70">{value.description}</span>
+                filteredModels.map((value, index) => {
+                  const prevGroup = filteredModels[index - 1]?.group
+                  const showGroup = Boolean(value.group && value.group !== prevGroup)
+                  return (
+                    <Fragment key={value.value}>
+                      {showGroup && (
+                        <div className="label-group px-2 py-1 text-muted-foreground">
+                          {value.group}
+                        </div>
                       )}
-                    </span>
-                    {value.value === displayValue && (
-                      <Check size={14} className="mt-0.5 text-muted-foreground" />
-                    )}
-                  </button>
-                ))
+                      <button
+                        type="button"
+                        onPointerDown={(event) => {
+                          if ((event.button ?? 0) !== 0) return
+                          event.preventDefault()
+                          handleSelectModel(value.value)
+                        }}
+                        onClick={() => handleSelectModel(value.value)}
+                        className={cn(
+                          'flex w-full items-start gap-2 rounded-md px-2 py-1.5 text-left text-sm text-foreground transition-colors hover:bg-accent hover:text-accent-foreground',
+                          value.value === displayValue && 'bg-accent text-accent-foreground'
+                        )}
+                      >
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate font-medium">{value.name}</span>
+                          {value.description && (
+                            <span className="block text-xs opacity-70">{value.description}</span>
+                          )}
+                        </span>
+                        {value.value === displayValue && (
+                          <Check size={14} className="mt-0.5 text-muted-foreground" />
+                        )}
+                      </button>
+                    </Fragment>
+                  )
+                })
               ) : (
                 <div className="px-2 py-1.5 text-xs text-muted-foreground">
                   {t('launcher.noModels', 'No matching models.')}

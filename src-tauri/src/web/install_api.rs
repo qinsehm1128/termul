@@ -21,18 +21,11 @@
 //! AND app-level failures (mirrors `catalog_api.rs`); only transport/parse
 //! failures become non-200 (renderer maps to `NETWORK_ERROR`).
 
-use axum::{
-    body::Bytes,
-    extract::{ConnectInfo, State},
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
-use std::net::SocketAddr;
-use tracing::{info, warn};
+use axum::{body::Bytes, extract::State, http::StatusCode, response::IntoResponse, Json};
 
 use crate::acp::install::{code, InstallOutcome, InstallRequest};
-use crate::web::fs_api::{check_local_only, IpcBody};
+use crate::web::auth::IngressProvenance;
+use crate::web::fs_api::IpcBody;
 use crate::web::ws::AppState;
 
 /// `POST /acp/install` — install a catalog agent.
@@ -51,21 +44,22 @@ use crate::web::ws::AppState;
 /// reach it. Mirrors the fs/git/workspace write routes' `check_local_only`.
 pub async fn install(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     body: Bytes,
 ) -> impl IntoResponse {
-    if let Some(forbidden) = check_local_only::<InstallOutcome>(peer) {
-        return (StatusCode::OK, Json(forbidden));
+    if let Err(denial) = crate::web::operation_policy::authorize_local_only(
+        provenance,
+        crate::web::operation_policy::LocalOnlyOperation::InstallAcpAgent,
+    ) {
+        return (
+            StatusCode::OK,
+            Json(IpcBody::<InstallOutcome>::err(denial.message, denial.code)),
+        );
     }
     let req: InstallRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,
         Err(error) => {
-            warn!(
-                target: "termul::web::install_api",
-                session = crate::logging::session_id(),
-                error = %error,
-                "install: payload validation failed (deny_unknown_fields or malformed JSON)"
-            );
+            log::warn!(target: "termul::web::install_api", "operation=install_validate stable_code=VALIDATION_ERROR");
             return (
                 StatusCode::OK,
                 Json(IpcBody::<InstallOutcome>::err(
@@ -86,24 +80,12 @@ pub async fn install(
     };
     match service.install_by_id(&req.agent_id).await {
         Ok(outcome) => {
-            info!(
-                target: "termul::web::install_api",
-                session = crate::logging::session_id(),
-                agent = %req.agent_id,
-                "install: success"
-            );
+            log::info!(target: "termul::web::install_api", "operation=install stable_code=OK");
             (StatusCode::OK, Json(IpcBody::ok(outcome)))
         }
         Err(error) => {
             let code = error.code();
-            warn!(
-                target: "termul::web::install_api",
-                session = crate::logging::session_id(),
-                agent = %req.agent_id,
-                code,
-                msg = %error.message,
-                "install: failure"
-            );
+            log::warn!(target: "termul::web::install_api", "operation=install stable_code={}", code);
             (
                 StatusCode::OK,
                 Json(IpcBody::<InstallOutcome>::err(error.message, code)),
@@ -115,8 +97,8 @@ pub async fn install(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::AcpCatalogService;
     use crate::acp::install::AcpInstallService;
+    use crate::acp::AcpCatalogService;
     use crate::web::ws::HistoryMode;
     use axum::body::Body;
     use axum::extract::ConnectInfo;
@@ -139,6 +121,7 @@ mod tests {
             .uri("/acp/install")
             .header("content-type", "application/json")
             .extension(ConnectInfo(loopback_peer()))
+            .extension(IngressProvenance::LocalOperator)
             .body(Body::from(body.to_vec()))
             .expect("build request")
     }
@@ -188,6 +171,7 @@ mod tests {
             registry_persistence: None,
             projects_file: None,
             history_mode: HistoryMode::LiveOnly,
+            conversation: None,
             project_root: Arc::new(parking_lot::RwLock::new(std::env::temp_dir())),
             workspace_manifest: None,
             acp_catalog: None,
@@ -210,6 +194,7 @@ mod tests {
             registry_persistence: None,
             projects_file: None,
             history_mode: HistoryMode::LiveOnly,
+            conversation: None,
             project_root: Arc::new(parking_lot::RwLock::new(std::env::temp_dir())),
             workspace_manifest: None,
             acp_catalog: None,
@@ -260,6 +245,7 @@ mod tests {
                     .uri("/acp/install")
                     .header("content-type", "application/json")
                     .extension(ConnectInfo(SocketAddr::from(([10, 0, 0, 5], 54321))))
+                    .extension(IngressProvenance::PublicTunnel)
                     .body(Body::from(br#"{"agentId":"opencode"}"#.to_vec()))
                     .expect("build request"),
             )
