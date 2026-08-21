@@ -107,6 +107,13 @@ impl BindingMissCache {
             }
         }
     }
+
+    fn invalidate_session(&mut self, agent_session_id: &str) {
+        self.entries
+            .retain(|key| key.agent_session_id != agent_session_id);
+        self.order
+            .retain(|key| key.agent_session_id != agent_session_id);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,17 +155,23 @@ impl ConversationPersistenceAdapter {
             .synchronize_generation(generation);
     }
 
-    pub fn register_binding(&self, _agent_session_id: &str, conversation_id: ConversationId) {
+    pub fn register_binding(&self, agent_session_id: &str, conversation_id: ConversationId) {
         let generation = self
             .repository
             .refresh_binding_index_hint(conversation_id)
             .unwrap_or_else(|| self.repository.binding_generation());
-        self.binding_misses
-            .lock()
-            .synchronize_generation(generation);
+        let mut misses = self.binding_misses.lock();
+        misses.synchronize_generation(generation);
+        // A lookup can race a repository refresh: it may insert a miss at the
+        // new generation after the binding already exists. Registration is an
+        // explicit positive observation, so invalidate this session even when
+        // refreshing identical keys does not advance the generation.
+        misses.invalidate_session(agent_session_id);
+        drop(misses);
         log::info!(
-            "[conversation-persistence] binding index observed conversation_id={} generation={}",
+            "[conversation-persistence] binding index observed conversation_id={} session_id={} generation={}",
             conversation_id,
+            agent_session_id,
             generation
         );
     }
@@ -1564,6 +1577,25 @@ mod tests {
         assert_eq!(invalidated.generation, repository.binding_generation());
         assert_eq!(invalidated.entries, 0);
         assert_eq!(repository.binding_index_stats().conversation_count, 1);
+
+        // Reproduce the registration race: a resolver can enqueue a miss after
+        // the repository has already advanced to the generation containing the
+        // binding. Re-registering identical keys keeps that generation stable,
+        // but must still invalidate the stale per-session miss.
+        adapter.binding_misses.lock().insert(BindingMissKey {
+            kind: BindingLookupKind::Active,
+            agent_session_id: "late-bound-session".to_string(),
+        });
+        assert!(adapter
+            .conversation_id_for_active_binding("late-bound-session")
+            .is_none());
+        let stable_generation = repository.binding_generation();
+        adapter.register_binding("late-bound-session", id);
+        assert_eq!(repository.binding_generation(), stable_generation);
+        assert_eq!(
+            adapter.conversation_id_for_active_binding("late-bound-session"),
+            Some(id)
+        );
     }
 
     #[tokio::test]

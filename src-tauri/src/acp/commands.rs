@@ -129,11 +129,9 @@ pub async fn acp_load_session(
     mcp_servers: Option<Vec<McpServer>>,
 ) -> Result<SessionReopenOutcome, String> {
     let session_id_str = session_id.0.clone();
-    let outcome = manager
-        .load_session(&agent_id, session_id, cwd, mcp_servers.unwrap_or_default())
-        .await?;
-    // Reopened sessions never went through creation binding; re-bind so
-    // ordered persistence admission resolves the canonical Conversation.
+    // Register before contacting the agent: load can synchronously emit
+    // session/update notifications, and those must resolve canonical
+    // Conversation persistence during the in-flight request.
     if let Some(raw) = conversation_id {
         match crate::conversation::ConversationId::parse(&raw) {
             Ok(conversation_id) => {
@@ -144,6 +142,9 @@ pub async fn acp_load_session(
             }
         }
     }
+    let outcome = manager
+        .load_session(&agent_id, session_id, cwd, mcp_servers.unwrap_or_default())
+        .await?;
     Ok(outcome)
 }
 
@@ -158,11 +159,8 @@ pub async fn acp_resume_session(
     mcp_servers: Option<Vec<McpServer>>,
 ) -> Result<SessionReopenOutcome, String> {
     let session_id_str = session_id.0.clone();
-    let outcome = manager
-        .resume_session(&agent_id, session_id, cwd, mcp_servers.unwrap_or_default())
-        .await?;
-    // Resumed agent sessions never went through creation binding; re-bind so
-    // ordered persistence admission can resolve the canonical Conversation.
+    // Resume may emit updates before its response, so make the durable route
+    // visible before sending the ACP request.
     if let Some(raw) = conversation_id {
         match crate::conversation::ConversationId::parse(&raw) {
             Ok(conversation_id) => {
@@ -173,6 +171,9 @@ pub async fn acp_resume_session(
             }
         }
     }
+    let outcome = manager
+        .resume_session(&agent_id, session_id, cwd, mcp_servers.unwrap_or_default())
+        .await?;
     Ok(outcome)
 }
 

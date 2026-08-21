@@ -683,7 +683,7 @@ describe('AgentLauncher ACP new thread', () => {
     )
   })
 
-  it('starts a chat in the conversation workspace without attach/target chrome', async () => {
+  it('starts a chat in the active project while keeping target chrome hidden', async () => {
     renderLauncher()
 
     expect(screen.queryByRole('combobox', { name: 'Execution target' })).not.toBeInTheDocument()
@@ -695,8 +695,13 @@ describe('AgentLauncher ACP new thread', () => {
     expect(mockFinalizeChatLaunch).toHaveBeenCalledWith(
       expect.objectContaining({
         cwd: '/work',
-        projectId: '',
-        executionTarget: { kind: 'workspace' }
+        projectId: 'p1',
+        projectAttachment: expect.objectContaining({
+          schemaVersion: 1,
+          projectId: 'p1',
+          projectPathSnapshot: '/work'
+        }),
+        executionTarget: { kind: 'project_root', projectId: 'p1', projectRoot: '/work' }
       })
     )
   })
@@ -728,10 +733,15 @@ describe('AgentLauncher ACP new thread', () => {
         placeholderId: 'launch-placeholder-1',
         configId: defaultAgent.configId,
         cwd: '/work',
-        projectId: '',
+        projectId: 'p1',
         initialBlocks: [{ type: 'text', text: 'hello acp' }],
         adoptSession: expect.any(Function),
-        executionTarget: { kind: 'workspace' }
+        projectAttachment: expect.objectContaining({
+          schemaVersion: 1,
+          projectId: 'p1',
+          projectPathSnapshot: '/work'
+        }),
+        executionTarget: { kind: 'project_root', projectId: 'p1', projectRoot: '/work' }
       })
     )
     await waitFor(() =>

@@ -4101,16 +4101,18 @@ async fn handle_load_session(
     let agent_id = parsed.agent_id.clone();
     let session_id = parsed.session_id.clone();
     let load_conversation_id = parsed.conversation_id.clone();
+    // `session/load` may emit updates before replying. Install the canonical
+    // persistence route first so those in-flight notifications are durable.
+    if let Some(raw) = &load_conversation_id {
+        if let Ok(conversation_id) = crate::conversation::ConversationId::parse(raw) {
+            acp.register_conversation_binding(&session_id.0, conversation_id);
+        }
+    }
     match acp
         .load_session(&agent_id, parsed.session_id, parsed.cwd, parsed.mcp_servers)
         .await
     {
         Ok(outcome) => {
-            if let Some(raw) = &load_conversation_id {
-                if let Ok(conversation_id) = crate::conversation::ConversationId::parse(raw) {
-                    acp.register_conversation_binding(&session_id.0, conversation_id);
-                }
-            }
             *current_agent = Some(agent_id);
             *current_conversation.lock() = acp.conversation_id_for_current_session(&session_id.0);
             *current_session.lock() = Some(session_id);
@@ -4147,18 +4149,17 @@ async fn handle_resume_session(
     let agent_id = parsed.agent_id.clone();
     let session_id = parsed.session_id.clone();
     let resume_conversation_id = parsed.conversation_id.clone();
+    // `session/resume` can stream before returning; bind before dispatch.
+    if let Some(raw) = &resume_conversation_id {
+        if let Ok(conversation_id) = crate::conversation::ConversationId::parse(raw) {
+            acp.register_conversation_binding(&session_id.0, conversation_id);
+        }
+    }
     match acp
         .resume_session(&agent_id, parsed.session_id, parsed.cwd, parsed.mcp_servers)
         .await
     {
         Ok(outcome) => {
-            // Resumed sessions never went through creation binding; re-bind so
-            // ordered persistence admission resolves the canonical Conversation.
-            if let Some(raw) = &resume_conversation_id {
-                if let Ok(conversation_id) = crate::conversation::ConversationId::parse(raw) {
-                    acp.register_conversation_binding(&session_id.0, conversation_id);
-                }
-            }
             *current_agent = Some(agent_id);
             *current_conversation.lock() = acp.conversation_id_for_current_session(&session_id.0);
             *current_session.lock() = Some(session_id);

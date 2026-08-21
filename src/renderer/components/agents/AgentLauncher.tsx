@@ -107,7 +107,7 @@ import {
 import { useConversationStore } from '@/stores/conversation-store'
 import { useActiveProject, useProjectStore } from '@/stores/project-store'
 import { useWorkspaceStore } from '@/stores/workspace-store'
-import type { Worktree } from '@/types/project'
+import type { Project, Worktree } from '@/types/project'
 
 interface AgentLauncherProps {
   paneId: string
@@ -129,6 +129,38 @@ let cachedConfigId: string | null = null
 /** Test-only: clear the cross-unmount selection cache. */
 export function __resetLauncherSelectionCache(): void {
   cachedConfigId = null
+}
+
+function defaultProjectContext(project: Project | undefined): {
+  executionTarget: ExecutionTarget
+  projectAttachment: ProjectAttachment
+} | null {
+  if (!project?.id || !project.path) return null
+  const activeWorktree = project.activeWorktreeId
+    ? project.worktrees?.find((worktree) => worktree.id === project.activeWorktreeId)
+    : undefined
+  return {
+    executionTarget: activeWorktree
+      ? {
+          kind: 'worktree',
+          projectId: project.id,
+          worktreePath: activeWorktree.path,
+          worktreeBranch: activeWorktree.branch
+        }
+      : {
+          kind: 'project_root',
+          projectId: project.id,
+          projectRoot: project.path
+        },
+    projectAttachment: {
+      schemaVersion: 1,
+      projectId: project.id,
+      attachedAtUtc: new Date().toISOString(),
+      projectPathSnapshot: project.path,
+      worktreePath: activeWorktree?.path ?? null,
+      worktreeBranch: activeWorktree?.branch ?? null
+    }
+  }
 }
 
 export function AgentLauncher({
@@ -169,8 +201,40 @@ export function AgentLauncher({
   const activeConversation = useConversationStore((state) =>
     activeConversationId ? state.summariesById[activeConversationId] : undefined
   )
-  const [executionTarget, setExecutionTarget] = useState<ExecutionTarget>({ kind: 'workspace' })
-  const [projectAttachment, setProjectAttachment] = useState<ProjectAttachment | null>(null)
+  const initialProjectContextRef = useRef(
+    activeConversation ? null : defaultProjectContext(activeProject)
+  )
+  const targetContextInitializedRef = useRef(
+    Boolean(activeConversation || initialProjectContextRef.current)
+  )
+  const [executionTarget, setExecutionTarget] = useState<ExecutionTarget>(
+    () =>
+      activeConversation?.executionTarget ??
+      initialProjectContextRef.current?.executionTarget ?? { kind: 'workspace' }
+  )
+  const [projectAttachment, setProjectAttachment] = useState<ProjectAttachment | null>(
+    () =>
+      activeConversation?.projectAttachment ??
+      initialProjectContextRef.current?.projectAttachment ??
+      null
+  )
+  useEffect(() => {
+    if (targetContextInitializedRef.current) return
+    if (activeConversation) {
+      setExecutionTarget(activeConversation.executionTarget)
+      setProjectAttachment(activeConversation.projectAttachment)
+      targetContextInitializedRef.current = true
+      return
+    }
+    const context = defaultProjectContext(activeProject)
+    if (!context) return
+    setExecutionTarget(context.executionTarget)
+    setProjectAttachment(context.projectAttachment)
+    targetContextInitializedRef.current = true
+    console.info(
+      `[agentLauncher.projectContext] defaulted projectId=${context.projectAttachment.projectId} target=${context.executionTarget.kind}`
+    )
+  }, [activeConversation, activeProject])
   const explicitProjectId = executionTarget.kind === 'workspace' ? null : executionTarget.projectId
   const conversationProjectId = explicitProjectId ?? projectAttachment?.projectId ?? null
   const selectedProjectId = conversationProjectId ?? activeProjectId
@@ -203,16 +267,24 @@ export function AgentLauncher({
   const setIsolationMode = (mode: 'current' | 'worktree'): void => {
     if (mode === 'current') {
       if (selectedProject?.path) {
+        const context = defaultProjectContext({
+          ...selectedProject,
+          activeWorktreeId: undefined
+        })
         setExecutionTarget({
           kind: 'project_root',
           projectId: selectedProject.id,
           projectRoot: selectedProject.path
         })
+        setProjectAttachment(context?.projectAttachment ?? null)
       } else {
         setExecutionTarget({ kind: 'workspace' })
+        setProjectAttachment(null)
       }
       return
     }
+    const context = defaultProjectContext(selectedProject)
+    setProjectAttachment(context?.projectAttachment ?? null)
     setExecutionTarget({
       kind: 'worktree',
       projectId: selectedProject?.id ?? '',
@@ -970,7 +1042,11 @@ export function AgentLauncher({
     const projectIdSnapshot = conversationProjectId ?? ''
     const projectRootSnapshot = projectRoot ?? ''
     const targetSnapshot = executionTarget
-    const attachmentSnapshot = projectAttachment
+    const attachmentSnapshot =
+      projectAttachment ??
+      (targetSnapshot.kind === 'workspace'
+        ? null
+        : (defaultProjectContext(selectedProject)?.projectAttachment ?? null))
     const needsSave = !acpConfigs.some((config) => config.id === selectedConfig.id)
 
     // Build the wire text (skills framed by path under `# Agent Skills`, then
@@ -1007,6 +1083,7 @@ export function AgentLauncher({
       targetSnapshot.kind === 'worktree' ? targetSnapshot.worktreeBranch : undefined
     let launchCwd = targetCwd
     let finalExecutionTarget: ExecutionTarget = targetSnapshot
+    let finalProjectAttachment = attachmentSnapshot
     if (targetSnapshot.kind === 'worktree' && !worktreePath) {
       if (!canUseWorktree || !projectRootSnapshot) {
         toast.error(t('launcher.errors.projectRootRequired', 'Select a Git project'))
@@ -1095,6 +1172,13 @@ export function AgentLauncher({
             projectId: projectIdSnapshot,
             worktreePath: worktreePathResult,
             worktreeBranch: worktreeBranchResult
+          }
+          if (attachmentSnapshot) {
+            finalProjectAttachment = {
+              ...attachmentSnapshot,
+              worktreePath: worktreePathResult,
+              worktreeBranch: worktreeBranchResult
+            }
           }
           // CAP-5: carry over untracked files listed in `.worktree-include`.
           // Symlink/path-escape/already-present defenses run on the host.
@@ -1331,7 +1415,7 @@ export function AgentLauncher({
             worktreePath,
             worktreeBranch,
             conversationId: retryableConversationId ?? activeConversationId ?? undefined,
-            projectAttachment: attachmentSnapshot ?? undefined,
+            projectAttachment: finalProjectAttachment ?? undefined,
             executionTarget: finalExecutionTarget
           })
         } else {
@@ -1363,6 +1447,7 @@ export function AgentLauncher({
     projectRoot,
     conversationProjectId,
     targetCwd,
+    selectedProject,
     selectedConfig,
     selectedEntry?.status,
     acpConfigs,
