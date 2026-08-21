@@ -966,7 +966,7 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
         parts.push(
           <span
             key={`${matchIndex}-${matchIndex + query.length}`}
-            className="rounded-sm border border-primary/35 bg-primary/20 px-0.5 text-foreground transition-colors group-hover:bg-primary/25 group-focus-visible:bg-primary/30"
+            className="bg-primary/18 text-foreground"
           >
             {lineText.slice(matchIndex, matchIndex + query.length)}
           </span>
@@ -1101,20 +1101,18 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
     <div
       id="file-explorer-panel"
       ref={containerRef}
-      className="relative flex h-full min-w-0 flex-shrink-0 flex-col overflow-hidden rounded-xl bg-background text-foreground"
+      className="relative flex h-full min-w-0 flex-shrink-0 flex-col overflow-hidden bg-sidebar text-foreground"
       style={{ width: explorerWidth }}
     >
       {/* Header */}
-      <div className="flex items-center justify-between px-3 h-10 border-b border-border flex-shrink-0 rounded-t-xl">
-        <span className="text-xs tracking-wider text-sidebar-foreground uppercase">
-          {t('fileExplorer.title')}
-        </span>
-        <div className="flex items-center gap-1">
+      <div className="flex h-8 shrink-0 items-center justify-between border-b border-sidebar-border/70 px-2.5">
+        <span className="label-section text-sidebar-foreground">{t('fileExplorer.title')}</span>
+        <div className="flex items-center gap-0.5">
           <button
             type="button"
             onClick={() => void startHeaderCreate('file')}
             disabled={!rootPath || !!rootLoadError}
-            className="text-muted-foreground hover:text-foreground transition-colors p-0.5 rounded-sm focus:outline-none focus-visible:ring-1 focus-visible:ring-primary disabled:opacity-40 disabled:cursor-not-allowed"
+            className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-40"
             title={t('fileExplorer.newFile')}
             aria-label={t('fileExplorer.newFile')}
           >
@@ -1124,7 +1122,7 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
             type="button"
             onClick={() => void startHeaderCreate('folder')}
             disabled={!rootPath || !!rootLoadError}
-            className="text-muted-foreground hover:text-foreground transition-colors p-0.5 rounded-sm focus:outline-none focus-visible:ring-1 focus-visible:ring-primary disabled:opacity-40 disabled:cursor-not-allowed"
+            className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-40"
             title={t('fileExplorer.newFolder')}
             aria-label={t('fileExplorer.newFolder')}
           >
@@ -1134,7 +1132,7 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
             type="button"
             onClick={handleHeaderRefresh}
             disabled={!rootPath || !!rootLoadError}
-            className="text-muted-foreground hover:text-foreground transition-colors p-0.5 rounded-sm focus:outline-none focus-visible:ring-1 focus-visible:ring-primary disabled:opacity-40 disabled:cursor-not-allowed"
+            className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-40"
             title={t('fileExplorer.refresh')}
             aria-label={t('fileExplorer.refresh')}
           >
@@ -1144,7 +1142,7 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
             type="button"
             onClick={collapseAll}
             disabled={!rootPath || !!rootLoadError}
-            className="text-muted-foreground hover:text-foreground transition-colors p-0.5 rounded-sm focus:outline-none focus-visible:ring-1 focus-visible:ring-primary disabled:opacity-40 disabled:cursor-not-allowed"
+            className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-40"
             title={t('fileExplorer.collapseAll')}
             aria-label={t('fileExplorer.collapseAll')}
           >
@@ -1153,28 +1151,28 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
         </div>
       </div>
 
-      <div className="px-3 py-1.5 border-b border-border">
+      <div className="border-b border-sidebar-border/70 px-2.5 py-1.5">
         <div className="relative">
           <Search
-            size={13}
-            className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-muted-foreground"
+            className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground"
+            aria-hidden="true"
           />
           <input
             type="text"
             value={normalizedSearchQuery}
             onChange={(event) => setSearchQuery(event.target.value)}
             placeholder={t('fileExplorer.searchPlaceholder')}
-            className="w-full rounded-none border-0 bg-transparent py-1 pl-7 pr-7 text-xs text-foreground outline-none placeholder:text-muted-foreground/60 focus:ring-0"
+            className="h-8 w-full rounded-none border-0 bg-transparent pl-7 pr-7 text-xs text-foreground outline-none placeholder:text-muted-foreground/60 focus-visible:ring-1 focus-visible:ring-ring/50"
             aria-label={t('fileExplorer.searchAria')}
           />
           {hasSearchInput && (
             <button
               onClick={() => resetSearch()}
-              className="absolute right-0 top-1/2 inline-flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground transition-colors hover:text-foreground focus:outline-none"
+              className="absolute right-0 top-1/2 inline-flex size-7 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               title={t('fileExplorer.clearSearch')}
               aria-label={t('fileExplorer.clearSearch')}
             >
-              <X size={11} />
+              <X className="size-3.5" />
             </button>
           )}
         </div>
@@ -1183,18 +1181,22 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
       {/* Tree / Search Results */}
       <div className="flex-1 overflow-y-auto overflow-x-hidden py-1">
         {roots.length === 0 && !rootPath && (
-          <div className="px-3 py-4 text-sm text-muted-foreground">
-            {t('fileExplorer.noProject')}
+          <div className="px-3 py-5" role="status">
+            <p className="text-xs leading-relaxed text-muted-foreground">
+              {t('fileExplorer.noProject')}
+            </p>
           </div>
         )}
 
         {!isMultiRoot && rootPath && rootLoadError && (
-          <div className="px-3 py-4 space-y-2">
-            <p className="text-sm text-red-400">{t('fileExplorer.loadFailed')}</p>
-            <p className="text-xs text-muted-foreground break-words">{rootLoadError.message}</p>
+          <div className="px-3 py-5" role="alert">
+            <p className="text-xs font-medium text-foreground">{t('fileExplorer.loadFailed')}</p>
+            <p className="mt-1 break-words text-xs leading-relaxed text-muted-foreground">
+              {rootLoadError.message}
+            </p>
             <button
               onClick={handleRootRetry}
-              className="px-2 py-1 text-xs rounded bg-secondary text-foreground hover:bg-secondary/80"
+              className="mt-2 inline-flex h-7 items-center rounded-md px-2 text-xs text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
             >
               {t('fileExplorer.retry')}
             </button>
@@ -1202,7 +1204,9 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
         )}
 
         {!isMultiRoot && rootPath && !rootEntries && !rootLoadError && (
-          <div className="px-3 py-4 text-sm text-muted-foreground">{t('fileExplorer.loading')}</div>
+          <div className="px-3 py-5 text-xs text-muted-foreground" role="status">
+            {t('fileExplorer.loading')}
+          </div>
         )}
 
         {!isMultiRoot &&
@@ -1240,8 +1244,10 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
               >
                 <div
                   className={cn(
-                    'group flex h-8 min-w-0 items-center gap-1 border-b border-border/40 px-1.5 text-sm',
-                    focused ? 'bg-accent/70 text-accent-foreground' : 'hover:bg-secondary/40'
+                    'group mx-1 flex h-7 min-w-0 items-center gap-1 rounded-sm px-1.5 text-xs',
+                    focused
+                      ? 'bg-sidebar-accent text-foreground ring-1 ring-inset ring-primary/35'
+                      : 'text-sidebar-foreground hover:bg-sidebar-accent/50'
                   )}
                 >
                   <button
@@ -1253,7 +1259,7 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
                       void toggleDirectory(root.path)
                     }}
                   >
-                    <span className="flex h-4 w-4 shrink-0 items-center justify-center">
+                    <span className="flex size-4 shrink-0 items-center justify-center text-muted-foreground">
                       {loading ? (
                         <LoaderCircle size={12} className="animate-spin" />
                       ) : expanded ? (
@@ -1262,12 +1268,12 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
                         <ChevronRight size={12} />
                       )}
                     </span>
-                    <FolderGit2 size={14} className="shrink-0 text-primary/80" />
-                    <span className="truncate font-medium">{root.name}</span>
+                    <FolderGit2 size={13} className="shrink-0 text-muted-foreground" />
+                    <span className="min-w-0 flex-1 truncate leading-4">{root.name}</span>
                   </button>
                   <button
                     type="button"
-                    className="rounded p-1 text-muted-foreground opacity-0 transition-opacity hover:bg-secondary hover:text-foreground group-hover:opacity-100 focus:opacity-100"
+                    className="inline-flex size-5 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-opacity hover:bg-sidebar-accent hover:text-foreground group-hover:opacity-100 focus:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                     title={t('tabs.terminal')}
                     aria-label={`${t('tabs.terminal')}: ${root.name}`}
                     onClick={() => void handleOpenRootTerminal(root.projectId, root.path)}
@@ -1277,11 +1283,11 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
                 </div>
 
                 {error ? (
-                  <div className="space-y-2 border-b border-border/40 px-4 py-3">
-                    <p className="text-xs text-red-400">{error.message}</p>
+                  <div className="px-3 py-3" role="alert">
+                    <p className="text-xs leading-relaxed text-muted-foreground">{error.message}</p>
                     <button
                       type="button"
-                      className="text-xs text-primary hover:underline"
+                      className="mt-1.5 text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline"
                       onClick={() => void toggleDirectory(root.path)}
                     >
                       {t('fileExplorer.retry')}
@@ -1301,7 +1307,7 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
                     />
                   ))
                 ) : !entries && loading ? (
-                  <div className="px-6 py-2 text-xs text-muted-foreground">
+                  <div className="px-3 py-2 text-xs text-muted-foreground">
                     {t('fileExplorer.loading')}
                   </div>
                 ) : null}
@@ -1310,13 +1316,13 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
           })}
 
         {rootPath && !rootLoadError && isSearchActive && (
-          <div className="space-y-1.5 px-2 py-1.5">
+          <div className="space-y-1 px-1 py-1">
             {(searchLoading ||
               searchError ||
               isSearchTooShort ||
               showSearchEmptyState ||
               !resultsAreCurrent) && (
-              <div className="rounded-md border border-border/70 bg-background/60 px-2 py-1.5 text-3xs leading-relaxed text-muted-foreground">
+              <div className="px-2 py-1.5 text-3xs leading-relaxed text-muted-foreground">
                 <p className="text-3xs font-medium text-foreground">
                   {searchLoading
                     ? t('fileExplorer.searching', { query: trimmedSearchQuery })
@@ -1345,7 +1351,7 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
             )}
 
             {(searchTruncated || searchFailedFiles > 0) && (
-              <div className="rounded-md border border-border/70 bg-background/60 px-2 py-1.5 text-3xs leading-relaxed text-muted-foreground">
+              <div className="px-2 py-1.5 text-3xs leading-relaxed text-muted-foreground">
                 {searchTruncated ? t('fileExplorer.truncated') : t('fileExplorer.someFilesFailed')}
                 {searchFailedFiles > 0
                   ? ` ${t('fileExplorer.filesSkipped', { count: searchFailedFiles })}`
@@ -1357,77 +1363,71 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
             )}
 
             {hasAnySearchResults && (
-              <div className="rounded-lg border border-border/70 bg-card/25 p-1 shadow-sm">
-                <div
-                  className="grid grid-cols-2 gap-1"
-                  role="tablist"
-                  aria-label={t('fileExplorer.resultTypes')}
+              <div
+                className="grid grid-cols-2"
+                role="tablist"
+                aria-label={t('fileExplorer.resultTypes')}
+              >
+                <button
+                  onClick={() => {
+                    userSelectedTabRef.current = true
+                    setSearchResultTab('content')
+                  }}
+                  className={cn(
+                    'flex h-7 items-center justify-center gap-1 border-b px-2 text-3xs font-medium transition-colors',
+                    searchResultTab === 'content'
+                      ? 'border-primary/50 text-foreground'
+                      : 'border-sidebar-border/70 text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground'
+                  )}
+                  type="button"
+                  role="tab"
+                  aria-selected={searchResultTab === 'content'}
                 >
-                  <button
-                    onClick={() => {
-                      userSelectedTabRef.current = true
-                      setSearchResultTab('content')
-                    }}
-                    className={cn(
-                      'flex items-center justify-center gap-1 rounded-md px-2 py-1 text-3xs font-medium transition-colors',
-                      searchResultTab === 'content'
-                        ? 'bg-secondary text-foreground shadow-sm'
-                        : 'text-muted-foreground hover:bg-background/70 hover:text-foreground'
-                    )}
-                    type="button"
-                    role="tab"
-                    aria-selected={searchResultTab === 'content'}
-                  >
-                    {searchLoading && <LoaderCircle size={10} className="animate-spin" />}
-                    {t('fileExplorer.content')}{' '}
-                    <span className="text-muted-foreground">{safeSearchResults.length}</span>
-                  </button>
-                  <button
-                    onClick={() => {
-                      userSelectedTabRef.current = true
-                      setSearchResultTab('files')
-                    }}
-                    className={cn(
-                      'flex items-center justify-center gap-1 rounded-md px-2 py-1 text-3xs font-medium transition-colors',
-                      searchResultTab === 'files'
-                        ? 'bg-secondary text-foreground shadow-sm'
-                        : 'text-muted-foreground hover:bg-background/70 hover:text-foreground'
-                    )}
-                    type="button"
-                    role="tab"
-                    aria-selected={searchResultTab === 'files'}
-                  >
-                    {searchLoading && <LoaderCircle size={10} className="animate-spin" />}
-                    {t('fileExplorer.files')}{' '}
-                    <span className="text-muted-foreground">
-                      {fileNameMatchesPending ? '…' : safeSearchFileNameMatches.length}
-                    </span>
-                  </button>
-                </div>
+                  {searchLoading && <LoaderCircle size={10} className="animate-spin" />}
+                  {t('fileExplorer.content')}{' '}
+                  <span className="text-muted-foreground">{safeSearchResults.length}</span>
+                </button>
+                <button
+                  onClick={() => {
+                    userSelectedTabRef.current = true
+                    setSearchResultTab('files')
+                  }}
+                  className={cn(
+                    'flex h-7 items-center justify-center gap-1 border-b px-2 text-3xs font-medium transition-colors',
+                    searchResultTab === 'files'
+                      ? 'border-primary/50 text-foreground'
+                      : 'border-sidebar-border/70 text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground'
+                  )}
+                  type="button"
+                  role="tab"
+                  aria-selected={searchResultTab === 'files'}
+                >
+                  {searchLoading && <LoaderCircle size={10} className="animate-spin" />}
+                  {t('fileExplorer.files')}{' '}
+                  <span className="text-muted-foreground">
+                    {fileNameMatchesPending ? '…' : safeSearchFileNameMatches.length}
+                  </span>
+                </button>
               </div>
             )}
 
             {searchResultTab === 'files' && hasFileResults && (
-              <div className="space-y-1">
+              <div>
                 {safeSearchFileNameMatches.map((filePath) => {
                   const { fileName, relativePath } = getFileLabel(filePath)
                   return (
                     <button
                       key={`fname:${filePath}`}
                       onClick={() => void handleSearchMatchClick(filePath, 1)}
-                      className="w-full px-2 py-1.5 text-left transition-colors hover:bg-secondary/40 focus:outline-none focus-visible:ring-1 focus-visible:ring-primary"
+                      className="flex h-7 w-full min-w-0 items-center px-2 text-left transition-colors hover:bg-sidebar-accent/50 focus:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring"
                       title={filePath}
                     >
-                      <div className="flex min-w-0 items-center justify-between gap-2">
-                        <div className="min-w-0 flex-1">
-                          <span className="truncate text-2xs font-medium text-foreground">
-                            {fileName}
-                          </span>
-                          <span className="ml-1.5 truncate text-3xs text-muted-foreground">
-                            {relativePath}
-                          </span>
-                        </div>
-                      </div>
+                      <span className="flex min-w-0 flex-1 items-center gap-1.5">
+                        <span className="truncate text-xs text-foreground">{fileName}</span>
+                        <span className="min-w-0 truncate text-2xs text-muted-foreground">
+                          {relativePath}
+                        </span>
+                      </span>
                     </button>
                   )
                 })}
@@ -1435,7 +1435,7 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
             )}
 
             {searchResultTab === 'content' && hasContentResults && (
-              <div className="space-y-1">
+              <div>
                 {safeSearchResults.map((fileResult) => {
                   const { fileName, relativePath } = getFileLabel(fileResult.filePath)
                   const isExpanded = expandedSearchResultPaths.has(fileResult.filePath)
@@ -1452,33 +1452,29 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
                             fileResult.matches[0]?.lineNumber ?? 1
                           )
                         }
-                        className="w-full px-2 py-1.5 text-left transition-colors hover:bg-secondary/40 focus:outline-none focus-visible:ring-1 focus-visible:ring-primary"
+                        className="flex h-7 w-full min-w-0 items-center px-2 text-left transition-colors hover:bg-sidebar-accent/50 focus:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring"
                         title={fileResult.filePath}
                       >
-                        <div className="flex min-w-0 items-center justify-between gap-2">
-                          <div className="min-w-0 flex-1">
-                            <span className="truncate text-2xs font-medium text-foreground">
-                              {fileName}
-                            </span>
-                            <span className="ml-1.5 truncate text-3xs text-muted-foreground">
-                              {relativePath}
-                            </span>
-                          </div>
-                          <span className="shrink-0 text-4xs text-muted-foreground">
-                            {t('fileExplorer.hits', { count: fileResult.matches.length })}
+                        <span className="flex min-w-0 flex-1 items-center gap-1.5">
+                          <span className="truncate text-xs text-foreground">{fileName}</span>
+                          <span className="min-w-0 truncate text-2xs text-muted-foreground">
+                            {relativePath}
                           </span>
-                        </div>
+                        </span>
+                        <span className="ml-2 shrink-0 text-2xs text-muted-foreground">
+                          {t('fileExplorer.hits', { count: fileResult.matches.length })}
+                        </span>
                       </button>
-                      <div className="space-y-0.5 pb-1">
+                      <div className="pb-0.5">
                         {visibleMatches.map((match, idx) => (
                           <button
                             key={`${fileResult.filePath}:${match.lineNumber}:${idx}`}
                             onClick={() =>
                               void handleSearchMatchClick(fileResult.filePath, match.lineNumber)
                             }
-                            className="group flex w-full items-center gap-2 overflow-hidden px-2 py-0.5 text-left text-3xs text-foreground transition-colors hover:bg-secondary/50 focus:outline-none focus-visible:ring-1 focus-visible:ring-primary"
+                            className="group flex h-7 w-full items-center gap-2 overflow-hidden px-2 text-left text-3xs text-foreground transition-colors hover:bg-sidebar-accent/50 focus:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring"
                           >
-                            <span className="shrink-0 min-w-[22px] text-right text-4xs text-muted-foreground">
+                            <span className="w-5 shrink-0 text-right text-2xs tabular-nums text-muted-foreground">
                               {match.lineNumber}
                             </span>
                             <span className="block min-w-0 flex-1 truncate text-foreground/90">
@@ -1490,7 +1486,7 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
                           <button
                             type="button"
                             onClick={() => toggleExpandedSearchResult(fileResult.filePath)}
-                            className="px-2 py-0.5 text-3xs text-muted-foreground transition-colors hover:text-foreground focus:outline-none"
+                            className="flex h-7 items-center px-2 text-3xs text-muted-foreground transition-colors hover:text-foreground focus:outline-none"
                           >
                             {t('fileExplorer.showMore', { count: hiddenCount })}
                           </button>
@@ -1499,7 +1495,7 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
                           <button
                             type="button"
                             onClick={() => toggleExpandedSearchResult(fileResult.filePath)}
-                            className="px-2 py-0.5 text-3xs text-muted-foreground transition-colors hover:text-foreground focus:outline-none"
+                            className="flex h-7 items-center px-2 text-3xs text-muted-foreground transition-colors hover:text-foreground focus:outline-none"
                           >
                             {t('fileExplorer.showLess')}
                           </button>
@@ -1532,7 +1528,7 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
                 }
               }}
               onBlur={handleInlineInputCancel}
-              className="flex-1 bg-input border border-primary rounded px-1.5 py-0.5 text-sm text-foreground outline-none"
+              className="h-7 min-w-0 flex-1 bg-transparent px-1.5 text-xs text-foreground outline-none ring-1 ring-inset ring-ring/50"
               placeholder={
                 inlineInput.mode === 'create'
                   ? inlineInput.type === 'file'
@@ -1549,7 +1545,7 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
         type="button"
         onMouseDown={handleResizeMouseDown}
         onKeyDown={handleResizeKeyDown}
-        className={`absolute ${side === 'right' ? 'left-0' : 'right-0'} top-0 h-full w-1 cursor-col-resize bg-transparent hover:bg-primary/20`}
+        className={`absolute ${side === 'right' ? 'left-0' : 'right-0'} top-0 h-full w-1 cursor-col-resize bg-transparent hover:bg-ring/25 focus-visible:bg-ring/30 focus-visible:outline-none`}
         title={t('fileExplorer.resizeTitle')}
         aria-label={t('fileExplorer.resizeAria')}
         role="separator"
@@ -1561,21 +1557,28 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
 
       {/* Delete Confirmation Dialog */}
       {deleteConfirm && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-          <div className="bg-card border border-border rounded-lg p-4 shadow-xl max-w-sm">
-            <p className="text-sm text-foreground mb-4">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-[2px]">
+          <div
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="file-explorer-delete-title"
+            className="w-full max-w-sm rounded-md border border-destructive/30 bg-card p-4 shadow-[0_18px_60px_hsl(var(--background)/0.7),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]"
+          >
+            <p id="file-explorer-delete-title" className="mb-4 text-sm text-foreground">
               {t('fileExplorer.deleteConfirm', { name: deleteConfirm.name })}
             </p>
             <div className="flex justify-end gap-2">
               <button
+                type="button"
                 onClick={() => setDeleteConfirm(null)}
-                className="px-3 py-1.5 text-sm rounded bg-secondary text-foreground hover:bg-secondary/80"
+                className="inline-flex h-8 items-center rounded-md bg-secondary/50 px-3 text-xs font-medium text-foreground transition-colors hover:bg-secondary focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               >
                 {t('fileExplorer.cancel')}
               </button>
               <button
+                type="button"
                 onClick={handleDeleteConfirm}
-                className="px-3 py-1.5 text-sm rounded bg-red-600 text-white hover:bg-red-700"
+                className="inline-flex h-8 items-center rounded-md bg-destructive px-3 text-xs font-medium text-destructive-foreground transition-colors hover:bg-destructive/90 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               >
                 {t('fileExplorer.delete')}
               </button>

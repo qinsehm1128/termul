@@ -1,4 +1,4 @@
-import { AlertTriangle, MessageSquare } from 'lucide-react'
+import { AlertTriangle } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useNavigate } from 'react-router-dom'
@@ -29,10 +29,13 @@ export function ConversationList({
   className
 }: ConversationListProps): React.JSX.Element {
   const { t } = useTranslation('common')
+  const { t: tConversation } = useTranslation('conversation')
   const navigate = useNavigate()
   const conversations = useVisibleConversations()
   const recoveryItems = useConversationStore((state) => state.recoveryItems)
   const activeConversationId = useConversationStore((state) => state.activeConversationId)
+  const loadingList = useConversationStore((state) => state.loadingList)
+  const listError = useConversationStore((state) => state.listError)
   const sessions = useAcpStore((state) => state.sessions)
   const sessionIndex = useAcpStore((state) => state.sessionIndex)
   const projects = useProjectStore((state) => state.projects)
@@ -51,9 +54,37 @@ export function ConversationList({
   const hasMore = visible.length < projected.length
 
   if (projected.length === 0) {
+    if (listError) {
+      return (
+        <div className="px-3 py-5" role="alert">
+          <p className="text-xs font-medium text-foreground">
+            {t('conversationRoute.errors.title')}
+          </p>
+          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{listError.message}</p>
+        </div>
+      )
+    }
+
+    if (loadingList) {
+      return (
+        <div className="flex flex-col gap-1 px-2 py-2" role="status" aria-busy="true">
+          <span className="px-1 pb-1 text-xs text-muted-foreground">
+            {tConversation('dashboard.loading')}
+          </span>
+          {Array.from({ length: 5 }, (_, index) => (
+            <div key={index} className="flex h-8 items-center px-2">
+              <span className="h-2.5 w-2/5 animate-pulse rounded-sm bg-muted" />
+            </div>
+          ))}
+        </div>
+      )
+    }
+
     return (
-      <div className="px-3 py-6 text-center text-xs text-muted-foreground" role="status">
-        {t('conversationNavigation.empty')}
+      <div className="px-3 py-5" role="status">
+        <p className="text-xs leading-relaxed text-muted-foreground">
+          {t('conversationNavigation.empty')}
+        </p>
       </div>
     )
   }
@@ -84,35 +115,40 @@ export function ConversationList({
           <div
             key={conversation.conversationId}
             className={cn(
-              'group flex min-h-11 items-center gap-1 border-l-2 pr-1 transition-colors',
+              'group mx-1 flex min-h-8 items-center gap-0.5 rounded-sm pr-0.5 transition-colors',
               isActive
-                ? 'border-primary bg-sidebar-accent'
-                : 'border-transparent hover:bg-sidebar-accent/60'
+                ? 'bg-sidebar-accent text-foreground ring-1 ring-inset ring-primary/35'
+                : 'hover:bg-sidebar-accent/50'
             )}
             data-conversation-id={conversation.conversationId}
           >
             <button
               type="button"
-              className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2 text-left"
+              className="flex min-h-8 min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring"
               aria-current={isActive ? 'page' : undefined}
               onClick={() => {
                 navigate(`/c/${conversation.conversationId}`)
                 onConversationOpened?.()
               }}
             >
-              <MessageSquare className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
               <span className="min-w-0 flex-1">
-                <span className="block truncate text-xs text-sidebar-foreground" title={title}>
+                <span
+                  className={cn(
+                    'block truncate text-xs leading-4',
+                    isActive ? 'font-medium text-foreground' : 'text-sidebar-foreground'
+                  )}
+                  title={title}
+                >
                   {title}
                 </span>
-                <span className="block truncate text-[10px] text-muted-foreground">
+                <span className="block truncate text-2xs leading-4 text-muted-foreground">
                   {projectLabel}
                 </span>
               </span>
               {recoveryCount > 0 && (
                 <span
                   role="status"
-                  className="inline-flex shrink-0 items-center gap-1 rounded-full bg-destructive/10 px-1.5 py-0.5 text-[10px] text-destructive"
+                  className="inline-flex shrink-0 items-center gap-0.5 text-2xs tabular-nums text-destructive"
                   aria-label={t('conversationNavigation.recoveryBadge', { count: recoveryCount })}
                 >
                   <AlertTriangle className="size-3" aria-hidden="true" />
@@ -130,7 +166,7 @@ export function ConversationList({
       {hasMore && (
         <button
           type="button"
-          className="mx-2 min-h-9 rounded-md text-xs text-muted-foreground hover:bg-sidebar-accent"
+          className="mx-1 mt-0.5 inline-flex h-8 items-center justify-center rounded-sm px-2 text-xs text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
           onClick={() => setVisibleCount((count) => count + pageSize)}
         >
           {t('conversationNavigation.loadMore', { count: projected.length - visible.length })}

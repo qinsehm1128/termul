@@ -836,6 +836,15 @@ describe('ProjectSidebar Project Search', () => {
     expect(screen.getByTestId('project-search-input')).toBeInTheDocument()
   })
 
+  it('renders the search field flush with the rail header', () => {
+    renderWithRouter({ projects: manyProjects, activeProjectId: '1' })
+    expect(screen.getByTestId('project-search-input')).toHaveClass(
+      'h-8',
+      'bg-transparent',
+      'rounded-none'
+    )
+  })
+
   it('filters the visible projects by name', () => {
     renderWithRouter({ projects: manyProjects, activeProjectId: '1' })
 
@@ -1129,5 +1138,22 @@ describe('ProjectSidebar Folder Grouping', () => {
     )
     expect(screen.getByTestId('project-group-group-1')).toHaveClass('bg-sidebar-accent')
     expect(screen.getByTestId('project-item-1').querySelector('[aria-current]')).toBeNull()
+  })
+})
+
+describe('ProjectSidebar compact rail', () => {
+  it('marks the active project with a 28px row, lichen inset, and color marker', () => {
+    renderWithRouter()
+
+    const row = screen.getByTestId('project-item-1').querySelector('[aria-current="page"]')
+    expect(row).toHaveClass('h-7', 'bg-sidebar-accent', 'ring-1')
+    expect(row?.querySelector('[data-project-color="blue"]')).toHaveClass('size-1.5')
+  })
+
+  it('keeps header actions discoverable as compact rail icons', () => {
+    renderWithRouter()
+
+    expect(screen.getByTestId('header-new-project')).toHaveClass('size-7')
+    expect(screen.getByLabelText('New Group Folder')).toHaveClass('size-7')
   })
 })

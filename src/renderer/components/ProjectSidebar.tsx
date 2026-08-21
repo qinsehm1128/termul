@@ -774,38 +774,37 @@ export function ProjectSidebar({
     isSearching && filteredActiveProjects.length === 0 && filteredArchivedProjects.length === 0
 
   return (
-    <aside className="w-64 bg-sidebar flex flex-col flex-shrink-0 rounded-xl h-full">
+    <aside className="flex h-full w-60 flex-shrink-0 flex-col bg-sidebar">
       {/* Header with inline + button */}
-      <div className="h-9 flex items-center justify-between px-3 border-b border-sidebar-border rounded-t-xl">
+      <div className="flex h-8 items-center justify-between border-b border-sidebar-border/70 px-2.5">
         <span className="label-section text-sidebar-foreground">{t('title')}</span>
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-0.5">
           <button
             onClick={handleCreateGroup}
-            className="group h-6 w-6 inline-flex items-center justify-center rounded-md hover:bg-sidebar-accent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
             title={t('newGroupFolder')}
             aria-label={t('newGroupFolder')}
           >
-            <FolderPlus size={14} className="text-muted-foreground group-hover:text-foreground" />
+            <FolderPlus size={14} />
           </button>
           <button
             onClick={onNewProject}
-            className="group h-6 w-6 inline-flex items-center justify-center rounded-md hover:bg-sidebar-accent transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
             title={t('newProject')}
             aria-label={t('newProject')}
             data-testid="header-new-project"
           >
-            <Plus size={14} className="text-muted-foreground group-hover:text-foreground" />
+            <Plus size={14} />
           </button>
         </div>
       </div>
 
       {/* Project search — flat style matching the file explorer search */}
       {showSearch && (
-        <div className="px-3 py-1.5 border-b border-sidebar-border">
+        <div className="border-b border-sidebar-border/70 px-2.5 py-1.5">
           <div className="relative">
             <Search
-              size={13}
-              className="pointer-events-none absolute left-2 top-1/2 -translate-y-1/2 text-muted-foreground"
+              className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground"
               aria-hidden="true"
             />
             <input
@@ -821,7 +820,7 @@ export function ProjectSidebar({
                   setSearchQuery('')
                 }
               }}
-              className="w-full rounded-none border-0 bg-transparent py-1 pl-7 pr-7 text-xs text-foreground outline-none placeholder:text-muted-foreground/60 focus:ring-0 [&::-webkit-search-cancel-button]:hidden"
+              className="h-8 w-full rounded-none border-0 bg-transparent pl-7 pr-7 text-xs text-foreground outline-none placeholder:text-muted-foreground/60 focus-visible:ring-1 focus-visible:ring-ring/50 [&::-webkit-search-cancel-button]:hidden"
               aria-label={t('searchProjects')}
               data-testid="project-search-input"
             />
@@ -832,12 +831,12 @@ export function ProjectSidebar({
                   // Clearing unmounts this button; return focus to the input.
                   searchInputRef.current?.focus()
                 }}
-                className="absolute right-0 top-1/2 inline-flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground transition-colors hover:text-foreground focus:outline-none"
+                className="absolute right-0 top-1/2 inline-flex size-7 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                 title={t('clearSearch')}
                 aria-label={t('clearSearch')}
                 data-testid="project-search-clear"
               >
-                <X size={11} />
+                <X className="size-3.5" />
               </button>
             )}
           </div>
@@ -847,19 +846,21 @@ export function ProjectSidebar({
       {/* Project List */}
       <div className="flex-1 overflow-y-auto py-1" data-group-id="root">
         {projects.length === 0 ? (
-          <div className="flex flex-col items-center justify-center p-6 text-center opacity-60">
-            <p className="text-sm text-muted-foreground">{t('noProjects')}</p>
-            <p className="text-xs text-muted-foreground mt-1">{t('createFirstProject')}</p>
+          <div className="px-3 py-5" role="status">
+            <p className="text-xs font-medium text-foreground">{t('noProjects')}</p>
+            <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
+              {t('createFirstProject')}
+            </p>
           </div>
         ) : hasNoSearchResults ? (
           <div
-            className="flex flex-col items-center justify-center p-6 text-center opacity-60"
+            className="px-3 py-5"
             data-testid="project-search-empty"
             role="status"
             aria-live="polite"
           >
-            <p className="text-sm text-muted-foreground">{t('noProjectsFound')}</p>
-            <p className="text-xs text-muted-foreground mt-1 break-words">
+            <p className="text-xs font-medium text-foreground">{t('noProjectsFound')}</p>
+            <p className="mt-1 break-words text-xs leading-relaxed text-muted-foreground">
               {t('nothingMatches', { query: trimmedQuery })}
             </p>
           </div>
@@ -902,11 +903,11 @@ export function ProjectSidebar({
                               role="group"
                               aria-label={group.name}
                               className={cn(
-                                'w-full flex items-center h-7 px-1.5 hover:bg-sidebar-accent/50 rounded transition-colors text-left select-none',
+                                'mx-1 flex h-7 w-[calc(100%-0.5rem)] cursor-pointer select-none items-center rounded-sm px-1.5 text-left transition-colors hover:bg-sidebar-accent/50',
                                 isActiveGroup &&
-                                  'bg-sidebar-accent ring-1 ring-inset ring-primary/30',
+                                  'bg-sidebar-accent ring-1 ring-inset ring-primary/35',
                                 activeDragOverGroupId === group.id &&
-                                  'bg-primary/20 border border-primary/50'
+                                  'bg-sidebar-accent/80 ring-1 ring-inset ring-ring/40'
                               )}
                               data-group-id={group.id}
                               data-testid={`project-group-${group.id}`}
@@ -917,7 +918,7 @@ export function ProjectSidebar({
                                   event.stopPropagation()
                                   toggleGroupCollapse(group.id)
                                 }}
-                                className="h-5 w-5 inline-flex items-center justify-center flex-shrink-0 mr-0.5 rounded focus:outline-none focus-visible:ring-1 focus-visible:ring-primary"
+                                className="mr-0.5 inline-flex size-5 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-sidebar-accent hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                                 aria-expanded={!isCollapsed}
                                 aria-label={t(
                                   isCollapsed ? 'expandGroupAria' : 'collapseGroupAria',
@@ -941,7 +942,7 @@ export function ProjectSidebar({
                                       'mr-1.5 flex-shrink-0 inline-flex items-center',
                                       group.color
                                         ? getColorClasses(group.color).text
-                                        : 'text-primary/80'
+                                        : 'text-muted-foreground'
                                     )}
                                   >
                                     {isCollapsed ? <Folder size={13} /> : <FolderOpen size={13} />}
@@ -967,10 +968,10 @@ export function ProjectSidebar({
                                       }
                                       setEditingGroupId(null)
                                     }}
-                                    className="flex-1 min-w-0 bg-sidebar-accent border border-border rounded px-1 py-0.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary mr-2"
+                                    className="mr-2 min-w-0 flex-1 bg-transparent px-1 text-xs text-foreground outline-none ring-1 ring-inset ring-ring/50"
                                     onClick={(e) => e.stopPropagation()}
                                   />
-                                  <span className="text-xs text-muted-foreground/60 px-2 font-normal">
+                                  <span className="px-1.5 text-2xs font-normal text-muted-foreground/70">
                                     {gpProjects.length}
                                   </span>
                                 </div>
@@ -978,29 +979,32 @@ export function ProjectSidebar({
                                 <button
                                   type="button"
                                   onClick={() => handleSelectGroup(group.id)}
-                                  className="flex min-w-0 flex-1 items-center self-stretch cursor-pointer"
+                                  className="flex min-w-0 flex-1 cursor-pointer items-center self-stretch"
                                   aria-pressed={isActiveGroup}
                                   aria-label={group.name}
                                 >
                                   <span
                                     className={cn(
-                                      'mr-1.5 flex-shrink-0 inline-flex items-center',
+                                      'mr-1.5 inline-flex shrink-0 items-center',
                                       group.color
                                         ? getColorClasses(group.color).text
-                                        : 'text-primary/80'
+                                        : 'text-muted-foreground'
                                     )}
                                   >
                                     {isCollapsed ? <Folder size={13} /> : <FolderOpen size={13} />}
                                   </span>
                                   <span
                                     className={cn(
-                                      'text-sm font-medium truncate flex-1',
-                                      isActiveGroup ? 'text-foreground' : 'text-sidebar-foreground'
+                                      'min-w-0 flex-1 truncate text-xs leading-4',
+                                      isActiveGroup
+                                        ? 'font-medium text-foreground'
+                                        : 'text-sidebar-foreground'
                                     )}
+                                    title={group.name}
                                   >
                                     {group.name}
                                   </span>
-                                  <span className="text-xs text-muted-foreground/60 px-2 font-normal">
+                                  <span className="px-1.5 text-2xs font-normal text-muted-foreground/70">
                                     {gpProjects.length}
                                   </span>
                                 </button>
@@ -1038,8 +1042,7 @@ export function ProjectSidebar({
                                   layout="position"
                                   className="list-none"
                                   whileDrag={{
-                                    scale: 1.02,
-                                    boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+                                    opacity: 0.82,
                                     pointerEvents: 'none'
                                   }}
                                   onDrag={(_event, info) => {
@@ -1134,8 +1137,7 @@ export function ProjectSidebar({
                         layout="position"
                         className="list-none"
                         whileDrag={{
-                          scale: 1.02,
-                          boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+                          opacity: 0.82,
                           pointerEvents: 'none'
                         }}
                         onDrag={(_event, info) => {
@@ -1203,7 +1205,7 @@ export function ProjectSidebar({
                 <button
                   onClick={() => setShowArchived(!showArchived)}
                   disabled={isSearching}
-                  className="label-section w-full flex items-center px-3 py-1.5 text-sidebar-foreground hover:bg-sidebar-accent/50 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-default disabled:hover:bg-transparent"
+                  className="label-section mx-1 mt-1 flex h-7 w-[calc(100%-0.5rem)] items-center rounded-sm px-1.5 text-sidebar-foreground transition-colors hover:bg-sidebar-accent/50 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-default disabled:hover:bg-transparent"
                   aria-expanded={showArchived || isSearching}
                   aria-label={t('archivedToggleAria')}
                 >
@@ -1243,9 +1245,9 @@ export function ProjectSidebar({
       />
 
       {/* Version - pinned bottom */}
-      <div className="p-2 rounded-b-xl">
-        <div className="w-full h-6 inline-flex items-center justify-center">
-          <span className="text-xs text-muted-foreground">Termul v0.4.10</span>
+      <div className="border-t border-sidebar-border/60 px-2 py-1">
+        <div className="inline-flex h-6 w-full items-center justify-center">
+          <span className="text-3xs text-muted-foreground/60">Termul v0.4.10</span>
         </div>
       </div>
 
@@ -1289,30 +1291,33 @@ export function ProjectSidebar({
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
-          className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-[2px]"
           onClick={handleCloseSettings}
         >
           <motion.div
-            initial={{ opacity: 0, scale: 0.95, y: 10 }}
-            animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.95, y: 10 }}
+            initial={{ opacity: 0, y: -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -6 }}
             transition={{ duration: 0.15 }}
-            className="bg-card rounded-lg shadow-2xl w-[500px] border border-border overflow-hidden"
+            className="w-[500px] overflow-hidden rounded-md border border-border/80 bg-card shadow-[0_18px_60px_hsl(var(--background)/0.7),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]"
             onClick={(e) => e.stopPropagation()}
           >
             {/* Header */}
-            <div className="px-4 py-3 border-b border-border flex justify-between items-center bg-secondary/50">
-              <h3 className="text-sm font-semibold text-foreground">{t('projectSettings')}</h3>
+            <div className="flex h-9 items-center justify-between border-b border-border/70 px-3">
+              <h3 className="text-xs font-semibold tracking-[-0.01em] text-foreground">
+                {t('projectSettings')}
+              </h3>
               <button
+                type="button"
                 onClick={handleCloseSettings}
-                className="text-muted-foreground hover:text-foreground transition-colors"
+                className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               >
                 <X size={14} />
               </button>
             </div>
 
             {/* Form */}
-            <div className="p-6 space-y-4">
+            <div className="space-y-3 p-4">
               {/* Name Field */}
               <div className="space-y-2">
                 <label className="text-xs font-medium text-muted-foreground">
@@ -1322,7 +1327,7 @@ export function ProjectSidebar({
                   type="text"
                   value={settingsName}
                   onChange={(e) => setSettingsName(e.target.value)}
-                  className="w-full bg-secondary border border-border rounded px-3 py-1.5 text-sm text-foreground focus:ring-1 focus:ring-primary outline-none placeholder-muted-foreground"
+                  className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:border-ring/70 focus-visible:ring-1 focus-visible:ring-ring/35"
                   placeholder={t('projectName')}
                 />
               </div>
@@ -1337,13 +1342,14 @@ export function ProjectSidebar({
                     type="text"
                     value={settingsPath}
                     onChange={(e) => setSettingsPath(e.target.value)}
-                    className="flex-1 bg-secondary border border-border rounded px-3 py-1.5 text-sm text-foreground focus:ring-1 focus:ring-primary outline-none placeholder-muted-foreground"
+                    className="h-8 flex-1 rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:border-ring/70 focus-visible:ring-1 focus-visible:ring-ring/35"
                     placeholder={t('noDirectorySelected')}
                   />
                   <button
+                    type="button"
                     onClick={handleBrowsePath}
                     disabled={settingsPathLoading}
-                    className="bg-secondary hover:bg-muted text-foreground text-xs px-3 rounded border border-border transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="inline-flex h-8 items-center rounded-md border border-border/80 bg-secondary/50 px-3 text-xs text-foreground transition-colors hover:bg-secondary focus:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-45"
                   >
                     {t('browse')}
                   </button>
@@ -1365,10 +1371,10 @@ export function ProjectSidebar({
                         type="button"
                         onClick={() => setSettingsColor(color)}
                         className={cn(
-                          'w-6 h-6 rounded-full transition-all',
+                          'size-6 rounded-sm transition-[opacity,box-shadow]',
                           colors.bg,
                           settingsColor === color
-                            ? 'ring-2 ring-offset-2 ring-offset-card ring-current'
+                            ? 'ring-1 ring-foreground/70 ring-offset-2 ring-offset-card'
                             : 'hover:opacity-80'
                         )}
                       />
@@ -1387,7 +1393,7 @@ export function ProjectSidebar({
                     <select
                       value={settingsShell}
                       onChange={(e) => setSettingsShell(e.target.value)}
-                      className="w-full appearance-none bg-secondary border border-border rounded px-3 py-1.5 pr-8 text-sm text-foreground focus:ring-1 focus:ring-primary focus:border-primary outline-none cursor-pointer"
+                      className="h-8 w-full cursor-pointer appearance-none rounded-md border border-input/80 bg-secondary/35 px-2.5 pr-8 text-sm text-foreground outline-none focus-visible:border-ring/70 focus-visible:ring-1 focus-visible:ring-ring/35"
                     >
                       {availableShells.available.map((shell) => (
                         <option key={shell.path} value={shell.path}>
@@ -1406,16 +1412,18 @@ export function ProjectSidebar({
             </div>
 
             {/* Footer */}
-            <div className="px-6 py-3 bg-secondary/50 flex justify-end gap-2 border-t border-border">
+            <div className="flex h-10 items-center justify-end gap-2 border-t border-border/70 bg-secondary/20 px-4">
               <button
+                type="button"
                 onClick={handleCloseSettings}
-                className="px-3 py-1.5 text-xs font-medium text-muted-foreground hover:text-foreground transition-colors"
+                className="inline-flex h-8 items-center rounded-md px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary/60 hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               >
                 {t('cancel')}
               </button>
               <button
+                type="button"
                 onClick={handleSaveSettings}
-                className="px-3 py-1.5 text-xs font-medium bg-primary text-primary-foreground rounded hover:bg-primary/90 shadow-md shadow-primary/20 transition-colors"
+                className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               >
                 {t('saveChanges')}
               </button>
@@ -1524,10 +1532,10 @@ const ProjectItem = memo(function ProjectItem({
               }
             }}
             className={cn(
-              'w-full flex items-center px-0 py-1 transition-colors group text-left border-l-2 cursor-pointer select-none',
+              'group mx-1 flex h-7 w-[calc(100%-0.5rem)] cursor-pointer select-none items-center rounded-sm px-1.5 text-left transition-colors',
               isActive
-                ? `${colors.border} bg-sidebar-accent`
-                : `${colors.borderMuted} hover:bg-sidebar-accent/50`
+                ? 'bg-sidebar-accent text-foreground ring-1 ring-inset ring-primary/35'
+                : 'text-sidebar-foreground hover:bg-sidebar-accent/50 hover:text-foreground'
             )}
             aria-current={isActive ? 'page' : undefined}
             aria-label={
@@ -1536,6 +1544,17 @@ const ProjectItem = memo(function ProjectItem({
                 : t('projectAria', { name: project.name })
             }
           >
+            {!isEditing && (
+              <span
+                aria-hidden="true"
+                data-project-color={project.color}
+                className={cn(
+                  'mr-1.5 size-1.5 shrink-0 rounded-[1px]',
+                  colors.bg,
+                  isActive ? 'opacity-80' : 'opacity-45'
+                )}
+              />
+            )}
             {isEditing ? (
               <input
                 ref={inputRef}
@@ -1544,15 +1563,17 @@ const ProjectItem = memo(function ProjectItem({
                 onChange={(e) => onEditNameChange(e.target.value)}
                 onKeyDown={handleKeyDown}
                 onBlur={onSaveRename}
-                className="flex-1 min-w-0 bg-sidebar-accent border border-border rounded-md px-2 py-0.5 text-sm text-foreground outline-none focus:ring-1 focus:ring-primary ml-2 mr-2"
+                className="mx-1 min-w-0 flex-1 bg-transparent px-1 text-xs text-foreground outline-none ring-1 ring-inset ring-ring/50"
                 onClick={(e) => e.stopPropagation()}
               />
             ) : (
               <span
                 className={cn(
-                  'text-sm transition-colors flex-1 min-w-0 truncate ml-2 mr-2',
+                  'min-w-0 flex-1 truncate text-xs leading-4 transition-colors',
                   // flex-1 min-w-0 is required for truncate to clip inside a flex row
-                  isActive ? 'text-foreground' : 'text-muted-foreground group-hover:text-foreground'
+                  isActive
+                    ? 'text-foreground'
+                    : 'text-sidebar-foreground group-hover:text-foreground'
                 )}
                 title={project.name}
               >
@@ -1561,7 +1582,7 @@ const ProjectItem = memo(function ProjectItem({
             )}
             {hasError && (
               <span
-                className="flex items-center mr-2 text-yellow-500 animate-pulse"
+                className="mr-1 flex animate-pulse items-center text-warning"
                 title={t('terminalCrashed')}
               >
                 <AlertTriangle size={12} />
@@ -1570,7 +1591,7 @@ const ProjectItem = memo(function ProjectItem({
             {!isEditing && shortcut && (
               <span
                 className={cn(
-                  'text-xs font-mono text-muted-foreground transition-opacity mr-3',
+                  'mr-1 font-mono text-2xs text-muted-foreground/70 transition-opacity',
                   isActive ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
                 )}
               >
@@ -1583,16 +1604,16 @@ const ProjectItem = memo(function ProjectItem({
                   e.stopPropagation()
                   onSettingsClick()
                 }}
-                className="h-5 w-5 inline-flex items-center justify-center rounded opacity-0 group-hover:opacity-100 hover:bg-sidebar-accent transition-all mr-2 flex-shrink-0 focus:outline-none focus-visible:ring-1 focus-visible:ring-primary"
+                className="mr-0.5 inline-flex size-5 shrink-0 items-center justify-center rounded-md text-muted-foreground opacity-0 transition-opacity hover:bg-sidebar-accent hover:text-foreground group-hover:opacity-100 focus:outline-none focus-visible:opacity-100 focus-visible:ring-1 focus-visible:ring-ring"
                 title={t('projectSettings')}
                 aria-label={t('settingsFor', { name: project.name })}
               >
-                <Settings size={12} className="text-muted-foreground" />
+                <Settings size={12} />
               </button>
             )}
             {!isEditing && hasActivity && (
               <span
-                className="flex items-center mr-3"
+                className="mr-1 flex items-center"
                 title={t('activity')}
                 style={{ isolation: 'isolate' }}
               >
@@ -1639,22 +1660,24 @@ function ArchivedProjectItem({
         <button
           onClick={onClick}
           onContextMenu={onContextMenu}
-          className={cn(
-            'w-full flex items-center px-0 py-1 transition-colors group text-left border-l-2 opacity-60 hover:opacity-100',
-            colors.borderMuted
-          )}
+          className="group mx-1 flex h-7 w-[calc(100%-0.5rem)] items-center rounded-sm px-1.5 text-left text-muted-foreground opacity-60 transition-[background-color,opacity] hover:bg-sidebar-accent/50 hover:opacity-100"
           aria-label={t('archivedProjectAria', { name: project.name })}
           data-testid={`archived-project-item-${project.id}`}
         >
           <span
-            className="text-sm text-muted-foreground group-hover:text-foreground flex-1 min-w-0 truncate ml-2 mr-2"
+            aria-hidden="true"
+            data-project-color={project.color}
+            className={cn('mr-1.5 size-1.5 shrink-0 rounded-[1px] opacity-40', colors.bg)}
+          />
+          <span
+            className="min-w-0 flex-1 truncate text-xs leading-4 text-muted-foreground group-hover:text-foreground"
             title={project.name}
           >
             {project.name}
           </span>
           {hasActivity && (
             <span
-              className="flex items-center mr-2"
+              className="mr-1 flex items-center"
               title={t('activity')}
               style={{ isolation: 'isolate' }}
             >
@@ -1669,13 +1692,13 @@ function ArchivedProjectItem({
           )}
           {hasError && (
             <span
-              className="flex items-center mr-2 text-yellow-500 animate-pulse"
+              className="mr-1 flex animate-pulse items-center text-warning"
               title={t('terminalCrashed')}
             >
               <AlertTriangle size={10} />
             </span>
           )}
-          <Archive size={12} className="text-muted-foreground mr-3" />
+          <Archive size={12} className="mr-0.5 text-muted-foreground" />
         </button>
       </ContextMenuTrigger>
       {renderContextMenu?.(project)}
@@ -1821,10 +1844,10 @@ function SSHResizableSection({
       {/* Drag handle */}
       <div
         onMouseDown={handleMouseDown}
-        className="h-[3px] border-t border-sidebar-border cursor-row-resize hover:bg-primary/30 active:bg-primary/50 transition-colors group flex items-center justify-center"
+        className="group flex h-1.5 shrink-0 cursor-row-resize items-center justify-center border-t border-sidebar-border/70 bg-transparent transition-colors hover:bg-ring/20 active:bg-ring/30"
         title={t('dragToResize')}
       >
-        <div className="w-8 h-[2px] rounded-full bg-muted-foreground/0 group-hover:bg-muted-foreground/30 transition-colors" />
+        <div className="h-px w-8 bg-muted-foreground/0 transition-colors group-hover:bg-muted-foreground/45" />
       </div>
       {/* SSH Panel content */}
       <div className="flex-1 overflow-hidden">

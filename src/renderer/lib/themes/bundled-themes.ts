@@ -18,14 +18,14 @@ const BUNDLED_DARK_COLOR_THEMES: Record<string, ColorThemeDefinition> = {
     familyId: 'termul',
     dark: {
       palette: {
-        neutral: '#121212',
-        ink: '#e5e5e5',
-        primary: '#3b82f6',
-        accent: '#3b82f6',
-        success: '#22c55e',
-        warning: '#eab308',
-        error: '#ef4444',
-        info: '#38bdf8'
+        neutral: '#131410',
+        ink: '#e6e5e0',
+        primary: '#8a9d72',
+        accent: '#8a9d72',
+        success: '#739d6c',
+        warning: '#c39f69',
+        error: '#c26b6b',
+        info: '#7898ab'
       },
       overrides: {
         'syntax-comment': '#6a9955',

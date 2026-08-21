@@ -232,6 +232,24 @@ describe('ChatMessageList', () => {
     expect(screen.getByText('Reading files')).toBeInTheDocument()
   })
 
+  it('lays out a content stream without edge fades or bubble chrome', () => {
+    const { container } = render(
+      <ChatMessageList
+        items={[userItem, completedToolItem, finalAgentItem]}
+        sessionId="session-1"
+        agentId="agent-1"
+        showRunningIndicator={false}
+      />
+    )
+
+    expect(container.innerHTML).toContain('max-w-3xl')
+    expect(container.querySelector('.chat-timeline-row-user')).toBeInTheDocument()
+    expect(container.querySelector('.chat-timeline-row-activity')).toBeInTheDocument()
+    expect(container.querySelector('.chat-timeline-row-agent')).toBeInTheDocument()
+    expect(container.innerHTML).not.toContain('bg-gradient-to-b')
+    expect(container.innerHTML).not.toContain('bg-gradient-to-t')
+  })
+
   it('collapses a failed tool-only turn but flags it for attention', () => {
     render(
       <ChatMessageList

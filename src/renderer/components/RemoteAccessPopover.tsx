@@ -12,7 +12,7 @@ import { useProjectStore } from '@/stores/project-store'
 import { useRemoteStatus, useRemoteStatusStore } from '@/stores/remote-status-store'
 
 const statusBarTriggerClass =
-  'flex cursor-pointer items-center rounded px-2 py-0.5 transition-colors hover:bg-muted hover:text-foreground'
+  'flex h-5 cursor-pointer items-center rounded-sm px-1.5 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground'
 
 /**
  * StatusBar popover for remote agent access.
@@ -101,21 +101,29 @@ export function RemoteAccessPopover(): React.JSX.Element {
           aria-label={t('remote.aria')}
           aria-pressed={isRunning}
         >
-          <Monitor size={14} className={cn('mr-0', isRunning ? 'text-green-300' : undefined)} />
+          <Monitor size={14} className={cn('mr-0', isRunning ? 'text-connection' : undefined)} />
           {isRunning && <span className="sr-only">{t('remote.enabled')}</span>}
         </button>
       </PopoverTrigger>
-      <PopoverContent side="top" align="end" className="w-72 p-4">
-        <div className="space-y-3">
+      <PopoverContent
+        side="top"
+        align="end"
+        className="w-72 p-3 shadow-[0_8px_24px_hsl(var(--background)/0.55),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]"
+      >
+        <div className="space-y-2.5">
           <div>
-            <h4 className="font-medium text-sm text-foreground">{t('remote.title')}</h4>
-            <p className="text-xs text-muted-foreground mt-1">{t('remote.description')}</p>
+            <h4 className="text-xs font-medium tracking-[-0.01em] text-foreground">
+              {t('remote.title')}
+            </h4>
+            <p className="mt-1 text-2xs leading-relaxed text-muted-foreground">
+              {t('remote.description')}
+            </p>
           </div>
 
           <div className="flex items-center justify-between gap-3">
-            <div className="flex-1 min-w-0">
-              <div className="text-sm text-foreground">{t('remote.enable')}</div>
-              <div className="text-xs text-muted-foreground mt-0.5">{t('remote.enableHint')}</div>
+            <div className="min-w-0 flex-1">
+              <div className="text-xs text-foreground">{t('remote.enable')}</div>
+              <div className="mt-0.5 text-2xs text-muted-foreground">{t('remote.enableHint')}</div>
             </div>
             <Switch
               checked={isRunning}
@@ -126,8 +134,8 @@ export function RemoteAccessPopover(): React.JSX.Element {
           </div>
 
           {remoteError && (
-            <div className="flex items-start gap-2 text-sm text-destructive bg-destructive/10 border border-destructive/30 rounded-md px-3 py-2">
-              <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+            <div className="flex items-start gap-2 rounded-md border border-destructive/35 bg-destructive/10 px-2.5 py-2 text-xs text-destructive">
+              <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
               <span>{remoteError}</span>
             </div>
           )}
@@ -136,36 +144,44 @@ export function RemoteAccessPopover(): React.JSX.Element {
             <div className="space-y-2">
               {/* White pad so the black QR modules are legible in dark themes. */}
               <div className="flex justify-center">
-                <div className="rounded-lg bg-white p-2">
+                <div className="rounded-md bg-white p-1.5">
                   <QRCodeSVG value={accessUrl} size={160} level="M" />
                 </div>
               </div>
-              <p className="text-xs text-muted-foreground">
+              <p className="text-2xs text-muted-foreground">
                 {remoteStatus?.tunnelProvider === 'cloudflareNamed'
                   ? t('remote.providerNamed')
                   : remoteStatus?.tunnelProvider === 'frp'
                     ? t('remote.providerFrp')
                     : t('remote.providerQuick')}
               </p>
-              <div className="flex items-start gap-2 text-xs text-amber-600 dark:text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-md px-3 py-2">
-                <ShieldAlert className="w-4 h-4 mt-0.5 shrink-0" />
+              <div className="flex items-start gap-2 rounded-md border border-warning/35 bg-warning/10 px-2.5 py-2 text-2xs text-warning">
+                <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0" />
                 <span>{t('remote.securityWarning')}</span>
               </div>
               <button
                 type="button"
                 onClick={() => void handleCopyLink()}
-                className="w-full inline-flex items-center justify-center gap-2 text-xs bg-secondary hover:bg-secondary/80 border border-border rounded-md px-3 py-1.5 transition-colors"
+                className="inline-flex h-7 w-full items-center justify-center gap-1.5 rounded-md border border-border/80 bg-secondary/50 px-2.5 text-2xs font-medium text-foreground transition-colors hover:bg-secondary focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                 aria-label={t('remote.copyAria')}
               >
-                {copiedUrl ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                {copiedUrl ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
                 {copiedUrl ? t('remote.copied') : t('remote.copy')}
               </button>
             </div>
           )}
 
           {isRunning && !accessUrl && (
-            <div className="flex items-center justify-center text-xs text-muted-foreground py-2">
-              {sawUrl ? t('remote.disconnected') : t('remote.starting')}
+            <div className="flex flex-col items-center justify-center gap-1.5 py-4 text-center">
+              <span
+                className={cn(
+                  'h-1.5 w-1.5 rounded-full',
+                  sawUrl ? 'bg-warning' : 'animate-pulse bg-connection'
+                )}
+              />
+              <p className={cn('text-2xs', sawUrl ? 'text-warning' : 'text-muted-foreground')}>
+                {sawUrl ? t('remote.disconnected') : t('remote.starting')}
+              </p>
             </div>
           )}
         </div>

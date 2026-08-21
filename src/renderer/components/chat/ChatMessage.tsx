@@ -21,7 +21,6 @@ import {
   AlertDialogHeader,
   AlertDialogTitle
 } from '@/components/ui/alert-dialog'
-import { Bubble, BubbleContent } from '@/components/ui/bubble'
 import { ImageLightbox } from '@/components/ui/image-lightbox'
 import { Message, MessageContent } from '@/components/ui/message'
 import { useRuntimeTranslation } from '@/i18n/use-runtime-translation'
@@ -47,6 +46,7 @@ import {
   isLocalFileUri,
   uint8ToBase64
 } from './chat-attachments'
+import { CHAT_USER_MEASURE } from './chat-layout'
 import { ChatMarkdownCode } from './chat-markdown-code'
 import { filePathFromHref, remarkFilePathLinks } from './chat-markdown-file-links'
 import { ChatMarkdownTable } from './chat-markdown-table'
@@ -75,17 +75,19 @@ function blocksToText(blocks: ContentBlock[]): string {
 function UserMessageText({ text }: { text: string }): React.JSX.Element {
   const segments = parseSkillSegments(text)
   return (
-    <BubbleContent className="whitespace-pre-wrap break-words">
-      {segments.length === 0
-        ? text
-        : segments.map((seg, i) =>
-            seg.kind === 'skill' ? (
-              <SkillChip key={`skill-${i}`} name={seg.name} />
-            ) : (
-              <span key={`text-${i}`}>{seg.text}</span>
-            )
-          )}
-    </BubbleContent>
+    <div className="chat-user-prompt">
+      <div className="whitespace-pre-wrap break-words">
+        {segments.length === 0
+          ? text
+          : segments.map((seg, i) =>
+              seg.kind === 'skill' ? (
+                <SkillChip key={`skill-${i}`} name={seg.name} />
+              ) : (
+                <span key={`text-${i}`}>{seg.text}</span>
+              )
+            )}
+      </div>
+    </div>
   )
 }
 
@@ -179,7 +181,7 @@ function ResourceText({ block }: { block: ContentBlock }): React.JSX.Element | n
   return (
     <pre
       data-embedded-resource={blockDisplayName(block)}
-      className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded border border-border/40 bg-background/60 px-2 py-1.5 font-mono text-xs leading-relaxed text-foreground/90"
+      className="chat-embedded-resource max-h-72 overflow-auto whitespace-pre-wrap break-words px-2.5 py-2 font-mono text-xs leading-relaxed text-foreground/90"
     >
       {boundedText}
     </pre>
@@ -402,7 +404,7 @@ function AgentProse({
   }, [filePathContext, t])
 
   return (
-    <div className="chat-streamdown min-w-0 text-sm leading-normal text-foreground">
+    <div className="chat-streamdown min-w-0 text-sm leading-[1.6] text-foreground">
       <Streamdown
         mode="streaming"
         isAnimating={streaming}
@@ -504,6 +506,7 @@ function ChatMessageComponent({
   onRetry,
   filePathContext
 }: ChatMessageProps): React.JSX.Element {
+  const t = useRuntimeTranslation('chat')
   const reduced = useReducedMotion() ?? false
 
   const isUser = message.role === 'user'
@@ -518,9 +521,13 @@ function ChatMessageComponent({
 
   if (isUser) {
     return (
-      <div className="w-full">
-        <Message align="end" className="py-2">
-          <MessageContent className="w-fit max-w-[85%]">
+      <article
+        className="w-full"
+        data-chat-message="user"
+        aria-label={t('messages.yourMessage', 'Your message')}
+      >
+        <Message align="end" className="py-1.5">
+          <MessageContent className={cn('w-fit', CHAT_USER_MEASURE)}>
             {hasMedia && (
               <StaggerSection
                 delay={nextDelay()}
@@ -538,9 +545,7 @@ function ChatMessageComponent({
                 reduced={reduced}
                 animateEnter={animateEnter}
               >
-                <Bubble variant="tinted" align="end" className="max-w-full">
-                  <UserMessageText text={text} />
-                </Bubble>
+                <UserMessageText text={text} />
               </StaggerSection>
             )}
             <StaggerSection
@@ -553,6 +558,7 @@ function ChatMessageComponent({
                 // Copy a display-safe string: tokens become `(name)` so the
                 // clipboard never carries private-use sentinels. Edit keeps the
                 // raw token text so the composer re-seeds with chips inline.
+                className="chat-message-meta"
                 text={replaceSkillTokensInline(text)}
                 align="end"
                 pinned={actionsPinned}
@@ -561,7 +567,7 @@ function ChatMessageComponent({
             </StaggerSection>
           </MessageContent>
         </Message>
-      </div>
+      </article>
     )
   }
 
@@ -572,39 +578,42 @@ function ChatMessageComponent({
   const actionsDelay = nextDelay()
 
   return (
-    <div className="w-full">
-      <Message align="start" className={cn(showHeader ? 'py-2' : 'pb-2')}>
+    <article
+      className="w-full"
+      data-chat-message="agent"
+      data-streaming={streaming ? 'true' : undefined}
+      aria-label={t('messages.assistantMessage', 'Assistant message')}
+    >
+      <Message align="start" className={cn(showHeader ? 'pt-2 pb-1.5' : 'pb-1.5')}>
         <MessageContent className="min-w-0 flex-1">
-          {/* Skip the ghost bubble entirely for attachment-only assistant turns
-              so they don't render a blank shell above the media grid. The
-              streaming caret still needs a bubble to live in while the turn is
-              in progress, even before any text has arrived. */}
+          {/* Attachment-only assistant turns skip the stream shell so they
+              don't render a blank block above the media grid. The streaming
+              caret still needs a home while the turn is in progress, even
+              before any text has arrived. */}
           {(proseText.length > 0 || streaming) && (
-            <Bubble variant="ghost" className="w-fit max-w-full">
-              <BubbleContent>
-                <StaggerSection
-                  delay={proseDelay}
-                  align="start"
-                  reduced={reduced}
-                  animateEnter={animateEnter}
-                >
-                  {proseText.length > 0 && (
-                    <AgentProse
-                      text={proseText}
-                      streaming={streaming}
-                      reduced={reduced}
-                      filePathContext={filePathContext}
-                    />
-                  )}
-                  {streaming && proseText.length === 0 && (
-                    <span
-                      aria-hidden="true"
-                      className="ml-0.5 inline-block h-[1.1em] w-[2px] translate-y-0.5 animate-caret-blink bg-primary align-middle motion-reduce:animate-none motion-reduce:opacity-100"
-                    />
-                  )}
-                </StaggerSection>
-              </BubbleContent>
-            </Bubble>
+            <div className="chat-agent-stream">
+              <StaggerSection
+                delay={proseDelay}
+                align="start"
+                reduced={reduced}
+                animateEnter={animateEnter}
+              >
+                {proseText.length > 0 && (
+                  <AgentProse
+                    text={proseText}
+                    streaming={streaming}
+                    reduced={reduced}
+                    filePathContext={filePathContext}
+                  />
+                )}
+                {streaming && proseText.length === 0 && (
+                  <span
+                    aria-hidden="true"
+                    className="ml-0.5 inline-block h-[1.1em] w-[2px] translate-y-0.5 animate-caret-blink bg-primary align-middle motion-reduce:animate-none motion-reduce:opacity-100"
+                  />
+                )}
+              </StaggerSection>
+            </div>
           )}
           {hasMedia && mediaDelay != null && (
             <StaggerSection
@@ -624,6 +633,7 @@ function ChatMessageComponent({
               animateEnter={animateEnter}
             >
               <MessageActions
+                className="chat-message-meta"
                 text={turnText ?? text}
                 align="start"
                 pinned={actionsPinned}
@@ -633,7 +643,7 @@ function ChatMessageComponent({
           )}
         </MessageContent>
       </Message>
-    </div>
+    </article>
   )
 }
 

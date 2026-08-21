@@ -1,4 +1,4 @@
-import { darkenHex, lightenHex, mixHex } from './color-utils'
+import { darkenHex, lightenHex } from './color-utils'
 import type { ThemeAppearance, ThemePalette } from './types'
 
 export interface DerivedSurfaces {
@@ -16,19 +16,19 @@ export function deriveSurfaces(
 ): DerivedSurfaces {
   if (appearance === 'light') {
     return {
-      card: darkenHex(palette.neutral, 0.02),
-      secondary: darkenHex(palette.neutral, 0.04),
-      muted: darkenHex(palette.neutral, 0.06),
-      border: darkenHex(palette.neutral, 0.12),
-      sidebar: mixHex(palette.neutral, '#000000', 0.03)
+      card: darkenHex(palette.neutral, 0.015),
+      secondary: darkenHex(palette.neutral, 0.035),
+      muted: darkenHex(palette.neutral, 0.055),
+      border: darkenHex(palette.neutral, 0.09),
+      sidebar: darkenHex(palette.neutral, 0.01)
     }
   }
 
   return {
-    card: lightenHex(palette.neutral, 0.06),
-    secondary: lightenHex(palette.neutral, 0.08),
-    muted: lightenHex(palette.neutral, 0.11),
-    border: lightenHex(palette.neutral, 0.14),
-    sidebar: mixHex(palette.neutral, '#000000', 0.04)
+    card: lightenHex(palette.neutral, 0.025),
+    secondary: lightenHex(palette.neutral, 0.045),
+    muted: lightenHex(palette.neutral, 0.065),
+    border: lightenHex(palette.neutral, 0.09),
+    sidebar: lightenHex(palette.neutral, 0.012)
   }
 }

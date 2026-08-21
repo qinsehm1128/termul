@@ -219,7 +219,7 @@ function MacOsTitlebarStrip(): React.JSX.Element | null {
       </div>
 
       {(activeGroupName || activeProject) && (
-        <span className="absolute left-1/2 -translate-x-1/2 text-sm text-muted-foreground pointer-events-none select-none truncate max-w-[50%]">
+        <span className="pointer-events-none absolute left-1/2 max-w-[50%] -translate-x-1/2 select-none truncate text-2xs font-medium tracking-[0.01em] text-muted-foreground/80">
           {activeGroupName ?? activeProject?.name}
         </span>
       )}
@@ -2034,7 +2034,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
   if (!isLoaded) {
     if (isMobileWebShell) {
       return (
-        <div className="flex h-screen flex-col overflow-hidden bg-background">
+        <div className="flex h-full min-h-0 flex-col overflow-hidden bg-background">
           <div className="flex flex-1 items-center justify-center">
             <div className="text-sm text-muted-foreground">{t('loading')}</div>
           </div>
@@ -2042,7 +2042,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
       )
     }
     return (
-      <div className="h-screen flex flex-col overflow-hidden bg-background">
+      <div className="flex h-full min-h-0 flex-col overflow-hidden bg-background">
         <ResizeEdges />
         <div className="flex-1 flex flex-col overflow-hidden min-h-0 h-full">
           <MacOsTitlebarStrip />
@@ -2052,7 +2052,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
               onShortcutsOpenChange={setIsShortcutMenuOpen}
               canOpenGitChanges={false}
             />
-            <div className="flex-1 flex flex-col min-w-0">
+            <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
               <TitleBar />
               <div className="flex-1 flex items-center justify-center">
                 <div className="text-muted-foreground text-sm">{t('loading')}</div>
@@ -2102,9 +2102,9 @@ export default function WorkspaceLayout(): React.JSX.Element {
               )}
               <motion.div
                 key={fullscreenPaneId ? 'fullscreen' : 'normal'}
-                initial={{ opacity: 0.85, scale: 0.97 }}
-                animate={{ opacity: 1, scale: 1 }}
-                transition={{ duration: 0.2, ease: 'easeOut' }}
+                initial={{ opacity: 0.88 }}
+                animate={{ opacity: 1 }}
+                transition={{ duration: 0.14, ease: 'easeOut' }}
                 className="h-full min-h-0 flex-1 overflow-hidden"
               >
                 <PaneRenderer
@@ -2120,7 +2120,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
               </motion.div>
             </>
           ) : (
-            <div className="relative flex-1 overflow-hidden bg-background rounded-xl">
+            <div className="relative flex-1 overflow-hidden bg-background">
               <div className="h-full w-full">
                 <Outlet />
               </div>
@@ -2397,7 +2397,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
 
   if (isMobileWebShell) {
     return (
-      <div className="flex h-screen flex-col overflow-hidden bg-background">
+      <div className="flex h-full min-h-0 flex-col overflow-hidden bg-background">
         <Suspense fallback={<ShellSkeleton />}>
           <MobileChatShell
             onNewChat={handleOpenAgentChat}
@@ -2456,7 +2456,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
   }
 
   return (
-    <div className="h-screen flex flex-col overflow-hidden bg-background">
+    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-background">
       <ResizeEdges />
       <div className="flex-1 flex flex-col overflow-hidden min-h-0 h-full">
         <MacOsTitlebarStrip />
@@ -2471,13 +2471,13 @@ export default function WorkspaceLayout(): React.JSX.Element {
             isThemePickerOpen={isThemePickerOpen}
             onToggleThemePicker={handleToggleThemePicker}
           />
-          <div className="flex-1 flex flex-col min-w-0">
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
             <TitleBar />
 
-            <div className="flex-1 flex overflow-hidden min-h-0 h-full p-2 gap-0">
+            <div className="flex-1 flex overflow-hidden min-h-0 h-full">
               {/* Sidebar */}
               {isSidebarVisible && (
-                <div className="mr-2 flex h-full gap-2">
+                <div className="h-full min-h-0 overflow-hidden border-r border-sidebar-border/70">
                   {isConversationRoute ? (
                     <ConversationSidebar onNewChat={handleOpenAgentChat} />
                   ) : (
@@ -2504,7 +2504,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
               <PaneDndProvider>
                 <div className="flex-1 flex min-h-0 h-full gap-0 overflow-hidden min-w-0">
                   {/* Main Content Area */}
-                  <main className="relative flex-1 flex flex-col min-w-0 rounded-xl bg-card overflow-hidden">
+                  <main className="relative flex-1 flex flex-col min-w-0 bg-background overflow-hidden">
                     <WorkspaceConflictBanner conversationId={activeConversationId} />
                     {workspaceMain}
                     {isConversationListRoute && isAgentLauncherOpen ? (
@@ -2537,9 +2537,9 @@ export default function WorkspaceLayout(): React.JSX.Element {
                     ) : null}
                   </main>
 
-                  {/* File Explorer - separate floating panel */}
+                  {/* File Explorer - integrated right rail */}
                   {(isExplorerVisible && explorerRootVisible) || activeSSHProfile ? (
-                    <div className="flex-shrink-0 ml-2 flex flex-col gap-2 h-full">
+                    <div className="flex-shrink-0 flex flex-col h-full border-l border-border/70">
                       {isExplorerVisible && explorerRootVisible && (
                         <div className={activeSSHProfile ? 'flex-1 min-h-0' : 'h-full'}>
                           <Suspense fallback={<ShellSkeleton />}>
@@ -2550,7 +2550,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
                       {activeSSHProfile && (
                         <div
                           className={cn(
-                            'flex-1 bg-background rounded-xl overflow-hidden min-h-0 flex flex-col border border-border',
+                            'flex-1 bg-background overflow-hidden min-h-0 flex flex-col border-t border-border/70',
                             !(isExplorerVisible && explorerRootVisible) && 'w-64'
                           )}
                         >
