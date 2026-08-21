@@ -21,13 +21,16 @@ final class ProjectStore {
         do {
             let payload: ProjectListPayload = try await http.get("projects")
             projects = payload.projects
-            if active == nil {
-                active = payload.projects.first(where: { $0.id == payload.defaultProjectId })
-                    ?? payload.projects.first(where: { !$0.isArchived })
+            if let current = active {
+                active = projects.first(where: { $0.id == current.id })
             }
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    func clearSelection() {
+        active = nil
     }
 
     func select(_ project: HostProject) async {

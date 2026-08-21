@@ -27,12 +27,15 @@ final class TerminalStore {
 
     private var socket: TerminalSocket?
     private var origin: URL?
+    private var credentials: HostCredentials?
     private var watchedId: String?
+    private var lastConversationId: String?
     private var lastProjectId: String?
 
-    func attach(socket: TerminalSocket, origin: URL) {
+    func attach(socket: TerminalSocket, origin: URL, credentials: HostCredentials) {
         self.socket = socket
         self.origin = origin
+        self.credentials = credentials
         socket.onBytes = { [weak self] terminalId, data in
             guard let self else { return }
             if let existing = self.terminals.firstIndex(where: { $0.id == terminalId }) {
@@ -63,21 +66,22 @@ final class TerminalStore {
     }
 
     func ensureConnected() async throws {
-        guard let socket, let origin else {
+        guard let socket, let origin, let credentials else {
             throw HostError.unexpected(String(localized: "Not connected."))
         }
         if socket.isConnected { return }
-        try await socket.connect(origin: origin)
+        try await socket.connect(origin: origin, credentials: credentials)
     }
 
-    func refresh(projectId: String) async {
+    func refresh(conversationId: String?, projectId: String?) async {
+        lastConversationId = conversationId
         lastProjectId = projectId
         isConnecting = true
         defer { isConnecting = false }
         do {
             try await ensureConnected()
             guard let socket else { return }
-            let listed = try await socket.list(projectId: projectId)
+            let listed = try await socket.list(conversationId: conversationId, projectId: projectId)
             let ownedById = Dictionary(uniqueKeysWithValues: terminals.filter(\.owned).map { ($0.id, $0) })
             let previousActive = activeId
             terminals = listed.map { item in
@@ -122,13 +126,18 @@ final class TerminalStore {
         }
     }
 
-    func spawn(projectId: String, cwd: String?, cols: Int = 80, rows: Int = 24) async {
+    func spawn(conversationId: String, projectId: String?, cols: Int = 80, rows: Int = 24) async {
         isConnecting = true
         defer { isConnecting = false }
         do {
             try await ensureConnected()
             guard let socket else { return }
-            let spawned = try await socket.spawn(projectId: projectId, cwd: cwd, cols: cols, rows: rows)
+            let spawned = try await socket.spawn(
+                conversationId: conversationId,
+                projectId: projectId,
+                cols: cols,
+                rows: rows
+            )
             let live = LiveTerminal(
                 id: spawned.id,
                 claim: spawned.claim,
@@ -136,7 +145,7 @@ final class TerminalStore {
                 cols: spawned.cols ?? cols,
                 rows: spawned.rows ?? rows,
                 title: String(localized: "Terminal"),
-                cwd: spawned.cwd ?? cwd,
+                cwd: spawned.cwd,
                 gitBranch: nil,
                 owned: true
             )

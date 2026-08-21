@@ -58,6 +58,7 @@
       }
     },
     "Chats" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -220,6 +221,7 @@
 
     },
     "New chat" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -249,13 +251,13 @@
         }
       }
     },
-    "No chats yet" : {
-
-    },
     "No live terminal" : {
 
     },
     "No projects" : {
+
+    },
+    "No running sessions" : {
 
     },
     "No saved desks" : {
@@ -268,14 +270,23 @@
         }
       }
     },
+    "No sessions yet" : {
+
+    },
     "Not connected." : {
 
     },
     "OK" : {
 
     },
-    "Open a new host PTY. This phone cannot attach to a desktop terminal without a claim." : {
-      "extractionState" : "stale"
+    "Open a chat on the desktop. Sessions are independent of projects." : {
+
+    },
+    "Open a chat or terminal on the desktop, then pull to refresh." : {
+
+    },
+    "Open a project on the desktop, then reconnect." : {
+
     },
     "Open a terminal on the desktop, or start a new one here." : {
       "localizations" : {
@@ -286,9 +297,6 @@
           }
         }
       }
-    },
-    "Open a project on the desktop, then reconnect." : {
-
     },
     "Open chat" : {
       "localizations" : {
@@ -366,7 +374,7 @@
         }
       }
     },
-    "Pick a project first." : {
+    "Pick a session first." : {
 
     },
     "Projects" : {
@@ -452,6 +460,12 @@
     "Send" : {
 
     },
+    "Session" : {
+
+    },
+    "Sessions" : {
+
+    },
     "Settings" : {
       "localizations" : {
         "zh-Hans" : {
@@ -471,9 +485,6 @@
           }
         }
       }
-    },
-    "Start a chat, or open one that is already running on the desk." : {
-
     },
     "System" : {
       "localizations" : {
@@ -522,7 +533,7 @@
         }
       }
     },
-    "The host did not issue a terminal claim." : {
+    "The access token was rejected. Scan the desktop QR again." : {
 
     },
     "The host rejected the request." : {
@@ -585,6 +596,9 @@
         }
       }
     },
+    "This access link is missing its token. Scan the QR again." : {
+
+    },
     "This directory has no visible files." : {
 
     },
@@ -619,6 +633,7 @@
       }
     },
     "Workspace" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {

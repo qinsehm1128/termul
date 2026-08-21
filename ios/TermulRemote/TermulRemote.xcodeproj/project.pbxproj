@@ -356,7 +356,6 @@
 			productName = SwiftTerm;
 		};
 /* End XCSwiftPackageProductDependency section */
-
 	};
 	rootObject = A11A00000000000000000004 /* Project object */;
 }

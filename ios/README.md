@@ -16,13 +16,13 @@ Requires Xcode 26 and iOS 26.
 
 1. On the desktop, enable remote access in the status bar.
 2. Scan the QR, or paste the copied `https://…` link.
-3. Use **Chat** / **Terminal** in the session header. Projects and Files are in the header actions.
+3. After pairing, choose **Sessions** (independent chats) or **Projects** (desktop project terminals). The access URL fragment (`#access_token=…`) is the bearer credential.
 
 Deep link: `termul://open?url=<encoded-https-access-url>`.
 
 HTTP FRP origins are rejected. Put TLS in front of FRP, or use Cloudflare.
 
-Terminal lists the host’s **already running** PTYs for the active project (`list` + `watch`) and shows their scrollback. “New terminal” is optional. Phone resize does not change a desktop-owned PTY. The emulator is [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) (`ios/Vendor/SwiftTerm`, plugin stripped so Xcode 27 can compile it).
+Terminal lists the host’s **already running** PTYs for the active desktop session (`list` by `conversationId`, then `watch`) and shows their scrollback. “New terminal” is optional and conversation-scoped. Phone resize does not change a desktop-owned PTY. The emulator is [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) (`ios/Vendor/SwiftTerm`, plugin stripped so Xcode 27 can compile it).
 
 ## Language
 

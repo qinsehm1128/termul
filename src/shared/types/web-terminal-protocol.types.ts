@@ -260,6 +260,7 @@ export interface LiveTerminalSummary {
   pid: number
   cols: number
   rows: number
+  conversationId?: string
   projectId?: string | null
   title: string
   gitBranch?: string | null

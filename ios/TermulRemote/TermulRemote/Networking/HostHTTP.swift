@@ -9,6 +9,12 @@ struct IpcResult<T: Decodable>: Decodable {
 
 struct HostHTTP: Sendable {
     let origin: URL
+    let credentials: HostCredentials
+
+    init(origin: URL, credentials: HostCredentials) {
+        self.origin = origin
+        self.credentials = credentials
+    }
 
     func get<T: Decodable>(_ path: String, query: [String: String] = [:]) async throws -> T {
         let result: IpcResult<T> = try await getEnvelope(path, query: query)
@@ -16,7 +22,7 @@ struct HostHTTP: Sendable {
     }
 
     func getEnvelope<T: Decodable>(_ path: String, query: [String: String] = [:]) async throws -> IpcResult<T> {
-        var components = URLComponents(url: origin.appendingPathComponent(path.hasPrefix("/") ? String(path.dropFirst()) : path), resolvingAgainstBaseURL: false)
+        var components = URLComponents(url: url(for: path), resolvingAgainstBaseURL: false)
         if !query.isEmpty {
             components?.queryItems = query.map { URLQueryItem(name: $0.key, value: $0.value) }
         }
@@ -26,6 +32,7 @@ struct HostHTTP: Sendable {
         var request = URLRequest(url: url, timeoutInterval: 20)
         request.httpMethod = "GET"
         request.assumesHTTP3Capable = false
+        credentials.apply(to: &request)
         return try await decode(request)
     }
 
@@ -38,6 +45,7 @@ struct HostHTTP: Sendable {
         var request = URLRequest(url: origin.appendingPathComponent("health"), timeoutInterval: 12)
         request.httpMethod = "GET"
         request.assumesHTTP3Capable = false
+        credentials.apply(to: &request)
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, (200 ..< 300).contains(http.statusCode) else {
             throw HostError.network(String(localized: "The phone could not reach the tunnel. Quick Tunnels go through Cloudflare, not your LAN."))
@@ -49,12 +57,22 @@ struct HostHTTP: Sendable {
     }
 
     private func sendJSON<T: Decodable>(_ path: String, method: String, body: [String: Any]) async throws -> IpcResult<T> {
-        var request = URLRequest(url: origin.appendingPathComponent(path.hasPrefix("/") ? String(path.dropFirst()) : path), timeoutInterval: 20)
+        var request = URLRequest(url: url(for: path), timeoutInterval: 20)
         request.httpMethod = method
         request.assumesHTTP3Capable = false
         request.setValue("application/json", forHTTPHeaderField: "content-type")
+        credentials.apply(to: &request)
         request.httpBody = try WireJSON.data(from: body)
         return try await decode(request)
+    }
+
+    private func url(for path: String) -> URL {
+        var base = origin.absoluteString
+        while base.hasSuffix("/") {
+            base.removeLast()
+        }
+        let suffix = path.hasPrefix("/") ? path : "/\(path)"
+        return URL(string: base + suffix) ?? origin.appending(path: path)
     }
 
     private func decode<T: Decodable>(_ request: URLRequest) async throws -> IpcResult<T> {
@@ -62,6 +80,9 @@ struct HostHTTP: Sendable {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse else {
                 throw HostError.network(String(localized: "The tunnel returned an unexpected response."))
+            }
+            if http.statusCode == 401 || http.statusCode == 403 {
+                throw HostError.network(String(localized: "The access token was rejected. Scan the desktop QR again."))
             }
             if !(200 ..< 300).contains(http.statusCode) {
                 throw HostError.network("HTTP \(http.statusCode)")

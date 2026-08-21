@@ -2,49 +2,15 @@ import SwiftUI
 
 struct ChatView: View {
     @Bindable var session: WorkspaceSession
+    var embedded = false
     @State private var draft = ""
-    @State private var showSessions = false
 
     var body: some View {
         VStack(spacing: 0) {
-            sessionBar
             messageList
             permissionStack
             composer
         }
-        .sheet(isPresented: $showSessions) {
-            SessionListView(session: session)
-        }
-    }
-
-    private var sessionBar: some View {
-        HStack {
-            Button {
-                showSessions = true
-            } label: {
-                Label(currentTitle, systemImage: "bubble.left.and.bubble.right")
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(1)
-            }
-            Spacer()
-            Button {
-                Task {
-                    let cwd = session.projects.active?.path ?? session.chat.activeCwd
-                    await session.chat.startNewChat(cwd: cwd, projectId: session.projects.active?.id)
-                }
-            } label: {
-                Image(systemName: "square.and.pencil")
-                    .frame(minWidth: 44, minHeight: 44)
-            }
-            .accessibilityLabel(Text("New chat"))
-        }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 4)
-    }
-
-    private var currentTitle: String {
-        session.chat.sessions.first(where: { $0.sessionId == session.chat.activeSessionId })?.displayTitle
-            ?? String(localized: "Chat")
     }
 
     private var messageList: some View {
@@ -113,7 +79,7 @@ struct ChatView: View {
                 Button {
                     let text = draft
                     draft = ""
-                    Task { await session.chat.send(text) }
+                    Task { await session.chat.send(text, in: session.conversations.active) }
                 } label: {
                     Image(systemName: "arrow.up.circle.fill")
                         .font(.title)
@@ -231,49 +197,5 @@ private struct QuestionCardView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(TermulTheme.surface)
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-    }
-}
-
-private struct SessionListView: View {
-    @Bindable var session: WorkspaceSession
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        NavigationStack {
-            List(session.chat.sessions) { item in
-                Button {
-                    Task {
-                        await session.chat.open(item)
-                        dismiss()
-                    }
-                } label: {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(item.displayTitle)
-                            .foregroundStyle(.primary)
-                        Text(item.cwd ?? item.sessionId)
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                }
-            }
-            .navigationTitle(String(localized: "Chats"))
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
-                }
-            }
-            .overlay {
-                if session.chat.sessions.isEmpty {
-                    ContentUnavailableView(
-                        "No chats yet",
-                        systemImage: "bubble.left",
-                        description: Text("Start a chat, or open one that is already running on the desk.")
-                    )
-                }
-            }
-        }
-        .presentationDetents([.medium, .large])
     }
 }

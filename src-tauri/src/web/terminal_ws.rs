@@ -4,9 +4,10 @@
 //! router admits it only after bearer capability middleware succeeds. All
 //! operations are Conversation-scoped: `conversationId` is the primary PTY
 //! ownership/claim scope. `projectId` is optional attribution only.
-//! Companion clients can enumerate project-attributed PTYs with `list` and
-//! subscribe without rotating the desktop claim with `watch`; the bearer
-//! principal and current claim generation still fence passive output.
+//! Companion clients enumerate live PTYs with `list` (`conversationId` first,
+//! `projectId` as attribution fallback) and subscribe with `watch` without
+//! rotating the desktop claim. The bearer principal and current claim
+//! generation still fence passive output.
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
@@ -26,6 +27,7 @@ use tracing::{info, warn};
 
 #[cfg(test)]
 use crate::pty::manager::SpawnOptions;
+use crate::conversation::ConversationId;
 use crate::pty::manager::{TerminalReplay, TerminalResumeRequest, TerminalSpawnIntentV1};
 use crate::web::auth::{
     auth_error_response, RemoteAccessAuthority, RemoteAuthError, RemoteCapability, RemotePrincipal,
@@ -473,12 +475,30 @@ async fn handle(
             serde_json::to_value(grant).map_err(|error| ("NETWORK_ERROR", error.to_string()))
         }
         "list" => {
-            let project_id = string_field(&request.payload, "projectId")?;
+            let conversation_filter = optional_conversation_id(&request.payload)?;
+            let project_filter = request
+                .payload
+                .get("projectId")
+                .and_then(Value::as_str)
+                .filter(|value| !value.is_empty());
+            if conversation_filter.is_none() && project_filter.is_none() {
+                return Err((
+                    "VALIDATION_ERROR",
+                    "list requires conversationId or projectId".to_string(),
+                ));
+            }
             let terminals: Vec<Value> = state
                 .pty
                 .get_all()
                 .into_iter()
-                .filter(|instance| instance.is_active() && instance.project_matches(project_id))
+                .filter(|instance| {
+                    instance.is_active()
+                        && companion_list_matches(
+                            instance,
+                            conversation_filter,
+                            project_filter,
+                        )
+                })
                 .map(|instance| {
                     let cwd = state
                         .cwd_tracker
@@ -489,7 +509,9 @@ async fn handle(
                 })
                 .collect();
             info!(
-                "[terminal-ws] list success project_id={project_id} count={}",
+                "[terminal-ws] list success conversation_filter={} project_filter={} count={}",
+                conversation_filter.is_some(),
+                project_filter.is_some(),
                 terminals.len()
             );
             Ok(json!({ "terminals": terminals }))
@@ -1049,6 +1071,32 @@ fn terminal_display_title(cwd: &str, shell: &str) -> String {
         .to_string()
 }
 
+fn optional_conversation_id(
+    payload: &Value,
+) -> Result<Option<ConversationId>, (&'static str, String)> {
+    let Some(raw) = payload
+        .get("conversationId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    ConversationId::parse(raw)
+        .map(Some)
+        .map_err(|_| ("VALIDATION_ERROR", "invalid conversationId".to_string()))
+}
+
+fn companion_list_matches(
+    instance: &crate::pty::manager::TerminalInstance,
+    conversation_filter: Option<ConversationId>,
+    project_filter: Option<&str>,
+) -> bool {
+    if let Some(conversation_id) = conversation_filter {
+        return instance.conversation_matches(conversation_id);
+    }
+    project_filter.is_some_and(|project_id| instance.project_matches(project_id))
+}
+
 fn live_terminal_summary(
     instance: &crate::pty::manager::TerminalInstance,
     cwd: String,
@@ -1061,6 +1109,7 @@ fn live_terminal_summary(
         "pid": instance.pid,
         "cols": *instance.cols.read(),
         "rows": *instance.rows.read(),
+        "conversationId": instance.conversation_id,
         "projectId": instance.project_id,
         "title": terminal_display_title(&cwd, &instance.shell),
         "gitBranch": git_branch,
@@ -1695,6 +1744,48 @@ mod tests {
         );
         assert_eq!(terminal_display_title("/", "zsh"), "zsh");
         assert_eq!(terminal_display_title("", "bash"), "bash");
+    }
+
+    #[test]
+    fn companion_list_prefers_conversation_scope() {
+        let conversation = ConversationId::parse("018f7a1c-1b4d-7c8a-9f01-0123456789ab").unwrap();
+        let other = ConversationId::parse("018f7a1c-1b4d-7c8a-9f01-0123456789ac").unwrap();
+        assert!(companion_list_matches_ids(
+            conversation,
+            Some("proj-1"),
+            Some(conversation),
+            None
+        ));
+        assert!(!companion_list_matches_ids(
+            conversation,
+            Some("proj-1"),
+            Some(other),
+            None
+        ));
+        assert!(companion_list_matches_ids(
+            conversation,
+            Some("proj-1"),
+            None,
+            Some("proj-1")
+        ));
+        assert!(!companion_list_matches_ids(
+            conversation,
+            Some("proj-1"),
+            None,
+            Some("proj-2")
+        ));
+    }
+
+    fn companion_list_matches_ids(
+        instance_conversation: ConversationId,
+        instance_project: Option<&str>,
+        conversation_filter: Option<ConversationId>,
+        project_filter: Option<&str>,
+    ) -> bool {
+        if let Some(conversation_id) = conversation_filter {
+            return instance_conversation == conversation_id;
+        }
+        project_filter == instance_project
     }
 
     #[test]

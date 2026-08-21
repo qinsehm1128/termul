@@ -32,6 +32,7 @@ struct LiveTerminalSummary: Decodable, Identifiable, Sendable {
     var pid: Int?
     var cols: Int?
     var rows: Int?
+    var conversationId: String?
     var projectId: String?
     var title: String?
     var gitBranch: String?
@@ -51,8 +52,11 @@ final class TerminalSocket {
     private var pending: [String: CheckedContinuation<Data, Error>] = [:]
     private var requestSerial = 0
 
-    func connect(origin: URL) async throws {
+    func connect(origin: URL, credentials: HostCredentials) async throws {
         stop()
+        guard credentials.bearer?.isEmpty == false else {
+            throw HostError.unexpected(String(localized: "This access link is missing its token. Scan the QR again."))
+        }
         var components = URLComponents(url: origin, resolvingAgainstBaseURL: false) ?? URLComponents()
         components.scheme = origin.scheme?.lowercased() == "https" ? "wss" : "ws"
         components.path = "/terminal/ws"
@@ -63,6 +67,7 @@ final class TerminalSocket {
         }
         var request = URLRequest(url: wsURL, timeoutInterval: 20)
         request.assumesHTTP3Capable = false
+        credentials.apply(to: &request)
         let session = URLSession(configuration: .default)
         self.session = session
         let task = session.webSocketTask(with: request)
@@ -72,14 +77,15 @@ final class TerminalSocket {
         isConnected = true
     }
 
-    func spawn(projectId: String, cwd: String?, cols: Int, rows: Int) async throws -> SpawnedTerminal {
+    func spawn(conversationId: String, projectId: String?, cols: Int, rows: Int) async throws -> SpawnedTerminal {
         var payload: [String: Any] = [
-            "projectId": projectId,
+            "conversationId": conversationId,
+            "cwdSource": "workspace",
             "cols": cols,
             "rows": rows
         ]
-        if let cwd, !cwd.isEmpty {
-            payload["cwd"] = cwd
+        if let projectId, !projectId.isEmpty {
+            payload["projectId"] = projectId
         }
         return try await request("spawn", payload: payload, as: SpawnedTerminal.self)
     }
@@ -96,10 +102,17 @@ final class TerminalSocket {
         )
     }
 
-    func list(projectId: String) async throws -> [LiveTerminalSummary] {
+    func list(conversationId: String?, projectId: String?) async throws -> [LiveTerminalSummary] {
+        var payload: [String: Any] = [:]
+        if let conversationId, !conversationId.isEmpty {
+            payload["conversationId"] = conversationId
+        }
+        if let projectId, !projectId.isEmpty {
+            payload["projectId"] = projectId
+        }
         let reply: LiveTerminalList = try await request(
             "list",
-            payload: ["projectId": projectId],
+            payload: payload,
             as: LiveTerminalList.self
         )
         return reply.terminals

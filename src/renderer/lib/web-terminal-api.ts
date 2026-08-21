@@ -310,9 +310,12 @@ export class WebTerminalClient {
     return this.performAttach(terminalId, claim, lastSeq)
   }
 
-  /** Enumerate live host PTYs for a project (companion viewer). */
-  list(projectId: string): Promise<IpcResult<WebTerminalListResult>> {
-    return this.request('list', { projectId })
+  /** Enumerate live host PTYs for a conversation or project (companion viewer). */
+  list(scope: {
+    conversationId?: string
+    projectId?: string
+  }): Promise<IpcResult<WebTerminalListResult>> {
+    return this.request('list', scope)
   }
 
   /**
@@ -901,6 +904,6 @@ export const webTerminalInternals = {
   },
   setProtected: (terminalId: string, protectedState: boolean) =>
     client.request<void>('set_protected', { terminalId, protected: protectedState }),
-  list: (projectId: string) => client.list(projectId),
+  list: (scope: { conversationId?: string; projectId?: string }) => client.list(scope),
   watch: (terminalId: string, lastSeq?: number) => client.watch(terminalId, lastSeq)
 }

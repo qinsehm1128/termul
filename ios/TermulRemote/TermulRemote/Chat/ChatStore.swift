@@ -123,7 +123,11 @@ final class ChatStore {
         }
     }
 
-    func startNewChat(cwd: String, projectId: String?) async {
+    func startInConversation(_ conversation: HostConversation) async {
+        await startNewChat(cwd: conversation.workspaceCwd, conversationId: conversation.id)
+    }
+
+    func startNewChat(cwd: String, conversationId: String?, projectId: String? = nil) async {
         guard let socket else { return }
         isLoading = true
         defer { isLoading = false }
@@ -134,6 +138,9 @@ final class ChatStore {
                 "cwd": cwd,
                 "ephemeral": false
             ]
+            if let conversationId, !conversationId.isEmpty {
+                payload["conversationId"] = conversationId
+            }
             if let projectId {
                 payload["projectId"] = projectId
             }
@@ -153,7 +160,10 @@ final class ChatStore {
         }
     }
 
-    func send(_ text: String) async {
+    func send(_ text: String, in conversation: HostConversation? = nil) async {
+        if activeSessionId == nil, let conversation {
+            await startInConversation(conversation)
+        }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let socket, let sessionId = activeSessionId, let agentId = activeAgentId else {
             if activeAgentId == nil {

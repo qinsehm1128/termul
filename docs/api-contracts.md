@@ -215,7 +215,7 @@ Supported request types are `spawn`, `resume`, `list`, `watch`, `write`,
 `get_git_status`, `get_exit_code`, `add_renderer_ref`, `remove_renderer_ref`,
 `set_protected`, and `update_orphan_detection`. Replies use the existing
 `IpcResult` shape with the request `id`. `attach` is CAP-3 claim-gated.
-Companion clients use `list` (`{ projectId }`) then `watch`
+Companion clients use `list` (`{ conversationId }` preferred, or `{ projectId }`) then `watch`
 (`{ terminalId, lastSeq? }`) to view a desktop-owned PTY without rotating its
 claim; both send the same bounded scrollback replay as `attach` before live
 `data` frames.

@@ -42,13 +42,17 @@ final class AcpSocket {
     private var origin: URL?
     private var opened: CheckedContinuation<Void, Error>?
 
-    func connect(origin: URL) async throws {
+    func connect(origin: URL, credentials: HostCredentials) async throws {
         stop()
         self.origin = origin
         state = .connecting
+        guard let token = credentials.bearer, !token.isEmpty else {
+            throw HostError.unexpected(String(localized: "This access link is missing its token. Scan the QR again."))
+        }
         let wsURL = Self.wsURL(origin: origin, path: "/ws")
         var urlRequest = URLRequest(url: wsURL, timeoutInterval: 20)
         urlRequest.assumesHTTP3Capable = false
+        credentials.apply(to: &urlRequest)
         let session = URLSession(configuration: .default)
         self.session = session
         let task = session.webSocketTask(with: urlRequest)
@@ -60,7 +64,7 @@ final class AcpSocket {
             try await withCheckedThrowingContinuation { continuation in
                 opened = continuation
             }
-            let data = try await request("authenticate", payload: ["token": "dev"])
+            let data = try await request("authenticate", payload: ["token": token])
             if let reply = try? JSONDecoder().decode(AcpAuthenticateReply.self, from: data) {
                 historyMode = reply.historyMode ?? "live_only"
             }

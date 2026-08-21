@@ -1414,7 +1414,7 @@ describe('WebTerminalClient frame handling & request lifecycle', () => {
     )
     const internals = client as unknown as ClientInternals
 
-    const listed = await client.list('proj-1')
+    const listed = await client.list({ projectId: 'proj-1' })
     expect(listed.success).toBe(true)
     if (listed.success) {
       expect(listed.data.terminals).toHaveLength(1)
