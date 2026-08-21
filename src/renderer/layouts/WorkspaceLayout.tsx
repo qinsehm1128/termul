@@ -2054,7 +2054,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
   if (!isLoaded) {
     if (isMobileWebShell) {
       return (
-        <div className="flex h-screen flex-col overflow-hidden bg-background">
+        <div className="flex h-full min-h-0 flex-col overflow-hidden bg-background">
           <div className="flex flex-1 items-center justify-center">
             <div className="text-sm text-muted-foreground">{t('loading')}</div>
           </div>
@@ -2062,7 +2062,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
       )
     }
     return (
-      <div className="h-screen flex flex-col overflow-hidden bg-background">
+      <div className="flex h-full min-h-0 flex-col overflow-hidden bg-background">
         <ResizeEdges />
         <div className="flex-1 flex flex-col overflow-hidden min-h-0 h-full">
           <MacOsTitlebarStrip />
@@ -2072,7 +2072,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
               onShortcutsOpenChange={setIsShortcutMenuOpen}
               canOpenGitChanges={false}
             />
-            <div className="flex-1 flex flex-col min-w-0">
+            <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
               <TitleBar />
               <div className="flex-1 flex items-center justify-center">
                 <div className="text-muted-foreground text-sm">{t('loading')}</div>
@@ -2417,7 +2417,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
 
   if (isMobileWebShell) {
     return (
-      <div className="flex h-screen flex-col overflow-hidden bg-background">
+      <div className="flex h-full min-h-0 flex-col overflow-hidden bg-background">
         <Suspense fallback={<ShellSkeleton />}>
           <MobileChatShell
             onNewChat={handleOpenAgentChat}
@@ -2476,7 +2476,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
   }
 
   return (
-    <div className="h-screen flex flex-col overflow-hidden bg-background">
+    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-background">
       <ResizeEdges />
       <div className="flex-1 flex flex-col overflow-hidden min-h-0 h-full">
         <MacOsTitlebarStrip />
@@ -2491,13 +2491,13 @@ export default function WorkspaceLayout(): React.JSX.Element {
             isThemePickerOpen={isThemePickerOpen}
             onToggleThemePicker={handleToggleThemePicker}
           />
-          <div className="flex-1 flex flex-col min-w-0">
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
             <TitleBar />
 
             <div className="flex-1 flex overflow-hidden min-h-0 h-full">
               {/* Sidebar */}
               {isSidebarVisible && (
-                <div className="border-r border-sidebar-border/70">
+                <div className="h-full min-h-0 overflow-hidden border-r border-sidebar-border/70">
                   {isConversationRoute ? (
                     <ConversationSidebar onNewChat={handleOpenAgentChat} />
                   ) : (
