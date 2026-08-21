@@ -16,10 +16,11 @@ import { TitleBarShortcutsPopover } from '@/components/TitleBarShortcutsPopover'
 import { useUpdatePanelVisibility } from '@/hooks/use-app-settings'
 import { isMac } from '@/lib/platform'
 import { isTauriContext } from '@/lib/tauri-runtime'
+import { cn } from '@/lib/utils'
 import { useSSHPanelVisible } from '@/stores/ssh-panel-store'
 
 const railButtonClass =
-  'w-12 h-11 flex items-center justify-center hover:bg-secondary/80 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-inset'
+  'relative mx-1 flex h-9 w-9 items-center justify-center rounded-md text-muted-foreground transition-[color,background-color,box-shadow] duration-150 ease-[var(--ease-out)] before:absolute before:-left-1 before:h-4 before:w-px before:rounded-full before:bg-primary before:opacity-0 before:transition-opacity hover:bg-foreground/[0.045] hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring/80 aria-[pressed=true]:bg-foreground/[0.065] aria-[pressed=true]:text-foreground aria-[pressed=true]:shadow-[inset_0_1px_0_hsl(var(--foreground)/0.035)] aria-[pressed=true]:before:opacity-100 aria-[current=page]:bg-foreground/[0.065] aria-[current=page]:text-foreground aria-[current=page]:before:opacity-100 disabled:opacity-30'
 
 interface ActivityRailProps {
   isShortcutsOpen?: boolean
@@ -84,18 +85,18 @@ export function ActivityRail({
 
   return (
     <nav
-      className="w-12 flex flex-col items-center bg-background select-none shrink-0"
+      className="flex w-11 shrink-0 select-none flex-col items-center border-r border-sidebar-border/70 bg-sidebar shadow-[inset_-1px_0_0_hsl(var(--background)/0.35)]"
       aria-label={t('activityRail.globalActions')}
     >
       {/* Brand mark */}
       <div
-        className="w-12 h-11 flex items-center justify-center text-foreground shrink-0"
+        className="flex h-9 w-11 shrink-0 items-center justify-center text-foreground/90"
         data-tauri-drag-region={isMac ? true : undefined}
       >
-        <TermulMark size={22} className="pointer-events-none" />
+        <TermulMark size={19} className="pointer-events-none" />
       </div>
 
-      <div className="w-6 h-px bg-border/60 my-1" aria-hidden="true" />
+      <div className="my-1 h-px w-4 bg-border/70" aria-hidden="true" />
 
       <button
         type="button"
@@ -110,7 +111,10 @@ export function ActivityRail({
       >
         <FolderKanban
           size={18}
-          className={location.pathname === '/' ? 'text-foreground' : 'text-muted-foreground'}
+          className={cn(
+            'transition-colors',
+            location.pathname === '/' ? 'text-foreground' : 'text-muted-foreground'
+          )}
         />
       </button>
 
@@ -127,9 +131,10 @@ export function ActivityRail({
       >
         <CalendarClock
           size={18}
-          className={
+          className={cn(
+            'transition-colors',
             location.pathname === '/scheduled-tasks' ? 'text-foreground' : 'text-muted-foreground'
-          }
+          )}
         />
       </button>
 
@@ -167,7 +172,10 @@ export function ActivityRail({
       >
         <MessageSquarePlus
           size={18}
-          className={isConversationsActive ? 'text-foreground' : 'text-muted-foreground'}
+          className={cn(
+            'transition-colors',
+            isConversationsActive ? 'text-foreground' : 'text-muted-foreground'
+          )}
         />
       </button>
 

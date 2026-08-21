@@ -479,6 +479,13 @@ function WorkspaceLayoutWithNavigate({
 }
 
 describe('WorkspaceLayout - Empty States', () => {
+  it('locks the desktop shell to the root height without viewport overflow', () => {
+    const view = renderWithRouter()
+
+    expect(view.container.firstElementChild).toHaveClass('h-full', 'min-h-0', 'overflow-hidden')
+    expect(view.container.firstElementChild).not.toHaveClass('h-screen')
+  })
+
   it('renders the regular project workspace at root without the conversation area', async () => {
     render(
       <TooltipProvider>

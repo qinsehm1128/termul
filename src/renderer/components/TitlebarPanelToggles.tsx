@@ -13,7 +13,7 @@ import { useSidebarVisible } from '@/stores/sidebar-store'
  * than the activity rail, which used 18px icons in a taller `h-11` rail.
  */
 const titlebarToggleButtonClass =
-  'h-full px-3 hover:bg-secondary/80 inline-flex items-center focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-inset cursor-pointer'
+  'inline-flex h-full cursor-pointer items-center px-3 text-muted-foreground transition-[color,background-color] duration-150 ease-[var(--ease-out)] hover:bg-foreground/[0.045] hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring/80 aria-[pressed=true]:bg-foreground/[0.035] aria-[pressed=true]:text-foreground'
 
 /**
  * Marks an element non-draggable so buttons stay clickable inside a
@@ -61,7 +61,7 @@ export function SidebarToggleButton({
       aria-label={isVisible ? t('titleBar.hideSidebar') : t('titleBar.showSidebar')}
       aria-pressed={isVisible}
     >
-      <PanelLeft size={16} className={isVisible ? 'text-foreground' : 'text-muted-foreground'} />
+      <PanelLeft size={16} className="text-current" />
     </button>
   )
 }
@@ -100,7 +100,7 @@ export function FileExplorerToggleButton({
       aria-label={isVisible ? t('titleBar.hideFileExplorer') : t('titleBar.showFileExplorer')}
       aria-pressed={isVisible}
     >
-      <PanelRight size={16} className={isVisible ? 'text-foreground' : 'text-muted-foreground'} />
+      <PanelRight size={16} className="text-current" />
     </button>
   )
 }

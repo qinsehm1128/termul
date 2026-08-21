@@ -12,6 +12,7 @@ import {
   SelectValue
 } from '@/components/ui/select'
 import { formatDate } from '@/i18n/format'
+import { cn } from '@/lib/utils'
 import type { CommandHistoryEntry } from '@/stores/command-history-store'
 
 type FilterMode = 'this-project' | 'all-projects'
@@ -141,28 +142,30 @@ export function CommandHistoryModal({
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
-          className="fixed inset-0 z-[60] flex flex-col items-center pt-[10vh] bg-black/40 backdrop-blur-sm"
+          className="fixed inset-0 z-[60] flex flex-col items-center bg-black/70 pt-[10vh] backdrop-blur-[2px]"
           onClick={onClose}
         >
           <motion.div
-            initial={{ opacity: 0, scale: 0.95, y: -10 }}
-            animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.95, y: -10 }}
+            initial={{ opacity: 0, y: -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -6 }}
             transition={{ duration: 0.15 }}
-            className="w-full max-w-2xl bg-card rounded-xl shadow-2xl border border-border overflow-hidden"
+            className="w-full max-w-2xl overflow-hidden rounded-md border border-border/80 bg-card shadow-[0_18px_60px_hsl(var(--background)/0.7),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]"
             onClick={(e) => e.stopPropagation()}
           >
             {/* Header */}
-            <div className="flex items-center justify-between gap-2 px-4 py-3 border-b border-border">
+            <div className="flex h-9 items-center justify-between gap-2 border-b border-border/70 px-3">
               <div className="flex items-center gap-2">
-                <History size={18} className="text-muted-foreground" />
-                <span className="text-sm font-medium">{t('commandHistory.title')}</span>
+                <History size={14} className="text-muted-foreground" />
+                <span className="text-xs font-medium tracking-[-0.01em]">
+                  {t('commandHistory.title')}
+                </span>
               </div>
               <Select
                 value={filterMode}
                 onValueChange={(value) => setFilterMode(value as FilterMode)}
               >
-                <SelectTrigger className="w-[140px] h-8 text-xs">
+                <SelectTrigger className="h-7 w-[140px] text-2xs">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -173,7 +176,7 @@ export function CommandHistoryModal({
             </div>
 
             {/* Search Input */}
-            <div className="p-2 border-b border-border">
+            <div className="border-b border-border/70 px-3 py-2">
               <input
                 ref={inputRef}
                 type="text"
@@ -181,15 +184,17 @@ export function CommandHistoryModal({
                 onChange={(e) => setQuery(e.target.value)}
                 onKeyDown={handleKeyDown}
                 placeholder={t('commandHistory.searchPlaceholder')}
-                className="w-full px-3 py-2 text-sm bg-background border border-border rounded focus:outline-none focus:ring-1 focus:ring-primary"
+                className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none transition-[border-color,background-color] placeholder:text-muted-foreground/70 focus-visible:border-ring/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
               />
             </div>
 
             {/* Command List */}
             {filteredEntries.length === 0 ? (
-              <div className="p-8 text-center text-muted-foreground">
-                <History size={32} className="mx-auto mb-2 opacity-50" />
-                <p className="text-sm">
+              <div className="flex flex-col items-center justify-center gap-2 px-6 py-12 text-center">
+                <div className="flex size-8 items-center justify-center rounded-md bg-secondary/50">
+                  <History size={16} className="text-muted-foreground" />
+                </div>
+                <p className="text-sm font-medium text-foreground">
                   {baseEntries.length === 0
                     ? t('commandHistory.noHistory')
                     : t('commandHistory.noMatches')}
@@ -208,22 +213,25 @@ export function CommandHistoryModal({
                         onSelectCommand(entry.command)
                         onClose()
                       }}
-                      className={`px-4 py-3 cursor-pointer transition-colors ${
-                        index === selectedIndex ? 'bg-secondary' : 'hover:bg-secondary/50'
-                      }`}
+                      className={cn(
+                        'relative cursor-pointer px-3 py-2 transition-colors before:absolute before:bottom-1.5 before:left-0 before:top-1.5 before:w-px before:rounded-full before:bg-primary before:opacity-0 before:transition-opacity',
+                        index === selectedIndex
+                          ? 'bg-secondary/80 shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.04)] before:opacity-100'
+                          : 'hover:bg-secondary/45'
+                      )}
                     >
                       <div className="flex items-start justify-between gap-3">
-                        <code className="flex-1 text-sm font-mono text-foreground break-all">
+                        <code className="flex-1 break-all font-mono text-xs text-foreground">
                           {entry.command}
                         </code>
                       </div>
-                      <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground">
+                      <div className="mt-1 flex items-center gap-3 text-2xs text-muted-foreground">
                         <span className="flex items-center gap-1">
-                          <Terminal size={12} />
+                          <Terminal size={11} />
                           {entry.terminalName}
                         </span>
                         <span className="flex items-center gap-1">
-                          <Clock size={12} />
+                          <Clock size={11} />
                           {formatTime(entry.timestamp)}
                         </span>
                       </div>
@@ -234,25 +242,31 @@ export function CommandHistoryModal({
             )}
 
             {/* Footer */}
-            <div className="label-group bg-background px-4 py-2 border-t border-border flex items-center justify-between text-muted-foreground">
-              <div className="flex items-center space-x-4">
-                <span className="flex items-center">
-                  <kbd className="bg-secondary text-foreground px-1 rounded mr-1">↑↓</kbd>{' '}
+            <div className="flex items-center justify-between border-t border-border/70 bg-secondary/20 px-3 py-1.5 text-2xs text-muted-foreground">
+              <div className="flex items-center gap-3">
+                <span className="flex items-center gap-1">
+                  <kbd className="rounded-sm border border-border/80 bg-secondary/50 px-1 py-px font-mono text-3xs text-foreground/80">
+                    ↑↓
+                  </kbd>
                   {t('commandHistory.navigate')}
                 </span>
-                <span className="flex items-center">
-                  <kbd className="bg-secondary text-foreground px-1 rounded mr-1">↵</kbd>{' '}
+                <span className="flex items-center gap-1">
+                  <kbd className="rounded-sm border border-border/80 bg-secondary/50 px-1 py-px font-mono text-3xs text-foreground/80">
+                    ↵
+                  </kbd>
                   {t('commandHistory.insert')}
                 </span>
-                <span className="flex items-center">
-                  <kbd className="bg-secondary text-foreground px-1 rounded mr-1">Esc</kbd>{' '}
+                <span className="flex items-center gap-1">
+                  <kbd className="rounded-sm border border-border/80 bg-secondary/50 px-1 py-px font-mono text-3xs text-foreground/80">
+                    Esc
+                  </kbd>
                   {t('commandHistory.close')}
                 </span>
               </div>
               <button
                 type="button"
                 onClick={() => setShowClearConfirm(true)}
-                className="flex items-center gap-1 px-2 py-1 rounded hover:bg-secondary/50 text-red-400 hover:text-red-300 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                className="inline-flex h-6 items-center gap-1 rounded-md px-1.5 text-destructive transition-colors hover:bg-destructive/10 disabled:cursor-not-allowed disabled:opacity-45"
                 disabled={entries.length === 0 || filterMode !== 'this-project' || isClearing}
                 title={
                   filterMode === 'all-projects'

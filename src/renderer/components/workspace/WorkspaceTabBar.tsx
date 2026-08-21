@@ -43,6 +43,87 @@ function computeTabPosition(target: HTMLElement, clientX: number): TabReorderPos
   return x < halfWidth ? 'before' : 'after'
 }
 
+const TAB_SURFACE =
+  'group relative flex h-full min-w-[100px] cursor-grab select-none items-center px-2.5 transition-colors duration-150 ease-[var(--ease-out)]'
+
+function tabToneClass(isActive: boolean, isDragging: boolean): string {
+  return cn(
+    TAB_SURFACE,
+    isActive
+      ? 'z-[1] -mb-px bg-background text-foreground shadow-[inset_0_1px_0_0_hsl(var(--primary)/0.55)]'
+      : 'text-muted-foreground hover:bg-secondary/40 hover:text-foreground',
+    isDragging && 'opacity-50 scale-[0.98]'
+  )
+}
+
+function TabDropMark({
+  isDropTarget,
+  dropPosition
+}: {
+  isDropTarget: boolean
+  dropPosition: TabReorderPosition | null
+}): React.JSX.Element | null {
+  if (!isDropTarget || !dropPosition) return null
+  return (
+    <div
+      className={cn(
+        'absolute top-1.5 bottom-1.5 z-10 w-px bg-primary',
+        dropPosition === 'before' ? 'left-0' : 'right-0'
+      )}
+    />
+  )
+}
+
+function TabCloseButton({
+  onClose,
+  disabled = false,
+  isActive,
+  spinning = false
+}: {
+  onClose: () => void
+  disabled?: boolean
+  isActive: boolean
+  spinning?: boolean
+}): React.JSX.Element {
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation()
+        if (!disabled) onClose()
+      }}
+      disabled={disabled}
+      className={cn(
+        'ml-auto flex h-4 w-4 shrink-0 items-center justify-center text-muted-foreground transition-opacity hover:bg-secondary hover:text-foreground disabled:cursor-wait',
+        isActive || spinning ? 'opacity-70 hover:opacity-100' : 'opacity-0 group-hover:opacity-100'
+      )}
+    >
+      {spinning ? <Loader2 size={11} className="animate-spin" /> : <XIcon size={11} />}
+    </button>
+  )
+}
+
+function TabLiveMark({
+  attention,
+  activity,
+  running
+}: {
+  attention?: boolean
+  activity?: boolean
+  running?: boolean
+}): React.JSX.Element | null {
+  if (attention) {
+    return <span className="mr-0.5 h-1.5 w-1.5 shrink-0 bg-warning" aria-hidden />
+  }
+  if (activity) {
+    return <span className="mr-0.5 h-1.5 w-1.5 shrink-0 bg-primary" aria-hidden />
+  }
+  if (running) {
+    return <span className="mr-0.5 h-1.5 w-1.5 shrink-0 bg-primary/40" aria-hidden />
+  }
+  return null
+}
+
 // Inline TerminalTab matching the style from TerminalTabBar
 
 interface TerminalTabInlineProps {
@@ -132,21 +213,14 @@ function TerminalTabInline({
             onClose()
           }
         }}
-        className={cn(
-          'relative h-full px-3 flex items-center border-r border-border min-w-[100px] cursor-pointer group transition-all duration-150 ease-out border-b-2 border-b-transparent',
-          isActive
-            ? 'bg-background border-b-primary'
-            : 'hover:bg-secondary/50 text-muted-foreground',
-          isDragging && 'opacity-50 scale-[0.98]'
-        )}
+        className={cn(tabToneClass(isActive, isDragging), 'border-r border-border/50')}
       >
-        {/* Drop indicator line */}
-        {isDropTarget && dropPosition === 'before' && (
-          <div className="absolute left-0 top-1 bottom-1 w-0.5 bg-primary rounded-full" />
-        )}
-        {isDropTarget && dropPosition === 'after' && (
-          <div className="absolute right-0 top-1 bottom-1 w-0.5 bg-primary rounded-full" />
-        )}
+        <TabDropMark isDropTarget={isDropTarget} dropPosition={dropPosition} />
+        <TabLiveMark
+          attention={terminal.needsAttention}
+          activity={terminal.hasActivity}
+          running={terminal.healthStatus === 'running'}
+        />
 
         {terminal.kind === 'agent' && terminal.agentId ? (
           <AgentIcon
@@ -184,18 +258,12 @@ function TerminalTabInline({
             {terminal.name}
           </span>
         )}
-        <button
-          onClick={(e) => {
-            e.stopPropagation()
-            if (!isClosing) {
-              onClose()
-            }
-          }}
+        <TabCloseButton
+          onClose={onClose}
           disabled={isClosing}
-          className="ml-auto p-0.5 rounded-md text-muted-foreground opacity-70 hover:bg-secondary hover:text-foreground group-hover:opacity-100 transition-opacity disabled:opacity-100 disabled:cursor-wait"
-        >
-          {isClosing ? <Loader2 size={11} className="animate-spin" /> : <XIcon size={11} />}
-        </button>
+          isActive={isActive}
+          spinning={isClosing}
+        />
       </div>
     </TabContextMenu>
   )
@@ -251,17 +319,13 @@ function EditorTabWrapper({
       onDragLeave={onDragLeave}
       onDrop={onDrop}
       className={cn(
-        'relative h-full transition-all duration-150 ease-out',
+        'relative h-full transition-colors duration-150 ease-out',
+        '[&_.border-b-2]:border-b-transparent [&_.border-b-primary]:border-b-transparent [&_.border-r]:border-border/50',
+        isActive && 'z-[1] -mb-px shadow-[inset_0_1px_0_0_hsl(var(--primary)/0.55)]',
         isDragging && 'opacity-50 scale-[0.98]'
       )}
     >
-      {/* Drop indicator line */}
-      {isDropTarget && dropPosition === 'before' && (
-        <div className="absolute left-0 top-1 bottom-1 w-0.5 bg-primary rounded-full z-10" />
-      )}
-      {isDropTarget && dropPosition === 'after' && (
-        <div className="absolute right-0 top-1 bottom-1 w-0.5 bg-primary rounded-full z-10" />
-      )}
+      <TabDropMark isDropTarget={isDropTarget} dropPosition={dropPosition} />
       <EditorTab
         filePath={tab.filePath}
         isActive={isActive}
@@ -335,35 +399,15 @@ function BrowserTabInline({
           e.stopPropagation()
           onClose()
         }}
-        className={cn(
-          'relative h-full px-3 flex items-center border-r border-border min-w-[100px] cursor-pointer group transition-all duration-150 ease-out border-b-2 border-b-transparent',
-          isActive
-            ? 'bg-background border-b-primary'
-            : 'hover:bg-secondary/50 text-muted-foreground',
-          isDragging && 'opacity-50 scale-[0.98]'
-        )}
+        className={cn(tabToneClass(isActive, isDragging), 'border-r border-border/50')}
       >
-        {/* Drop indicator line */}
-        {isDropTarget && dropPosition === 'before' && (
-          <div className="absolute left-0 top-1 bottom-1 w-0.5 bg-primary rounded-full" />
-        )}
-        {isDropTarget && dropPosition === 'after' && (
-          <div className="absolute right-0 top-1 bottom-1 w-0.5 bg-primary rounded-full" />
-        )}
+        <TabDropMark isDropTarget={isDropTarget} dropPosition={dropPosition} />
 
         <Globe size={12} className={cn('mr-2', isActive ? 'text-primary' : '')} />
         <span className={cn('text-2xs font-medium truncate', isActive && 'text-foreground')}>
           {label}
         </span>
-        <button
-          onClick={(e) => {
-            e.stopPropagation()
-            onClose()
-          }}
-          className="ml-auto p-0.5 rounded-md hover:bg-secondary opacity-0 group-hover:opacity-100 transition-opacity"
-        >
-          <XIcon size={11} />
-        </button>
+        <TabCloseButton onClose={onClose} isActive={isActive} />
       </div>
     </TabContextMenu>
   )
@@ -409,38 +453,24 @@ function GitTabInline({
         onDrop={onDrop}
         onClick={onSelect}
         className={cn(
-          'group relative h-full px-3 flex items-center min-w-[120px] max-w-[200px] gap-2 cursor-pointer select-none border-r border-border transition-all duration-150 ease-out border-b-2 border-b-transparent',
-          isActive
-            ? 'bg-background border-b-primary text-foreground'
-            : 'text-muted-foreground hover:bg-secondary/50 hover:text-foreground',
-          isDragging && 'opacity-50 scale-[0.98]',
-          isDropTarget && dropPosition === 'before' && 'border-l-2 border-l-primary',
-          isDropTarget && dropPosition === 'after' && 'border-r-2 border-r-primary'
+          tabToneClass(isActive, isDragging),
+          'max-w-[200px] min-w-[120px] gap-2 border-r border-border/50'
         )}
       >
+        <TabDropMark isDropTarget={isDropTarget} dropPosition={dropPosition} />
         <GitBranch size={12} className={isActive ? 'text-primary' : ''} />
         <span className="truncate text-2xs font-medium flex-1">{t('tabs.gitChanges')}</span>
         {totalChanges > 0 && (
           <span
             className={cn(
-              'px-1 min-w-[14px] h-3.5 flex items-center justify-center rounded-full text-4xs font-bold',
-              isActive
-                ? 'bg-primary text-primary-foreground'
-                : 'bg-muted-foreground/20 text-muted-foreground'
+              'min-w-[1ch] text-3xs font-medium tabular-nums',
+              isActive ? 'text-primary' : 'text-muted-foreground'
             )}
           >
             {totalChanges}
           </span>
         )}
-        <button
-          onClick={(e) => {
-            e.stopPropagation()
-            onClose()
-          }}
-          className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-background/50 transition-opacity"
-        >
-          <XIcon size={10} />
-        </button>
+        <TabCloseButton onClose={onClose} isActive={isActive} />
       </div>
     </TabContextMenu>
   )
@@ -482,26 +512,14 @@ function GitHistoryTabInline({
         onDrop={onDrop}
         onClick={onSelect}
         className={cn(
-          'group relative h-full px-3 flex items-center min-w-[120px] max-w-[200px] gap-2 cursor-pointer select-none border-r border-border transition-all duration-150 ease-out border-b-2 border-b-transparent',
-          isActive
-            ? 'bg-background border-b-primary text-foreground'
-            : 'text-muted-foreground hover:bg-secondary/50 hover:text-foreground',
-          isDragging && 'opacity-50 scale-[0.98]',
-          isDropTarget && dropPosition === 'before' && 'border-l-2 border-l-primary',
-          isDropTarget && dropPosition === 'after' && 'border-r-2 border-r-primary'
+          tabToneClass(isActive, isDragging),
+          'max-w-[200px] min-w-[120px] gap-2 border-r border-border/50'
         )}
       >
+        <TabDropMark isDropTarget={isDropTarget} dropPosition={dropPosition} />
         <History size={12} className={isActive ? 'text-primary' : ''} />
         <span className="truncate text-2xs font-medium flex-1">{t('tabs.gitHistory')}</span>
-        <button
-          onClick={(e) => {
-            e.stopPropagation()
-            onClose()
-          }}
-          className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-background/50 transition-opacity"
-        >
-          <XIcon size={10} />
-        </button>
+        <TabCloseButton onClose={onClose} isActive={isActive} />
       </div>
     </TabContextMenu>
   )
@@ -573,15 +591,11 @@ function AgentChatTabInline({
         onClick={onSelect}
         aria-label={`${tabLabel}, ${connected ? t('tabs.connected') : t('tabs.disconnected')}`}
         className={cn(
-          'group relative h-full px-3 flex items-center min-w-[120px] max-w-[200px] gap-1.5 cursor-pointer select-none border-r border-border transition-all duration-150 ease-out border-b-2 border-b-transparent',
-          isActive
-            ? 'bg-background border-b-primary text-foreground'
-            : 'text-muted-foreground hover:bg-secondary/50 hover:text-foreground',
-          isDragging && 'opacity-50 scale-[0.98]',
-          isDropTarget && dropPosition === 'before' && 'border-l-2 border-l-primary',
-          isDropTarget && dropPosition === 'after' && 'border-r-2 border-r-primary'
+          tabToneClass(isActive, isDragging),
+          'max-w-[200px] min-w-[120px] gap-1.5 border-r border-border/50'
         )}
       >
+        <TabDropMark isDropTarget={isDropTarget} dropPosition={dropPosition} />
         {session ? (
           <>
             <AgentBadge
@@ -604,15 +618,7 @@ function AgentChatTabInline({
         ) : (
           <span className="truncate text-2xs font-medium flex-1">{t('tabs.agentChat')}</span>
         )}
-        <button
-          onClick={(e) => {
-            e.stopPropagation()
-            onClose()
-          }}
-          className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:bg-background/50 transition-opacity"
-        >
-          <XIcon size={10} />
-        </button>
+        <TabCloseButton onClose={onClose} isActive={isActive} />
       </div>
     </TabContextMenu>
   )
@@ -887,7 +893,7 @@ export function WorkspaceTabBar({
 
   return (
     <div
-      className="h-9 bg-card border-b border-border flex items-center"
+      className="flex h-8 items-center border-b border-border/70 bg-sidebar"
       onDragOver={(e) => {
         e.preventDefault()
         e.dataTransfer.dropEffect = 'move'
@@ -1042,15 +1048,16 @@ export function WorkspaceTabBar({
         </div>
 
         {hasOverflow && (
-          <div className="absolute right-0 top-0 h-full w-8 bg-gradient-to-l from-card to-transparent pointer-events-none" />
+          <div className="pointer-events-none absolute right-0 top-0 h-full w-8 bg-gradient-to-l from-sidebar to-transparent" />
         )}
       </div>
 
-      <div className="ml-auto flex items-center gap-1 px-2 shrink-0 h-full border-l border-border/60">
+      <div className="ml-auto flex h-full shrink-0 items-center border-l border-border/50">
         {leafCount > 1 && (
           <button
+            type="button"
             onClick={() => togglePaneFullscreen(paneId)}
-            className="h-7 w-7 flex items-center justify-center rounded hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors"
+            className="flex h-full w-7 items-center justify-center text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
             title={isFullscreenPane ? t('tabs.restorePane') : t('tabs.focusPane')}
             aria-label={isFullscreenPane ? t('tabs.restorePane') : t('tabs.focusPane')}
           >
@@ -1058,22 +1065,23 @@ export function WorkspaceTabBar({
           </button>
         )}
         {onAddTerminal && (
-          <div ref={terminalMenuRef} className="relative flex items-center h-full">
+          <div ref={terminalMenuRef} className="relative flex h-full items-center">
             <button
+              type="button"
               onClick={() => setIsTerminalMenuOpen((open) => !open)}
-              className="h-7 w-7 flex items-center justify-center rounded hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors"
+              className="flex h-full w-7 items-center justify-center text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
               title={t('tabs.terminalMenu')}
             >
               <TerminalIcon size={12} />
             </button>
 
             {isTerminalMenuOpen && (
-              <div className="absolute top-full right-0 mt-1 w-44 bg-popover border border-border rounded-md shadow-lg z-50 overflow-hidden">
-                <div className="px-2.5 py-1 text-2xs font-medium text-muted-foreground bg-secondary/30">
+              <div className="absolute top-full right-0 z-50 mt-px w-44 overflow-hidden border border-border/70 bg-popover shadow-md">
+                <div className="bg-secondary/30 px-2.5 py-1 text-2xs font-medium text-muted-foreground">
                   {t('tabs.terminal')}
                 </div>
                 {loading ? (
-                  <div className="py-1 px-2.5 space-y-1.5">
+                  <div className="space-y-1.5 px-2.5 py-1">
                     <Skeleton className="h-6 w-full" />
                     <Skeleton className="h-6 w-full" />
                   </div>
@@ -1081,10 +1089,11 @@ export function WorkspaceTabBar({
                   <div className="py-1">
                     {sortedShells.map((shell) => (
                       <button
+                        type="button"
                         key={shell.name}
                         onClick={() => handleSelectShell(shell)}
                         className={cn(
-                          'w-full px-2.5 py-1.5 text-left text-2xs hover:bg-secondary flex items-center gap-2 leading-none',
+                          'flex w-full items-center gap-2 px-2.5 py-1.5 text-left text-2xs leading-none hover:bg-secondary',
                           isPreferredShell(shell, defaultShell) && 'text-primary'
                         )}
                       >
@@ -1110,8 +1119,9 @@ export function WorkspaceTabBar({
 
         {onAddBrowserTab && (
           <button
+            type="button"
             onClick={onAddBrowserTab}
-            className="h-7 w-7 flex items-center justify-center rounded hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors"
+            className="flex h-full w-7 items-center justify-center text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
             title={t('tabs.newBrowser')}
           >
             <Globe size={12} />

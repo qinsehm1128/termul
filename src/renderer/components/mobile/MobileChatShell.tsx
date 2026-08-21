@@ -62,7 +62,7 @@ interface MobileChatShellProps {
 }
 
 /**
- * ChatGPT-style mobile web chrome: slim header + slide-out chat list drawer.
+ * Compact mobile web chrome: slim header + slide-out chat list drawer.
  * Desktop IDE chrome (ActivityRail, TitleBar, persistent sidebar, tab strip)
  * stays outside this component and must be gated by `useMobileWebShell`.
  */
@@ -214,7 +214,7 @@ export function MobileChatShell({
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-background" data-mobile-chat-shell="">
-      <header className="flex h-12 shrink-0 items-center gap-2 border-b border-border/60 px-2">
+      <header className="flex h-11 shrink-0 items-center gap-1 border-b border-border/70 bg-sidebar px-1.5">
         <Button
           type="button"
           variant="ghost"

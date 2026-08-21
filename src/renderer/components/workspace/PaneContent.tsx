@@ -257,8 +257,11 @@ export function PaneContent({
     <div
       className={cn(
         'flex flex-col h-full relative',
-        isActivePane && hasMultiplePanes && !isFullscreenPane && 'ring-1 ring-primary/30',
-        isFullscreenPane && 'ring-1 ring-primary/30 rounded-xl overflow-hidden'
+        isActivePane &&
+          hasMultiplePanes &&
+          !isFullscreenPane &&
+          'shadow-[inset_0_0_0_1px_hsl(var(--primary)/0.34)]',
+        isFullscreenPane && 'overflow-hidden shadow-[inset_0_0_0_1px_hsl(var(--primary)/0.34)]'
       )}
       onMouseDown={handleFocus}
       onKeyDownCapture={handleKeyDownCapture}
@@ -288,16 +291,16 @@ export function PaneContent({
           {(panePreviewPosition === 'left' || panePreviewPosition === 'right') && (
             <div
               className={cn(
-                'absolute top-0 bottom-0 w-5 rounded-sm border border-primary/40 bg-primary/10 pointer-events-none',
-                panePreviewPosition === 'left' ? 'left-0' : 'right-0'
+                'pointer-events-none absolute top-0 bottom-0 w-4 border-primary/35 bg-primary/8',
+                panePreviewPosition === 'left' ? 'left-0 border-r' : 'right-0 border-l'
               )}
             />
           )}
           {(panePreviewPosition === 'top' || panePreviewPosition === 'bottom') && (
             <div
               className={cn(
-                'absolute left-0 right-0 h-5 rounded-sm border border-primary/40 bg-primary/10 pointer-events-none',
-                panePreviewPosition === 'top' ? 'top-0' : 'bottom-0'
+                'pointer-events-none absolute left-0 right-0 h-4 border-primary/35 bg-primary/8',
+                panePreviewPosition === 'top' ? 'top-0 border-b' : 'bottom-0 border-t'
               )}
             />
           )}
@@ -329,9 +332,9 @@ export function PaneContent({
                       aria-labelledby={disconnectedTitleId}
                       data-terminal-health="disconnected"
                     >
-                      <div className="flex w-full max-w-md flex-col items-center gap-4 rounded-xl border border-border/60 bg-card/80 p-6 text-center shadow-sm">
-                        <span className="flex h-12 w-12 items-center justify-center rounded-full bg-muted text-muted-foreground">
-                          <Unplug className="h-6 w-6" aria-hidden="true" />
+                      <div className="flex w-full max-w-md flex-col items-center gap-3 border border-border/50 bg-card/40 px-5 py-6 text-center">
+                        <span className="flex h-10 w-10 items-center justify-center bg-muted text-muted-foreground">
+                          <Unplug className="h-5 w-5" aria-hidden="true" />
                         </span>
                         <div className="space-y-2">
                           <h2 id={disconnectedTitleId} className="text-base font-semibold">
@@ -347,7 +350,7 @@ export function PaneContent({
                         </div>
                         <button
                           type="button"
-                          className="inline-flex min-h-10 items-center justify-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60"
+                          className="inline-flex min-h-9 items-center justify-center gap-2 bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-60"
                           disabled={isRetrying}
                           onClick={() => void retryDisconnectedTerminal(terminal.id)}
                         >
@@ -413,13 +416,9 @@ export function PaneContent({
                     key={tab.id}
                     className={cn(
                       isVisible ? 'w-full h-full' : INACTIVE_TAB_PANE_CLASS,
-                      // In-app highlight: ring the whole terminal content when its
-                      // process finished while unfocused. Distinct amber accent,
-                      // inset so it stays inside the pane and clear of the
-                      // active-pane primary ring and drop overlays. Pulse is
-                      // disabled under prefers-reduced-motion.
-                      terminal.needsAttention &&
-                        'rounded-sm ring-2 ring-inset ring-amber-400/70 animate-pulse motion-reduce:animate-none'
+                      // A quiet inset warning keeps a finished background terminal
+                      // visible without competing with pane focus or drop previews.
+                      terminal.needsAttention && 'shadow-[inset_0_0_0_1px_hsl(var(--warning)/0.65)]'
                     )}
                   >
                     <Suspense fallback={<PaneSkeleton />}>
@@ -562,7 +561,7 @@ export function PaneContent({
                 <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-background">
                   <button
                     type="button"
-                    className="rounded-md border border-border bg-card px-3 py-2 text-sm hover:bg-accent"
+                    className="border border-border/60 bg-card px-3 py-1.5 text-sm text-foreground transition-colors hover:bg-secondary"
                     onClick={() => handleAddTerminalForPane()}
                   >
                     {t('emptyPane.create', { ns: 'terminal' })}
@@ -589,7 +588,7 @@ export function PaneContent({
         >
           <button
             type="button"
-            className="absolute right-3 top-3 z-10 flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
+            className="absolute right-3 top-3 z-10 flex h-8 w-8 items-center justify-center text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
             title={t('pane.closeAgentLauncherEsc')}
             aria-label={t('pane.closeAgentLauncher')}
             onClick={() => useWorkspaceStore.getState().hideAgentLauncher()}

@@ -1604,7 +1604,7 @@ export function AgentLauncher({
           {/* biome-ignore lint/a11y/noStaticElementInteractions: drop zone for attachments; the file picker button is the accessible path */}
           <div
             data-agent-launcher-composer="true"
-            className="relative z-10 rounded-2xl border border-border/60 bg-card transition-colors focus-within:border-border"
+            className="relative z-10 rounded-lg border border-border/70 bg-card/90 transition-[border-color,background-color] focus-within:border-foreground/20 focus-within:bg-card"
             onDragOver={canDropPaste ? (e) => e.preventDefault() : undefined}
             onDrop={
               canDropPaste

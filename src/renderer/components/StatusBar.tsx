@@ -51,9 +51,9 @@ export function StatusBar({ project }: StatusBarProps): React.JSX.Element {
   const lastExitCode = activeTerminal?.lastExitCode
 
   return (
-    <div className="relative z-50 flex h-8 flex-shrink-0 items-center border-t border-border bg-status-bar px-3 font-sans text-xs text-status-bar-foreground select-none">
+    <div className="relative z-50 flex h-6 flex-shrink-0 select-none items-center border-t border-border bg-status-bar px-1.5 font-sans text-2xs text-status-bar-foreground shadow-[inset_0_1px_0_hsl(var(--foreground)/0.018)]">
       {/* Left side */}
-      <div className="flex items-center space-x-4">
+      <div className="flex min-w-0 items-center gap-1">
         {project && (
           <>
             <StatusItem
@@ -106,7 +106,7 @@ export function StatusBar({ project }: StatusBarProps): React.JSX.Element {
       <div className="flex-1" />
 
       {/* Right side */}
-      <div className="flex items-center space-x-4">
+      <div className="flex items-center gap-1">
         <RemoteAccessPopover />
 
         {showExitCode && lastExitCode !== null && lastExitCode !== undefined && (
@@ -162,7 +162,7 @@ function StatusItem({ icon, children, className }: StatusItemProps): React.JSX.E
   return (
     <div
       className={cn(
-        'flex cursor-pointer items-center rounded px-2 py-0.5 transition-colors hover:bg-muted hover:text-foreground',
+        'flex h-5 cursor-pointer items-center rounded-sm px-1.5 transition-[color,background-color] duration-150 ease-[var(--ease-out)] hover:bg-foreground/[0.045] hover:text-foreground',
         className
       )}
     >
@@ -231,7 +231,7 @@ function GitStatusIndicator({
   if (items.length === 0) return null
 
   return (
-    <div className="flex items-center space-x-2 rounded px-2 py-0.5 transition-colors hover:bg-muted hover:text-foreground">
+    <div className="flex h-5 items-center gap-2 rounded-sm px-1.5 transition-colors hover:bg-secondary">
       {items}
     </div>
   )

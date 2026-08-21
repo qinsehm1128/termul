@@ -15,7 +15,12 @@ import { cn } from '@/lib/utils'
 import { useAcpStore } from '@/stores/acp-store'
 import { ChatEmptyState } from './ChatEmptyState'
 import { ChatMessage } from './ChatMessage'
-import { CHAT_GUTTER_X } from './chat-layout'
+import {
+  CHAT_CONTENT_WIDTH,
+  CHAT_GUTTER_X,
+  CHAT_STREAM_PAD_Y,
+  chatTimelineRowClass
+} from './chat-layout'
 import { groupTurnActivity, type TimelineItem, type TurnTimelineItem } from './chat-timeline'
 import { ThoughtGroup } from './ThoughtGroup'
 import { ToolCallCard } from './ToolCallCard'
@@ -177,6 +182,9 @@ function VirtualizedTimeline({
     useAcpStore.getState?.()?.clearSessionBackfill?.(sessionId)
   }, [pinned, sessionId])
 
+  const rowClass = (item: TurnTimelineItem): string =>
+    chatTimelineRowClass(item.kind, item.kind === 'message' ? item.message.role : undefined)
+
   const renderItemContent = (item: TurnTimelineItem, index: number): React.JSX.Element => {
     if (item.kind === 'activity') {
       return (
@@ -226,11 +234,13 @@ function VirtualizedTimeline({
   const virtualItems = virtualizer.getVirtualItems()
   if (viewportEl === null || virtualItems.length === 0) {
     return (
-      <MessageScrollerContent className="mx-auto w-full max-w-3xl">
+      <MessageScrollerContent className={CHAT_CONTENT_WIDTH}>
         {groupedItems.map((item, index) => (
           <MessageScrollerItem
             key={item.key}
             messageId={item.key}
+            className={rowClass(item)}
+            data-timeline-kind={item.kind}
             scrollAnchor={item.kind === 'message' && item.message.role === 'user'}
           >
             {renderItemContent(item, index)}
@@ -242,7 +252,7 @@ function VirtualizedTimeline({
 
   return (
     <MessageScrollerContent
-      className="mx-auto w-full max-w-3xl"
+      className={CHAT_CONTENT_WIDTH}
       style={{ height: `${virtualizer.getTotalSize()}px`, position: 'relative' }}
     >
       {virtualItems.map((virtualItem) => {
@@ -253,8 +263,10 @@ function VirtualizedTimeline({
             key={virtualItem.key}
             ref={virtualizer.measureElement}
             messageId={item.key}
+            className={rowClass(item)}
             scrollAnchor={item.kind === 'message' && item.message.role === 'user'}
             data-index={virtualItem.index}
+            data-timeline-kind={item.kind}
             style={{
               position: 'absolute',
               top: 0,
@@ -298,13 +310,10 @@ export function ChatMessageList({
 
   return (
     <div className="relative min-h-0 flex-1">
-      {/* Edge fades: content dissolves into the header/composer instead of hard-cutting. */}
-      <div className="pointer-events-none absolute inset-x-0 top-0 z-10 h-6 bg-gradient-to-b from-terminal-bg to-transparent" />
-      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-10 h-6 bg-gradient-to-t from-terminal-bg to-transparent" />
       <MessageScrollerProvider autoScroll>
         <ItemCountReporter count={groupedItems.length} />
         <MessageScroller>
-          <MessageScrollerViewport className={cn(CHAT_GUTTER_X, 'py-4')}>
+          <MessageScrollerViewport className={cn(CHAT_GUTTER_X, CHAT_STREAM_PAD_Y)}>
             <VirtualizedTimeline
               sessionId={sessionId}
               groupedItems={groupedItems}
