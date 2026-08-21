@@ -32,6 +32,24 @@ vi.mock('@/lib/api', () => ({
     read: vi.fn().mockResolvedValue({ success: true, data: null }),
     write: vi.fn(),
     writeDebounced: (...args: unknown[]) => mockWriteDebounced(...args)
+  },
+  tunnelConfigApi: {
+    get: vi.fn().mockResolvedValue({
+      success: true,
+      data: {
+        provider: 'cloudflareQuick',
+        cloudflareNamedHostname: null,
+        cloudflareNamedLocalPort: null,
+        cloudflareNamedTokenSet: false,
+        frpServerAddr: null,
+        frpServerPort: null,
+        frpCustomDomain: null,
+        frpRemotePort: null,
+        frpPublicHttps: true,
+        frpTokenSet: false
+      }
+    }),
+    set: vi.fn()
   }
 }))
 

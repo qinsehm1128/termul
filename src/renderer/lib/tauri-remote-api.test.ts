@@ -9,7 +9,7 @@ vi.mock('@tauri-apps/api/core', () => ({
   invoke: mockInvoke
 }))
 
-import { remoteServerApi } from './tauri-remote-api'
+import { remoteServerApi, tunnelConfigApi } from './tauri-remote-api'
 
 describe('remoteServerApi', () => {
   beforeEach(() => {
@@ -84,5 +84,23 @@ describe('remoteServerApi', () => {
     if (!result.success) {
       expect(result.code).toBe('REMOTE_START_FAILED')
     }
+  })
+  it('tunnelConfigApi.get forwards tunnel_config_get', async () => {
+    const ipc: IpcResult<{ provider: 'cloudflareQuick' }> = {
+      success: true,
+      data: { provider: 'cloudflareQuick' }
+    }
+    mockInvoke.mockResolvedValueOnce(ipc)
+    const result = await tunnelConfigApi.get()
+    expect(mockInvoke).toHaveBeenCalledWith('tunnel_config_get', undefined)
+    expect(result).toEqual(ipc)
+  })
+
+  it('tunnelConfigApi.set forwards the update payload', async () => {
+    mockInvoke.mockResolvedValueOnce({ success: true, data: { provider: 'frp' } })
+    await tunnelConfigApi.set({ provider: 'frp', frpServerAddr: '1.2.3.4' })
+    expect(mockInvoke).toHaveBeenCalledWith('tunnel_config_set', {
+      update: { provider: 'frp', frpServerAddr: '1.2.3.4' }
+    })
   })
 })

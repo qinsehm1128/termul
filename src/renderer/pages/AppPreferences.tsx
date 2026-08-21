@@ -24,6 +24,7 @@ import { ConfirmDialog } from '@/components/ConfirmDialog'
 import { ShortcutRecorder } from '@/components/ShortcutRecorder'
 import { AcpAgentsSettings } from '@/components/settings/AcpAgentsSettings'
 import { McpServersSettings } from '@/components/settings/McpServersSettings'
+import { RemoteAccessSettings } from '@/components/settings/RemoteAccessSettings'
 import {
   type SettingsCategory,
   SettingsLayout,
@@ -101,6 +102,7 @@ const APP_PREF_CATEGORY_DEFS = [
   },
   { id: 'ai-agents', labelKey: 'categories.aiAgents', icon: <Bot size={16} /> },
   { id: 'mcp-servers', labelKey: 'categories.mcpServers', icon: <Network size={16} /> },
+  { id: 'remote-access', labelKey: 'categories.remoteAccess', icon: <Monitor size={16} /> },
   { id: 'shortcuts', labelKey: 'categories.shortcuts', icon: <Keyboard size={16} /> },
   { id: 'updates', labelKey: 'categories.updates', icon: <Download size={16} /> },
   { id: 'diagnostics', labelKey: 'categories.diagnostics', icon: <FileText size={16} /> },
@@ -203,6 +205,12 @@ const APP_PREF_SEARCH_DEFS = [
     labelKey: 'categories.mcpServers',
     descriptionKey: 'mcpServers.description',
     keywords: ['mcp', 'model context protocol', 'stdio', 'http', 'sse']
+  },
+  {
+    categoryId: 'remote-access',
+    labelKey: 'categories.remoteAccess',
+    descriptionKey: 'remoteAccess.description',
+    keywords: ['tunnel', 'cloudflare', 'frp', 'remote', 'qr', 'ios']
   },
   {
     categoryId: 'shortcuts',
@@ -1204,6 +1212,25 @@ export default function AppPreferences(): React.JSX.Element {
           </SettingsSection>
 
           {/* Keyboard Shortcuts Section */}
+          <SettingsSection id="remote-access">
+            <div className="flex flex-col gap-6 border-b border-border pb-6 lg:flex-row lg:items-start">
+              <div className="w-full pt-1 lg:w-1/3">
+                <div className="flex items-center gap-2">
+                  <Monitor size={18} className="text-primary" />
+                  <h2 className="text-lg font-medium text-foreground">
+                    {tSettings('categories.remoteAccess')}
+                  </h2>
+                </div>
+                <p className="mt-1 text-sm text-muted-foreground">
+                  {tSettings('remoteAccess.description')}
+                </p>
+              </div>
+              <div className="w-full lg:w-2/3">
+                <RemoteAccessSettings />
+              </div>
+            </div>
+          </SettingsSection>
+
           <SettingsSection id="shortcuts">
             <div className="flex items-start gap-6 border-b border-border pb-6">
               <div className="w-1/3 pt-1">

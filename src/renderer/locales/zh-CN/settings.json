@@ -17,6 +17,7 @@
     "projectDefaults": "新项目默认值",
     "aiAgents": "AI 代理",
     "mcpServers": "MCP 服务器",
+    "remoteAccess": "远程访问",
     "shortcuts": "键盘快捷键",
     "updates": "更新",
     "diagnostics": "诊断与日志",
@@ -160,6 +161,45 @@
     "skippedVersion": "已跳过版本",
     "skipping": "当前正在跳过版本 {{version}}",
     "skippingHint": "在更新版本可用之前，将不再提供此版本。"
+  },
+  "remoteAccess": {
+    "description": "选择手机如何连到这台电脑：免费 Cloudflare 临时隧道、你自己的 Cloudflare 域名，或自建 FRP。",
+    "desktopOnly": "隧道方案在桌面端配置。手机客户端只打开生成的链接。",
+    "loading": "正在加载隧道设置…",
+    "loadFailed": "无法加载隧道设置。",
+    "saveFailed": "无法保存隧道设置。",
+    "saved": "隧道设置已保存。",
+    "provider": "隧道方案",
+    "save": "保存隧道设置",
+    "tokenSet": "令牌已保存在系统钥匙串中。输入新值即可替换。",
+    "providers": {
+      "cloudflareQuick": "Cloudflare 免费临时隧道（随机域名）",
+      "cloudflareNamed": "自己的 Cloudflare 命名隧道",
+      "frp": "FRP（自建服务端）"
+    },
+    "hints": {
+      "cloudflareQuick": "无需配置。每次开启都会生成新的 https://*.trycloudflare.com 地址。",
+      "cloudflareNamed": "使用内置 cloudflared 和你的 tunnel token。请把 Cloudflare 入口指到 http://127.0.0.1 和下面的本地端口。",
+      "frp": "用 frpc 连接你的 frps。填写自定义域名（HTTP 代理）或远程端口（TCP）。请安装 frpc，或设置 TERMUL_FRPC_PATH。"
+    },
+    "namedHostname": "公网主机名",
+    "namedHostnameHint": "已经解析到这条命名隧道的域名，例如 termul.example.com。",
+    "namedLocalPort": "本地绑定端口",
+    "namedLocalPortHint": "固定回环端口（默认 18787），方便 Cloudflare 入口指向 http://127.0.0.1:18787。",
+    "namedToken": "Cloudflare 隧道令牌",
+    "namedTokenHint": "来自 Cloudflare Zero Trust 隧道页面。只保存在系统钥匙串。",
+    "frpServerAddr": "FRP 服务端地址",
+    "frpServerAddrHint": "frps 的主机名或 IP，不要带协议。",
+    "frpServerPort": "FRP 服务端端口",
+    "frpServerPortHint": "frps 监听端口。留空则使用 7000。",
+    "frpCustomDomain": "公网域名（HTTP 代理）",
+    "frpCustomDomainHint": "推荐。frpc 通过 frps 发布该主机名。留空则改用远程 TCP 端口。",
+    "frpRemotePort": "远程 TCP 端口",
+    "frpRemotePortHint": "仅在未填写自定义域名时使用。若保持 HTTPS，请在该端口前放置 TLS。",
+    "frpToken": "FRP 认证令牌",
+    "frpTokenHint": "必须与 frps 的 auth.token 一致。只保存在系统钥匙串。",
+    "frpPublicHttps": "二维码使用 HTTPS",
+    "frpPublicHttpsHint": "前面有反代终止 TLS 时请保持开启。仅在可信的 HTTP 测试环境关闭。"
   },
   "diagnostics": {
     "description": "导出或复制应用日志以排查问题。",

@@ -1663,6 +1663,7 @@ pub fn run() {
             // Create Remote Server State
             let remote_state = Arc::new(RemoteServerState::new());
             app.manage(remote_state);
+            app.manage(Arc::new(remote::TunnelConfigStore::new(app_data_dir.clone())));
 
             // Register default migrations
             register_default_migrations(migration_manager.as_ref());
@@ -1948,6 +1949,8 @@ pub fn run() {
             commands::remote_server_start,
             commands::remote_server_stop,
             commands::remote_server_status,
+            remote::tunnel::commands::tunnel_config_get,
+            remote::tunnel::commands::tunnel_config_set,
             commands::remote_sync_projects,
             commands::set_host_default_project,
             commands::remote_sync_chat_history,

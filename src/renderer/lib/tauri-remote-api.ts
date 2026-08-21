@@ -2,7 +2,10 @@ import type {
   IpcResult,
   RemoteBindMode,
   RemoteServerApi,
-  RemoteStatus
+  RemoteStatus,
+  TunnelConfigApi,
+  TunnelConfigUpdate,
+  TunnelConfigView
 } from '@shared/types/ipc.types'
 import type { ProjectSummary } from '@shared/types/web-projects.types'
 import type { PersistedSessionSummary } from '@shared/types/web-protocol.types'
@@ -40,6 +43,15 @@ async function invokeIpc<T>(command: string, args?: InvokeArgs): Promise<IpcResu
       error: error instanceof Error ? error.message : String(error),
       code: 'INVOKE_ERROR'
     }
+  }
+}
+
+export const tunnelConfigApi: TunnelConfigApi = {
+  async get(): Promise<IpcResult<TunnelConfigView>> {
+    return invokeIpc<TunnelConfigView>('tunnel_config_get')
+  },
+  async set(update: TunnelConfigUpdate): Promise<IpcResult<TunnelConfigView>> {
+    return invokeIpc<TunnelConfigView>('tunnel_config_set', { update })
   }
 }
 
