@@ -7,15 +7,15 @@ use sha2::{Digest, Sha256};
 use crate::conversation::{DirectoryPermissions, DurableFileSystem};
 
 pub const SCHEDULED_TASK_SKILL_NAME: &str = "termul-scheduled-tasks";
-pub const SCHEDULED_TASK_SKILL_TEMPLATE_VERSION: u32 = 1;
+pub const SCHEDULED_TASK_SKILL_TEMPLATE_VERSION: u32 = 2;
 const MANAGED_MARKER: &str = "<!-- managed-by-termul:termul-scheduled-tasks -->";
 
 const SKILL_TEMPLATE: &str = r#"---
 name: termul-scheduled-tasks
-description: Draft safe project-scoped AI schedules for review in Termul.
+description: Draft safe Termul-level AI schedules for review from any Conversation.
 metadata:
   managedByTermul: true
-  templateVersion: 1
+  templateVersion: 2
 ---
 <!-- managed-by-termul:termul-scheduled-tasks -->
 
@@ -24,8 +24,9 @@ metadata:
 Use Termul's `scheduled_task_*` tools when a user asks for recurring, delayed,
 or one-time autonomous work.
 
-1. Clarify the project, timezone, schedule, ACP, execution directory, expected
-   result, and minimum permissions.
+1. Clarify the timezone, schedule, ACP, execution directory, expected result,
+   and minimum permissions. A project association is optional; never require
+   one before drafting a task.
 2. Call `scheduled_task_preview` and show the next execution times. Never
    calculate timezone or DST behavior yourself.
 3. Create or update a draft. A draft does not run until the user confirms the

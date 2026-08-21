@@ -574,16 +574,14 @@ impl HostPlanServer {
             .conversation_id_for_session(real_session_id)
             .map(|id| id.to_string());
         let Some((
-            scoped_project_id,
+            associated_project_id,
             scoped_workspace_cwd,
             scoped_execution_target,
             scoped_execution_cwd,
             scoped_agent_config_id,
         )) = persistence.scheduled_task_scope_for_session(real_session_id)
         else {
-            return FrameReply::err(
-                "scheduled tasks require an active project-backed Conversation",
-            );
+            return FrameReply::err("scheduled tasks require an active Conversation");
         };
         let context = crate::scheduled_tasks::TaskMutationContextV1 {
             actor: crate::scheduled_tasks::ScheduledTaskAuditActor::Agent,
@@ -596,11 +594,7 @@ impl HostPlanServer {
                 crate::acp::host_mcp::ScheduledTaskListInput,
             >(payload)
             .map_err(|error| error.to_string())
-            .and_then(|_input| {
-                service
-                    .list_tasks(Some(&scoped_project_id))
-                    .map_err(|error| error.to_string())
-            })
+            .and_then(|_input| service.list_tasks(None).map_err(|error| error.to_string()))
             .and_then(|tasks| serde_json::to_value(tasks).map_err(|error| error.to_string())),
             FrameKind::ScheduledTaskGet => {
                 serde_json::from_value::<crate::acp::host_mcp::ScheduledTaskGetInput>(payload)
@@ -609,13 +603,6 @@ impl HostPlanServer {
                         service
                             .get_task(&input.task_id)
                             .map_err(|error| error.to_string())
-                    })
-                    .and_then(|task| {
-                        if task.project_id == scoped_project_id {
-                            Ok(task)
-                        } else {
-                            Err("scheduled task is outside this Conversation project".to_string())
-                        }
                     })
                     .and_then(|task| serde_json::to_value(task).map_err(|error| error.to_string()))
             }
@@ -644,7 +631,7 @@ impl HostPlanServer {
                 .map_err(|error| error.to_string())
             })
             .and_then(|mut draft| {
-                draft.project_id = scoped_project_id.clone();
+                draft.project_id = associated_project_id.clone();
                 draft.workspace_cwd = scoped_workspace_cwd.clone();
                 draft.execution_target = scoped_execution_target.clone();
                 draft.execution_cwd = scoped_execution_cwd.clone();
@@ -668,7 +655,7 @@ impl HostPlanServer {
                 )
                 .map_err(|error| error.to_string())
                 .map(|mut draft| {
-                    draft.project_id = scoped_project_id.clone();
+                    draft.project_id = associated_project_id.clone();
                     draft.workspace_cwd = scoped_workspace_cwd.clone();
                     draft.execution_target = scoped_execution_target.clone();
                     draft.execution_cwd = scoped_execution_cwd.clone();
@@ -678,12 +665,6 @@ impl HostPlanServer {
                 })
             })
             .and_then(|(task_id, expected_revision, draft)| {
-                let current = service
-                    .get_task(&task_id)
-                    .map_err(|error| error.to_string())?;
-                if current.project_id != scoped_project_id {
-                    return Err("scheduled task is outside this Conversation project".to_string());
-                }
                 service
                     .update_draft(&task_id, expected_revision, draft, context.clone())
                     .map_err(|error| error.to_string())
@@ -692,22 +673,16 @@ impl HostPlanServer {
                 self.emit_scheduled_task_draft(agent_id, real_session_id, &task);
                 serde_json::to_value(task).map_err(|error| error.to_string())
             }),
-            FrameKind::ScheduledTaskPause => serde_json::from_value::<
-                crate::acp::host_mcp::ScheduledTaskPauseInput,
-            >(payload)
-            .map_err(|error| error.to_string())
-            .and_then(|input| {
-                let current = service
-                    .get_task(&input.task_id)
-                    .map_err(|error| error.to_string())?;
-                if current.project_id != scoped_project_id {
-                    return Err("scheduled task is outside this Conversation project".to_string());
-                }
-                service
-                    .pause(&input.task_id, input.expected_revision, context)
+            FrameKind::ScheduledTaskPause => {
+                serde_json::from_value::<crate::acp::host_mcp::ScheduledTaskPauseInput>(payload)
                     .map_err(|error| error.to_string())
-            })
-            .and_then(|task| serde_json::to_value(task).map_err(|error| error.to_string())),
+                    .and_then(|input| {
+                        service
+                            .pause(&input.task_id, input.expected_revision, context)
+                            .map_err(|error| error.to_string())
+                    })
+                    .and_then(|task| serde_json::to_value(task).map_err(|error| error.to_string()))
+            }
             FrameKind::Plan | FrameKind::SetTitle => unreachable!("scheduled match only"),
         };
         match result {
@@ -803,6 +778,26 @@ mod tests {
             Ok(crate::web::sink::EventDeliveryReceipt::delivered(
                 None, false,
             ))
+        }
+    }
+
+    struct NoopScheduledTaskExecutor;
+
+    #[async_trait::async_trait]
+    impl crate::scheduled_tasks::ScheduledTaskExecutor for NoopScheduledTaskExecutor {
+        async fn execute(
+            &self,
+            _task: crate::scheduled_tasks::ScheduledTaskV1,
+            _run: crate::scheduled_tasks::ScheduledTaskRunV1,
+        ) -> Result<
+            crate::scheduled_tasks::TaskExecutionOutcome,
+            crate::scheduled_tasks::TaskExecutionError,
+        > {
+            Ok(crate::scheduled_tasks::TaskExecutionOutcome {
+                conversation_id: None,
+                summary: None,
+                usage: None,
+            })
         }
     }
 
@@ -908,11 +903,52 @@ mod tests {
         ));
         let server =
             HostPlanServer::start_with_conversation_persistence(vec![], Arc::clone(&adapter));
-        let (_port, token, _provisional) = server.register_session("agent-1");
+        let task_store = Arc::new(
+            crate::scheduled_tasks::ScheduledTaskStore::open(
+                temp.path().canonicalize().unwrap().join("scheduled-tasks"),
+            )
+            .unwrap(),
+        );
+        let task_service = crate::scheduled_tasks::ScheduledTaskService::with_max_concurrent_runs(
+            Arc::clone(&task_store),
+            Arc::new(NoopScheduledTaskExecutor),
+            1,
+        );
+        server.set_scheduled_tasks(&task_service);
+        let (port, token, provisional) = server.register_session("agent-1");
         server.bind_session(&token, "sess-cold-plan");
+        server.begin_turn("agent-1", "sess-cold-plan");
         let hydrated = server.plan_store.get("sess-cold-plan").unwrap();
         assert_eq!(hydrated.len(), 1);
         assert_eq!(hydrated[0].content, "ship");
+        let draft_reply = connect_and_send(
+            port,
+            &serde_json::json!({
+                "token": token,
+                "session_id": provisional,
+                "kind": "scheduled_task_draft_create",
+                "payload": {
+                    "draft": {
+                        "projectId": "agent-selected-project-must-be-ignored",
+                        "name": "Projectless task",
+                        "schedule": {"kind": "at", "at": "2099-01-01T00:00:00Z"},
+                        "prompt": "Run from the Conversation workspace",
+                        "agentConfigId": "agent-selected-config-must-be-ignored",
+                        "executionTarget": {"kind": "workspace"},
+                        "executionCwd": visible,
+                        "workspaceCwd": visible
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(draft_reply["ok"], true, "{draft_reply}");
+        assert_eq!(draft_reply["result"]["projectId"], serde_json::Value::Null);
+        assert_eq!(
+            draft_reply["result"]["sourceConversationId"],
+            conversation_id.to_string()
+        );
+        assert_eq!(task_store.list_tasks(None).unwrap().len(), 1);
 
         writer
             .append_event(

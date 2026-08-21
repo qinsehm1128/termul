@@ -1,4 +1,4 @@
-//! Host-owned, project-scoped AI scheduled tasks.
+//! Host-owned AI scheduled tasks with optional project association.
 //!
 //! The host persists schedule definitions and a compact run ledger. Each actual
 //! agent execution is represented by a separate Conversation v2 record so

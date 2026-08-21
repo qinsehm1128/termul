@@ -239,18 +239,21 @@ fn main() -> ExitCode {
             Arc::clone(&conversation_bootstrap.creation),
             Arc::clone(&conversation_bootstrap.persistence_adapter),
         ));
-        let scheduled_task_store = match termul_manager_lib::ScheduledTaskStore::open(
-            cfg.service_account_state_dir()
-                .join("scheduled-tasks")
-                .join("v1")
-                .join("projects"),
-        ) {
-            Ok(store) => Arc::new(store),
-            Err(error) => {
-                eprintln!("termul-server: failed to open scheduled task store: {error}");
-                return ExitCode::from(1);
-            }
-        };
+        let scheduled_task_root = cfg
+            .service_account_state_dir()
+            .join("scheduled-tasks")
+            .join("v1");
+        let scheduled_task_store =
+            match termul_manager_lib::ScheduledTaskStore::open_with_legacy_root(
+                scheduled_task_root.join("catalog"),
+                Some(scheduled_task_root.join("projects")),
+            ) {
+                Ok(store) => Arc::new(store),
+                Err(error) => {
+                    eprintln!("termul-server: failed to open scheduled task store: {error}");
+                    return ExitCode::from(1);
+                }
+            };
         let scheduled_tasks = termul_manager_lib::scheduled_tasks::ScheduledTaskService::new(
             scheduled_task_store,
             Arc::new(

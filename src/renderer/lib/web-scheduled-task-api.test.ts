@@ -5,7 +5,7 @@ const taskId = '11111111-1111-4111-8111-111111111111'
 const task = {
   schemaVersion: 1,
   taskId,
-  projectId: 'project-1',
+  projectId: null,
   name: 'Daily review',
   description: '',
   status: 'draft',
@@ -22,7 +22,7 @@ const task = {
   workspaceCwd: '/conversation',
   sourceConversationId: null,
   permissions: [],
-  skillTemplateVersion: 1,
+  skillTemplateVersion: 2,
   revision: 1,
   draftHash: 'b'.repeat(64),
   createdAt: '2026-08-20T00:00:00Z',

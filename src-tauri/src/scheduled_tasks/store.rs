@@ -21,6 +21,9 @@ use super::schedule::{next_after, normalize_schedule, ScheduleError};
 const CATALOG_FILE: &str = "tasks.json";
 const RUNS_FILE: &str = "runs.jsonl";
 const AUDIT_FILE: &str = "audit.jsonl";
+/// New tasks are host-level resources. Keep them in one durable partition while
+/// continuing to read legacy project-named partitions written by v1.
+const GLOBAL_PARTITION: &str = "_global";
 const MAX_NAME_BYTES: usize = 160;
 const MAX_DESCRIPTION_BYTES: usize = 8 * 1024;
 const MAX_PROMPT_BYTES: usize = 128 * 1024;
@@ -100,16 +103,36 @@ pub type Result<T> = std::result::Result<T, ScheduledTaskStoreError>;
 #[derive(Debug)]
 pub struct ScheduledTaskStore {
     root: PathBuf,
+    legacy_root: Option<PathBuf>,
     durable_fs: DurableFileSystem,
     mutation_lock: Mutex<()>,
 }
 
+#[derive(Debug)]
+struct CatalogLocation {
+    root: PathBuf,
+    partition: String,
+}
+
 impl ScheduledTaskStore {
     pub fn open(root: PathBuf) -> Result<Self> {
+        Self::open_with_legacy_root(root, None)
+    }
+
+    pub fn open_with_legacy_root(root: PathBuf, legacy_root: Option<PathBuf>) -> Result<Self> {
         let durable_fs = DurableFileSystem::new();
         durable_fs.create_dir_durable(&root, DirectoryPermissions::PrivateOwnerOnly)?;
+        let legacy_root = legacy_root.filter(|legacy| legacy != &root && legacy.is_dir());
+        if let Some(legacy) = legacy_root.as_ref() {
+            log::info!(
+                "[scheduled-task] boundary=legacy_store_enabled global_root={} legacy_root={}",
+                root.display(),
+                legacy.display()
+            );
+        }
         Ok(Self {
             root,
+            legacy_root,
             durable_fs,
             mutation_lock: Mutex::new(()),
         })
@@ -125,21 +148,28 @@ impl ScheduledTaskStore {
             .mutation_lock
             .lock()
             .map_err(|_| ScheduledTaskStoreError::Poisoned)?;
-        let mut tasks = if let Some(project_id) = project_id {
+        if let Some(project_id) = project_id {
             validate_component(project_id, "projectId")?;
-            self.load_catalog(project_id)?.tasks
-        } else {
-            let mut all = Vec::new();
-            for entry in fs::read_dir(&self.root)? {
+        }
+        let mut tasks_by_id = BTreeMap::new();
+        for root in self.catalog_roots() {
+            for entry in fs::read_dir(root)? {
                 let entry = entry?;
                 if entry.file_type()?.is_dir() {
-                    if let Some(project_id) = entry.file_name().to_str() {
-                        all.extend(self.load_catalog(project_id)?.tasks);
+                    if let Some(partition) = entry.file_name().to_str() {
+                        for task in self.load_catalog_from(root, partition)?.tasks {
+                            // The global catalog is scanned first and wins if an
+                            // interrupted migration left a duplicate legacy copy.
+                            tasks_by_id.entry(task.task_id.clone()).or_insert(task);
+                        }
                     }
                 }
             }
-            all
-        };
+        }
+        let mut tasks = tasks_by_id.into_values().collect::<Vec<_>>();
+        if let Some(project_id) = project_id {
+            tasks.retain(|task| task.project_id.as_deref() == Some(project_id));
+        }
         tasks.sort_by(|left, right| {
             left.project_id
                 .cmp(&right.project_id)
@@ -167,7 +197,7 @@ impl ScheduledTaskStore {
             .map_err(|_| ScheduledTaskStoreError::Poisoned)?;
         let input = validate_input(input)?;
         let now = Utc::now();
-        let mut catalog = self.load_catalog(&input.project_id)?;
+        let mut catalog = self.load_catalog(GLOBAL_PARTITION)?;
         let mut task = ScheduledTaskV1 {
             schema_version: SCHEDULED_TASK_SCHEMA_VERSION,
             task_id: Uuid::new_v4().to_string(),
@@ -195,8 +225,11 @@ impl ScheduledTaskStore {
         task.draft_hash = task_hash(&task)?;
         catalog.revision = catalog.revision.saturating_add(1);
         catalog.tasks.push(task.clone());
-        self.write_catalog(&input.project_id, &catalog)?;
-        self.append_audit_locked(audit_for("draftCreated", None, Some(&task), context)?)?;
+        self.write_catalog(GLOBAL_PARTITION, &catalog)?;
+        self.append_audit_locked(
+            GLOBAL_PARTITION,
+            audit_for("draftCreated", None, Some(&task), context)?,
+        )?;
         Ok(task)
     }
 
@@ -213,12 +246,7 @@ impl ScheduledTaskStore {
             .lock()
             .map_err(|_| ScheduledTaskStoreError::Poisoned)?;
         let input = validate_input(input)?;
-        let mut catalog = self.load_catalog(&input.project_id)?;
-        let index = catalog
-            .tasks
-            .iter()
-            .position(|task| task.task_id == task_id)
-            .ok_or_else(|| ScheduledTaskStoreError::NotFound(task_id.to_string()))?;
+        let (location, mut catalog, index) = self.locate_task_locked(task_id)?;
         let before = catalog.tasks[index].clone();
         ensure_revision(&before, expected_revision)?;
         if before.status != ScheduledTaskStatus::Draft {
@@ -234,6 +262,7 @@ impl ScheduledTaskStore {
         task.execution_policy = input.execution_policy;
         task.prompt = input.prompt;
         task.agent_config_id = input.agent_config_id;
+        task.project_id = input.project_id;
         task.execution_target = input.execution_target;
         task.execution_cwd = input.execution_cwd;
         task.workspace_cwd = input.workspace_cwd;
@@ -245,13 +274,12 @@ impl ScheduledTaskStore {
         task.draft_hash = task_hash(task)?;
         let updated = task.clone();
         catalog.revision = catalog.revision.saturating_add(1);
-        self.write_catalog(&input.project_id, &catalog)?;
-        self.append_audit_locked(audit_for(
-            "draftUpdated",
-            Some(&before),
-            Some(&updated),
-            context,
-        )?)?;
+        self.write_catalog_at(&location.root, &location.partition, &catalog)?;
+        self.append_audit_locked_at(
+            &location.root,
+            &location.partition,
+            audit_for("draftUpdated", Some(&before), Some(&updated), context)?,
+        )?;
         Ok(updated)
     }
 
@@ -315,13 +343,17 @@ impl ScheduledTaskStore {
             .mutation_lock
             .lock()
             .map_err(|_| ScheduledTaskStoreError::Poisoned)?;
-        let (project_id, mut catalog, index) = self.locate_task_locked(task_id)?;
+        let (location, mut catalog, index) = self.locate_task_locked(task_id)?;
         let before = catalog.tasks[index].clone();
         ensure_revision(&before, expected_revision)?;
         catalog.tasks.remove(index);
         catalog.revision = catalog.revision.saturating_add(1);
-        self.write_catalog(&project_id, &catalog)?;
-        self.append_audit_locked(audit_for("deleted", Some(&before), None, context)?)?;
+        self.write_catalog_at(&location.root, &location.partition, &catalog)?;
+        self.append_audit_locked_at(
+            &location.root,
+            &location.partition,
+            audit_for("deleted", Some(&before), None, context)?,
+        )?;
         Ok(())
     }
 
@@ -338,14 +370,14 @@ impl ScheduledTaskStore {
             .mutation_lock
             .lock()
             .map_err(|_| ScheduledTaskStoreError::Poisoned)?;
-        let (project_id, mut catalog, index) = self.locate_task_locked(task_id)?;
+        let (location, mut catalog, index) = self.locate_task_locked(task_id)?;
         if catalog.tasks[index].next_run_at == next_run_at {
             return Ok(catalog.tasks[index].clone());
         }
         catalog.tasks[index].next_run_at = next_run_at;
         let updated = catalog.tasks[index].clone();
         catalog.revision = catalog.revision.saturating_add(1);
-        self.write_catalog(&project_id, &catalog)?;
+        self.write_catalog_at(&location.root, &location.partition, &catalog)?;
         Ok(updated)
     }
 
@@ -355,23 +387,27 @@ impl ScheduledTaskStore {
             .mutation_lock
             .lock()
             .map_err(|_| ScheduledTaskStoreError::Poisoned)?;
-        let project_dir = self.ensure_project_dir(&run.project_id)?;
+        let (location, _, _) = self.locate_task_locked(&run.task_id)?;
+        let partition_dir = self.ensure_partition_dir_at(&location.root, &location.partition)?;
         let bytes = serde_json::to_vec(run)?;
         self.durable_fs
-            .append_jsonl(&project_dir.join(RUNS_FILE), &bytes)?;
+            .append_jsonl(&partition_dir.join(RUNS_FILE), &bytes)?;
         self.durable_fs
-            .sync_file_and_namespace(&project_dir.join(RUNS_FILE))?;
+            .sync_file_and_namespace(&partition_dir.join(RUNS_FILE))?;
         Ok(())
     }
 
     pub fn list_runs(&self, task_id: &str) -> Result<Vec<ScheduledTaskRunV1>> {
-        let task = self.get_task(task_id)?;
         let _guard = self
             .mutation_lock
             .lock()
             .map_err(|_| ScheduledTaskStoreError::Poisoned)?;
-        let records =
-            read_jsonl::<ScheduledTaskRunV1>(&self.project_dir(&task.project_id).join(RUNS_FILE))?;
+        let (location, _, _) = self.locate_task_locked(task_id)?;
+        let records = read_jsonl::<ScheduledTaskRunV1>(
+            &self
+                .partition_dir_at(&location.root, &location.partition)
+                .join(RUNS_FILE),
+        )?;
         let mut latest = BTreeMap::new();
         for run in records.into_iter().filter(|run| run.task_id == task_id) {
             validate_run(&run)?;
@@ -383,13 +419,15 @@ impl ScheduledTaskStore {
     }
 
     pub fn list_audit(&self, task_id: &str) -> Result<Vec<ScheduledTaskAuditEventV1>> {
-        let task = self.get_task(task_id)?;
         let _guard = self
             .mutation_lock
             .lock()
             .map_err(|_| ScheduledTaskStoreError::Poisoned)?;
+        let (location, _, _) = self.locate_task_locked(task_id)?;
         let mut events = read_jsonl::<ScheduledTaskAuditEventV1>(
-            &self.project_dir(&task.project_id).join(AUDIT_FILE),
+            &self
+                .partition_dir_at(&location.root, &location.partition)
+                .join(AUDIT_FILE),
         )?
         .into_iter()
         .filter(|event| event.task_id == task_id)
@@ -412,7 +450,7 @@ impl ScheduledTaskStore {
             .mutation_lock
             .lock()
             .map_err(|_| ScheduledTaskStoreError::Poisoned)?;
-        let (project_id, mut catalog, index) = self.locate_task_locked(task_id)?;
+        let (location, mut catalog, index) = self.locate_task_locked(task_id)?;
         let before = catalog.tasks[index].clone();
         ensure_revision(&before, expected_revision)?;
         if let Some(expected_hash) = expected_draft_hash {
@@ -431,34 +469,62 @@ impl ScheduledTaskStore {
         task.draft_hash = task_hash(task)?;
         let updated = task.clone();
         catalog.revision = catalog.revision.saturating_add(1);
-        self.write_catalog(&project_id, &catalog)?;
-        self.append_audit_locked(audit_for(action, Some(&before), Some(&updated), context)?)?;
+        self.write_catalog_at(&location.root, &location.partition, &catalog)?;
+        self.append_audit_locked_at(
+            &location.root,
+            &location.partition,
+            audit_for(action, Some(&before), Some(&updated), context)?,
+        )?;
         Ok(updated)
     }
 
-    fn locate_task_locked(&self, task_id: &str) -> Result<(String, ScheduledTaskCatalogV1, usize)> {
-        for entry in fs::read_dir(&self.root)? {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            let Some(project_id) = entry.file_name().to_str().map(str::to_string) else {
-                continue;
-            };
-            let catalog = self.load_catalog(&project_id)?;
-            if let Some(index) = catalog
-                .tasks
-                .iter()
-                .position(|task| task.task_id == task_id)
-            {
-                return Ok((project_id, catalog, index));
+    fn locate_task_locked(
+        &self,
+        task_id: &str,
+    ) -> Result<(CatalogLocation, ScheduledTaskCatalogV1, usize)> {
+        for root in self.catalog_roots() {
+            for entry in fs::read_dir(root)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let Some(partition) = entry.file_name().to_str().map(str::to_string) else {
+                    continue;
+                };
+                let catalog = self.load_catalog_from(root, &partition)?;
+                if let Some(index) = catalog
+                    .tasks
+                    .iter()
+                    .position(|task| task.task_id == task_id)
+                {
+                    return Ok((
+                        CatalogLocation {
+                            root: root.to_path_buf(),
+                            partition,
+                        },
+                        catalog,
+                        index,
+                    ));
+                }
             }
         }
         Err(ScheduledTaskStoreError::NotFound(task_id.to_string()))
     }
 
-    fn load_catalog(&self, project_id: &str) -> Result<ScheduledTaskCatalogV1> {
-        let path = self.project_dir(project_id).join(CATALOG_FILE);
+    fn catalog_roots(&self) -> Vec<&Path> {
+        let mut roots = vec![self.root.as_path()];
+        if let Some(legacy_root) = self.legacy_root.as_deref() {
+            roots.push(legacy_root);
+        }
+        roots
+    }
+
+    fn load_catalog(&self, partition: &str) -> Result<ScheduledTaskCatalogV1> {
+        self.load_catalog_from(&self.root, partition)
+    }
+
+    fn load_catalog_from(&self, root: &Path, partition: &str) -> Result<ScheduledTaskCatalogV1> {
+        let path = self.partition_dir_at(root, partition).join(CATALOG_FILE);
         let bytes = match fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -476,38 +542,63 @@ impl ScheduledTaskStore {
         Ok(catalog)
     }
 
-    fn write_catalog(&self, project_id: &str, catalog: &ScheduledTaskCatalogV1) -> Result<()> {
-        let project_dir = self.ensure_project_dir(project_id)?;
+    fn write_catalog(&self, partition: &str, catalog: &ScheduledTaskCatalogV1) -> Result<()> {
+        self.write_catalog_at(&self.root, partition, catalog)
+    }
+
+    fn write_catalog_at(
+        &self,
+        root: &Path,
+        partition: &str,
+        catalog: &ScheduledTaskCatalogV1,
+    ) -> Result<()> {
+        let partition_dir = self.ensure_partition_dir_at(root, partition)?;
         let bytes = serde_json::to_vec_pretty(catalog)?;
         self.durable_fs
-            .replace_bytes(&project_dir.join(CATALOG_FILE), &bytes)?;
+            .replace_bytes(&partition_dir.join(CATALOG_FILE), &bytes)?;
         Ok(())
     }
 
-    fn append_audit_locked(&self, event: ScheduledTaskAuditEventV1) -> Result<()> {
-        let project_dir = self.ensure_project_dir(&event.project_id)?;
+    fn append_audit_locked(&self, partition: &str, event: ScheduledTaskAuditEventV1) -> Result<()> {
+        self.append_audit_locked_at(&self.root, partition, event)
+    }
+
+    fn append_audit_locked_at(
+        &self,
+        root: &Path,
+        partition: &str,
+        event: ScheduledTaskAuditEventV1,
+    ) -> Result<()> {
+        let partition_dir = self.ensure_partition_dir_at(root, partition)?;
         let bytes = serde_json::to_vec(&event)?;
-        let path = project_dir.join(AUDIT_FILE);
+        let path = partition_dir.join(AUDIT_FILE);
         self.durable_fs.append_jsonl(&path, &bytes)?;
         self.durable_fs.sync_file_and_namespace(&path)?;
         Ok(())
     }
 
-    fn ensure_project_dir(&self, project_id: &str) -> Result<PathBuf> {
-        validate_component(project_id, "projectId")?;
-        let path = self.project_dir(project_id);
+    fn ensure_partition_dir_at(&self, root: &Path, partition: &str) -> Result<PathBuf> {
+        validate_component(partition, "scheduled task partition")?;
+        let path = self.partition_dir_at(root, partition);
         self.durable_fs
             .create_dir_durable(&path, DirectoryPermissions::PrivateOwnerOnly)?;
         Ok(path)
     }
 
-    fn project_dir(&self, project_id: &str) -> PathBuf {
-        self.root.join(project_id)
+    fn partition_dir_at(&self, root: &Path, partition: &str) -> PathBuf {
+        root.join(partition)
     }
 }
 
 fn validate_input(mut input: ScheduledTaskDraftInputV1) -> Result<ScheduledTaskDraftInputV1> {
-    validate_component(&input.project_id, "projectId")?;
+    input.project_id = input
+        .project_id
+        .take()
+        .map(|project_id| project_id.trim().to_string())
+        .filter(|project_id| !project_id.is_empty());
+    if let Some(project_id) = input.project_id.as_deref() {
+        validate_component(project_id, "projectId")?;
+    }
     input.name = input.name.trim().to_string();
     input.description = input.description.trim().to_string();
     input.prompt = input.prompt.trim().to_string();
@@ -604,7 +695,9 @@ fn validate_run(run: &ScheduledTaskRunV1) -> Result<()> {
     }
     validate_uuid(&run.run_id, "runId")?;
     validate_uuid(&run.task_id, "taskId")?;
-    validate_component(&run.project_id, "projectId")?;
+    if let Some(project_id) = run.project_id.as_deref() {
+        validate_component(project_id, "projectId")?;
+    }
     if run.occurrence_key.is_empty() || run.occurrence_key.len() > 256 {
         return Err(ScheduledTaskStoreError::InvalidInput(
             "occurrenceKey is invalid".to_string(),
@@ -710,7 +803,7 @@ mod tests {
 
     fn input(root: &Path) -> ScheduledTaskDraftInputV1 {
         ScheduledTaskDraftInputV1 {
-            project_id: "project-a".to_string(),
+            project_id: Some("project-a".to_string()),
             name: "Daily summary".to_string(),
             description: "Summarize work".to_string(),
             schedule: ScheduleSpecV1::Cron {
@@ -789,6 +882,80 @@ mod tests {
         let runs = store.list_runs(&draft.task_id).unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, ScheduledTaskRunStatus::Running);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn projectless_draft_uses_global_partition_and_executes_normally() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("termul-task-global-{}", Uuid::new_v4()));
+        let store = ScheduledTaskStore::open(root.join("state")).unwrap();
+        let mut draft_input = input(&root);
+        draft_input.project_id = None;
+        draft_input.execution_target = crate::conversation::ExecutionTarget::Workspace;
+        draft_input.source_conversation_id = Some(Uuid::new_v4().to_string());
+
+        let draft = store
+            .create_draft(draft_input, TaskMutationContextV1::default())
+            .unwrap();
+        assert_eq!(draft.project_id, None);
+        assert!(store
+            .root()
+            .join(GLOBAL_PARTITION)
+            .join(CATALOG_FILE)
+            .is_file());
+        assert_eq!(store.list_tasks(None).unwrap(), vec![draft.clone()]);
+        assert!(store.list_tasks(Some("project-a")).unwrap().is_empty());
+
+        let run = new_queued_run(
+            &draft,
+            super::super::models::ScheduledTaskRunTrigger::Manual,
+            Utc::now().to_rfc3339(),
+            None,
+        )
+        .unwrap();
+        store.append_run(&run).unwrap();
+        assert_eq!(store.list_runs(&draft.task_id).unwrap(), vec![run]);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_project_partitions_remain_readable_and_mutable() {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("termul-task-legacy-{}", Uuid::new_v4()));
+        let legacy_root = root.join("projects");
+        let legacy_store = ScheduledTaskStore::open(legacy_root.clone()).unwrap();
+        let original = legacy_store
+            .create_draft(input(&root), TaskMutationContextV1::default())
+            .unwrap();
+        let catalog = legacy_store.load_catalog(GLOBAL_PARTITION).unwrap();
+        legacy_store.write_catalog("project-a", &catalog).unwrap();
+        fs::remove_dir_all(legacy_store.root().join(GLOBAL_PARTITION)).unwrap();
+        drop(legacy_store);
+
+        let global_root = root.join("catalog");
+        let store = ScheduledTaskStore::open_with_legacy_root(
+            global_root.clone(),
+            Some(legacy_root.clone()),
+        )
+        .unwrap();
+
+        assert_eq!(store.get_task(&original.task_id).unwrap(), original);
+        let mut replacement = input(&root);
+        replacement.name = "Updated legacy task".to_string();
+        let updated = store
+            .update_draft(
+                &original.task_id,
+                original.revision,
+                replacement,
+                TaskMutationContextV1::default(),
+            )
+            .unwrap();
+        assert_eq!(updated.name, "Updated legacy task");
+        assert!(legacy_root.join("project-a").join(CATALOG_FILE).is_file());
+        assert!(!global_root.join("project-a").exists());
         let _ = fs::remove_dir_all(root);
     }
 }

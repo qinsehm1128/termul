@@ -115,7 +115,7 @@ impl ScheduledTaskService {
     ) -> Result<ScheduledTaskV1, ScheduledTaskStoreError> {
         let task = self.store.create_draft(input, context)?;
         log::info!(
-            "[scheduled-task] boundary=draft_created task_id={} project_id={}",
+            "[scheduled-task] boundary=draft_created task_id={} project_id={:?}",
             task.task_id,
             task.project_id
         );
@@ -148,7 +148,7 @@ impl ScheduledTaskService {
             .store
             .activate(task_id, expected_revision, expected_draft_hash, context)?;
         log::info!(
-            "[scheduled-task] boundary=activated task_id={} project_id={}",
+            "[scheduled-task] boundary=activated task_id={} project_id={:?}",
             task.task_id,
             task.project_id
         );
@@ -164,7 +164,7 @@ impl ScheduledTaskService {
     ) -> Result<ScheduledTaskV1, ScheduledTaskStoreError> {
         let task = self.store.pause(task_id, expected_revision, context)?;
         log::info!(
-            "[scheduled-task] boundary=paused task_id={} project_id={}",
+            "[scheduled-task] boundary=paused task_id={} project_id={:?}",
             task.task_id,
             task.project_id
         );
@@ -180,7 +180,7 @@ impl ScheduledTaskService {
     ) -> Result<ScheduledTaskV1, ScheduledTaskStoreError> {
         let task = self.store.resume(task_id, expected_revision, context)?;
         log::info!(
-            "[scheduled-task] boundary=resumed task_id={} project_id={}",
+            "[scheduled-task] boundary=resumed task_id={} project_id={:?}",
             task.task_id,
             task.project_id
         );
@@ -624,7 +624,7 @@ mod tests {
 
     fn input(root: &Path, overlap: OverlapPolicy) -> ScheduledTaskDraftInputV1 {
         ScheduledTaskDraftInputV1 {
-            project_id: "project-scheduler".to_string(),
+            project_id: Some("project-scheduler".to_string()),
             name: "One shot".to_string(),
             description: String::new(),
             schedule: ScheduleSpecV1::At {

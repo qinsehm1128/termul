@@ -143,7 +143,7 @@
   "scheduledTasks": {
     "title": "Scheduled tasks",
     "refresh": "Refresh scheduled tasks",
-    "empty": "No scheduled tasks for this project. Ask an AI in chat to create a draft.",
+    "empty": "No scheduled tasks yet. Ask an AI in any Conversation to create a draft.",
     "selectTask": "Select a scheduled task to inspect it.",
     "activate": "Review and activate",
     "pause": "Pause",
@@ -152,6 +152,9 @@
     "everySeconds": "Every {{count}} seconds",
     "prompt": "Task prompt",
     "agent": "Agent: {{agent}}",
+    "project": "Associated project: {{project}}",
+    "noProject": "No project association",
+    "workspace": "Workspace: {{workspace}}",
     "revision": "Revision: {{revision}}",
     "hash": "Draft hash: {{hash}}",
     "history": "Execution history",

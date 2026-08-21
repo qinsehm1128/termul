@@ -168,19 +168,23 @@ impl ConversationPersistenceAdapter {
         self.conversation_id_for_active_binding(agent_session_id)
     }
 
-    /// Resolve the host-owned scope used by scheduled-task drafts. Agent tool
-    /// input must never choose another project, execution directory, or ACP.
+    /// Resolve the host-owned execution context used by scheduled-task drafts.
+    /// Project association is optional metadata; the agent cannot choose a
+    /// different workspace, execution directory, or ACP.
     #[must_use]
     pub fn scheduled_task_scope_for_session(
         &self,
         agent_session_id: &str,
-    ) -> Option<(String, String, ExecutionTarget, String, String)> {
+    ) -> Option<(Option<String>, String, ExecutionTarget, String, String)> {
         let conversation_id = self.conversation_id_for_active_binding(agent_session_id)?;
         let record = self.reader.get(conversation_id).ok()?;
         let binding = self
             .binding_for_session(conversation_id, agent_session_id)
             .ok()?;
-        let project_id = record.project_attachment?.project_id;
+        let project_id = record
+            .project_attachment
+            .as_ref()
+            .map(|attachment| attachment.project_id.clone());
         let agent_config_id = binding
             .stable_agent_namespace
             .strip_prefix("config:")
@@ -1421,6 +1425,13 @@ mod tests {
             crate::conversation::ReaderPrecedence::ConversationV2Only,
         ));
         let adapter = ConversationPersistenceAdapter::new(writer, reader);
+        let scheduled_scope = adapter
+            .scheduled_task_scope_for_session("opaque/paged")
+            .expect("projectless Conversation must provide scheduled-task context");
+        assert_eq!(scheduled_scope.0, None);
+        assert_eq!(scheduled_scope.1, record.workspace_cwd);
+        assert_eq!(scheduled_scope.2, ExecutionTarget::Workspace);
+        assert_eq!(scheduled_scope.4, "stable");
         let full = repository.read_events(id, 0).unwrap();
         assert_eq!(full.len(), 1_051);
         let expected = (2..=1_051_u64).collect::<Vec<_>>();

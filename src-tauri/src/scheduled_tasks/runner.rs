@@ -102,9 +102,9 @@ impl ScheduledTaskExecutor for AcpScheduledTaskExecutor {
                 )
             })?;
 
-        let project_attachment = ProjectAttachment {
+        let project_attachment = task.project_id.clone().map(|project_id| ProjectAttachment {
             schema_version: PROJECT_ATTACHMENT_SCHEMA_VERSION,
-            project_id: task.project_id.clone(),
+            project_id,
             attached_at_utc: Utc::now(),
             project_path_snapshot: task.execution_cwd.clone(),
             worktree_path: match &task.execution_target {
@@ -119,7 +119,7 @@ impl ScheduledTaskExecutor for AcpScheduledTaskExecutor {
                 } => Some(worktree_branch.clone()),
                 _ => None,
             },
-        };
+        });
         let session = self
             .manager
             .new_session_with_context(
@@ -127,10 +127,10 @@ impl ScheduledTaskExecutor for AcpScheduledTaskExecutor {
                 task.execution_cwd.clone(),
                 Vec::new(),
                 SessionCreationContext {
-                    project_id: Some(task.project_id.clone()),
+                    project_id: task.project_id.clone(),
                     ephemeral: false,
                     conversation_id: None,
-                    project_attachment: Some(project_attachment),
+                    project_attachment,
                     execution_target: Some(task.execution_target.clone()),
                     worktree_path: None,
                     worktree_branch: None,

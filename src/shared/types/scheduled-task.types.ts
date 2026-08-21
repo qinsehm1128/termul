@@ -31,7 +31,7 @@ export interface ScheduledTaskExecutionPolicy {
 export interface ScheduledTaskRecordV1 {
   schemaVersion: 1
   taskId: ScheduledTaskId
-  projectId: string
+  projectId: string | null
   name: string
   description: string
   status: ScheduledTaskStatus
@@ -53,7 +53,7 @@ export interface ScheduledTaskRecordV1 {
 }
 
 export interface ScheduledTaskDraftInput {
-  projectId: string
+  projectId?: string | null
   name: string
   description: string
   schedule: ScheduledTaskSchedule
@@ -76,7 +76,7 @@ export interface ScheduledTaskRunV1 {
   schemaVersion: 1
   runId: ScheduledTaskRunId
   taskId: ScheduledTaskId
-  projectId: string
+  projectId: string | null
   trigger: ScheduledTaskRunTrigger
   status: ScheduledTaskRunStatus
   occurrenceKey: string
@@ -99,7 +99,7 @@ export interface ScheduledTaskAuditEventV1 {
   schemaVersion: 1
   eventId: string
   taskId: ScheduledTaskId
-  projectId: string
+  projectId: string | null
   action: string
   actor: ScheduledTaskAuditActor
   sourceConversationId: ConversationId | null
@@ -163,7 +163,10 @@ export function parseScheduledTask(value: unknown): ScheduledTaskRecordV1 {
   const candidate = record(value, 'scheduled task')
   if (candidate.schemaVersion !== 1) throw new TypeError('scheduled task schema is unsupported')
   parseScheduledTaskId(String(candidate.taskId))
-  if (typeof candidate.projectId !== 'string' || typeof candidate.name !== 'string') {
+  if (
+    (candidate.projectId !== null && typeof candidate.projectId !== 'string') ||
+    typeof candidate.name !== 'string'
+  ) {
     throw new TypeError('scheduled task identity is invalid')
   }
   if (!['draft', 'active', 'paused'].includes(String(candidate.status))) {

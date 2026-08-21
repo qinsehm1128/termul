@@ -143,7 +143,7 @@
   "scheduledTasks": {
     "title": "定时任务",
     "refresh": "刷新定时任务",
-    "empty": "当前项目还没有定时任务。可以在聊天中让 AI 创建草稿。",
+    "empty": "还没有定时任务。可以在任意会话中让 AI 创建草稿。",
     "selectTask": "请选择一个定时任务查看详情。",
     "activate": "审核并启用",
     "pause": "暂停",
@@ -152,6 +152,9 @@
     "everySeconds": "每 {{count}} 秒",
     "prompt": "任务提示词",
     "agent": "代理：{{agent}}",
+    "project": "关联项目：{{project}}",
+    "noProject": "未关联项目",
+    "workspace": "工作区：{{workspace}}",
     "revision": "修订：{{revision}}",
     "hash": "草稿哈希：{{hash}}",
     "history": "执行历史",

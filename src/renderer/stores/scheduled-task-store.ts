@@ -15,7 +15,7 @@ interface ScheduledTaskState {
   loading: boolean
   mutating: boolean
   error: string | null
-  load: (projectId?: string) => Promise<void>
+  load: () => Promise<void>
   select: (taskId: ScheduledTaskId | null) => Promise<void>
   activate: (task: ScheduledTaskRecordV1) => Promise<boolean>
   pause: (task: ScheduledTaskRecordV1) => Promise<boolean>
@@ -39,9 +39,9 @@ export const useScheduledTaskStore = create<ScheduledTaskState>((set, get) => ({
   mutating: false,
   error: null,
 
-  load: async (projectId) => {
+  load: async () => {
     set({ loading: true, error: null })
-    const result = await scheduledTaskApi.listTasks(projectId)
+    const result = await scheduledTaskApi.listTasks()
     if (!result.success) {
       set({ loading: false, error: result.error })
       return

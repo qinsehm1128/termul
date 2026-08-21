@@ -6,7 +6,7 @@ pub const SCHEDULED_TASK_SCHEMA_VERSION: u32 = 1;
 pub const SCHEDULED_TASK_RUN_SCHEMA_VERSION: u32 = 1;
 pub const SCHEDULED_TASK_AUDIT_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_CATCH_UP_WINDOW_SECONDS: u64 = 24 * 60 * 60;
-pub const SKILL_TEMPLATE_VERSION: u32 = 1;
+pub const SKILL_TEMPLATE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", tag = "kind")]
@@ -69,7 +69,8 @@ impl Default for ExecutionPolicyV1 {
 pub struct ScheduledTaskV1 {
     pub schema_version: u32,
     pub task_id: String,
-    pub project_id: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
     pub name: String,
     pub description: String,
     pub status: ScheduledTaskStatus,
@@ -93,7 +94,8 @@ pub struct ScheduledTaskV1 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ScheduledTaskDraftInputV1 {
-    pub project_id: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
     pub name: String,
     #[serde(default)]
     pub description: String,
@@ -145,7 +147,8 @@ pub struct ScheduledTaskRunV1 {
     pub schema_version: u32,
     pub run_id: String,
     pub task_id: String,
-    pub project_id: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
     pub trigger: ScheduledTaskRunTrigger,
     pub status: ScheduledTaskRunStatus,
     pub occurrence_key: String,
@@ -176,7 +179,8 @@ pub struct ScheduledTaskAuditEventV1 {
     pub schema_version: u32,
     pub event_id: String,
     pub task_id: String,
-    pub project_id: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
     pub action: String,
     pub actor: ScheduledTaskAuditActor,
     pub source_conversation_id: Option<String>,

@@ -157,7 +157,7 @@ impl TermulPlanServer {
 
     #[tool(
         name = "scheduled_task_list",
-        description = "List Termul project-scoped scheduled tasks. This is read-only."
+        description = "List Termul scheduled tasks across Conversations and optional project associations. This is read-only."
     )]
     async fn scheduled_task_list(
         &self,

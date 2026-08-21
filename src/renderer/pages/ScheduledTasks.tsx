@@ -15,7 +15,6 @@ import {
 } from '@/components/ui/alert-dialog'
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
-import { useActiveProjectId } from '@/stores/project-store'
 import { useScheduledTaskStore, useSelectedScheduledTask } from '@/stores/scheduled-task-store'
 
 function scheduleLabel(task: ScheduledTaskRecordV1, intervalLabel: string): string {
@@ -37,7 +36,6 @@ function statusTone(status: ScheduledTaskRecordV1['status']): string {
 export default function ScheduledTasks(): React.JSX.Element {
   const { t } = useTranslation('common')
   const navigate = useNavigate()
-  const projectId = useActiveProjectId()
   const task = useSelectedScheduledTask()
   const {
     tasks,
@@ -63,8 +61,8 @@ export default function ScheduledTasks(): React.JSX.Element {
     )
 
   useEffect(() => {
-    void load(projectId || undefined)
-  }, [load, projectId])
+    void load()
+  }, [load])
 
   return (
     <div className="flex h-full min-h-0 bg-background">
@@ -79,7 +77,7 @@ export default function ScheduledTasks(): React.JSX.Element {
             variant="ghost"
             size="icon"
             disabled={loading}
-            onClick={() => void load(projectId || undefined)}
+            onClick={() => void load()}
             aria-label={t('scheduledTasks.refresh')}
           >
             <RefreshCw size={14} className={loading ? 'animate-spin' : undefined} />
@@ -183,6 +181,14 @@ export default function ScheduledTasks(): React.JSX.Element {
               <div className="mt-4 grid gap-2 text-xs text-muted-foreground sm:grid-cols-2">
                 <div>{t('scheduledTasks.agent', { agent: task.agentConfigId })}</div>
                 <div>{t('scheduledTasks.revision', { revision: task.revision })}</div>
+                <div>
+                  {task.projectId
+                    ? t('scheduledTasks.project', { project: task.projectId })
+                    : t('scheduledTasks.noProject')}
+                </div>
+                <div className="truncate">
+                  {t('scheduledTasks.workspace', { workspace: task.workspaceCwd })}
+                </div>
                 <div className="truncate sm:col-span-2">
                   {t('scheduledTasks.hash', { hash: task.draftHash })}
                 </div>

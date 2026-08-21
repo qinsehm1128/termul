@@ -1749,9 +1749,11 @@ pub fn run() {
                 tauri::async_runtime::handle().inner().clone(),
             ));
             ws_relay.set_question_rendezvous(question_rendezvous);
+            let scheduled_task_root = app_data_dir.join("scheduled-tasks").join("v1");
             let scheduled_task_store = Arc::new(
-                crate::scheduled_tasks::ScheduledTaskStore::open(
-                    app_data_dir.join("scheduled-tasks").join("v1").join("projects"),
+                crate::scheduled_tasks::ScheduledTaskStore::open_with_legacy_root(
+                    scheduled_task_root.join("catalog"),
+                    Some(scheduled_task_root.join("projects")),
                 )
                 .map_err(|error| format!("failed to open scheduled task store: {error}"))?,
             );
@@ -2101,7 +2103,7 @@ pub fn run() {
             // Agent Skills (Zed-compatible SKILL.md packages)
             skills::commands::list_agent_skills_cmd,
             skills::commands::read_agent_skill_cmd,
-            // Project-scoped AI scheduled tasks
+            // Host-level AI scheduled tasks
             scheduled_tasks::commands::scheduled_task_preview,
             scheduled_tasks::commands::scheduled_task_list,
             scheduled_tasks::commands::scheduled_task_get,
