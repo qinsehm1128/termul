@@ -1751,19 +1751,19 @@ function ConnectedTerminalComponent({
             <div ref={containerRef} className="w-full h-full" />
           </div>
           {cleanupRecovery && (
-            <div className="absolute inset-x-4 top-4 z-[60]" role="alert" aria-live="polite">
-              <div className="flex items-start gap-3 rounded-lg border border-destructive/40 bg-card/95 p-4 text-foreground shadow-xl">
-                <AlertTriangle className="mt-0.5 shrink-0 text-destructive" size={18} />
+            <div className="absolute inset-x-3 top-3 z-[60]" role="alert" aria-live="polite">
+              <div className="flex items-start gap-3 rounded-md border border-destructive/35 bg-card p-3 text-foreground shadow-[0_12px_36px_hsl(var(--background)/0.55),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]">
+                <AlertTriangle className="mt-0.5 shrink-0 text-destructive" size={16} />
                 <div className="min-w-0 flex-1">
-                  <h3 className="text-sm font-semibold">{t('cleanup.title')}</h3>
-                  <p className="mt-1 text-xs text-muted-foreground">
+                  <h3 className="text-xs font-semibold tracking-[-0.01em]">{t('cleanup.title')}</h3>
+                  <p className="mt-1 text-2xs text-muted-foreground">
                     {t('cleanup.description', {
                       terminalId: cleanupRecovery.terminalId,
                       stage: cleanupStageLabel
                     })}
                   </p>
                   {cleanupRecovery.retryFailed && (
-                    <p className="mt-2 text-xs text-destructive">{t('cleanup.retryFailed')}</p>
+                    <p className="mt-1.5 text-2xs text-destructive">{t('cleanup.retryFailed')}</p>
                   )}
                 </div>
                 <button
@@ -1776,10 +1776,10 @@ function ConnectedTerminalComponent({
                     event.stopPropagation()
                     void retryTerminalCleanup(cleanupRecovery.terminalId)
                   }}
-                  className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-md bg-destructive px-3 text-xs font-medium text-destructive-foreground hover:bg-destructive/90 disabled:cursor-wait disabled:opacity-60"
+                  className="inline-flex h-7 shrink-0 items-center gap-1.5 rounded-md bg-destructive px-2.5 text-2xs font-medium text-destructive-foreground transition-colors hover:bg-destructive/90 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-wait disabled:opacity-60"
                 >
                   <RefreshCcw
-                    size={14}
+                    size={13}
                     className={cleanupRecovery.retrying ? 'animate-spin' : undefined}
                   />
                   {cleanupRecovery.retrying
@@ -1790,25 +1790,25 @@ function ConnectedTerminalComponent({
             </div>
           )}
           {isCrashed && !cleanupRecovery && (
-            <div className="absolute inset-0 z-50 flex animate-in items-center justify-center bg-background/70 p-4 text-foreground backdrop-blur-[2px] fade-in duration-150">
-              <div className="w-full max-w-md rounded-lg border border-destructive/30 bg-card p-5 shadow-[0_18px_60px_hsl(var(--background)/0.7)]">
+            <div className="absolute inset-0 z-50 flex animate-in items-center justify-center bg-background/78 p-4 text-foreground fade-in duration-150">
+              <div className="w-full max-w-md rounded-md border border-destructive/35 bg-card p-4 shadow-[0_18px_60px_hsl(var(--background)/0.7),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]">
                 <div className="flex items-start gap-3">
-                  <div className="flex size-9 shrink-0 items-center justify-center rounded-md bg-destructive/10">
-                    <AlertTriangle className="text-destructive" size={18} />
+                  <div className="flex size-8 shrink-0 items-center justify-center rounded-md bg-destructive/10">
+                    <AlertTriangle className="text-destructive" size={16} />
                   </div>
                   <div className="min-w-0 flex-1">
                     <div className="mb-1 text-2xs font-medium text-destructive">
                       {t('crash.criticalError')} · {t('crash.paneException')}
                     </div>
-                    <h3 className="text-base font-semibold tracking-[-0.01em]">
+                    <h3 className="text-sm font-semibold tracking-[-0.01em]">
                       {t('crash.sessionInterrupted')}
                     </h3>
-                    <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
+                    <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">
                       {t('crash.description')}
                     </p>
                   </div>
                 </div>
-                <div className="mt-5 flex items-center gap-3">
+                <div className="mt-4 flex items-center gap-3">
                   <button
                     type="button"
                     onClick={(e) => {
@@ -1819,7 +1819,7 @@ function ConnectedTerminalComponent({
                   >
                     <RefreshCcw size={14} /> {t('crash.reconnect')}
                   </button>
-                  <div className="text-3xs font-mono text-muted-foreground/60">
+                  <div className="font-mono text-3xs text-muted-foreground/60">
                     REF::{targetId?.slice(0, 8)}
                   </div>
                 </div>

@@ -180,12 +180,12 @@ export function SettingsLayout({
   return (
     <div className="flex-1 flex min-h-0 overflow-hidden">
       {/* Sidebar */}
-      <aside className="flex w-56 flex-shrink-0 flex-col border-r border-border/70 bg-sidebar">
+      <aside className="flex w-56 flex-shrink-0 flex-col border-r border-border/70 bg-sidebar shadow-[inset_-1px_0_0_hsl(var(--background)/0.35)]">
         <div className="border-b border-border/70 p-2">
           <div className="relative">
             <Search
               size={14}
-              className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground"
+              className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground"
             />
             <input
               type="text"
@@ -193,14 +193,14 @@ export function SettingsLayout({
               onChange={(e) => setQuery(e.target.value)}
               placeholder={t('layout.searchPlaceholder')}
               aria-label={t('layout.searchAria')}
-              className="h-8 w-full rounded-md border border-border/70 bg-secondary/35 pl-8 pr-8 text-xs text-foreground outline-none transition-colors placeholder:text-muted-foreground/70 focus:border-ring/60 focus:bg-secondary/50 focus:ring-1 focus:ring-ring/30"
+              className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 pl-8 pr-8 text-xs text-foreground outline-none transition-[border-color,background-color] placeholder:text-muted-foreground/70 focus-visible:border-ring/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
             />
             {query && (
               <button
                 type="button"
                 onClick={() => setQuery('')}
                 aria-label={t('layout.clearSearch')}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground p-0.5 rounded"
+                className="absolute right-1.5 top-1/2 flex size-6 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               >
                 <X size={14} />
               </button>
@@ -214,9 +214,14 @@ export function SettingsLayout({
         >
           {isSearching ? (
             results.length === 0 ? (
-              <p className="px-3 py-4 text-xs text-muted-foreground">
-                {t('layout.noResults', { query: query.trim() })}
-              </p>
+              <div className="flex flex-col items-center gap-2 px-3 py-8 text-center">
+                <div className="flex size-8 items-center justify-center rounded-md bg-secondary/50">
+                  <Search size={14} className="text-muted-foreground" />
+                </div>
+                <p className="text-2xs text-muted-foreground">
+                  {t('layout.noResults', { query: query.trim() })}
+                </p>
+              </div>
             ) : (
               results.map((result) => (
                 <button
@@ -244,14 +249,14 @@ export function SettingsLayout({
                   onClick={() => scrollToSection(category.id)}
                   onKeyDown={(e) => handleCategoryKeyDown(e, index)}
                   className={cn(
-                    'flex h-7 w-full items-center gap-2 rounded-sm px-2 text-left text-xs transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-ring',
+                    'relative flex h-7 w-full items-center gap-2 rounded-sm px-2 text-left text-xs transition-colors before:absolute before:left-0 before:h-3.5 before:w-px before:rounded-full before:bg-primary before:opacity-0 before:transition-opacity focus:outline-none focus-visible:ring-1 focus-visible:ring-ring',
                     isActive
-                      ? 'bg-secondary text-foreground font-medium'
+                      ? 'bg-secondary font-medium text-foreground shadow-[inset_0_1px_0_hsl(var(--foreground)/0.035)] before:opacity-100'
                       : 'text-muted-foreground hover:bg-secondary hover:text-foreground'
                   )}
                 >
                   {category.icon && (
-                    <span className="flex-shrink-0 flex items-center">{category.icon}</span>
+                    <span className="flex flex-shrink-0 items-center">{category.icon}</span>
                   )}
                   <span className="truncate">{category.label}</span>
                 </button>
@@ -264,7 +269,10 @@ export function SettingsLayout({
       </aside>
 
       {/* Content */}
-      <div ref={contentRef} className="min-w-0 flex-1 overflow-y-auto px-8 pb-32 pt-7">
+      <div
+        ref={contentRef}
+        className="min-w-0 flex-1 overflow-y-auto bg-background px-8 pb-32 pt-7"
+      >
         <div className="mx-auto max-w-4xl space-y-8">{children}</div>
       </div>
     </div>

@@ -10,7 +10,7 @@ export type QueueItemProps = ComponentProps<'li'>
 export const QueueItem = ({ className, ...props }: QueueItemProps) => (
   <li
     className={cn(
-      'group flex flex-col gap-1 rounded-md px-3 py-1 text-sm transition-colors hover:bg-muted',
+      'group flex flex-col gap-1 rounded-sm px-2 py-1 text-xs transition-colors hover:bg-secondary/60',
       className
     )}
     {...props}
@@ -49,7 +49,7 @@ export const QueueItemAction = ({ className, ...props }: QueueItemActionProps) =
     className={cn(
       // 44×44 layout slot so adjacent queue actions do not share hit regions.
       'relative size-11 shrink-0 rounded-md p-0 text-muted-foreground',
-      'opacity-100 transition-colors hover:bg-muted-foreground/10 hover:text-foreground',
+      'opacity-100 transition-colors hover:bg-secondary hover:text-foreground',
       className
     )}
     size="icon"
@@ -70,7 +70,7 @@ export type QueueItemImageProps = ComponentProps<'img'>
 export const QueueItemImage = ({ className, ...props }: QueueItemImageProps) => (
   <img
     alt=""
-    className={cn('h-8 w-8 rounded border object-cover', className)}
+    className={cn('h-8 w-8 rounded-sm border border-border/70 object-cover', className)}
     height={32}
     width={32}
     {...props}
@@ -81,7 +81,10 @@ export type QueueItemFileProps = ComponentProps<'span'>
 
 export const QueueItemFile = ({ children, className, ...props }: QueueItemFileProps) => (
   <span
-    className={cn('flex items-center gap-1 rounded border bg-muted px-2 py-1 text-xs', className)}
+    className={cn(
+      'flex items-center gap-1 rounded-sm border border-border/70 bg-secondary/50 px-1.5 py-0.5 text-2xs',
+      className
+    )}
     {...props}
   >
     <PaperclipIcon size={12} />
@@ -115,7 +118,7 @@ export const QueueSectionTrigger = ({
   <CollapsibleTrigger asChild>
     <button
       className={cn(
-        'group flex w-full items-center justify-between rounded-md bg-muted/40 px-3 py-2 text-left font-medium text-muted-foreground text-sm transition-colors hover:bg-muted',
+        'group flex h-7 w-full items-center justify-between rounded-sm px-2 text-left text-2xs font-medium text-muted-foreground transition-colors hover:bg-secondary/70 hover:text-foreground',
         className
       )}
       type="button"
@@ -140,7 +143,7 @@ export const QueueSectionLabel = ({
   ...props
 }: QueueSectionLabelProps) => (
   <span className={cn('flex items-center gap-2', className)} {...props}>
-    <ChevronDownIcon className="size-4 transition-transform group-data-[state=closed]:-rotate-90" />
+    <ChevronDownIcon className="size-3.5 transition-transform group-data-[state=closed]:-rotate-90" />
     {icon}
     <span>
       {count} {label}
@@ -159,7 +162,7 @@ export type QueueProps = ComponentProps<'div'>
 export const Queue = ({ className, ...props }: QueueProps) => (
   <div
     className={cn(
-      'flex flex-col gap-2 rounded-md border border-border/70 bg-background px-3 pb-2 pt-2',
+      'flex flex-col gap-1.5 rounded-md border border-border/70 bg-secondary/25 px-2.5 pb-1.5 pt-1.5 shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.035)]',
       className
     )}
     {...props}

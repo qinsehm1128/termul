@@ -267,6 +267,9 @@ describe('FileExplorer', () => {
 
     expect(screen.getByRole('tab', { name: /Content 1/i })).toHaveAttribute('aria-selected', 'true')
     expect(screen.getByRole('tab', { name: /Files 1/i })).toBeInTheDocument()
+    expect(document.getElementById('file-explorer-panel')).toHaveClass('bg-sidebar')
+    expect(screen.getByRole('tablist')).toHaveClass('grid', 'grid-cols-2')
+    expect(screen.getByRole('tablist').className).not.toMatch(/rounded|shadow/)
     expect(screen.getByText('FileExplorer.tsx')).toBeInTheDocument()
     expect(screen.getByText('src/FileExplorer.tsx')).toBeInTheDocument()
     expect(screen.getByText(/createExplorerSearch\(\)/)).toBeInTheDocument()
@@ -620,6 +623,7 @@ describe('FileExplorer header toolbar (GH-540)', () => {
       const button = screen.getByRole('button', { name })
       expect(button).toBeEnabled()
       expect(button).toHaveAttribute('title', name)
+      expect(button).toHaveClass('size-7')
     }
   })
 

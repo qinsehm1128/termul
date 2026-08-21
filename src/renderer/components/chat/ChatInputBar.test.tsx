@@ -284,10 +284,13 @@ describe('ChatInputBar config controls', () => {
     })
 
     const composer = document.querySelector('[data-chat-composer="true"]')
+    const inputBezel = document.querySelector('[data-chat-composer-input-bezel="true"]')
     const contextStrip = document.querySelector('[data-chat-composer-context-strip="true"]')
 
     expect(composer).toBeInTheDocument()
+    expect(inputBezel).toBeInTheDocument()
     expect(contextStrip).toBeInTheDocument()
+    expect(composer).toContainElement(inputBezel)
     expect(composer).not.toContainElement(contextStrip)
     expect(screen.getByText('New worktree')).toBeInTheDocument()
     expect(screen.getByText('chat/abcd1234')).toBeInTheDocument()

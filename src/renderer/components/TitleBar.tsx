@@ -11,8 +11,7 @@ import { isMac } from '@/lib/platform'
 import { useActiveProject } from '@/stores/project-store'
 
 const windowControlClass =
-  'h-full w-10 hover:bg-secondary inline-flex items-center justify-center text-muted-foreground hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-inset cursor-pointer'
-
+  'inline-flex h-full w-10 cursor-pointer items-center justify-center text-muted-foreground transition-[color,background-color] duration-150 ease-[var(--ease-out)] hover:bg-foreground/[0.045] hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring/80'
 /**
  * Slim window-control strip for Windows/Linux.
  *
@@ -44,16 +43,16 @@ export function TitleBar(): React.JSX.Element | null {
 
   return (
     <header
-      className="h-8 flex items-center border-b border-border/70 bg-sidebar select-none shrink-0 relative"
+      className="relative flex h-8 shrink-0 select-none items-center border-b border-border/70 bg-sidebar shadow-[inset_0_1px_0_hsl(var(--foreground)/0.025)]"
       data-tauri-drag-region
     >
       {/* Left-sidebar toggle — top-left of the content column. */}
-      <div className="flex items-center h-full relative z-[100]" style={titlebarNoDragStyle}>
+      <div className="relative z-10 flex h-full items-center" style={titlebarNoDragStyle}>
         <SidebarToggleButton />
       </div>
 
       {activeProject && (
-        <span className="absolute left-1/2 -translate-x-1/2 text-xs font-medium text-muted-foreground pointer-events-none select-none truncate max-w-[50%]">
+        <span className="pointer-events-none absolute left-1/2 max-w-[50%] -translate-x-1/2 select-none truncate text-2xs font-medium tracking-[0.01em] text-muted-foreground/80">
           {activeProject.name}
         </span>
       )}
@@ -61,10 +60,11 @@ export function TitleBar(): React.JSX.Element | null {
       <div className="flex-1 h-full" data-tauri-drag-region />
 
       {/* Right-sidebar toggle + window controls — top-right. */}
-      <div className="flex items-center h-full relative z-[100]" style={titlebarNoDragStyle}>
+      <div className="relative z-10 flex h-full items-center" style={titlebarNoDragStyle}>
         <FileExplorerToggleButton />
 
         <button
+          type="button"
           onClick={(e) => {
             e.stopPropagation()
             void windowApi.minimize()
@@ -77,6 +77,7 @@ export function TitleBar(): React.JSX.Element | null {
         </button>
 
         <button
+          type="button"
           onClick={(e) => {
             e.stopPropagation()
             void windowApi.toggleMaximize().then((result) => {
@@ -93,11 +94,12 @@ export function TitleBar(): React.JSX.Element | null {
         </button>
 
         <button
+          type="button"
           onClick={(e) => {
             e.stopPropagation()
             void windowApi.close()
           }}
-          className="h-full w-10 hover:bg-destructive/80 hover:text-destructive-foreground inline-flex items-center justify-center text-muted-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-destructive cursor-pointer"
+          className="inline-flex h-full w-10 cursor-pointer items-center justify-center text-muted-foreground transition-[color,background-color] duration-150 ease-[var(--ease-out)] hover:bg-destructive/75 hover:text-destructive-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-destructive"
           title={t('titleBar.close')}
           aria-label={t('titleBar.closeWindow')}
         >

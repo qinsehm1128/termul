@@ -51,7 +51,7 @@ export function StatusBar({ project }: StatusBarProps): React.JSX.Element {
   const lastExitCode = activeTerminal?.lastExitCode
 
   return (
-    <div className="relative z-50 flex h-6 flex-shrink-0 select-none items-center border-t border-border/70 bg-sidebar px-1.5 font-sans text-2xs text-muted-foreground">
+    <div className="relative z-50 flex h-6 flex-shrink-0 select-none items-center border-t border-border bg-status-bar px-1.5 font-sans text-2xs text-status-bar-foreground shadow-[inset_0_1px_0_hsl(var(--foreground)/0.018)]">
       {/* Left side */}
       <div className="flex min-w-0 items-center gap-1">
         {project && (
@@ -162,7 +162,7 @@ function StatusItem({ icon, children, className }: StatusItemProps): React.JSX.E
   return (
     <div
       className={cn(
-        'flex h-5 cursor-pointer items-center rounded-sm px-1.5 transition-colors hover:bg-secondary hover:text-foreground',
+        'flex h-5 cursor-pointer items-center rounded-sm px-1.5 transition-[color,background-color] duration-150 ease-[var(--ease-out)] hover:bg-foreground/[0.045] hover:text-foreground',
         className
       )}
     >

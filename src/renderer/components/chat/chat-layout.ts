@@ -77,3 +77,30 @@ export function useComposerToolbarMode(
 
   return mode
 }
+
+/** Centered thread column. Keep `max-w-3xl` so composer/notices stay aligned. */
+export const CHAT_CONTENT_WIDTH = 'mx-auto w-full max-w-3xl'
+
+/** Vertical padding on the scroller viewport: compact IDE density. */
+export const CHAT_STREAM_PAD_Y = 'py-3'
+
+/**
+ * User prompt measure: hug the text, never a full-width speech balloon.
+ * 36rem is a short prompt column; 86% keeps a gutter in narrow panes.
+ */
+export const CHAT_USER_MEASURE = 'max-w-[min(36rem,86%)]'
+
+export type ChatTimelineRowKind = 'message' | 'tool' | 'thought-group' | 'activity'
+
+/**
+ * Role-kind class for stream hierarchy (user / assistant / tool / activity).
+ * Visual only: does not change grouping or ACP behavior.
+ */
+export function chatTimelineRowClass(kind: ChatTimelineRowKind, role?: string): string {
+  const base = 'chat-timeline-row'
+  if (kind === 'activity') return `${base} ${base}-activity`
+  if (kind === 'tool') return `${base} ${base}-tool`
+  if (kind === 'thought-group') return `${base} ${base}-thought`
+  if (kind === 'message' && role === 'user') return `${base} ${base}-user`
+  return `${base} ${base}-agent`
+}

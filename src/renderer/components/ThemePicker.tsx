@@ -22,7 +22,7 @@ function ThemeSwatches({ themeId }: { themeId: string }): React.JSX.Element {
       {colors.map((color) => (
         <span
           key={`${themeId}-${color}`}
-          className="h-2.5 w-2.5 rounded-full border border-border/60"
+          className="h-2.5 w-2.5 rounded-sm border border-border/70"
           style={{ backgroundColor: color }}
         />
       ))}
@@ -212,32 +212,32 @@ export function ThemePicker(): React.JSX.Element | null {
         role="dialog"
         aria-modal="true"
         aria-label={t('themes.dialogLabel')}
-        className="pointer-events-auto absolute bottom-3 left-12 top-3 flex w-[min(20rem,calc(100vw-2rem))] flex-col rounded-md border border-border/80 bg-popover/97 shadow-[0_12px_36px_hsl(var(--background)/0.65)] backdrop-blur-sm"
+        className="pointer-events-auto absolute bottom-3 left-12 top-3 flex w-[min(20rem,calc(100vw-2rem))] flex-col overflow-hidden rounded-md border border-border/80 bg-popover shadow-[0_12px_36px_hsl(var(--background)/0.65),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]"
         onMouseDown={(event) => event.stopPropagation()}
       >
-        <header className="flex items-center gap-2 border-b border-border px-3 py-2.5">
-          <Palette size={16} className="text-primary shrink-0" aria-hidden="true" />
+        <header className="flex items-center gap-2 border-b border-border/70 px-3 py-2">
+          <Palette size={14} className="shrink-0 text-muted-foreground" aria-hidden="true" />
           <div className="min-w-0 flex-1">
-            <h2 className="text-sm font-medium text-foreground leading-none">
+            <h2 className="text-xs font-medium leading-none tracking-[-0.01em] text-foreground">
               {t('themes.title')}
             </h2>
-            <p className="text-2xs text-muted-foreground mt-0.5">{t('themes.hint')}</p>
+            <p className="mt-0.5 text-2xs text-muted-foreground">{t('themes.hint')}</p>
           </div>
           <button
             type="button"
             onClick={handleCancel}
-            className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground hover:bg-secondary hover:text-foreground transition-colors duration-150 ease-[var(--ease-out)] active:scale-[0.97]"
+            className="flex h-7 w-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
             aria-label={t('themes.close')}
           >
             <X size={14} />
           </button>
         </header>
 
-        <div className="px-3 py-2 border-b border-border">
+        <div className="border-b border-border/70 px-3 py-2">
           <div className="relative">
             <Search
               size={14}
-              className="absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground"
+              className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground"
               aria-hidden="true"
             />
             <input
@@ -249,7 +249,7 @@ export function ThemePicker(): React.JSX.Element | null {
                 setFocusIndex(0)
               }}
               placeholder={t('themes.searchPlaceholder')}
-              className="w-full rounded-md border border-border bg-secondary/50 py-1.5 pl-8 pr-3 text-sm text-foreground placeholder:text-muted-foreground outline-none focus:ring-2 focus:ring-primary/40"
+              className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 py-1.5 pl-8 pr-3 text-sm text-foreground outline-none transition-[border-color,background-color] placeholder:text-muted-foreground/70 focus-visible:border-ring/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
               aria-label={t('themes.searchAria')}
             />
           </div>
@@ -257,19 +257,22 @@ export function ThemePicker(): React.JSX.Element | null {
 
         <div
           ref={listRef}
-          className="flex-1 overflow-y-auto p-2"
+          className="flex-1 overflow-y-auto p-1.5"
           role="listbox"
           aria-label={t('themes.listAria')}
         >
           {filteredFamilies.length === 0 ? (
-            <p className="px-2 py-6 text-center text-sm text-muted-foreground">
-              {t('themes.empty')}
-            </p>
+            <div className="flex flex-col items-center justify-center gap-2 px-3 py-10 text-center">
+              <div className="flex size-8 items-center justify-center rounded-md bg-secondary/50">
+                <Search size={14} className="text-muted-foreground" />
+              </div>
+              <p className="text-xs font-medium text-foreground">{t('themes.empty')}</p>
+            </div>
           ) : (
             filteredFamilies.map((family) => {
               const rows = filteredRows.filter((row) => row.familyId === family.familyId)
               return (
-                <div key={family.familyId} className="mb-3 last:mb-0">
+                <div key={family.familyId} className="mb-2 last:mb-0">
                   <p className="label-group px-2 pb-1 text-muted-foreground">{family.name}</p>
                   {rows.map((row) => {
                     const index = rowCounter
@@ -288,10 +291,10 @@ export function ThemePicker(): React.JSX.Element | null {
                         data-theme-row
                         aria-selected={isHighlighted}
                         className={cn(
-                          'flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-sm transition-colors duration-100 ease-[var(--ease-out)] active:scale-[0.98]',
+                          'flex h-8 w-full items-center gap-2 rounded-sm px-2 text-left text-xs transition-colors',
                           isHighlighted || isFocused
-                            ? 'bg-accent/20 text-foreground'
-                            : 'text-foreground/90 hover:bg-secondary/80'
+                            ? 'bg-secondary text-foreground shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.04)] ring-1 ring-inset ring-primary/30'
+                            : 'text-foreground/90 hover:bg-secondary/70'
                         )}
                         onMouseEnter={() => {
                           setFocusIndex(index)
@@ -310,7 +313,7 @@ export function ThemePicker(): React.JSX.Element | null {
                         {isApplied ? (
                           <Check
                             size={14}
-                            className="text-primary shrink-0"
+                            className="shrink-0 text-primary"
                             aria-label={t('themes.applied')}
                           />
                         ) : null}
@@ -323,7 +326,7 @@ export function ThemePicker(): React.JSX.Element | null {
           )}
         </div>
 
-        <footer className="border-t border-border px-3 py-2 text-2xs text-muted-foreground">
+        <footer className="border-t border-border/70 bg-secondary/20 px-3 py-1.5 text-2xs text-muted-foreground">
           {t('themes.cancel')} · {t('themes.apply')}
         </footer>
       </section>

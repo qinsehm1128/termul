@@ -54,6 +54,14 @@ import { dataTransferFiles, useComposerAttachments } from './use-composer-attach
 import { useComposerCaretRestore, useComposerMentionSelect } from './use-composer-caret-restore'
 import { useComposerMentions } from './use-composer-mentions'
 
+/** Outer + inner recess around the editor only — not the toolbar or context strip. */
+const COMPOSER_INPUT_BEZEL_OUTER =
+  'rounded-md border border-border/85 bg-background/35 p-px transition-colors focus-within:border-ring/70'
+const COMPOSER_INPUT_BEZEL_INNER =
+  'rounded-[5px] border border-border/50 bg-secondary/40 shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.06)]'
+const COMPOSER_CONTROL_FOCUS =
+  'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring'
+
 interface ChatInputBarProps {
   /** Active session — drives selector chips. */
   session: AcpSession
@@ -603,12 +611,12 @@ export function ChatInputBar({
   )
 
   return (
-    <div ref={rootRef} className={cn(CHAT_GUTTER_X, 'pb-2 pt-3')}>
+    <div ref={rootRef} className={cn(CHAT_GUTTER_X, 'pb-2 pt-2')}>
       <div className="relative mx-auto w-full max-w-3xl">
         {disabled && (
           <div
             role="status"
-            className="mb-2 rounded-lg border border-border/60 bg-muted/40 px-3 py-1.5 text-xs text-muted-foreground"
+            className="mb-1.5 rounded-md border border-border/70 bg-secondary/40 px-2.5 py-1.5 text-xs text-muted-foreground"
           >
             {t('composer.sessionClosed')}
           </div>
@@ -617,7 +625,7 @@ export function ChatInputBar({
           <div
             role="status"
             data-testid="unbound-session-notice"
-            className="mb-2 rounded-lg border border-border/60 bg-muted/40 px-3 py-1.5 text-xs text-muted-foreground"
+            className="mb-1.5 rounded-md border border-border/70 bg-secondary/40 px-2.5 py-1.5 text-xs text-muted-foreground"
           >
             {t('lifecycle.errors.CONVERSATION_BINDING_NOT_FOUND')}
           </div>
@@ -646,26 +654,28 @@ export function ChatInputBar({
           {/* biome-ignore lint/a11y/noStaticElementInteractions: drop zone for attachments; the file picker button is the accessible path */}
           <div
             data-chat-composer="true"
-            className={cn(
-              'relative rounded-lg border border-border/70 bg-card/90 transition-[border-color,background-color]',
-              'focus-within:border-foreground/20 focus-within:bg-card',
-              busy && 'border-foreground/15',
-              dragActive && 'border-primary/70'
-            )}
+            className="relative bg-card/70"
             onDragEnter={handleDragEnter}
             onDragLeave={handleDragLeave}
             onDragOver={canDropPaste ? (e) => e.preventDefault() : undefined}
             onDrop={handleDrop}
           >
             {dragActive && canDropPaste && (
-              <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-lg border border-dashed border-primary/60 bg-background/90 text-sm font-medium text-foreground backdrop-blur-sm">
+              <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-md border border-dashed border-primary/55 bg-background/92 text-sm font-medium text-foreground">
                 <span className="flex items-center gap-2">
                   <Paperclip size={16} /> {t('composer.dropFiles')}
                 </span>
               </div>
             )}
-            <AttachmentPreviewGroup attachments={attachments} onRemove={removeAttachment} />
-            <div className="px-4 pb-1.5 pt-3.5">
+            {attachments.length > 0 && (
+              <div
+                data-chat-composer-attachment-strip="true"
+                className="border-b border-border/55 bg-secondary/25"
+              >
+                <AttachmentPreviewGroup attachments={attachments} onRemove={removeAttachment} />
+              </div>
+            )}
+            <div className="px-2 pt-2">
               {/* Tiptap rich-text editor — the skill "pill" is a real inline
                   DOM node (a Tiptap `NodeView`), so the caret sits flush
                   against the pill's right edge by construction. No transparent
@@ -673,39 +683,60 @@ export function ChatInputBar({
                   scroll-sync. The `value` string (sentinel-token format) is
                   the shared model the wire builder + draft persistence +
                   timeline consume (byte-identical wire payload). */}
-              <ChatComposerEditor
-                value={value}
-                onValueChange={setValue}
-                onCaretChange={mentions.update}
-                onBeforeEditorKeyDown={handleKeyDown}
-                onPasteAttachments={handlePaste}
-                getSkillPaths={() => skillPathsRef.current}
-                editorRef={editorRef}
-                inputRef={composerInputRef}
-                disabled={disabled || sending}
-                minHeight={52}
-                maxHeight={160}
-                placeholder={
-                  disabled
-                    ? t('composer.unavailable')
-                    : hasCommandToken
-                      ? t('composer.optionalMessage')
-                      : t('composer.askAnything')
-                }
-              />
+              <div
+                data-chat-composer-input-bezel="true"
+                className={cn(
+                  COMPOSER_INPUT_BEZEL_OUTER,
+                  busy && 'border-ring/35',
+                  dragActive && 'border-primary/65'
+                )}
+              >
+                <div className={COMPOSER_INPUT_BEZEL_INNER}>
+                  <div className="px-2.5 py-2">
+                    <ChatComposerEditor
+                      value={value}
+                      onValueChange={setValue}
+                      onCaretChange={mentions.update}
+                      onBeforeEditorKeyDown={handleKeyDown}
+                      onPasteAttachments={handlePaste}
+                      getSkillPaths={() => skillPathsRef.current}
+                      editorRef={editorRef}
+                      inputRef={composerInputRef}
+                      disabled={disabled || sending}
+                      minHeight={52}
+                      maxHeight={160}
+                      placeholder={
+                        disabled
+                          ? t('composer.unavailable')
+                          : hasCommandToken
+                            ? t('composer.optionalMessage')
+                            : t('composer.askAnything')
+                      }
+                    />
+                  </div>
+                </div>
+              </div>
             </div>
             <div
-              className="flex items-end justify-between gap-3 px-3 pb-3"
+              className="flex items-end justify-between gap-2 px-2 pb-2 pt-1.5"
               data-composer-toolbar={toolbarMode}
             >
-              <div className="flex min-w-0 items-center gap-2">
-                {canPick && <AttachFilesButton onClick={() => void pickFiles()} />}
+              <div
+                data-chat-composer-affordance-strip="true"
+                className="flex min-h-8 min-w-0 items-center gap-1"
+              >
+                {canPick && (
+                  <AttachFilesButton
+                    onClick={() => void pickFiles()}
+                    className="rounded-md border border-border/70 bg-secondary/35 hover:border-border hover:bg-secondary/60 hover:text-foreground"
+                  />
+                )}
                 {mcpBadge}
                 <PermissionPolicyBadge session={session} />
               </div>
               <div
                 className={cn(
-                  'flex min-w-0 flex-wrap items-end justify-end gap-2.5',
+                  'flex min-w-0 flex-wrap items-end justify-end gap-2',
                   toolbarMode === 'narrow' && 'flex-1'
                 )}
               >
@@ -721,10 +752,10 @@ export function ChatInputBar({
                     const hasRow2 = hasConfigOptions
                     if (!hasRow1 && !hasRow2) return null
                     return (
-                      <div className="flex min-w-0 flex-1 flex-col items-end gap-2">
+                      <div className="flex min-w-0 flex-1 flex-col items-end gap-1.5">
                         {hasRow1 && (
                           <div
-                            className="flex min-w-0 flex-wrap items-center justify-end gap-2"
+                            className="flex min-w-0 flex-wrap items-center justify-end gap-1.5"
                             data-composer-toolbar-row="1"
                           >
                             {modelChip ?? agentIdentityChip}
@@ -733,7 +764,7 @@ export function ChatInputBar({
                         )}
                         {hasRow2 && (
                           <div
-                            className="flex min-w-0 flex-wrap items-center justify-end gap-2"
+                            className="flex min-w-0 flex-wrap items-center justify-end gap-1.5"
                             data-composer-toolbar-row="2"
                           >
                             {thoughtChip}
@@ -746,7 +777,7 @@ export function ChatInputBar({
                   })()
                 ) : (
                   <div
-                    className="flex min-w-0 flex-wrap items-center justify-end gap-2.5"
+                    className="flex min-w-0 flex-wrap items-center justify-end gap-1.5"
                     data-composer-toolbar-row="single"
                   >
                     {modelChip ?? agentIdentityChip}
@@ -771,7 +802,10 @@ export function ChatInputBar({
                         animate={iconMotion.animate}
                         exit={iconMotion.exit}
                         transition={iconMotion.transition}
-                        className="absolute inset-0 flex items-center justify-center rounded-md bg-foreground text-background transition-colors hover:bg-foreground/88"
+                        className={cn(
+                          'absolute inset-0 flex items-center justify-center rounded-md bg-foreground text-background transition-colors hover:bg-foreground/88',
+                          COMPOSER_CONTROL_FOCUS
+                        )}
                       >
                         <Square size={10} fill="currentColor" strokeWidth={0} />
                       </motion.button>
@@ -790,9 +824,10 @@ export function ChatInputBar({
                         transition={iconMotion.transition}
                         className={cn(
                           'absolute inset-0 flex items-center justify-center rounded-md transition-colors',
+                          COMPOSER_CONTROL_FOCUS,
                           canSend
-                            ? 'bg-foreground text-background hover:bg-foreground/88'
-                            : 'cursor-not-allowed bg-muted text-muted-foreground'
+                            ? 'bg-primary text-primary-foreground hover:bg-primary/90'
+                            : 'cursor-not-allowed border border-border/70 bg-secondary/40 text-muted-foreground'
                         )}
                       >
                         <ArrowUp size={18} />
@@ -806,9 +841,9 @@ export function ChatInputBar({
         </div>
         <div
           data-chat-composer-context-strip="true"
-          className="mx-auto mt-1 flex w-full min-w-0 items-center justify-between gap-2 px-1 text-2xs text-muted-foreground"
+          className="mx-auto mt-1.5 flex h-6 w-full min-w-0 items-center justify-between gap-2 text-2xs text-muted-foreground"
         >
-          <span className="inline-flex shrink-0 items-center gap-1.5 px-2.5 font-medium text-muted-foreground/70">
+          <span className="inline-flex shrink-0 items-center gap-1 px-1 font-medium text-muted-foreground/75">
             {session.worktreePath ? (
               <FolderGit2 className="size-3.5" aria-hidden="true" />
             ) : (
@@ -818,7 +853,7 @@ export function ChatInputBar({
           </span>
           {isolationBranch ? (
             <span
-              className="inline-flex min-w-0 items-center justify-end gap-1.5 px-2.5 font-medium text-muted-foreground/70"
+              className="inline-flex min-w-0 items-center justify-end gap-1 px-1 font-medium text-muted-foreground/75"
               title={isolationTitle ?? undefined}
             >
               <GitBranch className="size-3.5 shrink-0" aria-hidden="true" />

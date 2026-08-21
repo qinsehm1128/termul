@@ -59,13 +59,13 @@ export function AskUserQuestion({ question }: AskUserQuestionProps): React.JSX.E
     <div
       role="dialog"
       aria-label={question.question}
-      className={cn(CHAT_GUTTER_X, 'border-t bg-card pb-2 pt-3')}
+      className={cn(CHAT_GUTTER_X, 'border-t border-border/70 bg-background pb-2 pt-2.5')}
       data-testid="ask-user-question"
     >
-      <div className="mx-auto w-full max-w-3xl rounded-lg border border-border/70 bg-card px-3.5 py-3">
-        <p className="text-sm font-medium">{question.question}</p>
+      <div className="mx-auto w-full max-w-3xl rounded-md border border-border/80 bg-card px-3 py-2.5 shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.04)]">
+        <p className="text-sm font-medium tracking-[-0.01em]">{question.question}</p>
         {question.options.length === 0 && (
-          <p className="mt-1 text-xs text-muted-foreground">{t('question.noOptions')}</p>
+          <p className="mt-1 text-2xs text-muted-foreground">{t('question.noOptions')}</p>
         )}
         <div className="mt-2 flex flex-col gap-1.5">
           {question.options.map((option) => (
@@ -75,17 +75,17 @@ export function AskUserQuestion({ question }: AskUserQuestionProps): React.JSX.E
               aria-pressed={multi ? selected.includes(option.value) : selected[0] === option.value}
               onClick={() => toggle(option.value)}
               className={cn(
-                'flex min-h-11 items-start gap-2 rounded-lg border px-3 py-2.5 text-left text-sm',
+                'flex min-h-11 items-start gap-2 rounded-md border px-3 py-2 text-left text-sm transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-ring',
                 selected.includes(option.value) || selected[0] === option.value
-                  ? 'border-primary bg-primary/10'
-                  : 'border-border hover:bg-accent'
+                  ? 'border-primary/50 bg-primary/10 shadow-[inset_0_1px_0_0_hsl(var(--primary)/0.12)]'
+                  : 'border-border/70 bg-secondary/20 hover:border-border hover:bg-secondary/55'
               )}
             >
               {multi && (
                 <span
                   aria-hidden
                   className={cn(
-                    'mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded border',
+                    'mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center rounded-sm border',
                     selected.includes(option.value)
                       ? 'border-primary bg-primary text-primary-foreground'
                       : 'border-border'
@@ -103,7 +103,7 @@ export function AskUserQuestion({ question }: AskUserQuestionProps): React.JSX.E
             </button>
           ))}
         </div>
-        <div className="mt-3 flex items-center justify-end gap-2">
+        <div className="mt-2.5 flex items-center justify-end gap-2">
           <Button variant="ghost" size="sm" onClick={cancel}>
             {t('common.cancel')}
           </Button>

@@ -17,8 +17,7 @@ export const isMac: boolean = _platform.includes('mac')
  * vertical offset on both platforms.
  */
 export const macOsTitlebarStripClass =
-  'h-8 shrink-0 border-b border-border/70 bg-sidebar flex items-center relative'
-
+  'relative flex h-8 shrink-0 items-center border-b border-border/70 bg-sidebar shadow-[inset_0_1px_0_hsl(var(--foreground)/0.025)]'
 /** True when running on Windows. */
 export const isWindows: boolean = _platform.includes('win')
 

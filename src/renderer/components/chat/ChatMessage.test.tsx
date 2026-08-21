@@ -257,7 +257,41 @@ describe('ChatMessage', () => {
       'overflow-hidden'
     )
     expect(table.parentElement).toHaveClass('max-w-full', 'overflow-x-auto')
-    expect(container.querySelector('.chat-streamdown')).toHaveClass('leading-normal', 'min-w-0')
+    expect(container.querySelector('.chat-streamdown')).toHaveClass('min-w-0', 'leading-[1.6]')
+    expect(container.querySelector('[data-chat-message="agent"]')).toHaveClass('w-full')
+    expect(container.querySelector('[data-slot="bubble"]')).toBeNull()
+    expect(container.querySelector('.chat-agent-stream')).toBeInTheDocument()
+  })
+
+  it('renders the user prompt as a compact stream chip, not a speech bubble', () => {
+    const { container } = render(
+      <TooltipProvider>
+        <ChatMessage
+          message={{
+            id: 'user-compact',
+            role: 'user',
+            blocks: [{ type: 'text', text: 'Please investigate the lock' }],
+            streaming: false,
+            timestamp: 0
+          }}
+        />
+      </TooltipProvider>
+    )
+
+    expect(container.querySelector('[data-chat-message="user"]')).toBeInTheDocument()
+    expect(container.querySelector('.chat-user-prompt')).toHaveTextContent(
+      'Please investigate the lock'
+    )
+    expect(container.querySelector('[data-slot="bubble"]')).toBeNull()
+    expect(container.querySelector('.chat-message-meta')).toBeInTheDocument()
+  })
+
+  it('marks the live agent stream while the caret is still running', () => {
+    const { container } = render(<ChatMessage message={agentMessage(true)} isLast />)
+    expect(container.querySelector('[data-chat-message="agent"]')).toHaveAttribute(
+      'data-streaming',
+      'true'
+    )
   })
 
   it('stops the Streamdown caret when the live agent message finishes', () => {
@@ -344,7 +378,7 @@ describe('ChatMessage', () => {
     expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument()
   })
 
-  describe('user message with inline skill chips', () => {
+  describe('user prompt with inline skill chips', () => {
     function userMessage(text: string): ChatMessageType {
       return {
         id: 'user-1',
@@ -355,7 +389,7 @@ describe('ChatMessage', () => {
       }
     }
 
-    it('renders inline skill chips for token text in a user bubble', () => {
+    it('renders inline skill chips for token text in a user prompt', () => {
       const text = `use this ${T('git-worktree')} and then ${T('release-version')}`
       const { container } = render(
         <TooltipProvider>

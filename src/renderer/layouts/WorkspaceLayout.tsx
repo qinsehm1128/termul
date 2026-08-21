@@ -219,7 +219,7 @@ function MacOsTitlebarStrip(): React.JSX.Element | null {
       </div>
 
       {(activeGroupName || activeProject) && (
-        <span className="absolute left-1/2 -translate-x-1/2 text-sm text-muted-foreground pointer-events-none select-none truncate max-w-[50%]">
+        <span className="pointer-events-none absolute left-1/2 max-w-[50%] -translate-x-1/2 select-none truncate text-2xs font-medium tracking-[0.01em] text-muted-foreground/80">
           {activeGroupName ?? activeProject?.name}
         </span>
       )}

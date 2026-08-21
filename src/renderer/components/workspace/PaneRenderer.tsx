@@ -154,7 +154,12 @@ const PaneSplitRenderer = memo(
     }, [])
 
     return (
-      <ResizablePanelGroup id={node.id} direction={node.direction} onLayout={handleLayout}>
+      <ResizablePanelGroup
+        id={node.id}
+        direction={node.direction}
+        onLayout={handleLayout}
+        className="bg-sidebar"
+      >
         {node.children.map((child, index) => (
           <PaneRendererPanel
             key={child.id}
@@ -221,7 +226,12 @@ const PaneRendererPanel = memo(
             defaultShell={defaultShell}
           />
         </ResizablePanel>
-        {!isLast && <ResizableHandle onDragging={onDragging} />}
+        {!isLast && (
+          <ResizableHandle
+            onDragging={onDragging}
+            className="bg-border/45 hover:bg-primary/40 data-[resize-handle-state=hover]:bg-primary/40 data-[resize-handle-state=drag]:bg-primary/70"
+          />
+        )}
       </>
     )
   }
