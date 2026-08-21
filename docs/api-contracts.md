@@ -206,7 +206,7 @@ Client request envelope:
 { "id": "terminal-1", "type": "resize", "payload": { "terminalId": "...", "cols": 100, "rows": 30 } }
 ```
 
-Supported request types are `spawn`, `write`, `resize`, `kill`, `attach`, `get_cwd`, `get_git_branch`, `get_git_status`, `get_exit_code`, `add_renderer_ref`, `remove_renderer_ref`, `set_protected`, and `update_orphan_detection`. Replies use the existing `IpcResult` shape with the request `id`. Output frames are `{ "type": "data", "terminalId": "...", "data": [byte...] }`; event frames contain the transport-neutral exit/cwd/git/exit-code payload. `attach` sends bounded retained scrollback before subscribed live output.
+Supported request types are `spawn`, `list`, `watch`, `write`, `resize`, `kill`, `attach`, `detach`, `get_cwd`, `get_git_branch`, `get_git_status`, `get_exit_code`, `add_renderer_ref`, `remove_renderer_ref`, `set_protected`, and `update_orphan_detection`. Replies use the existing `IpcResult` shape with the request `id`. Output frames are `{ "type": "data", "terminalId": "...", "data": [byte...] }`; event frames contain the transport-neutral exit/cwd/git/exit-code payload. `attach` is CAP-3 claim-gated. Companion clients use `list` (`{ projectId }`) then `watch` (`{ terminalId, lastSeq? }`) to view a desktop-owned PTY without rotating its claim; both send the same bounded scrollback replay as `attach` before live `data` frames.
 
 The service deliberately does not log request data, terminal bytes, environment values, or secrets. Authentication, authorization, TLS, and sandboxing are not provided; this endpoint is unsafe for public or untrusted network exposure.
 

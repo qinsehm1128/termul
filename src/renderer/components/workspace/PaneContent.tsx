@@ -207,8 +207,8 @@ export function PaneContent({
     <div
       className={cn(
         'flex flex-col h-full relative',
-        isActivePane && hasMultiplePanes && !isFullscreenPane && 'ring-1 ring-primary/30',
-        isFullscreenPane && 'ring-1 ring-primary/30 rounded-xl overflow-hidden'
+        isActivePane && hasMultiplePanes && !isFullscreenPane && 'ring-1 ring-foreground/15',
+        isFullscreenPane && 'ring-1 ring-foreground/15 overflow-hidden'
       )}
       onMouseDown={handleFocus}
       onKeyDownCapture={handleKeyDownCapture}

@@ -60,6 +60,29 @@ fn get_entry(key: &str) -> Result<Entry, String> {
     Entry::new(SERVICE_NAME, key).map_err(|e| format!("Failed to create keyring entry: {}", e))
 }
 
+/// Host-side keyring helpers used by remote tunnel config (not Tauri commands).
+/// Tokens never go in the JSON file; the renderer only sees `*TokenSet`.
+pub fn keyring_set(account: &str, value: &str) -> Result<(), String> {
+    get_entry(account)?
+        .set_password(value)
+        .map_err(|e| format!("Failed to store secret: {e}"))
+}
+
+pub fn keyring_get(account: &str) -> Result<Option<String>, String> {
+    match get_entry(account)?.get_password() {
+        Ok(value) => Ok(Some(value)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(format!("Failed to retrieve secret: {e}")),
+    }
+}
+
+pub fn keyring_delete(account: &str) -> Result<(), String> {
+    match get_entry(account)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(format!("Failed to delete secret: {e}")),
+    }
+}
+
 #[tauri::command]
 pub fn secure_storage_set(request: SecureStorageSetRequest) -> SecureStorageResponse<()> {
     match get_entry(&request.key) {

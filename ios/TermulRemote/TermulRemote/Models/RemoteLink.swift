@@ -1,5 +1,12 @@
 import Foundation
 
+enum WorkspaceSurface: String, Hashable, CaseIterable, Identifiable {
+    case chat
+    case terminal
+
+    var id: String { rawValue }
+}
+
 struct RemoteLink: Identifiable, Hashable, Codable {
     let id: UUID
     var title: String
@@ -15,6 +22,30 @@ struct RemoteLink: Identifiable, Hashable, Codable {
 
     var originHost: String {
         accessURL.host() ?? accessURL.absoluteString
+    }
+
+    var originURL: URL {
+        var components = URLComponents(url: accessURL, resolvingAgainstBaseURL: false) ?? URLComponents()
+        components.fragment = nil
+        components.query = nil
+        components.path = ""
+        return components.url ?? accessURL
+    }
+
+    func url(for surface: WorkspaceSurface) -> URL {
+        var base = accessURL.absoluteString
+        if let hash = base.firstIndex(of: "#") {
+            base = String(base[..<hash])
+        }
+        while base.hasSuffix("/") {
+            base.removeLast()
+        }
+        switch surface {
+        case .chat:
+            return accessURL
+        case .terminal:
+            return URL(string: "\(base)/#/terminal") ?? accessURL
+        }
     }
 
     static func parse(_ raw: String) throws -> RemoteLink {

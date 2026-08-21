@@ -16,7 +16,7 @@ export function SSHWorkspace({ profile, conn }: SSHWorkspaceProps): React.JSX.El
   const editingFile = useSSHEditorFile()
 
   return (
-    <div className="flex h-full w-full overflow-hidden rounded-xl bg-card">
+    <div className="flex h-full w-full overflow-hidden bg-background">
       {/* Right: Terminal + Editor area */}
       <div className="flex-1 flex flex-col min-w-0">
         {/* Top bar */}

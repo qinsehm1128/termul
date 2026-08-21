@@ -1833,40 +1833,37 @@ function ConnectedTerminalComponent({
             <div ref={containerRef} className="w-full h-full" />
           </div>
           {isCrashed && (
-            <div className="absolute inset-0 bg-background/40 backdrop-blur-md flex items-center justify-center z-50 p-4 md:p-8 animate-in fade-in zoom-in-95 duration-300 text-foreground">
-              <div className="grid grid-cols-1 md:grid-cols-[140px_1fr] gap-6 bg-card/95 border border-border/50 p-8 rounded-2xl shadow-2xl max-w-2xl w-full border-t-4 border-t-destructive">
-                <div className="flex flex-col items-center justify-center border-b md:border-b-0 md:border-r border-border/50 pb-6 md:pb-0 md:pr-6">
-                  <div className="w-20 h-20 rounded-2xl bg-destructive/10 flex items-center justify-center mb-3 shadow-inner group-hover:scale-110 transition-transform duration-500">
-                    <AlertTriangle className="text-destructive" size={40} />
+            <div className="absolute inset-0 z-50 flex animate-in items-center justify-center bg-background/70 p-4 text-foreground backdrop-blur-[2px] fade-in duration-150">
+              <div className="w-full max-w-md rounded-lg border border-destructive/30 bg-card p-5 shadow-[0_18px_60px_hsl(var(--background)/0.7)]">
+                <div className="flex items-start gap-3">
+                  <div className="flex size-9 shrink-0 items-center justify-center rounded-md bg-destructive/10">
+                    <AlertTriangle className="text-destructive" size={18} />
                   </div>
-                  <span className="text-3xs uppercase tracking-[0.2em] font-black text-destructive/80 text-center">
-                    {t('crash.criticalError')}
-                  </span>
-                </div>
-                <div className="flex flex-col justify-center text-center md:text-left">
-                  <div className="mb-1 text-xs font-medium text-muted-foreground uppercase tracking-wider opacity-70">
-                    {t('crash.paneException')}
-                  </div>
-                  <h3 className="text-2xl md:text-3xl font-bold tracking-tighter mb-3">
-                    {t('crash.sessionInterrupted')}
-                  </h3>
-                  <p className="text-muted-foreground leading-relaxed text-sm md:text-base mb-8">
-                    {t('crash.description')}
-                  </p>
-                  <div className="flex flex-col sm:flex-row items-center gap-4">
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        if (targetId) restartTerminal(targetId)
-                      }}
-                      className="w-full sm:w-auto inline-flex items-center justify-center gap-3 px-8 py-3.5 bg-primary text-primary-foreground rounded-xl hover:bg-primary/90 hover:shadow-xl hover:shadow-primary/20 active:scale-95 transition-all font-bold shadow-md"
-                    >
-                      <RefreshCcw size={20} /> {t('crash.reconnect')}
-                    </button>
-                    <div className="hidden sm:block h-8 w-px bg-border/50 mx-2" />
-                    <div className="text-3xs text-muted-foreground/60 font-mono">
-                      REF::{targetId?.slice(0, 8)}
+                  <div className="min-w-0 flex-1">
+                    <div className="mb-1 text-2xs font-medium text-destructive">
+                      {t('crash.criticalError')} · {t('crash.paneException')}
                     </div>
+                    <h3 className="text-base font-semibold tracking-[-0.01em]">
+                      {t('crash.sessionInterrupted')}
+                    </h3>
+                    <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
+                      {t('crash.description')}
+                    </p>
+                  </div>
+                </div>
+                <div className="mt-5 flex items-center gap-3">
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      if (targetId) restartTerminal(targetId)
+                    }}
+                    className="inline-flex h-8 items-center justify-center gap-1.5 rounded-md bg-foreground px-3 text-xs font-medium text-background transition-colors hover:bg-foreground/88 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                  >
+                    <RefreshCcw size={14} /> {t('crash.reconnect')}
+                  </button>
+                  <div className="text-3xs font-mono text-muted-foreground/60">
+                    REF::{targetId?.slice(0, 8)}
                   </div>
                 </div>
               </div>

@@ -7,8 +7,10 @@ final class ConnectionStore {
     private static let storageKey = "termul.remote.savedLinks"
 
     var savedLinks: [RemoteLink] = []
-    var path: [Route] = []
+    var activeLink: RemoteLink?
+    var surface: WorkspaceSurface = .chat
     var errorMessage: String?
+    var isScanning = false
 
     init() {
         savedLinks = Self.load()
@@ -19,20 +21,30 @@ final class ConnectionStore {
             let link = try RemoteLink.parse(raw)
             remember(link)
             errorMessage = nil
-            path.append(.session(link))
+            surface = .chat
+            activeLink = link
         } catch {
             errorMessage = error.localizedDescription
         }
     }
 
-    func connect(link: RemoteLink) {
+    func connect(link: RemoteLink, surface: WorkspaceSurface = .chat) {
         remember(link)
         errorMessage = nil
-        path.append(.session(link))
+        self.surface = surface
+        activeLink = link
+    }
+
+    func disconnect() {
+        activeLink = nil
+        surface = .chat
     }
 
     func forget(_ link: RemoteLink) {
         savedLinks.removeAll { $0.id == link.id }
+        if activeLink?.id == link.id {
+            disconnect()
+        }
         persist()
     }
 
@@ -42,10 +54,6 @@ final class ConnectionStore {
 
     func dismissError() {
         errorMessage = nil
-    }
-
-    enum Route: Hashable {
-        case session(RemoteLink)
     }
 
     private func remember(_ link: RemoteLink) {

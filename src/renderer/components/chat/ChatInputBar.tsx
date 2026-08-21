@@ -1,5 +1,4 @@
 import type { Editor } from '@tiptap/core'
-import { BorderBeam } from 'border-beam'
 import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { ArrowUp, Folder, FolderGit2, GitBranch, Paperclip, Square } from 'lucide-react'
 import { type DragEvent, useCallback, useEffect, useRef, useState } from 'react'
@@ -46,13 +45,6 @@ import { SkillPathError, useChatComposer } from './use-chat-composer'
 import { dataTransferFiles, useComposerAttachments } from './use-composer-attachments'
 import { useComposerCaretRestore, useComposerMentionSelect } from './use-composer-caret-restore'
 import { useComposerMentions } from './use-composer-mentions'
-
-// Subtle embossed/raised look shared by the send + stop buttons: soft outer
-// drop shadow to lift the button off the composer, a top inner highlight, and a
-// bottom inner shadow to fake a bevel. Fixed black/white tints read correctly
-// on both the white-in-dark and black-in-light button shapes.
-const EMBOSSED_BUTTON =
-  'shadow-[0_1px_2px_hsl(0_0%_0%/0.28),inset_0_1px_0_hsl(0_0%_100%/0.16),inset_0_-1px_0_hsl(0_0%_0%/0.16)] transition-shadow hover:shadow-[0_2px_6px_hsl(0_0%_0%/0.34),inset_0_1px_0_hsl(0_0%_100%/0.22),inset_0_-1px_0_hsl(0_0%_0%/0.2)]'
 
 interface ChatInputBarProps {
   /** Active session — drives selector chips. */
@@ -616,13 +608,14 @@ export function ChatInputBar({
             inputRef={composerInputRef}
           />
         )}
-        <ComposerBeamShell busy={busy} reduced={reduced}>
+        <div className="relative z-10 w-full">
           {/* biome-ignore lint/a11y/noStaticElementInteractions: drop zone for attachments; the file picker button is the accessible path */}
           <div
             data-chat-composer="true"
             className={cn(
-              'relative rounded-2xl border border-border/60 bg-card transition-[border-color,box-shadow]',
-              'focus-within:border-border focus-within:ring-2 focus-within:ring-inset focus-within:ring-ring',
+              'relative rounded-lg border border-border/70 bg-card/90 transition-[border-color,background-color]',
+              'focus-within:border-foreground/20 focus-within:bg-card',
+              busy && 'border-foreground/15',
               dragActive && 'border-primary/70'
             )}
             onDragEnter={handleDragEnter}
@@ -631,7 +624,7 @@ export function ChatInputBar({
             onDrop={handleDrop}
           >
             {dragActive && canDropPaste && (
-              <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl border-2 border-dashed border-primary/60 bg-background/80 text-sm font-medium text-foreground backdrop-blur-sm">
+              <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-lg border border-dashed border-primary/60 bg-background/90 text-sm font-medium text-foreground backdrop-blur-sm">
                 <span className="flex items-center gap-2">
                   <Paperclip size={16} /> {t('composer.dropFiles')}
                 </span>
@@ -729,7 +722,7 @@ export function ChatInputBar({
                   </div>
                 )}
                 <ContextUsageIndicator usage={sessionUsage} messages={messages} />
-                <div className="relative size-[34px] shrink-0 overflow-visible">
+                <div className="relative size-8 shrink-0 overflow-visible">
                   <AnimatePresence initial={false} mode="popLayout">
                     {showStop ? (
                       <motion.button
@@ -743,10 +736,7 @@ export function ChatInputBar({
                         animate={iconMotion.animate}
                         exit={iconMotion.exit}
                         transition={iconMotion.transition}
-                        className={cn(
-                          'absolute inset-0 flex items-center justify-center rounded-lg bg-foreground text-background transition-transform hover:bg-foreground/90 active:scale-[0.97]',
-                          EMBOSSED_BUTTON
-                        )}
+                        className="absolute inset-0 flex items-center justify-center rounded-md bg-foreground text-background transition-colors hover:bg-foreground/88"
                       >
                         <Square size={10} fill="currentColor" strokeWidth={0} />
                       </motion.button>
@@ -764,12 +754,9 @@ export function ChatInputBar({
                         exit={iconMotion.exit}
                         transition={iconMotion.transition}
                         className={cn(
-                          'absolute inset-0 flex items-center justify-center rounded-lg transition-transform',
+                          'absolute inset-0 flex items-center justify-center rounded-md transition-colors',
                           canSend
-                            ? cn(
-                                'bg-foreground text-background hover:bg-foreground/90 active:scale-[0.97]',
-                                EMBOSSED_BUTTON
-                              )
+                            ? 'bg-foreground text-background hover:bg-foreground/88'
                             : 'cursor-not-allowed bg-muted text-muted-foreground'
                         )}
                       >
@@ -781,10 +768,10 @@ export function ChatInputBar({
               </div>
             </div>
           </div>
-        </ComposerBeamShell>
+        </div>
         <div
           data-chat-composer-context-strip="true"
-          className="relative z-0 mx-auto -mt-4 flex w-[calc(100%-2.75rem)] min-w-0 items-center justify-between gap-2 rounded-b-2xl border border-t-0 border-border/60 bg-card/60 px-2 pb-1 pt-5 text-xs text-muted-foreground"
+          className="mx-auto mt-1 flex w-full min-w-0 items-center justify-between gap-2 px-1 text-2xs text-muted-foreground"
         >
           <span className="inline-flex shrink-0 items-center gap-1.5 px-2.5 font-medium text-muted-foreground/70">
             {session.worktreePath ? (
@@ -808,35 +795,5 @@ export function ChatInputBar({
         </div>
       </div>
     </div>
-  )
-}
-
-/**
- * BorderBeam only when motion is allowed. Under prefers-reduced-motion the beam
- * wrapper is omitted entirely (no keyframes / data-active), not merely paused.
- */
-function ComposerBeamShell({
-  busy,
-  reduced,
-  children
-}: {
-  busy: boolean
-  reduced: boolean
-  children: React.ReactNode
-}): React.JSX.Element {
-  if (reduced) {
-    return <div className="relative z-10 w-full">{children}</div>
-  }
-  return (
-    <BorderBeam
-      size="md"
-      colorVariant="mono"
-      theme="auto"
-      borderRadius={16}
-      active={busy}
-      className="relative z-10 w-full"
-    >
-      {children}
-    </BorderBeam>
   )
 }

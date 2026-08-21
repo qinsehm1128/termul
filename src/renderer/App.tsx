@@ -37,6 +37,10 @@ function RouteFallback(): React.JSX.Element {
   return <Skeleton className="h-full w-full" />
 }
 
+function CompanionTerminalRoute(): null {
+  return null
+}
+
 // PRODUCTION GUARDRAIL: This branch targets xterm 6.1-beta (the line VS Code
 // ships in production). The 6.1 beta track includes memory leak fixes
 // (IntersectionObserver retention, dispose-registration gaps) and TUI stability
@@ -173,6 +177,12 @@ const router = createHashRouter(
           )
         },
         { path: 'c/:sessionId', element: <ChatRoute /> },
+        {
+          // iOS companion deep-link: `https://<tunnel>/#/terminal` focuses or
+          // creates a terminal tab inside the existing mobile workspace.
+          path: 'terminal',
+          element: <CompanionTerminalRoute />
+        },
         {
           path: 'snapshots',
           element: (

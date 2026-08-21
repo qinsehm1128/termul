@@ -145,11 +145,11 @@ export function CommandHistoryModal({
           onClick={onClose}
         >
           <motion.div
-            initial={{ opacity: 0, scale: 0.95, y: -10 }}
-            animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.95, y: -10 }}
+            initial={{ opacity: 0, y: -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -6 }}
             transition={{ duration: 0.15 }}
-            className="w-full max-w-2xl bg-card rounded-xl shadow-2xl border border-border overflow-hidden"
+            className="w-full max-w-2xl overflow-hidden rounded-lg border border-border/80 bg-card shadow-[0_18px_60px_hsl(var(--background)/0.7)]"
             onClick={(e) => e.stopPropagation()}
           >
             {/* Header */}

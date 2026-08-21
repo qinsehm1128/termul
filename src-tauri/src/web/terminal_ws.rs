@@ -3,9 +3,15 @@
 //! This endpoint intentionally stays separate from the ACP relay. Authentication
 //! is not implemented yet; never expose it to an untrusted network. All
 //! operations are project-scoped: a connection may only interact with terminals
-//! whose `project_id` it has been authorized for via spawn or explicit attach.
+//! whose `project_id` it has been authorized for via spawn, claim-gated attach,
+//! or companion `watch` after `list`.
+//!
+//! `list` + `watch` are the companion-viewer path (Orca-style): enumerate live
+//! host PTYs for a project and subscribe to scrollback/output without rotating
+//! the desktop claim. `attach` remains CAP-3 claim-gated.
 
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 use parking_lot::RwLock;
 
@@ -192,6 +198,42 @@ async fn handle(
             info!("[terminal-ws] spawn success terminal_id={}", spawned.info.id);
             serde_json::to_value(spawned).map_err(|e| ("SPAWN_FAILED", e.to_string()))
         }
+        "list" => {
+            let project_id = string_field(&request.payload, "projectId")?;
+            let terminals: Vec<Value> = state
+                .pty
+                .get_all()
+                .into_iter()
+                .filter(|instance| instance.project_matches(project_id))
+                .map(|instance| {
+                    let cwd = state
+                        .cwd_tracker
+                        .get_cwd(&instance.id)
+                        .unwrap_or_else(|| instance.cwd.clone());
+                    let git_branch = state.git_tracker.get_branch(&instance.id);
+                    live_terminal_summary(&instance, cwd, git_branch)
+                })
+                .collect();
+            info!(
+                "[terminal-ws] list success project_id={project_id} count={}",
+                terminals.len()
+            );
+            Ok(json!({ "terminals": terminals }))
+        }
+        "watch" => {
+            let terminal_id = string_field(&request.payload, "terminalId")?.to_string();
+            let last_seq = request.payload["lastSeq"].as_u64().unwrap_or(0);
+            info!("[terminal-ws] watch requested terminal_id={terminal_id}");
+            bind_output_stream(
+                state,
+                tx,
+                ctx,
+                terminal_id,
+                last_seq,
+                StreamGate::CompanionWatch,
+            )
+            .await
+        }
         "write" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
             if !ctx.is_authorized(terminal_id) {
@@ -247,125 +289,17 @@ async fn handle(
             // hidden). A missing or empty claim is NOT a shape error: it flows
             // through verification like any bad credential (contract: "missing/
             // invalid claim" collapses into the one generic error).
-            let claim = request.payload["claim"].as_str().unwrap_or("");
-            let last_seq = request.payload["lastSeq"]
-                .as_u64()
-                .unwrap_or(0);
-
-            // Capture the generation BEFORE verifying (TOCTOU-safe ordering,
-            // same as the desktop command): captured-first means a rotate/
-            // revoke landing mid-handshake either fails verification or leaves
-            // the attachment task holding a stale generation it terminates on.
-            let generation = state.pty.claim_generation(&terminal_id);
-            if state.pty.verify_claim(&terminal_id, claim).is_err() {
-                return Err(unauthorized_error(&terminal_id));
-            }
-            let Some(instance) = state.pty.get(&terminal_id) else {
-                // Verified a heartbeat ago but gone now — same generic error.
-                return Err(unauthorized_error(&terminal_id));
-            };
-            // The credential is the gate now (same-connection prior
-            // authorization no longer is): verified attach authorizes the
-            // connection for write/resize/events on this terminal.
-            ctx.authorize(&terminal_id);
-
-            // Sequenced replay: only unseen chunks, with gap detection.
-            let replay = instance.subscribe_from(last_seq);
-            let attach_result = state.pty.build_attach_result(&instance, &replay);
-            let snapshot = state.terminal_events.snapshot(&terminal_id);
-
-            // Send replay frame: chunks + gap flag + latest seq + state snapshot.
-            let chunk_payloads: Vec<Value> = replay
-                .chunks
-                .iter()
-                .map(|chunk| {
-                    json!({
-                        "seq": chunk.seq,
-                        "data": chunk.data.iter().map(|b| *b as u64).collect::<Vec<u64>>()
-                    })
-                })
-                .collect();
-            send_json(
+            let claim = request.payload["claim"].as_str().unwrap_or("").to_string();
+            let last_seq = request.payload["lastSeq"].as_u64().unwrap_or(0);
+            bind_output_stream(
+                state,
                 tx,
-                json!({
-                    "type": "replay",
-                    "terminalId": terminal_id,
-                    "chunks": chunk_payloads,
-                    "gap": replay.gap,
-                    "latestSeq": replay.latest_seq,
-                    "snapshot": serde_json::to_value(&snapshot).unwrap_or(json!({}))
-                }),
+                ctx,
+                terminal_id,
+                last_seq,
+                StreamGate::Claim { claim },
             )
             .await
-            .map_err(|e| ("NETWORK_ERROR", e))?;
-
-            // Replace prior attachment task if any.
-            if let Some(previous) = ctx.attachments.remove(&terminal_id) {
-                previous.abort();
-            }
-            let output_tx = tx.clone();
-            let attached_id = terminal_id.clone();
-            let pty = state.pty.clone();
-            let task = tokio::spawn(async move {
-                let mut receiver = replay.receiver;
-                let mut current_seq = replay.latest_seq;
-                loop {
-                    // CAP-3 teardown (amendment R1): when this credential is
-                    // rotated/revoked — by ANY connection — or the terminal is
-                    // killed/reaped, the derived stream ends. The generation
-                    // check is what makes rotate/revoke sever the holders on
-                    // other connections, not just the rotating one.
-                    if crate::commands::forwarder_should_terminate(
-                        generation,
-                        pty.claim_generation(&attached_id),
-                    ) {
-                        info!(
-                            "[terminal-ws] attachment terminating (claim invalidated) terminal_id={attached_id}"
-                        );
-                        break;
-                    }
-                    match receiver.recv().await {
-                        Ok(chunk) => {
-                            current_seq = chunk.seq;
-                            let data: Vec<u64> = chunk.data.iter().map(|b| *b as u64).collect();
-                            if send_json(
-                                &output_tx,
-                                json!({
-                                    "type": "data",
-                                    "terminalId": attached_id,
-                                    "seq": current_seq,
-                                    "data": data
-                                }),
-                            )
-                            .await
-                            .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                            // Recoverable: send a gap marker and continue.
-                            warn!(
-                                "[terminal-ws] output receiver lagged by {skipped} for {attached_id}"
-                            );
-                            let _ = send_json(
-                                &output_tx,
-                                json!({
-                                    "type": "gap",
-                                    "terminalId": attached_id,
-                                    "lastSeq": current_seq
-                                }),
-                            )
-                            .await;
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            });
-            ctx.attachments.insert(terminal_id.clone(), task);
-            // Shared attach result — byte-identical camelCase shape to the
-            // desktop `terminal_attach` response (no claim key, ever).
-            serde_json::to_value(attach_result).map_err(|e| ("NETWORK_ERROR", e.to_string()))
         }
         "rotate_claim" => {
             // CAP-3: possession of the current credential yields a fresh one
@@ -495,6 +429,161 @@ async fn handle(
         }
         _ => Err(("NOT_IMPLEMENTED", "unknown terminal request".to_string())),
     }
+}
+
+enum StreamGate {
+    /// CAP-3: desktop/web holders present the spawn-issued claim. Rotate/revoke
+    /// severs this stream via generation.
+    Claim { claim: String },
+    /// Companion viewer: no claim, no generation teardown. Desktop keeps its
+    /// exclusive claim; the phone only fans out of the same broadcast.
+    CompanionWatch,
+}
+
+async fn bind_output_stream(
+    state: &AppState,
+    tx: &mpsc::Sender<Message>,
+    ctx: &mut ConnectionContext,
+    terminal_id: String,
+    last_seq: u64,
+    gate: StreamGate,
+) -> Result<Value, (&'static str, String)> {
+    let hold_generation = match &gate {
+        StreamGate::Claim { claim } => {
+            // Capture generation BEFORE verify (TOCTOU-safe, same as desktop).
+            let generation = state.pty.claim_generation(&terminal_id);
+            if state.pty.verify_claim(&terminal_id, claim).is_err() {
+                return Err(unauthorized_error(&terminal_id));
+            }
+            Some(generation)
+        }
+        StreamGate::CompanionWatch => None,
+    };
+
+    let Some(instance) = state.pty.get(&terminal_id) else {
+        return match gate {
+            StreamGate::Claim { .. } => Err(unauthorized_error(&terminal_id)),
+            StreamGate::CompanionWatch => {
+                Err(("TERMINAL_NOT_FOUND", "terminal not found".to_string()))
+            }
+        };
+    };
+
+    ctx.authorize(&terminal_id);
+
+    let replay = instance.subscribe_from(last_seq);
+    let attach_result = state.pty.build_attach_result(&instance, &replay);
+    let snapshot = state.terminal_events.snapshot(&terminal_id);
+
+    let chunk_payloads: Vec<Value> = replay
+        .chunks
+        .iter()
+        .map(|chunk| {
+            json!({
+                "seq": chunk.seq,
+                "data": chunk.data.iter().map(|b| *b as u64).collect::<Vec<u64>>()
+            })
+        })
+        .collect();
+    send_json(
+        tx,
+        json!({
+            "type": "replay",
+            "terminalId": terminal_id,
+            "chunks": chunk_payloads,
+            "gap": replay.gap,
+            "latestSeq": replay.latest_seq,
+            "snapshot": serde_json::to_value(&snapshot).unwrap_or(json!({}))
+        }),
+    )
+    .await
+    .map_err(|e| ("NETWORK_ERROR", e))?;
+
+    if let Some(previous) = ctx.attachments.remove(&terminal_id) {
+        previous.abort();
+    }
+    let output_tx = tx.clone();
+    let attached_id = terminal_id.clone();
+    let pty = state.pty.clone();
+    let task = tokio::spawn(async move {
+        let mut receiver = replay.receiver;
+        let mut current_seq = replay.latest_seq;
+        loop {
+            if let Some(generation) = hold_generation {
+                if crate::commands::forwarder_should_terminate(
+                    generation,
+                    pty.claim_generation(&attached_id),
+                ) {
+                    info!(
+                        "[terminal-ws] attachment terminating (claim invalidated) terminal_id={attached_id}"
+                    );
+                    break;
+                }
+            }
+            match receiver.recv().await {
+                Ok(chunk) => {
+                    current_seq = chunk.seq;
+                    let data: Vec<u64> = chunk.data.iter().map(|b| *b as u64).collect();
+                    if send_json(
+                        &output_tx,
+                        json!({
+                            "type": "data",
+                            "terminalId": attached_id,
+                            "seq": current_seq,
+                            "data": data
+                        }),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!("[terminal-ws] output receiver lagged by {skipped} for {attached_id}");
+                    let _ = send_json(
+                        &output_tx,
+                        json!({
+                            "type": "gap",
+                            "terminalId": attached_id,
+                            "lastSeq": current_seq
+                        }),
+                    )
+                    .await;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+    ctx.attachments.insert(terminal_id, task);
+    serde_json::to_value(attach_result).map_err(|e| ("NETWORK_ERROR", e.to_string()))
+}
+
+fn terminal_display_title(cwd: &str, shell: &str) -> String {
+    Path::new(cwd)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(shell)
+        .to_string()
+}
+
+fn live_terminal_summary(
+    instance: &crate::pty::manager::TerminalInstance,
+    cwd: String,
+    git_branch: Option<String>,
+) -> Value {
+    json!({
+        "id": instance.id,
+        "shell": instance.shell,
+        "cwd": cwd,
+        "pid": instance.pid,
+        "cols": *instance.cols.read(),
+        "rows": *instance.rows.read(),
+        "projectId": instance.project_id,
+        "title": terminal_display_title(&cwd, &instance.shell),
+        "gitBranch": git_branch,
+    })
 }
 
 fn string_field<'a>(value: &'a Value, key: &str) -> Result<&'a str, (&'static str, String)> {
@@ -641,5 +730,12 @@ mod tests {
         // abort actually reached the task (teardown is real, not bookkeeping).
         assert!(!ctx.is_authorized("t1"));
         assert!(ctx.attachments.is_empty());
+    }
+
+    #[test]
+    fn companion_title_uses_cwd_basename_then_shell() {
+        assert_eq!(terminal_display_title("/Users/qs/project/me/termul", "zsh"), "termul");
+        assert_eq!(terminal_display_title("/", "zsh"), "zsh");
+        assert_eq!(terminal_display_title("", "bash"), "bash");
     }
 }

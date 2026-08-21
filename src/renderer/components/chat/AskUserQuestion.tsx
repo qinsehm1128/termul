@@ -62,7 +62,7 @@ export function AskUserQuestion({ question }: AskUserQuestionProps): React.JSX.E
       className={cn(CHAT_GUTTER_X, 'border-t bg-card pb-2 pt-3')}
       data-testid="ask-user-question"
     >
-      <div className="mx-auto w-full max-w-3xl rounded-2xl border border-border/60 bg-card px-4 py-3">
+      <div className="mx-auto w-full max-w-3xl rounded-lg border border-border/70 bg-card px-3.5 py-3">
         <p className="text-sm font-medium">{question.question}</p>
         {question.options.length === 0 && (
           <p className="mt-1 text-xs text-muted-foreground">{t('question.noOptions')}</p>

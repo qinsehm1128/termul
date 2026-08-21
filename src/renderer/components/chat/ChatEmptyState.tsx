@@ -55,15 +55,15 @@ export function ChatEmptyState({ agentId, onPick }: ChatEmptyStateProps): React.
     reduced ? { duration: 0 } : { ...CHAT_SPRING, delay: 0.04 * i }
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-6 px-6 text-center">
+    <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-5 px-6 text-center">
       <motion.div
         className="flex flex-col items-center gap-3"
         initial={reduced ? false : { opacity: 0, y: 8, scale: 0.96 }}
         animate={reduced ? { opacity: 1 } : { opacity: 1, y: 0, scale: 1 }}
         transition={transition(0)}
       >
-        <div className="flex size-12 items-center justify-center rounded-2xl bg-secondary/60">
-          <AgentGlyph templateId={templateId} size={24} className="text-foreground" />
+        <div className="flex size-9 items-center justify-center">
+          <AgentGlyph templateId={templateId} size={22} className="text-foreground/90" />
         </div>
         <div>
           <h2 className="text-base font-semibold text-foreground">
@@ -78,7 +78,7 @@ export function ChatEmptyState({ agentId, onPick }: ChatEmptyStateProps): React.
       </motion.div>
 
       {onPick && (
-        <div className="grid w-full max-w-md grid-cols-1 gap-2 sm:grid-cols-2">
+        <div className="w-full max-w-md divide-y divide-border/60 border-y border-border/60">
           {SUGGESTIONS.map((s, i) => (
             <motion.button
               key={s.key}
@@ -87,8 +87,7 @@ export function ChatEmptyState({ agentId, onPick }: ChatEmptyStateProps): React.
               initial={reduced ? false : { opacity: 0, y: 8 }}
               animate={{ opacity: 1, y: 0 }}
               transition={transition(i + 1)}
-              whileTap={reduced ? undefined : { scale: 0.97 }}
-              className="flex items-center gap-2.5 rounded-lg border border-border/60 bg-secondary/30 px-3.5 py-2.5 text-left text-sm text-foreground transition-colors hover:border-border hover:bg-secondary/60"
+              className="flex w-full items-center gap-2.5 px-2 py-2.5 text-left text-sm text-muted-foreground transition-colors hover:bg-secondary/50 hover:text-foreground"
             >
               <s.icon className="size-4 shrink-0 text-muted-foreground" />
               <span className="truncate">{t(`empty.suggestions.${s.key}.label`, s.label)}</span>

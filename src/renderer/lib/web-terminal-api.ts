@@ -16,6 +16,7 @@ import type {
 import type {
   WebTerminalEventPayload,
   WebTerminalFrame,
+  WebTerminalListResult,
   WebTerminalReply,
   WebTerminalRequestType
 } from '@shared/types/web-terminal-protocol.types'
@@ -277,6 +278,26 @@ export class WebTerminalClient {
     lastSeq: number
   ): Promise<IpcResult<TerminalAttachResult>> {
     return this.performAttach(terminalId, claim, lastSeq)
+  }
+
+  /** Enumerate live host PTYs for a project (companion viewer). */
+  list(projectId: string): Promise<IpcResult<WebTerminalListResult>> {
+    return this.request('list', { projectId })
+  }
+
+  /**
+   * Subscribe to a desktop-owned PTY without a CAP-3 claim. Does not rotate
+   * the desktop holder. Replay + live `data` match `attach`.
+   */
+  async watch(terminalId: string, lastSeq = 0): Promise<IpcResult<TerminalAttachResult>> {
+    const result = await this.request<TerminalAttachResult>('watch', { terminalId, lastSeq })
+    if (result.success) {
+      const tracker = this.getOrCreate(terminalId)
+      tracker.refCount += 1
+      tracker.disconnected = false
+      tracker.lastSeq = result.data.latestSeq
+    }
+    return result
   }
 
   /**
@@ -694,5 +715,7 @@ export const webTerminalInternals = {
     return client.request<void>('remove_renderer_ref', { terminalId, rendererId })
   },
   setProtected: (terminalId: string, protectedState: boolean) =>
-    client.request<void>('set_protected', { terminalId, protected: protectedState })
+    client.request<void>('set_protected', { terminalId, protected: protectedState }),
+  list: (projectId: string) => client.list(projectId),
+  watch: (terminalId: string, lastSeq?: number) => client.watch(terminalId, lastSeq)
 }

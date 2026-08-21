@@ -18,7 +18,7 @@ import { isTauriContext } from '@/lib/tauri-runtime'
 import { useSSHPanelVisible } from '@/stores/ssh-panel-store'
 
 const railButtonClass =
-  'w-12 h-11 flex items-center justify-center hover:bg-secondary/80 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-inset'
+  'mx-1 flex h-9 w-9 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-35'
 
 interface ActivityRailProps {
   isShortcutsOpen?: boolean
@@ -90,18 +90,18 @@ export function ActivityRail({
 
   return (
     <nav
-      className="w-12 flex flex-col items-center bg-background select-none shrink-0"
+      className="w-11 flex flex-col items-center border-r border-sidebar-border/70 bg-sidebar select-none shrink-0"
       aria-label={t('activityRail.globalActions')}
     >
       {/* Brand mark */}
       <div
-        className="w-12 h-11 flex items-center justify-center text-foreground shrink-0"
+        className="flex h-9 w-11 shrink-0 items-center justify-center text-foreground"
         data-tauri-drag-region={isMac ? true : undefined}
       >
-        <TermulMark size={22} className="pointer-events-none" />
+        <TermulMark size={19} className="pointer-events-none" />
       </div>
 
-      <div className="w-6 h-px bg-border/60 my-1" aria-hidden="true" />
+      <div className="my-1 h-px w-5 bg-border/60" aria-hidden="true" />
 
       <button
         type="button"

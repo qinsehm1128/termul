@@ -786,9 +786,9 @@ export function ProjectSidebar({
     isSearching && filteredActiveProjects.length === 0 && filteredArchivedProjects.length === 0
 
   return (
-    <aside className="w-64 bg-sidebar flex flex-col flex-shrink-0 rounded-xl h-full">
+    <aside className="flex h-full w-60 flex-shrink-0 flex-col bg-sidebar">
       {/* Header with inline + button */}
-      <div className="h-9 flex items-center justify-between px-3 border-b border-sidebar-border rounded-t-xl">
+      <div className="flex h-8 items-center justify-between border-b border-sidebar-border/70 px-2.5">
         <span className="label-section text-sidebar-foreground">{t('title')}</span>
         <div className="flex items-center gap-1">
           <button
@@ -920,9 +920,9 @@ export function ProjectSidebar({
                                 }
                               }}
                               className={cn(
-                                'w-full flex items-center h-7 px-1.5 hover:bg-sidebar-accent/50 rounded transition-colors text-left cursor-pointer select-none',
+                                'mx-1 flex h-7 w-[calc(100%-0.5rem)] cursor-pointer select-none items-center rounded-sm px-1.5 text-left transition-colors hover:bg-sidebar-accent/50',
                                 activeDragOverGroupId === group.id &&
-                                  'bg-primary/20 border border-primary/50'
+                                  'bg-primary/15 ring-1 ring-inset ring-primary/40'
                               )}
                               data-group-id={group.id}
                             >
@@ -1008,8 +1008,7 @@ export function ProjectSidebar({
                                   layout="position"
                                   className="list-none"
                                   whileDrag={{
-                                    scale: 1.02,
-                                    boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+                                    opacity: 0.82,
                                     pointerEvents: 'none'
                                   }}
                                   onDrag={(_event, info) => {
@@ -1107,8 +1106,7 @@ export function ProjectSidebar({
                         layout="position"
                         className="list-none"
                         whileDrag={{
-                          scale: 1.02,
-                          boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
+                          opacity: 0.82,
                           pointerEvents: 'none'
                         }}
                         onDrag={(_event, info) => {
@@ -1224,9 +1222,9 @@ export function ProjectSidebar({
       />
 
       {/* Version - pinned bottom */}
-      <div className="p-2 rounded-b-xl">
-        <div className="w-full h-6 inline-flex items-center justify-center">
-          <span className="text-xs text-muted-foreground">Termul v0.4.10</span>
+      <div className="border-t border-sidebar-border/60 px-2 py-1">
+        <div className="inline-flex h-6 w-full items-center justify-center">
+          <span className="text-3xs text-muted-foreground/60">Termul v0.4.10</span>
         </div>
       </div>
 
@@ -1472,7 +1470,6 @@ const ProjectItem = memo(function ProjectItem({
   renderContextMenu
 }: ProjectItemProps): React.JSX.Element {
   const { t } = useTranslation('projects')
-  const colors = getColorClasses(project.color)
   const inputRef = useRef<HTMLInputElement>(null)
 
   // Focus input when editing starts
@@ -1509,10 +1506,10 @@ const ProjectItem = memo(function ProjectItem({
               }
             }}
             className={cn(
-              'w-full flex items-center px-0 py-1 transition-colors group text-left border-l-2 cursor-pointer select-none',
+              'group mx-1 flex h-7 w-[calc(100%-0.5rem)] cursor-pointer select-none items-center rounded-sm px-1 text-left transition-colors',
               isActive
-                ? `${colors.border} bg-sidebar-accent`
-                : `${colors.borderMuted} hover:bg-sidebar-accent/50`
+                ? 'bg-sidebar-accent text-foreground'
+                : 'text-muted-foreground hover:bg-sidebar-accent/60 hover:text-foreground'
             )}
             aria-current={isActive ? 'page' : undefined}
             aria-label={
@@ -1639,7 +1636,6 @@ function ArchivedProjectItem({
   renderContextMenu
 }: ArchivedProjectItemProps): React.JSX.Element {
   const { t } = useTranslation('projects')
-  const colors = getColorClasses(project.color)
 
   return (
     <ContextMenu>
@@ -1647,10 +1643,7 @@ function ArchivedProjectItem({
         <button
           onClick={onClick}
           onContextMenu={onContextMenu}
-          className={cn(
-            'w-full flex items-center px-0 py-1 transition-colors group text-left border-l-2 opacity-60 hover:opacity-100',
-            colors.borderMuted
-          )}
+          className="group mx-1 flex h-7 w-[calc(100%-0.5rem)] items-center rounded-sm px-1 text-left text-muted-foreground opacity-60 transition-[background-color,opacity] hover:bg-sidebar-accent/50 hover:opacity-100"
           aria-label={t('archivedProjectAria', { name: project.name })}
           data-testid={`archived-project-item-${project.id}`}
         >

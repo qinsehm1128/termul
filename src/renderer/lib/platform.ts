@@ -16,7 +16,8 @@ export const isMac: boolean = _platform.includes('mac')
  * Height matches Windows `TitleBar` (`h-8`) so content starts at the same
  * vertical offset on both platforms.
  */
-export const macOsTitlebarStripClass = 'h-8 shrink-0 bg-background flex items-center relative'
+export const macOsTitlebarStripClass =
+  'h-8 shrink-0 border-b border-border/70 bg-sidebar flex items-center relative'
 
 /** True when running on Windows. */
 export const isWindows: boolean = _platform.includes('win')

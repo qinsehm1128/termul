@@ -5,7 +5,6 @@ import { GitBranchPicker } from '@/components/GitBranchPicker'
 import { RemoteAccessPopover } from '@/components/RemoteAccessPopover'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { formatPath, useHomeDirectory } from '@/hooks/use-cwd'
-import { statusBarColors } from '@/lib/colors'
 import { cn } from '@/lib/utils'
 import {
   useShowExitCode,
@@ -23,7 +22,6 @@ interface StatusBarProps {
 
 export function StatusBar({ project }: StatusBarProps): React.JSX.Element {
   const { t } = useTranslation('shell')
-  const bgColor = project ? statusBarColors[project.color] : 'bg-status-bar'
   const activeTerminal = useActiveTerminal()
   const homeDir = useHomeDirectory()
 
@@ -51,14 +49,9 @@ export function StatusBar({ project }: StatusBarProps): React.JSX.Element {
   const lastExitCode = activeTerminal?.lastExitCode
 
   return (
-    <div
-      className={cn(
-        'h-8 text-white flex items-center px-3 text-xs font-sans select-none flex-shrink-0 relative z-50',
-        bgColor
-      )}
-    >
+    <div className="relative z-50 flex h-6 flex-shrink-0 select-none items-center border-t border-border/70 bg-sidebar px-1.5 font-sans text-2xs text-muted-foreground">
       {/* Left side */}
-      <div className="flex items-center space-x-4">
+      <div className="flex min-w-0 items-center gap-1">
         {project && (
           <>
             <StatusItem icon={<Server size={14} />}>
@@ -104,7 +97,7 @@ export function StatusBar({ project }: StatusBarProps): React.JSX.Element {
       <div className="flex-1" />
 
       {/* Right side */}
-      <div className="flex items-center space-x-4">
+      <div className="flex items-center gap-1">
         <RemoteAccessPopover />
 
         {showExitCode && lastExitCode !== null && lastExitCode !== undefined && (
@@ -160,7 +153,7 @@ function StatusItem({ icon, children, className }: StatusItemProps): React.JSX.E
   return (
     <div
       className={cn(
-        'flex items-center hover:bg-white/10 px-2 py-0.5 rounded cursor-pointer transition-colors',
+        'flex h-5 cursor-pointer items-center rounded-sm px-1.5 transition-colors hover:bg-secondary hover:text-foreground',
         className
       )}
     >
@@ -229,7 +222,7 @@ function GitStatusIndicator({
   if (items.length === 0) return null
 
   return (
-    <div className="flex items-center space-x-2 px-2 py-0.5 rounded hover:bg-white/10 transition-colors">
+    <div className="flex h-5 items-center gap-2 rounded-sm px-1.5 transition-colors hover:bg-secondary">
       {items}
     </div>
   )

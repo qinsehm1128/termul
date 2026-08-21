@@ -1,6 +1,8 @@
 # Termul iOS companion
 
-Native SwiftUI client for the desktop shared-live session. It does **not** run a PTY or tunnel sidecar. The desktop app still hosts the session; this app scans or pastes the HTTPS access URL and opens the existing mobile web client inside `WebView`.
+Native SwiftUI client for the desktop shared-live session. It does **not** run a PTY or tunnel sidecar. The desktop still hosts agents and terminals; this app pairs over HTTPS and speaks the same `/ws`, `/terminal/ws`, `/projects`, and `/fs/*` contracts as the browser client.
+
+The pairing chrome is native (home, language, appearance). After you connect, **Chat**, **Terminal**, project switching, and a read-only file tree are native too. There is no WebView.
 
 ## Open in Xcode
 
@@ -13,9 +15,15 @@ Requires Xcode 26 and iOS 26.
 ## Pairing
 
 1. On the desktop, enable remote access in the status bar.
-2. Scan the QR, or paste the copied `https://…/#access_token=…` link.
-3. The token stays in the URL fragment and is consumed by the existing web client.
+2. Scan the QR, or paste the copied `https://…` link.
+3. Use **Chat** / **Terminal** in the session header. Projects and Files are in the header actions.
 
 Deep link: `termul://open?url=<encoded-https-access-url>`.
 
 HTTP FRP origins are rejected. Put TLS in front of FRP, or use Cloudflare.
+
+Terminal lists the host’s **already running** PTYs for the active project (`list` + `watch`) and shows their scrollback. “New terminal” is optional. Phone resize does not change a desktop-owned PTY. The emulator is [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) (`ios/Vendor/SwiftTerm`, plugin stripped so Xcode 27 can compile it).
+
+## Language
+
+Settings → Language: system, English, or Simplified Chinese.

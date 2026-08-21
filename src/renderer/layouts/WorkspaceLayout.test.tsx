@@ -637,7 +637,7 @@ describe('WorkspaceLayout - Empty States', () => {
       renderWithRouter()
 
       const title = screen.getByText('No Projects Yet')
-      expect(title.className).toContain('text-xl')
+      expect(title.className).toContain('text-base')
       expect(title.className).toContain('font-semibold')
     })
 

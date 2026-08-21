@@ -1663,7 +1663,11 @@ pub fn run() {
             // Create Remote Server State
             let remote_state = Arc::new(RemoteServerState::new());
             app.manage(remote_state);
-            app.manage(Arc::new(remote::TunnelConfigStore::new(app_data_dir.clone())));
+            let app_data_dir = handle
+                .path()
+                .app_data_dir()
+                .map_err(|error| format!("failed to resolve app data directory: {error}"))?;
+            app.manage(Arc::new(remote::TunnelConfigStore::new(app_data_dir)));
 
             // Register default migrations
             register_default_migrations(migration_manager.as_ref());

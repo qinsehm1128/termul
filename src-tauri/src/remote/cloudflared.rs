@@ -139,6 +139,21 @@ pub fn detect_cloudflared_path() -> String {
     detected
 }
 
+/// Tunnel protocols (QUIC / HTTP2 to the Cloudflare or FRP edge) break when
+/// the desktop inherits a system/Clash HTTP proxy. Fake-IP destinations such
+/// as `198.18.0.0/15` show up as "connected" in logs, then the child dies.
+pub(crate) fn strip_proxy_env(command: &mut Command) {
+    command
+        .env_remove("HTTP_PROXY")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("ALL_PROXY")
+        .env_remove("http_proxy")
+        .env_remove("https_proxy")
+        .env_remove("all_proxy")
+        .env("NO_PROXY", "*")
+        .env("no_proxy", "*");
+}
+
 #[cfg(target_os = "windows")]
 pub(crate) fn configure_background_command(command: &mut Command) {
     // Reuse the same CREATE_NO_WINDOW flag (0x08000000) as the rg sidecar so
@@ -195,7 +210,10 @@ async fn probe_tunnel_ready_with(
     // push total wait past `timeout`. A hung send() still yields: reqwest errors
     // on the per-request timeout → reachable=false → the loop re-checks the
     // deadline + exits.
+    // Bypass Clash/Surge system-proxy + fake-IP (198.18.0.0/15). A proxied
+    // probe looks "connected" then never reaches the trycloudflare edge.
     let client = reqwest::Client::builder()
+        .no_proxy()
         .build()
         .map_err(|e| format!("tunnel probe client build failed: {e}"))?;
     let deadline = std::time::Instant::now() + timeout;
@@ -267,6 +285,7 @@ pub async fn start_quick_tunnel(port: u16) -> Result<QuickTunnel, String> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    strip_proxy_env(&mut command);
     configure_background_command(&mut command);
 
     let mut child = command
@@ -348,7 +367,10 @@ where
                         if let Some(tx) = url_tx.lock().await.take() {
                             let _ = tx.send(m.as_str().to_string());
                         }
-                        return;
+                        // Keep draining. Returning here closes the pipe;
+                        // cloudflared then gets SIGPIPE on the next log line
+                        // and the tunnel dies about a second after the URL
+                        // appears (UI: "Tunnel disconnected").
                     }
                 }
                 Err(_) => break,
@@ -414,6 +436,38 @@ mod tests {
         assert!(TRY_TUNNEL_URL_RE
             .find("redirect to https://example.com/path")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn scanner_keeps_draining_after_url_so_writer_does_not_block() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (url_tx, url_rx) = oneshot::channel::<String>();
+        let url_tx = std::sync::Arc::new(Mutex::new(Some(url_tx)));
+        spawn_line_scanner(reader, url_tx);
+
+        writer
+            .write_all(b"https://foo-bar.trycloudflare.com\n")
+            .await
+            .unwrap();
+        let url = tokio::time::timeout(std::time::Duration::from_secs(2), url_rx)
+            .await
+            .expect("url oneshot timed out")
+            .expect("url oneshot dropped");
+        assert_eq!(url, "https://foo-bar.trycloudflare.com");
+
+        // A 64-byte duplex fills immediately if the scanner returned and
+        // dropped the reader. Completing these writes means we kept draining.
+        for _ in 0..32 {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                writer.write_all(b"INF more log line that would SIGPIPE if unread\n"),
+            )
+            .await
+            .expect("post-URL log write stalled — scanner closed the pipe")
+            .unwrap();
+        }
     }
 
     #[tokio::test]

@@ -132,9 +132,9 @@ function TerminalTabInline({
           }
         }}
         className={cn(
-          'relative h-full px-3 flex items-center border-r border-border min-w-[100px] cursor-pointer group transition-all duration-150 ease-out border-b-2 border-b-transparent',
+          'relative h-full px-3 flex items-center border-r border-border/60 min-w-[100px] cursor-pointer group transition-colors duration-150 ease-out',
           isActive
-            ? 'bg-background border-b-primary'
+            ? 'bg-background text-foreground'
             : 'hover:bg-secondary/50 text-muted-foreground',
           isDragging && 'opacity-50 scale-[0.98]'
         )}
@@ -335,9 +335,9 @@ function BrowserTabInline({
           onClose()
         }}
         className={cn(
-          'relative h-full px-3 flex items-center border-r border-border min-w-[100px] cursor-pointer group transition-all duration-150 ease-out border-b-2 border-b-transparent',
+          'relative h-full px-3 flex items-center border-r border-border/60 min-w-[100px] cursor-pointer group transition-colors duration-150 ease-out',
           isActive
-            ? 'bg-background border-b-primary'
+            ? 'bg-background text-foreground'
             : 'hover:bg-secondary/50 text-muted-foreground',
           isDragging && 'opacity-50 scale-[0.98]'
         )}
@@ -408,9 +408,9 @@ function GitTabInline({
         onDrop={onDrop}
         onClick={onSelect}
         className={cn(
-          'group relative h-full px-3 flex items-center min-w-[120px] max-w-[200px] gap-2 cursor-pointer select-none border-r border-border transition-all duration-150 ease-out border-b-2 border-b-transparent',
+          'group relative h-full px-3 flex items-center min-w-[120px] max-w-[200px] gap-2 cursor-pointer select-none border-r border-border/60 transition-colors duration-150 ease-out',
           isActive
-            ? 'bg-background border-b-primary text-foreground'
+            ? 'bg-background text-foreground'
             : 'text-muted-foreground hover:bg-secondary/50 hover:text-foreground',
           isDragging && 'opacity-50 scale-[0.98]',
           isDropTarget && dropPosition === 'before' && 'border-l-2 border-l-primary',
@@ -481,9 +481,9 @@ function GitHistoryTabInline({
         onDrop={onDrop}
         onClick={onSelect}
         className={cn(
-          'group relative h-full px-3 flex items-center min-w-[120px] max-w-[200px] gap-2 cursor-pointer select-none border-r border-border transition-all duration-150 ease-out border-b-2 border-b-transparent',
+          'group relative h-full px-3 flex items-center min-w-[120px] max-w-[200px] gap-2 cursor-pointer select-none border-r border-border/60 transition-colors duration-150 ease-out',
           isActive
-            ? 'bg-background border-b-primary text-foreground'
+            ? 'bg-background text-foreground'
             : 'text-muted-foreground hover:bg-secondary/50 hover:text-foreground',
           isDragging && 'opacity-50 scale-[0.98]',
           isDropTarget && dropPosition === 'before' && 'border-l-2 border-l-primary',
@@ -559,9 +559,9 @@ function AgentChatTabInline({
         onClick={onSelect}
         aria-label={`${tabLabel}, ${connected ? t('tabs.connected') : t('tabs.disconnected')}`}
         className={cn(
-          'group relative h-full px-3 flex items-center min-w-[120px] max-w-[200px] gap-1.5 cursor-pointer select-none border-r border-border transition-all duration-150 ease-out border-b-2 border-b-transparent',
+          'group relative h-full px-3 flex items-center min-w-[120px] max-w-[200px] gap-1.5 cursor-pointer select-none border-r border-border/60 transition-colors duration-150 ease-out',
           isActive
-            ? 'bg-background border-b-primary text-foreground'
+            ? 'bg-background text-foreground'
             : 'text-muted-foreground hover:bg-secondary/50 hover:text-foreground',
           isDragging && 'opacity-50 scale-[0.98]',
           isDropTarget && dropPosition === 'before' && 'border-l-2 border-l-primary',
@@ -873,7 +873,7 @@ export function WorkspaceTabBar({
 
   return (
     <div
-      className="h-9 bg-card border-b border-border flex items-center"
+      className="flex h-8 items-center border-b border-border/70 bg-sidebar"
       onDragOver={(e) => {
         e.preventDefault()
         e.dataTransfer.dropEffect = 'move'

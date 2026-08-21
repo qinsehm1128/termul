@@ -121,6 +121,7 @@ rmcp = { version = "1.4.0", features = [
 # Regex and parsing
 regex = "1"
 lazy_static = "1.4"
+url = "2.5"
 
 # UUID generation
 uuid = { version = "1", features = ["v4", "serde"] }

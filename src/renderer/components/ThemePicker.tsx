@@ -212,7 +212,7 @@ export function ThemePicker(): React.JSX.Element | null {
         role="dialog"
         aria-modal="true"
         aria-label={t('themes.dialogLabel')}
-        className="pointer-events-auto absolute left-14 top-4 bottom-4 w-[min(20rem,calc(100vw-2rem))] flex flex-col rounded-xl border border-border bg-popover/95 shadow-2xl backdrop-blur-sm"
+        className="pointer-events-auto absolute bottom-3 left-12 top-3 flex w-[min(20rem,calc(100vw-2rem))] flex-col rounded-md border border-border/80 bg-popover/97 shadow-[0_12px_36px_hsl(var(--background)/0.65)] backdrop-blur-sm"
         onMouseDown={(event) => event.stopPropagation()}
       >
         <header className="flex items-center gap-2 border-b border-border px-3 py-2.5">

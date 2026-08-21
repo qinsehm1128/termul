@@ -180,8 +180,8 @@ export function SettingsLayout({
   return (
     <div className="flex-1 flex min-h-0 overflow-hidden">
       {/* Sidebar */}
-      <aside className="w-60 flex-shrink-0 border-r border-border bg-card/50 flex flex-col">
-        <div className="p-3 border-b border-border">
+      <aside className="flex w-56 flex-shrink-0 flex-col border-r border-border/70 bg-sidebar">
+        <div className="border-b border-border/70 p-2">
           <div className="relative">
             <Search
               size={14}
@@ -193,7 +193,7 @@ export function SettingsLayout({
               onChange={(e) => setQuery(e.target.value)}
               placeholder={t('layout.searchPlaceholder')}
               aria-label={t('layout.searchAria')}
-              className="w-full bg-secondary/50 border border-border rounded-md pl-8 pr-8 py-1.5 text-sm text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none transition-shadow"
+              className="h-8 w-full rounded-md border border-border/70 bg-secondary/35 pl-8 pr-8 text-xs text-foreground outline-none transition-colors placeholder:text-muted-foreground/70 focus:border-ring/60 focus:bg-secondary/50 focus:ring-1 focus:ring-ring/30"
             />
             {query && (
               <button
@@ -210,7 +210,7 @@ export function SettingsLayout({
 
         <nav
           aria-label={t('layout.categoriesAria')}
-          className="flex-1 overflow-y-auto p-2 space-y-0.5"
+          className="flex-1 space-y-0.5 overflow-y-auto p-1.5"
         >
           {isSearching ? (
             results.length === 0 ? (
@@ -223,7 +223,7 @@ export function SettingsLayout({
                   key={`${result.categoryId}-${result.label}`}
                   type="button"
                   onClick={() => scrollToSection(result.categoryId, result.anchorId)}
-                  className="w-full flex flex-col items-start gap-0.5 text-left rounded-md px-3 py-2 text-sm text-foreground hover:bg-secondary focus:outline-none focus-visible:ring-2 focus-visible:ring-primary transition-colors"
+                  className="flex w-full flex-col items-start gap-0.5 rounded-sm px-2 py-1.5 text-left text-xs text-foreground transition-colors hover:bg-secondary focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                 >
                   <span className="font-medium">{result.label}</span>
                   <span className="text-2xs text-muted-foreground">
@@ -244,9 +244,9 @@ export function SettingsLayout({
                   onClick={() => scrollToSection(category.id)}
                   onKeyDown={(e) => handleCategoryKeyDown(e, index)}
                   className={cn(
-                    'w-full flex items-center gap-2.5 rounded-md px-3 py-2 text-sm text-left transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary',
+                    'flex h-7 w-full items-center gap-2 rounded-sm px-2 text-left text-xs transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-ring',
                     isActive
-                      ? 'bg-primary/10 text-primary font-medium'
+                      ? 'bg-secondary text-foreground font-medium'
                       : 'text-muted-foreground hover:bg-secondary hover:text-foreground'
                   )}
                 >
@@ -260,12 +260,12 @@ export function SettingsLayout({
           )}
         </nav>
 
-        {sidebarFooter && <div className="p-2 border-t border-border">{sidebarFooter}</div>}
+        {sidebarFooter && <div className="border-t border-border/70 p-2">{sidebarFooter}</div>}
       </aside>
 
       {/* Content */}
-      <div ref={contentRef} className="flex-1 overflow-y-auto p-6 pb-32 min-w-0">
-        <div className="max-w-4xl mx-auto space-y-8">{children}</div>
+      <div ref={contentRef} className="min-w-0 flex-1 overflow-y-auto px-8 pb-32 pt-7">
+        <div className="mx-auto max-w-4xl space-y-8">{children}</div>
       </div>
     </div>
   )

@@ -102,16 +102,15 @@ export default {
         '4xs': '0.5625rem' // 9px
       },
       fontFamily: {
-        // Variable Inter (bundled). Fall through to native UI fonts so we still
-        // look right if the bundled font fails to load. Ubuntu/Cantarell are
-        // the actual GNOME UI fonts on Linux.
+        // Prefer each platform's native UI face for IDE chrome. Bundled Inter
+        // remains the deterministic fallback on Linux and older environments.
         sans: [
-          '"Inter Variable"',
-          'Inter',
           '"SF Pro Text"',
           '"Segoe UI"',
           'Ubuntu',
           'Cantarell',
+          '"Inter Variable"',
+          'Inter',
           'system-ui',
           '-apple-system',
           'BlinkMacSystemFont',
@@ -132,8 +131,8 @@ export default {
       },
       borderRadius: {
         lg: 'var(--radius)',
-        md: 'calc(var(--radius) - 2px)',
-        sm: 'calc(var(--radius) - 4px)'
+        md: 'calc(var(--radius) - 1px)',
+        sm: 'calc(var(--radius) - 2px)'
       },
       keyframes: {
         'accordion-down': {
@@ -175,11 +174,6 @@ export default {
         'slide-in': 'slide-in 180ms cubic-bezier(0.23, 1, 0.32, 1)',
         'typing-bounce': 'typing-bounce 1s cubic-bezier(0.77, 0, 0.175, 1) infinite',
         'caret-blink': 'caret-blink 1s step-end infinite'
-      },
-      boxShadow: {
-        'glow-blue': '0 0 15px hsla(217, 91%, 60%, 0.3)',
-        'glow-purple': '0 0 15px hsla(271, 81%, 56%, 0.3)',
-        'glow-green': '0 0 15px hsla(142, 71%, 45%, 0.3)'
       }
     }
   },

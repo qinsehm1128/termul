@@ -68,6 +68,45 @@ class FakeWebSocket {
       this.emitReply({ id: req.id, success: true, data: { claim: rotateReplyClaim } })
       return
     }
+    if (req.type === 'list') {
+      this.emitReply({
+        id: req.id,
+        success: true,
+        data: {
+          terminals: [
+            {
+              id: 'pty-desktop-1',
+              shell: 'zsh',
+              cwd: '/tmp/termul',
+              pid: 9,
+              cols: 80,
+              rows: 24,
+              projectId: req.payload.projectId,
+              title: 'termul',
+              gitBranch: 'dev'
+            }
+          ]
+        }
+      })
+      return
+    }
+    if (req.type === 'watch') {
+      this.emitReply({
+        id: req.id,
+        success: true,
+        data: {
+          id: req.payload.terminalId,
+          shell: 'zsh',
+          cwd: '/tmp/termul',
+          pid: 9,
+          cols: 80,
+          rows: 24,
+          latestSeq: (req.payload.lastSeq as number) ?? 0,
+          gap: false
+        }
+      })
+      return
+    }
     this.emitReply({ id: req.id, success: true, data: undefined })
   }
 
@@ -800,6 +839,37 @@ describe('WebTerminalClient frame handling & request lifecycle', () => {
       clearTimeout(internals.reconnectTimer)
       internals.reconnectTimer = null
     }
+    client.dispose()
+  })
+
+  it('lists live host PTYs and watches without a claim', async () => {
+    const client = new WebTerminalClient(
+      'ws://test/terminal/ws',
+      FakeWebSocket as unknown as typeof WebSocket
+    )
+    const internals = client as unknown as ClientInternals
+
+    const listed = await client.list('proj-1')
+    expect(listed.success).toBe(true)
+    if (listed.success) {
+      expect(listed.data.terminals).toHaveLength(1)
+      expect(listed.data.terminals[0]).toMatchObject({
+        id: 'pty-desktop-1',
+        title: 'termul',
+        projectId: 'proj-1'
+      })
+    }
+    expect(findSentRequest(internals.socket, 'list')?.payload).toEqual({ projectId: 'proj-1' })
+
+    const watched = await client.watch('pty-desktop-1', 0)
+    expect(watched.success).toBe(true)
+    expect(findSentRequest(internals.socket, 'watch')?.payload).toEqual({
+      terminalId: 'pty-desktop-1',
+      lastSeq: 0
+    })
+    expect(findSentRequest(internals.socket, 'attach')).toBeUndefined()
+    expect(internals.trackers.get('pty-desktop-1')?.disconnected).toBe(false)
+
     client.dispose()
   })
 })

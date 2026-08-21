@@ -11,7 +11,7 @@ import { isMac } from '@/lib/platform'
 import { useActiveProject } from '@/stores/project-store'
 
 const windowControlClass =
-  'h-full px-3 hover:bg-secondary/80 inline-flex items-center focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-inset cursor-pointer'
+  'h-full w-10 hover:bg-secondary inline-flex items-center justify-center text-muted-foreground hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-inset cursor-pointer'
 
 /**
  * Slim window-control strip for Windows/Linux.
@@ -44,7 +44,7 @@ export function TitleBar(): React.JSX.Element | null {
 
   return (
     <header
-      className="h-8 flex items-center bg-background select-none shrink-0 relative"
+      className="h-8 flex items-center border-b border-border/70 bg-sidebar select-none shrink-0 relative"
       data-tauri-drag-region
     >
       {/* Left-sidebar toggle — top-left of the content column. */}
@@ -53,7 +53,7 @@ export function TitleBar(): React.JSX.Element | null {
       </div>
 
       {activeProject && (
-        <span className="absolute left-1/2 -translate-x-1/2 text-sm text-muted-foreground pointer-events-none select-none truncate max-w-[50%]">
+        <span className="absolute left-1/2 -translate-x-1/2 text-xs font-medium text-muted-foreground pointer-events-none select-none truncate max-w-[50%]">
           {activeProject.name}
         </span>
       )}
@@ -97,7 +97,7 @@ export function TitleBar(): React.JSX.Element | null {
             e.stopPropagation()
             void windowApi.close()
           }}
-          className="h-full px-3 hover:bg-red-500/90 hover:text-white inline-flex items-center focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500 cursor-pointer"
+          className="h-full w-10 hover:bg-destructive/80 hover:text-destructive-foreground inline-flex items-center justify-center text-muted-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-destructive cursor-pointer"
           title={t('titleBar.close')}
           aria-label={t('titleBar.closeWindow')}
         >

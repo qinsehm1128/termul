@@ -47,9 +47,14 @@ export function showUpdateToast(version: string, releaseNotes?: string): void {
   const isAur = isAurUpdateMode()
   const channel = updaterStore.getState().updateChannel
   const channelPrefix =
-    channel === 'stable' ? '' : `${i18n.t(`updates.channels.${channel}`, { ns: 'shell' })} `
+    channel === 'stable' ? '' : i18n.t(`updates.channels.${channel}`, { ns: 'shell' })
+  const title = i18n.t('updates.available', {
+    ns: 'shell',
+    channel: channelPrefix,
+    version
+  })
 
-  toast.success(i18n.t('updates.available', { ns: 'shell', channel: channelPrefix, version }), {
+  toast.success(title.trim(), {
     duration: 30000,
     description: releaseNotes
       ? i18n.t('updates.whatsNew', {

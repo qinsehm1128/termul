@@ -22,6 +22,7 @@ pub fn spawn_sidecar(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    crate::remote::cloudflared::strip_proxy_env(&mut command);
     for (key, value) in extra_env {
         command.env(key, value);
     }
@@ -116,7 +117,7 @@ fn spawn_pattern_scanner<R>(
                         if let Some(tx) = ready_tx.lock().await.take() {
                             let _ = tx.send(());
                         }
-                        return;
+                        // Keep draining so the sidecar does not get SIGPIPE.
                     }
                 }
                 Err(_) => break,

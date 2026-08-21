@@ -111,6 +111,7 @@ import {
   findPaneContainingTab,
   getActiveFilePathFromTree,
   getActiveTerminalIdFromTree,
+  getAllLeafPanes,
   useActiveTab,
   useFullscreenPaneId,
   usePaneRoot,
@@ -1072,6 +1073,25 @@ export default function WorkspaceLayout(): React.JSX.Element {
     [handleCreateTerminalInPane]
   )
 
+  useEffect(() => {
+    if (location.pathname !== '/terminal') return
+    const workspace = useWorkspaceStore.getState()
+    const existing = getAllLeafPanes(workspace.root).flatMap((leaf) =>
+      (leaf.tabs ?? [])
+        .filter((tab) => tab.type === 'terminal')
+        .map((tab) => ({ paneId: leaf.id, tabId: tab.id }))
+    )
+    const first = existing[0]
+    if (first) {
+      if (workspace.activePaneId !== first.paneId) {
+        workspace.setActivePane(first.paneId)
+      }
+      workspace.setActiveTab(first.paneId, first.tabId)
+      return
+    }
+    handleAddTerminal(undefined)
+  }, [handleAddTerminal, location.pathname])
+
   const handleNewBrowserTab = useCallback((paneId?: string) => {
     const resolvedPaneId = paneId ?? useWorkspaceStore.getState().activePaneId
     if (resolvedPaneId) {
@@ -1683,24 +1703,26 @@ export default function WorkspaceLayout(): React.JSX.Element {
           <SSHWorkspace profile={sshProfileWithPassword!} conn={sshConn} />
         </Suspense>
       ) : projects.length === 0 ? (
-        <div className="flex flex-1 flex-col items-center justify-center bg-background px-6 rounded-xl">
+        <div className="flex flex-1 flex-col items-center justify-center bg-background px-6">
           <motion.div
-            initial={{ opacity: 0, scale: 0.9 }}
-            animate={{ opacity: 1, scale: 1 }}
-            transition={{ duration: 0.4, ease: 'easeOut' }}
+            initial={{ opacity: 0, y: 6 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.22, ease: 'easeOut' }}
             className="flex max-w-md flex-col items-center text-center"
           >
-            <div className="mb-6">
-              <FolderKanban className="h-24 w-24 text-muted-foreground/50" />
+            <div className="mb-4">
+              <FolderKanban className="h-10 w-10 text-muted-foreground/45" />
             </div>
-            <h2 className="mb-2 text-xl font-semibold text-foreground">{t('noProjectsTitle')}</h2>
-            <p className="mb-6 text-sm leading-relaxed text-muted-foreground">
+            <h2 className="mb-1.5 text-base font-semibold tracking-[-0.01em] text-foreground">
+              {t('noProjectsTitle')}
+            </h2>
+            <p className="mb-5 max-w-sm text-sm leading-relaxed text-muted-foreground">
               {t('noProjectsDescription')}
             </p>
             <button
               type="button"
               onClick={() => setIsNewProjectModalOpen(true)}
-              className="rounded-xl bg-primary px-6 py-2.5 text-sm font-medium text-primary-foreground shadow-sm transition-colors hover:bg-primary/90 hover:shadow"
+              className="h-8 rounded-md bg-foreground px-3 text-xs font-medium text-background transition-colors hover:bg-foreground/88 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
             >
               {t('createFirstProject')}
             </button>
@@ -1713,9 +1735,9 @@ export default function WorkspaceLayout(): React.JSX.Element {
               <ChatRoute />
               <motion.div
                 key={fullscreenPaneId ? 'fullscreen' : 'normal'}
-                initial={{ opacity: 0.85, scale: 0.97 }}
-                animate={{ opacity: 1, scale: 1 }}
-                transition={{ duration: 0.2, ease: 'easeOut' }}
+                initial={{ opacity: 0.88 }}
+                animate={{ opacity: 1 }}
+                transition={{ duration: 0.14, ease: 'easeOut' }}
                 className="h-full min-h-0 flex-1 overflow-hidden"
               >
                 <PaneRenderer
@@ -1731,7 +1753,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
               </motion.div>
             </>
           ) : (
-            <div className="relative flex-1 overflow-hidden bg-background rounded-xl">
+            <div className="relative flex-1 overflow-hidden bg-background">
               <div className="h-full w-full">
                 <Outlet />
               </div>
@@ -2000,10 +2022,10 @@ export default function WorkspaceLayout(): React.JSX.Element {
           <div className="flex-1 flex flex-col min-w-0">
             <TitleBar />
 
-            <div className="flex-1 flex overflow-hidden min-h-0 h-full p-2 gap-0">
+            <div className="flex-1 flex overflow-hidden min-h-0 h-full">
               {/* Sidebar */}
               {isSidebarVisible && (
-                <div className="mr-2">
+                <div className="border-r border-sidebar-border/70">
                   <ProjectSidebar
                     projects={projects}
                     activeProjectId={activeProjectId}
@@ -2025,14 +2047,14 @@ export default function WorkspaceLayout(): React.JSX.Element {
               <PaneDndProvider>
                 <div className="flex-1 flex min-h-0 h-full gap-0 overflow-hidden min-w-0">
                   {/* Main Content Area */}
-                  <main className="flex-1 flex flex-col min-w-0 rounded-xl bg-card overflow-hidden">
+                  <main className="flex-1 flex flex-col min-w-0 bg-background overflow-hidden">
                     <WorkspaceConflictBanner />
                     {workspaceMain}
                   </main>
 
-                  {/* File Explorer - separate floating panel */}
+                  {/* File Explorer - integrated right rail */}
                   {(isExplorerVisible && activeProject?.path) || activeSSHProfile ? (
-                    <div className="flex-shrink-0 ml-2 flex flex-col gap-2 h-full">
+                    <div className="flex-shrink-0 flex flex-col h-full border-l border-border/70">
                       {isExplorerVisible && activeProject?.path && (
                         <div className={activeSSHProfile ? 'flex-1 min-h-0' : 'h-full'}>
                           <Suspense fallback={<ShellSkeleton />}>
@@ -2043,7 +2065,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
                       {activeSSHProfile && (
                         <div
                           className={cn(
-                            'flex-1 bg-background rounded-xl overflow-hidden min-h-0 flex flex-col border border-border',
+                            'flex-1 bg-background overflow-hidden min-h-0 flex flex-col border-t border-border/70',
                             !(isExplorerVisible && activeProject?.path) && 'w-64'
                           )}
                         >

@@ -8,6 +8,8 @@ import type {
 
 export type WebTerminalRequestType =
   | 'spawn'
+  | 'list'
+  | 'watch'
   | 'write'
   | 'resize'
   | 'kill'
@@ -92,6 +94,23 @@ export type WebTerminalFrame<T = unknown> =
  * camelCase, same shape as the desktop `terminal_spawn` IpcResult data).
  */
 export type WebTerminalSpawnReply = WebTerminalReply<SpawnedTerminal>
+
+/** Live host PTY listed for a companion viewer (`list`). */
+export interface LiveTerminalSummary {
+  id: string
+  shell: string
+  cwd: string
+  pid: number
+  cols: number
+  rows: number
+  projectId?: string | null
+  title: string
+  gitBranch?: string | null
+}
+
+export interface WebTerminalListResult {
+  terminals: LiveTerminalSummary[]
+}
 
 /** CAP-3: attach reply — shared TerminalAttachResult shape (never a claim). */
 export type WebTerminalAttachReply = WebTerminalReply<TerminalAttachResult>
