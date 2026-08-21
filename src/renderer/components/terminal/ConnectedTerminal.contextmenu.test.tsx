@@ -111,11 +111,6 @@ vi.mock('@xterm/addon-webgl', async () => {
     }
   }
 })
-vi.mock('@xterm/addon-web-links', () => ({
-  WebLinksAddon: class {
-    dispose() {}
-  }
-}))
 
 vi.mock('@/lib/api', async () => {
   const { vi: v } = await import('vitest')
@@ -198,7 +193,8 @@ vi.mock('@/stores/app-settings-store', () => ({
   useTerminalSymbolFontFamily: () => '',
   useTerminalFontSize: () => 14,
   useTerminalBufferSize: () => 10000,
-  useTerminalRenderer: () => 'auto'
+  useTerminalRenderer: () => 'auto',
+  useTerminalScreenReaderMode: () => false
 }))
 vi.mock('@/stores/terminal-store', async () => {
   const { vi: v } = await import('vitest')

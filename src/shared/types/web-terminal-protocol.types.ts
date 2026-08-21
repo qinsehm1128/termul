@@ -11,6 +11,66 @@ import type {
 
 export type { TerminalResumeGrant, TerminalResumeRequest } from './ipc.types'
 
+/** Negotiated WebSocket subprotocol enabling binary PTY output frames. */
+export const WEB_TERMINAL_BINARY_PROTOCOL = 'termul-terminal-v2.binary'
+
+const WEB_TERMINAL_BINARY_MAGIC = [0x54, 0x4d, 0x4c, 0x32] as const // "TML2"
+const WEB_TERMINAL_BINARY_FIXED_HEADER_BYTES = 15
+
+export const WEB_TERMINAL_BINARY_KIND = {
+  LIVE: 1,
+  REPLAY: 2
+} as const
+
+export type WebTerminalBinaryKind =
+  (typeof WEB_TERMINAL_BINARY_KIND)[keyof typeof WEB_TERMINAL_BINARY_KIND]
+
+export interface WebTerminalBinaryFrame {
+  kind: WebTerminalBinaryKind
+  terminalId: string
+  seq: number
+  data: Uint8Array
+}
+
+/**
+ * Decode a negotiated binary PTY frame:
+ * magic[4] + kind[u8] + terminalIdLength[u16 BE] + seq[u64 BE] + id + bytes.
+ */
+export function decodeWebTerminalBinaryFrame(buffer: ArrayBuffer): WebTerminalBinaryFrame | null {
+  if (buffer.byteLength < WEB_TERMINAL_BINARY_FIXED_HEADER_BYTES) return null
+  const bytes = new Uint8Array(buffer)
+  for (let index = 0; index < WEB_TERMINAL_BINARY_MAGIC.length; index++) {
+    if (bytes[index] !== WEB_TERMINAL_BINARY_MAGIC[index]) return null
+  }
+
+  const kind = bytes[4]
+  if (kind !== WEB_TERMINAL_BINARY_KIND.LIVE && kind !== WEB_TERMINAL_BINARY_KIND.REPLAY) {
+    return null
+  }
+
+  const view = new DataView(buffer)
+  const terminalIdLength = view.getUint16(5, false)
+  const payloadOffset = WEB_TERMINAL_BINARY_FIXED_HEADER_BYTES + terminalIdLength
+  if (terminalIdLength === 0 || payloadOffset > buffer.byteLength) return null
+
+  const seqHigh = view.getUint32(7, false)
+  const seqLow = view.getUint32(11, false)
+  const seq = seqHigh * 0x1_0000_0000 + seqLow
+  if (!Number.isSafeInteger(seq)) return null
+
+  const terminalId = new TextDecoder().decode(
+    bytes.subarray(WEB_TERMINAL_BINARY_FIXED_HEADER_BYTES, payloadOffset)
+  )
+  if (!terminalId) return null
+
+  return {
+    kind,
+    terminalId,
+    seq,
+    data: bytes.slice(payloadOffset)
+  }
+}
+
 export type WebTerminalRequestType =
   | 'spawn'
   | 'resume'

@@ -1,5 +1,13 @@
+import {
+  WEB_TERMINAL_BINARY_KIND,
+  WEB_TERMINAL_BINARY_PROTOCOL
+} from '@shared/types/web-terminal-protocol.types'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { resolveTerminalWsUrl, WebTerminalClient } from './web-terminal-api'
+
+vi.mock('@/lib/log-api', () => ({
+  logFrontendError: vi.fn()
+}))
 
 /**
  * Minimal FakeWebSocket for the terminal protocol (`{id,type,payload}` requests
@@ -19,8 +27,12 @@ class FakeWebSocket {
   onerror: ((ev: Event) => void) | null = null
   onclose: ((ev: CloseEvent) => void) | null = null
   sent: string[] = []
+  binaryType: BinaryType = 'blob'
 
-  constructor(public url: string) {
+  constructor(
+    public url: string,
+    public protocols?: string | string[]
+  ) {
     queueMicrotask(() => {
       this.readyState = FakeWebSocket.OPEN
       this.onopen?.(new Event('open'))
@@ -144,9 +156,32 @@ class FakeWebSocket {
     this.onmessage?.(new MessageEvent('message', { data: JSON.stringify(obj) }))
   }
 
+  emitBinary(data: ArrayBuffer): void {
+    this.onmessage?.(new MessageEvent('message', { data }))
+  }
+
   emitReply(obj: unknown): void {
     queueMicrotask(() => this.emit(obj))
   }
+}
+
+function encodeBinaryFrame(
+  kind: number,
+  terminalId: string,
+  seq: number,
+  data: number[]
+): ArrayBuffer {
+  const terminalIdBytes = new TextEncoder().encode(terminalId)
+  const buffer = new ArrayBuffer(15 + terminalIdBytes.length + data.length)
+  const bytes = new Uint8Array(buffer)
+  bytes.set([0x54, 0x4d, 0x4c, 0x32, kind], 0)
+  const view = new DataView(buffer)
+  view.setUint16(5, terminalIdBytes.length, false)
+  view.setUint32(7, Math.floor(seq / 0x1_0000_0000), false)
+  view.setUint32(11, seq >>> 0, false)
+  bytes.set(terminalIdBytes, 15)
+  bytes.set(data, 15 + terminalIdBytes.length)
+  return buffer
 }
 
 /** Test knob: make `attach` replies fail with the generic UNAUTHORIZED. */
@@ -571,6 +606,71 @@ describe('WebTerminalClient frame handling & request lifecycle', () => {
 
     offMatching()
     offUnrelated()
+    client.dispose()
+  })
+
+  it('negotiates and decodes binary terminal output without JSON byte arrays', async () => {
+    vi.useFakeTimers()
+    const client = new WebTerminalClient(
+      'ws://test/terminal/ws',
+      FakeWebSocket as unknown as typeof WebSocket
+    )
+    const internals = client as unknown as ClientInternals
+    const matching = vi.fn()
+    const unrelated = vi.fn()
+    client.onDataForTerminal('t1', matching)
+    client.onDataForTerminal('t2', unrelated)
+
+    await client.connect()
+    expect(internals.socket.protocols).toBe(WEB_TERMINAL_BINARY_PROTOCOL)
+    expect(internals.socket.binaryType).toBe('arraybuffer')
+
+    internals.socket.emitBinary(
+      encodeBinaryFrame(WEB_TERMINAL_BINARY_KIND.LIVE, 't1', 4_294_967_299, [0, 0xff, 0x41])
+    )
+
+    expect(matching).toHaveBeenCalledTimes(1)
+    expect(Array.from(matching.mock.calls[0][0] as Uint8Array)).toEqual([0, 0xff, 0x41])
+    expect(unrelated).not.toHaveBeenCalled()
+    expect(internals.trackers.get('t1')?.lastSeq).toBe(4_294_967_299)
+
+    client.dispose()
+  })
+
+  it('ignores malformed binary terminal output frames', async () => {
+    vi.useFakeTimers()
+    const client = new WebTerminalClient(
+      'ws://test/terminal/ws',
+      FakeWebSocket as unknown as typeof WebSocket
+    )
+    const internals = client as unknown as ClientInternals
+    const received = vi.fn()
+    client.onData(received)
+
+    await client.connect()
+    internals.socket.emitBinary(new Uint8Array([1, 2, 3]).buffer)
+
+    expect(received).not.toHaveBeenCalled()
+    client.dispose()
+  })
+
+  it('preserves UTF-8 CJK, emoji, and combining bytes in binary replay frames', async () => {
+    vi.useFakeTimers()
+    const client = new WebTerminalClient(
+      'ws://test/terminal/ws',
+      FakeWebSocket as unknown as typeof WebSocket
+    )
+    const internals = client as unknown as ClientInternals
+    const received = vi.fn()
+    client.onDataForTerminal('unicode', received)
+    const encoded = new TextEncoder().encode('中文 👩🏽‍💻 e\u0301')
+
+    await client.connect()
+    internals.socket.emitBinary(
+      encodeBinaryFrame(WEB_TERMINAL_BINARY_KIND.REPLAY, 'unicode', 7, Array.from(encoded))
+    )
+
+    expect(Array.from(received.mock.calls[0][0] as Uint8Array)).toEqual(Array.from(encoded))
     client.dispose()
   })
 

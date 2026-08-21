@@ -23,7 +23,7 @@ The app behaves like a workspace shell rather than a single-purpose terminal vie
 | State | Zustand | App and feature stores |
 | Styling | Tailwind CSS + Radix/shadcn | Design system and primitives |
 | Terminal UI | xterm.js | In-renderer terminal rendering |
-| PTY backend | portable-pty / tauri-pty | Native process-backed terminals |
+| PTY backend | portable-pty + Termul PtyManager | Native process-backed terminals, replay, and lifecycle |
 | Build | Vite | Tauri dev/build integration |
 | Testing | Vitest + Testing Library | Renderer validation |
 | CI/CD | GitHub Actions | Validation, release, updater artifact publishing |

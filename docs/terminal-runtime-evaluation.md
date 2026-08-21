@@ -16,7 +16,7 @@ The production terminal runtime is owned by Termul:
 OS PTY / ConPTY
   -> Rust PtyManager
   -> 4 ms bounded output flusher
-  -> Tauri binary Channel or Termul WebSocket protocol
+  -> Tauri binary Channel or negotiated binary/JSON WebSocket protocol
   -> ConnectedTerminal
   -> xterm.js 6.1 beta (WebGL with DOM fallback)
 ```
@@ -84,15 +84,26 @@ Completed on 2026-08-21:
   retaining the global subscription only for detached transcript capture and
   the pre-spawn path;
 - added cache ownership, hidden-renderer, remount, and transport-routing tests,
-  and restored previously skipped lifecycle/output tests.
+  and restored previously skipped lifecycle/output tests;
+- deleted the unused renderer pool, dormant ring, terminal factory,
+  `XTerminal`, `TauriTerminal`, and `use-xterm` implementations together with
+  their dedicated dependencies and tests;
+- added an opt-in screen-reader setting, defaulting off, that updates both new
+  and already-mounted xterm instances;
+- added an opt-in `termul-terminal-v2.binary` WebSocket subprotocol. New clients
+  receive live and replay PTY bytes in compact binary frames, while old clients
+  and protocol-stripping proxies continue to receive the existing JSON
+  `number[]` frames;
+- added UTF-8 transport baselines for CJK, emoji/ZWJ, and combining characters.
 
 Still measurement-gated:
 
-- removing the unused renderer-pool/factory/alternate-terminal prototypes;
-- moving web terminal output from JSON `number[]` frames to binary WebSocket
-  frames;
 - changing the Rust 4 ms flusher;
-- selecting a stable xterm release or adding Unicode/accessibility addons.
+- selecting a stable xterm release;
+- adding a Unicode addon. The transport now preserves representative Unicode
+  byte sequences, but glyph width, IME, and grapheme behavior still require
+  real browser/Tauri acceptance measurements before changing xterm's Unicode
+  provider.
 
 These remain gated because they need a real browser/Tauri baseline rather than
 JSDOM timing. The existing benchmark description now reflects the pinned xterm

@@ -198,7 +198,10 @@ persistence path and wire format.
 
 ## Web Terminal WebSocket
 
-`GET /terminal/ws` upgrades to the browser terminal transport and is isolated from ACP `/ws`.
+`GET /terminal/ws` upgrades to the browser terminal transport and is isolated
+from ACP `/ws`. The shared-live and standalone-server routers require an
+authenticated bearer principal with `Mutate` capability and validate the
+request origin before upgrading.
 
 Client request envelope:
 
@@ -206,9 +209,48 @@ Client request envelope:
 { "id": "terminal-1", "type": "resize", "payload": { "terminalId": "...", "cols": 100, "rows": 30 } }
 ```
 
-Supported request types are `spawn`, `write`, `resize`, `kill`, `attach`, `get_cwd`, `get_git_branch`, `get_git_status`, `get_exit_code`, `add_renderer_ref`, `remove_renderer_ref`, `set_protected`, and `update_orphan_detection`. Replies use the existing `IpcResult` shape with the request `id`. Output frames are `{ "type": "data", "terminalId": "...", "data": [byte...] }`; event frames contain the transport-neutral exit/cwd/git/exit-code payload. `attach` sends bounded retained scrollback before subscribed live output.
+Supported request types are `spawn`, `resume`, `write`, `resize`, `terminate`,
+`kill` (compatibility alias), `attach`, `detach`, `close_view`, `rotate_claim`,
+`revoke_claim`, `get_cwd`, `get_git_branch`, `get_git_status`,
+`get_exit_code`, `add_renderer_ref`, `remove_renderer_ref`, `set_protected`,
+and `update_orphan_detection`. Replies use the existing `IpcResult` shape with
+the request `id`.
 
-The service deliberately does not log request data, terminal bytes, environment values, or secrets. Authentication, authorization, TLS, and sandboxing are not provided; this endpoint is unsafe for public or untrusted network exposure.
+Without protocol negotiation, output remains backward-compatible JSON:
+
+```json
+{ "type": "data", "terminalId": "pty-1", "seq": 42, "data": [27, 91, 109] }
+```
+
+`replay` frames carry sequenced retained chunks, a gap flag, the latest
+sequence, and a terminal metadata snapshot. `gap` reports live receiver lag;
+`event` carries transport-neutral exit/cwd/git/exit-code updates.
+
+New browser clients request the WebSocket subprotocol
+`termul-terminal-v2.binary`. When selected, live and replay output use binary
+frames while request/reply, replay metadata, gap, and event frames remain JSON.
+Old clients, old servers, and intermediaries that do not negotiate the
+subprotocol continue using the JSON representation.
+
+Binary frame layout (network byte order):
+
+```text
+magic "TML2" [4 bytes]
+kind          [u8: 1 = live, 2 = replay]
+terminal id length [u16]
+sequence      [u64]
+terminal id   [UTF-8 bytes]
+PTY output    [remaining raw bytes]
+```
+
+For binary replay, the binary chunk frames are followed by the normal JSON
+`replay` metadata frame with an empty `chunks` array. WebSocket ordering
+preserves replay-before-live delivery.
+
+The service deliberately does not log request data, terminal bytes,
+environment values, claims, or other secrets. Transport deployment still owns
+TLS and network exposure policy; application-level bearer/origin checks do not
+replace those controls.
 
 ## Event Contracts
 

@@ -38,6 +38,7 @@ import {
   useTerminalFontFamily,
   useTerminalFontSize,
   useTerminalRenderer,
+  useTerminalScreenReaderMode,
   useTerminalSymbolFontFamily
 } from '@/stores/app-settings-store'
 import { matchesShortcut, useKeyboardShortcutsStore } from '@/stores/keyboard-shortcuts-store'
@@ -308,6 +309,7 @@ function ConnectedTerminalComponent({
   const fontSize = useTerminalFontSize()
   const bufferSize = useTerminalBufferSize()
   const rendererPreference = useTerminalRenderer()
+  const screenReaderMode = useTerminalScreenReaderMode()
   const activeProject = useActiveProject()
   const shortcuts = useKeyboardShortcutsStore((state) => state.shortcuts)
 
@@ -597,7 +599,8 @@ function ConnectedTerminalComponent({
       ...getTerminalOptions(navigator.platform),
       fontFamily,
       fontSize,
-      scrollback: bufferSize
+      scrollback: bufferSize,
+      screenReaderMode
     }
 
     // Check for a cached terminal preserved across project switches.
@@ -618,6 +621,7 @@ function ConnectedTerminalComponent({
       searchAddon = cachedSession.searchAddon
       applyThemeToTerminal(terminal, getActiveTerminalTheme())
       terminal.options.cursorBlink = terminalOptions.cursorBlink
+      terminal.options.screenReaderMode = terminalOptions.screenReaderMode
     } else {
       terminal = new Terminal(terminalOptions)
       fitAddon = new FitAddon()
@@ -1444,6 +1448,12 @@ function ConnectedTerminalComponent({
       performFit(true)
     }
   }, [fontFamily, fontSize])
+
+  useEffect(() => {
+    if (terminalRef.current) {
+      terminalRef.current.options.screenReaderMode = screenReaderMode
+    }
+  }, [screenReaderMode])
 
   useEffect(() => {
     if (!shouldUseWebglRenderer(rendererPreference)) {

@@ -30,6 +30,15 @@ use crate::web::ws::AppState;
 
 const MAX_RECONNECT_FRAMES: usize = 64;
 const ATTACH_GENERATION_CHECK_MS: u64 = 250;
+const BINARY_SUBPROTOCOL: &str = "termul-terminal-v2.binary";
+const BINARY_FRAME_MAGIC: &[u8; 4] = b"TML2";
+
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum BinaryOutputKind {
+    Live = 1,
+    Replay = 2,
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -72,8 +81,28 @@ pub async fn terminal_ws_upgrade(
         stable_code = "OK",
         "terminal WebSocket upgrade authenticated"
     );
-    ws.on_upgrade(move |socket| run(socket, state, authority, principal))
+    let binary_output = supports_binary_subprotocol(&headers);
+    let ws = if binary_output {
+        ws.protocols([BINARY_SUBPROTOCOL])
+    } else {
+        ws
+    };
+    info!(
+        target: "termul::web::terminal_ws",
+        binary_output,
+        "terminal WebSocket output protocol selected"
+    );
+    ws.on_upgrade(move |socket| run(socket, state, authority, principal, binary_output))
         .into_response()
+}
+
+fn supports_binary_subprotocol(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|protocol| protocol.trim() == BINARY_SUBPROTOCOL)
 }
 
 fn authorize_terminal_upgrade(
@@ -117,6 +146,7 @@ async fn run(
     state: AppState,
     authority: Arc<RemoteAccessAuthority>,
     principal: RemotePrincipal,
+    binary_output: bool,
 ) {
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::channel::<Message>(MAX_RECONNECT_FRAMES);
@@ -186,6 +216,7 @@ async fn run(
     let mut ctx = ConnectionContext {
         authorized: authorized.clone(),
         attachments,
+        binary_output,
     };
 
     loop {
@@ -262,6 +293,8 @@ struct ConnectionContext {
     authorized: AuthorizedTerminals,
     /// Per-terminal output forwarding tasks (terminal_id -> task).
     attachments: HashMap<String, tokio::task::JoinHandle<()>>,
+    /// True only when the client requested and negotiated the v2 binary output subprotocol.
+    binary_output: bool,
 }
 
 impl ConnectionContext {
@@ -781,16 +814,32 @@ async fn install_replay_forwarder(
     }
 
     let snapshot = state.terminal_events.snapshot(terminal_id);
-    let chunk_payloads: Vec<Value> = replay
-        .chunks
-        .iter()
-        .map(|chunk| {
-            json!({
-                "seq": chunk.seq,
-                "data": chunk.data.iter().map(|byte| *byte as u64).collect::<Vec<u64>>()
+    let binary_output = ctx.binary_output;
+    let chunk_payloads = if binary_output {
+        for chunk in &replay.chunks {
+            send_binary_output(
+                tx,
+                BinaryOutputKind::Replay,
+                terminal_id,
+                chunk.seq,
+                &chunk.data,
+            )
+            .await
+            .map_err(|error| ("NETWORK_ERROR", error))?;
+        }
+        Vec::new()
+    } else {
+        replay
+            .chunks
+            .iter()
+            .map(|chunk| {
+                json!({
+                    "seq": chunk.seq,
+                    "data": chunk.data.iter().map(|byte| *byte as u64).collect::<Vec<u64>>()
+                })
             })
-        })
-        .collect();
+            .collect()
+    };
     send_json(
         tx,
         json!({
@@ -853,20 +902,30 @@ async fn install_replay_forwarder(
                                 break;
                             }
                             current_seq = chunk.seq;
-                            let data: Vec<u64> =
-                                chunk.data.iter().map(|byte| *byte as u64).collect();
-                            if send_json(
-                                &output_tx,
-                                json!({
-                                    "type": "data",
-                                    "terminalId": attached_id,
-                                    "seq": current_seq,
-                                    "data": data
-                                }),
-                            )
-                            .await
-                            .is_err()
-                            {
+                            let sent = if binary_output {
+                                send_binary_output(
+                                    &output_tx,
+                                    BinaryOutputKind::Live,
+                                    &attached_id,
+                                    current_seq,
+                                    &chunk.data,
+                                )
+                                .await
+                            } else {
+                                let data: Vec<u64> =
+                                    chunk.data.iter().map(|byte| *byte as u64).collect();
+                                send_json(
+                                    &output_tx,
+                                    json!({
+                                        "type": "data",
+                                        "terminalId": attached_id,
+                                        "seq": current_seq,
+                                        "data": data
+                                    }),
+                                )
+                                .await
+                            };
+                            if sent.is_err() {
                                 break;
                             }
                         }
@@ -966,6 +1025,38 @@ fn u16_field(value: &Value, key: &str) -> Result<u16, (&'static str, String)> {
         .ok_or_else(|| ("VALIDATION_ERROR", format!("invalid {key}")))
 }
 
+fn encode_binary_output_frame(
+    kind: BinaryOutputKind,
+    terminal_id: &str,
+    seq: u64,
+    data: &[u8],
+) -> Result<Vec<u8>, String> {
+    let terminal_id = terminal_id.as_bytes();
+    let terminal_id_len = u16::try_from(terminal_id.len())
+        .map_err(|_| "terminal id is too long for binary output frame".to_string())?;
+    let mut frame = Vec::with_capacity(15 + terminal_id.len() + data.len());
+    frame.extend_from_slice(BINARY_FRAME_MAGIC);
+    frame.push(kind as u8);
+    frame.extend_from_slice(&terminal_id_len.to_be_bytes());
+    frame.extend_from_slice(&seq.to_be_bytes());
+    frame.extend_from_slice(terminal_id);
+    frame.extend_from_slice(data);
+    Ok(frame)
+}
+
+async fn send_binary_output(
+    tx: &mpsc::Sender<Message>,
+    kind: BinaryOutputKind,
+    terminal_id: &str,
+    seq: u64,
+    data: &[u8],
+) -> Result<(), String> {
+    let frame = encode_binary_output_frame(kind, terminal_id, seq, data)?;
+    tx.send(Message::Binary(frame.into()))
+        .await
+        .map_err(|_| "terminal websocket closed".to_string())
+}
+
 async fn send_json(tx: &mpsc::Sender<Message>, value: Value) -> Result<(), String> {
     tx.send(Message::Text(value.to_string().into()))
         .await
@@ -997,6 +1088,39 @@ mod tests {
     fn validates_numeric_dimensions() {
         assert_eq!(u16_field(&json!({ "cols": 80 }), "cols"), Ok(80));
         assert!(u16_field(&json!({ "cols": 0 }), "cols").is_err());
+    }
+
+    #[test]
+    fn binary_output_requires_explicit_subprotocol_negotiation() {
+        let mut headers = HeaderMap::new();
+        assert!(!supports_binary_subprotocol(&headers));
+
+        headers.insert(
+            axum::http::header::SEC_WEBSOCKET_PROTOCOL,
+            axum::http::HeaderValue::from_static("legacy, termul-terminal-v2.binary"),
+        );
+        assert!(supports_binary_subprotocol(&headers));
+    }
+
+    #[test]
+    fn binary_output_frame_uses_stable_big_endian_envelope() {
+        let frame = encode_binary_output_frame(
+            BinaryOutputKind::Replay,
+            "pty-1",
+            0x0102_0304_0506_0708,
+            &[0, 0xff, b'A'],
+        )
+        .unwrap();
+
+        assert_eq!(&frame[0..4], b"TML2");
+        assert_eq!(frame[4], BinaryOutputKind::Replay as u8);
+        assert_eq!(u16::from_be_bytes([frame[5], frame[6]]), 5);
+        assert_eq!(
+            u64::from_be_bytes(frame[7..15].try_into().unwrap()),
+            0x0102_0304_0506_0708
+        );
+        assert_eq!(&frame[15..20], b"pty-1");
+        assert_eq!(&frame[20..], &[0, 0xff, b'A']);
     }
 
     #[tokio::test]
@@ -1081,6 +1205,7 @@ mod tests {
         let mut ctx = ConnectionContext {
             authorized: Arc::new(RwLock::new(HashMap::new())),
             attachments: HashMap::new(),
+            binary_output: false,
         };
         retain_compound_cleanup_authorization(
             &state,
@@ -1314,6 +1439,7 @@ mod tests {
         let mut ctx = ConnectionContext {
             authorized: Arc::new(RwLock::new(HashMap::new())),
             attachments: HashMap::new(),
+            binary_output: false,
         };
         ctx.authorize("t1", conversation_id(), 7);
         assert!(ctx.is_authorized("t1"));
@@ -1349,6 +1475,7 @@ mod tests {
         let mut ctx = ConnectionContext {
             authorized: Arc::new(RwLock::new(HashMap::new())),
             attachments: HashMap::new(),
+            binary_output: false,
         };
         ctx.authorize(&terminal_id, conversation_id, generation);
 
@@ -1431,6 +1558,7 @@ mod tests {
         let mut ctx = ConnectionContext {
             authorized: Arc::new(RwLock::new(HashMap::new())),
             attachments: HashMap::new(),
+            binary_output: false,
         };
         ctx.authorize("t1", conversation_id(), 7);
 

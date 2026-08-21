@@ -54,6 +54,8 @@ export interface AppSettings {
   terminalFontSize: number
   terminalBufferSize: number // Scrollback buffer size in lines
   terminalRenderer: 'auto' | 'webgl' | 'dom'
+  /** Expose xterm's accessibility tree for NVDA/VoiceOver. Off by default for throughput. */
+  terminalScreenReaderMode: boolean
   defaultShell: string
   defaultProjectColor: string // Default color for new projects (from PROJECT_COLORS)
   maxTerminalsPerProject: number // Maximum terminals allowed per project
@@ -293,6 +295,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   terminalFontSize: 14,
   terminalBufferSize: 10000,
   terminalRenderer: 'webgl',
+  terminalScreenReaderMode: false,
   defaultShell: '',
   defaultProjectColor: 'blue',
   maxTerminalsPerProject: 10,

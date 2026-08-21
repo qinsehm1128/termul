@@ -143,6 +143,21 @@ describe('use-app-settings', () => {
     })
   })
 
+  it('keeps screen reader mode disabled for legacy persisted settings', async () => {
+    const { terminalScreenReaderMode: _terminalScreenReaderMode, ...legacySettings } =
+      DEFAULT_APP_SETTINGS
+    mockPersistenceRead.mockResolvedValueOnce({
+      success: true,
+      data: legacySettings
+    })
+
+    renderHook(() => useAppSettingsLoader())
+
+    await waitFor(() => {
+      expect(useAppSettingsStore.getState().settings.terminalScreenReaderMode).toBe(false)
+    })
+  })
+
   it('persists normalized legacy light color theme settings', async () => {
     mockPersistenceRead.mockResolvedValueOnce({
       success: true,

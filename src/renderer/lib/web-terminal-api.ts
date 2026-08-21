@@ -17,12 +17,15 @@ import type {
   TerminalSpawnOptions
 } from '@shared/types/ipc.types'
 import {
+  decodeWebTerminalBinaryFrame,
   readTerminalResourceFailure,
+  WEB_TERMINAL_BINARY_PROTOCOL,
   type WebTerminalEventPayload,
   type WebTerminalFrame,
   type WebTerminalReply,
   type WebTerminalRequestType
 } from '@shared/types/web-terminal-protocol.types'
+import { logFrontendError } from '@/lib/log-api'
 
 const REQUEST_TIMEOUT_MS = 15_000
 const RECONNECT_BASE_MS = 500
@@ -103,6 +106,7 @@ export class WebTerminalClient {
   private readonly branchCallbacks = new Set<TerminalGitBranchChangedCallback>()
   private readonly statusCallbacks = new Set<TerminalGitStatusChangedCallback>()
   private readonly exitCodeCallbacks = new Set<TerminalExitCodeChangedCallback>()
+  private invalidBinaryFrameLogged = false
 
   constructor(
     private readonly url = resolveTerminalWsUrl(),
@@ -148,7 +152,8 @@ export class WebTerminalClient {
     if (this.socket?.readyState === this.WebSocketImpl.OPEN) return Promise.resolve()
     if (this.connecting) return this.connecting
     this.connecting = new Promise<void>((resolve, reject) => {
-      const socket = new this.WebSocketImpl(this.url)
+      const socket = new this.WebSocketImpl(this.url, WEB_TERMINAL_BINARY_PROTOCOL)
+      socket.binaryType = 'arraybuffer'
       this.socket = socket
       this.connectingReject = reject
       socket.onopen = () => {
@@ -198,7 +203,7 @@ export class WebTerminalClient {
         }
         resolve()
       }
-      socket.onmessage = (event) => this.handleFrame(String(event.data))
+      socket.onmessage = (event) => this.handleIncomingFrame(event.data)
       socket.onerror = () => {
         this.connecting = null
         this.connectingReject = null
@@ -485,7 +490,57 @@ export class WebTerminalClient {
     this.scopedDataCallbacks.clear()
   }
 
-  private handleFrame(text: string): void {
+  private handleIncomingFrame(data: unknown): void {
+    if (typeof data === 'string') {
+      this.handleJsonFrame(data)
+      return
+    }
+    if (data instanceof ArrayBuffer) {
+      this.handleBinaryFrame(data)
+      return
+    }
+    if (typeof Blob !== 'undefined' && data instanceof Blob) {
+      void data
+        .arrayBuffer()
+        .then((buffer) => {
+          if (!this.disposed) this.handleBinaryFrame(buffer)
+        })
+        .catch(() => {
+          this.logInvalidBinaryFrame('Could not read terminal WebSocket Blob payload')
+        })
+    }
+  }
+
+  private dispatchData(terminalId: string, bytes: Uint8Array): void {
+    for (const callback of this.dataCallbacks) callback(terminalId, bytes)
+    const scopedCallbacks = this.scopedDataCallbacks.get(terminalId)
+    if (scopedCallbacks) {
+      for (const callback of scopedCallbacks) callback(bytes)
+    }
+  }
+
+  private handleBinaryFrame(buffer: ArrayBuffer): void {
+    const frame = decodeWebTerminalBinaryFrame(buffer)
+    if (!frame) {
+      this.logInvalidBinaryFrame('Rejected malformed terminal WebSocket binary frame')
+      return
+    }
+    const tracker = this.getOrCreate(frame.terminalId)
+    tracker.lastSeq = Math.max(tracker.lastSeq, frame.seq)
+    this.dispatchData(frame.terminalId, frame.data)
+  }
+
+  private logInvalidBinaryFrame(message: string): void {
+    if (this.invalidBinaryFrameLogged) return
+    this.invalidBinaryFrameLogged = true
+    void logFrontendError({
+      level: 'warn',
+      source: 'WebTerminalClient.binaryFrame',
+      message
+    })
+  }
+
+  private handleJsonFrame(text: string): void {
     let frame: WebTerminalFrame
     try {
       frame = JSON.parse(text) as WebTerminalFrame
@@ -506,11 +561,7 @@ export class WebTerminalClient {
         tracker.lastSeq = frame.seq
       }
       const bytes = Uint8Array.from(frame.data)
-      for (const callback of this.dataCallbacks) callback(frame.terminalId, bytes)
-      const scopedCallbacks = this.scopedDataCallbacks.get(frame.terminalId)
-      if (scopedCallbacks) {
-        for (const callback of scopedCallbacks) callback(bytes)
-      }
+      this.dispatchData(frame.terminalId, bytes)
       return
     }
     if (frame.type === 'replay') {
@@ -518,7 +569,7 @@ export class WebTerminalClient {
       const tracker = this.getOrCreate(frame.terminalId)
       for (const chunk of frame.chunks) {
         const bytes = Uint8Array.from(chunk.data)
-        for (const callback of this.dataCallbacks) callback(frame.terminalId, bytes)
+        this.dispatchData(frame.terminalId, bytes)
         tracker.lastSeq = chunk.seq
       }
       tracker.lastSeq = Math.max(tracker.lastSeq, frame.latestSeq)
@@ -536,7 +587,7 @@ export class WebTerminalClient {
           0x30,
           0x6d // ESC[0m (reset)
         ])
-        for (const callback of this.dataCallbacks) callback(frame.terminalId, marker)
+        this.dispatchData(frame.terminalId, marker)
       }
       return
     }
@@ -554,7 +605,7 @@ export class WebTerminalClient {
         0x30,
         0x6d
       ])
-      for (const callback of this.dataCallbacks) callback(frame.terminalId, marker)
+      this.dispatchData(frame.terminalId, marker)
       return
     }
     if (frame.type === 'event') this.handleEvent(frame.payload)

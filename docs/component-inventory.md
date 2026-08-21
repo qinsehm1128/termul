@@ -33,8 +33,6 @@ Supporting these are shared layout, navigation, modal, and design-system compone
 ### Terminal Components
 
 - `terminal/ConnectedTerminal.tsx` — production terminal surface integrating xterm, PTY lifecycle, clipboard, fit, WebGL, scrollback replay, and shortcut passthrough
-- `terminal/XTerminal.tsx` — xterm-focused rendering support
-- `terminal/TauriTerminal.tsx` — alternate direct Tauri PTY terminal implementation
 - `terminal/TerminalSearchBar.tsx` — terminal text search UI
 - `terminal/ActivityIndicator.tsx` — recent terminal activity indicator
 - `mobile/MobileChatShell.tsx` — narrow web shell with terminal creation, selection, and close navigation alongside chat history
@@ -155,7 +153,7 @@ The component layer has broad renderer test coverage, including tests for:
 
 ## Notes for Future Work
 
-- `TerminalView.tsx` and `TauriTerminal.tsx` appear to coexist with the more integrated `ConnectedTerminal.tsx`, indicating some retained transitional/legacy implementation surface.
+- `ConnectedTerminal.tsx` is the single production xterm surface; the earlier renderer-pool, factory, `XTerminal`, `TauriTerminal`, and `use-xterm` prototypes were removed in August 2026.
 - The browser annotation workflow is a major differentiated feature and deserves special attention when changing browser tab or overlay behavior.
 - Pane and terminal rendering are performance-sensitive; several files include optimizations and render-isolation strategies.
 

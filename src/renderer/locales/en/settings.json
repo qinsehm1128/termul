@@ -46,6 +46,8 @@
     "maxTerminalsHint": "Maximum number of terminal tabs allowed per project.",
     "renderer": "Terminal Renderer",
     "rendererHint": "GPU-accelerated rendering for terminal output. WebGL provides best performance. Changes apply to new terminals.",
+    "screenReader": "Screen reader mode",
+    "screenReaderHint": "Expose terminal output to NVDA and VoiceOver. Enable only when needed because accessibility rendering can reduce throughput.",
     "preview": "Preview",
     "symbolFont": "Symbol font (terminal icons/glyphs)",
     "symbolFontHint": "Nerd Font used to render prompt icons and powerline glyphs; Auto picks installed Nerd Fonts."

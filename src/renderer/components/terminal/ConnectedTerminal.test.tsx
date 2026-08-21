@@ -277,10 +277,11 @@ vi.mock('@/stores/app-settings-store', () => ({
   useTerminalSymbolFontFamily: vi.fn(() => ''),
   useTerminalFontSize: vi.fn(() => 14),
   useTerminalBufferSize: vi.fn(() => 10000),
-  useTerminalRenderer: vi.fn(() => 'auto')
+  useTerminalRenderer: vi.fn(() => 'auto'),
+  useTerminalScreenReaderMode: vi.fn(() => false)
 }))
 
-import { useTerminalRenderer } from '@/stores/app-settings-store'
+import { useTerminalRenderer, useTerminalScreenReaderMode } from '@/stores/app-settings-store'
 
 const mockTerminalStoreState = {
   terminals: [] as Array<{ id: string; ptyId?: string; healthStatus?: string }>,
@@ -358,6 +359,7 @@ describe('ConnectedTerminal', () => {
     rendererPreferenceSpy = vi
       .spyOn(appSettingsStore, 'useTerminalRenderer')
       .mockReturnValue('auto')
+    vi.mocked(useTerminalScreenReaderMode).mockReturnValue(false)
     webglAddonCreateCount = 0
     capturedContextLossCallback = null
     capturedPowerResumeCallback = null
@@ -488,6 +490,21 @@ describe('ConnectedTerminal', () => {
     expect(container.querySelector('div')).toBeTruthy()
   })
 
+  it('should keep screen reader mode opt-in and apply runtime changes', async () => {
+    const { rerender } = render(<ConnectedTerminal />)
+
+    expect(mockTerminalConstructor).toHaveBeenCalledWith(
+      expect.objectContaining({ screenReaderMode: false })
+    )
+
+    vi.mocked(useTerminalScreenReaderMode).mockReturnValue(true)
+    rerender(<ConnectedTerminal className="screen-reader-enabled" />)
+
+    await vi.waitFor(() => {
+      expect(mockTerminalInstance.options.screenReaderMode).toBe(true)
+    })
+  })
+
   it('should spawn terminal on mount when no external ID provided', async () => {
     render(<ConnectedTerminal />)
 
@@ -606,12 +623,14 @@ describe('ConnectedTerminal', () => {
     expect(mockTerminalConstructor).toHaveBeenCalledTimes(1)
     expect(mockTerminalInstance.dispose).not.toHaveBeenCalled()
 
+    vi.mocked(useTerminalScreenReaderMode).mockReturnValue(true)
     const second = render(<ConnectedTerminal terminalId="external-cached" />)
     await vi.waitFor(() => {
       expect(addRendererRef).toHaveBeenCalledTimes(2)
     })
 
     expect(mockTerminalConstructor).toHaveBeenCalledTimes(1)
+    expect(mockTerminalInstance.options.screenReaderMode).toBe(true)
     second.unmount()
   })
 
@@ -898,6 +917,24 @@ describe('ConnectedTerminal', () => {
 
     // The callback should have called terminal.write
     expect(mockTerminalInstance.write).toHaveBeenCalledWith(bytes)
+
+    unmount()
+  })
+
+  it('should preserve UTF-8 bytes for CJK, emoji, and combining characters', async () => {
+    const { unmount } = render(<ConnectedTerminal />)
+
+    await vi.waitFor(() => {
+      expect(vi.mocked(terminalApi).spawn).toHaveBeenCalled()
+    })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    const bytes = new TextEncoder().encode('中文 👩🏽‍💻 e\u0301')
+    expect(capturedDataCallback).not.toBeNull()
+    capturedDataCallback!('terminal-123', bytes)
+
+    expect(mockTerminalInstance.write).toHaveBeenCalledWith(bytes)
+    expect(mockTerminalInstance.write.mock.calls.at(-1)?.[0]).toEqual(bytes)
 
     unmount()
   })

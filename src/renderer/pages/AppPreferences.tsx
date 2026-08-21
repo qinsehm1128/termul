@@ -62,6 +62,7 @@ import {
   useTerminalFontFamily,
   useTerminalFontSize,
   useTerminalRenderer,
+  useTerminalScreenReaderMode,
   useTerminalSymbolFontFamily,
   useTerminalUrlOpenMode,
   useUiLanguage,
@@ -152,6 +153,12 @@ const APP_PREF_SEARCH_DEFS = [
     labelKey: 'appearance.renderer',
     descriptionKey: 'appearance.rendererHint',
     keywords: ['webgl', 'dom', 'gpu']
+  },
+  {
+    categoryId: 'appearance',
+    labelKey: 'appearance.screenReader',
+    descriptionKey: 'appearance.screenReaderHint',
+    keywords: ['accessibility', 'screen reader', 'voiceover', 'nvda']
   },
   {
     categoryId: 'shell',
@@ -311,6 +318,7 @@ export default function AppPreferences(): React.JSX.Element {
   const languagePreference = useUiLanguage()
   const bufferSize = useTerminalBufferSize()
   const terminalRenderer = useTerminalRenderer()
+  const terminalScreenReaderMode = useTerminalScreenReaderMode()
   const defaultShell = useDefaultShell()
   const defaultProjectColor = useDefaultProjectColor() as ProjectColor
   const maxTerminals = useMaxTerminalsPerProject()
@@ -403,6 +411,10 @@ export default function AppPreferences(): React.JSX.Element {
     if (value === 'auto' || value === 'webgl' || value === 'dom') {
       updateSetting('terminalRenderer', value)
     }
+  }
+
+  const handleScreenReaderModeToggle = (enabled: boolean) => {
+    updateSetting('terminalScreenReaderMode', enabled)
   }
 
   const handleDefaultShellChange = (value: string) => {
@@ -766,6 +778,36 @@ export default function AppPreferences(): React.JSX.Element {
                   <p className="text-xs text-muted-foreground mt-1">
                     {tSettings('appearance.rendererHint')}
                   </p>
+                </div>
+
+                {/* Terminal screen reader accessibility */}
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <div className="text-sm font-medium text-secondary-foreground">
+                      {tSettings('appearance.screenReader')}
+                    </div>
+                    <div className="mt-0.5 text-xs text-muted-foreground">
+                      {tSettings('appearance.screenReaderHint')}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={terminalScreenReaderMode}
+                    aria-label={tSettings('appearance.screenReader')}
+                    onClick={() => handleScreenReaderModeToggle(!terminalScreenReaderMode)}
+                    className={cn(
+                      'relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2',
+                      terminalScreenReaderMode ? 'bg-primary' : 'bg-input'
+                    )}
+                  >
+                    <span
+                      className={cn(
+                        'inline-block h-4 w-4 transform rounded-full bg-white transition-transform',
+                        terminalScreenReaderMode ? 'translate-x-6' : 'translate-x-1'
+                      )}
+                    />
+                  </button>
                 </div>
 
                 {/* Preview */}
