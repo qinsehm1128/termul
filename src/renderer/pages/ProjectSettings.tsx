@@ -411,22 +411,14 @@ export default function ProjectSettings() {
     <>
       <main className="flex-1 flex flex-col min-w-0 h-full relative">
         {/* Header */}
-        <div className="h-16 flex items-center justify-between px-8 border-b border-border bg-card flex-shrink-0">
-          <div className="flex items-center gap-3">
-            <div className="p-2 bg-primary/10 rounded text-primary">
-              <Settings size={20} />
-            </div>
-            <div>
-              <h1 className="text-xl font-semibold text-foreground leading-tight">
-                {t('projectSettings')}
-              </h1>
-              <p className="text-xs text-muted-foreground">
-                {t('configurationFor')}{' '}
-                <span className="font-semibold text-secondary-foreground">
-                  {activeProject?.name}
-                </span>
-              </p>
-            </div>
+        <div className="flex h-9 shrink-0 items-center justify-between border-b border-border/70 bg-sidebar px-3 shadow-[inset_0_1px_0_hsl(var(--foreground)/0.025)]">
+          <div className="flex min-w-0 items-baseline gap-2">
+            <Settings size={16} className="shrink-0 self-center text-muted-foreground" />
+            <h1 className="truncate text-sm font-medium text-foreground">{t('projectSettings')}</h1>
+            <p className="truncate text-2xs text-muted-foreground">
+              {t('configurationFor')}{' '}
+              <span className="font-medium text-secondary-foreground">{activeProject?.name}</span>
+            </p>
           </div>
           <button
             onClick={() => {
@@ -436,11 +428,11 @@ export default function ProjectSettings() {
                 navigate('/')
               }
             }}
-            className="group flex items-center justify-center h-8 w-8 rounded-md hover:bg-secondary transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            className="inline-flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 hover:bg-secondary hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
             title={t('close')}
             aria-label={t('projectSettingsAria')}
           >
-            <X size={18} className="text-muted-foreground group-hover:text-foreground" />
+            <X size={16} />
           </button>
         </div>
 
@@ -448,7 +440,7 @@ export default function ProjectSettings() {
         <SettingsLayout categories={localizedCategories} searchIndex={localizedSearchIndex}>
           {/* General Section */}
           <SettingsSection id="general">
-            <div className="flex items-start gap-6 border-b border-border pb-6">
+            <div className="flex items-start gap-6 border-b border-border/70 pb-6">
               <div className="w-1/3 pt-1">
                 <h2 className="text-lg font-medium text-foreground">
                   {t('settingsCategoryGeneral')}
@@ -469,7 +461,7 @@ export default function ProjectSettings() {
                       setProjectName(e.target.value)
                       setHasChanges(true)
                     }}
-                    className="w-full bg-secondary/50 border border-border rounded-md px-3 py-2 text-sm text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none transition-shadow"
+                    className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none transition-[border-color,background-color] duration-150 focus-visible:border-ring/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
                   />
                 </div>
 
@@ -485,7 +477,7 @@ export default function ProjectSettings() {
                         setRootPath(e.target.value)
                         setHasChanges(true)
                       }}
-                      className="flex-1 bg-secondary/50 border border-border rounded-md px-3 py-2 text-sm text-foreground font-mono focus:ring-2 focus:ring-primary outline-none"
+                      className="h-8 flex-1 rounded-md border border-input/80 bg-secondary/35 px-2.5 font-mono text-sm text-foreground outline-none transition-[border-color,background-color] duration-150 focus-visible:border-ring/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
                     />
                     <button
                       onClick={async () => {
@@ -495,7 +487,7 @@ export default function ProjectSettings() {
                           setHasChanges(true)
                         }
                       }}
-                      className="px-4 py-2 bg-card hover:bg-secondary border border-border rounded-md text-sm text-foreground transition-colors shadow-sm"
+                      className="inline-flex h-8 items-center rounded-md bg-secondary/50 px-3 text-sm text-foreground transition-colors duration-150 hover:bg-secondary focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                     >
                       {t('browse')}
                     </button>
@@ -537,7 +529,7 @@ export default function ProjectSettings() {
 
           {/* Environment Variables Section */}
           <SettingsSection id="env-vars">
-            <div className="flex items-start gap-6 border-b border-border pb-6">
+            <div className="flex items-start gap-6 border-b border-border/70 pb-6">
               <div className="w-1/3 pt-1">
                 <h2 className="text-lg font-medium text-foreground">
                   {t('settingsCategoryEnvVars')}
@@ -565,19 +557,19 @@ export default function ProjectSettings() {
                 )}
               </div>
               <div className="w-2/3">
-                <div className="bg-secondary/30 rounded-lg border border-border overflow-hidden">
-                  <div className="grid grid-cols-[1fr_1.5fr_auto] gap-px bg-border">
-                    <div className="label-section bg-secondary/80 px-4 py-2 text-muted-foreground">
+                <div className="overflow-hidden rounded-md bg-secondary/25 shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.035)]">
+                  <div className="grid grid-cols-[1fr_1.5fr_auto] gap-px bg-border/50">
+                    <div className="label-section bg-secondary/50 px-4 py-2 text-muted-foreground">
                       {t('key')}
                     </div>
-                    <div className="label-section bg-secondary/80 px-4 py-2 text-muted-foreground">
+                    <div className="label-section bg-secondary/50 px-4 py-2 text-muted-foreground">
                       {t('value')}
                     </div>
-                    <div className="bg-secondary/80 w-10"></div>
+                    <div className="w-10 bg-secondary/50"></div>
 
                     {envVars.map((envVar, index) => (
                       <Fragment key={index}>
-                        <div className="bg-card p-2">
+                        <div className="bg-background p-2">
                           <input
                             type="text"
                             value={envVar.key}
@@ -588,10 +580,10 @@ export default function ProjectSettings() {
                               setHasChanges(true)
                             }}
                             placeholder={t('key')}
-                            className="w-full bg-transparent border-none text-sm font-mono text-primary focus:ring-0 px-2 py-1"
+                            className="w-full bg-transparent border-none px-2 py-1 font-mono text-sm text-primary focus:ring-0"
                           />
                         </div>
-                        <div className="bg-card p-2 relative group">
+                        <div className="group relative bg-background p-2">
                           <input
                             type={envVar.isSecret ? 'password' : 'text'}
                             value={envVar.value}
@@ -603,17 +595,17 @@ export default function ProjectSettings() {
                             }}
                             placeholder={t('value')}
                             className={cn(
-                              'w-full bg-transparent border-none text-sm font-mono focus:ring-0 px-2 py-1',
+                              'w-full bg-transparent border-none px-2 py-1 font-mono text-sm focus:ring-0',
                               envVar.isSecret ? 'text-muted-foreground' : 'text-green-400'
                             )}
                           />
                         </div>
-                        <div className="bg-card flex items-center justify-center">
+                        <div className="flex items-center justify-center bg-background">
                           <button
                             onClick={() => removeEnvVar(index)}
-                            className="text-muted-foreground hover:text-destructive p-1 rounded transition-colors"
+                            className="rounded-md p-1 text-muted-foreground transition-colors duration-150 hover:text-destructive"
                           >
-                            <X size={18} />
+                            <X size={16} />
                           </button>
                         </div>
                       </Fragment>
@@ -626,7 +618,7 @@ export default function ProjectSettings() {
 
           {/* Shell Settings Section */}
           <SettingsSection id="shell">
-            <div className="flex items-start gap-6 border-b border-border pb-6">
+            <div className="flex items-start gap-6 border-b border-border/70 pb-6">
               <div className="w-1/3 pt-1">
                 <h2 className="text-lg font-medium text-foreground">
                   {t('settingsCategoryShell')}
@@ -648,7 +640,7 @@ export default function ProjectSettings() {
                           setShell(e.target.value)
                           setHasChanges(true)
                         }}
-                        className="w-full appearance-none bg-secondary/50 border border-border rounded-md pl-3 pr-10 py-2 text-sm text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none cursor-pointer shadow-sm"
+                        className="h-8 w-full cursor-pointer appearance-none rounded-md border border-input/80 bg-secondary/35 pl-3 pr-10 text-sm text-foreground outline-none transition-[border-color,background-color] duration-150 focus-visible:border-ring/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
                       >
                         {availableShells?.available && availableShells.available.length > 0 ? (
                           availableShells.available.map((s) => (
@@ -672,7 +664,7 @@ export default function ProjectSettings() {
 
           {/* Worktree Symlink Directories Section */}
           <SettingsSection id="symlinks">
-            <div className="flex items-start gap-6 border-b border-border pb-6">
+            <div className="flex items-start gap-6 border-b border-border/70 pb-6">
               <div className="w-1/3 pt-1">
                 <h2 className="text-lg font-medium text-foreground">
                   {t('settingsCategorySymlinks')}
@@ -703,7 +695,7 @@ export default function ProjectSettings() {
                 </div>
               </div>
               <div className="w-2/3">
-                <div className="bg-secondary/30 rounded-lg border border-border p-3 space-y-2">
+                <div className="space-y-2 rounded-md bg-secondary/25 p-3 shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.035)]">
                   {symlinkDirs.length === 0 ? (
                     <p className="text-xs text-muted-foreground text-center py-4">
                       {t('noSymlinkDirs')}
@@ -717,11 +709,11 @@ export default function ProjectSettings() {
                           value={dir}
                           onChange={(e) => updateSymlinkDir(index, e.target.value)}
                           placeholder={t('symlinkPlaceholder')}
-                          className="flex-1 bg-secondary/50 border border-border rounded px-2 py-1 text-sm font-mono text-foreground focus:ring-1 focus:ring-primary outline-none placeholder-muted-foreground"
+                          className="h-8 flex-1 rounded-md border border-input/80 bg-secondary/35 px-2 font-mono text-sm text-foreground outline-none transition-[border-color,background-color] duration-150 placeholder:text-muted-foreground focus-visible:border-ring/70 focus-visible:ring-1 focus-visible:ring-ring/35"
                         />
                         <button
                           onClick={() => removeSymlinkDir(index)}
-                          className="text-muted-foreground hover:text-destructive p-1 rounded transition-colors"
+                          className="rounded-md p-1 text-muted-foreground transition-colors duration-150 hover:text-destructive"
                         >
                           <X size={14} />
                         </button>
@@ -743,7 +735,7 @@ export default function ProjectSettings() {
                 <p className="text-sm text-muted-foreground mt-1">{t('emergencyDescription')}</p>
               </div>
               <div className="w-2/3">
-                <div className="bg-secondary/30 rounded-lg border border-border p-4 space-y-4">
+                <div className="space-y-4 rounded-md bg-secondary/25 p-4 shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.035)]">
                   <div className="flex items-center justify-between">
                     <div>
                       <p className="text-sm font-medium text-foreground">
@@ -793,7 +785,7 @@ export default function ProjectSettings() {
                         setDefaultBranchPrefix(e.target.value)
                       }}
                       placeholder="feature/"
-                      className="w-full bg-secondary/50 border border-border rounded-md px-3 py-2 text-sm font-mono text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none"
+                      className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 font-mono text-sm text-foreground outline-none transition-[border-color,background-color] duration-150 focus-visible:border-ring/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
                     />
                     <p className="text-xs text-muted-foreground mt-1">
                       {t('branchPrefixDescription')}
@@ -807,20 +799,20 @@ export default function ProjectSettings() {
 
         {/* Save Bar */}
         {hasChanges && (
-          <div className="absolute bottom-0 left-0 right-0 p-4 bg-card border-t border-border flex justify-end items-center gap-4 z-10 shadow-[0_-4px_6px_-1px_rgba(0,0,0,0.1)]">
-            <span className="text-sm text-muted-foreground mr-auto flex items-center">
+          <div className="absolute bottom-0 left-0 right-0 z-10 flex items-center justify-end gap-3 border-t border-border/70 bg-sidebar px-3 py-2 shadow-[inset_0_1px_0_hsl(var(--foreground)/0.025)]">
+            <span className="mr-auto flex items-center text-sm text-muted-foreground">
               <Info size={14} className="mr-2 text-yellow-500" />
               <span className="opacity-80">{t('unsavedChanges')}</span>
             </span>
             <button
               onClick={() => setHasChanges(false)}
-              className="px-4 py-2 text-sm font-medium text-secondary-foreground hover:text-foreground hover:bg-secondary rounded transition-colors"
+              className="inline-flex h-8 items-center rounded-md px-3 text-sm font-medium text-secondary-foreground transition-colors duration-150 hover:bg-secondary hover:text-foreground"
             >
               {t('discard')}
             </button>
             <button
               onClick={handleSave}
-              className="bg-primary hover:bg-primary/90 text-primary-foreground text-sm font-medium py-2 px-6 rounded shadow-lg shadow-primary/20 transition-all flex items-center"
+              className="inline-flex h-8 items-center rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition-colors duration-150 hover:bg-primary/90"
             >
               <Save size={14} className="mr-2" />
               {t('saveChanges')}

@@ -1,5 +1,5 @@
 import { useVirtualizer } from '@tanstack/react-virtual'
-import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   MessageScroller,
   MessageScrollerButton,
@@ -9,6 +9,7 @@ import {
   MessageScrollerViewport,
   useMessageScroller
 } from '@/components/ui/message-scroller'
+import { useRuntimeTranslation } from '@/i18n/use-runtime-translation'
 import type { AgentId, SessionId } from '@/lib/acp-api'
 import type { FilePathResolutionContext } from '@/lib/file-path-links'
 import { cn } from '@/lib/utils'
@@ -25,6 +26,85 @@ import { groupTurnActivity, type TimelineItem, type TurnTimelineItem } from './c
 import { ThoughtGroup } from './ThoughtGroup'
 import { ToolCallCard } from './ToolCallCard'
 import { TurnActivity } from './TurnActivity'
+
+/** Compact top-of-thread status for older-message / history backfill. Overlay — no scroll jump. */
+export function ChatHistoryLoadingStatus(): React.JSX.Element {
+  const t = useRuntimeTranslation('chat')
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      aria-atomic="true"
+      data-testid="chat-history-loading"
+      className={cn(CHAT_GUTTER_X, 'pointer-events-none')}
+    >
+      <div className={cn(CHAT_CONTENT_WIDTH, 'flex items-center gap-2 py-1.5')}>
+        <span
+          className="h-1.5 w-16 animate-pulse rounded-sm bg-muted motion-reduce:animate-none"
+          aria-hidden="true"
+        />
+        <span
+          className="h-1.5 w-28 animate-pulse rounded-sm bg-muted/70 motion-reduce:animate-none"
+          aria-hidden="true"
+        />
+        <span className="text-2xs text-muted-foreground">
+          {t('history.loadingOlder', 'Loading earlier messages…')}
+        </span>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Reverse-infinite-scroll load of older messages. Returns a React flag for the
+ * overlay so the effect can keep a ref guard without depending on render state.
+ */
+export function useLoadOlderMessages(
+  sessionId: SessionId,
+  itemCount: number,
+  startIndex: number | undefined,
+  viewportEl: HTMLDivElement | null,
+  pinned: boolean
+): boolean {
+  const [loadingOlder, setLoadingOlder] = useState(false)
+  const loadingOlderRef = useRef(false)
+
+  useEffect(() => {
+    if (startIndex === undefined || startIndex > 0) return
+    if (itemCount === 0 || loadingOlderRef.current) return
+    if (viewportEl === null || pinned) return
+    if (viewportEl.scrollHeight <= viewportEl.clientHeight) return
+    const prevScrollHeight = viewportEl.scrollHeight
+    const prevScrollTop = viewportEl.scrollTop
+    // Cancel on dependency change (e.g. session switch) so a load that resolves
+    // after the reader moved to another chat never adjusts the new viewport.
+    let cancelled = false
+    loadingOlderRef.current = true
+    setLoadingOlder(true)
+    void useAcpStore
+      .getState()
+      .loadOlderMessages(sessionId, 50)
+      .then(() => {
+        if (cancelled) return
+        // Restore the reader's position after older rows are prepended above.
+        requestAnimationFrame(() => {
+          if (cancelled || !viewportEl) return
+          viewportEl.scrollTop = prevScrollTop + (viewportEl.scrollHeight - prevScrollHeight)
+        })
+      })
+      .finally(() => {
+        loadingOlderRef.current = false
+        if (!cancelled) setLoadingOlder(false)
+      })
+    return () => {
+      cancelled = true
+      loadingOlderRef.current = false
+      setLoadingOlder(false)
+    }
+  }, [startIndex, itemCount, sessionId, viewportEl, pinned])
+
+  return loadingOlder
+}
 
 /** Reports the live item count to the scroller so the jump button can badge unread. */
 function ItemCountReporter({ count }: { count: number }): null {
@@ -97,6 +177,7 @@ interface TimelineRenderProps {
   onEditMessage?: (text: string) => void
   onRetry?: () => void
   filePathContext?: FilePathResolutionContext
+  onLoadingOlderChange?: (loading: boolean) => void
 }
 
 /**
@@ -111,7 +192,8 @@ function VirtualizedTimeline({
   shouldAnimateEnter,
   onEditMessage,
   onRetry,
-  filePathContext
+  filePathContext,
+  onLoadingOlderChange
 }: TimelineRenderProps): React.JSX.Element {
   const { viewportEl, pinned } = useMessageScroller()
   const virtualizer = useVirtualizer({
@@ -140,37 +222,17 @@ function VirtualizedTimeline({
   // live window and undoing the bound. The store guards concurrent loads and is
   // idempotent at the history head; this local flag avoids spamming on rapid
   // range notifications. The reader's position is preserved across the prepend.
-  const loadingOlderRef = useRef(false)
   const startIndex = virtualizer.range?.startIndex
+  const loadingOlder = useLoadOlderMessages(
+    sessionId,
+    groupedItems.length,
+    startIndex,
+    viewportEl,
+    pinned
+  )
   useEffect(() => {
-    if (startIndex === undefined || startIndex > 0) return
-    if (groupedItems.length === 0 || loadingOlderRef.current) return
-    if (viewportEl === null || pinned) return
-    if (viewportEl.scrollHeight <= viewportEl.clientHeight) return
-    const prevScrollHeight = viewportEl.scrollHeight
-    const prevScrollTop = viewportEl.scrollTop
-    // Cancel on dependency change (e.g. session switch) so a load that resolves
-    // after the reader moved to another chat never adjusts the new viewport.
-    let cancelled = false
-    loadingOlderRef.current = true
-    void useAcpStore
-      .getState()
-      .loadOlderMessages(sessionId, 50)
-      .then(() => {
-        if (cancelled) return
-        // Restore the reader's position after older rows are prepended above.
-        requestAnimationFrame(() => {
-          if (cancelled || !viewportEl) return
-          viewportEl.scrollTop = prevScrollTop + (viewportEl.scrollHeight - prevScrollHeight)
-        })
-      })
-      .finally(() => {
-        loadingOlderRef.current = false
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [startIndex, groupedItems.length, sessionId, viewportEl, pinned])
+    onLoadingOlderChange?.(loadingOlder)
+  }, [loadingOlder, onLoadingOlderChange])
 
   // When the reader returns to the live edge, drop the per-session backfill
   // allowance so the next coalesced flush trims the window back to the live
@@ -303,6 +365,7 @@ export function ChatMessageList({
   )
   const lastMsgIndex = useMemo(() => lastMessageIndex(groupedItems), [groupedItems])
   const shouldAnimateEnter = useAnimateEnter(sessionId, items)
+  const [loadingOlder, setLoadingOlder] = useState(false)
 
   if (items.length === 0 && !showRunningIndicator) {
     return <ChatEmptyState agentId={agentId} onPick={onEditMessage} />
@@ -310,6 +373,11 @@ export function ChatMessageList({
 
   return (
     <div className="relative min-h-0 flex-1">
+      {loadingOlder ? (
+        <div className="pointer-events-none absolute inset-x-0 top-0 z-10">
+          <ChatHistoryLoadingStatus />
+        </div>
+      ) : null}
       <MessageScrollerProvider autoScroll>
         <ItemCountReporter count={groupedItems.length} />
         <MessageScroller>
@@ -322,6 +390,7 @@ export function ChatMessageList({
               filePathContext={filePathContext}
               onEditMessage={onEditMessage}
               onRetry={onRetry}
+              onLoadingOlderChange={setLoadingOlder}
             />
           </MessageScrollerViewport>
           <MessageScrollerButton />

@@ -654,7 +654,7 @@ export function ChatInputBar({
           {/* biome-ignore lint/a11y/noStaticElementInteractions: drop zone for attachments; the file picker button is the accessible path */}
           <div
             data-chat-composer="true"
-            className="relative bg-card/70"
+            className="relative border-t border-border/55 bg-card/80 shadow-[0_-10px_18px_-14px_hsl(var(--foreground)/0.10)]"
             onDragEnter={handleDragEnter}
             onDragLeave={handleDragLeave}
             onDragOver={canDropPaste ? (e) => e.preventDefault() : undefined}

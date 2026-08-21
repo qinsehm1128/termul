@@ -81,7 +81,7 @@ export function AiPromptDialog({ isOpen, onClose, context }: AiPromptDialogProps
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-[2px]"
       role="dialog"
       aria-modal="true"
       aria-labelledby="ai-prompt-dialog-title"
@@ -89,16 +89,19 @@ export function AiPromptDialog({ isOpen, onClose, context }: AiPromptDialogProps
         if (e.key === 'Escape') onClose()
       }}
     >
-      <div className="w-[600px] max-w-[90vw] max-h-[80vh] bg-popover border border-border rounded-lg shadow-2xl flex flex-col">
+      <div className="flex max-h-[80vh] w-[600px] max-w-[90vw] flex-col overflow-hidden rounded-md border border-border/80 bg-popover shadow-[0_18px_60px_hsl(var(--background)/0.7),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]">
         {/* Header */}
-        <div className="flex items-center justify-between px-4 py-3 border-b border-border">
-          <h2 id="ai-prompt-dialog-title" className="text-sm font-semibold text-foreground">
+        <div className="flex h-9 items-center justify-between border-b border-border/70 px-3">
+          <h2
+            id="ai-prompt-dialog-title"
+            className="text-xs font-semibold tracking-[-0.01em] text-foreground"
+          >
             {t('aiPrompt.title')}
           </h2>
           <button
             type="button"
             onClick={onClose}
-            className="h-6 w-6 flex items-center justify-center rounded hover:bg-secondary text-muted-foreground"
+            className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
             aria-label={t('aiPrompt.close')}
           >
             ✕
@@ -106,7 +109,7 @@ export function AiPromptDialog({ isOpen, onClose, context }: AiPromptDialogProps
         </div>
 
         {/* Template selector */}
-        <div className="px-4 py-2 border-b border-border">
+        <div className="border-b border-border/70 px-3 py-2">
           <span className="label-group text-muted-foreground">{t('aiPrompt.tool')}</span>
           <div className="flex gap-2 mt-1">
             {BUILT_IN_TEMPLATES.map((tpl) => {
@@ -123,7 +126,7 @@ export function AiPromptDialog({ isOpen, onClose, context }: AiPromptDialogProps
                   aria-label={templateName}
                   title={templateDescription}
                   className={cn(
-                    'flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs transition-colors',
+                    'inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-xs transition-colors',
                     selectedTemplate.id === tpl.id
                       ? 'bg-primary text-primary-foreground'
                       : 'bg-secondary text-muted-foreground hover:text-foreground'
@@ -149,13 +152,13 @@ export function AiPromptDialog({ isOpen, onClose, context }: AiPromptDialogProps
               })}
             </span>
           </div>
-          <pre className="whitespace-pre-wrap text-xs text-foreground bg-muted rounded-md p-3 font-mono leading-relaxed max-h-[300px] overflow-auto">
+          <pre className="max-h-[300px] overflow-auto whitespace-pre-wrap rounded-md border border-border/80 bg-secondary/35 p-3 font-mono text-xs leading-relaxed text-foreground">
             {generatedPrompt || t('aiPrompt.missingContext')}
           </pre>
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-between px-4 py-3 border-t border-border">
+        <div className="flex h-10 items-center justify-between border-t border-border/70 bg-secondary/20 px-4">
           <span className="text-3xs text-muted-foreground">
             {t('aiPrompt.variables', { variables: selectedTemplate.variables.join(', ') })}
           </span>
@@ -164,11 +167,11 @@ export function AiPromptDialog({ isOpen, onClose, context }: AiPromptDialogProps
             onClick={handleCopy}
             disabled={!generatedPrompt}
             className={cn(
-              'flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors',
+              'inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-xs font-medium transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-ring',
               copied
-                ? 'bg-green-500/10 text-green-500'
+                ? 'bg-success/10 text-success'
                 : 'bg-primary text-primary-foreground hover:bg-primary/90',
-              !generatedPrompt && 'opacity-50 cursor-not-allowed'
+              !generatedPrompt && 'cursor-not-allowed opacity-50'
             )}
           >
             {copied ? (

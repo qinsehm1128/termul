@@ -103,18 +103,21 @@ export default {
         '4xs': '0.5625rem' // 9px
       },
       fontFamily: {
-        // Prefer each platform's native UI face for IDE chrome. Bundled Inter
-        // remains the deterministic fallback on Linux and older environments.
+        // Apple: named SF Pro, then -apple-system so San Francisco still wins
+        // when the named face is not registered. Windows: Segoe UI. Web/Linux:
+        // bundled Geist Variable, then Inter and distro UI faces.
         sans: [
           '"SF Pro Text"',
+          '-apple-system',
+          'BlinkMacSystemFont',
           '"Segoe UI"',
+          '"Geist Variable"',
+          'Geist',
           'Ubuntu',
           'Cantarell',
           '"Inter Variable"',
           'Inter',
           'system-ui',
-          '-apple-system',
-          'BlinkMacSystemFont',
           'sans-serif'
         ],
         mono: [

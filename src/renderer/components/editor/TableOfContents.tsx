@@ -30,10 +30,10 @@ export function TableOfContents({
 }: TableOfContentsProps): React.JSX.Element {
   const { t } = useTranslation('workspace')
   return (
-    <div className="flex h-full min-h-0 flex-col border-l border-border bg-card">
-      <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
-        <div className="flex items-center gap-2 text-sm font-medium text-foreground">
-          <List className="h-4 w-4" />
+    <div className="flex h-full min-h-0 flex-col border-l border-border/70 bg-sidebar shadow-[inset_1px_0_0_hsl(var(--background)/0.35)]">
+      <div className="flex h-8 shrink-0 items-center justify-between gap-2 border-b border-border/70 px-2.5 shadow-[inset_0_1px_0_hsl(var(--foreground)/0.025)]">
+        <div className="flex items-center gap-2 text-xs font-medium text-foreground">
+          <List size={16} />
           <span>{t('toc.contents')}</span>
         </div>
 
@@ -42,11 +42,11 @@ export function TableOfContents({
             <Button
               variant="ghost"
               size="icon"
-              className="h-7 w-7"
+              className="size-7"
               title={t('toc.settings')}
               aria-label={t('toc.settings')}
             >
-              <Settings2 className="h-4 w-4" />
+              <Settings2 size={16} />
             </Button>
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end">
@@ -79,8 +79,9 @@ export function TableOfContents({
                   <button
                     type="button"
                     className={cn(
-                      'w-full rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-accent hover:text-accent-foreground',
-                      isActive && 'bg-accent text-accent-foreground'
+                      'w-full rounded-sm px-2 py-1.5 text-left text-sm transition-colors duration-150 hover:bg-sidebar-accent/50 hover:text-foreground',
+                      isActive &&
+                        'bg-sidebar-accent text-foreground shadow-[inset_0_1px_0_hsl(var(--foreground)/0.035)] ring-1 ring-inset ring-primary/35'
                     )}
                     style={{ paddingLeft: (heading.level - 1) * 12 + 8 }}
                     onClick={() => onHeadingClick(heading)}

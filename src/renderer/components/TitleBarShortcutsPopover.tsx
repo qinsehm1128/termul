@@ -1,4 +1,4 @@
-import { AnimatePresence, motion } from 'framer-motion'
+import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { Keyboard } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -32,6 +32,7 @@ export function TitleBarShortcutsPopover({
   onOpenChange
 }: TitleBarShortcutsPopoverProps): React.JSX.Element {
   const { t } = useTranslation('shell')
+  const reducedMotion = useReducedMotion() ?? false
   const [openFallback, setOpenFallback] = useState(false)
   const isOpen = open ?? openFallback
   const shortcuts = useKeyboardShortcutsStore((state) => state.shortcuts)
@@ -121,27 +122,27 @@ export function TitleBarShortcutsPopover({
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[110] flex flex-col items-center pt-[7vh] bg-black/40 backdrop-blur-sm"
+            className="fixed inset-0 z-[110] flex flex-col items-center bg-black/70 pt-[7vh] backdrop-blur-[2px]"
             onClick={() => setOpen(false)}
           >
             <motion.div
               role="dialog"
               aria-modal="true"
               aria-labelledby="shortcut-menu-title"
-              initial={{ opacity: 0, scale: 0.97, y: -8 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.97, y: -8 }}
-              transition={{ duration: 0.15 }}
-              className="w-full max-w-lg overflow-hidden rounded-lg border border-border bg-card shadow-2xl"
+              initial={{ opacity: 0, y: reducedMotion ? 0 : -6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: reducedMotion ? 0 : -6 }}
+              transition={{ duration: reducedMotion ? 0 : 0.15 }}
+              className="w-full max-w-lg overflow-hidden rounded-md border border-border/80 bg-popover shadow-[0_18px_60px_hsl(var(--background)/0.7),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]"
               onClick={(event) => event.stopPropagation()}
             >
-              <div className="flex items-start justify-between gap-3 border-b border-border px-4 py-3">
+              <div className="flex items-start justify-between gap-3 border-b border-border/70 px-3 py-2">
                 <div>
                   <div
                     id="shortcut-menu-title"
-                    className="flex items-center gap-2 text-sm font-semibold text-foreground"
+                    className="flex items-center gap-2 text-xs font-semibold tracking-[-0.01em] text-foreground"
                   >
-                    <Keyboard aria-hidden="true" size={15} />
+                    <Keyboard aria-hidden="true" size={14} />
                     {t('titleBar.shortcutMenu')}
                   </div>
                   <p className="mt-1 text-xs text-muted-foreground">
@@ -152,7 +153,7 @@ export function TitleBarShortcutsPopover({
                   ref={closeButtonRef}
                   type="button"
                   onClick={() => setOpen(false)}
-                  className="rounded px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-secondary hover:text-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+                  className="inline-flex h-7 items-center rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                 >
                   Esc
                 </button>

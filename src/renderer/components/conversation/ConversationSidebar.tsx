@@ -17,14 +17,14 @@ export function ConversationSidebar({ onNewChat }: ConversationSidebarProps): Re
   const projects = useProjectStore((state) => state.projects)
 
   return (
-    <aside className="flex h-full w-64 shrink-0 flex-col bg-sidebar">
+    <aside className="flex h-full w-60 shrink-0 flex-col bg-sidebar">
       <div className="flex h-8 items-center justify-between border-b border-sidebar-border/70 px-2.5">
         <span className="label-section text-sidebar-foreground">
           {t('conversationNavigation.title')}
         </span>
         <button
           type="button"
-          className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 ease-[var(--ease-out)] hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
           aria-label={t('conversationNavigation.newChat')}
           title={t('conversationNavigation.newChat')}
           onClick={onNewChat}

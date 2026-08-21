@@ -147,6 +147,13 @@ describe('AppPreferences settings controls', () => {
     })
   })
 
+  it('uses compact sidebar chrome for the page header', () => {
+    renderPage()
+
+    const header = screen.getByRole('heading', { name: 'Application Preferences' }).closest('.h-9')
+    expect(header).toHaveClass('h-9', 'bg-sidebar')
+  })
+
   it('keeps screen reader mode opt-in and persists the user toggle', async () => {
     renderPage()
 

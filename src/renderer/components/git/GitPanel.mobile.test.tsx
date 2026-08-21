@@ -150,7 +150,7 @@ describe('GitPanel desktop branch (regression)', () => {
     const { container } = render(<GitPanel cwd="/work" isVisible />)
 
     // Desktop keeps the `w-80` file-list sidebar AND the diff view side-by-side.
-    expect(container.querySelector('.w-80')).not.toBeNull()
+    expect(container.querySelector('.w-80')).toHaveClass('bg-sidebar')
     expect(screen.getByTestId('git-diff-view')).toBeInTheDocument()
     expect(screen.getByPlaceholderText('Filter changes...')).toBeInTheDocument()
     // Desktop never renders the mobile back button.

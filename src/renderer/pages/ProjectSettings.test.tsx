@@ -72,6 +72,26 @@ function importEnv() {
   fireEvent.click(screen.getByRole('button', { name: /import from \.env/i }))
 }
 
+describe('ProjectSettings chrome', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    apiMocks.getAvailableShells.mockResolvedValue({
+      success: true,
+      data: {
+        available: [{ name: 'bash', path: '/bin/bash', displayName: 'Bash' }],
+        default: { name: 'bash', path: '/bin/bash', displayName: 'Bash' }
+      }
+    })
+    apiMocks.parseGitignore.mockResolvedValue({ success: true, data: [] })
+  })
+
+  it('uses compact sidebar chrome for the page header', () => {
+    renderSettings()
+    const header = screen.getByRole('heading', { name: 'Project Settings' }).closest('.h-9')
+    expect(header).toHaveClass('h-9', 'bg-sidebar')
+  })
+})
+
 describe('ProjectSettings .env import', () => {
   beforeEach(() => {
     vi.clearAllMocks()
