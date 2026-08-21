@@ -66,6 +66,12 @@ describe('PlanPanel', () => {
     expect(screen.getByText('Task 0')).toHaveClass('line-through')
   })
 
+  it('snaps the disclosure chevron under reduced motion', () => {
+    const { container } = render(<PlanPanel entries={[{ content: 'Task A', status: 'pending' }]} />)
+    expect(container.innerHTML).toContain('motion-reduce:transition-none')
+    expect(container.innerHTML).toContain('motion-reduce:duration-0')
+  })
+
   it('collapses to just the header when the chevron toggle is clicked', () => {
     const { container } = render(
       <PlanPanel

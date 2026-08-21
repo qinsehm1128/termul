@@ -130,7 +130,7 @@ export function PlanPanel({ entries }: PlanPanelProps): React.JSX.Element {
           initial={reduced ? { opacity: 0 } : { opacity: 0, y: -4 }}
           animate={reduced ? { opacity: 1 } : { opacity: 1, y: 0 }}
           exit={reduced ? { opacity: 0 } : { opacity: 0, y: -4 }}
-          transition={reduced ? { duration: 0.15 } : CHAT_SPRING_SOFT}
+          transition={reduced ? { duration: 0 } : CHAT_SPRING_SOFT}
           className="shrink-0"
         >
           <div className={cn(CHAT_GUTTER_X, 'py-2')}>
@@ -168,7 +168,7 @@ export function PlanPanel({ entries }: PlanPanelProps): React.JSX.Element {
                 <ChevronDown
                   size={14}
                   className={cn(
-                    'shrink-0 text-muted-foreground/60 transition-transform',
+                    'shrink-0 text-muted-foreground/60 transition-transform motion-reduce:duration-0 motion-reduce:transition-none',
                     collapsed ? '' : 'rotate-180'
                   )}
                   aria-hidden="true"
@@ -192,7 +192,7 @@ export function PlanPanel({ entries }: PlanPanelProps): React.JSX.Element {
                           ? { opacity: 1 }
                           : { opacity: 1, y: 0, filter: 'blur(0px)' },
                         transition: {
-                          ...(reduced ? { duration: 0.15 } : CHAT_SPRING_SOFT),
+                          ...(reduced ? { duration: 0 } : CHAT_SPRING_SOFT),
                           delay: reduced ? 0 : Math.min(i, 8) * 0.08
                         }
                       }

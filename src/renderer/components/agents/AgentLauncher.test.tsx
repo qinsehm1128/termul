@@ -1718,6 +1718,8 @@ describe('AgentLauncher worktree isolation', () => {
 
     expect(composer).toBeInTheDocument()
     expect(contextStrip).toBeInTheDocument()
+    expect(composer).toHaveClass('bg-secondary/25')
+    expect(contextStrip).toHaveClass('bg-secondary/20')
     expect(composer).not.toContainElement(contextStrip)
     expect(composer?.compareDocumentPosition(contextStrip as Node)).toBe(
       Node.DOCUMENT_POSITION_FOLLOWING

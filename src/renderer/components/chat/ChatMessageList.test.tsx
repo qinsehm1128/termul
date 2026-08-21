@@ -1,7 +1,23 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
-import { ChatMessageList } from './ChatMessageList'
+import { act, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { TimelineItem } from './chat-timeline'
+
+const { mockLoadOlder, mockClearBackfill } = vi.hoisted(() => ({
+  mockLoadOlder: vi.fn(() => Promise.resolve()),
+  mockClearBackfill: vi.fn()
+}))
+
+vi.mock('@/stores/acp-store', () => ({
+  useAcpStore: Object.assign((sel: (s: Record<string, unknown>) => unknown) => sel({}), {
+    getState: () => ({
+      loadOlderMessages: mockLoadOlder,
+      clearSessionBackfill: mockClearBackfill
+    })
+  }),
+  useAgentIdentity: () => ({ name: 'Cursor', templateId: 'cursor' })
+}))
+
+import { ChatHistoryLoadingStatus, ChatMessageList, useLoadOlderMessages } from './ChatMessageList'
 
 vi.mock('./ChatMessage', () => ({
   ChatMessage: ({
@@ -99,6 +115,11 @@ const thoughtItem: TimelineItem = {
 }
 
 describe('ChatMessageList', () => {
+  beforeEach(() => {
+    mockLoadOlder.mockReset().mockResolvedValue(undefined)
+    mockClearBackfill.mockReset()
+  })
+
   it.each([
     ['before content arrives', [userItem]],
     ['while a thought streams', [userItem, thoughtItem]],
@@ -250,6 +271,34 @@ describe('ChatMessageList', () => {
     expect(container.innerHTML).not.toContain('bg-gradient-to-t')
   })
 
+  it('does not show history loading status on a pinned first paint', () => {
+    render(
+      <ChatMessageList
+        items={[userItem]}
+        sessionId="session-1"
+        agentId="agent-1"
+        showRunningIndicator={false}
+      />
+    )
+    expect(screen.queryByTestId('chat-history-loading')).not.toBeInTheDocument()
+    expect(mockLoadOlder).not.toHaveBeenCalled()
+  })
+
+  it('aligns the empty thread with CHAT_GUTTER_X / max-w-3xl', () => {
+    const { container } = render(
+      <ChatMessageList
+        items={[]}
+        sessionId="session-1"
+        agentId="agent-1"
+        showRunningIndicator={false}
+      />
+    )
+    expect(screen.getByRole('heading', { name: 'Chat with Cursor' })).toBeInTheDocument()
+    expect(container.innerHTML).toContain('max-w-3xl')
+    expect(container.innerHTML).toContain('px-3')
+    expect(container.innerHTML).toContain('@[400px]:px-5')
+  })
+
   it('collapses a failed tool-only turn but flags it for attention', () => {
     render(
       <ChatMessageList
@@ -262,5 +311,76 @@ describe('ChatMessageList', () => {
 
     const trigger = screen.getByRole('button', { name: /Worked.*needs attention/ })
     expect(trigger).toHaveAttribute('aria-expanded', 'false')
+  })
+})
+
+describe('ChatHistoryLoadingStatus', () => {
+  it('renders a restrained top-of-thread skeleton aligned to the thread column', () => {
+    const { container } = render(<ChatHistoryLoadingStatus />)
+    const status = screen.getByRole('status')
+    expect(status).toHaveAttribute('aria-live', 'polite')
+    expect(status).toHaveTextContent('Loading earlier messages')
+    expect(container.innerHTML).toContain('max-w-3xl')
+    expect(container.innerHTML).toContain('px-3')
+    expect(container.innerHTML).toContain('@[400px]:px-5')
+    expect(container.innerHTML).toContain('animate-pulse')
+    expect(container.innerHTML).toContain('motion-reduce:animate-none')
+    expect(container.innerHTML).not.toContain('sticky')
+  })
+})
+
+describe('useLoadOlderMessages', () => {
+  beforeEach(() => {
+    mockLoadOlder.mockReset()
+    mockClearBackfill.mockReset()
+  })
+
+  it('exposes loading while older history is in flight and restores scroll after', async () => {
+    let resolveLoad: (() => void) | undefined
+    mockLoadOlder.mockReturnValue(
+      new Promise<void>((resolve) => {
+        resolveLoad = resolve
+      })
+    )
+    const viewport = {
+      scrollHeight: 800,
+      clientHeight: 200,
+      scrollTop: 40
+    } as HTMLDivElement
+
+    const { result } = renderHook(() => useLoadOlderMessages('session-1', 3, 0, viewport, false))
+
+    await waitFor(() => expect(result.current).toBe(true))
+    expect(mockLoadOlder).toHaveBeenCalledWith('session-1', 50)
+
+    viewport.scrollHeight = 1200
+    await act(async () => {
+      resolveLoad?.()
+    })
+    await waitFor(() => expect(result.current).toBe(false))
+    await act(async () => {
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => resolve())
+      })
+    })
+    expect(viewport.scrollTop).toBe(440)
+  })
+
+  it('does not load when pinned to the live edge or the viewport is not scrollable', () => {
+    const viewport = {
+      scrollHeight: 800,
+      clientHeight: 200,
+      scrollTop: 0
+    } as HTMLDivElement
+    renderHook(() => useLoadOlderMessages('session-1', 3, 0, viewport, true))
+    expect(mockLoadOlder).not.toHaveBeenCalled()
+
+    const shortViewport = {
+      scrollHeight: 200,
+      clientHeight: 200,
+      scrollTop: 0
+    } as HTMLDivElement
+    renderHook(() => useLoadOlderMessages('session-1', 3, 0, shortViewport, false))
+    expect(mockLoadOlder).not.toHaveBeenCalled()
   })
 })

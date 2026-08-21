@@ -93,6 +93,66 @@ describe('FileTreeNode', () => {
     expect(nameEl.parentElement).toHaveClass('min-w-0', 'overflow-hidden')
   })
 
+  it('marks the selected row with sidebar-accent and a lichen inset ring', () => {
+    render(
+      <FileTreeNode
+        entry={{
+          path: '/project/selected.ts',
+          name: 'selected.ts',
+          type: 'file',
+          extension: 'ts',
+          size: 32,
+          modifiedAt: Date.UTC(2026, 5, 10)
+        }}
+        depth={0}
+        isExpanded={false}
+        isSelected
+        isLoading={false}
+        onToggle={vi.fn()}
+        onSelect={vi.fn()}
+        onContextMenu={vi.fn()}
+      />
+    )
+
+    const selected = document.querySelector('[data-path="/project/selected.ts"]')
+    expect(selected).toHaveClass(
+      'h-7',
+      'bg-sidebar-accent',
+      'ring-1',
+      'ring-inset',
+      'ring-primary/35',
+      'duration-150'
+    )
+    expect(selected).not.toHaveClass('bg-accent')
+    expect(selected).not.toHaveClass('hover:bg-secondary/50')
+  })
+
+  it('uses sidebar-accent hover on idle rows', () => {
+    render(
+      <FileTreeNode
+        entry={{
+          path: '/project/idle.ts',
+          name: 'idle.ts',
+          type: 'file',
+          extension: 'ts',
+          size: 16,
+          modifiedAt: Date.UTC(2026, 5, 10)
+        }}
+        depth={0}
+        isExpanded={false}
+        isSelected={false}
+        isLoading={false}
+        onToggle={vi.fn()}
+        onSelect={vi.fn()}
+        onContextMenu={vi.fn()}
+      />
+    )
+
+    expect(document.querySelector('[data-path="/project/idle.ts"]')).toHaveClass(
+      'hover:bg-sidebar-accent/50'
+    )
+  })
+
   it('exposes the entry path via data-path for header-action reveal (GH-540)', () => {
     render(
       <FileTreeNode

@@ -61,33 +61,33 @@ export function BrowserControls({ browserTabId }: BrowserControlsProps): React.J
 
   return (
     <div className="flex flex-col shrink-0">
-      <div className="h-9 flex items-center gap-1.5 px-2 bg-card border-b border-border">
+      <div className="flex h-9 items-center gap-1.5 border-b border-border/70 bg-sidebar px-2 shadow-[inset_0_1px_0_hsl(var(--foreground)/0.025)]">
         <button
           onClick={() => browserTabGoBack(browserTabId).catch(console.error)}
-          className="p-1.5 rounded hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors"
+          className="rounded-md p-1.5 text-muted-foreground transition-colors duration-150 hover:bg-secondary hover:text-foreground"
           title={t('controls.back')}
         >
           <ArrowLeft size={14} />
         </button>
         <button
           onClick={() => browserTabGoForward(browserTabId).catch(console.error)}
-          className="p-1.5 rounded hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors"
+          className="rounded-md p-1.5 text-muted-foreground transition-colors duration-150 hover:bg-secondary hover:text-foreground"
           title={t('controls.forward')}
         >
           <ArrowRight size={14} />
         </button>
         <button
           onClick={() => browserTabReload(browserTabId).catch(console.error)}
-          className="p-1.5 rounded hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors"
+          className="rounded-md p-1.5 text-muted-foreground transition-colors duration-150 hover:bg-secondary hover:text-foreground"
           title={t('controls.reload')}
         >
           <RotateCcw size={14} />
         </button>
-        <div className="flex-1 flex items-center gap-2 min-w-0">
+        <div className="flex min-w-0 flex-1 items-center gap-2 rounded-md bg-secondary/35 px-2">
           {tabLoading ? (
-            <Loader2 size={14} className="text-primary shrink-0 animate-spin" />
+            <Loader2 size={14} className="shrink-0 animate-spin text-primary" />
           ) : (
-            <Globe size={14} className="text-muted-foreground shrink-0" />
+            <Globe size={14} className="shrink-0 text-muted-foreground" />
           )}
           <input
             type="text"
@@ -95,7 +95,7 @@ export function BrowserControls({ browserTabId }: BrowserControlsProps): React.J
             onChange={(e) => setInputUrl(e.target.value)}
             onKeyDown={handleKeyDown}
             onBlur={handleNavigate}
-            className="flex-1 bg-transparent text-sm text-foreground outline-none min-w-0"
+            className="min-w-0 flex-1 bg-transparent text-sm text-foreground outline-none"
             placeholder={t('controls.enterUrl')}
           />
         </div>
@@ -104,7 +104,7 @@ export function BrowserControls({ browserTabId }: BrowserControlsProps): React.J
             <TooltipTrigger asChild>
               <button
                 onClick={() => browserTabOpenDevtools(browserTabId).catch(console.error)}
-                className="p-1.5 rounded shrink-0 hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors"
+                className="shrink-0 rounded-md p-1.5 text-muted-foreground transition-colors duration-150 hover:bg-secondary hover:text-foreground"
                 aria-label={t('controls.openDebugConsole')}
                 title={t('controls.debugConsole')}
               >
@@ -120,10 +120,10 @@ export function BrowserControls({ browserTabId }: BrowserControlsProps): React.J
               onClick={handleToggleAnnotationMode}
               aria-pressed={tabAnnotationMode}
               className={cn(
-                'p-1.5 rounded shrink-0 transition-all motion-safe:transition-[background-color,color,transform,box-shadow] motion-safe:duration-150 motion-safe:hover:scale-110 motion-safe:active:scale-95',
+                'shrink-0 rounded-md p-1.5 transition-colors duration-150',
                 tabAnnotationMode
-                  ? 'bg-primary text-primary-foreground hover:bg-primary/90 ring-2 ring-primary/30 shadow-sm shadow-primary/20'
-                  : 'hover:bg-secondary text-muted-foreground hover:text-foreground'
+                  ? 'bg-primary text-primary-foreground shadow-[inset_0_1px_0_hsl(var(--foreground)/0.08)] ring-1 ring-inset ring-primary/35 hover:bg-primary/90'
+                  : 'text-muted-foreground hover:bg-secondary hover:text-foreground'
               )}
               aria-label={
                 tabAnnotationMode

@@ -1,4 +1,4 @@
-import { AnimatePresence, motion } from 'framer-motion'
+import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { AlertTriangle } from 'lucide-react'
 import { type KeyboardEvent, useCallback, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -35,6 +35,7 @@ export function ConfirmDialog({
   onCancel
 }: ConfirmDialogProps): React.JSX.Element {
   const { t } = useTranslation('common')
+  const reducedMotion = useReducedMotion() ?? false
 
   // Handle Escape key to close dialog
   useEffect(() => {
@@ -71,41 +72,43 @@ export function ConfirmDialog({
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
-          className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-[2px]"
           onClick={onCancel}
         >
           <motion.div
-            initial={{ opacity: 0, scale: 0.95, y: 10 }}
-            animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.95, y: 10 }}
-            transition={{ duration: 0.15 }}
-            className="bg-card rounded-lg shadow-2xl w-[400px] border border-border overflow-hidden"
+            initial={{ opacity: 0, y: reducedMotion ? 0 : -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: reducedMotion ? 0 : -6 }}
+            transition={{ duration: reducedMotion ? 0 : 0.15 }}
+            className="w-[400px] overflow-hidden rounded-md border border-border/80 bg-card shadow-[0_18px_60px_hsl(var(--background)/0.7),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]"
             onClick={(e) => e.stopPropagation()}
             onKeyDown={handleKeyDown}
             tabIndex={-1}
           >
             {/* Content */}
-            <div className="p-6">
-              <div className="flex items-start gap-4">
+            <div className="p-4">
+              <div className="flex items-start gap-3">
                 {variant === 'danger' && (
-                  <div className="flex-shrink-0 w-10 h-10 rounded-full bg-red-500/10 flex items-center justify-center">
-                    <AlertTriangle className="w-5 h-5 text-red-500" />
+                  <div className="flex size-8 shrink-0 items-center justify-center rounded-md bg-destructive/10">
+                    <AlertTriangle className="size-4 text-destructive" />
                   </div>
                 )}
                 <div className="flex-1">
-                  <h3 className="text-sm font-semibold text-foreground mb-1">{title}</h3>
+                  <h3 className="mb-1 text-xs font-semibold tracking-[-0.01em] text-foreground">
+                    {title}
+                  </h3>
                   <p className="text-sm text-muted-foreground">{message}</p>
-                  {children && <div className="mt-4">{children}</div>}
+                  {children && <div className="mt-3">{children}</div>}
                 </div>
               </div>
             </div>
 
             {/* Footer */}
-            <div className="px-6 py-3 bg-secondary/50 flex justify-end gap-2 border-t border-border">
+            <div className="flex h-10 items-center justify-end gap-2 border-t border-border/70 bg-secondary/20 px-4">
               <button
                 onClick={onCancel}
                 disabled={isLoading}
-                className="px-3 py-1.5 text-xs font-medium text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                className="inline-flex h-8 items-center rounded-md px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary/60 hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {cancelLabel ?? t('actions.cancel')}
               </button>
@@ -113,7 +116,7 @@ export function ConfirmDialog({
                 <button
                   onClick={secondaryAction.onClick}
                   disabled={isLoading}
-                  className="px-3 py-1.5 text-xs font-medium rounded transition-all text-red-400 hover:text-red-300 hover:bg-red-500/10 disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="inline-flex h-8 items-center rounded-md px-3 text-xs font-medium text-destructive transition-colors hover:bg-destructive/10 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   {secondaryAction.label}
                 </button>
@@ -122,9 +125,9 @@ export function ConfirmDialog({
                 onClick={onConfirm}
                 disabled={isLoading}
                 className={cn(
-                  'px-3 py-1.5 text-xs font-medium rounded transition-all disabled:opacity-50 disabled:cursor-not-allowed',
+                  'inline-flex h-8 items-center rounded-md px-3 text-xs font-medium transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50',
                   variant === 'danger'
-                    ? 'bg-red-500 text-white hover:bg-red-600'
+                    ? 'bg-destructive text-destructive-foreground hover:bg-destructive/90'
                     : 'bg-primary text-primary-foreground hover:bg-primary/90'
                 )}
               >

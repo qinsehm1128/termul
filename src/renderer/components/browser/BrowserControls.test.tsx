@@ -97,9 +97,9 @@ describe('BrowserControls', () => {
     renderWithProvider(<BrowserControls browserTabId="tab-1" />)
 
     const toggleBtn = screen.getByLabelText('Disable annotation mode')
-    // Active state should have ring and shadow classes
-    expect(toggleBtn.className).toContain('ring-2')
-    expect(toggleBtn.className).toContain('ring-primary/30')
+    expect(toggleBtn.className).toContain('ring-1')
+    expect(toggleBtn.className).toContain('ring-primary/35')
+    expect(toggleBtn.className).toContain('ring-inset')
   })
 
   it('renders browser navigation and debug button', () => {

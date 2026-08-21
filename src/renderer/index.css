@@ -1,7 +1,3 @@
-/* Local variable fonts (no network dependency, consistent across OS) */
-@import "@fontsource-variable/inter/index.css";
-@import "@fontsource-variable/jetbrains-mono/index.css";
-
 @import "tailwindcss";
 @import "shadcn/tailwind.css";
 @config "../../tailwind.config.ts";
@@ -140,7 +136,7 @@
   body {
     @apply bg-background text-foreground font-sans antialiased;
     margin: 0;
-    /* Inter typographic features: kerning, contextual alts, tabular figures */
+    /* Tabular figures for IDE chrome; Inter stylistic sets apply when Inter is active */
     font-feature-settings: "cv11", "ss01", "ss03", "cv02", "tnum";
     font-variant-ligatures: contextual;
   }

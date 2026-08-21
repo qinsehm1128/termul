@@ -53,20 +53,19 @@ vi.mock('@/stores/editor-store', () => ({
   )
 }))
 
+const { mockTerminals } = vi.hoisted(() => ({
+  mockTerminals: [
+    { id: 'term-1', name: 'Terminal 1', shell: 'bash' },
+    { id: 'term-2', name: 'Terminal 2', shell: 'zsh' },
+    { id: 'term-3', name: 'Terminal 3', shell: 'bash' }
+  ] as Array<Record<string, unknown>>
+}))
+
 vi.mock('@/stores/terminal-store', () => ({
-  useTerminalStore: vi.fn(
-    (
-      selector: (state: {
-        terminals: Array<{ id: string; name: string; shell: string }>
-      }) => unknown
-    ) =>
-      selector({
-        terminals: [
-          { id: 'term-1', name: 'Terminal 1', shell: 'bash' },
-          { id: 'term-2', name: 'Terminal 2', shell: 'zsh' },
-          { id: 'term-3', name: 'Terminal 3', shell: 'bash' }
-        ]
-      })
+  useTerminalStore: vi.fn((selector: (state: { terminals: typeof mockTerminals }) => unknown) =>
+    selector({
+      terminals: mockTerminals
+    })
   ),
   useProjectsWithActivity: () => [],
   useProjectsWithErrors: () => new Set()
@@ -268,6 +267,14 @@ beforeEach(() => {
     clearReorderPreview: mockClearReorderPreview,
     handleTabReorder: mockHandleTabReorder
   })
+
+  mockTerminals.splice(
+    0,
+    mockTerminals.length,
+    { id: 'term-1', name: 'Terminal 1', shell: 'bash' },
+    { id: 'term-2', name: 'Terminal 2', shell: 'zsh' },
+    { id: 'term-3', name: 'Terminal 3', shell: 'bash' }
+  )
 
   mockShellApiGetAvailableShells.mockResolvedValue({
     success: true,
@@ -774,7 +781,7 @@ describe('WorkspaceTabBar', () => {
     expect(mockSetReorderPreview).not.toHaveBeenCalled()
   })
 
-  it('applies opacity and scale to dragged tab', async () => {
+  it('dims a dragged tab without scale feedback', async () => {
     // Mock dragPayload to indicate tab-1 is being dragged
     mockUsePaneDnd.mockReturnValue({
       startTabDrag: mockStartTabDrag,
@@ -799,8 +806,75 @@ describe('WorkspaceTabBar', () => {
     const tabEls = container.querySelectorAll('[draggable="true"]')
     const draggedTab = tabEls[0] as HTMLElement // First tab (the one being dragged)
 
-    // The dragged tab should have opacity-50 and scale classes
     expect(draggedTab.className).toContain('opacity-50')
-    expect(draggedTab.className).toContain('scale-[0.98]')
+    expect(draggedTab.className).not.toMatch(/scale-/)
+  })
+
+  it('renders attention, activity, and running live marks with attention winning', async () => {
+    mockTerminals.splice(
+      0,
+      mockTerminals.length,
+      {
+        id: 'term-1',
+        name: 'Attention',
+        shell: 'bash',
+        needsAttention: true,
+        hasActivity: true,
+        healthStatus: 'running'
+      },
+      {
+        id: 'term-2',
+        name: 'Activity',
+        shell: 'zsh',
+        hasActivity: true,
+        healthStatus: 'running'
+      },
+      {
+        id: 'term-3',
+        name: 'Running',
+        shell: 'bash',
+        healthStatus: 'running'
+      }
+    )
+
+    const tabs: WorkspaceTab[] = [
+      { type: 'terminal', id: 'tab-1', terminalId: 'term-1' },
+      { type: 'terminal', id: 'tab-2', terminalId: 'term-2' },
+      { type: 'terminal', id: 'tab-3', terminalId: 'term-3' }
+    ]
+
+    const { container } = render(
+      <WorkspaceTabBar paneId="pane-a" tabs={tabs} activeTabId="tab-1" />
+    )
+    await flushShellEffect()
+
+    const attentionTab = screen.getByText('Attention').closest('[draggable="true"]')
+    const activityTab = screen.getByText('Activity').closest('[draggable="true"]')
+    const runningTab = screen.getByText('Running').closest('[draggable="true"]')
+
+    expect(attentionTab?.querySelector('.bg-warning')).toBeTruthy()
+    expect(attentionTab?.querySelector('.bg-primary')).toBeNull()
+    expect(activityTab?.querySelector('.bg-primary')).toBeTruthy()
+    expect(activityTab?.querySelector('.bg-primary\\/40')).toBeNull()
+    expect(runningTab?.querySelector('.bg-primary\\/40')).toBeTruthy()
+    expect(container.querySelectorAll('.bg-warning').length).toBe(1)
+  })
+
+  it('keeps content icons at 14px and retains dirty editor marks', async () => {
+    mockEditorOpenFiles.set('/a.ts', { isDirty: true, operationStatus: 'idle' })
+    const tabs: WorkspaceTab[] = [
+      { type: 'terminal', id: 'tab-1', terminalId: 'term-1' },
+      { type: 'editor', id: 'edit-/a.ts', filePath: '/a.ts' }
+    ]
+
+    const { container } = render(
+      <WorkspaceTabBar paneId="pane-a" tabs={tabs} activeTabId="tab-1" />
+    )
+    await flushShellEffect()
+
+    const terminalIcon = screen.getByText('Terminal 1').previousElementSibling
+    expect(terminalIcon).toHaveAttribute('width', '14')
+    expect(terminalIcon).toHaveAttribute('height', '14')
+    expect(container.querySelectorAll('.w-2.h-2.rounded-full.bg-primary').length).toBe(1)
   })
 })

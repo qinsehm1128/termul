@@ -72,7 +72,7 @@ export function ConversationList({
             {tConversation('dashboard.loading')}
           </span>
           {Array.from({ length: 5 }, (_, index) => (
-            <div key={index} className="flex h-8 items-center px-2">
+            <div key={index} className="flex h-7 items-center px-2">
               <span className="h-2.5 w-2/5 animate-pulse rounded-sm bg-muted" />
             </div>
           ))}
@@ -115,7 +115,7 @@ export function ConversationList({
           <div
             key={conversation.conversationId}
             className={cn(
-              'group mx-1 flex min-h-8 items-center gap-0.5 rounded-sm pr-0.5 transition-colors',
+              'group mx-1 flex min-h-7 items-center gap-0.5 rounded-sm pr-0.5 transition-colors duration-150 ease-[var(--ease-out)]',
               isActive
                 ? 'bg-sidebar-accent text-foreground ring-1 ring-inset ring-primary/35'
                 : 'hover:bg-sidebar-accent/50'
@@ -124,7 +124,7 @@ export function ConversationList({
           >
             <button
               type="button"
-              className="flex min-h-8 min-w-0 flex-1 items-center gap-2 px-2 py-1.5 text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring"
+              className="flex min-h-7 min-w-0 flex-1 items-center gap-2 px-2 py-0.5 text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring"
               aria-current={isActive ? 'page' : undefined}
               onClick={() => {
                 navigate(`/c/${conversation.conversationId}`)
@@ -134,14 +134,14 @@ export function ConversationList({
               <span className="min-w-0 flex-1">
                 <span
                   className={cn(
-                    'block truncate text-xs leading-4',
+                    'block truncate text-xs leading-3.5',
                     isActive ? 'font-medium text-foreground' : 'text-sidebar-foreground'
                   )}
                   title={title}
                 >
                   {title}
                 </span>
-                <span className="block truncate text-2xs leading-4 text-muted-foreground">
+                <span className="block truncate text-2xs leading-3 text-muted-foreground">
                   {projectLabel}
                 </span>
               </span>
@@ -166,7 +166,7 @@ export function ConversationList({
       {hasMore && (
         <button
           type="button"
-          className="mx-1 mt-0.5 inline-flex h-8 items-center justify-center rounded-sm px-2 text-xs text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          className="mx-1 mt-0.5 inline-flex h-7 items-center justify-center rounded-sm px-2 text-xs text-muted-foreground transition-colors duration-150 ease-[var(--ease-out)] hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
           onClick={() => setVisibleCount((count) => count + pageSize)}
         >
           {t('conversationNavigation.loadMore', { count: projected.length - visible.length })}

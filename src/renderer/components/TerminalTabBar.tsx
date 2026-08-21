@@ -121,7 +121,7 @@ export function TerminalTabBar({
   })
 
   return (
-    <div className="h-9 bg-card border-b border-border flex items-center">
+    <div className="flex h-8 items-center border-b border-border/70 bg-sidebar shadow-[inset_0_1px_0_hsl(var(--foreground)/0.025)]">
       <div className="relative flex items-center h-full min-w-0 shrink">
         <div
           ref={tabsContainerRef}
@@ -155,7 +155,7 @@ export function TerminalTabBar({
 
         {/* Gradient overlay when there are more tabs */}
         {hasOverflow && (
-          <div className="absolute right-0 top-0 h-full w-8 bg-gradient-to-l from-card to-transparent pointer-events-none" />
+          <div className="pointer-events-none absolute right-0 top-0 h-full w-8 bg-gradient-to-l from-sidebar to-transparent" />
         )}
       </div>
 
@@ -163,25 +163,25 @@ export function TerminalTabBar({
       <div ref={dropdownRef} className="relative flex items-center ml-1 shrink-0">
         <button
           onClick={onNewTerminal}
-          className="h-7 w-7 flex items-center justify-center rounded-l hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors border-r border-border/50"
+          className="flex h-7 w-7 items-center justify-center rounded-l-md border-r border-border/50 text-muted-foreground transition-colors duration-150 hover:bg-secondary hover:text-foreground"
           title={t('terminalTabs.newTerminalDefault')}
         >
-          <Plus size={12} />
+          <Plus size={14} />
         </button>
         {onNewTerminalWithShell && (
           <>
             <button
               onClick={() => setIsDropdownOpen(!isDropdownOpen)}
-              className="h-7 w-5 flex items-center justify-center rounded-r hover:bg-secondary text-muted-foreground hover:text-foreground transition-colors"
+              className="flex h-7 w-5 items-center justify-center rounded-r-md text-muted-foreground transition-colors duration-150 hover:bg-secondary hover:text-foreground"
               title={t('terminalTabs.selectShell')}
             >
-              <ChevronDown size={12} />
+              <ChevronDown size={14} />
             </button>
 
             {isDropdownOpen && (
-              <div className="absolute top-full left-0 mt-1 w-48 bg-popover border border-border rounded-md shadow-lg z-50">
+              <div className="absolute left-0 top-full z-50 mt-1 w-48 overflow-hidden rounded-md border border-border/80 bg-popover shadow-[0_12px_36px_hsl(var(--background)/0.65),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]">
                 {loading ? (
-                  <div className="py-1 px-3 space-y-2">
+                  <div className="space-y-2 px-3 py-1">
                     <Skeleton className="h-8 w-full" />
                     <Skeleton className="h-8 w-full" />
                     <Skeleton className="h-8 w-full" />
@@ -193,11 +193,11 @@ export function TerminalTabBar({
                         key={shell.name}
                         onClick={() => handleSelectShell(shell)}
                         className={cn(
-                          'w-full px-3 py-2 text-left text-sm hover:bg-secondary flex items-center gap-2',
+                          'flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors duration-150 hover:bg-secondary',
                           isPreferredShell(shell, defaultShell) && 'text-primary'
                         )}
                       >
-                        <TerminalIcon size={12} />
+                        <TerminalIcon size={14} />
                         <span>{shell.displayName}</span>
                         {isPreferredShell(shell, defaultShell) && (
                           <span className="ml-auto text-xs text-muted-foreground">
@@ -300,13 +300,13 @@ function TerminalTab({ terminal, isActive, onSelect, onClose, onRename }: Termin
       <div
         onClick={onSelect}
         className={cn(
-          'h-full px-3 flex items-center border-r border-border min-w-[100px] cursor-pointer group transition-colors',
+          'group flex h-full min-w-[100px] cursor-pointer items-center border-r border-border/50 px-3 transition-colors duration-150',
           isActive
-            ? 'bg-background border-t-2 border-t-primary'
-            : 'hover:bg-secondary/50 text-muted-foreground'
+            ? 'z-[1] -mb-px bg-background text-foreground shadow-[inset_0_1px_0_0_hsl(var(--primary)/0.55)]'
+            : 'text-muted-foreground hover:bg-secondary/40 hover:text-foreground'
         )}
       >
-        <TerminalIcon size={12} className={cn('mr-2', isActive ? 'text-primary' : '')} />
+        <TerminalIcon size={14} className={cn('mr-2', isActive ? 'text-primary' : '')} />
         {isEditing ? (
           <input
             ref={inputRef}
@@ -342,7 +342,7 @@ function TerminalTab({ terminal, isActive, onSelect, onClose, onRename }: Termin
             e.stopPropagation()
             onClose()
           }}
-          className="ml-auto p-0.5 rounded-md text-muted-foreground opacity-70 hover:bg-secondary hover:text-foreground group-hover:opacity-100 transition-opacity"
+          className="ml-auto rounded-md p-0.5 text-muted-foreground opacity-70 transition-opacity duration-150 hover:bg-secondary hover:text-foreground group-hover:opacity-100"
           aria-label={t('terminalTabs.closeTerminal', { name: terminal.name })}
         >
           <X size={11} />

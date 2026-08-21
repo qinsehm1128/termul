@@ -58,10 +58,10 @@ export function EditorTab({
       <div
         onClick={onSelect}
         className={cn(
-          'h-full px-3 flex items-center border-r border-border min-w-[100px] cursor-pointer group transition-colors border-b-2 border-b-transparent',
+          'group flex h-full min-w-[100px] cursor-pointer items-center border-r border-border border-b-2 border-b-transparent px-3 transition-colors duration-150 ease-[var(--ease-out)]',
           isActive
             ? 'bg-background border-b-primary'
-            : 'hover:bg-secondary/50 text-muted-foreground'
+            : 'hover:bg-secondary/40 text-muted-foreground'
         )}
       >
         {isDirty && <span className="w-2 h-2 rounded-full bg-primary mr-1.5 flex-shrink-0" />}
@@ -71,7 +71,7 @@ export function EditorTab({
           isDirectory={false}
           isExpanded={false}
           depth={0}
-          size={12}
+          size={14}
           className="mr-2"
         />
         <span className={cn('text-2xs font-medium truncate', isActive && 'text-foreground')}>
@@ -95,7 +95,7 @@ export function EditorTab({
                   : t('tabs.closeTab')
           }
           className={cn(
-            'ml-auto p-0.5 rounded-md transition-opacity flex-shrink-0',
+            'ml-auto shrink-0 rounded-md p-0.5 transition-opacity duration-150 ease-[var(--ease-out)]',
             showStatusIndicator
               ? 'opacity-100'
               : 'hover:bg-secondary opacity-0 group-hover:opacity-100',

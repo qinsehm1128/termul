@@ -3,6 +3,7 @@ import type { ThemeAppearance, ThemePalette } from './types'
 
 export interface DerivedSurfaces {
   card: string
+  popover: string
   secondary: string
   muted: string
   border: string
@@ -17,6 +18,7 @@ export function deriveSurfaces(
   if (appearance === 'light') {
     return {
       card: darkenHex(palette.neutral, 0.015),
+      popover: darkenHex(palette.neutral, 0.028),
       secondary: darkenHex(palette.neutral, 0.035),
       muted: darkenHex(palette.neutral, 0.055),
       border: darkenHex(palette.neutral, 0.09),
@@ -26,6 +28,7 @@ export function deriveSurfaces(
 
   return {
     card: lightenHex(palette.neutral, 0.025),
+    popover: lightenHex(palette.neutral, 0.04),
     secondary: lightenHex(palette.neutral, 0.045),
     muted: lightenHex(palette.neutral, 0.065),
     border: lightenHex(palette.neutral, 0.09),

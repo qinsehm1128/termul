@@ -144,18 +144,18 @@ export default function WorkspaceSnapshots(): React.JSX.Element {
     <>
       <main className="flex-1 flex flex-col min-w-0">
         {/* Header */}
-        <div className="h-14 bg-card border-b border-border flex items-center justify-between px-6">
-          <div className="flex items-center">
-            <h1 className="text-lg font-semibold text-foreground flex items-center gap-2">
-              <span className={cn('w-3 h-3 rounded-full shadow-sm', colors.bg, colors.shadow)} />
+        <div className="flex h-9 shrink-0 items-center justify-between border-b border-border/70 bg-sidebar px-3 shadow-[inset_0_1px_0_hsl(var(--foreground)/0.025)]">
+          <div className="flex min-w-0 items-center">
+            <h1 className="flex items-center gap-2 truncate text-sm font-medium text-foreground">
+              <span className={cn('h-2.5 w-2.5 rounded-full', colors.bg)} />
               {activeProject?.name}
-              <span className="text-border text-lg mx-1">/</span>
-              <span className="text-secondary-foreground font-normal">{t('snapshots.title')}</span>
+              <span className="mx-0.5 text-muted-foreground/50">/</span>
+              <span className="font-normal text-secondary-foreground">{t('snapshots.title')}</span>
             </h1>
           </div>
           <button
             onClick={() => setIsCreateSnapshotModalOpen(true)}
-            className="bg-primary hover:bg-primary/90 text-primary-foreground text-sm font-medium py-1.5 px-3 rounded shadow-lg shadow-primary/20 transition-all flex items-center"
+            className="inline-flex h-8 items-center rounded-md bg-primary px-2.5 text-xs font-medium text-primary-foreground transition-colors duration-150 hover:bg-primary/90"
           >
             <Camera size={14} className="mr-2" />
             {t('snapshots.createNew')}
@@ -176,7 +176,7 @@ export default function WorkspaceSnapshots(): React.JSX.Element {
                 </p>
                 <button
                   onClick={() => setIsCreateSnapshotModalOpen(true)}
-                  className="bg-primary hover:bg-primary/90 text-primary-foreground text-sm font-medium py-1.5 px-3 rounded shadow-lg shadow-primary/20 transition-all flex items-center"
+                  className="inline-flex h-8 items-center rounded-md bg-primary px-2.5 text-xs font-medium text-primary-foreground transition-colors duration-150 hover:bg-primary/90"
                 >
                   <Camera size={14} className="mr-2" />
                   {t('snapshots.createFirst')}
@@ -244,7 +244,7 @@ function SnapshotCard({
 }: SnapshotCardProps): React.JSX.Element {
   const { t } = useTranslation('workspace')
   return (
-    <div className="group bg-card/50 border border-border rounded-lg p-4 flex items-start gap-5 hover:border-muted-foreground/50 transition-colors">
+    <div className="group flex items-start gap-5 rounded-md bg-secondary/25 p-4 shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.035)] transition-colors duration-150 hover:bg-secondary/40">
       {/* Thumbnail */}
       <SnapshotThumbnail snapshot={snapshot} />
 
@@ -268,14 +268,14 @@ function SnapshotCard({
           </div>
           <div className="flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity">
             <button
-              className="p-1.5 text-muted-foreground hover:text-foreground hover:bg-secondary rounded transition-colors"
+              className="rounded-md p-1.5 text-muted-foreground transition-colors duration-150 hover:bg-secondary hover:text-foreground"
               title={t('snapshots.rename')}
             >
               <Edit2 size={14} />
             </button>
             <button
               onClick={() => onDelete(snapshot)}
-              className="p-1.5 text-muted-foreground hover:text-destructive hover:bg-destructive/10 rounded transition-colors"
+              className="rounded-md p-1.5 text-muted-foreground transition-colors duration-150 hover:bg-destructive/10 hover:text-destructive"
               title={t('snapshots.delete')}
             >
               <Trash2 size={14} />
@@ -302,10 +302,10 @@ function SnapshotCard({
       </div>
 
       {/* Restore Button */}
-      <div className="flex flex-col justify-center self-center pl-4 border-l border-border h-16">
+      <div className="flex flex-col justify-center self-center border-l border-border/70 pl-4">
         <button
           onClick={() => onRestore(snapshot)}
-          className="bg-card hover:bg-secondary text-foreground text-xs font-medium py-1.5 px-3 rounded border border-border transition-colors flex items-center gap-2 shadow-sm"
+          className="inline-flex h-8 items-center gap-2 rounded-md bg-secondary/50 px-3 text-xs font-medium text-foreground transition-colors duration-150 hover:bg-secondary"
         >
           <RotateCcw size={14} />
           {t('snapshots.restore')}
@@ -342,7 +342,7 @@ function SnapshotThumbnail({ snapshot }: { snapshot: Snapshot }) {
   }
 
   return (
-    <div className="w-40 h-24 bg-black rounded border border-border relative overflow-hidden flex-shrink-0 shadow-inner p-1">
+    <div className="relative h-24 w-40 shrink-0 overflow-hidden rounded-md bg-black p-1 shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.04)]">
       <div className="flex flex-col gap-0.5">
         {getLines().map((line, i) => (
           <div

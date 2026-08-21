@@ -716,8 +716,8 @@ export function GitPanel({ cwd, isVisible }: GitPanelProps) {
     return (
       <div className="flex h-full w-full bg-background overflow-hidden">
         {selectedFile ? (
-          <div className="flex w-full flex-col min-w-0 bg-card/30">
-            <div className="border-b border-border bg-background p-3 flex items-center justify-between gap-2">
+          <div className="flex min-w-0 w-full flex-col bg-background">
+            <div className="flex h-9 items-center justify-between gap-2 border-b border-border/70 bg-sidebar px-2.5 shadow-[inset_0_1px_0_hsl(var(--foreground)/0.025)]">
               <Button
                 type="button"
                 variant="ghost"
@@ -734,7 +734,7 @@ export function GitPanel({ cwd, isVisible }: GitPanelProps) {
               </div>
               <div className="flex items-center gap-2 shrink-0">
                 <div
-                  className="flex items-center rounded-md border border-border p-0.5"
+                  className="flex items-center rounded-md bg-secondary/35 p-0.5 shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.035)]"
                   role="group"
                   aria-label={t('diff.viewMode')}
                 >
@@ -800,8 +800,8 @@ export function GitPanel({ cwd, isVisible }: GitPanelProps) {
             </ScrollArea>
           </div>
         ) : (
-          <div className="flex w-full flex-col shrink-0">
-            <div className="p-3 border-b border-border flex flex-col gap-2 bg-muted/20">
+          <div className="flex w-full shrink-0 flex-col bg-sidebar">
+            <div className="flex flex-col gap-1.5 border-b border-border/70 bg-sidebar px-2.5 py-1.5 shadow-[inset_0_1px_0_hsl(var(--foreground)/0.025)]">
               <div className="flex items-center justify-between">
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
@@ -810,7 +810,7 @@ export function GitPanel({ cwd, isVisible }: GitPanelProps) {
                       size="sm"
                       className="h-8 px-2 font-medium text-xs flex items-center gap-1.5 max-w-[190px] truncate hover:bg-secondary"
                     >
-                      <GitBranch size={13} className="text-muted-foreground shrink-0" />
+                      <GitBranch size={14} className="shrink-0 text-muted-foreground" />
                       <span className="truncate">
                         {commitContext?.branch ?? t('branch.detachedHead')}
                       </span>
@@ -822,7 +822,7 @@ export function GitPanel({ cwd, isVisible }: GitPanelProps) {
                   </DropdownMenuTrigger>
                   <DropdownMenuContent
                     align="start"
-                    className="w-56 max-h-[300px] overflow-y-auto z-50"
+                    className="z-50 max-h-[300px] w-56 overflow-y-auto shadow-[0_12px_36px_hsl(var(--background)/0.65),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]"
                   >
                     <DropdownMenuItem
                       onClick={() => setIsCreateBranchOpen(true)}
@@ -878,7 +878,7 @@ export function GitPanel({ cwd, isVisible }: GitPanelProps) {
                   type="text"
                   placeholder={t('changes.filterPlaceholder')}
                   aria-label={t('changes.filterLabel')}
-                  className="w-full bg-secondary/50 border-none rounded-md py-1.5 pl-8 pr-3 text-xs focus:ring-1 focus:ring-primary outline-none"
+                  className="h-8 w-full rounded-md border-0 bg-secondary/35 py-1.5 pl-8 pr-3 text-xs outline-none transition-[background-color] duration-150 placeholder:text-muted-foreground/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                 />
@@ -994,7 +994,7 @@ export function GitPanel({ cwd, isVisible }: GitPanelProps) {
                       {stashes.map((s) => (
                         <div
                           key={s.index}
-                          className="group flex w-full min-w-0 items-center justify-between px-2 py-1.5 rounded hover:bg-secondary/40 text-xs text-foreground cursor-default transition-all"
+                          className="group flex w-full min-w-0 cursor-default items-center justify-between rounded-sm px-2 py-1.5 text-xs text-foreground transition-colors duration-150 hover:bg-sidebar-accent/50"
                         >
                           <div className="flex flex-col min-w-0 flex-1 pr-1.5">
                             <span className="font-semibold text-muted-foreground text-3xs">{`stash@{${s.index}}`}</span>
@@ -1043,12 +1043,12 @@ export function GitPanel({ cwd, isVisible }: GitPanelProps) {
             </ScrollArea>
 
             {/* Commit footer (GitHub Desktop style) */}
-            <div className="border-t border-border p-3 space-y-2 bg-background/60">
+            <div className="space-y-2 border-t border-border/70 bg-secondary/25 p-3">
               <input
                 type="text"
                 aria-label={t('commit.summaryLabel')}
                 placeholder={amend ? t('commit.updateMessage') : t('commit.summaryRequired')}
-                className="w-full bg-secondary/50 border-none rounded-md py-1.5 px-3 text-xs focus:ring-1 focus:ring-primary outline-none"
+                className="h-8 w-full rounded-md border-0 bg-secondary/35 px-3 py-1.5 text-xs outline-none transition-[background-color] duration-150 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
                 value={summary}
                 onChange={(e) => setSummary(e.target.value)}
                 disabled={isCommitting || isGenerating}
@@ -1057,7 +1057,7 @@ export function GitPanel({ cwd, isVisible }: GitPanelProps) {
                 aria-label={t('commit.descriptionLabel')}
                 placeholder={t('commit.descriptionOptional')}
                 rows={3}
-                className="w-full resize-none bg-secondary/50 border-none rounded-md py-1.5 px-3 text-xs focus:ring-1 focus:ring-primary outline-none"
+                className="w-full resize-none rounded-md border-0 bg-secondary/35 px-3 py-1.5 text-xs outline-none transition-[background-color] duration-150 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
                 value={description}
                 onChange={(e) => setDescription(e.target.value)}
                 disabled={isCommitting || isGenerating}
@@ -1193,7 +1193,7 @@ export function GitPanel({ cwd, isVisible }: GitPanelProps) {
                 <label className="text-muted-foreground">{t('branch.nameLabel')}</label>
                 <input
                   type="text"
-                  className="w-full bg-secondary/50 border-none rounded-md py-1.5 px-3 focus:ring-1 focus:ring-primary outline-none text-xs"
+                  className="h-8 w-full rounded-md border-0 bg-secondary/35 px-3 py-1.5 text-xs outline-none transition-[background-color] duration-150 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
                   placeholder={t('branch.namePlaceholder')}
                   value={branchNameInput}
                   onChange={(e) => setBranchNameInput(e.target.value)}
@@ -1226,7 +1226,7 @@ export function GitPanel({ cwd, isVisible }: GitPanelProps) {
                 <label className="text-muted-foreground">{t('stash.messageOptional')}</label>
                 <input
                   type="text"
-                  className="w-full bg-secondary/50 border-none rounded-md py-1.5 px-3 focus:ring-1 focus:ring-primary outline-none text-xs"
+                  className="h-8 w-full rounded-md border-0 bg-secondary/35 px-3 py-1.5 text-xs outline-none transition-[background-color] duration-150 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
                   placeholder={t('stash.placeholder')}
                   value={stashMessage}
                   onChange={(e) => setStashMessage(e.target.value)}
@@ -1300,8 +1300,8 @@ export function GitPanel({ cwd, isVisible }: GitPanelProps) {
   return (
     <div className="flex h-full w-full bg-background overflow-hidden">
       {/* File List Sidebar */}
-      <div className="w-80 border-r border-border flex flex-col shrink-0">
-        <div className="p-3 border-b border-border flex flex-col gap-2 bg-muted/20">
+      <div className="flex w-80 shrink-0 flex-col border-r border-border/70 bg-sidebar shadow-[inset_-1px_0_0_hsl(var(--background)/0.35)]">
+        <div className="flex flex-col gap-1.5 border-b border-border/70 bg-sidebar px-2.5 py-1.5 shadow-[inset_0_1px_0_hsl(var(--foreground)/0.025)]">
           <div className="flex items-center justify-between">
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
@@ -1310,7 +1310,7 @@ export function GitPanel({ cwd, isVisible }: GitPanelProps) {
                   size="sm"
                   className="h-8 px-2 font-medium text-xs flex items-center gap-1.5 max-w-[190px] truncate hover:bg-secondary"
                 >
-                  <GitBranch size={13} className="text-muted-foreground shrink-0" />
+                  <GitBranch size={14} className="shrink-0 text-muted-foreground" />
                   <span className="truncate">
                     {commitContext?.branch ?? t('branch.detachedHead')}
                   </span>
@@ -1319,7 +1319,7 @@ export function GitPanel({ cwd, isVisible }: GitPanelProps) {
               </DropdownMenuTrigger>
               <DropdownMenuContent
                 align="start"
-                className="w-56 max-h-[300px] overflow-y-auto z-50"
+                className="z-50 max-h-[300px] w-56 overflow-y-auto shadow-[0_12px_36px_hsl(var(--background)/0.65),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]"
               >
                 <DropdownMenuItem
                   onClick={() => setIsCreateBranchOpen(true)}
@@ -1373,7 +1373,7 @@ export function GitPanel({ cwd, isVisible }: GitPanelProps) {
               type="text"
               placeholder={t('changes.filterPlaceholder')}
               aria-label={t('changes.filterLabel')}
-              className="w-full bg-secondary/50 border-none rounded-md py-1.5 pl-8 pr-3 text-xs focus:ring-1 focus:ring-primary outline-none"
+              className="h-8 w-full rounded-md border-0 bg-secondary/35 py-1.5 pl-8 pr-3 text-xs outline-none transition-[background-color] duration-150 placeholder:text-muted-foreground/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
             />
@@ -1484,7 +1484,7 @@ export function GitPanel({ cwd, isVisible }: GitPanelProps) {
                   {stashes.map((s) => (
                     <div
                       key={s.index}
-                      className="group flex w-full min-w-0 items-center justify-between px-2 py-1.5 rounded hover:bg-secondary/40 text-xs text-foreground cursor-default transition-all"
+                      className="group flex w-full min-w-0 cursor-default items-center justify-between rounded-sm px-2 py-1.5 text-xs text-foreground transition-colors duration-150 hover:bg-sidebar-accent/50"
                     >
                       <div className="flex flex-col min-w-0 flex-1 pr-1.5">
                         <span className="font-semibold text-muted-foreground text-3xs">{`stash@{${s.index}}`}</span>
@@ -1533,12 +1533,12 @@ export function GitPanel({ cwd, isVisible }: GitPanelProps) {
         </ScrollArea>
 
         {/* Commit footer (GitHub Desktop style) */}
-        <div className="border-t border-border p-3 space-y-2 bg-background/60">
+        <div className="space-y-2 border-t border-border/70 bg-secondary/25 p-3">
           <input
             type="text"
             aria-label={t('commit.summaryLabel')}
             placeholder={amend ? t('commit.updateMessage') : t('commit.summaryRequired')}
-            className="w-full bg-secondary/50 border-none rounded-md py-1.5 px-3 text-xs focus:ring-1 focus:ring-primary outline-none"
+            className="h-8 w-full rounded-md border-0 bg-secondary/35 px-3 py-1.5 text-xs outline-none transition-[background-color] duration-150 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
             value={summary}
             onChange={(e) => setSummary(e.target.value)}
             disabled={isCommitting || isGenerating}
@@ -1547,7 +1547,7 @@ export function GitPanel({ cwd, isVisible }: GitPanelProps) {
             aria-label={t('commit.descriptionLabel')}
             placeholder={t('commit.descriptionOptional')}
             rows={3}
-            className="w-full resize-none bg-secondary/50 border-none rounded-md py-1.5 px-3 text-xs focus:ring-1 focus:ring-primary outline-none"
+            className="w-full resize-none rounded-md border-0 bg-secondary/35 px-3 py-1.5 text-xs outline-none transition-[background-color] duration-150 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
             value={description}
             onChange={(e) => setDescription(e.target.value)}
             disabled={isCommitting || isGenerating}
@@ -1637,17 +1637,17 @@ export function GitPanel({ cwd, isVisible }: GitPanelProps) {
       </div>
 
       {/* Diff View */}
-      <div className="flex-1 flex flex-col min-w-0 bg-card/30">
+      <div className="flex min-w-0 flex-1 flex-col bg-background">
         {selectedFile ? (
           <>
-            <div className="p-3 border-b border-border flex items-center justify-between gap-2 bg-background">
+            <div className="flex h-9 items-center justify-between gap-2 border-b border-border/70 bg-sidebar px-2.5 shadow-[inset_0_1px_0_hsl(var(--foreground)/0.025)]">
               <div className="flex items-center gap-3 overflow-hidden min-w-0">
                 <FileCode size={16} className="text-primary shrink-0" />
                 <span className="text-sm font-medium truncate">{selectedFile}</span>
               </div>
               <div className="flex items-center gap-2 shrink-0">
                 <div
-                  className="flex items-center rounded-md border border-border p-0.5"
+                  className="flex items-center rounded-md bg-secondary/35 p-0.5 shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.035)]"
                   role="group"
                   aria-label={t('diff.viewMode')}
                 >
@@ -1770,7 +1770,7 @@ export function GitPanel({ cwd, isVisible }: GitPanelProps) {
               <label className="text-muted-foreground">{t('branch.nameLabel')}</label>
               <input
                 type="text"
-                className="w-full bg-secondary/50 border-none rounded-md py-1.5 px-3 focus:ring-1 focus:ring-primary outline-none text-xs"
+                className="h-8 w-full rounded-md border-0 bg-secondary/35 px-3 py-1.5 text-xs outline-none transition-[background-color] duration-150 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
                 placeholder={t('branch.namePlaceholder')}
                 value={branchNameInput}
                 onChange={(e) => setBranchNameInput(e.target.value)}
@@ -1803,7 +1803,7 @@ export function GitPanel({ cwd, isVisible }: GitPanelProps) {
               <label className="text-muted-foreground">{t('stash.messageOptional')}</label>
               <input
                 type="text"
-                className="w-full bg-secondary/50 border-none rounded-md py-1.5 px-3 focus:ring-1 focus:ring-primary outline-none text-xs"
+                className="h-8 w-full rounded-md border-0 bg-secondary/35 px-3 py-1.5 text-xs outline-none transition-[background-color] duration-150 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
                 placeholder={t('stash.placeholder')}
                 value={stashMessage}
                 onChange={(e) => setStashMessage(e.target.value)}
@@ -2060,12 +2060,12 @@ function FileItem({
       onKeyDown={handleKeyDown}
       aria-selected={isSelected || isActive}
       className={cn(
-        'group/row flex w-full items-center gap-3 px-3 py-2 rounded-md text-left cursor-pointer transition-colors select-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/60',
+        'group/row flex h-7 w-full cursor-pointer select-none items-center gap-3 rounded-sm px-2 text-left transition-colors duration-150 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring',
         isSelected
-          ? 'bg-primary/15 text-foreground'
+          ? 'bg-sidebar-accent text-foreground ring-1 ring-inset ring-primary/35'
           : isActive
-            ? 'bg-primary/10 text-primary'
-            : 'hover:bg-secondary/80 text-muted-foreground hover:text-foreground'
+            ? 'bg-sidebar-accent/80 text-foreground ring-1 ring-inset ring-ring/40'
+            : 'text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground'
       )}
     >
       <GitStatusBadge status={file.status} />

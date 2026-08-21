@@ -58,7 +58,7 @@ export function SSHFileEditor({ connectionId }: SSHFileEditorProps): React.JSX.E
   return (
     <>
       <div className="flex-1 flex flex-col">
-        <div className="h-8 flex items-center justify-between px-3 border-b border-border bg-muted/30">
+        <div className="flex h-8 items-center justify-between border-b border-border/70 bg-secondary/20 px-3">
           <div className="flex items-center gap-2">
             <FileEdit className="h-3 w-3 text-muted-foreground" />
             <span className="text-2xs font-mono text-muted-foreground">{editingFile.name}</span>
@@ -68,12 +68,12 @@ export function SSHFileEditor({ connectionId }: SSHFileEditorProps): React.JSX.E
               onClick={handleSave}
               disabled={isSaving}
               className={cn(
-                'p-1 rounded transition-all duration-300',
+                'rounded-md p-1 transition-colors',
                 saveAnimating
-                  ? 'bg-green-500/20 text-green-500 scale-110'
+                  ? 'bg-success/20 text-success'
                   : isDirty
-                    ? 'bg-amber-500/20 text-amber-500'
-                    : 'hover:bg-accent text-muted-foreground'
+                    ? 'bg-warning/20 text-warning'
+                    : 'text-muted-foreground hover:bg-secondary hover:text-foreground'
               )}
               title={t('actions.save')}
             >
@@ -81,7 +81,7 @@ export function SSHFileEditor({ connectionId }: SSHFileEditorProps): React.JSX.E
             </button>
             <button
               onClick={handleClose}
-              className="p-1 rounded hover:bg-accent text-muted-foreground"
+              className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
               title={t('actions.close')}
             >
               <X className="h-3 w-3" />
@@ -91,29 +91,31 @@ export function SSHFileEditor({ connectionId }: SSHFileEditorProps): React.JSX.E
         <textarea
           value={editingContent}
           onChange={(e) => setStoreContent(e.target.value)}
-          className="flex-1 w-full p-3 text-xs font-mono bg-background resize-none focus:outline-none"
+          className="w-full flex-1 resize-none bg-card p-3 font-mono text-xs text-foreground outline-none"
           spellCheck={false}
         />
       </div>
 
       {confirmClose && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-          <div className="bg-background border border-border rounded-lg shadow-lg w-[340px] p-4">
-            <h3 className="text-sm font-semibold mb-2">{t('fileEditor.unsavedTitle')}</h3>
-            <p className="text-xs text-muted-foreground mb-4">
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-[2px]">
+          <div className="w-[340px] overflow-hidden rounded-md border border-border/80 bg-card p-4 shadow-[0_18px_60px_hsl(var(--background)/0.7),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]">
+            <h3 className="mb-2 text-xs font-semibold tracking-[-0.01em] text-foreground">
+              {t('fileEditor.unsavedTitle')}
+            </h3>
+            <p className="mb-4 text-xs text-muted-foreground">
               {t('fileEditor.unsavedMessage', { name: editingFile.name })}
             </p>
             <div className="flex justify-end gap-2">
               <button
                 onClick={() => setConfirmClose(false)}
-                className="px-3 py-1.5 text-xs rounded border border-border hover:bg-accent"
+                className="inline-flex h-8 items-center rounded-md px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary/60 hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               >
                 {t('fileEditor.continueEditing')}
               </button>
               <button
                 onClick={handleSave}
                 disabled={isSaving}
-                className="px-3 py-1.5 text-xs rounded bg-primary text-primary-foreground hover:bg-primary/90"
+                className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-50"
               >
                 {t('actions.save')}
               </button>
@@ -122,7 +124,7 @@ export function SSHFileEditor({ connectionId }: SSHFileEditorProps): React.JSX.E
                   setStoreFile(null)
                   setConfirmClose(false)
                 }}
-                className="px-3 py-1.5 text-xs rounded bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                className="inline-flex h-8 items-center rounded-md bg-destructive px-3 text-xs font-medium text-destructive-foreground transition-colors hover:bg-destructive/90 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               >
                 {t('actions.discard')}
               </button>

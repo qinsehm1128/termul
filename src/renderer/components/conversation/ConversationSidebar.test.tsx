@@ -142,6 +142,24 @@ describe('ConversationSidebar global navigation', () => {
     expect(onNewChat).toHaveBeenCalledTimes(1)
   })
 
+  it('uses the 28px project-rail row, lichen inset, and matching sidebar width', () => {
+    useConversationStore.getState().setActiveConversationId(projectlessId)
+    renderSidebar()
+
+    const sidebar = screen.getByText('Conversations').closest('aside')
+    expect(sidebar).toHaveClass('w-60')
+
+    const row = screen.getByText('Projectless chat').closest('[data-conversation-id]')
+    expect(row).toHaveClass('min-h-7', 'bg-sidebar-accent', 'ring-1', 'duration-150')
+    expect(row?.querySelector('[aria-current="page"]')).not.toBeNull()
+
+    const idle = screen.getByText('Attached chat').closest('[data-conversation-id]')
+    expect(idle).toHaveClass('min-h-7')
+    expect(idle).not.toHaveClass('bg-sidebar-accent')
+    expect(idle).toHaveTextContent('Demo project')
+    expect(row).toHaveTextContent('No project')
+  })
+
   it('renders the same global navigation controls from the Chinese locale', async () => {
     await i18n.changeLanguage('zh-CN')
     renderSidebar()

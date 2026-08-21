@@ -4,6 +4,10 @@ import { EditorView } from '@codemirror/view'
 import { tags } from '@lezer/highlight'
 import type { ResolvedSyntaxColors } from '@/lib/themes/types'
 
+/** Matches Tailwind `font-mono`. Terminal Nerd Font fallbacks stay out of this stack. */
+export const CODEMIRROR_MONO_FONT_FAMILY =
+  '"JetBrains Mono Variable", "JetBrains Mono", "Cascadia Code", "SF Mono", Menlo, Consolas, "Ubuntu Mono", "DejaVu Sans Mono", "Liberation Mono", monospace'
+
 const defaultDarkSyntax: ResolvedSyntaxColors = {
   keyword: '#c586c0',
   comment: '#6a9955',
@@ -71,7 +75,7 @@ export function createTermulTheme(
         },
         '.cm-content': {
           caretColor: 'hsl(var(--primary))',
-          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+          fontFamily: CODEMIRROR_MONO_FONT_FAMILY,
           fontSize: '13px',
           lineHeight: '1.6'
         },

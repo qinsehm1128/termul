@@ -107,9 +107,11 @@ export function FileTreeNode({
           <div
             data-path={entry.path}
             className={cn(
-              'group relative flex min-w-0 items-center h-7 cursor-pointer text-sm hover:bg-secondary/50 transition-colors select-none',
+              'group relative flex h-7 min-w-0 cursor-pointer select-none items-center text-sm transition-colors duration-150 ease-[var(--ease-out)]',
               isIgnored && 'opacity-50',
-              isSelected && 'bg-accent text-accent-foreground'
+              isSelected
+                ? 'bg-sidebar-accent text-foreground ring-1 ring-inset ring-primary/35'
+                : 'hover:bg-sidebar-accent/50'
             )}
             title={isIgnored ? t('fileContext.gitIgnored', { name: entry.name }) : undefined}
             style={{ paddingLeft: depth * 16 + 4 }}
