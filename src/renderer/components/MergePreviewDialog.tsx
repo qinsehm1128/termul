@@ -75,17 +75,19 @@ export function MergePreviewDialog({
 
   return (
     <>
-      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-        <div className="w-[500px] max-w-[90vw] bg-popover border border-border rounded-lg shadow-2xl flex flex-col">
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-[2px]">
+        <div className="flex w-[500px] max-w-[90vw] flex-col overflow-hidden rounded-md border border-border/80 bg-popover shadow-[0_18px_60px_hsl(var(--background)/0.7),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]">
           {/* Header */}
-          <div className="flex items-center justify-between px-4 py-3 border-b border-border">
+          <div className="flex h-9 items-center justify-between border-b border-border/70 px-3">
             <div className="flex items-center gap-2">
               <GitMerge size={14} className="text-primary" />
-              <h2 className="text-sm font-semibold text-foreground">{t('mergePreview.title')}</h2>
+              <h2 className="text-xs font-semibold tracking-[-0.01em] text-foreground">
+                {t('mergePreview.title')}
+              </h2>
             </div>
             <button
               onClick={onClose}
-              className="h-6 w-6 flex items-center justify-center rounded hover:bg-secondary text-muted-foreground"
+              className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
             >
               <X size={12} />
             </button>
@@ -124,8 +126,8 @@ export function MergePreviewDialog({
                   className={cn(
                     'text-3xs px-1.5 py-0.5 rounded font-medium',
                     preview.detectionMode === 'accurate'
-                      ? 'bg-green-500/10 text-green-500'
-                      : 'bg-yellow-500/10 text-yellow-500'
+                      ? 'bg-success/10 text-success'
+                      : 'bg-warning/10 text-warning'
                   )}
                 >
                   {t(detectionModeKey(preview.detectionMode))}
@@ -143,7 +145,7 @@ export function MergePreviewDialog({
                   <span
                     className={cn(
                       'font-medium',
-                      preview.conflictFiles.length > 0 ? 'text-destructive' : 'text-green-500'
+                      preview.conflictFiles.length > 0 ? 'text-destructive' : 'text-success'
                     )}
                   >
                     {preview.conflictFiles.length}
@@ -170,8 +172,8 @@ export function MergePreviewDialog({
                           file.severity === 'high'
                             ? 'bg-destructive/10 text-destructive'
                             : file.severity === 'medium'
-                              ? 'bg-yellow-500/10 text-yellow-500'
-                              : 'bg-green-500/10 text-green-500'
+                              ? 'bg-warning/10 text-warning'
+                              : 'bg-success/10 text-success'
                         )}
                       >
                         {t(conflictSeverityKey(file.severity))}
@@ -207,18 +209,18 @@ export function MergePreviewDialog({
               )}
 
               {/* Actions */}
-              <div className="flex gap-2 pt-2 border-t border-border">
+              <div className="flex gap-2 border-t border-border/70 pt-2">
                 {preview.conflictFiles.length > 0 ? (
                   <>
                     <button
                       onClick={handleResolveConflicts}
-                      className="flex-1 px-3 py-1.5 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
+                      className="inline-flex h-8 flex-1 items-center justify-center rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                     >
                       {t('mergePreview.resolve')}
                     </button>
                     <button
                       onClick={handleAiHelp}
-                      className="px-3 py-1.5 rounded-md text-xs font-medium bg-secondary text-muted-foreground hover:text-foreground transition-colors"
+                      className="inline-flex h-8 items-center rounded-md bg-secondary/50 px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                     >
                       {t('mergePreview.aiHelp')}
                     </button>
@@ -226,14 +228,14 @@ export function MergePreviewDialog({
                 ) : (
                   <button
                     onClick={onExecuteMerge}
-                    className="flex-1 px-3 py-1.5 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
+                    className="inline-flex h-8 flex-1 items-center justify-center rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                   >
                     {t('mergePreview.execute')}
                   </button>
                 )}
                 <button
                   onClick={onClose}
-                  className="px-3 py-1.5 rounded-md text-xs font-medium bg-secondary text-muted-foreground hover:text-foreground transition-colors"
+                  className="inline-flex h-8 items-center rounded-md px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary/60 hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                 >
                   {t('mergePreview.cancel')}
                 </button>
@@ -241,7 +243,7 @@ export function MergePreviewDialog({
 
               {/* Conflict resolution panel */}
               {showConflictPanel && preview.conflictFiles.length > 0 && (
-                <div className="pt-2 border-t border-border">
+                <div className="border-t border-border/70 pt-2">
                   <ConflictResolutionPanel
                     conflictFiles={preview.conflictFiles.map((f) => f.path)}
                     sourceBranch={preview.sourceBranch}

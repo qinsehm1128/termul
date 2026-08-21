@@ -1604,7 +1604,7 @@ export function AgentLauncher({
           {/* biome-ignore lint/a11y/noStaticElementInteractions: drop zone for attachments; the file picker button is the accessible path */}
           <div
             data-agent-launcher-composer="true"
-            className="relative z-10 rounded-lg border border-border/70 bg-card/90 transition-[border-color,background-color] focus-within:border-foreground/20 focus-within:bg-card"
+            className="relative z-10 rounded-md bg-secondary/25 shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.05)] transition-[background-color,box-shadow] duration-150 focus-within:bg-secondary/40 focus-within:shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.08)]"
             onDragOver={canDropPaste ? (e) => e.preventDefault() : undefined}
             onDrop={
               canDropPaste
@@ -1817,7 +1817,7 @@ export function AgentLauncher({
                   onClick={() => launch()}
                   disabled={!canLaunch}
                   className={cn(
-                    'flex size-[34px] shrink-0 items-center justify-center rounded-lg transition-colors',
+                    'flex size-8 shrink-0 items-center justify-center rounded-md transition-colors duration-150',
                     canLaunch
                       ? 'bg-foreground text-background hover:bg-foreground/90'
                       : 'cursor-not-allowed bg-muted text-muted-foreground'
@@ -1825,7 +1825,7 @@ export function AgentLauncher({
                   aria-label={t('launcher.startChat', 'Start agent chat')}
                   title={t('launcher.startChat', 'Start agent chat')}
                 >
-                  <ArrowUp size={18} />
+                  <ArrowUp size={16} />
                 </button>
               </div>
             </div>
@@ -1833,7 +1833,7 @@ export function AgentLauncher({
           {canUseWorktree && (
             <div
               data-agent-launcher-context-strip="true"
-              className="relative z-0 mx-auto -mt-4 flex w-[calc(100%-2.75rem)] min-w-0 items-center justify-between gap-2 rounded-b-2xl border border-t-0 border-border/60 bg-card/60 px-2 pb-1 pt-5"
+              className="relative z-0 mx-auto -mt-4 flex w-[calc(100%-2.75rem)] min-w-0 items-center justify-between gap-2 rounded-b-md bg-secondary/20 px-2 pb-1 pt-5 shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.03)]"
             >
               {!activeConversation && activeGroupProjects.length > 1 && (
                 <Select value={selectedProjectId ?? ''} onValueChange={setGroupProject}>
@@ -2182,7 +2182,11 @@ function AcpAgentPicker({
           <span className="truncate">{label}</span>
         </ComposerPill>
       </PopoverTrigger>
-      <PopoverContent align="end" side="top" className="w-72 p-1">
+      <PopoverContent
+        align="end"
+        side="top"
+        className="w-72 p-1 shadow-[0_12px_36px_hsl(var(--background)/0.65),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]"
+      >
         <div className="px-2 py-1 text-3xs font-semibold uppercase tracking-wide text-muted-foreground/70">
           {t('launcher.agentPicker', 'ACP Agent')}
         </div>
@@ -2326,7 +2330,11 @@ function AcpModelPicker({
           <span className="truncate">{label}</span>
         </ComposerPill>
       </PopoverTrigger>
-      <PopoverContent align="end" side="top" className="w-72 p-1">
+      <PopoverContent
+        align="end"
+        side="top"
+        className="w-72 p-1 shadow-[0_12px_36px_hsl(var(--background)/0.65),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]"
+      >
         <div className="px-2 py-1 text-3xs font-semibold uppercase tracking-wide text-muted-foreground/70">
           {t('common.model', 'Model')}
           {connecting && !setupError && (

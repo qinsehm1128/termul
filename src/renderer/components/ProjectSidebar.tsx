@@ -781,7 +781,7 @@ export function ProjectSidebar({
         <div className="flex items-center gap-0.5">
           <button
             onClick={handleCreateGroup}
-            className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 ease-[var(--ease-out)] hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
             title={t('newGroupFolder')}
             aria-label={t('newGroupFolder')}
           >
@@ -789,7 +789,7 @@ export function ProjectSidebar({
           </button>
           <button
             onClick={onNewProject}
-            className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 ease-[var(--ease-out)] hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
             title={t('newProject')}
             aria-label={t('newProject')}
             data-testid="header-new-project"
@@ -903,7 +903,7 @@ export function ProjectSidebar({
                               role="group"
                               aria-label={group.name}
                               className={cn(
-                                'mx-1 flex h-7 w-[calc(100%-0.5rem)] cursor-pointer select-none items-center rounded-sm px-1.5 text-left transition-colors hover:bg-sidebar-accent/50',
+                                'mx-1 flex h-7 w-[calc(100%-0.5rem)] cursor-pointer select-none items-center rounded-sm px-1.5 text-left transition-colors duration-150 ease-[var(--ease-out)] hover:bg-sidebar-accent/50',
                                 isActiveGroup &&
                                   'bg-sidebar-accent ring-1 ring-inset ring-primary/35',
                                 activeDragOverGroupId === group.id &&
@@ -1205,7 +1205,7 @@ export function ProjectSidebar({
                 <button
                   onClick={() => setShowArchived(!showArchived)}
                   disabled={isSearching}
-                  className="label-section mx-1 mt-1 flex h-7 w-[calc(100%-0.5rem)] items-center rounded-sm px-1.5 text-sidebar-foreground transition-colors hover:bg-sidebar-accent/50 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-default disabled:hover:bg-transparent"
+                  className="label-section mx-1 mt-1 flex h-7 w-[calc(100%-0.5rem)] items-center rounded-sm px-1.5 text-sidebar-foreground transition-colors duration-150 ease-[var(--ease-out)] hover:bg-sidebar-accent/50 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-default disabled:hover:bg-transparent"
                   aria-expanded={showArchived || isSearching}
                   aria-label={t('archivedToggleAria')}
                 >
@@ -1532,7 +1532,7 @@ const ProjectItem = memo(function ProjectItem({
               }
             }}
             className={cn(
-              'group mx-1 flex h-7 w-[calc(100%-0.5rem)] cursor-pointer select-none items-center rounded-sm px-1.5 text-left transition-colors',
+              'group mx-1 flex h-7 w-[calc(100%-0.5rem)] cursor-pointer select-none items-center rounded-sm px-1.5 text-left transition-colors duration-150 ease-[var(--ease-out)]',
               isActive
                 ? 'bg-sidebar-accent text-foreground ring-1 ring-inset ring-primary/35'
                 : 'text-sidebar-foreground hover:bg-sidebar-accent/50 hover:text-foreground'
@@ -1660,7 +1660,7 @@ function ArchivedProjectItem({
         <button
           onClick={onClick}
           onContextMenu={onContextMenu}
-          className="group mx-1 flex h-7 w-[calc(100%-0.5rem)] items-center rounded-sm px-1.5 text-left text-muted-foreground opacity-60 transition-[background-color,opacity] hover:bg-sidebar-accent/50 hover:opacity-100"
+          className="group mx-1 flex h-7 w-[calc(100%-0.5rem)] items-center rounded-sm px-1.5 text-left text-muted-foreground opacity-60 transition-[background-color,opacity] duration-150 ease-[var(--ease-out)] hover:bg-sidebar-accent/50 hover:opacity-100"
           aria-label={t('archivedProjectAria', { name: project.name })}
           data-testid={`archived-project-item-${project.id}`}
         >

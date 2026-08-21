@@ -1,5 +1,5 @@
 import type { BranchInfo } from '@shared/types/ipc.types'
-import { AnimatePresence, motion } from 'framer-motion'
+import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { AlertTriangle, GitBranch, Link2, Loader2, Search, Terminal, X } from 'lucide-react'
 import { type KeyboardEvent, useCallback, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -19,6 +19,7 @@ interface NewWorktreeModalProps {
 
 export function NewWorktreeModal({ isOpen, onClose, projectId }: NewWorktreeModalProps) {
   const { t } = useTranslation('agents')
+  const reducedMotion = useReducedMotion() ?? false
   const project = useProjectStore((state) => state.projects.find((p) => p.id === projectId))
   const isWorktreeOperationLocked = useProjectStore((state) => state.isWorktreeOperationLocked)
   const { addWorktree, setWorktreeOperationLock } = useProjectActions()
@@ -371,34 +372,36 @@ export function NewWorktreeModal({ isOpen, onClose, projectId }: NewWorktreeModa
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
-          className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-[2px]"
           onClick={onClose}
         >
           <motion.div
-            initial={{ opacity: 0, scale: 0.95, y: 10 }}
-            animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.95, y: 10 }}
-            transition={{ duration: 0.15 }}
-            className="bg-card rounded-lg shadow-2xl w-[520px] border border-border overflow-hidden"
+            initial={{ opacity: 0, y: reducedMotion ? 0 : -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: reducedMotion ? 0 : -6 }}
+            transition={{ duration: reducedMotion ? 0 : 0.15 }}
+            className="w-[520px] overflow-hidden rounded-md border border-border/80 bg-card shadow-[0_18px_60px_hsl(var(--background)/0.7),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]"
             onClick={(e) => e.stopPropagation()}
             onKeyDown={handleKeyDown}
           >
             {/* Header */}
-            <div className="px-4 py-3 border-b border-border flex justify-between items-center bg-secondary/50">
+            <div className="flex h-9 items-center justify-between border-b border-border/70 px-3">
               <div className="flex items-center gap-2">
                 <GitBranch size={14} className="text-primary" />
-                <h3 className="text-sm font-semibold text-foreground">{t('newWorktree.title')}</h3>
+                <h3 className="text-xs font-semibold tracking-[-0.01em] text-foreground">
+                  {t('newWorktree.title')}
+                </h3>
               </div>
               <button
                 onClick={onClose}
-                className="text-muted-foreground hover:text-foreground transition-colors"
+                className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               >
                 <X size={14} />
               </button>
             </div>
 
             {/* Content */}
-            <div className="p-4 space-y-4">
+            <div className="space-y-3 p-4">
               {/* Project name (read-only) */}
               <div>
                 <label className="block text-xs font-medium text-muted-foreground mb-1">
@@ -408,7 +411,7 @@ export function NewWorktreeModal({ isOpen, onClose, projectId }: NewWorktreeModa
                   type="text"
                   value={project.name}
                   readOnly
-                  className="w-full bg-secondary/50 border border-border rounded px-3 py-1.5 text-sm text-muted-foreground cursor-not-allowed"
+                  className="h-8 w-full cursor-not-allowed rounded-md border border-input/80 bg-secondary/50 px-2.5 text-sm text-muted-foreground"
                 />
               </div>
 
@@ -422,7 +425,7 @@ export function NewWorktreeModal({ isOpen, onClose, projectId }: NewWorktreeModa
                   value={worktreeName}
                   onChange={(e) => setWorktreeName(e.target.value)}
                   placeholder={t('newWorktree.namePlaceholder')}
-                  className="w-full bg-secondary border border-border rounded px-3 py-1.5 text-sm text-foreground focus:ring-1 focus:ring-primary outline-none placeholder-muted-foreground"
+                  className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:border-ring/70 focus-visible:ring-1 focus-visible:ring-ring/35"
                 />
                 <p className="text-3xs text-muted-foreground mt-0.5">{t('newWorktree.nameHint')}</p>
               </div>
@@ -452,10 +455,10 @@ export function NewWorktreeModal({ isOpen, onClose, projectId }: NewWorktreeModa
                       <button
                         onClick={() => setBranchType('new')}
                         className={cn(
-                          'flex-1 px-3 py-1.5 text-xs font-medium rounded border transition-colors',
+                          'inline-flex h-8 flex-1 items-center justify-center rounded-md border px-3 text-xs font-medium transition-colors',
                           branchType === 'new'
-                            ? 'bg-primary text-primary-foreground border-primary'
-                            : 'bg-secondary text-muted-foreground border-border hover:bg-muted'
+                            ? 'border-primary bg-primary text-primary-foreground'
+                            : 'border-border/80 bg-secondary/50 text-muted-foreground hover:bg-secondary hover:text-foreground'
                         )}
                       >
                         {t('newWorktree.newBranch')}
@@ -463,10 +466,10 @@ export function NewWorktreeModal({ isOpen, onClose, projectId }: NewWorktreeModa
                       <button
                         onClick={() => setBranchType('existing')}
                         className={cn(
-                          'flex-1 px-3 py-1.5 text-xs font-medium rounded border transition-colors',
+                          'inline-flex h-8 flex-1 items-center justify-center rounded-md border px-3 text-xs font-medium transition-colors',
                           branchType === 'existing'
-                            ? 'bg-primary text-primary-foreground border-primary'
-                            : 'bg-secondary text-muted-foreground border-border hover:bg-muted'
+                            ? 'border-primary bg-primary text-primary-foreground'
+                            : 'border-border/80 bg-secondary/50 text-muted-foreground hover:bg-secondary hover:text-foreground'
                         )}
                       >
                         {t('newWorktree.existingBranch')}
@@ -498,7 +501,7 @@ export function NewWorktreeModal({ isOpen, onClose, projectId }: NewWorktreeModa
                               value={branchSearch}
                               onChange={(e) => setBranchSearch(e.target.value)}
                               placeholder={t('newWorktree.searchBranches')}
-                              className="w-full bg-secondary border border-border rounded pl-7 pr-3 py-1 text-xs text-foreground focus:ring-1 focus:ring-primary outline-none placeholder-muted-foreground"
+                              className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 py-1 pl-7 pr-3 text-xs text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:border-ring/70 focus-visible:ring-1 focus-visible:ring-ring/35"
                             />
                           </div>
                           {/* Remote toggle */}
@@ -512,7 +515,7 @@ export function NewWorktreeModal({ isOpen, onClose, projectId }: NewWorktreeModa
                             {t('newWorktree.showRemote')}
                           </label>
                           {/* Branch list */}
-                          <div className="max-h-32 overflow-y-auto border border-border rounded bg-secondary/50">
+                          <div className="max-h-32 overflow-y-auto rounded-md border border-border/80 bg-secondary/50">
                             {sortedBranches.length === 0 ? (
                               <div className="p-2 text-xs text-muted-foreground text-center">
                                 {t('newWorktree.noBranches')}
@@ -569,7 +572,7 @@ export function NewWorktreeModal({ isOpen, onClose, projectId }: NewWorktreeModa
                               ? sanitizeBranchName(worktreeName)
                               : t('newWorktree.branchNamePlaceholder')
                           }
-                          className="w-full bg-secondary border border-border rounded px-3 py-1.5 text-sm text-foreground focus:ring-1 focus:ring-primary outline-none placeholder-muted-foreground"
+                          className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:border-ring/70 focus-visible:ring-1 focus-visible:ring-ring/35"
                         />
                         <p className="text-3xs text-muted-foreground mt-0.5">
                           {newBranchName && sanitizeBranchName(newBranchName) !== newBranchName
@@ -591,7 +594,7 @@ export function NewWorktreeModal({ isOpen, onClose, projectId }: NewWorktreeModa
                           value={startRef}
                           onChange={(e) => setStartRef(e.target.value)}
                           placeholder={t('newWorktree.startRefPlaceholder')}
-                          className="w-full bg-secondary border border-border rounded px-3 py-1.5 text-sm text-foreground focus:ring-1 focus:ring-primary outline-none placeholder-muted-foreground"
+                          className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:border-ring/70 focus-visible:ring-1 focus-visible:ring-ring/35"
                         />
                         <p className="text-3xs text-muted-foreground mt-0.5">
                           {t('newWorktree.defaultsToHead')}
@@ -607,7 +610,7 @@ export function NewWorktreeModal({ isOpen, onClose, projectId }: NewWorktreeModa
                 <label className="block text-xs font-medium text-muted-foreground mb-1">
                   {t('newWorktree.pathPreview')}
                 </label>
-                <code className="block text-3xs text-muted-foreground bg-secondary/50 border border-border rounded px-3 py-1.5 overflow-x-auto whitespace-nowrap">
+                <code className="block overflow-x-auto whitespace-nowrap rounded-md border border-border/80 bg-secondary/50 px-3 py-1.5 text-3xs text-muted-foreground">
                   {pathPreview}
                 </code>
               </div>
@@ -626,7 +629,7 @@ export function NewWorktreeModal({ isOpen, onClose, projectId }: NewWorktreeModa
                     <span className="text-3xs">{showSymlinkSection ? '▼' : '▶'}</span>
                   </button>
                   {showSymlinkSection && (
-                    <div className="mt-1.5 border border-border rounded bg-secondary/30 p-2 space-y-1">
+                    <div className="mt-1.5 space-y-1 rounded-md border border-border/80 bg-secondary/30 p-2">
                       {project.symlinkDirs.map((dir) => (
                         <label
                           key={dir}
@@ -659,7 +662,7 @@ export function NewWorktreeModal({ isOpen, onClose, projectId }: NewWorktreeModa
 
               {/* Validation error */}
               {validationError && (
-                <div className="flex items-start gap-2 text-xs text-red-500 bg-red-500/10 border border-red-500/20 rounded px-3 py-2">
+                <div className="flex items-start gap-2 rounded-md border border-destructive/35 bg-destructive/10 px-3 py-2 text-xs text-destructive">
                   <AlertTriangle size={12} className="flex-shrink-0 mt-0.5" />
                   {validationError}
                 </div>
@@ -667,7 +670,7 @@ export function NewWorktreeModal({ isOpen, onClose, projectId }: NewWorktreeModa
 
               {/* Pre-check warnings */}
               {!isGitRepo && (
-                <div className="flex items-start gap-2 text-xs text-amber-500 bg-amber-500/10 border border-amber-500/20 rounded px-3 py-2">
+                <div className="flex items-start gap-2 rounded-md border border-warning/35 bg-warning/10 px-3 py-2 text-xs text-warning">
                   <AlertTriangle size={12} className="flex-shrink-0 mt-0.5" />
                   {t('newWorktree.notGitWarning')}
                 </div>
@@ -675,17 +678,17 @@ export function NewWorktreeModal({ isOpen, onClose, projectId }: NewWorktreeModa
             </div>
 
             {/* Footer */}
-            <div className="px-4 py-3 bg-secondary/50 flex justify-end gap-2 border-t border-border">
+            <div className="flex h-10 items-center justify-end gap-2 border-t border-border/70 bg-secondary/20 px-4">
               <button
                 onClick={onClose}
-                className="px-3 py-1.5 text-xs font-medium text-muted-foreground hover:text-foreground transition-colors"
+                className="inline-flex h-8 items-center rounded-md px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary/60 hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               >
                 {t('newWorktree.cancel')}
               </button>
               <button
                 onClick={() => void handleCreate()}
                 disabled={!canProceed || isCreating || !worktreeName.trim()}
-                className="px-3 py-1.5 text-xs font-medium bg-primary text-primary-foreground rounded hover:bg-primary/90 shadow-md shadow-primary/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-1.5"
+                className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {isCreating && <Loader2 size={12} className="animate-spin" />}
                 {!isCreating && <Terminal size={12} />}

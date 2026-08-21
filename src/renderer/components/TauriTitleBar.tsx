@@ -43,7 +43,7 @@ export function TauriTitleBar(): React.JSX.Element {
 
   return (
     <header
-      className="h-8 flex items-center justify-between bg-card border-b border-border select-none shrink-0"
+      className="flex h-8 shrink-0 select-none items-center justify-between border-b border-border/70 bg-sidebar shadow-[inset_0_1px_0_hsl(var(--foreground)/0.025)]"
       data-tauri-drag-region
     >
       <span className="label-section text-muted-foreground px-3" data-tauri-drag-region>

@@ -568,22 +568,22 @@ export default function AppPreferences(): React.JSX.Element {
     <>
       <main className="flex-1 flex flex-col min-w-0 h-full relative">
         {/* Header */}
-        <div className="h-16 flex items-center justify-between px-8 border-b border-border bg-card flex-shrink-0">
-          <div>
-            <h1 className="text-xl font-semibold text-foreground leading-tight">
+        <div className="flex h-9 shrink-0 items-center justify-between border-b border-border/70 bg-sidebar px-3 shadow-[inset_0_1px_0_hsl(var(--foreground)/0.025)]">
+          <div className="flex min-w-0 items-baseline gap-2">
+            <h1 className="truncate text-sm font-medium text-foreground">
               {tSettings('page.title')}
             </h1>
-            <p className="text-xs text-muted-foreground">{tSettings('page.subtitle')}</p>
+            <p className="truncate text-2xs text-muted-foreground">{tSettings('page.subtitle')}</p>
           </div>
           <button
             onClick={() => {
               navigate('/')
             }}
-            className="group flex items-center justify-center h-8 w-8 rounded-md hover:bg-secondary transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            className="inline-flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 hover:bg-secondary hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
             title={tCommon('actions.close')}
             aria-label={tCommon('actions.close')}
           >
-            <X size={18} className="text-muted-foreground group-hover:text-foreground" />
+            <X size={16} />
           </button>
         </div>
 
@@ -591,7 +591,7 @@ export default function AppPreferences(): React.JSX.Element {
         <SettingsLayout categories={categories} searchIndex={searchIndex}>
           {/* Terminal Appearance Section */}
           <SettingsSection id="appearance">
-            <div className="flex items-start gap-6 border-b border-border pb-6">
+            <div className="flex items-start gap-6 border-b border-border/70 pb-6">
               <div className="w-1/3 pt-1">
                 <h2 className="text-lg font-medium text-foreground">
                   {tSettings('categories.appearance')}
@@ -612,7 +612,7 @@ export default function AppPreferences(): React.JSX.Element {
                     id="ui-language"
                     value={languagePreference}
                     onChange={(event) => handleLanguageChange(event.target.value)}
-                    className="w-full bg-secondary/50 border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none transition-shadow"
+                    className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none transition-[border-color,background-color] duration-150 focus-visible:border-ring/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
                   >
                     <option value="system">{tSettings('language.system')}</option>
                     <option value="en">{tSettings('language.english')}</option>
@@ -665,7 +665,7 @@ export default function AppPreferences(): React.JSX.Element {
                   <select
                     value={fontFamily}
                     onChange={(e) => handleFontFamilyChange(e.target.value)}
-                    className="w-full bg-secondary/50 border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none transition-shadow"
+                    className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none transition-[border-color,background-color] duration-150 focus-visible:border-ring/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
                   >
                     {FONT_FAMILY_OPTIONS.map((option) => (
                       <option key={option.value} value={option.value}>
@@ -686,7 +686,7 @@ export default function AppPreferences(): React.JSX.Element {
                   <select
                     value={symbolFontFamily}
                     onChange={(e) => handleSymbolFontChange(e.target.value)}
-                    className="w-full bg-secondary/50 border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none transition-shadow"
+                    className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none transition-[border-color,background-color] duration-150 focus-visible:border-ring/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
                   >
                     {SYMBOL_FONT_OPTIONS.map((option) => (
                       <option key={option.label} value={option.value}>
@@ -730,7 +730,7 @@ export default function AppPreferences(): React.JSX.Element {
                   <select
                     value={bufferSize}
                     onChange={(e) => handleBufferSizeChange(parseInt(e.target.value, 10))}
-                    className="w-full bg-secondary/50 border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none transition-shadow"
+                    className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none transition-[border-color,background-color] duration-150 focus-visible:border-ring/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
                   >
                     {BUFFER_SIZE_OPTIONS.map((option) => (
                       <option key={option.value} value={option.value}>
@@ -754,7 +754,7 @@ export default function AppPreferences(): React.JSX.Element {
                   <select
                     value={maxTerminals}
                     onChange={(e) => handleMaxTerminalsChange(parseInt(e.target.value, 10))}
-                    className="w-full bg-secondary/50 border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none transition-shadow"
+                    className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none transition-[border-color,background-color] duration-150 focus-visible:border-ring/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
                   >
                     {MAX_TERMINALS_OPTIONS.map((option) => (
                       <option key={option.value} value={option.value}>
@@ -775,7 +775,7 @@ export default function AppPreferences(): React.JSX.Element {
                   <select
                     value={terminalRenderer}
                     onChange={(e) => handleRendererChange(e.target.value)}
-                    className="w-full bg-secondary/50 border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none transition-shadow"
+                    className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none transition-[border-color,background-color] duration-150 focus-visible:border-ring/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
                   >
                     {TERMINAL_RENDERER_OPTIONS.map((option) => (
                       <option key={option.value} value={option.value}>
@@ -824,7 +824,7 @@ export default function AppPreferences(): React.JSX.Element {
                     {tSettings('appearance.preview')}
                   </label>
                   <div
-                    className="bg-terminal-bg border border-border rounded-md p-4 text-terminal-fg"
+                    className="rounded-md bg-terminal-bg p-4 text-terminal-fg shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.04)]"
                     style={{
                       fontFamily: fontFamily,
                       fontSize: `${fontSize}px`,
@@ -843,7 +843,7 @@ export default function AppPreferences(): React.JSX.Element {
 
           {/* Default Shell Section */}
           <SettingsSection id="shell">
-            <div className="flex items-start gap-6 border-b border-border pb-6">
+            <div className="flex items-start gap-6 border-b border-border/70 pb-6">
               <div className="w-1/3 pt-1">
                 <h2 className="text-lg font-medium text-foreground">
                   {tSettings('categories.shell')}
@@ -874,7 +874,7 @@ export default function AppPreferences(): React.JSX.Element {
                       return match?.path ?? defaultShell
                     })()}
                     onChange={(e) => handleDefaultShellChange(e.target.value)}
-                    className="w-full bg-secondary/50 border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none transition-shadow"
+                    className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none transition-[border-color,background-color] duration-150 focus-visible:border-ring/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
                   >
                     <option value="">{tSettings('shell.systemDefault')}</option>
                     {availableShells?.available?.map((shell) => (
@@ -893,7 +893,7 @@ export default function AppPreferences(): React.JSX.Element {
 
           {/* Terminal Behavior Section */}
           <SettingsSection id="behavior">
-            <div className="flex items-start gap-6 border-b border-border pb-6">
+            <div className="flex items-start gap-6 border-b border-border/70 pb-6">
               <div className="w-1/3 pt-1">
                 <h2 className="text-lg font-medium text-foreground">
                   {tSettings('categories.behavior')}
@@ -910,7 +910,7 @@ export default function AppPreferences(): React.JSX.Element {
                   <select
                     value={terminalUrlOpenMode}
                     onChange={(e) => handleTerminalUrlOpenModeChange(e.target.value)}
-                    className="w-full bg-secondary/50 border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none transition-shadow"
+                    className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none transition-[border-color,background-color] duration-150 focus-visible:border-ring/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35"
                   >
                     {TERMINAL_URL_OPEN_MODE_OPTIONS.map((option) => (
                       <option key={option.value} value={option.value}>
@@ -928,7 +928,7 @@ export default function AppPreferences(): React.JSX.Element {
                   <label className="block text-sm font-medium text-secondary-foreground mb-2">
                     {tSettings('behavior.orphanDetection')}
                   </label>
-                  <div className="flex items-center justify-between bg-secondary/30 border border-border rounded-md px-4 py-3">
+                  <div className="flex items-center justify-between rounded-md bg-secondary/25 px-3 py-2.5 shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.035)]">
                     <div className="flex-1">
                       <div className="text-sm text-foreground">
                         {tSettings('behavior.enableOrphanDetection')}
@@ -967,7 +967,7 @@ export default function AppPreferences(): React.JSX.Element {
                       )
                     }
                     disabled={!orphanDetectionEnabled}
-                    className="w-full bg-secondary/50 border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none transition-shadow disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none transition-[border-color,background-color] duration-150 focus-visible:border-ring/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35 disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     {ORPHAN_TIMEOUT_OPTIONS.map((option) => (
                       <option key={option.value} value={option.value}>
@@ -985,7 +985,7 @@ export default function AppPreferences(): React.JSX.Element {
                   <label className="block text-sm font-medium text-secondary-foreground mb-2">
                     {tSettings('behavior.autoSave')}
                   </label>
-                  <div className="flex items-center justify-between bg-secondary/30 border border-border rounded-md px-4 py-3">
+                  <div className="flex items-center justify-between rounded-md bg-secondary/25 px-3 py-2.5 shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.035)]">
                     <div className="flex-1">
                       <div className="text-sm text-foreground">
                         {tSettings('behavior.enableAutoSave')}
@@ -1031,7 +1031,7 @@ export default function AppPreferences(): React.JSX.Element {
                     onChange={(e) => handleEditorAutoSaveDelayChange(parseInt(e.target.value, 10))}
                     disabled={!editorAutoSave}
                     aria-label={tSettings('behavior.autoSaveDelayAria')}
-                    className="w-full bg-secondary/50 border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none transition-shadow disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none transition-[border-color,background-color] duration-150 focus-visible:border-ring/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35 disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     {EDITOR_AUTO_SAVE_DELAY_OPTIONS.map((option) => (
                       <option key={option.value} value={option.value}>
@@ -1049,7 +1049,7 @@ export default function AppPreferences(): React.JSX.Element {
 
           {/* New Project Defaults Section */}
           <SettingsSection id="project-defaults">
-            <div className="flex items-start gap-6 border-b border-border pb-6">
+            <div className="flex items-start gap-6 border-b border-border/70 pb-6">
               <div className="w-1/3 pt-1">
                 <h2 className="text-lg font-medium text-foreground">
                   {tSettings('categories.projectDefaults')}
@@ -1094,10 +1094,10 @@ export default function AppPreferences(): React.JSX.Element {
 
           {/* AI Agents Section */}
           <SettingsSection id="ai-agents">
-            <div className="flex items-start gap-6 border-b border-border pb-6">
+            <div className="flex items-start gap-6 border-b border-border/70 pb-6">
               <div className="w-1/3 pt-1">
                 <div className="flex items-center gap-2">
-                  <Bot size={18} className="text-primary" />
+                  <Bot size={16} className="text-primary" />
                   <h2 className="text-lg font-medium text-foreground">
                     {tSettings('categories.aiAgents')}
                   </h2>
@@ -1112,7 +1112,7 @@ export default function AppPreferences(): React.JSX.Element {
                   <label className="block text-sm font-medium text-secondary-foreground mb-2">
                     {tSettings('aiAgents.preferLocalNpmInstall')}
                   </label>
-                  <div className="flex items-center justify-between bg-secondary/30 border border-border rounded-md px-4 py-3">
+                  <div className="flex items-center justify-between rounded-md bg-secondary/25 px-3 py-2.5 shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.035)]">
                     <div className="flex-1">
                       <div className="text-sm text-foreground">
                         {tSettings('aiAgents.preferLocalNpmInstall')}
@@ -1156,7 +1156,7 @@ export default function AppPreferences(): React.JSX.Element {
                       )
                     }
                     disabled={!isTauriContext()}
-                    className="w-full bg-secondary/50 border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none transition-shadow disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none transition-[border-color,background-color] duration-150 focus-visible:border-ring/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35 disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     {ACP_TURN_TIMEOUT_OPTIONS.map((option) => (
                       <option
@@ -1191,7 +1191,7 @@ export default function AppPreferences(): React.JSX.Element {
                       )
                     }
                     disabled={!isTauriContext()}
-                    className="w-full bg-secondary/50 border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none transition-shadow disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none transition-[border-color,background-color] duration-150 focus-visible:border-ring/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35 disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     {ACP_TURN_IDLE_TIMEOUT_OPTIONS.map((option) => (
                       <option
@@ -1226,7 +1226,7 @@ export default function AppPreferences(): React.JSX.Element {
                       )
                     }
                     disabled={!isTauriContext()}
-                    className="w-full bg-secondary/50 border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none transition-shadow disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none transition-[border-color,background-color] duration-150 focus-visible:border-ring/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35 disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     {ACP_SESSION_NEW_TIMEOUT_OPTIONS.map((option) => (
                       <option
@@ -1263,7 +1263,7 @@ export default function AppPreferences(): React.JSX.Element {
                       )
                     }
                     disabled={!isTauriContext()}
-                    className="w-full bg-secondary/50 border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none transition-shadow disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none transition-[border-color,background-color] duration-150 focus-visible:border-ring/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35 disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     {ACP_SESSION_REOPEN_TIMEOUT_OPTIONS.map((option) => (
                       <option
@@ -1298,7 +1298,7 @@ export default function AppPreferences(): React.JSX.Element {
                       )
                     }
                     disabled={!isTauriContext()}
-                    className="w-full bg-secondary/50 border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none transition-shadow disabled:opacity-50 disabled:cursor-not-allowed"
+                    className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none transition-[border-color,background-color] duration-150 focus-visible:border-ring/70 focus-visible:bg-secondary/50 focus-visible:ring-1 focus-visible:ring-ring/35 disabled:cursor-not-allowed disabled:opacity-50"
                   >
                     {ACP_FIRST_PROMPT_WARMUP_OPTIONS.map((option) => (
                       <option
@@ -1322,10 +1322,10 @@ export default function AppPreferences(): React.JSX.Element {
           </SettingsSection>
 
           <SettingsSection id="mcp-servers">
-            <div className="flex flex-col gap-6 border-b border-border pb-6 lg:flex-row lg:items-start">
+            <div className="flex flex-col gap-6 border-b border-border/70 pb-6 lg:flex-row lg:items-start">
               <div className="w-full pt-1 lg:w-1/3">
                 <div className="flex items-center gap-2">
-                  <Network size={18} className="text-primary" />
+                  <Network size={16} className="text-primary" />
                   <h2 className="text-lg font-medium text-foreground">
                     {tSettings('categories.mcpServers')}
                   </h2>
@@ -1342,10 +1342,10 @@ export default function AppPreferences(): React.JSX.Element {
 
           {/* Keyboard Shortcuts Section */}
           <SettingsSection id="remote-access">
-            <div className="flex flex-col gap-6 border-b border-border pb-6 lg:flex-row lg:items-start">
+            <div className="flex flex-col gap-6 border-b border-border/70 pb-6 lg:flex-row lg:items-start">
               <div className="w-full pt-1 lg:w-1/3">
                 <div className="flex items-center gap-2">
-                  <Monitor size={18} className="text-primary" />
+                  <Monitor size={16} className="text-primary" />
                   <h2 className="text-lg font-medium text-foreground">
                     {tSettings('categories.remoteAccess')}
                   </h2>
@@ -1361,10 +1361,10 @@ export default function AppPreferences(): React.JSX.Element {
           </SettingsSection>
 
           <SettingsSection id="shortcuts">
-            <div className="flex items-start gap-6 border-b border-border pb-6">
+            <div className="flex items-start gap-6 border-b border-border/70 pb-6">
               <div className="w-1/3 pt-1">
                 <div className="flex items-center gap-2">
-                  <Keyboard size={18} className="text-primary" />
+                  <Keyboard size={16} className="text-primary" />
                   <h2 className="text-lg font-medium text-foreground">
                     {tSettings('categories.shortcuts')}
                   </h2>
@@ -1396,10 +1396,10 @@ export default function AppPreferences(): React.JSX.Element {
 
           {/* Updates Section */}
           <SettingsSection id="updates">
-            <div className="flex items-start gap-6 border-b border-border pb-6">
+            <div className="flex items-start gap-6 border-b border-border/70 pb-6">
               <div className="w-1/3 pt-1">
                 <div className="flex items-center gap-2">
-                  <Download size={18} className="text-primary" />
+                  <Download size={16} className="text-primary" />
                   <h2 className="text-lg font-medium text-foreground">
                     {tSettings('categories.updates')}
                   </h2>
@@ -1414,7 +1414,7 @@ export default function AppPreferences(): React.JSX.Element {
                   <label className="block text-sm font-medium text-secondary-foreground mb-2">
                     {tSettings('updates.currentVersion')}
                   </label>
-                  <div className="bg-secondary/30 border border-border rounded-md px-4 py-3">
+                  <div className="rounded-md bg-secondary/25 px-3 py-2.5 shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.035)]">
                     <span className="text-sm font-mono text-foreground">
                       v{import.meta.env.PACKAGE_VERSION || '0.1.0'}
                     </span>
@@ -1440,10 +1440,10 @@ export default function AppPreferences(): React.JSX.Element {
                               aria-pressed={active}
                               disabled={isChecking}
                               className={cn(
-                                'flex flex-col items-start gap-0.5 px-3 py-2.5 border rounded-lg text-left transition-colors disabled:opacity-50 disabled:cursor-not-allowed',
+                                'flex flex-col items-start gap-0.5 rounded-md px-3 py-2.5 text-left transition-colors duration-150 disabled:cursor-not-allowed disabled:opacity-50',
                                 active
-                                  ? 'bg-primary/10 border-primary'
-                                  : 'bg-secondary/30 border-border hover:bg-secondary/60'
+                                  ? 'bg-secondary text-foreground shadow-[inset_0_1px_0_hsl(var(--foreground)/0.035)] ring-1 ring-inset ring-primary/35'
+                                  : 'bg-secondary/25 hover:bg-secondary/50'
                               )}
                             >
                               <span
@@ -1536,7 +1536,7 @@ export default function AppPreferences(): React.JSX.Element {
                     <button
                       onClick={checkForUpdates}
                       disabled={isChecking}
-                      className="flex items-center gap-2 px-4 py-2 bg-primary hover:bg-primary/90 disabled:bg-primary/50 disabled:cursor-not-allowed border border-primary rounded-lg text-sm text-primary-foreground transition-colors"
+                      className="inline-flex h-8 items-center gap-2 rounded-md bg-primary px-3 text-sm text-primary-foreground transition-colors duration-150 hover:bg-primary/90 disabled:cursor-not-allowed disabled:bg-primary/50"
                     >
                       <Download size={16} />
                       {isChecking ? tSettings('updates.checking') : tSettings('updates.check')}
@@ -1544,7 +1544,7 @@ export default function AppPreferences(): React.JSX.Element {
                     {updateAvailable && isManualUpdateMode && (
                       <button
                         onClick={installAndRestart}
-                        className="flex items-center gap-2 px-4 py-2 bg-amber-500 hover:bg-amber-500/90 border border-amber-500 rounded-lg text-sm text-white transition-colors"
+                        className="inline-flex h-8 items-center gap-2 rounded-md bg-amber-500 px-3 text-sm text-white transition-colors duration-150 hover:bg-amber-500/90"
                       >
                         <ExternalLink size={16} />
                         {tSettings('updates.openDownloadPage')}
@@ -1565,7 +1565,7 @@ export default function AppPreferences(): React.JSX.Element {
                   <label className="block text-sm font-medium text-secondary-foreground mb-2">
                     {tSettings('updates.autoUpdate')}
                   </label>
-                  <div className="flex items-center justify-between bg-secondary/30 border border-border rounded-md px-4 py-3">
+                  <div className="flex items-center justify-between rounded-md bg-secondary/25 px-3 py-2.5 shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.035)]">
                     <div className="flex-1">
                       <div className="text-sm text-foreground">
                         {tSettings('updates.autoUpdateLabel')}
@@ -1597,7 +1597,7 @@ export default function AppPreferences(): React.JSX.Element {
                     <label className="block text-sm font-medium text-secondary-foreground mb-2">
                       {tSettings('updates.skippedVersion')}
                     </label>
-                    <div className="bg-secondary/30 border border-border rounded-md px-4 py-3">
+                    <div className="rounded-md bg-secondary/25 px-3 py-2.5 shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.035)]">
                       <div className="text-sm text-foreground">
                         {tSettings('updates.skipping', { version: skippedVersion })}
                       </div>
@@ -1612,10 +1612,10 @@ export default function AppPreferences(): React.JSX.Element {
           </SettingsSection>
 
           <SettingsSection id="diagnostics">
-            <div className="flex items-start gap-6 border-b border-border pb-6">
+            <div className="flex items-start gap-6 border-b border-border/70 pb-6">
               <div className="w-1/3 pt-1">
                 <div className="flex items-center gap-2">
-                  <FileText size={18} className="text-primary" />
+                  <FileText size={16} className="text-primary" />
                   <h2 className="text-lg font-medium text-foreground">
                     {tSettings('categories.diagnostics')}
                   </h2>
@@ -1629,7 +1629,7 @@ export default function AppPreferences(): React.JSX.Element {
                   <button
                     type="button"
                     onClick={() => void logApi.revealLogDir()}
-                    className="flex items-center justify-start gap-2.5 px-4 py-3 bg-secondary/30 hover:bg-secondary/60 border border-border rounded-lg text-sm font-medium text-foreground transition-all hover:scale-[1.01] active:scale-[0.99] shadow-sm"
+                    className="flex items-center justify-start gap-2.5 rounded-md bg-secondary/25 px-3 py-2.5 text-sm font-medium text-foreground shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.035)] transition-colors duration-150 hover:bg-secondary/50"
                   >
                     <FolderOpen size={16} className="text-muted-foreground" />
                     <div className="text-left">
@@ -1643,7 +1643,7 @@ export default function AppPreferences(): React.JSX.Element {
                   <button
                     type="button"
                     onClick={() => void logApi.exportLogFile()}
-                    className="flex items-center justify-start gap-2.5 px-4 py-3 bg-secondary/30 hover:bg-secondary/60 border border-border rounded-lg text-sm font-medium text-foreground transition-all hover:scale-[1.01] active:scale-[0.99] shadow-sm"
+                    className="flex items-center justify-start gap-2.5 rounded-md bg-secondary/25 px-3 py-2.5 text-sm font-medium text-foreground shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.035)] transition-colors duration-150 hover:bg-secondary/50"
                   >
                     <FileText size={16} className="text-muted-foreground" />
                     <div className="text-left">
@@ -1657,7 +1657,7 @@ export default function AppPreferences(): React.JSX.Element {
                   <button
                     type="button"
                     onClick={() => void logApi.copyLogContents()}
-                    className="flex items-center justify-start gap-2.5 px-4 py-3 bg-secondary/30 hover:bg-secondary/60 border border-border rounded-lg text-sm font-medium text-foreground transition-all hover:scale-[1.01] active:scale-[0.99] shadow-sm"
+                    className="flex items-center justify-start gap-2.5 rounded-md bg-secondary/25 px-3 py-2.5 text-sm font-medium text-foreground shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.035)] transition-colors duration-150 hover:bg-secondary/50"
                   >
                     <Clipboard size={16} className="text-muted-foreground" />
                     <div className="text-left">
@@ -1671,7 +1671,7 @@ export default function AppPreferences(): React.JSX.Element {
                   <button
                     type="button"
                     onClick={() => void logApi.exportLogToDefault()}
-                    className="flex items-center justify-start gap-2.5 px-4 py-3 bg-secondary/30 hover:bg-secondary/60 border border-border rounded-lg text-sm font-medium text-foreground transition-all hover:scale-[1.01] active:scale-[0.99] shadow-sm"
+                    className="flex items-center justify-start gap-2.5 rounded-md bg-secondary/25 px-3 py-2.5 text-sm font-medium text-foreground shadow-[inset_0_1px_0_0_hsl(var(--foreground)/0.035)] transition-colors duration-150 hover:bg-secondary/50"
                   >
                     <Download size={16} className="text-muted-foreground" />
                     <div className="text-left">
@@ -1700,7 +1700,7 @@ export default function AppPreferences(): React.JSX.Element {
               <div className="w-2/3">
                 <button
                   onClick={() => setIsResetDialogOpen(true)}
-                  className="flex items-center gap-2 px-4 py-2 bg-card hover:bg-secondary border border-border rounded-lg text-sm text-foreground transition-colors"
+                  className="inline-flex h-8 items-center gap-2 rounded-md bg-secondary/50 px-3 text-sm text-foreground transition-colors duration-150 hover:bg-secondary"
                 >
                   <RotateCcw size={16} />
                   {tSettings('reset.button')}

@@ -22,4 +22,20 @@ describe('deriveSurfaces', () => {
     const surfaces = deriveSurfaces(palette, 'light')
     expect(lightness(surfaces.border)).toBeLessThan(lightness(palette.neutral))
   })
+
+  it('keeps popover a distinct elevation step above card in dark chrome', () => {
+    const palette = BUNDLED_COLOR_THEMES.termul.dark.palette
+    const surfaces = deriveSurfaces(palette, 'dark')
+    expect(surfaces.popover).not.toBe(surfaces.card)
+    expect(lightness(surfaces.popover)).toBeGreaterThan(lightness(surfaces.card))
+    expect(lightness(surfaces.popover)).toBeLessThan(lightness(surfaces.secondary))
+  })
+
+  it('keeps popover a distinct elevation step above card in light chrome', () => {
+    const palette = BUNDLED_COLOR_THEMES['termul-light'].dark.palette
+    const surfaces = deriveSurfaces(palette, 'light')
+    expect(surfaces.popover).not.toBe(surfaces.card)
+    expect(lightness(surfaces.popover)).toBeLessThan(lightness(surfaces.card))
+    expect(lightness(surfaces.popover)).toBeGreaterThan(lightness(surfaces.secondary))
+  })
 })

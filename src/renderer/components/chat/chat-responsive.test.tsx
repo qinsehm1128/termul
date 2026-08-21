@@ -202,6 +202,22 @@ describe('Story 5.1 responsive chat layout', () => {
     restoreResizeMocks()
   })
 
+  it('aligns the empty thread with the same gutter / max-w-3xl column', () => {
+    const { container } = render(
+      <TooltipProvider>
+        <ChatMessageList
+          items={[]}
+          sessionId="session-1"
+          agentId="agent-1"
+          showRunningIndicator={false}
+        />
+      </TooltipProvider>
+    )
+    expect(container.innerHTML).toContain('max-w-3xl')
+    expect(container.innerHTML).toContain(CHAT_GUTTER_X.split(' ')[0]!)
+    expect(container.innerHTML).toContain('@[400px]:px-5')
+  })
+
   it('keeps max-w-3xl + container gutter classes on the thread column (wide non-regression)', () => {
     const { container } = render(
       <TooltipProvider>

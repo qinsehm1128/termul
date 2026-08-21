@@ -1,4 +1,4 @@
-import { AnimatePresence, motion } from 'framer-motion'
+import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { AlertTriangle, Download, X } from 'lucide-react'
 import { type KeyboardEvent, useCallback, useEffect } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -23,6 +23,7 @@ export function UpdateReadyModal({
   onClose
 }: UpdateReadyModalProps): React.JSX.Element {
   const { t } = useTranslation('shell')
+  const reducedMotion = useReducedMotion() ?? false
 
   // Handle Escape key to close modal
   useEffect(() => {
@@ -56,32 +57,32 @@ export function UpdateReadyModal({
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
-          className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-[2px]"
           onClick={onClose}
         >
           <motion.div
-            initial={{ opacity: 0, scale: 0.95, y: 10 }}
-            animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.95, y: 10 }}
-            transition={{ duration: 0.15 }}
-            className="bg-card rounded-lg shadow-2xl w-[500px] border border-border overflow-hidden"
+            initial={{ opacity: 0, y: reducedMotion ? 0 : -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: reducedMotion ? 0 : -6 }}
+            transition={{ duration: reducedMotion ? 0 : 0.15 }}
+            className="w-[500px] overflow-hidden rounded-md border border-border/80 bg-card shadow-[0_18px_60px_hsl(var(--background)/0.7),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]"
             onClick={(e) => e.stopPropagation()}
             onKeyDown={handleKeyDown}
             tabIndex={-1}
           >
             {/* Header */}
-            <div className="px-4 py-3 border-b border-border flex justify-between items-center bg-secondary/50">
+            <div className="flex h-9 items-center justify-between border-b border-border/70 px-3">
               <div className="flex items-center gap-2">
-                <div className="w-5 h-5 rounded bg-green-500/10 flex items-center justify-center">
-                  <Download className="w-3 h-3 text-green-500" />
+                <div className="flex size-5 items-center justify-center rounded-md bg-success/10">
+                  <Download className="size-3 text-success" />
                 </div>
-                <h3 className="text-sm font-semibold text-foreground">
+                <h3 className="text-xs font-semibold tracking-[-0.01em] text-foreground">
                   {t('updateReadyModal.title')}
                 </h3>
               </div>
               <button
                 onClick={onClose}
-                className="text-muted-foreground hover:text-foreground transition-colors"
+                className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                 aria-label={t('updateReadyModal.close')}
               >
                 <X size={14} />
@@ -106,7 +107,7 @@ export function UpdateReadyModal({
                   <label className="block text-xs font-medium text-muted-foreground mb-1.5">
                     {t('updateReadyModal.releaseNotes')}
                   </label>
-                  <div className="bg-secondary border border-border rounded px-3 py-2 text-sm text-foreground max-h-[200px] overflow-y-auto">
+                  <div className="max-h-[200px] overflow-y-auto rounded-md border border-border/80 bg-secondary/35 px-3 py-2 text-sm text-foreground">
                     <div className="whitespace-pre-wrap text-xs leading-relaxed">
                       {releaseNotes}
                     </div>
@@ -116,28 +117,26 @@ export function UpdateReadyModal({
 
               {/* Warning about running terminals */}
               {hasActiveTerminals && (
-                <div className="flex items-start gap-2 bg-amber-500/5 border border-amber-500/20 rounded px-3 py-2">
-                  <AlertTriangle className="w-4 h-4 text-amber-500 flex-shrink-0 mt-0.5" />
+                <div className="flex items-start gap-2 rounded-md border border-warning/35 bg-warning/10 px-3 py-2">
+                  <AlertTriangle className="mt-0.5 size-4 shrink-0 text-warning" />
                   <div className="flex-1">
-                    <p className="text-xs text-amber-600 dark:text-amber-400">
-                      {t('updateReadyModal.warning')}
-                    </p>
+                    <p className="text-xs text-warning">{t('updateReadyModal.warning')}</p>
                   </div>
                 </div>
               )}
             </div>
 
             {/* Footer */}
-            <div className="px-4 py-3 bg-secondary/50 flex justify-end gap-2 border-t border-border flex-wrap">
+            <div className="flex h-10 flex-wrap items-center justify-end gap-2 border-t border-border/70 bg-secondary/20 px-4">
               <button
                 onClick={onSkip}
-                className="px-3 py-1.5 text-xs font-medium text-muted-foreground hover:text-foreground transition-colors"
+                className="inline-flex h-8 items-center rounded-md px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary/60 hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               >
                 {t('updateReadyModal.skip')}
               </button>
               <button
                 onClick={onRestartNow}
-                className="px-3 py-1.5 text-xs font-medium rounded bg-green-600 text-white hover:bg-green-700 shadow-md shadow-green-500/20 transition-all"
+                className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               >
                 {t('updateReadyModal.restart')}
               </button>

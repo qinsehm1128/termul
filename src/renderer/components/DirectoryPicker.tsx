@@ -21,7 +21,7 @@
  */
 
 import type { DirectoryEntry, IpcResult } from '@shared/types/ipc.types'
-import { AnimatePresence, motion } from 'framer-motion'
+import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { ArrowUp, ChevronRight, Folder, Loader2, X } from 'lucide-react'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -179,6 +179,7 @@ export function DirectoryPicker(): React.JSX.Element {
   // a misconfigured import is a no-op rather than a broken modal.
   const { t } = useTranslation('common')
   const { t: projectT } = useTranslation('projects')
+  const reducedMotion = useReducedMotion() ?? false
   const [isOpen, setIsOpen] = useState(false)
   // Empty until the opener resolves the host OS initial path (CAP-3). The
   // picker is closed while empty, so the brief pre-resolve state is invisible.
@@ -359,25 +360,25 @@ export function DirectoryPicker(): React.JSX.Element {
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
-          className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[60] flex items-center justify-center"
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-black/70 backdrop-blur-[2px]"
           onClick={handleCancel}
         >
           <motion.div
-            initial={{ opacity: 0, scale: 0.95, y: 10 }}
-            animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.95, y: 10 }}
-            transition={{ duration: 0.15 }}
-            className="bg-card rounded-lg shadow-2xl w-[560px] border border-border overflow-hidden max-h-[80vh] flex flex-col"
+            initial={{ opacity: 0, y: reducedMotion ? 0 : -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: reducedMotion ? 0 : -6 }}
+            transition={{ duration: reducedMotion ? 0 : 0.15 }}
+            className="flex max-h-[80vh] w-[560px] flex-col overflow-hidden rounded-md border border-border/80 bg-card shadow-[0_18px_60px_hsl(var(--background)/0.7),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]"
             onClick={(e) => e.stopPropagation()}
           >
             {/* Header */}
-            <div className="px-4 py-3 border-b border-border flex justify-between items-center bg-secondary/50 flex-shrink-0">
-              <h3 className="text-sm font-semibold text-foreground">
+            <div className="flex h-9 shrink-0 items-center justify-between border-b border-border/70 px-3">
+              <h3 className="text-xs font-semibold tracking-[-0.01em] text-foreground">
                 {t('directoryPicker.title')}
               </h3>
               <button
                 onClick={handleCancel}
-                className="text-muted-foreground hover:text-foreground transition-colors"
+                className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                 aria-label={t('directoryPicker.cancelAria')}
               >
                 <X size={14} />
@@ -385,15 +386,15 @@ export function DirectoryPicker(): React.JSX.Element {
             </div>
 
             {/* Current path + go up */}
-            <div className="px-4 py-2 border-b border-border bg-secondary/30 flex items-center gap-2 flex-shrink-0">
+            <div className="flex shrink-0 items-center gap-2 border-b border-border/70 bg-secondary/20 px-3 py-2">
               <button
                 onClick={handleGoUp}
                 disabled={!canGoUp || loading}
                 className={cn(
-                  'flex items-center gap-1 text-xs px-2 py-1 rounded border border-border transition-colors',
+                  'inline-flex h-8 items-center gap-1 rounded-md border border-border/80 px-2 text-xs transition-colors',
                   canGoUp && !loading
-                    ? 'text-foreground hover:bg-muted'
-                    : 'text-muted-foreground/50 cursor-not-allowed'
+                    ? 'text-foreground hover:bg-secondary'
+                    : 'cursor-not-allowed text-muted-foreground/50'
                 )}
                 aria-label={t('directoryPicker.goUpAria')}
               >
@@ -401,7 +402,7 @@ export function DirectoryPicker(): React.JSX.Element {
                 <span>{t('directoryPicker.up')}</span>
               </button>
               <div
-                className="flex-1 text-xs font-mono text-muted-foreground truncate px-2 py-1 bg-background border border-border rounded"
+                className="flex-1 truncate rounded-md border border-border/80 bg-secondary/35 px-2 py-1 font-mono text-xs text-muted-foreground"
                 title={currentPath}
               >
                 {currentPath || projectT('fileContext.noPath')}
@@ -426,7 +427,7 @@ export function DirectoryPicker(): React.JSX.Element {
                       <button
                         onClick={() => handleNavigateInto(entry)}
                         className={cn(
-                          'w-full flex items-center gap-2 px-2 py-1.5 rounded text-sm text-left transition-colors',
+                          'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors',
                           entry.ignored
                             ? 'text-muted-foreground/60 hover:bg-secondary/50'
                             : 'text-foreground hover:bg-secondary'
@@ -450,10 +451,10 @@ export function DirectoryPicker(): React.JSX.Element {
             </div>
 
             {/* Footer */}
-            <div className="px-4 py-3 bg-secondary/50 flex justify-end gap-2 border-t border-border flex-shrink-0">
+            <div className="flex h-10 shrink-0 items-center justify-end gap-2 border-t border-border/70 bg-secondary/20 px-4">
               <button
                 onClick={handleCancel}
-                className="px-3 py-1.5 text-xs font-medium text-muted-foreground hover:text-foreground transition-colors"
+                className="inline-flex h-8 items-center rounded-md px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary/60 hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               >
                 {t('actions.cancel')}
               </button>
@@ -461,10 +462,10 @@ export function DirectoryPicker(): React.JSX.Element {
                 onClick={handleSelectCurrent}
                 disabled={!currentPath}
                 className={cn(
-                  'px-3 py-1.5 text-xs font-medium rounded transition-all',
+                  'inline-flex h-8 items-center rounded-md px-3 text-xs font-medium transition-colors focus:outline-none focus-visible:ring-1 focus-visible:ring-ring',
                   currentPath
-                    ? 'bg-primary text-primary-foreground hover:bg-primary/90 shadow-md shadow-primary/20'
-                    : 'bg-primary/50 text-primary-foreground/70 cursor-not-allowed'
+                    ? 'bg-primary text-primary-foreground hover:bg-primary/90'
+                    : 'cursor-not-allowed bg-primary/50 text-primary-foreground/70'
                 )}
               >
                 {t('directoryPicker.selectCurrent')}

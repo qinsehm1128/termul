@@ -98,176 +98,182 @@ export function SSHProfileForm({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
-      <div className="bg-background border border-border rounded-lg shadow-lg w-[420px] max-h-[80vh] overflow-y-auto">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-[2px]">
+      <div className="max-h-[80vh] w-[420px] overflow-y-auto rounded-md border border-border/80 bg-card shadow-[0_18px_60px_hsl(var(--background)/0.7),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]">
         {/* Header */}
-        <div className="flex items-center justify-between px-4 py-3 border-b border-border">
-          <h3 className="text-sm font-semibold">
+        <div className="flex h-9 items-center justify-between border-b border-border/70 px-3">
+          <h3 className="text-xs font-semibold tracking-[-0.01em] text-foreground">
             {profile ? t('profile.editTitle') : t('profile.newTitle')}
           </h3>
-          <button onClick={onClose} className="p-1 rounded hover:bg-accent">
+          <button
+            onClick={onClose}
+            className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          >
             <X className="h-4 w-4" />
           </button>
         </div>
 
         {/* Form */}
-        <form onSubmit={handleSubmit} className="p-4 space-y-4">
-          {/* Name */}
-          <div>
-            <label className="text-xs font-medium text-muted-foreground">{t('profile.name')}</label>
-            <input
-              type="text"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder={t('profile.namePlaceholder')}
-              className="mt-1 w-full px-3 py-1.5 text-sm bg-muted border border-border rounded focus:outline-none focus:ring-1 focus:ring-ring"
-            />
-          </div>
-
-          {/* Host + Port */}
-          <div className="flex gap-3">
-            <div className="flex-1">
+        <form onSubmit={handleSubmit}>
+          <div className="space-y-3 p-4">
+            {/* Name */}
+            <div>
               <label className="text-xs font-medium text-muted-foreground">
-                {t('profile.host')}
+                {t('profile.name')}
               </label>
               <input
                 type="text"
-                value={host}
-                onChange={(e) => setHost(e.target.value)}
-                placeholder={t('profile.hostPlaceholder')}
-                className="mt-1 w-full px-3 py-1.5 text-sm bg-muted border border-border rounded focus:outline-none focus:ring-1 focus:ring-ring"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                placeholder={t('profile.namePlaceholder')}
+                className="mt-1 h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:border-ring/70 focus-visible:ring-1 focus-visible:ring-ring/35"
               />
             </div>
-            <div className="w-20">
-              <label className="text-xs font-medium text-muted-foreground">
-                {t('profile.port')}
-              </label>
-              <input
-                type="number"
-                value={port}
-                onChange={(e) => setPort(Number(e.target.value))}
-                min={1}
-                max={65535}
-                className="mt-1 w-full px-3 py-1.5 text-sm bg-muted border border-border rounded focus:outline-none focus:ring-1 focus:ring-ring"
-              />
-            </div>
-          </div>
 
-          {/* Username */}
-          <div>
-            <label className="text-xs font-medium text-muted-foreground">
-              {t('profile.username')}
-            </label>
-            <input
-              type="text"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              placeholder={t('profile.usernamePlaceholder')}
-              className="mt-1 w-full px-3 py-1.5 text-sm bg-muted border border-border rounded focus:outline-none focus:ring-1 focus:ring-ring"
-            />
-          </div>
-
-          {/* Auth Method */}
-          <div>
-            <label className="text-xs font-medium text-muted-foreground">
-              {t('profile.authentication')}
-            </label>
-            <select
-              value={authMethod}
-              onChange={(e) => setAuthMethod(e.target.value as SSHAuthMethod)}
-              className="mt-1 w-full px-3 py-1.5 text-sm bg-muted border border-border rounded focus:outline-none focus:ring-1 focus:ring-ring"
-            >
-              <option value="key">{t('profile.auth.privateKey')}</option>
-              <option value="password">{t('profile.auth.password')}</option>
-              <option value="agent">{t('profile.auth.agent')}</option>
-            </select>
-          </div>
-
-          {/* Private Key Path (conditional) */}
-          {authMethod === 'key' && (
-            <div>
-              <label className="text-xs font-medium text-muted-foreground">
-                {t('profile.privateKeyPath')}
-              </label>
-              <div className="flex gap-2 mt-1">
+            {/* Host + Port */}
+            <div className="flex gap-3">
+              <div className="flex-1">
+                <label className="text-xs font-medium text-muted-foreground">
+                  {t('profile.host')}
+                </label>
                 <input
                   type="text"
-                  value={privateKeyPath}
-                  onChange={(e) => setPrivateKeyPath(e.target.value)}
-                  placeholder="~/.ssh/id_rsa"
-                  className="flex-1 px-3 py-1.5 text-sm bg-muted border border-border rounded focus:outline-none focus:ring-1 focus:ring-ring"
+                  value={host}
+                  onChange={(e) => setHost(e.target.value)}
+                  placeholder={t('profile.hostPlaceholder')}
+                  className="mt-1 h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:border-ring/70 focus-visible:ring-1 focus-visible:ring-ring/35"
                 />
-                <button
-                  type="button"
-                  onClick={handleSelectKeyFile}
-                  className="px-2 py-1.5 text-xs rounded border border-border bg-muted hover:bg-accent text-muted-foreground flex items-center"
-                  title={t('profile.browsePrivateKey')}
-                >
-                  <FolderOpen className="h-4 w-4" />
-                </button>
+              </div>
+              <div className="w-20">
+                <label className="text-xs font-medium text-muted-foreground">
+                  {t('profile.port')}
+                </label>
+                <input
+                  type="number"
+                  value={port}
+                  onChange={(e) => setPort(Number(e.target.value))}
+                  min={1}
+                  max={65535}
+                  className="mt-1 h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:border-ring/70 focus-visible:ring-1 focus-visible:ring-ring/35"
+                />
               </div>
             </div>
-          )}
 
-          {/* Passphrase for key (conditional) */}
-          {authMethod === 'key' && (
+            {/* Username */}
             <div>
               <label className="text-xs font-medium text-muted-foreground">
-                {t('profile.passphrase')}
+                {t('profile.username')}
               </label>
               <input
-                type="password"
-                value={passphrase}
-                onChange={(e) => setPassphrase(e.target.value)}
-                placeholder={
-                  profile?.hasStoredPassphrase ? '••••••••' : t('profile.passphrasePlaceholder')
-                }
-                className="mt-1 w-full px-3 py-1.5 text-sm bg-muted border border-border rounded focus:outline-none focus:ring-1 focus:ring-ring"
+                type="text"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                placeholder={t('profile.usernamePlaceholder')}
+                className="mt-1 h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:border-ring/70 focus-visible:ring-1 focus-visible:ring-ring/35"
               />
-              {profile?.hasStoredPassphrase && (
+            </div>
+
+            {/* Auth Method */}
+            <div>
+              <label className="text-xs font-medium text-muted-foreground">
+                {t('profile.authentication')}
+              </label>
+              <select
+                value={authMethod}
+                onChange={(e) => setAuthMethod(e.target.value as SSHAuthMethod)}
+                className="mt-1 h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:border-ring/70 focus-visible:ring-1 focus-visible:ring-ring/35"
+              >
+                <option value="key">{t('profile.auth.privateKey')}</option>
+                <option value="password">{t('profile.auth.password')}</option>
+                <option value="agent">{t('profile.auth.agent')}</option>
+              </select>
+            </div>
+
+            {/* Private Key Path (conditional) */}
+            {authMethod === 'key' && (
+              <div>
+                <label className="text-xs font-medium text-muted-foreground">
+                  {t('profile.privateKeyPath')}
+                </label>
+                <div className="flex gap-2 mt-1">
+                  <input
+                    type="text"
+                    value={privateKeyPath}
+                    onChange={(e) => setPrivateKeyPath(e.target.value)}
+                    placeholder="~/.ssh/id_rsa"
+                    className="h-8 flex-1 rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:border-ring/70 focus-visible:ring-1 focus-visible:ring-ring/35"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleSelectKeyFile}
+                    className="inline-flex h-8 items-center rounded-md border border-border/80 bg-secondary/50 px-2 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    title={t('profile.browsePrivateKey')}
+                  >
+                    <FolderOpen className="h-4 w-4" />
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Passphrase for key (conditional) */}
+            {authMethod === 'key' && (
+              <div>
+                <label className="text-xs font-medium text-muted-foreground">
+                  {t('profile.passphrase')}
+                </label>
+                <input
+                  type="password"
+                  value={passphrase}
+                  onChange={(e) => setPassphrase(e.target.value)}
+                  placeholder={
+                    profile?.hasStoredPassphrase ? '••••••••' : t('profile.passphrasePlaceholder')
+                  }
+                  className="mt-1 h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:border-ring/70 focus-visible:ring-1 focus-visible:ring-ring/35"
+                />
+                {profile?.hasStoredPassphrase && (
+                  <p className="mt-1 text-3xs text-muted-foreground">
+                    {t('profile.passphraseStored')}
+                  </p>
+                )}
+              </div>
+            )}
+
+            {/* Password (conditional) */}
+            {authMethod === 'password' && (
+              <div>
+                <label className="text-xs font-medium text-muted-foreground">
+                  {t('profile.password')}
+                </label>
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder={
+                    profile?.hasStoredPassword ? '••••••••' : t('profile.passwordPlaceholder')
+                  }
+                  className="mt-1 h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:border-ring/70 focus-visible:ring-1 focus-visible:ring-ring/35"
+                />
                 <p className="mt-1 text-3xs text-muted-foreground">
-                  {t('profile.passphraseStored')}
+                  {profile?.hasStoredPassword
+                    ? t('profile.passwordStored')
+                    : t('profile.passwordStorageHint')}
                 </p>
-              )}
-            </div>
-          )}
-
-          {/* Password (conditional) */}
-          {authMethod === 'password' && (
-            <div>
-              <label className="text-xs font-medium text-muted-foreground">
-                {t('profile.password')}
-              </label>
-              <input
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder={
-                  profile?.hasStoredPassword ? '••••••••' : t('profile.passwordPlaceholder')
-                }
-                className="mt-1 w-full px-3 py-1.5 text-sm bg-muted border border-border rounded focus:outline-none focus:ring-1 focus:ring-ring"
-              />
-              <p className="mt-1 text-3xs text-muted-foreground">
-                {profile?.hasStoredPassword
-                  ? t('profile.passwordStored')
-                  : t('profile.passwordStorageHint')}
-              </p>
-            </div>
-          )}
-
+              </div>
+            )}
+          </div>
           {/* Actions */}
-          <div className="flex justify-end gap-2 pt-2">
+          <div className="flex h-10 items-center justify-end gap-2 border-t border-border/70 bg-secondary/20 px-4">
             <button
               type="button"
               onClick={onClose}
-              className="px-3 py-1.5 text-xs rounded border border-border hover:bg-accent"
+              className="inline-flex h-8 items-center rounded-md px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary/60 hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
             >
               {t('actions.cancel')}
             </button>
             <button
               type="submit"
               disabled={saving}
-              className="px-3 py-1.5 text-xs rounded bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-50"
             >
               {saving ? t('actions.saving') : profile ? t('actions.update') : t('actions.create')}
             </button>

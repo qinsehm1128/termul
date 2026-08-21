@@ -1,6 +1,6 @@
 import type { DetectedShells } from '@shared/types/ipc.types'
 import type { ProjectTemplate } from '@shared/types/project-template.types'
-import { AnimatePresence, motion } from 'framer-motion'
+import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { ChevronDown, X } from 'lucide-react'
 import { type KeyboardEvent, useCallback, useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -51,6 +51,7 @@ function getTemplateTranslationKeys(id: string) {
 
 export function NewProjectModal({ isOpen, onClose, onCreateProject }: NewProjectModalProps) {
   const { t } = useTranslation('projects')
+  const reducedMotion = useReducedMotion() ?? false
   const defaultColor = useDefaultProjectColor() as ProjectColor
   const [name, setName] = useState('')
   const [selectedColor, setSelectedColor] = useState<ProjectColor>(defaultColor || 'blue')
@@ -261,32 +262,34 @@ export function NewProjectModal({ isOpen, onClose, onCreateProject }: NewProject
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
-          className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-[2px]"
           onClick={onClose}
         >
           <motion.div
-            initial={{ opacity: 0, scale: 0.95, y: 10 }}
-            animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.95, y: 10 }}
-            transition={{ duration: 0.15 }}
-            className="bg-card rounded-lg shadow-2xl w-[520px] border border-border overflow-hidden max-h-[90vh] flex flex-col"
+            initial={{ opacity: 0, y: reducedMotion ? 0 : -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: reducedMotion ? 0 : -6 }}
+            transition={{ duration: reducedMotion ? 0 : 0.15 }}
+            className="flex max-h-[90vh] w-[520px] flex-col overflow-hidden rounded-md border border-border/80 bg-card shadow-[0_18px_60px_hsl(var(--background)/0.7),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]"
             onClick={(e) => e.stopPropagation()}
             onKeyDown={handleKeyDown}
           >
             {/* Header */}
-            <div className="px-4 py-3 border-b border-border flex justify-between items-center bg-secondary/50 flex-shrink-0">
-              <h3 className="text-sm font-semibold text-foreground">{t('createNewProject')}</h3>
+            <div className="flex h-9 shrink-0 items-center justify-between border-b border-border/70 px-3">
+              <h3 className="text-xs font-semibold tracking-[-0.01em] text-foreground">
+                {t('createNewProject')}
+              </h3>
               <button
                 onClick={onClose}
-                className="text-muted-foreground hover:text-foreground transition-colors"
+                className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               >
                 <X size={14} />
               </button>
             </div>
 
-            <div className="p-4 space-y-4 overflow-y-auto flex-1">
-              <div>
-                <label className="block text-xs font-medium text-muted-foreground mb-1">
+            <div className="flex-1 space-y-3 overflow-y-auto p-4">
+              <div className="space-y-2">
+                <label className="text-xs font-medium text-muted-foreground">
                   {t('projectTemplate')}
                 </label>
                 <div className="relative">
@@ -296,7 +299,7 @@ export function NewProjectModal({ isOpen, onClose, onCreateProject }: NewProject
                       const tpl = BUILT_IN_TEMPLATES.find((t) => t.id === e.target.value)
                       if (tpl) handleSelectTemplate(tpl)
                     }}
-                    className="w-full appearance-none bg-secondary border border-border rounded px-3 py-1.5 pr-8 text-sm text-foreground focus:ring-1 focus:ring-primary focus:border-primary outline-none cursor-pointer"
+                    className="h-8 w-full cursor-pointer appearance-none rounded-md border border-input/80 bg-secondary/35 px-2.5 pr-8 text-sm text-foreground outline-none focus-visible:border-ring/70 focus-visible:ring-1 focus-visible:ring-ring/35"
                   >
                     {BUILT_IN_TEMPLATES.map((tpl) => (
                       <option key={tpl.id} value={tpl.id}>
@@ -314,7 +317,7 @@ export function NewProjectModal({ isOpen, onClose, onCreateProject }: NewProject
               </div>
 
               {selectedTemplate.envVars && selectedTemplate.envVars.length > 0 && (
-                <div className="bg-secondary/40 border border-border/60 rounded p-2.5 mt-2">
+                <div className="mt-2 rounded-md border border-border/80 bg-secondary/40 p-2.5">
                   <span className="text-3xs font-semibold text-muted-foreground block mb-1.5">
                     {t('includedEnvironmentVariables')}
                   </span>
@@ -322,7 +325,7 @@ export function NewProjectModal({ isOpen, onClose, onCreateProject }: NewProject
                     {selectedTemplate.envVars.map((ev) => (
                       <span
                         key={ev.key}
-                        className="text-3xs font-mono bg-background border border-border/80 px-2 py-0.5 rounded text-secondary-foreground"
+                        className="rounded-md border border-border/80 bg-background px-2 py-0.5 font-mono text-3xs text-secondary-foreground"
                       >
                         {ev.key}={ev.value}
                       </span>
@@ -331,8 +334,8 @@ export function NewProjectModal({ isOpen, onClose, onCreateProject }: NewProject
                 </div>
               )}
 
-              <div>
-                <label className="block text-xs font-medium text-muted-foreground mb-1">
+              <div className="space-y-2">
+                <label className="text-xs font-medium text-muted-foreground">
                   {t('projectName')}
                 </label>
                 <input
@@ -340,12 +343,12 @@ export function NewProjectModal({ isOpen, onClose, onCreateProject }: NewProject
                   value={name}
                   onChange={(e) => setName(e.target.value)}
                   placeholder={t('namePlaceholder')}
-                  className="w-full bg-secondary border border-border rounded px-3 py-1.5 text-sm text-foreground focus:ring-1 focus:ring-primary focus:border-primary outline-none placeholder-muted-foreground"
+                  className="h-8 w-full rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:border-ring/70 focus-visible:ring-1 focus-visible:ring-ring/35"
                 />
               </div>
 
-              <div>
-                <label className="block text-xs font-medium text-muted-foreground mb-1">
+              <div className="space-y-2">
+                <label className="text-xs font-medium text-muted-foreground">
                   {t('rootDirectory')}
                 </label>
                 <div className="flex gap-2">
@@ -354,11 +357,11 @@ export function NewProjectModal({ isOpen, onClose, onCreateProject }: NewProject
                     value={path}
                     onChange={(e) => setPath(e.target.value)}
                     placeholder={t('noDirectorySelected')}
-                    className="flex-1 bg-secondary border border-border rounded px-3 py-1.5 text-sm text-foreground focus:ring-1 focus:ring-primary outline-none placeholder-muted-foreground"
+                    className="h-8 flex-1 rounded-md border border-input/80 bg-secondary/35 px-2.5 text-sm text-foreground outline-none placeholder:text-muted-foreground/70 focus-visible:border-ring/70 focus-visible:ring-1 focus-visible:ring-ring/35"
                   />
                   <button
                     onClick={handleBrowse}
-                    className="bg-secondary hover:bg-muted text-foreground text-xs px-3 rounded border border-border transition-colors"
+                    className="inline-flex h-8 items-center rounded-md border border-border/80 bg-secondary/50 px-3 text-xs text-foreground transition-colors hover:bg-secondary focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                   >
                     {t('browse')}
                   </button>
@@ -383,11 +386,9 @@ export function NewProjectModal({ isOpen, onClose, onCreateProject }: NewProject
                 )}
               </div>
 
-              <div>
-                <label className="block text-xs font-medium text-muted-foreground mb-2">
-                  {t('color')}
-                </label>
-                <div className="flex gap-2 flex-wrap">
+              <div className="space-y-2">
+                <label className="text-xs font-medium text-muted-foreground">{t('color')}</label>
+                <div className="flex flex-wrap gap-2">
                   {availableColors.map((color) => {
                     const colors = getColorClasses(color)
                     return (
@@ -395,10 +396,10 @@ export function NewProjectModal({ isOpen, onClose, onCreateProject }: NewProject
                         key={color}
                         onClick={() => setSelectedColor(color)}
                         className={cn(
-                          'w-6 h-6 rounded-full transition-all',
+                          'size-6 rounded-sm transition-[opacity,box-shadow]',
                           colors.bg,
                           selectedColor === color
-                            ? 'ring-2 ring-offset-2 ring-offset-card ring-current'
+                            ? 'ring-1 ring-foreground/70 ring-offset-2 ring-offset-card'
                             : 'hover:opacity-80'
                         )}
                       />
@@ -407,18 +408,18 @@ export function NewProjectModal({ isOpen, onClose, onCreateProject }: NewProject
                 </div>
               </div>
 
-              <div>
-                <label className="block text-xs font-medium text-muted-foreground mb-1">
+              <div className="space-y-2">
+                <label className="text-xs font-medium text-muted-foreground">
                   {t('defaultTerminal')}
                 </label>
                 {shellsLoading ? (
-                  <Skeleton className="w-full h-9 rounded" />
+                  <Skeleton className="h-8 w-full rounded-md" />
                 ) : (
                   <div className="relative">
                     <select
                       value={selectedShell}
                       onChange={(e) => setSelectedShell(e.target.value)}
-                      className="w-full appearance-none bg-secondary border border-border rounded px-3 py-1.5 pr-8 text-sm text-foreground focus:ring-1 focus:ring-primary focus:border-primary outline-none cursor-pointer"
+                      className="h-8 w-full cursor-pointer appearance-none rounded-md border border-input/80 bg-secondary/35 px-2.5 pr-8 text-sm text-foreground outline-none focus-visible:border-ring/70 focus-visible:ring-1 focus-visible:ring-ring/35"
                     >
                       {shells?.available && shells.available.length > 0 ? (
                         shells.available.map((shell) => (
@@ -438,24 +439,24 @@ export function NewProjectModal({ isOpen, onClose, onCreateProject }: NewProject
               </div>
 
               {!isTauriContext() && (
-                <p className="text-xs text-muted-foreground bg-muted/50 rounded px-3 py-2 leading-relaxed">
+                <p className="rounded-md bg-secondary/35 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
                   {t('webSessionNote')}
                 </p>
               )}
             </div>
 
             {/* Footer */}
-            <div className="px-4 py-3 bg-secondary/50 flex justify-end gap-2 border-t border-border flex-shrink-0">
+            <div className="flex h-10 shrink-0 items-center justify-end gap-2 border-t border-border/70 bg-secondary/20 px-4">
               <button
                 onClick={onClose}
-                className="px-3 py-1.5 text-xs font-medium text-muted-foreground hover:text-foreground transition-colors"
+                className="inline-flex h-8 items-center rounded-md px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary/60 hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               >
                 {t('cancel')}
               </button>
               <button
                 onClick={handleCreate}
                 disabled={!name.trim() || !path.trim()}
-                className="px-3 py-1.5 text-xs font-medium bg-primary text-primary-foreground rounded hover:bg-primary/90 shadow-md shadow-primary/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {t('create')}
               </button>

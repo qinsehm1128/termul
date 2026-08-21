@@ -37,7 +37,7 @@ function applyDocumentAppearance(appearance: ThemeAppearance): void {
 function applyCssVariables(palette: ThemePalette, appearance: ThemeAppearance): void {
   const root = document.documentElement
   const surfaces = deriveSurfaces(palette, appearance)
-  const { card, secondary, muted, border, sidebar } = surfaces
+  const { card, popover, secondary, muted, border, sidebar } = surfaces
   const primaryForeground =
     appearance === 'light'
       ? hexToHslComponents(lightenHex(palette.primary, 0.98))
@@ -52,7 +52,7 @@ function applyCssVariables(palette: ThemePalette, appearance: ThemeAppearance): 
     '--foreground': hexToHslComponents(palette.ink),
     '--card': hexToHslComponents(card),
     '--card-foreground': hexToHslComponents(palette.ink),
-    '--popover': hexToHslComponents(card),
+    '--popover': hexToHslComponents(popover),
     '--popover-foreground': hexToHslComponents(palette.ink),
     '--primary': hexToHslComponents(palette.primary),
     '--primary-foreground': primaryForeground,

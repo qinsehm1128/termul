@@ -59,7 +59,11 @@ export function StatusBar({ project }: StatusBarProps): React.JSX.Element {
             <StatusItem
               icon={
                 <span className="flex items-center gap-1.5">
-                  <span className={cn('size-2 rounded-sm', projectColor?.bg)} aria-hidden="true" />
+                  <span
+                    className={cn('size-1.5 rounded-[1px]', projectColor?.bg)}
+                    data-project-color={project.color}
+                    aria-hidden="true"
+                  />
                   <Server size={14} />
                 </span>
               }

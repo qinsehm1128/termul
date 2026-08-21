@@ -1394,3 +1394,56 @@ describe('WorkspaceLayout - conversation area navigation', () => {
     })
   })
 })
+
+describe('WorkspaceLayout panel fade structure', () => {
+  it('wraps the project sidebar and file explorer in opacity-only fades', () => {
+    const project = createProject('a', '/workspace/a', 'blue')
+    mockUseProjects.mockReturnValue([project])
+    mockUseActiveProject.mockReturnValue(project)
+    mockUseActiveProjectId.mockReturnValue('a')
+
+    render(
+      <TooltipProvider>
+        <MemoryRouter initialEntries={['/']}>
+          <WorkspaceLayout />
+        </MemoryRouter>
+      </TooltipProvider>
+    )
+
+    const sidebar = screen.getByTestId('sidebar-panel-fade')
+    const explorer = screen.getByTestId('file-explorer-panel-fade')
+    expect(sidebar).toHaveClass('duration-150', 'overflow-hidden', 'opacity-100')
+    expect(explorer).toHaveClass('duration-150', 'overflow-hidden', 'opacity-100')
+    expect(sidebar.className).not.toMatch(/scale-/)
+    expect(explorer.className).not.toMatch(/scale-/)
+    expect(screen.getByTestId('file-explorer')).toBeInTheDocument()
+  })
+
+  it('unmounts faded rails after the visibility store turns them off', async () => {
+    const project = createProject('a', '/workspace/a', 'blue')
+    mockUseProjects.mockReturnValue([project])
+    mockUseActiveProject.mockReturnValue(project)
+    mockUseActiveProjectId.mockReturnValue('a')
+
+    render(
+      <TooltipProvider>
+        <MemoryRouter initialEntries={['/']}>
+          <WorkspaceLayout />
+        </MemoryRouter>
+      </TooltipProvider>
+    )
+
+    expect(screen.getByTestId('sidebar-panel-fade')).toBeInTheDocument()
+    expect(screen.getByTestId('file-explorer-panel-fade')).toBeInTheDocument()
+
+    act(() => {
+      useSidebarStore.setState({ isVisible: false })
+      useFileExplorerStore.setState({ isVisible: false })
+    })
+
+    await waitFor(() => {
+      expect(screen.queryByTestId('sidebar-panel-fade')).not.toBeInTheDocument()
+      expect(screen.queryByTestId('file-explorer-panel-fade')).not.toBeInTheDocument()
+    })
+  })
+})

@@ -1,9 +1,16 @@
-import { describe, expect, it } from 'vitest'
-import { paletteToXtermTheme, resolveThemeForTest } from './apply-color-theme'
+import { afterEach, describe, expect, it } from 'vitest'
+import { applyColorTheme, paletteToXtermTheme, resolveThemeForTest } from './apply-color-theme'
 import { BUNDLED_COLOR_THEMES } from './bundled-themes'
+import { hexToHslComponents } from './color-utils'
+import { deriveSurfaces } from './derive-surfaces'
 import { resolveSyntaxColors } from './resolve-syntax'
 
 describe('apply-color-theme', () => {
+  afterEach(() => {
+    document.documentElement.removeAttribute('style')
+    document.documentElement.classList.remove('dark')
+  })
+
   it('includes dark and light bundled themes', () => {
     const ids = Object.keys(BUNDLED_COLOR_THEMES)
     expect(ids).toContain('termul')
@@ -46,5 +53,21 @@ describe('apply-color-theme', () => {
     expect(theme.appearance).toBe('light')
     expect(xterm.background).toBe('#ffffff')
     expect(xterm.foreground).toBe('#24292f')
+  })
+
+  it.each([
+    'termul',
+    'termul-light'
+  ] as const)('applies a distinct --popover elevation from --card for %s', (themeId) => {
+    applyColorTheme(themeId)
+    const theme = BUNDLED_COLOR_THEMES[themeId]
+    const surfaces = deriveSurfaces(theme.dark.palette, theme.appearance)
+    const root = document.documentElement
+    const card = root.style.getPropertyValue('--card')
+    const popover = root.style.getPropertyValue('--popover')
+
+    expect(card).toBe(hexToHslComponents(surfaces.card))
+    expect(popover).toBe(hexToHslComponents(surfaces.popover))
+    expect(popover).not.toBe(card)
   })
 })

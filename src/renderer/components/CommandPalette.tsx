@@ -1,4 +1,4 @@
-import { AnimatePresence, motion } from 'framer-motion'
+import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import {
   Bot,
   Globe,
@@ -97,6 +97,7 @@ export function CommandPalette({
   getProjectShortcutLabel
 }: CommandPaletteProps): React.JSX.Element {
   const { t } = useTranslation('shell')
+  const reducedMotion = useReducedMotion() ?? false
   const [query, setQuery] = useState('')
   const recentCommandIds = useRecentCommandIds()
   const saveRecentCommand = useSaveRecentCommand()
@@ -417,7 +418,7 @@ export function CommandPalette({
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
           {cmd.shortcut && (
-            <CommandShortcut className="rounded border border-border bg-secondary/70 px-1.5 py-0.5 font-mono text-3xs tracking-normal text-muted-foreground">
+            <CommandShortcut className="rounded-sm border border-border/80 bg-secondary/50 px-1.5 py-0.5 font-mono text-3xs tracking-normal text-muted-foreground">
               {cmd.shortcut}
             </CommandShortcut>
           )}
@@ -459,15 +460,15 @@ export function CommandPalette({
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
-          className="fixed inset-0 z-[60] flex flex-col items-center pt-[7vh] bg-black/40 backdrop-blur-sm"
+          className="fixed inset-0 z-[60] flex flex-col items-center bg-black/70 pt-[7vh] backdrop-blur-[2px]"
           onClick={onClose}
         >
           <motion.div
-            initial={{ opacity: 0, scale: 0.97, y: -8 }}
-            animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.97, y: -8 }}
-            transition={{ duration: 0.15 }}
-            className="w-full max-w-[100vw] overflow-hidden rounded-lg border border-border bg-card shadow-2xl md:max-w-xl"
+            initial={{ opacity: 0, y: reducedMotion ? 0 : -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: reducedMotion ? 0 : -6 }}
+            transition={{ duration: reducedMotion ? 0 : 0.15 }}
+            className="w-full max-w-[100vw] overflow-hidden rounded-md border border-border/80 bg-popover shadow-[0_18px_60px_hsl(var(--background)/0.7),inset_0_1px_0_0_hsl(var(--foreground)/0.05)] md:max-w-xl"
             onClick={(e) => e.stopPropagation()}
           >
             <Command
@@ -479,7 +480,7 @@ export function CommandPalette({
                 placeholder={t('commandPalette.searchPlaceholder')}
                 value={query}
                 onValueChange={setQuery}
-                className="h-10 py-2 text-sm"
+                className="h-9 py-1.5 text-sm"
               />
               <CommandList className="max-h-[52vh] px-1 py-1">
                 <CommandEmpty>{t('commandPalette.empty')}</CommandEmpty>
@@ -503,18 +504,24 @@ export function CommandPalette({
                 ))}
               </CommandList>
 
-              <div className="label-group flex items-center justify-end gap-3 border-t border-border bg-background px-3 py-2 text-muted-foreground">
+              <div className="label-group flex items-center justify-end gap-3 border-t border-border/70 bg-secondary/20 px-3 py-1.5 text-muted-foreground">
                 <span className="flex items-center gap-3">
                   <span className="flex items-center">
-                    <kbd className="mr-1 rounded bg-secondary px-1 text-foreground">↑↓</kbd>
+                    <kbd className="mr-1 rounded-sm border border-border/80 bg-secondary/50 px-1 py-px font-mono text-3xs text-foreground/80">
+                      ↑↓
+                    </kbd>
                     {t('commandPalette.navigate')}
                   </span>
                   <span className="flex items-center">
-                    <kbd className="mr-1 rounded bg-secondary px-1 text-foreground">↵</kbd>
+                    <kbd className="mr-1 rounded-sm border border-border/80 bg-secondary/50 px-1 py-px font-mono text-3xs text-foreground/80">
+                      ↵
+                    </kbd>
                     {t('commandPalette.select')}
                   </span>
                   <span className="flex items-center">
-                    <kbd className="mr-1 rounded bg-secondary px-1 text-foreground">Esc</kbd>
+                    <kbd className="mr-1 rounded-sm border border-border/80 bg-secondary/50 px-1 py-px font-mono text-3xs text-foreground/80">
+                      Esc
+                    </kbd>
                     {t('commandPalette.close')}
                   </span>
                 </span>

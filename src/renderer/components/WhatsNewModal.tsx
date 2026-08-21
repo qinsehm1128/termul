@@ -1,4 +1,4 @@
-import { AnimatePresence, motion } from 'framer-motion'
+import { AnimatePresence, motion, useReducedMotion } from 'framer-motion'
 import { ExternalLink, Sparkles, X } from 'lucide-react'
 import { type KeyboardEvent, useCallback, useEffect, useMemo } from 'react'
 import { useTranslation } from 'react-i18next'
@@ -21,6 +21,7 @@ export function WhatsNewModal({
   onClose
 }: WhatsNewModalProps): React.JSX.Element {
   const { t } = useTranslation('shell')
+  const reducedMotion = useReducedMotion() ?? false
 
   useEffect(() => {
     if (!isOpen) return
@@ -66,15 +67,15 @@ export function WhatsNewModal({
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           exit={{ opacity: 0 }}
-          className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-[2px]"
           onClick={onClose}
         >
           <motion.div
-            initial={{ opacity: 0, scale: 0.95, y: 10 }}
-            animate={{ opacity: 1, scale: 1, y: 0 }}
-            exit={{ opacity: 0, scale: 0.95, y: 10 }}
-            transition={{ duration: 0.15 }}
-            className="bg-card rounded-lg shadow-2xl w-[500px] border border-border overflow-hidden"
+            initial={{ opacity: 0, y: reducedMotion ? 0 : -6 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: reducedMotion ? 0 : -6 }}
+            transition={{ duration: reducedMotion ? 0 : 0.15 }}
+            className="w-[500px] overflow-hidden rounded-md border border-border/80 bg-card shadow-[0_18px_60px_hsl(var(--background)/0.7),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]"
             onClick={(e) => e.stopPropagation()}
             onKeyDown={handleKeyDown}
             role="dialog"
@@ -83,19 +84,22 @@ export function WhatsNewModal({
             tabIndex={-1}
           >
             {/* Header */}
-            <div className="px-4 py-3 border-b border-border flex justify-between items-center bg-secondary/50">
+            <div className="flex h-9 items-center justify-between border-b border-border/70 px-3">
               <div className="flex items-center gap-2">
-                <div className="w-5 h-5 rounded bg-primary/10 flex items-center justify-center">
-                  <Sparkles className="w-3 h-3 text-primary" />
+                <div className="flex size-5 items-center justify-center rounded-md bg-primary/10">
+                  <Sparkles className="size-3 text-primary" />
                 </div>
-                <h3 id="whats-new-title" className="text-sm font-semibold text-foreground">
+                <h3
+                  id="whats-new-title"
+                  className="text-xs font-semibold tracking-[-0.01em] text-foreground"
+                >
                   {t('whatsNew.title')}
                 </h3>
               </div>
               <button
                 type="button"
                 onClick={onClose}
-                className="text-muted-foreground hover:text-foreground transition-colors"
+                className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                 aria-label={t('whatsNew.close')}
               >
                 <X size={14} />
@@ -134,12 +138,12 @@ export function WhatsNewModal({
             </div>
 
             {/* Footer */}
-            <div className="px-4 py-3 bg-secondary/50 flex justify-end gap-2 border-t border-border flex-wrap">
+            <div className="flex h-10 flex-wrap items-center justify-end gap-2 border-t border-border/70 bg-secondary/20 px-4">
               {htmlUrl && (
                 <button
                   type="button"
                   onClick={handleViewOnGitHub}
-                  className="px-3 py-1.5 text-xs font-medium text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1.5"
+                  className="inline-flex h-8 items-center gap-1.5 rounded-md px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary/60 hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                 >
                   <ExternalLink size={13} />
                   <span>{t('whatsNew.viewGithub')}</span>
@@ -148,7 +152,7 @@ export function WhatsNewModal({
               <button
                 type="button"
                 onClick={onClose}
-                className="px-3 py-1.5 text-xs font-medium rounded bg-primary text-primary-foreground hover:bg-primary/90 shadow-md shadow-primary/20 transition-all"
+                className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               >
                 {t('whatsNew.gotIt')}
               </button>

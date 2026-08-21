@@ -85,7 +85,8 @@ describe('TableOfContents', () => {
     )
 
     expect(screen.getByText('Title')).toBeInTheDocument()
-    expect(screen.getByText('Section').closest('button')).toHaveClass('bg-accent')
+    expect(screen.getByText('Section').closest('button')).toHaveClass('bg-sidebar-accent')
+    expect(screen.getByText('Contents').closest('.bg-sidebar')).toHaveClass('h-full')
   })
 
   it('calls onHeadingClick when a heading is selected', () => {

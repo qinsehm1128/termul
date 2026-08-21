@@ -22,21 +22,22 @@ export function EditorToolbar({
   const toggleTocVisibility = useTocSettingsStore((state) => state.toggleVisibility)
 
   return (
-    <div className="flex items-center justify-between px-3 h-8 border-b border-border bg-card flex-shrink-0">
-      <span className="text-xs text-muted-foreground truncate">{fileName}</span>
+    <div className="flex h-8 shrink-0 items-center justify-between border-b border-border/70 bg-sidebar px-2.5 shadow-[inset_0_1px_0_hsl(var(--foreground)/0.025)]">
+      <span className="truncate text-xs text-muted-foreground">{fileName}</span>
       <div className="flex items-center gap-1">
         <Button
           variant="ghost"
           size="sm"
           className={cn(
-            'h-6 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground',
-            isTocVisible && 'bg-accent text-accent-foreground'
+            'h-6 gap-1 px-2 text-xs text-muted-foreground transition-colors duration-150 hover:text-foreground',
+            isTocVisible &&
+              'bg-sidebar-accent text-foreground shadow-[inset_0_1px_0_hsl(var(--foreground)/0.035)] ring-1 ring-inset ring-primary/35'
           )}
           onClick={toggleTocVisibility}
           title={t('toc.toggle')}
           aria-pressed={isTocVisible}
         >
-          <List size={12} />
+          <List size={14} />
           <span>{t('toc.contents')}</span>
         </Button>
 
@@ -44,9 +45,7 @@ export function EditorToolbar({
           variant="ghost"
           size="sm"
           onClick={onToggleViewMode}
-          className={cn(
-            'h-6 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground hover:bg-secondary'
-          )}
+          className="h-6 gap-1 px-2 text-xs text-muted-foreground transition-colors duration-150 hover:bg-secondary hover:text-foreground"
           title={
             viewMode === 'markdown'
               ? settingsT('editor.switchToSource')
@@ -55,12 +54,12 @@ export function EditorToolbar({
         >
           {viewMode === 'markdown' ? (
             <>
-              <Code2 size={12} />
+              <Code2 size={14} />
               <span>{settingsT('editor.source')}</span>
             </>
           ) : (
             <>
-              <Eye size={12} />
+              <Eye size={14} />
               <span>{settingsT('appearance.preview')}</span>
             </>
           )}

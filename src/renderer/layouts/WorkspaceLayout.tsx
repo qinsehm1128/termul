@@ -28,6 +28,7 @@ import {
   DialogHeader,
   DialogTitle
 } from '@/components/ui/dialog'
+import { PanelFade } from '@/components/ui/panel-fade'
 import { Sheet, SheetContent } from '@/components/ui/sheet'
 import { Skeleton } from '@/components/ui/skeleton'
 import { PaneRenderer } from '@/components/workspace/PaneRenderer'
@@ -2496,29 +2497,31 @@ export default function WorkspaceLayout(): React.JSX.Element {
 
             <div className="flex-1 flex overflow-hidden min-h-0 h-full">
               {/* Sidebar */}
-              {isSidebarVisible && (
-                <div className="h-full min-h-0 overflow-hidden border-r border-sidebar-border/70">
-                  {isConversationRoute ? (
-                    <ConversationSidebar onNewChat={handleOpenAgentChat} />
-                  ) : (
-                    <ProjectSidebar
-                      projects={projects}
-                      activeProjectId={activeProjectId}
-                      onSelectProject={handleSelectProject}
-                      onSelectGroup={handleSelectGroup}
-                      onNewProject={() => setIsNewProjectModalOpen(true)}
-                      onUpdateProject={updateProject}
-                      onDeleteProject={deleteProject}
-                      onArchiveProject={archiveProject}
-                      onRestoreProject={restoreProject}
-                      onReorderProjects={reorderProjects}
-                      onSSHConnect={handleSSHConnect}
-                      onSelectSSHProfile={handleSelectSSHProfile}
-                      activeSSHProfileId={activeSSHProfileId}
-                    />
-                  )}
-                </div>
-              )}
+              <PanelFade
+                open={isSidebarVisible}
+                data-testid="sidebar-panel-fade"
+                className="h-full min-h-0 overflow-hidden border-r border-sidebar-border/70"
+              >
+                {isConversationRoute ? (
+                  <ConversationSidebar onNewChat={handleOpenAgentChat} />
+                ) : (
+                  <ProjectSidebar
+                    projects={projects}
+                    activeProjectId={activeProjectId}
+                    onSelectProject={handleSelectProject}
+                    onSelectGroup={handleSelectGroup}
+                    onNewProject={() => setIsNewProjectModalOpen(true)}
+                    onUpdateProject={updateProject}
+                    onDeleteProject={deleteProject}
+                    onArchiveProject={archiveProject}
+                    onRestoreProject={restoreProject}
+                    onReorderProjects={reorderProjects}
+                    onSSHConnect={handleSSHConnect}
+                    onSelectSSHProfile={handleSelectSSHProfile}
+                    activeSSHProfileId={activeSSHProfileId}
+                  />
+                )}
+              </PanelFade>
 
               {/* Main Content and File Explorer Container */}
               <PaneDndProvider>
@@ -2558,48 +2561,52 @@ export default function WorkspaceLayout(): React.JSX.Element {
                   </main>
 
                   {/* File Explorer - integrated right rail */}
-                  {(isExplorerVisible && explorerRootVisible) || activeSSHProfile ? (
-                    <div className="flex-shrink-0 flex flex-col h-full border-l border-border/70">
-                      {isExplorerVisible && explorerRootVisible && (
-                        <div className={activeSSHProfile ? 'flex-1 min-h-0' : 'h-full'}>
-                          <Suspense fallback={<ShellSkeleton />}>
-                            <FileExplorer side="right" />
-                          </Suspense>
-                        </div>
-                      )}
-                      {activeSSHProfile && (
-                        <div
-                          className={cn(
-                            'flex-1 bg-background overflow-hidden min-h-0 flex flex-col border-t border-border/70',
-                            !(isExplorerVisible && explorerRootVisible) && 'w-64'
-                          )}
-                        >
-                          <Suspense fallback={<ShellSkeleton />}>
-                            <SSHFileExplorer
-                              connectionId={sshConn.connectionId ?? ''}
-                              isConnected={sshConn.isConnected}
-                              sftpReady={sshConn.sftpReady}
-                              entries={sshConn.entries}
-                              currentPath={sshConn.currentPath}
-                              expandedDirs={sshConn.expandedDirs}
-                              childEntries={sshConn.childEntries}
-                              loadingDirs={sshConn.loadingDirs}
-                              isLoadingRoot={sshConn.isLoadingRoot}
-                              profileName={activeSSHProfile.name}
-                              onConnect={sshConn.handleConnect}
-                              onBrowseFiles={sshConn.handleBrowseFiles}
-                              onToggleDir={sshConn.toggleDirectory}
-                              onLoadDir={sshConn.loadDirectory}
-                              onMkdir={handleSSHMkdir}
-                              onCreateFile={handleSSHCreateFile}
-                              onDelete={handleSSHDelete}
-                              onRename={handleSSHRename}
-                            />
-                          </Suspense>
-                        </div>
-                      )}
-                    </div>
-                  ) : null}
+                  <PanelFade
+                    open={Boolean((isExplorerVisible && explorerRootVisible) || activeSSHProfile)}
+                    data-testid="explorer-rail-fade"
+                    className="flex h-full flex-shrink-0 flex-col border-l border-border/70"
+                  >
+                    <PanelFade
+                      open={Boolean(isExplorerVisible && explorerRootVisible)}
+                      data-testid="file-explorer-panel-fade"
+                      className={activeSSHProfile ? 'min-h-0 flex-1' : 'h-full'}
+                    >
+                      <Suspense fallback={<ShellSkeleton />}>
+                        <FileExplorer side="right" />
+                      </Suspense>
+                    </PanelFade>
+                    {activeSSHProfile && (
+                      <div
+                        className={cn(
+                          'flex min-h-0 flex-1 flex-col overflow-hidden border-t border-border/70 bg-background',
+                          !(isExplorerVisible && explorerRootVisible) && 'w-64'
+                        )}
+                      >
+                        <Suspense fallback={<ShellSkeleton />}>
+                          <SSHFileExplorer
+                            connectionId={sshConn.connectionId ?? ''}
+                            isConnected={sshConn.isConnected}
+                            sftpReady={sshConn.sftpReady}
+                            entries={sshConn.entries}
+                            currentPath={sshConn.currentPath}
+                            expandedDirs={sshConn.expandedDirs}
+                            childEntries={sshConn.childEntries}
+                            loadingDirs={sshConn.loadingDirs}
+                            isLoadingRoot={sshConn.isLoadingRoot}
+                            profileName={activeSSHProfile.name}
+                            onConnect={sshConn.handleConnect}
+                            onBrowseFiles={sshConn.handleBrowseFiles}
+                            onToggleDir={sshConn.toggleDirectory}
+                            onLoadDir={sshConn.loadDirectory}
+                            onMkdir={handleSSHMkdir}
+                            onCreateFile={handleSSHCreateFile}
+                            onDelete={handleSSHDelete}
+                            onRename={handleSSHRename}
+                          />
+                        </Suspense>
+                      </div>
+                    )}
+                  </PanelFade>
                 </div>
               </PaneDndProvider>
             </div>

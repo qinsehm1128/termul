@@ -48,7 +48,7 @@ describe('ColorPickerPopover', () => {
 
     // The current color button should have ring styling
     const buttons = screen.getAllByRole('button')
-    const hasRingButton = buttons.some((btn) => btn.className.includes('ring-2'))
+    const hasRingButton = buttons.some((btn) => btn.className.includes('ring-1'))
     expect(hasRingButton).toBe(true)
   })
 })

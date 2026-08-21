@@ -268,6 +268,17 @@ describe('ChatInputBar config controls', () => {
     vi.clearAllMocks()
   })
 
+  it('anchors the composer with a localized top edge, not a floating card', () => {
+    renderInputBar()
+    const composer = document.querySelector('[data-chat-composer="true"]')
+    expect(composer).toHaveClass('border-t')
+    expect(composer?.className).toContain('shadow-[0_-10px_18px_-14px_hsl(var(--foreground)/0.10)]')
+    expect(composer).toHaveClass('bg-card/80')
+    expect(composer).not.toHaveClass('sticky')
+    expect(composer).not.toHaveClass('absolute')
+    expect(composer?.className).not.toMatch(/rounded-(lg|xl|2xl)/)
+  })
+
   it('shows the last ACP agent when the session has no model option', () => {
     renderInputBar({ configOptions: [], modes: null })
     expect(screen.getByTestId('composer-agent-identity')).toHaveTextContent('Cursor')
@@ -292,6 +303,11 @@ describe('ChatInputBar config controls', () => {
     expect(contextStrip).toBeInTheDocument()
     expect(composer).toContainElement(inputBezel)
     expect(composer).not.toContainElement(contextStrip)
+    expect(composer).toHaveClass('border-t')
+    expect(composer?.className).toContain('shadow-[0_-10px_18px_-14px_hsl(var(--foreground)/0.10)]')
+    expect(composer).not.toHaveClass('sticky')
+    expect(composer).not.toHaveClass('absolute')
+    expect(composer?.className).not.toMatch(/rounded-(lg|xl|2xl)/)
     expect(screen.getByText('New worktree')).toBeInTheDocument()
     expect(screen.getByText('chat/abcd1234')).toBeInTheDocument()
     expect(screen.queryByText(/Shift\+Enter/i)).not.toBeInTheDocument()

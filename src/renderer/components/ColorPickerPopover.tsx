@@ -73,7 +73,7 @@ export function ColorPickerPopover({
   return (
     <div
       ref={popoverRef}
-      className="fixed z-50 bg-card border border-border rounded-lg shadow-lg p-3"
+      className="fixed z-50 rounded-md border border-border/80 bg-popover p-3 shadow-[0_18px_60px_hsl(var(--background)/0.7),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]"
       style={{ left: position.left, top: position.top }}
     >
       <p className="text-xs text-muted-foreground mb-2">{t('selectColor')}</p>
@@ -89,10 +89,10 @@ export function ColorPickerPopover({
                 onClose()
               }}
               className={cn(
-                'w-6 h-6 rounded-full transition-all',
+                'size-6 rounded-sm transition-[opacity,box-shadow]',
                 colors.bg,
                 currentColor === color
-                  ? 'ring-2 ring-offset-2 ring-offset-card ring-current'
+                  ? 'ring-1 ring-foreground/70 ring-offset-2 ring-offset-popover'
                   : 'hover:opacity-80'
               )}
             />

@@ -206,6 +206,16 @@ describe('StatusBar', () => {
     })
   })
 
+  describe('project color marker', () => {
+    it('uses the same 6px square micro-marker as project sidebar rows', () => {
+      renderWithProviders(<StatusBar project={mockProject} />)
+
+      const marker = document.querySelector('[data-project-color="blue"]')
+      expect(marker).toHaveClass('size-1.5', 'rounded-[1px]')
+      expect(marker).not.toHaveClass('size-2', 'rounded-sm')
+    })
+  })
+
   describe('project name always visible', () => {
     it('should always render project name regardless of settings', () => {
       useContextBarSettingsStore.setState({
