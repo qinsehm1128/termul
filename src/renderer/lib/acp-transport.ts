@@ -33,6 +33,7 @@ import {
 } from '@shared/types/web-protocol.types'
 import { invoke } from '@tauri-apps/api/core'
 import { listen, type UnlistenFn } from '@tauri-apps/api/event'
+import { runtimeT } from '@/i18n/runtime'
 import type {
   AcpRegistrySnapshot,
   AgentConfig,
@@ -390,6 +391,16 @@ const RECONNECT_BASE_MS = 500
 const RECONNECT_MAX_MS = 8_000
 /** Bounded application round-trip check used for browser resume signals. */
 const RESUME_VALIDATION_TIMEOUT_MS = 5_000
+/**
+ * Hidden duration above which the client skips round-trip validation and goes
+ * directly to {@link WsAcpTransport.forceReconnect}. At 30s of hidden time
+ * the heartbeat is throttled or paused by the OS, so the server will kill the
+ * socket within ~45s (75s `PONG_TIMEOUT` minus 30s already elapsed). A ping
+ * validation round-trip would waste `RESUME_VALIDATION_TIMEOUT_MS` on a link
+ * that is dead or about to die. 30s is 40% of the 75s server timeout —
+ * principled, not a workaround.
+ */
+const VISIBILITY_STALE_THRESHOLD_MS = 30_000
 
 /**
  * Application-level heartbeat interval. A client-emitted `ping` text request
@@ -556,7 +567,12 @@ export class WsAcpTransport implements AcpTransport {
     }
     for (const [, p] of this.pending) {
       if (p.timer) clearTimeout(p.timer)
-      p.reject(new AcpTransportError('closed', 'transport disposed'))
+      p.reject(
+        new AcpTransportError(
+          'closed',
+          runtimeT('chat', 'transport.disposed', 'transport disposed')
+        )
+      )
     }
     this.pending.clear()
     this.socket?.close()
@@ -629,7 +645,14 @@ export class WsAcpTransport implements AcpTransport {
   async installRegistryBinary(
     _request: InstallAcpRegistryBinaryRequest
   ): Promise<InstallAcpRegistryBinaryOutcome> {
-    throw new AcpTransportError('unsupported', 'Registry binary install is desktop-only')
+    throw new AcpTransportError(
+      'unsupported',
+      runtimeT(
+        'chat',
+        'transport.registryInstallDesktopOnly',
+        'Registry binary install is desktop-only'
+      )
+    )
   }
 
   /**
@@ -1011,21 +1034,39 @@ export class WsAcpTransport implements AcpTransport {
 
       ws.onerror = () => {
         if (this.socket !== ws) return
-        this.rejectAllPending('closed', 'WebSocket error')
-        settleErr(new AcpTransportError('closed', 'WebSocket error'))
+        const message = runtimeT('chat', 'transport.websocketError', 'WebSocket error')
+        this.rejectAllPending('closed', message)
+        settleErr(new AcpTransportError('closed', message))
       }
 
       ws.onclose = () => {
         if (this.socket !== ws) {
-          settleErr(new AcpTransportError('closed', 'superseded WebSocket closed before auth'))
+          settleErr(
+            new AcpTransportError(
+              'closed',
+              runtimeT(
+                'chat',
+                'transport.websocketSupersededBeforeAuth',
+                'superseded WebSocket closed before auth'
+              )
+            )
+          )
           return
         }
         this.socket = null
         this.authed = false
         this.clearHeartbeat()
-        this.rejectAllPending('closed', 'WebSocket closed')
+        this.rejectAllPending(
+          'closed',
+          runtimeT('chat', 'transport.websocketClosed', 'WebSocket closed')
+        )
         if (!this.disposed) this.scheduleReconnect()
-        settleErr(new AcpTransportError('closed', 'WebSocket closed before auth'))
+        settleErr(
+          new AcpTransportError(
+            'closed',
+            runtimeT('chat', 'transport.websocketClosedBeforeAuth', 'WebSocket closed before auth')
+          )
+        )
       }
 
       authTimer = setTimeout(() => {
@@ -1035,7 +1076,12 @@ export class WsAcpTransport implements AcpTransport {
           } catch {
             /* ignore */
           }
-          settleErr(new AcpTransportError('closed', 'WebSocket auth handshake timeout'))
+          settleErr(
+            new AcpTransportError(
+              'closed',
+              runtimeT('chat', 'transport.websocketAuthTimeout', 'WebSocket auth handshake timeout')
+            )
+          )
         }
       }, REQUEST_TIMEOUT_MS)
     })
@@ -1050,6 +1096,34 @@ export class WsAcpTransport implements AcpTransport {
   }
 
   /**
+   * CAP-3: send an id-less `background`/`foreground` WS control frame so the
+   * server extends (background) or resets (foreground, or any normal frame)
+   * its keepalive watchdog ceiling. Fire-and-forget — no reply, no
+   * request/reply correlation id. Guarded to a live, authenticated socket;
+   * never throws (a failed lifecycle signal is harmless — the watchdog closes
+   * a dead socket on the next ping tick and the reconnect path engages).
+   */
+  private sendLifecycleSignal(type: 'background' | 'foreground'): void {
+    if (this.disposed) return
+    const socket = this.socket
+    if (!socket || socket.readyState !== WebSocket.OPEN || !this.authed) return
+    try {
+      socket.send(JSON.stringify({ type }))
+    } catch (err) {
+      // Never rethrow out of a browser lifecycle event listener, but emit a
+      // durable boundary log (per AGENTS.md) so a dead/closed socket here is
+      // observable. Safe context only — no frame payload, secrets, or creds.
+      void logFrontendError({
+        level: 'warn',
+        source: 'WsAcpTransport.sendLifecycleSignal',
+        message: `failed to send a background/foreground lifecycle signal: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      })
+    }
+  }
+
+  /**
    * Attach browser lifecycle listeners so every resume signal validates the
    * application round trip instead of trusting `readyState === OPEN`.
    */
@@ -1058,12 +1132,51 @@ export class WsAcpTransport implements AcpTransport {
     const onVisibility = (): void => {
       if (document.visibilityState === 'hidden') {
         this.lastHiddenAt = Date.now()
+        // CAP-3: signal the server to extend its keepalive watchdog to the
+        // 5-min background ceiling before the tab suspends (the OS will
+        // throttle/pause this transport's timers).
+        this.sendLifecycleSignal('background')
         return
       }
-      this.validateOnResume('visibility return')
+      // CAP-3: signal the server to resume the normal 75s watchdog ceiling
+      // (a no-op if the socket is already dead — sendLifecycleSignal guards on
+      // readyState === OPEN). Then CAP-2's stale-threshold branching decides
+      // whether to validate the round trip or force-reconnect.
+      this.sendLifecycleSignal('foreground')
+      // CAP-2: Skip round-trip ping validation on long background returns.
+      // After VISIBILITY_STALE_THRESHOLD_MS, the heartbeat is throttled and
+      // the server will kill the socket within ~45s, so a ping wastes up to
+      // 5s on a dead/dying link. Go directly to reconnect with backoff reset.
+      const hiddenFor = this.lastHiddenAt != null ? Date.now() - this.lastHiddenAt : 0
+      if (hiddenFor > VISIBILITY_STALE_THRESHOLD_MS) {
+        this.lastHiddenAt = null
+        void logFrontendError({
+          level: 'warn',
+          source: 'WsAcpTransport.visibilityStale',
+          message: `visibility return after ${Math.round(hiddenFor / 1000)}s: skipping ping validation, force-reconnecting`
+        })
+        this.forceReconnect('visibility return: long background')
+      } else {
+        this.validateOnResume('visibility return')
+      }
     }
     const onFocus = (): void => {
-      if (this.lastHiddenAt != null) this.validateOnResume('window focus')
+      if (this.lastHiddenAt == null) return
+      // Same stale-threshold check as the visibility handler: if the tab was
+      // hidden long enough for the server to kill (or be about to kill) the
+      // socket, skip the ping round-trip and force-reconnect directly.
+      const hiddenFor = Date.now() - this.lastHiddenAt
+      if (hiddenFor > VISIBILITY_STALE_THRESHOLD_MS) {
+        void logFrontendError({
+          level: 'warn',
+          source: 'WsAcpTransport.focusStale',
+          message: `focus return after ${Math.round(hiddenFor / 1000)}s: skipping ping validation, force-reconnecting`
+        })
+        this.lastHiddenAt = null
+        this.forceReconnect('window focus: long background')
+      } else {
+        this.validateOnResume('window focus')
+      }
     }
     const onPageShow = (): void => this.validateOnResume('pageshow')
     const onResume = (): void => this.validateOnResume('browser resume')
@@ -1127,11 +1240,24 @@ export class WsAcpTransport implements AcpTransport {
   private async validateRoundTrip(reason: string): Promise<void> {
     try {
       if (this.socket?.readyState !== WebSocket.OPEN || !this.authed) {
-        throw new AcpTransportError('closed', 'socket is not authenticated and open')
+        throw new AcpTransportError(
+          'closed',
+          runtimeT(
+            'chat',
+            'transport.socketNotAuthenticated',
+            'socket is not authenticated and open'
+          )
+        )
       }
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(
-          () => reject(new AcpTransportError('timeout', 'resume health check timed out')),
+          () =>
+            reject(
+              new AcpTransportError(
+                'timeout',
+                runtimeT('chat', 'transport.resumeHealthTimeout', 'resume health check timed out')
+              )
+            ),
           RESUME_VALIDATION_TIMEOUT_MS
         )
         void this.request<void>('ping', {}).then(
@@ -1162,13 +1288,33 @@ export class WsAcpTransport implements AcpTransport {
    * Pong-timeout, and the client's `onclose` may not have fired yet (or the
    * link is half-open and still reports OPEN). Tears down the suspect socket
    * (detaching its handlers so its eventual close does not double-trigger
-   * `scheduleReconnect`/`rejectAllPending`), then reuses `scheduleReconnect()`
-   * so the existing backoff + `reconnect()` + cursor-resubscribe +
-   * `onReconnectStateChange` machinery runs unchanged.
+   * `scheduleReconnect`/`rejectAllPending`), cancels any pending reconnect
+   * timer (which may carry elevated backoff from prior failures), resets
+   * exponential backoff to zero (the visibility-triggered path must recover
+   * within the server's grace window), then reuses `scheduleReconnect()` so
+   * the `reconnect()` + cursor-resubscribe + `onReconnectStateChange`
+   * machinery runs unchanged.
    */
   private forceReconnect(reason: string): void {
-    if (this.disposed || this.connecting || this.reconnecting || this.reconnectTimer) return
+    if (this.disposed) return
+    // An active reconnect that has already progressed past socket creation
+    // (in-flight `reconnect()` with no pending timer) means the socket is
+    // being re-established — don't interfere. A pending timer or an in-flight
+    // `connect()` that hasn't opened a socket yet are both safe to cancel:
+    // `scheduleReconnect` queued a future attempt (possibly with elevated
+    // backoff from prior failures), or `connect()` created a socket that the
+    // OS hasn't opened yet (half-open during background throttling).
+    if (this.reconnecting && !this.reconnectTimer && !this.connecting) return
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
     this.discardSocket(reason)
+    // Clear any in-flight connect attempt — the old socket is gone, so the
+    // pending Promise will reject via the detached handlers. Setting to null
+    // allows `connect()` to start a fresh attempt from `scheduleReconnect`.
+    this.connecting = null
+    this.reconnectAttempt = 0
     this.scheduleReconnect()
   }
 
@@ -1293,7 +1439,14 @@ export class WsAcpTransport implements AcpTransport {
           source: 'WsAcpTransport.reconnect',
           message: `ACP subscription recovery failed for session ids: ${failedSessions.join(', ')}`
         })
-        throw new AcpTransportError('closed', 'required ACP subscriptions did not recover')
+        throw new AcpTransportError(
+          'closed',
+          runtimeT(
+            'chat',
+            'transport.subscriptionRecoveryFailed',
+            'required ACP subscriptions did not recover'
+          )
+        )
       }
       this.reconnectAttempt = 0
       // Story 5.3 (AC3): fire `false` AFTER the socket re-opens and all
@@ -1362,13 +1515,25 @@ export class WsAcpTransport implements AcpTransport {
         // + authed — it refreshes the server keepalive watchdog through proxies
         // that strip WS-level Ping/Pong so a focused tab stops dropping at ~75s.
         this.startHeartbeat()
+        // CAP-3: if the tab is already hidden when auth completes (e.g. a
+        // reconnect that finished while backgrounded), the hide event fired
+        // before we were authed and was a no-op. Re-sync the server's watchdog
+        // to the 5-min background ceiling now that this connection is live.
+        if (typeof document !== 'undefined' && document.visibilityState === 'hidden') {
+          this.sendLifecycleSignal('background')
+        }
       } catch (err) {
         try {
           this.socket?.close()
         } catch {
           /* ignore */
         }
-        throw err instanceof Error ? err : new AcpTransportError('closed', 'authenticate failed')
+        throw err instanceof Error
+          ? err
+          : new AcpTransportError(
+              'closed',
+              runtimeT('chat', 'transport.authenticateFailed', 'authenticate failed')
+            )
       }
       this.emitLocal(evt.type, evt.payload)
       return
@@ -1458,7 +1623,14 @@ export class WsAcpTransport implements AcpTransport {
         timerMs > 0
           ? setTimeout(() => {
               this.pending.delete(id)
-              pending.reject(new AcpTransportError('timeout', 'Request send_prompt timed out'))
+              pending.reject(
+                new AcpTransportError(
+                  'timeout',
+                  runtimeT('chat', 'transport.requestTimedOut', 'Request {{type}} timed out', {
+                    type: 'send_prompt'
+                  })
+                )
+              )
             }, timerMs)
           : null
     }
@@ -1529,7 +1701,14 @@ export class WsAcpTransport implements AcpTransport {
         timerMs > 0
           ? setTimeout(() => {
               this.pending.delete(id)
-              reject(new AcpTransportError('timeout', `Request ${type} timed out`))
+              reject(
+                new AcpTransportError(
+                  'timeout',
+                  runtimeT('chat', 'transport.requestTimedOut', 'Request {{type}} timed out', {
+                    type
+                  })
+                )
+              )
             }, timerMs)
           : null
       this.pending.set(id, {
@@ -1543,7 +1722,12 @@ export class WsAcpTransport implements AcpTransport {
       if (!this.socket || this.socket.readyState !== WebSocket.OPEN) {
         if (timer) clearTimeout(timer)
         this.pending.delete(id)
-        reject(new AcpTransportError('closed', 'WebSocket not open'))
+        reject(
+          new AcpTransportError(
+            'closed',
+            runtimeT('chat', 'transport.websocketNotOpen', 'WebSocket not open')
+          )
+        )
         return
       }
       this.socket.send(JSON.stringify(frame))

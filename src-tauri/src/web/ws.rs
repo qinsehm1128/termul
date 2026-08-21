@@ -26,7 +26,7 @@
 //! `err.code: "not_implemented"` until Stories 1.7/1.8/Epic 4.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,6 +46,7 @@ use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub}
 use crate::web::permissions::{TurnClaim, DEFAULT_PERMISSION_RECONNECT_GRACE};
 use crate::web::project_registry::{ProjectRegistry, ProjectSwitchContext};
 use crate::web::sink::{broadcast_projects_changed, ClientId, ReplayResult, WsRelaySink};
+use crate::web::store::WebStore;
 
 // ---------------------------------------------------------------------------
 // Sequenced event — the wire envelope (AC2 + AC3)
@@ -344,6 +345,12 @@ pub struct AppState {
     /// `install_acp_agent`; the desktop renderer uses the `acp_install_agent`
     /// Tauri command (same `IpcResult<T>` shape byte-for-byte).
     pub acp_install: Option<Arc<crate::acp::install::AcpInstallService>>,
+    /// Issue #613: server-side generic key-value store for web-client state
+    /// (terminal layout, settings, editor state, command history, snapshots,
+    /// SSH profiles). `None` when a server does not attach a store — the
+    /// `store_*` WS handlers return `STORE_UNAVAILABLE` (degraded mode). The
+    /// standalone binary + desktop shared-live host both attach one.
+    pub store: Option<Arc<WebStore>>,
     /// PR-S4 / CAP-1: the project-root boundary for the fs_api / git / skills /
     /// search routes. Requests whose canonicalized target path resolves outside
     /// this root are refused with `code: "OUTSIDE_ROOT"` (or `PATH_TRAVERSAL`
@@ -474,18 +481,70 @@ const PING_INTERVAL: Duration = Duration::from_secs(20);
 /// browser's reconnect+cursor-resubscribe path can engage.
 const PONG_TIMEOUT: Duration = Duration::from_secs(75);
 
+/// Signal-gated keepalive ceiling (CAP-3): while a web client has sent a
+/// `type:"background"` control frame and not yet sent `foreground` (or any
+/// normal frame), the watchdog tolerates up to 5 minutes of inactivity so a
+/// backgrounded mobile tab (whose `setInterval` the OS throttles/pauses)
+/// survives an app-switch round-trip. `PONG_TIMEOUT` is NOT raised — the
+/// 5-min ceiling applies only while `backgrounded=true`. 5 min balances
+/// mobile battery against reconnect latency (codeg tolerates 1h; buzz 30s).
+const BACKGROUND_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// Reusable Ping payload (opaque; browsers must echo it back in the Pong, but
 /// the relay does not correlate — any inbound frame resets the watchdog).
 /// Must stay under 125 bytes per RFC 6455 control-frame limits.
 const PING_PAYLOAD: &[u8] = b"keepalive";
 
 /// Pure keepalive-watchdog decision: returns true when no inbound frame
-/// (text request, Pong, or client Ping) has arrived for longer than
-/// `PONG_TIMEOUT`. Extracted from the write task so the threshold semantics
-/// (strict `>`) are unit-testable without spinning up a real socket. The write
-/// task calls this with `last_activity.load()` + `now_ms()` on each ping tick.
-fn watchdog_is_stale(last_activity_ms: u64, now_ms_value: u64) -> bool {
-    now_ms_value.saturating_sub(last_activity_ms) > PONG_TIMEOUT.as_millis() as u64
+/// (text request, Pong, or client Ping) has arrived for longer than `ceiling`
+/// — `PONG_TIMEOUT` for an active/foreground connection, or `BACKGROUND_TIMEOUT`
+/// while a `background` signal is in effect (CAP-3). Extracted from the write
+/// task so the threshold semantics (strict `>`) are unit-testable without
+/// spinning up a real socket. The write task calls this with
+/// `last_activity.load()` + `now_ms()` + the active ceiling on each tick.
+fn watchdog_is_stale(last_activity_ms: u64, now_ms_value: u64, ceiling_ms: u64) -> bool {
+    now_ms_value.saturating_sub(last_activity_ms) > ceiling_ms
+}
+
+/// Cheaply extract the `type` field of a client WS text frame (CAP-3 control
+/// signals). Returns `None` for non-JSON or frames without a string `type`.
+/// The read task uses this to recognize id-less `background`/`foreground`
+/// lifecycle frames before the strict `WsRequest` parse (which requires `id`).
+fn peer_frame_type(text: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(text).ok()?;
+    value.get("type")?.as_str().map(str::to_owned)
+}
+
+/// CAP-3: consume an id-less `background`/`foreground` lifecycle control frame.
+/// Returns `true` when the frame was a lifecycle signal and the caller should
+/// skip dispatch (no reply, no `WsRequest` parse). The `backgrounded` flag is
+/// toggled ONLY when `authed` (an unauthenticated peer cannot manipulate the
+/// watchdog ceiling); an unauthenticated signal is still consumed (ignored,
+/// no dispatch, no error). Returns `false` for any other frame — the caller
+/// then resets the flag ("any normal frame resets the normal timeout") and
+/// dispatches as a normal ACP request.
+fn handle_lifecycle_signal(text: &str, authed: bool, backgrounded: &AtomicBool) -> bool {
+    if let Some(type_) = peer_frame_type(text) {
+        match type_.as_str() {
+            "background" => {
+                if authed {
+                    backgrounded.store(true, Ordering::Relaxed);
+                } else {
+                    debug!("[ws] ignoring background signal from unauthenticated connection");
+                }
+                true
+            }
+            "foreground" => {
+                if authed {
+                    backgrounded.store(false, Ordering::Relaxed);
+                }
+                true
+            }
+            _ => false,
+        }
+    } else {
+        false
+    }
 }
 
 /// Epoch-millis timestamp for the keepalive watchdog. Uses `SystemTime` (not
@@ -520,6 +579,9 @@ async fn run_relay(socket: WebSocket, state: AppState) {
     // CAP-6 / Story 9: the host-owned verified-atomic ACP install service for
     // the `install_acp_agent` WS request.
     let acp_install = state.acp_install.clone();
+    // Issue #613: the server-side generic key-value store behind the
+    // `store_read` / `store_write` / `store_delete` WS requests.
+    let store = state.store.clone();
     // Client ids registered via `subscribe` — unregistered on disconnect.
     let subscribed_clients = Arc::new(tokio::sync::Mutex::new(Vec::<(String, ClientId)>::new()));
     let cleanup = ConnectionCleanup::new(Arc::clone(&relay), Arc::clone(&subscribed_clients));
@@ -550,7 +612,13 @@ async fn run_relay(socket: WebSocket, state: AppState) {
     // the only way to refresh NAT/proxy/browser idle timers during silent
     // reasoning phases and to surface a dead client promptly.
     let last_activity = Arc::new(AtomicU64::new(now_ms()));
+    // CAP-3: per-connection background flag. `true` while a web client has
+    // signaled `type:"background"` (tab suspending); the watchdog then uses
+    // BACKGROUND_TIMEOUT (5min) instead of PONG_TIMEOUT (75s). Reset to
+    // false by `foreground` or any normal client frame.
+    let backgrounded = Arc::new(AtomicBool::new(false));
     let write_last_activity = Arc::clone(&last_activity);
+    let write_backgrounded = Arc::clone(&backgrounded);
 
     let write_tx = out_tx.clone();
     let mut write_task = tokio::spawn(async move {
@@ -600,10 +668,17 @@ async fn run_relay(socket: WebSocket, state: AppState) {
                     let last = write_last_activity.load(Ordering::Relaxed);
                     let now = now_ms();
                     let stale = now.saturating_sub(last);
-                    if watchdog_is_stale(last, now) {
+                    // CAP-3: a backgrounded client (sent `type:"background"`)
+                    // gets the 5-min ceiling; any other state gets 75s.
+                    let ceiling = if write_backgrounded.load(Ordering::Relaxed) {
+                        BACKGROUND_TIMEOUT
+                    } else {
+                        PONG_TIMEOUT
+                    };
+                    if watchdog_is_stale(last, now, ceiling.as_millis() as u64) {
                         warn!(
                             "[ws] keepalive: no client activity for {stale} ms \
-                             (>{PONG_TIMEOUT:?}); closing connection"
+                             (>{ceiling:?}); closing connection"
                         );
                         break;
                     }
@@ -613,6 +688,7 @@ async fn run_relay(socket: WebSocket, state: AppState) {
     });
 
     let read_last_activity = Arc::clone(&last_activity);
+    let read_backgrounded = Arc::clone(&backgrounded);
     let read_subscribed_clients = Arc::clone(&subscribed_clients);
     let read_relay = Arc::clone(&relay);
     let mut read_task = tokio::spawn(async move {
@@ -632,6 +708,19 @@ async fn run_relay(socket: WebSocket, state: AppState) {
             read_last_activity.store(now_ms(), Ordering::Relaxed);
             match msg {
                 Message::Text(t) => {
+                    // CAP-3: consume id-less `background`/`foreground`
+                    // lifecycle control frames before the strict `WsRequest`
+                    // parse (which requires `id`). These are fire-and-forget
+                    // (no reply) and toggle the keepalive ceiling; an
+                    // unauthenticated connection's signal is ignored (no flag
+                    // set, no dispatch, no error).
+                    if handle_lifecycle_signal(&t, authed, &read_backgrounded) {
+                        continue;
+                    }
+                    // Any other text frame resets the background flag (CAP-3:
+                    // "resets on foreground or any normal frame") and dispatches
+                    // as a normal ACP request.
+                    read_backgrounded.store(false, Ordering::Relaxed);
                     if !dispatch_connection_text(
                         &t,
                         &mut authed,
@@ -649,6 +738,7 @@ async fn run_relay(socket: WebSocket, state: AppState) {
                         history_mode,
                         acp_catalog.as_ref(),
                         acp_install.as_ref(),
+                        store.as_ref(),
                     )
                     .await
                     {
@@ -785,6 +875,7 @@ async fn dispatch_connection_text(
     history_mode: HistoryMode,
     acp_catalog: Option<&Arc<crate::acp::AcpCatalogService>>,
     acp_install: Option<&Arc<crate::acp::install::AcpInstallService>>,
+    store: Option<&Arc<WebStore>>,
 ) -> bool {
     if let Some((id, payload)) = authenticated_send_prompt(text, *authed) {
         return match accept_send_prompt(id, &payload, acp, relay).await {
@@ -819,6 +910,7 @@ async fn dispatch_connection_text(
         history_mode,
         acp_catalog,
         acp_install,
+        store,
     )
     .await;
     write_tx.send(Outbound::Reply(reply)).is_ok()
@@ -901,6 +993,7 @@ async fn handle_request(
     history_mode: HistoryMode,
     acp_catalog: Option<&Arc<crate::acp::AcpCatalogService>>,
     acp_install: Option<&Arc<crate::acp::install::AcpInstallService>>,
+    store: Option<&Arc<WebStore>>,
 ) -> WsReply {
     let req: WsRequest = match serde_json::from_str(text) {
         Ok(r) => r,
@@ -1111,6 +1204,13 @@ async fn handle_request(
         "install_acp_agent" => {
             handle_install_acp_agent(id, &req.payload, acp_install).await
         }
+        // Issue #613: server-side generic key-value store. The web client
+        // routes its `persistenceApi` through these (replacing the per-browser
+        // localStorage stub) so settings / layout / command history / SSH
+        // profiles survive browser switches + server restarts.
+        "store_read" => handle_store_read(id, &req.payload, store).await,
+        "store_write" => handle_store_write(id, &req.payload, store).await,
+        "store_delete" => handle_store_delete(id, &req.payload, store).await,
         "kill_agent" => {
             handle_kill_agent(
                 id,
@@ -1739,6 +1839,140 @@ async fn handle_install_acp_agent(
     match service.install_by_id(&parsed.agent_id).await {
         Ok(outcome) => ok_with_payload(id, &outcome),
         Err(error) => WsReply::err_with_code(id, error.code(), error.message),
+    }
+}
+
+// --- Issue #613: server-side generic key-value store -------------------------
+
+/// `store_read` WS request payload. `deny_unknown_fields` rejects an
+/// over-serialized payload loudly at the host boundary.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoreReadPayload {
+    key: String,
+}
+
+/// `store_write` WS request payload. `value` is any JSON value.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoreWritePayload {
+    key: String,
+    value: Value,
+    #[serde(default)]
+    expected: Option<Value>,
+}
+
+/// `store_delete` WS request payload.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StoreDeletePayload {
+    key: String,
+}
+
+/// `store_read` → `WebStore::read`. Reply = `{ value: <json | null> }`.
+/// Degrade-mode (`store: None`) returns `STORE_UNAVAILABLE`.
+async fn handle_store_read(
+    id: String,
+    payload: &Value,
+    store: Option<&Arc<WebStore>>,
+) -> WsReply {
+    let parsed: StoreReadPayload = match serde_json::from_value(payload.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            return WsReply::err_with_code(
+                id,
+                "VALIDATION_ERROR",
+                format!("malformed store_read payload (want key): {e}"),
+            )
+        }
+    };
+    let Some(store) = store.cloned() else {
+        return WsReply::err_with_code(id, "STORE_UNAVAILABLE", "server store is unavailable");
+    };
+    let result = tokio::task::spawn_blocking(move || store.read(&parsed.key)).await;
+    match result {
+        Ok(Ok(value)) => WsReply::ok(id, Some(json!({ "value": value }))),
+        Ok(Err(e)) => WsReply::err_with_code(id, "STORE_UNAVAILABLE", e.to_string()),
+        Err(join_err) => {
+            tracing::warn!("store_read task failed: {join_err}");
+            WsReply::err_with_code(id, "STORE_UNAVAILABLE", format!("store read task failed: {join_err}"))
+        }
+    }
+}
+
+/// `store_write` → `WebStore::write` (atomic replace). Reply = `{}`.
+async fn handle_store_write(
+    id: String,
+    payload: &Value,
+    store: Option<&Arc<WebStore>>,
+) -> WsReply {
+    let parsed: StoreWritePayload = match serde_json::from_value(payload.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            return WsReply::err_with_code(
+                id,
+                "VALIDATION_ERROR",
+                format!("malformed store_write payload (want key + value): {e}"),
+            )
+        }
+    };
+    let Some(store) = store.cloned() else {
+        return WsReply::err_with_code(id, "STORE_UNAVAILABLE", "server store is unavailable");
+    };
+    if parsed.key.len() > 1024 {
+        return WsReply::err_with_code(id, "VALIDATION_ERROR", "key too long");
+    }
+    let store_clone = store.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        store_clone.write(&parsed.key, parsed.value, parsed.expected)
+    }).await;
+    match result {
+        Ok(Ok(true)) => WsReply::ok(id, Some(json!({}))),
+        Ok(Ok(false)) => WsReply::err_with_code(id, "STORE_CAS_FAILED", "store write rejected: value changed concurrently"),
+        Ok(Err(error)) => {
+            tracing::warn!("store_write failed: {error}");
+            WsReply::err_with_code(id, "STORE_WRITE_FAILED", format!("store write failed: {error}"))
+        }
+        Err(join_err) => {
+            tracing::warn!("store_write task failed: {join_err}");
+            WsReply::err_with_code(id, "STORE_WRITE_FAILED", format!("task failed: {join_err}"))
+        }
+    }
+}
+
+/// `store_delete` → `WebStore::delete`. Reply = `{ existed: bool }`.
+async fn handle_store_delete(
+    id: String,
+    payload: &Value,
+    store: Option<&Arc<WebStore>>,
+) -> WsReply {
+    let parsed: StoreDeletePayload = match serde_json::from_value(payload.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            return WsReply::err_with_code(
+                id,
+                "VALIDATION_ERROR",
+                format!("malformed store_delete payload (want key): {e}"),
+            )
+        }
+    };
+    let Some(store) = store.cloned() else {
+        return WsReply::err_with_code(id, "STORE_UNAVAILABLE", "server store is unavailable");
+    };
+    let store_clone = store.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        store_clone.delete(&parsed.key)
+    }).await;
+    match result {
+        Ok(Ok(existed)) => WsReply::ok(id, Some(json!({ "existed": existed }))),
+        Ok(Err(error)) => {
+            tracing::warn!("store_delete failed: {error}");
+            WsReply::err_with_code(id, "STORE_DELETE_FAILED", format!("store delete failed: {error}"))
+        }
+        Err(join_err) => {
+            tracing::warn!("store_delete task failed: {join_err}");
+            WsReply::err_with_code(id, "STORE_DELETE_FAILED", format!("task failed: {join_err}"))
+        }
     }
 }
 
@@ -3110,6 +3344,24 @@ async fn handle_subscribe(
         return WsReply::err(id, WsErrorCode::Unsupported, "sessionId is required");
     }
 
+    // CAP-1: Reopen the durable session writer before subscribing so every
+    // event flowing after a reconnect-based subscribe is persisted. Idempotent
+    // for already-active sessions. A missing persistence layer (desktop path)
+    // or an unknown session is logged but never blocks the subscribe.
+    match relay.persistence() {
+        Some(persistence) => {
+            if let Err(error) = persistence.reopen_writer(&parsed.session_id).await {
+                warn!(
+                    "subscribe: reopen_writer failed for session {}: {error}",
+                    parsed.session_id
+                );
+            }
+        }
+        None => {
+            debug!("subscribe: reopen_writer skipped (no persistence)");
+        }
+    }
+
     // Do not drop the currently-live subscription until the replacement is
     // successfully registered. This preserves pending-permission ownership on
     // stale/failure and lets grace cancellation happen only after resubscribe.
@@ -3626,6 +3878,7 @@ mod tests {
                 HistoryMode::LiveOnly,
                 None,
                 None,
+                None,
             )
             .await
         );
@@ -3651,6 +3904,7 @@ mod tests {
                 &current_project,
                 &switch_queue,
                 HistoryMode::LiveOnly,
+                None,
                 None,
                 None,
             )
@@ -3754,6 +4008,7 @@ mod tests {
                 HistoryMode::LiveOnly,
                 None,
                 None,
+                None,
             )
             .await
         );
@@ -3773,6 +4028,7 @@ mod tests {
                 &current_project,
                 &switch_queue,
                 HistoryMode::LiveOnly,
+                None,
                 None,
                 None,
             )
@@ -3899,6 +4155,7 @@ mod tests {
                 HistoryMode::Server,
                 None,
                 None,
+                None,
             )
             .await
         );
@@ -3979,6 +4236,7 @@ mod tests {
             &switch_queue,
             HistoryMode::LiveOnly,
             Some(catalog),
+            None,
             None,
         )
         .await
@@ -4081,6 +4339,7 @@ mod tests {
             HistoryMode::LiveOnly,
             None,
             None,
+            None,
         )
         .await
     }
@@ -4126,6 +4385,161 @@ mod tests {
         .await;
         assert!(!reply.ok);
         assert_eq!(reply.err.as_ref().unwrap().code, "VALIDATION_ERROR");
+    }
+
+    // ---- Issue #613: server-side generic key-value store WS handlers ----
+
+    /// Dispatch `text` through `handle_request` with a real `WebStore` attached.
+    async fn handle_request_with_store(text: &str, store: &Arc<WebStore>) -> WsReply {
+        let relay = Arc::new(WsRelaySink::new());
+        let acp = Arc::new(AcpManager::new(vec![]));
+        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let mut subs = Vec::new();
+        let registry = Arc::new(ProjectRegistry::new());
+        let mut current_agent: Option<AgentId> = None;
+        let current_session = Arc::new(parking_lot::Mutex::new(None::<SessionId>));
+        let current_project = Arc::new(parking_lot::Mutex::new(None::<String>));
+        let switch_queue = Arc::new(tokio::sync::Mutex::new(ProjectSwitchQueue::default()));
+        let mut authed = true;
+        handle_request(
+            text,
+            &mut authed,
+            &acp,
+            &relay,
+            &registry,
+            None,
+            None,
+            &tx,
+            &mut subs,
+            &mut current_agent,
+            &current_session,
+            &current_project,
+            &switch_queue,
+            HistoryMode::LiveOnly,
+            None,
+            None,
+            Some(store),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn store_write_then_read_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("termul-ws-store-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(WebStore::open(dir.join("store.json")));
+
+        let write = handle_request_with_store(
+            r#"{"id":"r1","type":"store_write","payload":{"key":"settings","value":{"theme":"dark"}}}"#,
+            &store,
+        )
+        .await;
+        assert!(write.ok, "write ok: {:?}", write.err);
+
+        let read = handle_request_with_store(
+            r#"{"id":"r2","type":"store_read","payload":{"key":"settings"}}"#,
+            &store,
+        )
+        .await;
+        assert!(read.ok, "read ok: {:?}", read.err);
+        assert_eq!(
+            read.payload.as_ref().and_then(|p| p.get("value")),
+            Some(&json!({ "theme": "dark" }))
+        );
+
+        // A second open (fresh connection) still sees the value — server-side
+        // persistence, not per-connection memory.
+        let reopened = Arc::new(WebStore::open(dir.join("store.json")));
+        let read2 = handle_request_with_store(
+            r#"{"id":"r3","type":"store_read","payload":{"key":"settings"}}"#,
+            &reopened,
+        )
+        .await;
+        assert_eq!(
+            read2.payload.as_ref().and_then(|p| p.get("value")),
+            Some(&json!({ "theme": "dark" }))
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn store_read_missing_key_returns_null_value() {
+        let dir = std::env::temp_dir().join(format!("termul-ws-store-miss-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(WebStore::open(dir.join("store.json")));
+        let reply = handle_request_with_store(
+            r#"{"id":"r1","type":"store_read","payload":{"key":"nope"}}"#,
+            &store,
+        )
+        .await;
+        assert!(reply.ok, "missing key is not an error: {:?}", reply.err);
+        assert_eq!(reply.payload.as_ref().and_then(|p| p.get("value")), Some(&Value::Null));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn store_delete_removes_and_reports_existed() {
+        let dir = std::env::temp_dir().join(format!("termul-ws-store-del-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(WebStore::open(dir.join("store.json")));
+        store.write("k", json!("v"), None).unwrap();
+
+        let del = handle_request_with_store(
+            r#"{"id":"r1","type":"store_delete","payload":{"key":"k"}}"#,
+            &store,
+        )
+        .await;
+        assert!(del.ok, "delete ok: {:?}", del.err);
+        assert_eq!(del.payload.as_ref().and_then(|p| p.get("existed")), Some(&json!(true)));
+        assert_eq!(store.read("k").unwrap(), None);
+
+        let del2 = handle_request_with_store(
+            r#"{"id":"r2","type":"store_delete","payload":{"key":"k"}}"#,
+            &store,
+        )
+        .await;
+        assert!(del2.ok, "delete of missing key is not an error: {:?}", del2.err);
+        assert_eq!(del2.payload.as_ref().and_then(|p| p.get("existed")), Some(&json!(false)));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn store_handlers_degraded_return_unavailable() {
+        // No store attached — same `handle_request_without_catalog` plumbing
+        // (store: None). All three store_* requests must fail loudly.
+        for frame in [
+            r#"{"id":"r1","type":"store_read","payload":{"key":"k"}}"#,
+            r#"{"id":"r2","type":"store_write","payload":{"key":"k","value":1}}"#,
+            r#"{"id":"r3","type":"store_delete","payload":{"key":"k"}}"#,
+        ] {
+            let reply = handle_request_without_catalog(frame).await;
+            assert!(!reply.ok, "degraded {frame} must fail");
+            assert_eq!(reply.err.as_ref().unwrap().code, "STORE_UNAVAILABLE");
+        }
+    }
+
+    #[tokio::test]
+    async fn store_malformed_payload_returns_validation_error() {
+        let dir = std::env::temp_dir().join(format!("termul-ws-store-bad-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(WebStore::open(dir.join("store.json")));
+        // Missing `key` fails the payload serde.
+        let reply = handle_request_with_store(
+            r#"{"id":"r1","type":"store_read","payload":{}}"#,
+            &store,
+        )
+        .await;
+        assert!(!reply.ok);
+        assert_eq!(reply.err.as_ref().unwrap().code, "VALIDATION_ERROR");
+        // store_write without a `value` also fails serde.
+        let reply2 = handle_request_with_store(
+            r#"{"id":"r2","type":"store_write","payload":{"key":"k"}}"#,
+            &store,
+        )
+        .await;
+        assert!(!reply2.ok);
+        assert_eq!(reply2.err.as_ref().unwrap().code, "VALIDATION_ERROR");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     // ---- Cross-client host-authority (Category C / Recovery Matrix: Browser A → Browser B) ----
@@ -4452,6 +4866,7 @@ mod tests {
                 HistoryMode::LiveOnly,
                 None,
                 None,
+                None,
             ))
     }
 
@@ -4514,31 +4929,94 @@ mod tests {
     #[test]
     fn watchdog_is_stale_only_past_pong_timeout() {
         // Pure threshold semantics for the keepalive watchdog: a connection is
-        // torn down only after strictly more than PONG_TIMEOUT with no inbound
-        // frame. Tests the decision the write task consults on each ping tick
-        // (the false-positive symptom behind issue: a focused tab through a
-        // proxy dropped every ~75s because Pongs didn't round-trip; a client
-        // `ping` text frame refreshes this and stays open).
+        // torn down only after strictly more than the active ceiling with no
+        // inbound frame. Tests the decision the write task consults on each
+        // ping tick (the false-positive symptom behind issue: a focused tab
+        // through a proxy dropped every ~75s because Pongs didn't round-trip;
+        // a client `ping` text frame refreshes this and stays open).
         let base = 1_000_000_u64;
         let timeout = PONG_TIMEOUT.as_millis() as u64;
         assert!(
-            !watchdog_is_stale(base, base),
+            !watchdog_is_stale(base, base, timeout),
             "fresh connection is not stale"
         );
         assert!(
-            !watchdog_is_stale(base, base + timeout),
+            !watchdog_is_stale(base, base + timeout, timeout),
             "exactly at timeout is not stale (strict >)"
         );
         assert!(
-            !watchdog_is_stale(base, base + timeout - 1),
+            !watchdog_is_stale(base, base + timeout - 1, timeout),
             "just under timeout is not stale"
         );
         assert!(
-            watchdog_is_stale(base, base + timeout + 1),
+            watchdog_is_stale(base, base + timeout + 1, timeout),
             "just past timeout is stale"
         );
         // Clock-skew safe: a future `last_activity` saturates to 0 (not stale).
-        assert!(!watchdog_is_stale(base + 10_000, base));
+        assert!(!watchdog_is_stale(base + 10_000, base, timeout));
+    }
+
+    #[test]
+    fn watchdog_backgrounded_uses_five_minute_ceiling() {
+        // CAP-3: while backgrounded, the watchdog tolerates up to
+        // BACKGROUND_TIMEOUT (5min) — 90s of inactivity must NOT close a
+        // backgrounded connection (would close under the 75s PONG_TIMEOUT).
+        let base = 1_000_000_u64;
+        let ceiling = BACKGROUND_TIMEOUT.as_millis() as u64;
+        assert!(
+            !watchdog_is_stale(base, base + 90_000, ceiling),
+            "90s idle is not stale under the 5-min background ceiling"
+        );
+        assert!(
+            watchdog_is_stale(base, base + ceiling + 1, ceiling),
+            "just past 5-min ceiling is stale"
+        );
+        // 90s idle WOULD close under the normal 75s ceiling.
+        assert!(
+            watchdog_is_stale(base, base + 90_000, PONG_TIMEOUT.as_millis() as u64),
+            "90s idle is stale under the normal 75s ceiling"
+        );
+    }
+
+    #[test]
+    fn peer_frame_type_extracts_background_and_foreground() {
+        // CAP-3: id-less lifecycle frames are recognized by `type` without a
+        // strict `WsRequest` parse (which requires `id`).
+        assert_eq!(peer_frame_type(r#"{"type":"background"}"#).as_deref(), Some("background"));
+        assert_eq!(peer_frame_type(r#"{"type":"foreground"}"#).as_deref(), Some("foreground"));
+        // Normal ACP request frames still report their type (dispatched below).
+        assert_eq!(
+            peer_frame_type(r#"{"id":"p1","type":"send_prompt","payload":{}}"#).as_deref(),
+            Some("send_prompt")
+        );
+        // Malformed / typeless frames yield None (dispatch handles the error).
+        assert!(peer_frame_type("not json").is_none());
+        assert!(peer_frame_type(r#"{"id":"x"}"#).is_none());
+    }
+
+    #[test]
+    fn handle_lifecycle_signal_toggles_background_flag() {
+        // CAP-3: a background frame sets the flag (authed); foreground clears
+        // it; an unauthed background is ignored (no flag, still consumed); a
+        // normal request frame is NOT consumed (dispatched).
+        let flag = Arc::new(AtomicBool::new(false));
+        // Unauthed background: consumed, no flag set.
+        assert!(handle_lifecycle_signal(r#"{"type":"background"}"#, false, &flag));
+        assert!(!flag.load(Ordering::Relaxed), "unauthed background does not set flag");
+        // Authed background: consumed, flag set.
+        assert!(handle_lifecycle_signal(r#"{"type":"background"}"#, true, &flag));
+        assert!(flag.load(Ordering::Relaxed), "authed background sets flag");
+        // Authed foreground: consumed, flag cleared.
+        assert!(handle_lifecycle_signal(r#"{"type":"foreground"}"#, true, &flag));
+        assert!(!flag.load(Ordering::Relaxed), "foreground clears flag");
+        // Normal request frame: NOT consumed (returns false) — dispatched.
+        assert!(!handle_lifecycle_signal(
+            r#"{"id":"p1","type":"send_prompt","payload":{}}"#,
+            true,
+            &flag,
+        ));
+        // Malformed frame: NOT consumed.
+        assert!(!handle_lifecycle_signal("not json", true, &flag));
     }
 
     #[test]
@@ -4728,10 +5206,11 @@ mod tests {
             &mut current_agent,
             &current_session,
             &current_project,
-            &switch_queue,
-            HistoryMode::LiveOnly,
-            None,
-            Some(&store),
+            &switch_queue,                HistoryMode::LiveOnly,
+                None,
+                Some(&store),
+                None,
+
         )
         .await;
         assert!(!reply.ok, "unknown agent must fail");
@@ -4926,6 +5405,7 @@ mod tests {
                 HistoryMode::LiveOnly,
                 None,
                 None,
+                None,
             ));
         assert!(!reply.ok);
         assert_eq!(reply.err.unwrap().code, "unsupported");
@@ -5011,6 +5491,7 @@ mod tests {
             HistoryMode::LiveOnly,
             None,
             None,
+            None,
         ));
         assert!(!reply.ok);
         assert_eq!(reply.err.unwrap().code, "permission_denied");
@@ -5062,6 +5543,7 @@ mod tests {
             HistoryMode::LiveOnly,
             None,
             None,
+            None,
         ));
         assert!(!reply.ok);
         assert_eq!(reply.err.unwrap().code, "not_found");
@@ -5099,6 +5581,7 @@ mod tests {
             HistoryMode::LiveOnly,
             None,
             None,
+            None,
         ));
         assert!(ok_reply.ok, "first response wins: {:?}", ok_reply.err);
         // Second frame for the same requestId → stale (ticket evicted).
@@ -5117,6 +5600,7 @@ mod tests {
             &current_project,
             &switch_queue,
             HistoryMode::LiveOnly,
+            None,
             None,
             None,
         ));
@@ -5153,6 +5637,7 @@ mod tests {
             &current_project,
             &switch_queue,
             HistoryMode::LiveOnly,
+            None,
             None,
             None,
         ));
@@ -5244,6 +5729,7 @@ mod tests {
             HistoryMode::LiveOnly,
             None,
             None,
+            None,
         ));
         assert!(!reply.ok);
         assert_eq!(reply.err.unwrap().code, "unsupported");
@@ -5277,6 +5763,7 @@ mod tests {
             &current_project,
             &switch_queue,
             HistoryMode::LiveOnly,
+            None,
             None,
             None,
         ));
@@ -5328,6 +5815,7 @@ mod tests {
             HistoryMode::LiveOnly,
             None,
             None,
+            None,
         ));
         assert!(!reply.ok);
         assert_eq!(reply.err.unwrap().code, "not_found");
@@ -5364,6 +5852,7 @@ mod tests {
             HistoryMode::LiveOnly,
             None,
             None,
+            None,
         ));
         assert!(ok_reply.ok, "first answer wins: {:?}", ok_reply.err);
         let stale_reply = block_on(handle_request(
@@ -5381,6 +5870,7 @@ mod tests {
             &current_project,
             &switch_queue,
             HistoryMode::LiveOnly,
+            None,
             None,
             None,
         ));
@@ -5416,6 +5906,7 @@ mod tests {
             &current_project,
             &switch_queue,
             HistoryMode::LiveOnly,
+            None,
             None,
             None,
         ));
@@ -5475,6 +5966,7 @@ mod tests {
                 HistoryMode::LiveOnly,
                 None,
                 None,
+                None,
             ));
         assert!(!reply.ok);
         assert_eq!(reply.err.unwrap().code, "stale");
@@ -5500,6 +5992,7 @@ mod tests {
                 &current_project,
                 &switch_queue,
                 HistoryMode::LiveOnly,
+                None,
                 None,
                 None,
             ));
@@ -5528,6 +6021,7 @@ mod tests {
                 HistoryMode::LiveOnly,
                 None,
                 None,
+                None,
             ));
         assert!(reply_resub.ok, "{:?}", reply_resub.err);
         assert_eq!(subs2.len(), 1);
@@ -5553,6 +6047,7 @@ mod tests {
                 &current_project,
                 &switch_queue,
                 HistoryMode::LiveOnly,
+                None,
                 None,
                 None,
             ));
@@ -5607,6 +6102,7 @@ mod tests {
             &current_project,
             &switch_queue,
             HistoryMode::LiveOnly,
+            None,
             None,
             None,
         ));
@@ -5666,6 +6162,7 @@ mod tests {
             &current_project,
             &switch_queue,
             HistoryMode::LiveOnly,
+            None,
             None,
             None,
         ));
@@ -5782,6 +6279,7 @@ mod tests {
             &current_project,
             &switch_queue,
             HistoryMode::LiveOnly,
+            None,
             None,
             None,
         ));
@@ -6534,6 +7032,7 @@ mod tests {
             &current_project_a,
             &switch_queue,
             HistoryMode::LiveOnly,
+            None,
             None,
             None,
         )

@@ -190,6 +190,13 @@ pub struct ServerConfig {
     /// reads this field; it constructs its own `AcpCatalogService` under
     /// `<app_data_dir>/acp-catalog`.
     pub acp_catalog_dir: Option<PathBuf>,
+    /// Issue #613: server-side generic key-value store file for the web
+    /// client (terminal layout, settings, editor state, command history,
+    /// snapshots, SSH profiles, …). `None` means "use
+    /// `<service_account_state_dir>/store.json`" — resolved at serve time in
+    /// `serve_router`, so the desktop shared-live path gets a durable store
+    /// too (no per-browser localStorage fallback).
+    pub store_file: Option<PathBuf>,
 }
 
 impl ServerConfig {
@@ -267,7 +274,7 @@ impl ServerConfig {
         let mut port: u16 = 8080;
         let mut event_log_capacity: usize = 4096;
         let mut permission_timeout_secs: u64 = 60;
-        let mut permission_reconnect_grace_secs: u64 = 15;
+        let mut permission_reconnect_grace_secs: u64 = 60;
         // PR-S4: when `--project-root` is absent, fall back to the env var or
         // the user's home directory via `default_project_root()`. The
         // resolved value is run through `resolve_and_validate_project_root`
@@ -290,6 +297,10 @@ impl ServerConfig {
         // CAP-6 / Story 8: acp-catalog root override. Same pattern as
         // `workspace_manifests_dir` — `None` means resolve at startup.
         let mut acp_catalog_dir: Option<PathBuf> = None;
+        // Issue #613: server-side generic key-value store file override.
+        // `None` means resolve `<service_account_state_dir>/store.json` at
+        // serve time (the desktop shared-live path never sets this).
+        let mut store_file: Option<PathBuf> = None;
 
         let mut iter = args.into_iter().peekable();
         while let Some(arg) = iter.next() {
@@ -438,6 +449,18 @@ impl ServerConfig {
                     }
                     acp_catalog_dir = Some(PathBuf::from(trimmed));
                 }
+                "--store-file" => {
+                    let value = iter.next().ok_or_else(|| {
+                        ParseCliError::Message("missing value for --store-file".into())
+                    })?;
+                    let trimmed = value.as_ref().trim();
+                    if trimmed.is_empty() {
+                        return Err(ParseCliError::Message(
+                            "invalid --store-file '': must be a non-empty path".into(),
+                        ));
+                    }
+                    store_file = Some(PathBuf::from(trimmed));
+                }
                 "--projects-file" => {
                     let value = iter.next().ok_or_else(|| {
                         ParseCliError::Message("missing value for --projects-file".into())
@@ -498,6 +521,18 @@ impl ServerConfig {
             }),
         };
 
+        // Issue #613: optional $TERMUL_STORE_FILE env default when
+        // --store-file is absent (mirrors the $TERMUL_PROJECTS_FILE env
+        // pattern). An unset/empty env var means "resolve the default at
+        // serve time".
+        let store_file = match store_file {
+            Some(p) => Some(p),
+            None => std::env::var("TERMUL_STORE_FILE").ok().and_then(|v| {
+                let t = v.trim();
+                (!t.is_empty()).then(|| PathBuf::from(t))
+            }),
+        };
+
         let sessions_dir = sessions_dir.or_else(default_sessions_dir).ok_or_else(|| {
             ParseCliError::Message(
                 "could not determine sessions directory: set --sessions-dir or $TERMUL_SESSIONS_DIR"
@@ -522,6 +557,7 @@ impl ServerConfig {
             sessions_dir: Some(sessions_dir),
             workspace_manifests_dir,
             acp_catalog_dir,
+            store_file,
         })
     }
 }
@@ -647,6 +683,7 @@ mod tests {
             sessions_dir: None,
             workspace_manifests_dir: None,
             acp_catalog_dir: None,
+            store_file: None,
         };
         assert_eq!(
             cfg.bind_addr(),
@@ -664,6 +701,7 @@ mod tests {
             sessions_dir: None,
             workspace_manifests_dir: None,
             acp_catalog_dir: None,
+            store_file: None,
         };
         assert_eq!(bad.bind_addr(), None);
     }
@@ -682,8 +720,8 @@ mod tests {
             "default permission-timeout is 60s (Story 1.7 / FR14)"
         );
         assert_eq!(
-            cfg.permission_reconnect_grace_secs, 15,
-            "default reconnect grace is 15s"
+            cfg.permission_reconnect_grace_secs, 60,
+            "default reconnect grace is 60s (CAP-4: mobile wake + reconnect chain)"
         );
         // PR-S4: project_root defaults to $HOME / $USERPROFILE when the env var
         // is unset. The CI hosts in this repo all set $HOME, so the resolved
@@ -859,6 +897,35 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn from_args_accepts_store_file() {
+        let cfg = ServerConfig::from_args(["--store-file", "/var/lib/termul/store.json"])
+            .expect("parse");
+        assert_eq!(
+            cfg.store_file,
+            Some(PathBuf::from("/var/lib/termul/store.json"))
+        );
+        // Other defaults stay intact.
+        assert_eq!(cfg.host, "127.0.0.1");
+        assert_eq!(cfg.port, 8080);
+    }
+
+    #[test]
+    fn from_args_missing_store_file_value() {
+        assert!(matches!(
+            ServerConfig::from_args(["--store-file"]),
+            Err(ParseCliError::Message(_))
+        ));
+    }
+
+    #[test]
+    fn from_args_rejects_empty_store_file() {
+        assert!(matches!(
+            ServerConfig::from_args(["--store-file", ""]),
+            Err(ParseCliError::Message(_))
+        ));
+    }
+
     // Patch 15: `service_account_state_dir` filters out empty env var values
     // so an empty `XDG_STATE_HOME` / `HOME` / `LOCALAPPDATA` does not produce
     // a relative `./termul` dir.
@@ -875,6 +942,7 @@ mod tests {
             sessions_dir: None,
             workspace_manifests_dir: None,
             acp_catalog_dir: None,
+            store_file: None,
         };
         // We cannot safely mutate the real process env vars in a parallel
         // test runner, so we assert the contract indirectly: the resolved
