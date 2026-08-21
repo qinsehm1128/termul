@@ -1,4 +1,5 @@
 import { render, screen, waitFor } from '@testing-library/react'
+import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ErrorBoundary } from '@/components/ErrorBoundary'
 import type { LeafNode } from '@/types/workspace.types'
@@ -101,7 +102,11 @@ describe('PaneContent — editor pane lazy/Suspense boundary (CAP-6 Row 3)', () 
   })
 
   it('renders EditorPanel through React.lazy + <Suspense>', async () => {
-    render(<PaneContent pane={editorPane} />)
+    render(
+      <MemoryRouter>
+        <PaneContent pane={editorPane} />
+      </MemoryRouter>
+    )
 
     const editor = await screen.findByTestId('editor-stub')
     expect(editor).toBeInTheDocument()
@@ -123,9 +128,11 @@ describe('PaneContent — chunk-load failure error path (CAP-6 Patch 4)', () => 
 
   it('surfaces the error via ErrorBoundary + logFrontendError when the editor chunk fails', async () => {
     render(
-      <ErrorBoundary context="editorPane">
-        <PaneContent pane={editorPane} />
-      </ErrorBoundary>
+      <MemoryRouter>
+        <ErrorBoundary context="editorPane">
+          <PaneContent pane={editorPane} />
+        </ErrorBoundary>
+      </MemoryRouter>
     )
 
     // The ErrorBoundary catches the thrown error, calls logFrontendError,

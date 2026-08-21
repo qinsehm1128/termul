@@ -1,6 +1,22 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { terminalApi } from '@/lib/terminal-api'
 import { serializeTerminalsForProject } from '../hooks/useTerminalAutoSave'
+
+vi.mock('@/lib/terminal-api', () => ({
+  terminalApi: {
+    closeView: vi.fn(async () => ({ success: true, data: undefined })),
+    terminate: vi.fn(async () => ({ success: true, data: undefined })),
+    spawn: vi.fn(),
+    resume: vi.fn()
+  }
+}))
+
+vi.mock('@/lib/log-api', () => ({
+  logFrontendError: vi.fn(async () => undefined)
+}))
+
 import { useProjectStore } from './project-store'
+import { useSessionWorkspaceSyncStore } from './session-workspace-sync-store'
 import {
   HIDDEN_BUFFER_TRUNCATION_DELAY,
   MAX_TRANSCRIPT_CHARS,
@@ -11,6 +27,9 @@ import {
 describe('terminal-store', () => {
   beforeEach(() => {
     // Reset stores to initial state before each test
+    useSessionWorkspaceSyncStore.setState({
+      activeConversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+    })
     useProjectStore.setState({
       projects: [
         { id: '1', name: 'Project 1', color: 'blue', isActive: true },
@@ -25,8 +44,16 @@ describe('terminal-store', () => {
         { id: 't2', name: 'Terminal 2', projectId: '1', shell: 'powershell', output: [] },
         { id: 't3', name: 'Terminal 3', projectId: '2', shell: 'bash', output: [] }
       ],
-      activeTerminalId: 't1'
+      activeTerminalId: 't1',
+      ptyIdIndex: new Map(),
+      cleanupRecoveries: {}
     })
+    vi.mocked(terminalApi.closeView).mockReset()
+    vi.mocked(terminalApi.closeView).mockResolvedValue({ success: true, data: undefined })
+    vi.mocked(terminalApi.terminate).mockReset()
+    vi.mocked(terminalApi.terminate).mockResolvedValue({ success: true, data: undefined })
+    vi.mocked(terminalApi.spawn).mockReset()
+    vi.mocked(terminalApi.resume).mockReset()
   })
 
   describe('initial state', () => {
@@ -118,6 +145,113 @@ describe('terminal-store', () => {
     })
   })
 
+  describe('resumeTerminalResource', () => {
+    it('treats a scope-less running project terminal with a claim as already attached', async () => {
+      useTerminalStore.setState({
+        terminals: [
+          {
+            id: 'proj-term',
+            name: 'Project terminal',
+            projectId: '1',
+            shell: 'bash',
+            ptyId: 'pty-proj',
+            claim: 'spawn-claim',
+            healthStatus: 'running',
+            output: []
+          }
+        ],
+        activeTerminalId: 'proj-term',
+        ptyIdIndex: new Map([['pty-proj', 'proj-term']]),
+        cleanupRecoveries: {}
+      })
+
+      const result = await useTerminalStore.getState().resumeTerminalResource('proj-term')
+
+      expect(result).toEqual({ success: true, data: undefined })
+      expect(terminalApi.resume).not.toHaveBeenCalled()
+    })
+
+    it('does not call the Conversation resume path for a scope-less terminal without a claim', async () => {
+      useTerminalStore.setState({
+        terminals: [
+          {
+            id: 'proj-term',
+            name: 'Project terminal',
+            projectId: '1',
+            shell: 'bash',
+            ptyId: 'pty-proj',
+            healthStatus: 'running',
+            output: []
+          }
+        ],
+        activeTerminalId: 'proj-term',
+        ptyIdIndex: new Map([['pty-proj', 'proj-term']]),
+        cleanupRecoveries: {}
+      })
+
+      const result = await useTerminalStore.getState().resumeTerminalResource('proj-term')
+
+      expect(result).toEqual({
+        success: false,
+        error: 'Terminal unavailable',
+        code: 'TERMINAL_NOT_FOUND'
+      })
+      expect(terminalApi.resume).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('restartTerminalResource', () => {
+    it('respawns a scope-less project terminal without a Conversation id', async () => {
+      vi.mocked(terminalApi.spawn).mockResolvedValue({
+        success: true,
+        data: {
+          id: 'pty-restarted-project',
+          shell: 'bash',
+          cwd: '/tmp',
+          pid: 3,
+          cols: 80,
+          rows: 24,
+          claim: 'fresh-project-claim'
+        }
+      })
+      useTerminalStore.setState({
+        terminals: [
+          {
+            id: 'proj-term',
+            name: 'Project terminal',
+            projectId: '1',
+            shell: 'bash',
+            ptyId: 'pty-proj',
+            claim: 'old-claim',
+            healthStatus: 'running',
+            output: []
+          }
+        ],
+        activeTerminalId: 'proj-term',
+        ptyIdIndex: new Map([['pty-proj', 'proj-term']]),
+        cleanupRecoveries: {}
+      })
+
+      const restarted = await useTerminalStore.getState().restartTerminalResource('proj-term')
+
+      expect(restarted).toBe(true)
+      expect(terminalApi.terminate).toHaveBeenCalledWith('pty-proj')
+      expect(terminalApi.spawn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          projectId: '1',
+          shell: 'bash'
+        })
+      )
+      expect(vi.mocked(terminalApi.spawn).mock.calls[0]?.[0]).not.toHaveProperty('conversationId')
+      expect(useTerminalStore.getState().terminals[0]).toMatchObject({
+        id: 'proj-term',
+        ptyId: 'pty-restarted-project',
+        claim: 'fresh-project-claim',
+        healthStatus: 'running'
+      })
+    })
+  })
+
   describe('closeTerminal', () => {
     it('should remove terminal from array', () => {
       const { closeTerminal } = useTerminalStore.getState()
@@ -144,6 +278,28 @@ describe('terminal-store', () => {
 
       const { activeTerminalId } = useTerminalStore.getState()
       expect(activeTerminalId).toBe('t1')
+    })
+
+    it('hides the view even when closeView IPC fails', async () => {
+      useTerminalStore.setState((state) => ({
+        terminals: state.terminals.map((terminal) =>
+          terminal.id === 't1' ? { ...terminal, ptyId: 'pty-1' } : terminal
+        )
+      }))
+      vi.mocked(terminalApi.closeView).mockResolvedValueOnce({
+        success: false,
+        error: 'forwarder busy',
+        code: 'INVOKE_ERROR'
+      })
+      const { closeTerminalView } = useTerminalStore.getState()
+
+      await expect(closeTerminalView('t1')).resolves.toBe(true)
+      expect(terminalApi.closeView).toHaveBeenCalledWith('pty-1')
+
+      expect(useTerminalStore.getState().terminals.find((t) => t.id === 't1')).toMatchObject({
+        viewState: 'hidden',
+        isHidden: true
+      })
     })
 
     it('should set empty activeTerminalId when closing last terminal for project', () => {
@@ -837,6 +993,117 @@ describe('terminal-store', () => {
     })
   })
 
+  describe('cleanup-only recovery', () => {
+    const failure = (
+      terminalId: string,
+      cleanupStage: 'kill' | 'wait' | 'flusher_join' | 'reader_join' = 'reader_join'
+    ) => ({
+      success: false as const,
+      code: 'TERMINATE_FAILED',
+      error: JSON.stringify({
+        terminalId,
+        primaryCode: 'TERMINATE_FAILED',
+        cleanupStage
+      })
+    })
+
+    it('deduplicates sanitized records by retained terminal id and rejects extra-key secret shapes', () => {
+      const { recordTerminalCleanupFailure } = useTerminalStore.getState()
+
+      expect(recordTerminalCleanupFailure(failure('pty-cleanup-1', 'kill'))).toEqual({
+        terminalId: 'pty-cleanup-1',
+        primaryCode: 'TERMINATE_FAILED',
+        cleanupStage: 'kill'
+      })
+      expect(recordTerminalCleanupFailure(failure('pty-cleanup-1', 'reader_join'))).not.toBeNull()
+      expect(
+        recordTerminalCleanupFailure({
+          success: false,
+          code: 'TERMINATE_FAILED',
+          error: JSON.stringify({
+            terminalId: 'pty-cleanup-2',
+            primaryCode: 'TERMINATE_FAILED',
+            cleanupStage: 'kill',
+            claim: 'must-never-enter-renderer-recovery-state'
+          })
+        })
+      ).toBeNull()
+
+      const recoveries = useTerminalStore.getState().cleanupRecoveries
+      expect(Object.keys(recoveries)).toEqual(['pty-cleanup-1'])
+      expect(recoveries['pty-cleanup-1']).toEqual({
+        terminalId: 'pty-cleanup-1',
+        primaryCode: 'TERMINATE_FAILED',
+        cleanupStage: 'reader_join',
+        retrying: false,
+        retryFailed: false
+      })
+      expect(JSON.stringify(recoveries)).not.toContain('claim')
+    })
+
+    it('coalesces double-click retries, retains failure, and never attaches, resumes, or spawns', async () => {
+      const { recordTerminalCleanupFailure, retryTerminalCleanup } = useTerminalStore.getState()
+      recordTerminalCleanupFailure(failure('pty-cleanup-retry'))
+
+      let resolveRetry!: (value: ReturnType<typeof failure>) => void
+      vi.mocked(terminalApi.terminate).mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            resolveRetry = resolve
+          })
+      )
+
+      const first = retryTerminalCleanup('pty-cleanup-retry')
+      const second = retryTerminalCleanup('pty-cleanup-retry')
+      expect(first).toBe(second)
+      expect(terminalApi.terminate).toHaveBeenCalledTimes(1)
+      expect(terminalApi.terminate).toHaveBeenCalledWith('pty-cleanup-retry')
+      expect(useTerminalStore.getState().cleanupRecoveries['pty-cleanup-retry']?.retrying).toBe(
+        true
+      )
+
+      resolveRetry(failure('pty-cleanup-retry', 'flusher_join'))
+      await expect(first).resolves.toBe(false)
+
+      expect(useTerminalStore.getState().cleanupRecoveries['pty-cleanup-retry']).toMatchObject({
+        terminalId: 'pty-cleanup-retry',
+        cleanupStage: 'flusher_join',
+        retrying: false,
+        retryFailed: true
+      })
+      expect(terminalApi.spawn).not.toHaveBeenCalled()
+      expect(terminalApi.resume).not.toHaveBeenCalled()
+    })
+
+    it('successful destructive cleanup retry reconciles terminal record', async () => {
+      useTerminalStore.setState((state) => ({
+        terminals: state.terminals.map((terminal) =>
+          terminal.id === 't1'
+            ? { ...terminal, ptyId: 'pty-cleanup-success', claim: 'memory-only-claim' }
+            : terminal
+        ),
+        ptyIdIndex: new Map([['pty-cleanup-success', 't1']]),
+        activeTerminalId: 't1'
+      }))
+      const { recordTerminalCleanupFailure, retryTerminalCleanup } = useTerminalStore.getState()
+      recordTerminalCleanupFailure(failure('pty-cleanup-success'))
+
+      await expect(retryTerminalCleanup('pty-cleanup-success')).resolves.toBe(true)
+
+      const state = useTerminalStore.getState()
+      expect(state.cleanupRecoveries['pty-cleanup-success']).toBeUndefined()
+      expect(state.terminals.find((terminal) => terminal.id === 't1')).toBeUndefined()
+      expect(
+        state.terminals.find((terminal) => terminal.ptyId === 'pty-cleanup-success')
+      ).toBeUndefined()
+      expect(state.ptyIdIndex.has('pty-cleanup-success')).toBe(false)
+      expect(state.activeTerminalId).not.toBe('t1')
+      expect(terminalApi.terminate).toHaveBeenCalledWith('pty-cleanup-success')
+      expect(terminalApi.spawn).not.toHaveBeenCalled()
+      expect(terminalApi.resume).not.toHaveBeenCalled()
+    })
+  })
+
   // ========== CAP-3: reclaimable terminal lease (claim) lifecycle ==========
   // The claim credential is in-memory only: set on spawn/rotate, cleared on
   // kill/close/restart/clearTerminalPtyId, and NEVER written to persistence.
@@ -924,7 +1191,7 @@ describe('terminal-store', () => {
       expect(terminals.some((t) => t.claim === 'lease-on-closed-terminal')).toBe(false)
     })
 
-    it('restartTerminal drops the stale claim of the replaced PTY', () => {
+    it('restartTerminal preserves the live PTY claim during a renderer-only reset', () => {
       const { setTerminalPtyId, setTerminalClaim, restartTerminal } = useTerminalStore.getState()
 
       setTerminalPtyId('t1', 'pty-cap3-restart')
@@ -934,12 +1201,11 @@ describe('terminal-store', () => {
 
       const { terminals } = useTerminalStore.getState()
       const restarted = terminals.find((t) => t.id === 't1')
-      // The old lease belonged to the old PTY — the record gets a fresh
-      // placeholder ptyId and no claim until the restart re-spawns.
-      expect(restarted?.claim).toBeUndefined()
-      expect(restarted?.ptyId).toBeDefined()
-      expect(restarted?.ptyId).not.toBe('pty-cap3-restart')
-      expect(terminals.some((t) => t.claim === 'lease-stale-after-restart')).toBe(false)
+      // This compatibility action resets only renderer state. Explicit
+      // restartTerminalResource owns PTY termination, re-spawn, and claim rotation.
+      expect(restarted?.claim).toBe('lease-stale-after-restart')
+      expect(restarted?.ptyId).toBe('pty-cap3-restart')
+      expect(terminals.some((t) => t.claim === 'lease-stale-after-restart')).toBe(true)
     })
 
     it('excludes the claim from the auto-save persisted payload (persistence exclusion)', () => {

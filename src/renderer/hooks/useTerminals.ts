@@ -31,16 +31,26 @@ const mockOutput: TerminalLine[] = [
   { type: 'info', content: 'info  - Loaded env from .env.local' }
 ]
 
+const deprecatedConversationId = '00000000-0000-4000-8000-000000000000'
+
 const initialTerminals: Terminal[] = [
   {
     id: '1',
+    conversationId: deprecatedConversationId,
     name: 'Dev Server',
     projectId: '1',
     shell: 'powershell',
     isActive: true,
     output: mockOutput
   },
-  { id: '2', name: 'Build Check', projectId: '1', shell: 'powershell', output: [] }
+  {
+    id: '2',
+    conversationId: deprecatedConversationId,
+    name: 'Build Check',
+    projectId: '1',
+    shell: 'powershell',
+    output: []
+  }
 ]
 
 export function useTerminals(projectId: string) {
@@ -58,6 +68,7 @@ export function useTerminals(projectId: string) {
   const addTerminal = (name: string, shell: Terminal['shell'] = 'powershell') => {
     const newTerminal: Terminal = {
       id: Date.now().toString(),
+      conversationId: deprecatedConversationId,
       name,
       projectId,
       shell,

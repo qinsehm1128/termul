@@ -123,17 +123,16 @@ describe('ActivityRail', () => {
     expect(rail.querySelector('[data-tauri-drag-region="true"]')).not.toBeNull()
   })
 
-  it('opens the command palette via the projects action', () => {
-    const onOpenCommandPalette = vi.fn()
+  it('enters the regular project workspace via the projects action', () => {
     render(
-      <MemoryRouter>
-        <ActivityRail onOpenCommandPalette={onOpenCommandPalette} />
+      <MemoryRouter initialEntries={['/conversations']}>
+        <ActivityRail />
       </MemoryRouter>
     )
 
     fireEvent.click(screen.getByRole('button', { name: 'Open projects' }))
 
-    expect(onOpenCommandPalette).toHaveBeenCalledTimes(1)
+    expect(mockNavigate).toHaveBeenCalledWith('/')
   })
 
   it('opens git changes when a project is available', () => {
@@ -163,31 +162,30 @@ describe('ActivityRail', () => {
     expect(onOpenGitChanges).not.toHaveBeenCalled()
   })
 
-  it('opens a new agent chat when a project is available', () => {
-    const onOpenAgentChat = vi.fn()
+  it('opens the conversations area from the rail chat toggle', () => {
     render(
       <MemoryRouter>
-        <ActivityRail onOpenAgentChat={onOpenAgentChat} canOpenAgentChat />
+        <ActivityRail />
       </MemoryRouter>
     )
 
-    fireEvent.click(screen.getByRole('button', { name: 'New agent chat' }))
-
-    expect(onOpenAgentChat).toHaveBeenCalledTimes(1)
+    const chatButton = screen.getByRole('button', { name: 'Open the conversations area' })
+    expect(chatButton).toHaveAttribute('aria-pressed', 'false')
+    fireEvent.click(chatButton)
+    expect(mockNavigate).toHaveBeenCalledWith('/conversations')
   })
 
-  it('disables new agent chat when no project is available', () => {
-    const onOpenAgentChat = vi.fn()
+  it('returns to the project workspace when the conversations area is active', () => {
     render(
-      <MemoryRouter>
-        <ActivityRail onOpenAgentChat={onOpenAgentChat} canOpenAgentChat={false} />
+      <MemoryRouter initialEntries={['/conversations']}>
+        <ActivityRail />
       </MemoryRouter>
     )
 
-    const chatButton = screen.getByRole('button', { name: 'New agent chat' })
-    expect(chatButton).toBeDisabled()
+    const chatButton = screen.getByRole('button', { name: 'Open the conversations area' })
+    expect(chatButton).toHaveAttribute('aria-pressed', 'true')
     fireEvent.click(chatButton)
-    expect(onOpenAgentChat).not.toHaveBeenCalled()
+    expect(mockNavigate).toHaveBeenCalledWith('/')
   })
 
   it('toggles the SSH panel via persistence-aware updater on click', async () => {

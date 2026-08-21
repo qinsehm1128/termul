@@ -69,6 +69,14 @@ impl From<&SessionId> for agent_client_protocol::schema::v1::SessionId {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionPolicy {
+    #[default]
+    Ask,
+    AllowAll,
+}
+
 /// Configuration describing how to launch an ACP agent subprocess.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -94,6 +102,11 @@ pub struct AgentConfig {
     /// `false`.
     #[serde(default)]
     pub allow_terminal: bool,
+    /// Host-side handling for ACP `session/request_permission`. `allow_all`
+    /// selects an allow option supplied by the agent; it never fabricates an
+    /// option id or disables the agent's own sandbox.
+    #[serde(default)]
+    pub permission_policy: PermissionPolicy,
 }
 
 /// OQ1: the spawn path requires a non-empty `configId` so it derives a stable
@@ -195,19 +208,18 @@ impl AgentConfig {
         // `node.exe <script>`, prepending the script ahead of the user args.
         // A resolution failure falls back to the legacy PATH/PATHEXT lookup so
         // any real spawn error stays observable.
-        let (command, args): (String, Vec<String>) = match crate::pty::manager::resolve_spawn_program(
-            &self.command,
-        ) {
-            Ok(resolved) => {
-                let mut args = resolved.prepend_args;
-                args.extend(self.args.iter().cloned());
-                (resolved.program, args)
-            }
-            Err(_) => (
-                crate::trackers::git_tracker::resolve_executable(&self.command),
-                self.args.clone(),
-            ),
-        };
+        let (command, args): (String, Vec<String>) =
+            match crate::pty::manager::resolve_spawn_program(&self.command) {
+                Ok(resolved) => {
+                    let mut args = resolved.prepend_args;
+                    args.extend(self.args.iter().cloned());
+                    (resolved.program, args)
+                }
+                Err(_) => (
+                    crate::trackers::git_tracker::resolve_executable(&self.command),
+                    self.args.clone(),
+                ),
+            };
 
         // On non-Windows `resolve_spawn_program` returns a bare command name
         // unchanged, leaving PATH resolution to whoever spawns the process. The
@@ -269,9 +281,13 @@ mod tests {
             args: vec![],
             env: HashMap::new(),
             allow_terminal: false,
+            permission_policy: PermissionPolicy::Ask,
         };
         let err = require_config_id(&config).expect_err("None configId must be rejected");
-        assert!(err.contains("configId"), "err should mention configId: {err}");
+        assert!(
+            err.contains("configId"),
+            "err should mention configId: {err}"
+        );
     }
 
     #[test]
@@ -284,6 +300,7 @@ mod tests {
                 args: vec![],
                 env: HashMap::new(),
                 allow_terminal: false,
+                permission_policy: PermissionPolicy::Ask,
             };
             require_config_id(&config).expect_err("empty/whitespace configId must be rejected");
         }
@@ -298,6 +315,7 @@ mod tests {
             args: vec![],
             env: HashMap::new(),
             allow_terminal: false,
+            permission_policy: PermissionPolicy::Ask,
         };
         require_config_id(&config).expect("a non-empty configId must pass the guard");
     }
@@ -343,8 +361,26 @@ mod tests {
         assert_eq!(parsed.name, "Internal Helper");
         assert_eq!(parsed.command, "node");
         assert_eq!(parsed.args, vec!["/path/to/agent.js".to_string()]);
-        assert_eq!(parsed.env.get("API_KEY").map(String::as_str), Some("$INTERNAL_API_KEY"));
+        assert_eq!(
+            parsed.env.get("API_KEY").map(String::as_str),
+            Some("$INTERNAL_API_KEY")
+        );
         assert!(!parsed.allow_terminal);
+        assert_eq!(parsed.permission_policy, PermissionPolicy::Ask);
+    }
+
+    #[test]
+    fn agent_config_deserializes_allow_all_permission_policy() {
+        let parsed: AgentConfig = serde_json::from_str(
+            r#"{
+                "configId": "trusted-agent",
+                "name": "Trusted",
+                "command": "trusted",
+                "permissionPolicy": "allow_all"
+            }"#,
+        )
+        .expect("allow_all is a supported permission policy");
+        assert_eq!(parsed.permission_policy, PermissionPolicy::AllowAll);
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -395,6 +431,7 @@ mod tests {
             args: vec!["--acp".to_string()],
             env,
             allow_terminal: false,
+            permission_policy: PermissionPolicy::Ask,
         };
 
         match config.to_mcp_server() {
@@ -439,6 +476,7 @@ mod tests {
             args: vec!["--experimental-acp".to_string()],
             env: HashMap::new(),
             allow_terminal: false,
+            permission_policy: PermissionPolicy::Ask,
         };
 
         match config.to_mcp_server() {

@@ -1,4 +1,4 @@
-import { cleanup, render } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { toast } from 'sonner'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import * as appSettingsStore from '@/stores/app-settings-store'
@@ -228,8 +228,9 @@ Object.defineProperty(window, 'api', {
 
 import { clipboardApi, systemApi, terminalApi } from '@/lib/api'
 import { openFilePathFromTerminal } from '@/lib/file-path-links'
-import { addRendererRef, removeRendererRef } from '@/lib/tauri-terminal-api'
+import { addRendererRef, removeRendererRef, subscribeTerminalData } from '@/lib/terminal-api'
 import { ConnectedTerminal } from './ConnectedTerminal'
+import { clearTerminalCache, disposeCachedTerminal, hasCachedTerminal } from './terminal-cache'
 
 const { mockRecordTerminalContinuityEvent, mockGetOrCreateProjectContinuityCorrelation } =
   vi.hoisted(() => ({
@@ -252,6 +253,8 @@ vi.mock('@/lib/api', () => ({
     spawn: vi.fn(),
     write: vi.fn(),
     resize: vi.fn(),
+    closeView: vi.fn(),
+    terminate: vi.fn(),
     kill: vi.fn(),
     onData: vi.fn(),
     onExit: vi.fn(),
@@ -271,12 +274,14 @@ vi.mock('@/lib/api', () => ({
 
 vi.mock('@/stores/app-settings-store', () => ({
   useTerminalFontFamily: vi.fn(() => 'Menlo, Monaco, "Courier New", monospace'),
+  useTerminalSymbolFontFamily: vi.fn(() => ''),
   useTerminalFontSize: vi.fn(() => 14),
   useTerminalBufferSize: vi.fn(() => 10000),
-  useTerminalRenderer: vi.fn(() => 'auto')
+  useTerminalRenderer: vi.fn(() => 'auto'),
+  useTerminalScreenReaderMode: vi.fn(() => false)
 }))
 
-import { useTerminalRenderer } from '@/stores/app-settings-store'
+import { useTerminalRenderer, useTerminalScreenReaderMode } from '@/stores/app-settings-store'
 
 const mockTerminalStoreState = {
   terminals: [] as Array<{ id: string; ptyId?: string; healthStatus?: string }>,
@@ -287,6 +292,7 @@ const mockTerminalStoreState = {
   renameTerminal: vi.fn(),
   reorderTerminals: vi.fn(),
   setTerminals: vi.fn(),
+  resumeTerminalResource: vi.fn(async () => ({ success: true, data: undefined })),
   setTerminalPtyId: vi.fn(),
   setTerminalClaim: vi.fn(),
   findTerminalByPtyId: vi.fn(),
@@ -307,11 +313,24 @@ const mockTerminalStoreState = {
   updateTerminalLastActivityTimestamp: vi.fn(),
   updateTerminalActivityBatch: vi.fn(),
   restartTerminal: vi.fn(),
+  restartTerminalResource: vi.fn(async () => true),
   clearTerminalPtyId: vi.fn(),
   truncateHiddenTerminalBuffers: vi.fn(),
   getTerminalCount: vi.fn(() => 0),
   isTerminalLimitReached: vi.fn(() => false),
-  cleanupProjectTerminals: vi.fn()
+  cleanupProjectTerminals: vi.fn(),
+  cleanupRecoveries: {} as Record<
+    string,
+    {
+      terminalId: string
+      primaryCode: string
+      cleanupStage: 'kill' | 'wait' | 'flusher_join' | 'reader_join'
+      retrying: boolean
+      retryFailed: boolean
+    }
+  >,
+  recordTerminalCleanupFailure: vi.fn(),
+  retryTerminalCleanup: vi.fn(async () => true)
 }
 
 vi.mock('@/stores/terminal-store', () => ({
@@ -321,9 +340,10 @@ vi.mock('@/stores/terminal-store', () => ({
   )
 }))
 
-vi.mock('@/lib/tauri-terminal-api', () => ({
+vi.mock('@/lib/terminal-api', () => ({
   addRendererRef: vi.fn().mockResolvedValue({ success: true, data: undefined }),
-  removeRendererRef: vi.fn().mockResolvedValue({ success: true, data: undefined })
+  removeRendererRef: vi.fn().mockResolvedValue({ success: true, data: undefined }),
+  subscribeTerminalData: vi.fn(() => vi.fn())
 }))
 
 describe('ConnectedTerminal', () => {
@@ -331,6 +351,7 @@ describe('ConnectedTerminal', () => {
   let getBoundingClientRectSpy: ReturnType<typeof vi.spyOn>
 
   beforeEach(() => {
+    clearTerminalCache()
     vi.clearAllMocks()
     mockRecordTerminalContinuityEvent.mockReset()
     mockGetOrCreateProjectContinuityCorrelation.mockReset()
@@ -338,6 +359,7 @@ describe('ConnectedTerminal', () => {
     rendererPreferenceSpy = vi
       .spyOn(appSettingsStore, 'useTerminalRenderer')
       .mockReturnValue('auto')
+    vi.mocked(useTerminalScreenReaderMode).mockReturnValue(false)
     webglAddonCreateCount = 0
     capturedContextLossCallback = null
     capturedPowerResumeCallback = null
@@ -385,8 +407,21 @@ describe('ConnectedTerminal', () => {
       return vi.fn()
     })
 
+    mockTerminalStoreState.terminals = []
     mockTerminalStoreState.findTerminalByPtyId.mockReset()
-    mockTerminalStoreState.findTerminalByPtyId.mockReturnValue({ cwd: '/terminal-cwd' })
+    mockTerminalStoreState.findTerminalByPtyId.mockImplementation((ptyId: string) => ({
+      id: ptyId,
+      ptyId,
+      conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+      claim: 'test-memory-grant',
+      healthStatus: 'running',
+      cwd: '/terminal-cwd'
+    }))
+    mockTerminalStoreState.resumeTerminalResource.mockReset()
+    mockTerminalStoreState.resumeTerminalResource.mockResolvedValue({
+      success: true,
+      data: undefined
+    })
     mockTerminalStoreState.updateTerminalActivity.mockReset()
     mockTerminalStoreState.updateTerminalLastActivityTimestamp.mockReset()
     mockTerminalStoreState.updateTerminalActivityBatch.mockReset()
@@ -397,6 +432,28 @@ describe('ConnectedTerminal', () => {
     mockTerminalStoreState.consumeTranscript.mockReturnValue('')
     mockTerminalStoreState.consumeDetachedOutput.mockReset()
     mockTerminalStoreState.consumeDetachedOutput.mockReturnValue('')
+    mockTerminalStoreState.cleanupRecoveries = {}
+    mockTerminalStoreState.recordTerminalCleanupFailure.mockReset()
+    mockTerminalStoreState.recordTerminalCleanupFailure.mockImplementation((result) => {
+      if (result.success) return null
+      try {
+        const detail = JSON.parse(result.error) as {
+          terminalId: string
+          primaryCode: string
+          cleanupStage: 'kill' | 'wait' | 'flusher_join' | 'reader_join'
+        }
+        mockTerminalStoreState.cleanupRecoveries[detail.terminalId] = {
+          ...detail,
+          retrying: false,
+          retryFailed: false
+        }
+        return detail
+      } catch {
+        return null
+      }
+    })
+    mockTerminalStoreState.retryTerminalCleanup.mockReset()
+    mockTerminalStoreState.retryTerminalCleanup.mockResolvedValue(true)
 
     vi.mocked(terminalApi).spawn.mockResolvedValue({
       success: true,
@@ -410,6 +467,8 @@ describe('ConnectedTerminal', () => {
     })
     vi.mocked(terminalApi).write.mockResolvedValue({ success: true, data: undefined })
     vi.mocked(terminalApi).resize.mockResolvedValue({ success: true, data: undefined })
+    vi.mocked(terminalApi).terminate.mockReset()
+    vi.mocked(terminalApi).terminate.mockResolvedValue({ success: true, data: undefined })
 
     // Reset clipboard mocks
     vi.mocked(clipboardApi).readText.mockResolvedValue({ success: true, data: '' })
@@ -429,6 +488,21 @@ describe('ConnectedTerminal', () => {
   it('should render without crashing', () => {
     const { container } = render(<ConnectedTerminal />)
     expect(container.querySelector('div')).toBeTruthy()
+  })
+
+  it('should keep screen reader mode opt-in and apply runtime changes', async () => {
+    const { rerender } = render(<ConnectedTerminal />)
+
+    expect(mockTerminalConstructor).toHaveBeenCalledWith(
+      expect.objectContaining({ screenReaderMode: false })
+    )
+
+    vi.mocked(useTerminalScreenReaderMode).mockReturnValue(true)
+    rerender(<ConnectedTerminal className="screen-reader-enabled" />)
+
+    await vi.waitFor(() => {
+      expect(mockTerminalInstance.options.screenReaderMode).toBe(true)
+    })
   })
 
   it('should spawn terminal on mount when no external ID provided', async () => {
@@ -527,7 +601,40 @@ describe('ConnectedTerminal', () => {
     })
   })
 
-  it.skip('should clean up terminal listeners on unmount without creating extra registrations', async () => {
+  it('should use a PTY-scoped data subscription for an external terminal', async () => {
+    render(<ConnectedTerminal terminalId="external-123" />)
+
+    await vi.waitFor(() => {
+      expect(subscribeTerminalData).toHaveBeenCalledWith('external-123', expect.any(Function))
+    })
+    expect(vi.mocked(terminalApi).onData).not.toHaveBeenCalled()
+  })
+
+  it('should reuse the cached terminal session and addons after remount', async () => {
+    const first = render(<ConnectedTerminal terminalId="external-cached" />)
+    await vi.waitFor(() => {
+      expect(addRendererRef).toHaveBeenCalledWith(
+        'external-cached',
+        expect.stringMatching(/^conn-/)
+      )
+    })
+
+    first.unmount()
+    expect(mockTerminalConstructor).toHaveBeenCalledTimes(1)
+    expect(mockTerminalInstance.dispose).not.toHaveBeenCalled()
+
+    vi.mocked(useTerminalScreenReaderMode).mockReturnValue(true)
+    const second = render(<ConnectedTerminal terminalId="external-cached" />)
+    await vi.waitFor(() => {
+      expect(addRendererRef).toHaveBeenCalledTimes(2)
+    })
+
+    expect(mockTerminalConstructor).toHaveBeenCalledTimes(1)
+    expect(mockTerminalInstance.options.screenReaderMode).toBe(true)
+    second.unmount()
+  })
+
+  it('should clean up terminal listeners on unmount without creating extra registrations', async () => {
     const { unmount } = render(<ConnectedTerminal />)
 
     await vi.waitFor(() => {
@@ -539,10 +646,13 @@ describe('ConnectedTerminal', () => {
 
     unmount()
 
-    expect(mockTerminalInstance.dispose).toHaveBeenCalledTimes(1)
+    expect(mockTerminalInstance.dispose).not.toHaveBeenCalled()
+    expect(hasCachedTerminal('terminal-123')).toBe(true)
     expect(removeRendererRef).toHaveBeenCalledWith('terminal-123', expect.stringMatching(/^conn-/))
     expect(vi.mocked(terminalApi).onData).toHaveBeenCalledTimes(1)
     expect(vi.mocked(terminalApi).onExit).toHaveBeenCalledTimes(1)
+    expect(disposeCachedTerminal('terminal-123')).toBe(true)
+    expect(mockTerminalInstance.dispose).toHaveBeenCalledTimes(1)
   })
 
   it('should not spawn terminal when external ID provided', async () => {
@@ -641,6 +751,77 @@ describe('ConnectedTerminal', () => {
     })
   })
 
+  it('renders one sanitized cleanup-only recovery and retries only the retained id', async () => {
+    const detail = {
+      terminalId: 'terminal-recoverable-1',
+      primaryCode: 'CONVERSATION_DURABILITY_FAILED',
+      cleanupStage: 'reader_join' as const
+    }
+    vi.mocked(terminalApi).spawn.mockResolvedValue({
+      success: false,
+      error: JSON.stringify(detail),
+      code: 'TERMINAL_RESOURCE_ROLLBACK_FAILED'
+    })
+    vi.mocked(terminalApi)
+      .terminate.mockResolvedValueOnce({
+        success: false,
+        error: JSON.stringify({
+          terminalId: detail.terminalId,
+          primaryCode: 'TERMINATE_FAILED',
+          cleanupStage: 'reader_join'
+        }),
+        code: 'TERMINATE_FAILED'
+      })
+      .mockResolvedValueOnce({ success: true, data: undefined })
+    mockTerminalStoreState.retryTerminalCleanup.mockImplementation(async (terminalId: string) => {
+      const result = await terminalApi.terminate(terminalId)
+      const retained = mockTerminalStoreState.cleanupRecoveries[terminalId]
+      if (result.success) {
+        delete mockTerminalStoreState.cleanupRecoveries[terminalId]
+        return true
+      }
+      if (retained) {
+        mockTerminalStoreState.cleanupRecoveries[terminalId] = {
+          ...retained,
+          retrying: false,
+          retryFailed: true
+        }
+      }
+      return false
+    })
+    const onError = vi.fn()
+
+    const { rerender } = render(<ConnectedTerminal onError={onError} />)
+
+    await vi.waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent(detail.terminalId)
+    })
+    expect(onError).toHaveBeenCalledWith('The terminal process stopped, but cleanup is incomplete.')
+    expect(onError).not.toHaveBeenCalledWith(expect.stringContaining('primaryCode'))
+    expect(screen.getAllByRole('button', { name: /retry termination for terminal/i })).toHaveLength(
+      1
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /retry termination for terminal/i }))
+    await vi.waitFor(() => expect(terminalApi.terminate).toHaveBeenCalledTimes(1))
+    rerender(<ConnectedTerminal onError={onError} className="cleanup-retry-state" />)
+    expect(screen.getByRole('alert')).toHaveTextContent(
+      'Cleanup is still incomplete. You can retry termination again.'
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: /retry termination for terminal/i }))
+    await vi.waitFor(() => expect(terminalApi.terminate).toHaveBeenCalledTimes(2))
+    rerender(<ConnectedTerminal onError={onError} className="cleanup-retry-cleared" />)
+    expect(screen.queryByRole('alert')).toBeNull()
+
+    expect(terminalApi.terminate).toHaveBeenNthCalledWith(1, detail.terminalId)
+    expect(terminalApi.terminate).toHaveBeenNthCalledWith(2, detail.terminalId)
+    expect(vi.mocked(terminalApi).spawn).toHaveBeenCalledTimes(1)
+    expect(mockTerminalStoreState.resumeTerminalResource).not.toHaveBeenCalled()
+    expect(addRendererRef).not.toHaveBeenCalled()
+    expect(mockTerminalStoreState.restartTerminalResource).not.toHaveBeenCalled()
+  })
+
   it('should focus terminal by default', () => {
     render(<ConnectedTerminal />)
     expect(mockTerminalInstance.focus).toHaveBeenCalled()
@@ -717,9 +898,7 @@ describe('ConnectedTerminal', () => {
     })
   })
 
-  // Skipped: This test has timing issues with async component initialization
-  // The test would need significant refactoring to properly test the IPC data flow
-  it.skip('should write PTY data to terminal when ID matches', async () => {
+  it('should write PTY data to terminal when ID matches', async () => {
     const { unmount } = render(<ConnectedTerminal />)
 
     await vi.waitFor(() => {
@@ -733,10 +912,29 @@ describe('ConnectedTerminal', () => {
     expect(capturedDataCallback).toBeTruthy()
 
     // Manually call the callback to verify it works
-    capturedDataCallback!('terminal-123', new TextEncoder().encode('Hello World'))
+    const bytes = new TextEncoder().encode('Hello World')
+    capturedDataCallback!('terminal-123', bytes)
 
     // The callback should have called terminal.write
-    expect(mockTerminalInstance.write).toHaveBeenCalledWith('Hello World')
+    expect(mockTerminalInstance.write).toHaveBeenCalledWith(bytes)
+
+    unmount()
+  })
+
+  it('should preserve UTF-8 bytes for CJK, emoji, and combining characters', async () => {
+    const { unmount } = render(<ConnectedTerminal />)
+
+    await vi.waitFor(() => {
+      expect(vi.mocked(terminalApi).spawn).toHaveBeenCalled()
+    })
+    await new Promise((resolve) => setTimeout(resolve, 50))
+
+    const bytes = new TextEncoder().encode('中文 👩🏽‍💻 e\u0301')
+    expect(capturedDataCallback).not.toBeNull()
+    capturedDataCallback!('terminal-123', bytes)
+
+    expect(mockTerminalInstance.write).toHaveBeenCalledWith(bytes)
+    expect(mockTerminalInstance.write.mock.calls.at(-1)?.[0]).toEqual(bytes)
 
     unmount()
   })
@@ -1692,9 +1890,44 @@ describe('ConnectedTerminal', () => {
         expect(vi.mocked(terminalApi).spawn).toHaveBeenCalled()
       })
 
-      // loadAddon is called for FitAddon, WebLinksAddon, SearchAddon, WebglAddon
+      // loadAddon is called for FitAddon, SearchAddon, and WebglAddon
       expect(mockTerminalInstance.loadAddon).toHaveBeenCalled()
       expect(webglAddonCreateCount).toBe(1)
+    })
+
+    it('should release WebGL while hidden and restore it when visible again', async () => {
+      const { rerender } = render(<ConnectedTerminal isVisible={true} />)
+
+      await vi.waitFor(() => {
+        expect(vi.mocked(terminalApi).spawn).toHaveBeenCalled()
+      })
+      const visibleWebgl = lastCreatedWebglInstance
+      expect(visibleWebgl).toBeTruthy()
+
+      rerender(<ConnectedTerminal isVisible={false} />)
+      await vi.waitFor(() => {
+        expect(visibleWebgl?.dispose).toHaveBeenCalledTimes(1)
+      })
+      expect(webglAddonCreateCount).toBe(1)
+
+      rerender(<ConnectedTerminal isVisible={true} />)
+      await vi.waitFor(() => {
+        expect(webglAddonCreateCount).toBe(2)
+      })
+    })
+
+    it('should defer WebGL allocation until a hidden terminal becomes visible', async () => {
+      const { rerender } = render(<ConnectedTerminal isVisible={false} />)
+
+      await vi.waitFor(() => {
+        expect(vi.mocked(terminalApi).spawn).toHaveBeenCalled()
+      })
+      expect(webglAddonCreateCount).toBe(0)
+
+      rerender(<ConnectedTerminal isVisible={true} />)
+      await vi.waitFor(() => {
+        expect(webglAddonCreateCount).toBe(1)
+      })
     })
 
     it('should stop recovery after max attempts exhausted', async () => {
@@ -1737,7 +1970,7 @@ describe('ConnectedTerminal', () => {
       }
     })
 
-    it.skip('should dispose WebGL and skip recovery after switching renderer preference to canvas', async () => {
+    it('should dispose WebGL and skip recovery after switching renderer preference to dom', async () => {
       vi.useFakeTimers()
       const { rerender } = render(<ConnectedTerminal className="renderer-auto" />)
 
@@ -1748,8 +1981,8 @@ describe('ConnectedTerminal', () => {
       expect(webglAddonCreateCount).toBe(1)
       expect(lastCreatedWebglInstance?.dispose).not.toHaveBeenCalled()
 
-      rendererPreferenceSpy.mockReturnValue('canvas')
-      rerender(<ConnectedTerminal className="renderer-canvas" />)
+      vi.mocked(useTerminalRenderer).mockReturnValue('dom')
+      rerender(<ConnectedTerminal className="renderer-dom" />)
 
       await vi.waitFor(() => {
         expect(lastCreatedWebglInstance?.dispose).toHaveBeenCalled()
@@ -1933,7 +2166,7 @@ describe('ConnectedTerminal', () => {
       expect(mockFitAddonInstance.fit).not.toHaveBeenCalled()
     })
 
-    it.skip('should remove visibilitychange listener on unmount', async () => {
+    it('should remove visibilitychange listener on unmount', async () => {
       const removeEventListenerSpy = vi.spyOn(document, 'removeEventListener')
 
       const { unmount } = render(<ConnectedTerminal />)
@@ -2345,7 +2578,7 @@ describe('ConnectedTerminal', () => {
   })
 
   describe('Power resume recovery', () => {
-    it.skip('should subscribe to power resume events', async () => {
+    it('should subscribe to power resume events', async () => {
       render(<ConnectedTerminal />)
 
       await vi.waitFor(() => {
@@ -2384,7 +2617,7 @@ describe('ConnectedTerminal', () => {
       vi.useRealTimers()
     })
 
-    it.skip('should cleanup power resume subscription on unmount', async () => {
+    it('should cleanup power resume subscription on unmount', async () => {
       const cleanupFn = vi.fn()
       ;(systemApi.onPowerResume as ReturnType<typeof vi.fn>).mockReturnValue(cleanupFn)
 
@@ -2917,6 +3150,8 @@ describe('ConnectedTerminal', () => {
       expect(typeof terminalApi.spawn).toBe('function')
       expect(typeof terminalApi.write).toBe('function')
       expect(typeof terminalApi.resize).toBe('function')
+      expect(typeof terminalApi.closeView).toBe('function')
+      expect(typeof terminalApi.terminate).toBe('function')
       expect(typeof terminalApi.kill).toBe('function')
     })
 

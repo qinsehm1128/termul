@@ -15,11 +15,10 @@
 //! - `crate::detect_shells` for shell detection.
 
 use std::fs;
-use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 
 use axum::{
-    extract::{ConnectInfo, Query, State},
+    extract::{Query, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -27,6 +26,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::trackers::git_tracker::GitTracker;
+use crate::web::auth::IngressProvenance;
 use crate::web::ws::AppState;
 
 /// HTTP response body mirroring the renderer-side `IpcResult<T>` shape
@@ -205,13 +205,12 @@ fn should_ignore(name: &str) -> bool {
 /// local, or `Some(IpcBody::err(...))` with `code: "FORBIDDEN"` when remote.
 /// Matches the existing 200+IpcResult convention (200 with the IpcResult error)
 /// so the renderer maps it to a uniform failure body.
-pub(super) fn check_local_only<T>(peer: SocketAddr) -> Option<IpcBody<T>> {
-    let is_loopback = peer.ip().is_loopback();
-    if is_loopback {
+pub(super) fn check_local_only<T>(provenance: IngressProvenance) -> Option<IpcBody<T>> {
+    if provenance.allows_local_operator_mutation() {
         None
     } else {
         Some(IpcBody::<T>::err(
-            format!("fs write routes are localhost-only (peer {peer} is not loopback)"),
+            "host mutation is localhost-only and requires local-operator ingress",
             "FORBIDDEN",
         ))
     }
@@ -309,10 +308,7 @@ pub(super) fn resolve_request_path(path: &Path) -> Result<PathBuf, (String, &'st
         let canonical_parent = loop {
             let Some(parent) = ancestor.parent() else {
                 return Err((
-                    format!(
-                        "path '{}' has no existing ancestor",
-                        path.display()
-                    ),
+                    format!("path '{}' has no existing ancestor", path.display()),
                     "READ_ERROR",
                 ));
             };
@@ -433,10 +429,10 @@ fn entry_dto(parent: &Path, name: String, metadata: Option<&fs::Metadata>) -> Di
 ///
 pub async fn mkdir(
     State(_state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<MkdirRequest>,
 ) -> impl IntoResponse {
-    if let Some(forbidden) = check_local_only::<()>(peer) {
+    if let Some(forbidden) = check_local_only::<()>(provenance) {
         return (StatusCode::OK, Json(forbidden));
     }
     let path = match resolve_request_path(Path::new(&req.path)) {
@@ -465,10 +461,10 @@ pub async fn mkdir(
 /// peer is loopback.
 pub async fn write(
     State(_state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<WriteRequest>,
 ) -> impl IntoResponse {
-    if let Some(forbidden) = check_local_only::<()>(peer) {
+    if let Some(forbidden) = check_local_only::<()>(provenance) {
         return (StatusCode::OK, Json(forbidden));
     }
     let path = match resolve_request_path(Path::new(&req.path)) {
@@ -565,57 +561,58 @@ pub async fn read(State(_state): State<AppState>, Query(q): Query<PathQuery>) ->
     let path = match resolve_request_path(Path::new(&q.path)) {
         Ok(safe) => safe,
         Err((msg, code)) => {
-            return (StatusCode::OK, Json(IpcBody::<FileContentDto>::err(msg, code)));
+            return (
+                StatusCode::OK,
+                Json(IpcBody::<FileContentDto>::err(msg, code)),
+            );
         }
     };
-    let result = tokio::task::spawn_blocking(move || -> Result<FileContentDto, (String, &'static str)> {
-        let metadata = fs::metadata(&path).map_err(|e| (format!("{e}"), "READ_ERROR"))?;
-        if metadata.is_dir() {
-            return Err((
-                "cannot read a directory as a file".to_string(),
-                "READ_ERROR",
-            ));
-        }
-        let size = metadata.len();
-        if size > MAX_FILE_SIZE {
-            return Err((
-                format!("File too large ({size} bytes, max {MAX_FILE_SIZE})"),
-                "FILE_TOO_LARGE",
-            ));
-        }
-        let modified_at = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let bytes = fs::read(&path).map_err(|e| (format!("{e}"), "READ_ERROR"))?;
-        // Binary detection: control bytes (0x00-0x08) in the first 512
-        // bytes — mirrors the renderer's `isBinaryFile` regex `/[\x00-\x08]/`
-        // so the web path rejects binaries exactly like desktop.
-        let sample_end = bytes.len().min(512);
-        if bytes[..sample_end].iter().any(|&b| b <= 0x08) {
-            return Err((
-                "Binary file cannot be displayed".to_string(),
-                "BINARY_FILE",
-            ));
-        }
-        // Reject non-UTF-8 text instead of lossy-decoding: `from_utf8_lossy`
-        // would replace invalid bytes with U+FFFD and let the editor save the
-        // corrupted content back over the original file. Desktop's
-        // `readTextFile` fails on invalid UTF-8 (→ READ_ERROR); match that
-        // contract so the web path never silently corrupts a file.
-        let content = String::from_utf8(bytes)
-            .map_err(|_| ("file is not valid UTF-8 text".to_string(), "READ_ERROR"))?;
-        Ok(FileContentDto {
-            content,
-            encoding: "utf-8".to_string(),
-            size,
-            modified_at,
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<FileContentDto, (String, &'static str)> {
+            let metadata = fs::metadata(&path).map_err(|e| (format!("{e}"), "READ_ERROR"))?;
+            if metadata.is_dir() {
+                return Err((
+                    "cannot read a directory as a file".to_string(),
+                    "READ_ERROR",
+                ));
+            }
+            let size = metadata.len();
+            if size > MAX_FILE_SIZE {
+                return Err((
+                    format!("File too large ({size} bytes, max {MAX_FILE_SIZE})"),
+                    "FILE_TOO_LARGE",
+                ));
+            }
+            let modified_at = metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let bytes = fs::read(&path).map_err(|e| (format!("{e}"), "READ_ERROR"))?;
+            // Binary detection: control bytes (0x00-0x08) in the first 512
+            // bytes — mirrors the renderer's `isBinaryFile` regex `/[\x00-\x08]/`
+            // so the web path rejects binaries exactly like desktop.
+            let sample_end = bytes.len().min(512);
+            if bytes[..sample_end].iter().any(|&b| b <= 0x08) {
+                return Err(("Binary file cannot be displayed".to_string(), "BINARY_FILE"));
+            }
+            // Reject non-UTF-8 text instead of lossy-decoding: `from_utf8_lossy`
+            // would replace invalid bytes with U+FFFD and let the editor save the
+            // corrupted content back over the original file. Desktop's
+            // `readTextFile` fails on invalid UTF-8 (→ READ_ERROR); match that
+            // contract so the web path never silently corrupts a file.
+            let content = String::from_utf8(bytes)
+                .map_err(|_| ("file is not valid UTF-8 text".to_string(), "READ_ERROR"))?;
+            Ok(FileContentDto {
+                content,
+                encoding: "utf-8".to_string(),
+                size,
+                modified_at,
+            })
         })
-    })
-    .await
-    .map_err(|e| format!("read task failed: {e}"));
+        .await
+        .map_err(|e| format!("read task failed: {e}"));
     let body = match result {
         Ok(Ok(fc)) => IpcBody::ok(fc),
         Ok(Err((msg, code))) => IpcBody::<FileContentDto>::err(msg, code),
@@ -638,10 +635,10 @@ pub async fn read(State(_state): State<AppState>, Query(q): Query<PathQuery>) ->
 /// agrees with desktop on which files the editor should refuse to open.
 pub async fn info(
     State(_state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Query(q): Query<PathQuery>,
 ) -> impl IntoResponse {
-    if let Some(forbidden) = check_local_only::<FileInfoDto>(peer) {
+    if let Some(forbidden) = check_local_only::<FileInfoDto>(provenance) {
         return (StatusCode::OK, Json(forbidden));
     }
     let requested_path = q.path.clone();
@@ -651,52 +648,51 @@ pub async fn info(
             return (StatusCode::OK, Json(IpcBody::<FileInfoDto>::err(msg, code)));
         }
     };
-    let result = tokio::task::spawn_blocking(move || -> Result<FileInfoDto, (String, &'static str)> {
-        let metadata = fs::metadata(&path).map_err(|e| (format!("{e}"), "STAT_ERROR"))?;
-        let modified_at = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        let is_dir = metadata.is_dir();
-        let size = metadata.len();
-        let is_read_only = metadata.permissions().readonly();
-        let is_binary = if is_dir {
-            false
-        } else {
-            // Binary detection: control bytes (0x00-0x08) in the first 512
-            // bytes — mirrors the renderer's `readBinarySample` +
-            // `isBinaryFile` regex and the `/fs/read` handler's sample scan.
-            // `take(512)` caps the read so large files are not fully loaded;
-            // `read_to_end` fills the buffer completely (no partial-read gap).
-            use std::io::Read;
-            match std::fs::File::open(&path) {
-                Ok(file) => {
-                    let mut buf = Vec::with_capacity(512);
-                    file.take(512)
-                        .read_to_end(&mut buf)
-                        .is_ok()
-                        && buf.iter().any(|&b| b <= 0x08)
-                }
-                Err(_) => false,
-            }
-        };
-        Ok(FileInfoDto {
-            path: requested_path,
-            size,
-            modified_at,
-            r#type: if is_dir {
-                "directory".to_string()
+    let result =
+        tokio::task::spawn_blocking(move || -> Result<FileInfoDto, (String, &'static str)> {
+            let metadata = fs::metadata(&path).map_err(|e| (format!("{e}"), "STAT_ERROR"))?;
+            let modified_at = metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let is_dir = metadata.is_dir();
+            let size = metadata.len();
+            let is_read_only = metadata.permissions().readonly();
+            let is_binary = if is_dir {
+                false
             } else {
-                "file".to_string()
-            },
-            is_read_only,
-            is_binary,
+                // Binary detection: control bytes (0x00-0x08) in the first 512
+                // bytes — mirrors the renderer's `readBinarySample` +
+                // `isBinaryFile` regex and the `/fs/read` handler's sample scan.
+                // `take(512)` caps the read so large files are not fully loaded;
+                // `read_to_end` fills the buffer completely (no partial-read gap).
+                use std::io::Read;
+                match std::fs::File::open(&path) {
+                    Ok(file) => {
+                        let mut buf = Vec::with_capacity(512);
+                        file.take(512).read_to_end(&mut buf).is_ok()
+                            && buf.iter().any(|&b| b <= 0x08)
+                    }
+                    Err(_) => false,
+                }
+            };
+            Ok(FileInfoDto {
+                path: requested_path,
+                size,
+                modified_at,
+                r#type: if is_dir {
+                    "directory".to_string()
+                } else {
+                    "file".to_string()
+                },
+                is_read_only,
+                is_binary,
+            })
         })
-    })
-    .await
-    .map_err(|e| format!("info task failed: {e}"));
+        .await
+        .map_err(|e| format!("info task failed: {e}"));
     let body = match result {
         Ok(Ok(info)) => IpcBody::ok(info),
         Ok(Err((msg, code))) => IpcBody::<FileInfoDto>::err(msg, code),
@@ -712,10 +708,10 @@ pub async fn info(
 /// is bound to `0.0.0.0`.
 pub async fn delete(
     State(_state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<DeleteRequest>,
 ) -> impl IntoResponse {
-    if let Some(forbidden) = check_local_only::<()>(peer) {
+    if let Some(forbidden) = check_local_only::<()>(provenance) {
         return (StatusCode::OK, Json(forbidden));
     }
     let path = match resolve_request_path(Path::new(&req.path)) {
@@ -748,10 +744,10 @@ pub async fn delete(
 /// allowed, matching `ls`/`mkdir`). Loopback-guarded (mutation).
 pub async fn rename(
     State(_state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<RenameRequest>,
 ) -> impl IntoResponse {
-    if let Some(forbidden) = check_local_only::<()>(peer) {
+    if let Some(forbidden) = check_local_only::<()>(provenance) {
         return (StatusCode::OK, Json(forbidden));
     }
     let from = match resolve_request_path(Path::new(&req.from)) {
@@ -785,10 +781,10 @@ pub async fn rename(
 /// (mutation).
 pub async fn copy(
     State(_state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<CopyRequest>,
 ) -> impl IntoResponse {
-    if let Some(forbidden) = check_local_only::<()>(peer) {
+    if let Some(forbidden) = check_local_only::<()>(provenance) {
         return (StatusCode::OK, Json(forbidden));
     }
     let from = match resolve_request_path(Path::new(&req.from)) {
@@ -820,8 +816,12 @@ pub async fn copy(
 /// `{ success: false, error: <trimmed stderr>, code: "GIT_INIT_ERROR" }`.
 pub async fn git_init(
     State(_state): State<AppState>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<GitInitRequest>,
 ) -> impl IntoResponse {
+    if let Some(forbidden) = check_local_only::<()>(provenance) {
+        return (StatusCode::OK, Json(forbidden));
+    }
     let cwd = req.cwd;
     let result = tokio::task::spawn_blocking(move || {
         let output = GitTracker::run_git_command(&cwd, &["init"]);
@@ -929,7 +929,9 @@ mod tests {
     use crate::web::sink::WsRelaySink;
     use crate::web::test_pty_manager;
     use axum::body::Body;
+    use axum::extract::ConnectInfo;
     use axum::http::{Request, StatusCode};
+    use std::net::SocketAddr;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -993,7 +995,10 @@ mod tests {
             registry_persistence: None,
             projects_file: None,
             history_mode: crate::web::ws::HistoryMode::LiveOnly,
-            project_root: Arc::new(parking_lot::RwLock::new(root.canonicalize().unwrap_or_else(|_| root.to_path_buf()))),
+            conversation: None,
+            project_root: Arc::new(parking_lot::RwLock::new(
+                root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
+            )),
             workspace_manifest: None,
             acp_catalog: None,
             acp_install: None,
@@ -1049,7 +1054,10 @@ mod tests {
             .route("/fs/rename", axum::routing::post(rename))
             .route("/fs/copy", axum::routing::post(copy))
             .route("/git/init", axum::routing::post(git_init))
-            .route("/git/status", axum::routing::post(crate::web::git_api::get_status))
+            .route(
+                "/git/status",
+                axum::routing::post(crate::web::git_api::get_status),
+            )
             .route("/skills", axum::routing::get(crate::web::skills_api::list))
             .route("/shells", axum::routing::get(shells))
             .with_state(state)
@@ -1072,6 +1080,11 @@ mod tests {
                     .method("GET")
                     .uri(uri)
                     .extension(ConnectInfo(peer))
+                    .extension(if peer.ip().is_loopback() {
+                        IngressProvenance::LocalOperator
+                    } else {
+                        IngressProvenance::PublicTunnel
+                    })
                     .body(Body::empty())
                     .expect("build request"),
             )
@@ -1105,6 +1118,11 @@ mod tests {
                     .uri(uri)
                     .header("content-type", "application/json")
                     .extension(ConnectInfo(peer))
+                    .extension(if peer.ip().is_loopback() {
+                        IngressProvenance::LocalOperator
+                    } else {
+                        IngressProvenance::PublicTunnel
+                    })
                     .body(Body::from(bytes))
                     .expect("build request"),
             )
@@ -1504,7 +1522,11 @@ mod tests {
         let resp = post_json(test_state_with_root(root.path()), "/fs/mkdir", &req_body).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body: IpcBody<()> = body_as_json(resp.into_body()).await;
-        assert!(body.success, "mkdir outside root should succeed: {:?}", body.error);
+        assert!(
+            body.success,
+            "mkdir outside root should succeed: {:?}",
+            body.error
+        );
         assert!(target.is_dir(), "directory outside root must be created");
     }
 
@@ -1537,7 +1559,11 @@ mod tests {
         let req_body = serde_json::json!({ "path": target.to_string_lossy(), "content": "pwn" });
         let resp = post_json(test_state_with_root(root.path()), "/fs/write", &req_body).await;
         let body: IpcBody<()> = body_as_json(resp.into_body()).await;
-        assert!(body.success, "write outside root should succeed: {:?}", body.error);
+        assert!(
+            body.success,
+            "write outside root should succeed: {:?}",
+            body.error
+        );
         assert!(target.exists(), "file outside root must be written");
         assert_eq!(fs::read_to_string(&target).unwrap(), "pwn");
     }
@@ -1556,7 +1582,11 @@ mod tests {
         );
         let resp = get_request(test_state_with_root(root.path()), &uri).await;
         let body: IpcBody<Vec<DirectoryEntryDto>> = body_as_json(resp.into_body()).await;
-        assert!(body.success, "ls outside root should succeed: {:?}", body.error);
+        assert!(
+            body.success,
+            "ls outside root should succeed: {:?}",
+            body.error
+        );
         let entries = body.data.expect("entries");
         assert!(
             entries.iter().any(|e| e.name == "marker.txt"),
@@ -1656,7 +1686,11 @@ mod tests {
         let uri = format!("/fs/read?path={}", urlencoding(&target.to_string_lossy()));
         let resp = get_request(test_state_with_root(root.path()), &uri).await;
         let body: IpcBody<FileContentDto> = body_as_json(resp.into_body()).await;
-        assert!(body.success, "read outside root should succeed: {:?}", body.error);
+        assert!(
+            body.success,
+            "read outside root should succeed: {:?}",
+            body.error
+        );
         assert_eq!(body.data.expect("content").content, "pwn");
     }
 
@@ -1667,7 +1701,10 @@ mod tests {
         let inside = root.path().join("sub");
         fs::create_dir_all(&inside).expect("mkdir inside");
         let traversal = inside.join("..").join("..").join("etc");
-        let uri = format!("/fs/read?path={}", urlencoding(&traversal.to_string_lossy()));
+        let uri = format!(
+            "/fs/read?path={}",
+            urlencoding(&traversal.to_string_lossy())
+        );
         let resp = get_request(test_state_with_root(root.path()), &uri).await;
         let body: IpcBody<FileContentDto> = body_as_json(resp.into_body()).await;
         assert!(!body.success, "traversal must be refused");
@@ -1722,7 +1759,10 @@ mod tests {
         let uri = format!("/fs/read?path={}", urlencoding(&file.to_string_lossy()));
         let resp = get_request(test_state_with_root(root.path()), &uri).await;
         let body: IpcBody<FileContentDto> = body_as_json(resp.into_body()).await;
-        assert!(!body.success, "non-UTF-8 text must be refused, not lossy-decoded");
+        assert!(
+            !body.success,
+            "non-UTF-8 text must be refused, not lossy-decoded"
+        );
         assert_eq!(body.code.as_deref(), Some("READ_ERROR"));
     }
 
@@ -1739,7 +1779,10 @@ mod tests {
         let uri = format!("/fs/read?path={}", urlencoding(&file.to_string_lossy()));
         let resp = get_request(test_state_with_root(root.path()), &uri).await;
         let body: IpcBody<FileContentDto> = body_as_json(resp.into_body()).await;
-        assert!(!body.success, "oversized file must be refused before reading");
+        assert!(
+            !body.success,
+            "oversized file must be refused before reading"
+        );
         assert_eq!(body.code.as_deref(), Some("FILE_TOO_LARGE"));
     }
 
@@ -1754,7 +1797,11 @@ mod tests {
         let resp = get_request(test_state_with_root(root.path()), &uri).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body: IpcBody<FileInfoDto> = body_as_json(resp.into_body()).await;
-        assert!(body.success, "info on existing file must succeed: {:?}", body.error);
+        assert!(
+            body.success,
+            "info on existing file must succeed: {:?}",
+            body.error
+        );
         let info = body.data.expect("FileInfo present");
         assert_eq!(info.size, "hello world".len() as u64);
         assert!(info.modified_at > 0, "modifiedAt must be populated");
@@ -1773,7 +1820,11 @@ mod tests {
         let resp = get_request(test_state_with_root(root.path()), &uri).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body: IpcBody<FileInfoDto> = body_as_json(resp.into_body()).await;
-        assert!(body.success, "info on directory must succeed: {:?}", body.error);
+        assert!(
+            body.success,
+            "info on directory must succeed: {:?}",
+            body.error
+        );
         let info = body.data.expect("FileInfo present");
         assert_eq!(info.r#type, "directory");
         assert!(!info.is_binary, "directory must not be binary");
@@ -1791,7 +1842,10 @@ mod tests {
         let resp = get_request(test_state_with_root(root.path()), &uri).await;
         let body: IpcBody<FileInfoDto> = body_as_json(resp.into_body()).await;
         assert!(body.success, "info on binary file must succeed");
-        assert!(body.data.expect("FileInfo").is_binary, "binary file must be flagged");
+        assert!(
+            body.data.expect("FileInfo").is_binary,
+            "binary file must be flagged"
+        );
     }
 
     /// `/fs/info` rejects explicit `..` traversal components (defense-in-depth,
@@ -1802,7 +1856,10 @@ mod tests {
         let inside = root.path().join("sub");
         fs::create_dir_all(&inside).expect("mkdir inside");
         let traversal = inside.join("..").join("..").join("etc");
-        let uri = format!("/fs/info?path={}", urlencoding(&traversal.to_string_lossy()));
+        let uri = format!(
+            "/fs/info?path={}",
+            urlencoding(&traversal.to_string_lossy())
+        );
         let resp = get_request(test_state_with_root(root.path()), &uri).await;
         let body: IpcBody<FileInfoDto> = body_as_json(resp.into_body()).await;
         assert!(!body.success, "traversal must be refused");
@@ -1896,7 +1953,11 @@ mod tests {
         let req_body = serde_json::json!({ "path": target.to_string_lossy() });
         let resp = post_json(test_state_with_root(root.path()), "/fs/delete", &req_body).await;
         let body: IpcBody<()> = body_as_json(resp.into_body()).await;
-        assert!(body.success, "delete outside root should succeed: {:?}", body.error);
+        assert!(
+            body.success,
+            "delete outside root should succeed: {:?}",
+            body.error
+        );
         assert!(!target.exists(), "file outside root must be deleted");
     }
 
@@ -1928,7 +1989,8 @@ mod tests {
         let from = root.path().join("a.txt");
         let to = root.path().join("b.txt");
         fs::write(&from, "payload").expect("write from");
-        let req_body = serde_json::json!({ "from": from.to_string_lossy(), "to": to.to_string_lossy() });
+        let req_body =
+            serde_json::json!({ "from": from.to_string_lossy(), "to": to.to_string_lossy() });
         let resp = post_json(test_state_with_root(root.path()), "/fs/rename", &req_body).await;
         let body: IpcBody<()> = body_as_json(resp.into_body()).await;
         assert!(body.success, "rename must succeed");
@@ -1946,7 +2008,8 @@ mod tests {
         let from = root.path().join("a.txt");
         let to = root.path().join("b.txt");
         fs::write(&from, "payload").expect("write from");
-        let req_body = serde_json::json!({ "from": from.to_string_lossy(), "to": to.to_string_lossy() });
+        let req_body =
+            serde_json::json!({ "from": from.to_string_lossy(), "to": to.to_string_lossy() });
         let resp = post_json_from(
             test_state_with_root(root.path()),
             "/fs/rename",
@@ -1958,7 +2021,10 @@ mod tests {
         assert!(!body.success, "non-loopback rename must be refused");
         assert_eq!(body.code.as_deref(), Some("FORBIDDEN"));
         assert!(from.exists(), "refused rename must not move the source");
-        assert!(!to.exists(), "refused rename must not create the destination");
+        assert!(
+            !to.exists(),
+            "refused rename must not create the destination"
+        );
     }
 
     /// `/fs/rename` allows a destination outside the project root (the jail
@@ -1970,10 +2036,15 @@ mod tests {
         let from = root.path().join("a.txt");
         let to = outside.path().join("b.txt");
         fs::write(&from, "payload").expect("write from");
-        let req_body = serde_json::json!({ "from": from.to_string_lossy(), "to": to.to_string_lossy() });
+        let req_body =
+            serde_json::json!({ "from": from.to_string_lossy(), "to": to.to_string_lossy() });
         let resp = post_json(test_state_with_root(root.path()), "/fs/rename", &req_body).await;
         let body: IpcBody<()> = body_as_json(resp.into_body()).await;
-        assert!(body.success, "rename to outside root should succeed: {:?}", body.error);
+        assert!(
+            body.success,
+            "rename to outside root should succeed: {:?}",
+            body.error
+        );
         assert!(!from.exists(), "source must be gone after rename");
         assert!(to.exists(), "destination must exist after rename");
         assert_eq!(fs::read_to_string(&to).unwrap(), "payload");
@@ -1986,7 +2057,8 @@ mod tests {
         let from = root.path().join("orig.txt");
         let to = root.path().join("dup.txt");
         fs::write(&from, "payload").expect("write from");
-        let req_body = serde_json::json!({ "from": from.to_string_lossy(), "to": to.to_string_lossy() });
+        let req_body =
+            serde_json::json!({ "from": from.to_string_lossy(), "to": to.to_string_lossy() });
         let resp = post_json(test_state_with_root(root.path()), "/fs/copy", &req_body).await;
         let body: IpcBody<()> = body_as_json(resp.into_body()).await;
         assert!(body.success, "copy must succeed");
@@ -2003,7 +2075,8 @@ mod tests {
         let from = root.path().join("orig.txt");
         let to = root.path().join("dup.txt");
         fs::write(&from, "payload").expect("write from");
-        let req_body = serde_json::json!({ "from": from.to_string_lossy(), "to": to.to_string_lossy() });
+        let req_body =
+            serde_json::json!({ "from": from.to_string_lossy(), "to": to.to_string_lossy() });
         let resp = post_json_from(
             test_state_with_root(root.path()),
             "/fs/copy",
@@ -2028,10 +2101,15 @@ mod tests {
         let from = root.path().join("orig.txt");
         let to = outside.path().join("dup.txt");
         fs::write(&from, "payload").expect("write from");
-        let req_body = serde_json::json!({ "from": from.to_string_lossy(), "to": to.to_string_lossy() });
+        let req_body =
+            serde_json::json!({ "from": from.to_string_lossy(), "to": to.to_string_lossy() });
         let resp = post_json(test_state_with_root(root.path()), "/fs/copy", &req_body).await;
         let body: IpcBody<()> = body_as_json(resp.into_body()).await;
-        assert!(body.success, "copy to outside root should succeed: {:?}", body.error);
+        assert!(
+            body.success,
+            "copy to outside root should succeed: {:?}",
+            body.error
+        );
         assert!(from.exists(), "source must remain after copy");
         assert!(to.exists(), "destination must exist after copy");
         assert_eq!(fs::read_to_string(&to).unwrap(), "payload");
@@ -2108,10 +2186,7 @@ mod tests {
         // --- WITHIN project_root: all routes accept (no OUTSIDE_PROJECT_ROOT) ---
 
         // `/fs/ls` within project_root SUCCEEDS.
-        let ls_uri = format!(
-            "/fs/ls?path={}",
-            urlencoding(&inside.to_string_lossy())
-        );
+        let ls_uri = format!("/fs/ls?path={}", urlencoding(&inside.to_string_lossy()));
         let resp = get_request(state.clone(), &ls_uri).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body: IpcBody<Vec<DirectoryEntryDto>> = body_as_json(resp.into_body()).await;

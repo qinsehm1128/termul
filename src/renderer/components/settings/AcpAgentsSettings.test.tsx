@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { StoredAgentConfig } from '@/lib/acp-agents-persistence'
 import type { SupportedAcpAgentEntry } from '@/lib/agents/supported-acp-agents'
@@ -66,7 +66,7 @@ describe('AcpAgentsSettings', () => {
     resolvedRef.current = null
   })
 
-  it('shows supported ACP agent status without enable toggles', () => {
+  it('shows supported ACP agent status and permission policy controls', () => {
     const entries = buildSupportedAcpAgents([], 'windows-x86_64')
     render(<AcpAgentsSettings />)
 
@@ -76,7 +76,9 @@ describe('AcpAgentsSettings', () => {
     expect(screen.getByText('Cursor')).toBeInTheDocument()
     expect(screen.getByText('OpenCode')).toBeInTheDocument()
     expect(screen.getByText('pi ACP')).toBeInTheDocument()
-    expect(screen.queryByRole('switch')).not.toBeInTheDocument()
+    expect(screen.getAllByRole('switch')).toHaveLength(
+      entries.filter((entry) => entry.config !== null).length
+    )
     expect(screen.getAllByText('Install from Agent Chat')).toHaveLength(
       entries.filter((entry) => entry.status === 'install-required').length
     )
@@ -93,7 +95,8 @@ describe('AcpAgentsSettings', () => {
       command: 'node',
       args: ['/path/to/agent.js'],
       env: {},
-      allowTerminal: false
+      allowTerminal: false,
+      permissionPolicy: 'ask'
     }
     resolvedRef.current = [
       {
@@ -115,5 +118,44 @@ describe('AcpAgentsSettings', () => {
 
     expect(stateRef.current.deleteAgentConfig).toHaveBeenCalledTimes(1)
     expect(stateRef.current.deleteAgentConfig).toHaveBeenCalledWith('custom-xyz')
+  })
+
+  it('requires confirmation before enabling the allow-all permission policy', async () => {
+    const stored: StoredAgentConfig = {
+      id: 'custom-policy',
+      configId: 'custom-policy',
+      name: 'Trusted Agent',
+      command: 'trusted-agent',
+      args: [],
+      env: {},
+      allowTerminal: false,
+      permissionPolicy: 'ask'
+    }
+    resolvedRef.current = [
+      {
+        id: stored.id,
+        configId: stored.configId!,
+        agent: { id: stored.id, name: stored.name, version: '', description: '', distribution: {} },
+        config: stored,
+        status: 'ready',
+        install: null,
+        manualInstall: null,
+        runtimeLauncher: null,
+        unavailableReason: null
+      }
+    ]
+    stateRef.current.saveAgentConfig = vi.fn().mockResolvedValue(undefined)
+    render(<AcpAgentsSettings />)
+
+    fireEvent.click(screen.getByRole('switch', { name: /trusted agent/i }))
+    expect(stateRef.current.saveAgentConfig).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Enable full access' }))
+
+    await waitFor(() =>
+      expect(stateRef.current.saveAgentConfig).toHaveBeenCalledWith({
+        ...stored,
+        permissionPolicy: 'allow_all'
+      })
+    )
   })
 })

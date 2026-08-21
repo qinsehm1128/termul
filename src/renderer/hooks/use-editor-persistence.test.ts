@@ -1,7 +1,11 @@
 import { renderHook, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { LeafNode, PaneNode, SplitNode } from '@/types/workspace.types'
-import { persistState, useEditorPersistence } from './use-editor-persistence'
+import {
+  persistState,
+  subscribeProjectWorkspaceRestored,
+  useEditorPersistence
+} from './use-editor-persistence'
 
 const { mockLoadPersistedTerminals } = vi.hoisted(() => ({
   mockLoadPersistedTerminals: vi.fn()
@@ -130,6 +134,14 @@ vi.mock('@/stores/project-store', () => ({
   }
 }))
 
+const mockConversationState = { activeConversationId: null as string | null }
+
+vi.mock('@/stores/conversation-store', () => ({
+  useConversationStore: {
+    getState: vi.fn(() => mockConversationState)
+  }
+}))
+
 const mockTerminalState = {
   terminals: [] as Array<{
     id: string
@@ -177,7 +189,7 @@ const {
     getBasedRevision: vi.fn(() => null),
     hasPendingConflict: vi.fn(() => false),
     pendingConflict: null,
-    basedRevisionByProject: {},
+    legacyRevisionByProject: {},
     manifestRestoreInProgressByProject: {}
   }
 }))
@@ -271,6 +283,7 @@ beforeEach(() => {
   mockWorkspaceState.loadProjectWorkspace.mockReset()
 
   mockTerminalState.terminals = []
+  mockConversationState.activeConversationId = null
 })
 
 afterEach(() => {
@@ -298,6 +311,35 @@ describe('useEditorPersistence', () => {
       expect(mockExplorerState.restoreExpandedDirs).toHaveBeenCalledWith([
         '/projects/a',
         '/projects/a/src'
+      ])
+    })
+  })
+
+  it('restores expanded dirs from every root in a group workspace', async () => {
+    mockPersistenceRead.mockResolvedValue({
+      success: true,
+      data: {
+        openFiles: [],
+        activeFilePath: null,
+        expandedDirs: ['/projects/a/src', '/projects/b/docs', '/outside/path'],
+        activeTabId: null
+      }
+    })
+
+    renderHook(() =>
+      useEditorPersistence('group-workspace', {
+        projectIds: ['project-a', 'project-b'],
+        rootPaths: ['/projects/a', '/projects/b'],
+        manifestProjectId: null,
+        notificationProjectId: 'project-a'
+      })
+    )
+
+    await waitFor(() => {
+      expect(mockPersistenceRead).toHaveBeenCalledWith('editor-state/group-workspace')
+      expect(mockExplorerState.restoreExpandedDirs).toHaveBeenCalledWith([
+        '/projects/a/src',
+        '/projects/b/docs'
       ])
     })
   })
@@ -429,6 +471,41 @@ describe('useEditorPersistence', () => {
       { type: 'terminal', terminalId: 'old-1' },
       { type: 'editor', filePath: '/projects/a/src/index.ts' }
     ])
+  })
+
+  it('does not persist the project pane tree while a Conversation is active', () => {
+    mockConversationState.activeConversationId = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+    persistState('project-a')
+    expect(mockPersistenceWriteDebounced).not.toHaveBeenCalled()
+  })
+
+  it('notifies listeners after a project pane restore finishes', async () => {
+    mockPersistenceRead.mockResolvedValue({
+      success: true,
+      data: {
+        openFiles: [],
+        activeFilePath: null,
+        expandedDirs: [],
+        activeTabId: null,
+        paneLayout: {
+          type: 'leaf',
+          id: 'pane-empty',
+          tabs: [],
+          activeTabId: null
+        }
+      }
+    })
+    const restored: string[] = []
+    const unsubscribe = subscribeProjectWorkspaceRestored((projectId) => {
+      restored.push(projectId)
+    })
+
+    renderHook(() => useEditorPersistence('project-a'))
+
+    await waitFor(() => {
+      expect(restored).toEqual(['project-a'])
+    })
+    unsubscribe()
   })
 
   it('restores pane layout, remaps terminal tabs to live terminals, and prunes missing editor tabs', async () => {
@@ -764,12 +841,9 @@ describe('useEditorPersistence', () => {
     })
   })
 
-  // P3: manifest-wins integration — when getManifest returns a real manifest,
-  // loadWorkspaceManifest rebuilds the tree from the manifest's portable
-  // topology and the legacy paneLayout path (reconcileTerminalTabs +
-  // loadPersistedTerminals) is skipped. Asserts the workspace root matches
-  // the manifest-rebuilt tree (leaf id from manifest), NOT the paneLayout tree.
-  it('uses the manifest-rebuilt tree and skips the legacy paneLayout path when a manifest exists', async () => {
+  // Stage-5 cutover: preserved project manifests are inspection-only. Their editor evidence may
+  // be opened, but the Conversation-independent project pane tree is never restored as live state.
+  it('inspects a legacy manifest but restores the renderer-local paneLayout instead', async () => {
     mockPersistenceRead.mockResolvedValue({
       success: true,
       data: {
@@ -811,23 +885,15 @@ describe('useEditorPersistence', () => {
       expect(mockGetManifest).toHaveBeenCalledWith('project-a')
     })
 
-    // The manifest path rebuilt the tree → loadProjectWorkspace called with
-    // the manifest-rebuilt root (leaf id 'manifest-leaf-A'), NOT 'legacy-leaf'.
     await waitFor(() => {
       expect(mockWorkspaceState.loadProjectWorkspace).toHaveBeenCalledTimes(1)
     })
-    const [restoredRootArg, activePaneIdArg] = mockWorkspaceState.loadProjectWorkspace.mock.calls[0]
-    expect((restoredRootArg as { id: string }).id).toBe('manifest-leaf-A')
-    expect(activePaneIdArg).toBe('manifest-leaf-A')
-
-    // The legacy path is skipped: loadPersistedTerminals + reconcileTerminalTabs
-    // (which would call loadProjectWorkspace with the 'legacy-leaf' tree) are
-    // NOT invoked.
-    expect(mockLoadPersistedTerminals).not.toHaveBeenCalled()
+    const [restoredRootArg] = mockWorkspaceState.loadProjectWorkspace.mock.calls[0]
+    expect((restoredRootArg as { id: string }).id).toBe('legacy-leaf')
+    expect(mockLoadPersistedTerminals).toHaveBeenCalled()
     expect(mockWorkspaceState.resetLayout).not.toHaveBeenCalled()
-    expect(mockWorkspaceState.syncEditorTabs).not.toHaveBeenCalled()
 
-    // P2: the manifest's editor descriptors are seeded into openFiles.
+    // Preserved manifest editor paths remain inspectable, without applying its pane topology.
     expect(mockEditorState.openFile).toHaveBeenCalledWith('/manifest/file.ts')
   })
 

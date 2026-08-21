@@ -20,33 +20,49 @@
 //!
 //! # Scope fence
 //!
-//! `authenticate` is a placeholder (accepts any token; Epic 2 replaces).
+//! `authenticate` is enforced by the host-injected remote-access authority.
 //! `subscribe` is wired (Story 1.6): binds the connection to a session log with
 //! optional `lastSeq` cursor replay. Other ACP request types still return
 //! `err.code: "not_implemented"` until Stories 1.7/1.8/Epic 4.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
+use axum::extract::{ConnectInfo, State};
+use axum::http::HeaderMap;
 use axum::response::IntoResponse;
+use axum::Extension;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, warn};
 
-use crate::acp::config::AgentConfig;
+use crate::acp::config::{AgentConfig, PermissionPolicy};
 use crate::acp::{AcpManager, AgentId, FileProjectRegistry, SessionCreationContext, SessionId};
 use crate::pty::PtyManager;
 use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub};
+use crate::web::auth::{
+    auth_error_response, IngressProvenance, RemoteAccessAuthority, RemoteAuthError,
+    RemoteCapability, RemotePrincipal,
+};
+use crate::web::operation_policy;
 use crate::web::permissions::{TurnClaim, DEFAULT_PERMISSION_RECONNECT_GRACE};
 use crate::web::project_registry::{ProjectRegistry, ProjectSwitchContext};
-use crate::web::sink::{broadcast_projects_changed, ClientId, ReplayResult, WsRelaySink};
+use crate::web::sink::{
+    broadcast_projects_changed, AcpEvent, ClientId, ReplayResult, WsRelaySink,
+    CLIENT_OUTBOUND_BYTES, CLIENT_OUTBOUND_RECORDS, MAX_CONNECTION_SUBSCRIPTIONS,
+    RELIABLE_CLIENT_TIMEOUT,
+};
 use crate::web::store::WebStore;
+use crate::web::upgraded_connections::{UpgradedConnectionKind, UpgradedConnectionRegistry};
+use crate::web::EventSink;
+
+const MAX_COMPAT_HISTORY_ENCODED_BYTES: usize = 4_194_304;
 
 // ---------------------------------------------------------------------------
 // Sequenced event — the wire envelope (AC2 + AC3)
@@ -321,6 +337,9 @@ pub struct AppState {
     pub projects_file: Option<Arc<PathBuf>>,
     /// Deployment history provider exposed to authenticated browser clients.
     pub history_mode: HistoryMode,
+    /// Bootstrap-published Conversation application service. Production routers always provide
+    /// the shared Arc; legacy unit fixtures that do not exercise Conversation routes use `None`.
+    pub conversation: Option<Arc<crate::conversation::ConversationApplicationService>>,
     /// Host-owned versioned workspace manifest service (CAP-5 / Story 5).
     /// `None` when the desktop could not open `WorkspaceManifestService` at
     /// startup (degraded fresh-only mode) — routes return `Ok(None)` /
@@ -432,11 +451,192 @@ impl RuntimePolicy {
 // ---------------------------------------------------------------------------
 
 /// Outbound frame on a connection's write loop (event or reply).
+#[derive(Debug)]
 enum Outbound {
     /// A sequenced event (server→client push).
     Event(SequencedEvent),
     /// A reply to a client request.
     Reply(WsReply),
+}
+
+struct QueuedOutbound {
+    frame: Option<Outbound>,
+    _record_permit: OwnedSemaphorePermit,
+    _byte_permit: OwnedSemaphorePermit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundSendError {
+    Closed,
+    Full,
+    Oversized,
+    Serialization,
+    Timeout,
+}
+
+#[derive(Clone)]
+struct OutboundSender {
+    tx: mpsc::Sender<QueuedOutbound>,
+    record_budget: Arc<Semaphore>,
+    byte_budget: Arc<Semaphore>,
+    disconnected: Arc<AtomicBool>,
+    disconnect_notify: Arc<Notify>,
+}
+
+struct OutboundReceiver {
+    rx: mpsc::Receiver<QueuedOutbound>,
+    disconnected: Arc<AtomicBool>,
+    disconnect_notify: Arc<Notify>,
+}
+
+fn outbound_channel() -> (OutboundSender, OutboundReceiver) {
+    let record_budget = Arc::new(Semaphore::new(CLIENT_OUTBOUND_RECORDS));
+    let byte_budget = Arc::new(Semaphore::new(CLIENT_OUTBOUND_BYTES));
+    let disconnected = Arc::new(AtomicBool::new(false));
+    let disconnect_notify = Arc::new(Notify::new());
+    let (tx, rx) = mpsc::channel(CLIENT_OUTBOUND_RECORDS);
+    (
+        OutboundSender {
+            tx,
+            record_budget: Arc::clone(&record_budget),
+            byte_budget: Arc::clone(&byte_budget),
+            disconnected: Arc::clone(&disconnected),
+            disconnect_notify: Arc::clone(&disconnect_notify),
+        },
+        OutboundReceiver {
+            rx,
+            disconnected,
+            disconnect_notify,
+        },
+    )
+}
+
+fn outbound_frame_bytes(frame: &Outbound) -> Result<usize, OutboundSendError> {
+    let encoded = match frame {
+        Outbound::Event(event) => serde_json::to_vec(event),
+        Outbound::Reply(reply) => serde_json::to_vec(reply),
+    }
+    .map_err(|_| OutboundSendError::Serialization)?;
+    Ok(encoded.len().max(1))
+}
+
+impl OutboundSender {
+    fn disconnect(&self) {
+        if !self.disconnected.swap(true, Ordering::AcqRel) {
+            self.disconnect_notify.notify_waiters();
+        }
+    }
+
+    fn send(&self, frame: Outbound) -> Result<(), OutboundSendError> {
+        if self.disconnected.load(Ordering::Acquire) {
+            return Err(OutboundSendError::Closed);
+        }
+        let bytes = outbound_frame_bytes(&frame)?;
+        if bytes > CLIENT_OUTBOUND_BYTES {
+            self.disconnect();
+            return Err(OutboundSendError::Oversized);
+        }
+        let record_permit = Arc::clone(&self.record_budget)
+            .try_acquire_owned()
+            .map_err(|_| OutboundSendError::Full)?;
+        let byte_permit = Arc::clone(&self.byte_budget)
+            .try_acquire_many_owned(bytes as u32)
+            .map_err(|_| OutboundSendError::Full)?;
+        self.tx
+            .try_send(QueuedOutbound {
+                frame: Some(frame),
+                _record_permit: record_permit,
+                _byte_permit: byte_permit,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => OutboundSendError::Full,
+                mpsc::error::TrySendError::Closed(_) => OutboundSendError::Closed,
+            })
+    }
+
+    async fn send_event(&self, event: SequencedEvent) -> Result<(), OutboundSendError> {
+        if tier_of(&event.type_) == ReliabilityTier::Lossy {
+            return match self.send(Outbound::Event(event)) {
+                Ok(()) | Err(OutboundSendError::Full) => Ok(()),
+                Err(error) => Err(error),
+            };
+        }
+        if self.disconnected.load(Ordering::Acquire) {
+            return Err(OutboundSendError::Closed);
+        }
+        let frame = Outbound::Event(event);
+        let bytes = outbound_frame_bytes(&frame)?;
+        if bytes > CLIENT_OUTBOUND_BYTES {
+            self.disconnect();
+            return Err(OutboundSendError::Oversized);
+        }
+        let deadline = tokio::time::Instant::now() + RELIABLE_CLIENT_TIMEOUT;
+        let record_permit = match tokio::time::timeout_at(
+            deadline,
+            Arc::clone(&self.record_budget).acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(OutboundSendError::Closed),
+            Err(_) => {
+                self.disconnect();
+                return Err(OutboundSendError::Timeout);
+            }
+        };
+        let byte_permit = match tokio::time::timeout_at(
+            deadline,
+            Arc::clone(&self.byte_budget).acquire_many_owned(bytes as u32),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(_)) => return Err(OutboundSendError::Closed),
+            Err(_) => {
+                self.disconnect();
+                return Err(OutboundSendError::Timeout);
+            }
+        };
+        let queued = QueuedOutbound {
+            frame: Some(frame),
+            _record_permit: record_permit,
+            _byte_permit: byte_permit,
+        };
+        let result = tokio::time::timeout_at(deadline, self.tx.send(queued)).await;
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(OutboundSendError::Closed),
+            Err(_) => {
+                self.disconnect();
+                Err(OutboundSendError::Timeout)
+            }
+        }
+    }
+}
+
+impl OutboundReceiver {
+    async fn recv_queued(&mut self) -> Option<QueuedOutbound> {
+        self.rx.recv().await
+    }
+
+    #[cfg(test)]
+    async fn recv(&mut self) -> Option<Outbound> {
+        let mut queued = self.rx.recv().await?;
+        queued.frame.take()
+    }
+
+    #[cfg(test)]
+    fn try_recv(&mut self) -> Result<Outbound, mpsc::error::TryRecvError> {
+        let mut queued = self.rx.try_recv()?;
+        Ok(queued
+            .frame
+            .take()
+            .expect("queued outbound frame is consumed exactly once"))
+    }
+
+    fn is_disconnected(&self) -> bool {
+        self.disconnected.load(Ordering::Acquire)
+    }
 }
 
 /// The `auth_required` event type name (relay-level, not from `events.rs`).
@@ -447,17 +647,59 @@ fn auth_required_event() -> SequencedEvent {
     SequencedEvent::new(None, 0, AUTH_REQUIRED_TYPE, json!({}))
 }
 
+fn reauthentication_required_event() -> SequencedEvent {
+    SequencedEvent::new(
+        None,
+        0,
+        "reauthentication_required",
+        json!({"code":"REAUTHENTICATION_REQUIRED"}),
+    )
+}
+
 /// Axum WS upgrade handler for `/ws` (AC1).
 ///
-/// The upgrade is gated behind a placeholder `pre_auth` check (AC1): the
-/// primary auth gate is the first-frame `auth_required` emission (AC9). The
-/// default bind stays localhost per `web/config.rs`.
-pub async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
-    // Placeholder pre_auth check (AC1) — Epic 2 wires the real token gate.
-    // Until then, the upgrade always proceeds; the first frame is auth_required.
+/// The upgrade validates the exact browser Origin before switching protocols;
+/// the first `authenticate` frame then verifies the bearer credential with
+/// bounded per-peer failure throttling.
+pub async fn ws_upgrade(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    Extension(provenance): Extension<IngressProvenance>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let started = Instant::now();
+    let origin = headers.get(axum::http::header::ORIGIN);
+    if let Err(error) = authority.verify_origin(origin) {
+        warn!(
+            target: "termul::web::ws",
+            request_type = "GET /ws",
+            auth_class = "origin",
+            stable_code = error.code(),
+            duration_ms = started.elapsed().as_millis(),
+            "WebSocket upgrade rejected by Origin policy"
+        );
+        return auth_error_response(error);
+    }
+    info!(
+        target: "termul::web::ws",
+        request_type = "GET /ws",
+        auth_class = "origin",
+        stable_code = "OK",
+        duration_ms = started.elapsed().as_millis(),
+        "WebSocket upgrade Origin accepted"
+    );
+    let _ = provenance;
     ws.on_upgrade(move |socket| async move {
-        run_relay(socket, state).await;
+        let registry = UpgradedConnectionRegistry::global();
+        let id = registry.register(UpgradedConnectionKind::Acp, None);
+        run_relay(socket, state, authority, peer).await;
+        if let Some(id) = id {
+            registry.complete(id, false);
+        }
     })
+    .into_response()
 }
 
 /// Keepalive Ping interval for the `/ws` relay.
@@ -547,6 +789,25 @@ fn handle_lifecycle_signal(text: &str, authed: bool, backgrounded: &AtomicBool) 
     }
 }
 
+fn generation_requires_reauthentication(
+    authenticated_generation: u64,
+    current: crate::web::auth::RemoteGenerationState,
+) -> bool {
+    authenticated_generation != 0
+        && (!current.active || current.generation != authenticated_generation)
+}
+
+fn publish_authenticated_generation(
+    slot: Option<&AtomicU64>,
+    generation: u64,
+    current: crate::web::auth::RemoteGenerationState,
+) -> bool {
+    if let Some(slot) = slot {
+        slot.store(generation, Ordering::Release);
+    }
+    !generation_requires_reauthentication(generation, current)
+}
+
 /// Epoch-millis timestamp for the keepalive watchdog. Uses `SystemTime` (not
 /// `Instant`) so it fits an `AtomicU64`; clock skew inside one process over a
 /// ~minute window is negligible, and `saturating_sub` keeps the compare safe
@@ -560,9 +821,14 @@ fn now_ms() -> u64 {
 
 /// Run the per-connection relay loop: a write task draining the outbound
 /// channel + a read task routing requests. Returns when either half closes.
-async fn run_relay(socket: WebSocket, state: AppState) {
+async fn run_relay(
+    socket: WebSocket,
+    state: AppState,
+    authority: Arc<RemoteAccessAuthority>,
+    peer: SocketAddr,
+) {
     let (mut sink, mut stream) = socket.split();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Outbound>();
+    let (out_tx, mut out_rx) = outbound_channel();
     let relay = Arc::clone(&state.relay);
     // Story 1.8: the ACP manager — the server is the ACP client-of-record; the
     // 10 ACP command handlers (`send_prompt`, `create_session`, …) forward to it.
@@ -582,6 +848,7 @@ async fn run_relay(socket: WebSocket, state: AppState) {
     // Issue #613: the server-side generic key-value store behind the
     // `store_read` / `store_write` / `store_delete` WS requests.
     let store = state.store.clone();
+    let conversation = state.conversation.clone();
     // Client ids registered via `subscribe` — unregistered on disconnect.
     let subscribed_clients = Arc::new(tokio::sync::Mutex::new(Vec::<(String, ClientId)>::new()));
     let cleanup = ConnectionCleanup::new(Arc::clone(&relay), Arc::clone(&subscribed_clients));
@@ -593,6 +860,11 @@ async fn run_relay(socket: WebSocket, state: AppState) {
     // `resume_session` (the handlers that carry an agentId / create a session).
     let mut current_agent: Option<crate::acp::AgentId> = None;
     let current_session = Arc::new(parking_lot::Mutex::new(None::<crate::acp::SessionId>));
+    // Canonical Conversation authority is connection-local and independent from the optional
+    // opaque ACP binding and project attribution retained below for compatibility routing.
+    let current_conversation = Arc::new(parking_lot::Mutex::new(
+        None::<crate::conversation::ConversationId>,
+    ));
     // Project identity is connection-local. The registry's active id may have
     // been changed by another browser/desktop and cannot prove this socket's
     // tracked session is already rooted at that project.
@@ -619,6 +891,9 @@ async fn run_relay(socket: WebSocket, state: AppState) {
     let backgrounded = Arc::new(AtomicBool::new(false));
     let write_last_activity = Arc::clone(&last_activity);
     let write_backgrounded = Arc::clone(&backgrounded);
+    let authenticated_generation = Arc::new(AtomicU64::new(0));
+    let write_authenticated_generation = Arc::clone(&authenticated_generation);
+    let mut generation_rx = authority.subscribe_generation();
 
     let write_tx = out_tx.clone();
     let mut write_task = tokio::spawn(async move {
@@ -630,10 +905,34 @@ async fn run_relay(socket: WebSocket, state: AppState) {
         // full interval after connect (a fresh connection needs no keepalive
         // yet and the auth_required frame has just been queued).
         ping.tick().await;
+        let write_disconnect = Arc::clone(&out_rx.disconnect_notify);
         loop {
+            if out_rx.is_disconnected() {
+                break;
+            }
             tokio::select! {
-                frame = out_rx.recv() => {
-                    let Some(frame) = frame else { break };
+                biased;
+                changed = generation_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    let authenticated = write_authenticated_generation.load(Ordering::Acquire);
+                    let current = *generation_rx.borrow_and_update();
+                    if generation_requires_reauthentication(authenticated, current) {
+                        let terminal = serde_json::to_string(&reauthentication_required_event())
+                            .expect("credential-free reauthentication frame serializes");
+                        let _ = sink.send(Message::Text(terminal.into())).await;
+                        let _ = sink.send(Message::Close(None)).await;
+                        break;
+                    }
+                }
+                () = write_disconnect.notified() => break,
+                queued = out_rx.recv_queued() => {
+                    let Some(mut queued) = queued else { break };
+                    let frame = queued
+                        .frame
+                        .take()
+                        .expect("queued outbound frame is consumed exactly once");
                     let text = match frame {
                         Outbound::Event(evt) => serde_json::to_string(&evt).unwrap_or_else(|e| {
                             warn!("[ws] failed to serialize event {}: {e}", evt.type_);
@@ -691,8 +990,10 @@ async fn run_relay(socket: WebSocket, state: AppState) {
     let read_backgrounded = Arc::clone(&backgrounded);
     let read_subscribed_clients = Arc::clone(&subscribed_clients);
     let read_relay = Arc::clone(&relay);
+    let read_authenticated_generation = Arc::clone(&authenticated_generation);
     let mut read_task = tokio::spawn(async move {
         let mut authed = false;
+        let mut principal = None;
         while let Some(frame) = stream.next().await {
             let msg = match frame {
                 Ok(m) => m,
@@ -721,9 +1022,10 @@ async fn run_relay(socket: WebSocket, state: AppState) {
                     // "resets on foreground or any normal frame") and dispatches
                     // as a normal ACP request.
                     read_backgrounded.store(false, Ordering::Relaxed);
-                    if !dispatch_connection_text(
+                    if !dispatch_connection_text_with_conversation(
                         &t,
                         &mut authed,
+                        &mut principal,
                         &acp,
                         &read_relay,
                         &registry,
@@ -733,12 +1035,17 @@ async fn run_relay(socket: WebSocket, state: AppState) {
                         &read_subscribed_clients,
                         &mut current_agent,
                         &current_session,
+                        &current_conversation,
                         &current_project,
                         &switch_queue,
                         history_mode,
                         acp_catalog.as_ref(),
                         acp_install.as_ref(),
                         store.as_ref(),
+                        conversation.as_ref(),
+                        &authority,
+                        peer,
+                        Some(&read_authenticated_generation),
                     )
                     .await
                     {
@@ -858,26 +1165,47 @@ fn authenticated_send_prompt(text: &str, authed: bool) -> Option<(String, Value)
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn dispatch_connection_text(
+async fn dispatch_connection_text_with_conversation(
     text: &str,
     authed: &mut bool,
+    principal: &mut Option<RemotePrincipal>,
     acp: &Arc<AcpManager>,
     relay: &Arc<WsRelaySink>,
     registry: &Arc<ProjectRegistry>,
     registry_persistence: Option<&Arc<parking_lot::Mutex<FileProjectRegistry>>>,
     projects_file: Option<&PathBuf>,
-    write_tx: &mpsc::UnboundedSender<Outbound>,
+    write_tx: &OutboundSender,
     subscribed_clients: &Arc<tokio::sync::Mutex<Vec<(String, ClientId)>>>,
     current_agent: &mut Option<AgentId>,
     current_session: &Arc<parking_lot::Mutex<Option<SessionId>>>,
+    current_conversation: &Arc<parking_lot::Mutex<Option<crate::conversation::ConversationId>>>,
     current_project: &Arc<parking_lot::Mutex<Option<String>>>,
     switch_queue: &Arc<tokio::sync::Mutex<ProjectSwitchQueue>>,
     history_mode: HistoryMode,
     acp_catalog: Option<&Arc<crate::acp::AcpCatalogService>>,
     acp_install: Option<&Arc<crate::acp::install::AcpInstallService>>,
     store: Option<&Arc<WebStore>>,
+    conversation: Option<&Arc<crate::conversation::ConversationApplicationService>>,
+    authority: &Arc<RemoteAccessAuthority>,
+    peer: SocketAddr,
+    generation_slot: Option<&AtomicU64>,
 ) -> bool {
     if let Some((id, payload)) = authenticated_send_prompt(text, *authed) {
+        if principal.as_ref().is_none_or(|principal| {
+            authority
+                .authorize(principal, RemoteCapability::Connect)
+                .is_err()
+        }) {
+            *authed = false;
+            *principal = None;
+            return write_tx
+                .send(Outbound::Reply(WsReply::err_with_code(
+                    id,
+                    "REAUTHENTICATION_REQUIRED",
+                    "remote access generation is no longer authorized",
+                )))
+                .is_ok();
+        }
         return match accept_send_prompt(id, &payload, acp, relay).await {
             Ok(accepted) => {
                 let prompt_acp = Arc::clone(acp);
@@ -893,9 +1221,10 @@ async fn dispatch_connection_text(
     }
 
     let mut subscriptions = subscribed_clients.lock().await;
-    let reply = handle_request(
+    let reply = handle_request_with_conversation(
         text,
         authed,
+        principal,
         acp,
         relay,
         registry,
@@ -905,15 +1234,73 @@ async fn dispatch_connection_text(
         &mut subscriptions,
         current_agent,
         current_session,
+        current_conversation,
         current_project,
         switch_queue,
         history_mode,
         acp_catalog,
         acp_install,
         store,
+        conversation,
+        authority,
+        peer,
+        generation_slot,
     )
     .await;
     write_tx.send(Outbound::Reply(reply)).is_ok()
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_connection_text(
+    text: &str,
+    authed: &mut bool,
+    acp: &Arc<AcpManager>,
+    relay: &Arc<WsRelaySink>,
+    registry: &Arc<ProjectRegistry>,
+    registry_persistence: Option<&Arc<parking_lot::Mutex<FileProjectRegistry>>>,
+    projects_file: Option<&PathBuf>,
+    write_tx: &OutboundSender,
+    subscribed_clients: &Arc<tokio::sync::Mutex<Vec<(String, ClientId)>>>,
+    current_agent: &mut Option<AgentId>,
+    current_session: &Arc<parking_lot::Mutex<Option<SessionId>>>,
+    current_project: &Arc<parking_lot::Mutex<Option<String>>>,
+    switch_queue: &Arc<tokio::sync::Mutex<ProjectSwitchQueue>>,
+    history_mode: HistoryMode,
+    acp_catalog: Option<&Arc<crate::acp::AcpCatalogService>>,
+    acp_install: Option<&Arc<crate::acp::install::AcpInstallService>>,
+    store: Option<&Arc<WebStore>>,
+) -> bool {
+    let current_conversation = Arc::new(parking_lot::Mutex::new(None));
+    let authority = Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token"));
+    let mut principal =
+        (*authed).then(|| authority.verify_bearer("test-remote-access-token").unwrap());
+    dispatch_connection_text_with_conversation(
+        text,
+        authed,
+        &mut principal,
+        acp,
+        relay,
+        registry,
+        registry_persistence,
+        projects_file,
+        write_tx,
+        subscribed_clients,
+        current_agent,
+        current_session,
+        &current_conversation,
+        current_project,
+        switch_queue,
+        history_mode,
+        acp_catalog,
+        acp_install,
+        store,
+        None,
+        &authority,
+        SocketAddr::from(([127, 0, 0, 1], 3000)),
+        None,
+    )
+    .await
 }
 
 async fn cleanup_connection_subscriptions(
@@ -975,6 +1362,7 @@ struct SubscribePayload {
 /// command types (`send_prompt`, `create_session`, …) forward to
 /// `AcpManager` (Story 1.8); OS-cap requests → `unsupported`; `switch_project`
 /// + unknown types → `not_implemented` (Epic 4).
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn handle_request(
     text: &str,
@@ -984,7 +1372,7 @@ async fn handle_request(
     registry: &Arc<ProjectRegistry>,
     registry_persistence: Option<&Arc<parking_lot::Mutex<FileProjectRegistry>>>,
     projects_file: Option<&PathBuf>,
-    out_tx: &mpsc::UnboundedSender<Outbound>,
+    out_tx: &OutboundSender,
     subscribed_clients: &mut Vec<(String, ClientId)>,
     current_agent: &mut Option<AgentId>,
     current_session: &Arc<parking_lot::Mutex<Option<SessionId>>>,
@@ -994,6 +1382,70 @@ async fn handle_request(
     acp_catalog: Option<&Arc<crate::acp::AcpCatalogService>>,
     acp_install: Option<&Arc<crate::acp::install::AcpInstallService>>,
     store: Option<&Arc<WebStore>>,
+) -> WsReply {
+    let current_conversation = Arc::new(parking_lot::Mutex::new(None));
+    let authority = Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token"));
+    let mut principal =
+        (*authed).then(|| authority.verify_bearer("test-remote-access-token").unwrap());
+    handle_request_with_conversation(
+        text,
+        authed,
+        &mut principal,
+        acp,
+        relay,
+        registry,
+        registry_persistence,
+        projects_file,
+        out_tx,
+        subscribed_clients,
+        current_agent,
+        current_session,
+        &current_conversation,
+        current_project,
+        switch_queue,
+        history_mode,
+        acp_catalog,
+        acp_install,
+        store,
+        None,
+        &authority,
+        SocketAddr::from(([127, 0, 0, 1], 3000)),
+        None,
+    )
+    .await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthenticatePayload {
+    token: String,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_request_with_conversation(
+    text: &str,
+    authed: &mut bool,
+    principal: &mut Option<RemotePrincipal>,
+    acp: &Arc<AcpManager>,
+    relay: &Arc<WsRelaySink>,
+    registry: &Arc<ProjectRegistry>,
+    registry_persistence: Option<&Arc<parking_lot::Mutex<FileProjectRegistry>>>,
+    projects_file: Option<&PathBuf>,
+    out_tx: &OutboundSender,
+    subscribed_clients: &mut Vec<(String, ClientId)>,
+    current_agent: &mut Option<AgentId>,
+    current_session: &Arc<parking_lot::Mutex<Option<SessionId>>>,
+    current_conversation: &Arc<parking_lot::Mutex<Option<crate::conversation::ConversationId>>>,
+    current_project: &Arc<parking_lot::Mutex<Option<String>>>,
+    switch_queue: &Arc<tokio::sync::Mutex<ProjectSwitchQueue>>,
+    history_mode: HistoryMode,
+    acp_catalog: Option<&Arc<crate::acp::AcpCatalogService>>,
+    acp_install: Option<&Arc<crate::acp::install::AcpInstallService>>,
+    store: Option<&Arc<WebStore>>,
+    conversation: Option<&Arc<crate::conversation::ConversationApplicationService>>,
+    authority: &Arc<RemoteAccessAuthority>,
+    peer: SocketAddr,
+    generation_slot: Option<&AtomicU64>,
 ) -> WsReply {
     let req: WsRequest = match serde_json::from_str(text) {
         Ok(r) => r,
@@ -1007,12 +1459,64 @@ async fn handle_request(
     };
     let id = req.id.clone();
 
-    // Pre-auth gate (AC9): only authenticate is allowed.
+    // Pre-auth gate (AC9): only a valid authenticate request is allowed.
     if !*authed {
         if req.type_ == "authenticate" {
-            // Placeholder (AC10): accept any token, mark authed. Epic 2 wires
-            // the real cookie/token gate.
-            *authed = true;
+            let auth_started = Instant::now();
+            let payload: AuthenticatePayload = match serde_json::from_value(req.payload) {
+                Ok(payload) => payload,
+                Err(_) => {
+                    let reported = authority
+                        .verify_bearer_for_peer("", peer.ip())
+                        .err()
+                        .unwrap_or(RemoteAuthError::InvalidCredential);
+                    warn!(
+                        target: "termul::web::ws",
+                        request_type = "authenticate",
+                        auth_class = "bearer",
+                        stable_code = reported.code(),
+                        duration_ms = auth_started.elapsed().as_millis(),
+                        "WebSocket authentication rejected"
+                    );
+                    return WsReply::err_with_code(id, reported.code(), reported.to_string());
+                }
+            };
+            match authority.verify_bearer_for_peer(&payload.token, peer.ip()) {
+                Ok(verified_principal) => {
+                    if !publish_authenticated_generation(
+                        generation_slot,
+                        verified_principal.generation(),
+                        authority.generation_state(),
+                    ) {
+                        return WsReply::err_with_code(
+                            id,
+                            "REAUTHENTICATION_REQUIRED",
+                            "remote access generation rotated during admission",
+                        );
+                    }
+                    *principal = Some(verified_principal);
+                    *authed = true;
+                    info!(
+                        target: "termul::web::ws",
+                        request_type = "authenticate",
+                        auth_class = "bearer",
+                        stable_code = "OK",
+                        duration_ms = auth_started.elapsed().as_millis(),
+                        "WebSocket authentication completed"
+                    );
+                }
+                Err(error) => {
+                    warn!(
+                        target: "termul::web::ws",
+                        request_type = "authenticate",
+                        auth_class = "bearer",
+                        stable_code = error.code(),
+                        duration_ms = auth_started.elapsed().as_millis(),
+                        "WebSocket authentication rejected"
+                    );
+                    return WsReply::err_with_code(id, error.code(), error.to_string());
+                }
+            }
             let reconnect_grace = relay
                 .rendezvous()
                 .map_or(DEFAULT_PERMISSION_RECONNECT_GRACE, |rendezvous| {
@@ -1026,6 +1530,13 @@ async fn handle_request(
                 })),
             );
         }
+        if is_conversation_request(&req.type_) {
+            return WsReply::err_with_code(
+                id,
+                "UNAUTHORIZED",
+                "pre-auth: send an `authenticate` request first",
+            );
+        }
         return WsReply::err(
             id,
             WsErrorCode::Unauthorized,
@@ -1033,12 +1544,32 @@ async fn handle_request(
         );
     }
 
+    // Post-auth requests are reauthorized against the current credential generation. A stale
+    // principal cannot read, mutate, subscribe, or keep a superseded socket alive.
+    let Some(verified_principal) = principal.as_ref() else {
+        *authed = false;
+        return WsReply::err_with_code(
+            id,
+            "REAUTHENTICATION_REQUIRED",
+            "remote access principal is unavailable",
+        );
+    };
+    if authority
+        .authorize(verified_principal, RemoteCapability::Connect)
+        .is_err()
+    {
+        *authed = false;
+        *principal = None;
+        return WsReply::err_with_code(
+            id,
+            "REAUTHENTICATION_REQUIRED",
+            "remote access generation is no longer authorized",
+        );
+    }
+
     // Post-auth routing.
     match req.type_.as_str() {
-        "authenticate" => {
-            // Idempotent re-auth — accept and succeed.
-            WsReply::ok(id, Some(json!({})))
-        }
+        "authenticate" => WsReply::ok(id, Some(json!({}))),
         // Application-level heartbeat: a client-emitted `ping` request keeps
         // the keepalive watchdog (`last_activity`) fresh through proxies that
         // strip WS-level Ping/Pong control frames (Cloudflare tunnels, etc.).
@@ -1046,6 +1577,26 @@ async fn handle_request(
         // before routing, so this handler only needs to round-trip a reply so
         // the client's request promise resolves (no timeout).
         "ping" => WsReply::ok(id, Some(json!({}))),
+        "conversation_host_status"
+        | "list_conversations"
+        | "get_conversation"
+        | "open_conversation"
+        | "resolve_legacy_conversation_id"
+        | "get_session_workspace"
+        | "write_session_workspace"
+        | "resolve_recovery_item"
+        | "attach_project"
+        | "detach_project"
+        | "update_execution_target" => {
+            handle_conversation_application(
+                id,
+                &req.type_,
+                &req.payload,
+                conversation,
+                current_conversation,
+            )
+            .await
+        }
         "subscribe" => handle_subscribe(id, &req.payload, relay, out_tx, subscribed_clients).await,
         "list_persisted_sessions" => {
             handle_list_persisted_sessions(id, relay, history_mode).await
@@ -1063,6 +1614,9 @@ async fn handle_request(
         }
         "get_session_payload" => {
             handle_get_session_payload(id, &req.payload, relay, history_mode).await
+        }
+        "get_session_payload_page" => {
+            handle_get_session_payload_page(id, &req.payload, relay, history_mode).await
         }
         "recover_session_snapshot" => {
             handle_recover_session_snapshot(
@@ -1103,8 +1657,11 @@ async fn handle_request(
                 acp,
                 registry,
                 current_agent,
-                current_session,
-                current_project,
+                CurrentConversationRefs {
+                    session: current_session,
+                    conversation: current_conversation,
+                    project: current_project,
+                },
             )
             .await
         }
@@ -1115,6 +1672,7 @@ async fn handle_request(
                 acp,
                 current_agent,
                 current_session,
+                current_conversation,
                 current_project,
             )
             .await
@@ -1126,12 +1684,71 @@ async fn handle_request(
                 acp,
                 current_agent,
                 current_session,
+                current_conversation,
                 current_project,
             )
             .await
         }
+        "detach_binding" => {
+            handle_conversation_lifecycle_with_service(
+                id,
+                &req.payload,
+                conversation,
+                relay,
+                ConversationWsMutation::Detach,
+            )
+            .await
+        }
+        "rebind_binding" => {
+            handle_conversation_lifecycle_with_service(
+                id,
+                &req.payload,
+                conversation,
+                relay,
+                ConversationWsMutation::Rebind,
+            )
+            .await
+        }
+        "suspend_binding" => {
+            handle_conversation_lifecycle_with_service(
+                id,
+                &req.payload,
+                conversation,
+                relay,
+                ConversationWsMutation::Suspend,
+            )
+            .await
+        }
+        "replace_binding" => {
+            handle_conversation_lifecycle_with_service(
+                id,
+                &req.payload,
+                conversation,
+                relay,
+                ConversationWsMutation::Replace,
+            )
+            .await
+        }
+        "delete_conversation" => {
+            handle_conversation_lifecycle_with_service(
+                id,
+                &req.payload,
+                conversation,
+                relay,
+                ConversationWsMutation::Delete,
+            )
+            .await
+        }
         "close_session" => {
-            handle_close_session(id, &req.payload, acp, current_session, current_project).await
+            handle_close_session(
+                id,
+                &req.payload,
+                acp,
+                relay,
+                current_session,
+                current_project,
+            )
+            .await
         }
         "dispose_ephemeral_session" => {
             handle_dispose_ephemeral_session(
@@ -1159,6 +1776,7 @@ async fn handle_request(
                 out_tx,
                 current_agent,
                 current_session,
+                current_conversation,
                 current_project,
                 switch_queue,
             )
@@ -1170,6 +1788,12 @@ async fn handle_request(
         // rollback), and broadcasts `projects_changed` to ALL clients. Any
         // authenticated client can set the default for now (Epic 2 wires auth).
         "set_default_project" => {
+            if let Err(denial) = operation_policy::authorize_local_only(
+                authority.ingress_provenance(),
+                operation_policy::LocalOnlyOperation::SetDefaultProject,
+            ) {
+                return WsReply::err_with_code(id, denial.code, denial.message);
+            }
             handle_set_default_project(
                 id,
                 &req.payload,
@@ -1190,6 +1814,12 @@ async fn handle_request(
             handle_list_acp_catalog(id, &req.payload, acp_catalog, acp_install).await
         }
         "set_catalog_opt_in" => {
+            if let Err(denial) = operation_policy::authorize_local_only(
+                authority.ingress_provenance(),
+                operation_policy::LocalOnlyOperation::SetCatalogOptIn,
+            ) {
+                return WsReply::err_with_code(id, denial.code, denial.message);
+            }
             handle_set_catalog_opt_in(id, &req.payload, acp_catalog).await
         }
         // CAP-6 / Story 9: host-owned verified-atomic ACP install. The web
@@ -1202,6 +1832,12 @@ async fn handle_request(
         // carry SCREAMING_SNAKE_CASE codes byte-identical to the Tauri +
         // HTTP transports (via `WsReply::err_with_code`).
         "install_acp_agent" => {
+            if let Err(denial) = operation_policy::authorize_local_only(
+                authority.ingress_provenance(),
+                operation_policy::LocalOnlyOperation::InstallAcpAgent,
+            ) {
+                return WsReply::err_with_code(id, denial.code, denial.message);
+            }
             handle_install_acp_agent(id, &req.payload, acp_install).await
         }
         // Issue #613: server-side generic key-value store. The web client
@@ -1223,6 +1859,7 @@ async fn handle_request(
             .await
         }
         "list_agents" => handle_list_agents(id, acp),
+        "set_permission_policy" => handle_set_permission_policy(id, &req.payload, acp),
         // CAP: ACP agent `authenticate` method (agent-advertised auth, e.g.
         // `pi_terminal_login`). Distinct from the WS connection `authenticate`
         // token gate — this runs the method on the host where the agent lives.
@@ -1265,8 +1902,9 @@ async fn handle_list_persisted_sessions(
             "persisted history is unavailable",
         );
     }
-    // Host-owned history (CAP-2): both desktop shared-live and the standalone
-    // server serve the file-backed `SessionPersistence` index.
+    if let Some(persistence) = relay.conversation_persistence() {
+        return ok_with_payload(id, &persistence.list_sessions());
+    }
     match relay.persistence() {
         Some(persistence) => ok_with_payload(id, &persistence.list_sessions()),
         None => WsReply::err(
@@ -1275,6 +1913,73 @@ async fn handle_list_persisted_sessions(
             "persisted history is unavailable",
         ),
     }
+}
+
+fn charge_compat_history_bytes(
+    current: usize,
+    record: &impl serde::Serialize,
+) -> Result<usize, &'static str> {
+    let added = crate::conversation::contracts::encoded_json_len_bounded(
+        record,
+        crate::conversation::MAX_CONVERSATION_RECORD_BYTES,
+    )
+    .ok_or("CONVERSATION_RECORD_TOO_LARGE")?;
+    let total = current.saturating_add(added);
+    if total > MAX_COMPAT_HISTORY_ENCODED_BYTES {
+        Err(crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED)
+    } else {
+        Ok(total)
+    }
+}
+
+fn materialize_compat_session_payload(
+    persistence: &crate::conversation::ConversationPersistenceAdapter,
+    session_id: &str,
+    metadata: &crate::acp::session_persistence::SessionMetadata,
+    target_last_seq: u64,
+) -> Result<crate::acp::session_payload::MaterializedSessionPayload, (&'static str, String)> {
+    let mut accumulator = crate::acp::session_payload::SessionPayloadAccumulator::new(metadata);
+    let mut cursor = 0u64;
+    let mut materialized_records = 0usize;
+    let mut encoded_bytes = 0usize;
+    while cursor < target_last_seq {
+        let remaining =
+            crate::conversation::MAX_COMPAT_HISTORY_RECORDS.saturating_sub(materialized_records);
+        let limit = remaining
+            .saturating_add(1)
+            .clamp(1, crate::conversation::MAX_CONVERSATION_HISTORY_PAGE_LIMIT);
+        let page = persistence
+            .history_page(session_id, cursor, limit)
+            .map_err(|error| (error.code, "failed to read session payload".to_string()))?;
+        if page.records.len() > remaining {
+            return Err((
+                crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED,
+                "history exceeds the compatibility limit; use bounded pages".to_string(),
+            ));
+        }
+        for record in &page.records {
+            encoded_bytes = charge_compat_history_bytes(encoded_bytes, record).map_err(|code| {
+                (
+                    code,
+                    "history exceeds the 4194304-byte compatibility ceiling".to_string(),
+                )
+            })?;
+        }
+        materialized_records = materialized_records.saturating_add(page.records.len());
+        accumulator
+            .push_history_page(&page, limit)
+            .map_err(|error| {
+                (
+                    error.stable_code(),
+                    "invalid canonical history page".to_string(),
+                )
+            })?;
+        cursor = page.next_cursor;
+        if page.complete {
+            break;
+        }
+    }
+    Ok(accumulator.snapshot())
 }
 
 /// `get_session_payload` — fetch the FULL stored transcript (`{ metadata,
@@ -1311,11 +2016,38 @@ async fn handle_get_session_payload(
             )
         }
     };
-    // Host-owned history (CAP-2): materialize the renderer-shaped payload from
-    // the durable JSONL records (pure fold of `user_prompt` / `message_chunk`).
-    // `session_payload_async` flushes the writer queue first, so an active
-    // session reads every already-assigned seq; a finalized session is served
-    // read-only. Errors fail closed — never a fabricated empty payload.
+    if let Some(persistence) = relay.conversation_persistence() {
+        let (_, metadata, target_last_seq) =
+            match persistence.history_metadata(&parsed.session_id, "get_session_payload") {
+                Ok(value) => value,
+                Err(error) if error.code == "CONVERSATION_NOT_FOUND" => {
+                    return WsReply::err(id, WsErrorCode::NotFound, "session payload not found")
+                }
+                Err(error) => {
+                    return WsReply::err_with_code(id, error.code, "failed to read session payload")
+                }
+            };
+        let persistence = Arc::clone(&persistence);
+        let session_id = parsed.session_id.clone();
+        let materialized = tokio::task::spawn_blocking(move || {
+            materialize_compat_session_payload(
+                &persistence,
+                &session_id,
+                &metadata,
+                target_last_seq,
+            )
+        })
+        .await;
+        return match materialized {
+            Ok(Ok(snapshot)) => ok_with_payload(id, &snapshot),
+            Ok(Err((code, message))) => WsReply::err_with_code(id, code, message),
+            Err(_) => WsReply::err_with_code(
+                id,
+                "PERSIST_FAILED",
+                "session payload materialization task failed",
+            ),
+        };
+    }
     match relay.persistence() {
         Some(persistence) => {
             match persistence.session_payload_async(&parsed.session_id).await {
@@ -1354,11 +2086,157 @@ async fn handle_get_session_payload(
     }
 }
 
+/// Return one exact bounded canonical history page. Validation happens before repository traversal
+/// or page allocation; all application codes remain transport-identical.
+async fn handle_get_session_payload_page(
+    id: String,
+    payload: &Value,
+    relay: &Arc<WsRelaySink>,
+    history_mode: HistoryMode,
+) -> WsReply {
+    if history_mode != HistoryMode::Server {
+        return WsReply::err(
+            id,
+            WsErrorCode::Unsupported,
+            "persisted history is unavailable",
+        );
+    }
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Request {
+        session_id: String,
+        after_seq: u64,
+        limit: usize,
+        #[serde(default)]
+        target_last_seq: Option<u64>,
+    }
+    let request: Request = match serde_json::from_value::<Request>(payload.clone()) {
+        Ok(request)
+            if !request.session_id.trim().is_empty()
+                && (crate::conversation::MIN_CONVERSATION_HISTORY_PAGE_LIMIT
+                    ..=crate::conversation::MAX_CONVERSATION_HISTORY_PAGE_LIMIT)
+                    .contains(&request.limit) =>
+        {
+            request
+        }
+        Ok(_) => {
+            return WsReply::err_with_code(
+                id,
+                "VALIDATION_ERROR",
+                "history sessionId/afterSeq/limit is invalid",
+            )
+        }
+        Err(_) => {
+            return WsReply::err_with_code(
+                id,
+                "VALIDATION_ERROR",
+                "malformed get_session_payload_page payload",
+            )
+        }
+    };
+    let Some(persistence) = relay.conversation_persistence() else {
+        return WsReply::err_with_code(
+            id,
+            crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED,
+            "bounded canonical history is unavailable",
+        );
+    };
+    match persistence
+        .history_page_blocking(
+            request.session_id.clone(),
+            request.after_seq,
+            request.limit,
+            request.target_last_seq,
+        )
+        .await
+    {
+        Ok(page) => {
+            tracing::info!(
+                target: "termul::web::ws",
+                cursor_start = request.after_seq,
+                cursor_end = page.next_cursor,
+                record_count = page.records.len(),
+                complete = page.complete,
+                "bounded Conversation history page served"
+            );
+            ok_with_payload(id, &page)
+        }
+        Err(error) => {
+            tracing::warn!(
+                target: "termul::web::ws",
+                code = error.code,
+                cursor_start = request.after_seq,
+                limit = request.limit,
+                "bounded Conversation history page rejected"
+            );
+            WsReply::err_with_code(id, error.code, "failed to read history page")
+        }
+    }
+}
+
+async fn load_recover_snapshot(
+    relay: &Arc<WsRelaySink>,
+    session_id: &str,
+    history_mode: HistoryMode,
+) -> Result<(Vec<SequencedEvent>, u64), WsReply> {
+    if history_mode != HistoryMode::Server {
+        return Err(WsReply::err(
+            "recover",
+            WsErrorCode::Unsupported,
+            "atomic snapshot recovery is unavailable in live-only mode",
+        ));
+    }
+    if let Some(persistence) = relay.conversation_persistence() {
+        let watermark = persistence.last_seq(session_id).map_err(|error| {
+            WsReply::err_with_code("recover", error.code, "failed to read session snapshot")
+        })?;
+        let records = persistence.replay_after(session_id, 0).map_err(|error| {
+            WsReply::err_with_code("recover", error.code, "failed to read session snapshot")
+        })?;
+        let events = records
+            .into_iter()
+            .map(|record| {
+                SequencedEvent::new(
+                    Some(record.session_id),
+                    record.seq,
+                    record.type_,
+                    record.payload,
+                )
+            })
+            .collect();
+        return Ok((events, watermark));
+    }
+    if let Some(persistence) = relay.persistence() {
+        let watermark = persistence
+            .last_seq(session_id)
+            .map_err(|error| WsReply::err("recover", WsErrorCode::NotFound, error.to_string()))?;
+        let records = persistence
+            .replay_after_async(session_id.to_string(), 0)
+            .await
+            .map_err(|error| {
+                WsReply::err("recover", WsErrorCode::AgentCrashed, error.to_string())
+            })?;
+        let events = records
+            .into_iter()
+            .map(|record| {
+                SequencedEvent::new(
+                    Some(record.session_id),
+                    record.seq,
+                    record.type_,
+                    record.payload,
+                )
+            })
+            .collect();
+        return Ok((events, watermark));
+    }
+    Ok((Vec::new(), 0))
+}
+
 async fn handle_recover_session_snapshot(
     id: String,
     payload: &Value,
     relay: &Arc<WsRelaySink>,
-    out_tx: &mpsc::UnboundedSender<Outbound>,
+    out_tx: &OutboundSender,
     subscribed_clients: &mut Vec<(String, ClientId)>,
     history_mode: HistoryMode,
 ) -> WsReply {
@@ -1387,6 +2265,53 @@ async fn handle_recover_session_snapshot(
     if parsed.session_id.is_empty() {
         return WsReply::err(id, WsErrorCode::Unsupported, "sessionId is required");
     }
+    let distinct_subscriptions = subscribed_clients
+        .iter()
+        .map(|(session_id, _)| session_id)
+        .collect::<std::collections::HashSet<_>>();
+    if !distinct_subscriptions.contains(&parsed.session_id)
+        && distinct_subscriptions.len() >= MAX_CONNECTION_SUBSCRIPTIONS
+    {
+        return WsReply::err_with_code(
+            id,
+            "SUBSCRIPTION_LIMIT_EXCEEDED",
+            "one connection may subscribe to at most 64 sessions",
+        );
+    }
+    let connection_client = subscribed_clients.first().map(|(_, client_id)| *client_id);
+    if let Some(client_id) = connection_client {
+        let (events, watermark) =
+            match load_recover_snapshot(relay, &parsed.session_id, history_mode).await {
+                Ok(snapshot) => snapshot,
+                Err(reply) => return reply,
+            };
+        match relay
+            .subscribe_existing(client_id, &parsed.session_id, None)
+            .await
+        {
+            ReplayResult::Ok(_) => {}
+            ReplayResult::Stale => {
+                return WsReply::err(
+                    id,
+                    WsErrorCode::Stale,
+                    "connection client is no longer registered",
+                )
+            }
+        }
+        subscribed_clients.retain(|(sid, _)| sid != &parsed.session_id);
+        subscribed_clients.push((parsed.session_id.clone(), client_id));
+        if let Some(rendezvous) = relay.rendezvous() {
+            rendezvous.cancel_disconnect_grace(&parsed.session_id);
+        }
+        return WsReply::ok(
+            id,
+            Some(json!({
+                "sessionId": parsed.session_id,
+                "watermark": watermark,
+                "events": events,
+            })),
+        );
+    }
     let prior_clients: Vec<ClientId> = subscribed_clients
         .iter()
         .filter(|(sid, _)| sid == &parsed.session_id)
@@ -1396,12 +2321,19 @@ async fn handle_recover_session_snapshot(
         match relay.subscribe_snapshot(&parsed.session_id).await {
             Ok(result) => result,
             Err(error) => {
-                if relay.persistence().is_some_and(|persistence| {
+                let conversation_missing =
+                    relay.conversation_persistence().is_some_and(|persistence| {
+                        persistence
+                            .conversation_id_for_session(&parsed.session_id)
+                            .is_none()
+                    });
+                let legacy_missing = relay.persistence().is_some_and(|persistence| {
                     matches!(
                         persistence.metadata(&parsed.session_id),
                         Err(crate::acp::SessionPersistenceError::SessionNotFound)
                     )
-                }) {
+                });
+                if conversation_missing || legacy_missing {
                     return WsReply::err(id, WsErrorCode::NotFound, "session snapshot not found");
                 }
                 tracing::warn!(
@@ -1432,7 +2364,7 @@ async fn handle_recover_session_snapshot(
     let forward_tx = out_tx.clone();
     tokio::spawn(async move {
         while let Some(event) = rx.recv().await {
-            if forward_tx.send(Outbound::Event(event)).is_err() {
+            if forward_tx.send_event(event).await.is_err() {
                 break;
             }
         }
@@ -1493,21 +2425,34 @@ async fn handle_get_session_cursor(
     // but `Err(_)` for a real I/O / decode failure. `unwrap_or(0)` would mask a
     // storage failure as "new session" in the reply + logs; log the `Err` first
     // so a corrupted payload or permission error is visible, then default to 0.
-    let watermark = relay
-        .persistence()
-        .map(|persistence| {
-            persistence
-                .last_seq(&parsed.session_id)
-                .unwrap_or_else(|error| {
-                    tracing::warn!(
-                        session_id = %parsed.session_id,
-                        error = ?error,
-                        "get_session_cursor: last_seq lookup failed"
-                    );
-                    0
-                })
-        })
-        .unwrap_or(0);
+    let watermark = if let Some(persistence) = relay.conversation_persistence() {
+        persistence
+            .last_seq(&parsed.session_id)
+            .unwrap_or_else(|error| {
+                tracing::warn!(
+                    session_id = %parsed.session_id,
+                    code = error.code,
+                    "get_session_cursor: Conversation last_seq lookup failed"
+                );
+                0
+            })
+    } else {
+        relay
+            .persistence()
+            .map(|persistence| {
+                persistence
+                    .last_seq(&parsed.session_id)
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(
+                            session_id = %parsed.session_id,
+                            error = ?error,
+                            "get_session_cursor: last_seq lookup failed"
+                        );
+                        0
+                    })
+            })
+            .unwrap_or(0)
+    };
     tracing::debug!(
         target: "termul::web::ws",
         session_id = %parsed.session_id,
@@ -1524,7 +2469,7 @@ async fn handle_open_persisted_session(
     id: String,
     payload: &Value,
     relay: &Arc<WsRelaySink>,
-    out_tx: &mpsc::UnboundedSender<Outbound>,
+    out_tx: &OutboundSender,
     subscribed_clients: &mut Vec<(String, ClientId)>,
     history_mode: HistoryMode,
 ) -> WsReply {
@@ -1547,6 +2492,13 @@ async fn handle_open_persisted_session(
 /// failures (`"agent does not support …"`) → `Unsupported`. Unrecognized
 /// errors fall back to `NotImplemented` (preserves the human message verbatim).
 fn acp_err_to_reply(id: String, err: String) -> WsReply {
+    if let Some(failure) = crate::conversation::AgentCompensationFailure::from_wire_error(&err) {
+        return WsReply::err_with_code(
+            id,
+            crate::conversation::ACP_COMPENSATION_FAILED,
+            failure.wire_detail(),
+        );
+    }
     if let Some(code) = map_prompt_error_code(&err) {
         return WsReply::err(id, code, err);
     }
@@ -1570,6 +2522,553 @@ fn ok_with_payload<T: serde::Serialize>(id: String, value: &T) -> WsReply {
             WsErrorCode::Unsupported,
             format!("failed to serialize reply payload: {e}"),
         ),
+    }
+}
+
+fn is_conversation_request(type_: &str) -> bool {
+    matches!(
+        type_,
+        "conversation_host_status"
+            | "list_conversations"
+            | "get_conversation"
+            | "open_conversation"
+            | "resolve_legacy_conversation_id"
+            | "get_session_workspace"
+            | "write_session_workspace"
+            | "resolve_recovery_item"
+            | "attach_project"
+            | "detach_project"
+            | "update_execution_target"
+            | "detach_binding"
+            | "rebind_binding"
+            | "suspend_binding"
+            | "replace_binding"
+            | "delete_conversation"
+    )
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConversationIdWsPayload {
+    conversation_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConversationWorkspaceWriteWsPayload {
+    conversation_id: String,
+    based_revision: Option<u64>,
+    workspace: crate::conversation::SessionWorkspaceV1,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConversationAttachProjectWsPayload {
+    conversation_id: String,
+    expected_revision: u64,
+    attachment: crate::conversation::ProjectAttachment,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConversationDetachProjectWsPayload {
+    conversation_id: String,
+    expected_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConversationUpdateExecutionTargetWsPayload {
+    conversation_id: String,
+    expected_revision: u64,
+    execution_target: crate::conversation::ExecutionTarget,
+}
+
+async fn handle_conversation_application(
+    id: String,
+    type_: &str,
+    payload: &Value,
+    service: Option<&Arc<crate::conversation::ConversationApplicationService>>,
+    current_conversation: &Arc<parking_lot::Mutex<Option<crate::conversation::ConversationId>>>,
+) -> WsReply {
+    let Some(service) = service else {
+        return WsReply::err_with_code(
+            id,
+            "CONVERSATION_SERVICE_UNAVAILABLE",
+            "bootstrap-published Conversation application service is unavailable",
+        );
+    };
+    match type_ {
+        "conversation_host_status" => match service.host_status() {
+            Ok(value) => ok_with_payload(id, &value),
+            Err(error) => WsReply::err_with_code(id, error.code, error.detail),
+        },
+        "list_conversations" => ok_with_payload(id, &service.list_conversations()),
+        "get_conversation" | "open_conversation" | "get_session_workspace" => {
+            let parsed: ConversationIdWsPayload = match serde_json::from_value(payload.clone()) {
+                Ok(value) => value,
+                Err(error) => {
+                    return WsReply::err_with_code(
+                        id,
+                        "VALIDATION_ERROR",
+                        format!("malformed Conversation payload: {error}"),
+                    )
+                }
+            };
+            let conversation_id = match crate::conversation::ConversationId::parse_path_component(
+                &parsed.conversation_id,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    return WsReply::err_with_code(id, "CONVERSATION_INVALID_ID", error.to_string())
+                }
+            };
+            let result = match type_ {
+                "get_conversation" => service
+                    .get_conversation(conversation_id)
+                    .map(|value| serde_json::to_value(value).expect("Conversation serializes")),
+                "open_conversation" => {
+                    service
+                        .open_conversation(conversation_id)
+                        .await
+                        .map(|value| {
+                            serde_json::to_value(value).expect("Conversation open serializes")
+                        })
+                }
+                _ => service
+                    .get_workspace(conversation_id)
+                    .await
+                    .map(|value| serde_json::to_value(value).expect("workspace serializes")),
+            };
+            match result {
+                Ok(value) => {
+                    if type_ == "open_conversation" {
+                        *current_conversation.lock() = Some(conversation_id);
+                    }
+                    WsReply::ok(id, Some(value))
+                }
+                Err(error) => WsReply::err_with_code(id, error.code, error.detail),
+            }
+        }
+        "resolve_legacy_conversation_id" => {
+            let request: crate::conversation::LegacyConversationKey =
+                match serde_json::from_value(payload.clone()) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return WsReply::err_with_code(
+                            id,
+                            "VALIDATION_ERROR",
+                            format!("malformed legacy resolver payload: {error}"),
+                        )
+                    }
+                };
+            match service.resolve_legacy_conversation_id(request) {
+                Ok(value) => ok_with_payload(id, &value),
+                Err(error) => WsReply::err_with_code(id, error.code, error.detail),
+            }
+        }
+        "write_session_workspace" => {
+            let request: ConversationWorkspaceWriteWsPayload =
+                match serde_json::from_value(payload.clone()) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return WsReply::err_with_code(
+                            id,
+                            "VALIDATION_ERROR",
+                            format!("malformed workspace payload: {error}"),
+                        )
+                    }
+                };
+            let conversation_id = match crate::conversation::ConversationId::parse_path_component(
+                &request.conversation_id,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    return WsReply::err_with_code(id, "CONVERSATION_INVALID_ID", error.to_string())
+                }
+            };
+            match service
+                .write_workspace(conversation_id, request.based_revision, request.workspace)
+                .await
+            {
+                Ok(value) => ok_with_payload(id, &value),
+                Err(error) => WsReply::err_with_code(id, error.code, error.detail),
+            }
+        }
+        "attach_project" => {
+            let request: ConversationAttachProjectWsPayload =
+                match serde_json::from_value(payload.clone()) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return WsReply::err_with_code(
+                            id,
+                            "VALIDATION_ERROR",
+                            format!("malformed attach project payload: {error}"),
+                        )
+                    }
+                };
+            let conversation_id = match crate::conversation::ConversationId::parse_path_component(
+                &request.conversation_id,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    return WsReply::err_with_code(id, "CONVERSATION_INVALID_ID", error.to_string())
+                }
+            };
+            match service
+                .attach_project(
+                    conversation_id,
+                    request.expected_revision,
+                    request.attachment,
+                )
+                .await
+            {
+                Ok(value) => ok_with_payload(id, &value),
+                Err(error) => WsReply::err_with_code(id, error.code, error.detail),
+            }
+        }
+        "detach_project" => {
+            let request: ConversationDetachProjectWsPayload =
+                match serde_json::from_value(payload.clone()) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return WsReply::err_with_code(
+                            id,
+                            "VALIDATION_ERROR",
+                            format!("malformed detach project payload: {error}"),
+                        )
+                    }
+                };
+            let conversation_id = match crate::conversation::ConversationId::parse_path_component(
+                &request.conversation_id,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    return WsReply::err_with_code(id, "CONVERSATION_INVALID_ID", error.to_string())
+                }
+            };
+            match service
+                .detach_project(conversation_id, request.expected_revision)
+                .await
+            {
+                Ok(value) => ok_with_payload(id, &value),
+                Err(error) => WsReply::err_with_code(id, error.code, error.detail),
+            }
+        }
+        "update_execution_target" => {
+            let request: ConversationUpdateExecutionTargetWsPayload =
+                match serde_json::from_value(payload.clone()) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return WsReply::err_with_code(
+                            id,
+                            "VALIDATION_ERROR",
+                            format!("malformed execution target payload: {error}"),
+                        )
+                    }
+                };
+            let conversation_id = match crate::conversation::ConversationId::parse_path_component(
+                &request.conversation_id,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    return WsReply::err_with_code(id, "CONVERSATION_INVALID_ID", error.to_string())
+                }
+            };
+            match service
+                .update_execution_target(
+                    conversation_id,
+                    request.expected_revision,
+                    request.execution_target,
+                )
+                .await
+            {
+                Ok(value) => ok_with_payload(id, &value),
+                Err(error) => WsReply::err_with_code(id, error.code, error.detail),
+            }
+        }
+        "resolve_recovery_item" => {
+            let request: crate::conversation::migration::ResolveRecoveryItemRequest =
+                match serde_json::from_value(payload.clone()) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return WsReply::err_with_code(
+                            id,
+                            "VALIDATION_ERROR",
+                            format!("malformed recovery payload: {error}"),
+                        )
+                    }
+                };
+            match service.resolve_recovery_item(request).await {
+                Ok(value) => ok_with_payload(id, &value),
+                Err(error) => WsReply::err_with_code(id, error.code, error.detail),
+            }
+        }
+        _ => WsReply::err_with_code(id, "NOT_IMPLEMENTED", "unknown Conversation request"),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ConversationWsMutation {
+    Detach,
+    Rebind,
+    Suspend,
+    Replace,
+    Delete,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConversationLifecycleWsPayload {
+    conversation_id: String,
+    expected_revision: u64,
+    #[serde(default)]
+    request: Option<crate::conversation::PrepareConversationRequest>,
+}
+
+async fn retire_ws_deleted_binding_if_updated(
+    relay: &WsRelaySink,
+    current_session_id: Option<&str>,
+    outcome: &crate::conversation::ConversationLifecycleOutcome,
+) -> Result<(), String> {
+    if matches!(
+        outcome,
+        crate::conversation::ConversationLifecycleOutcome::Updated {
+            action: crate::conversation::ConversationLifecycleAction::DeleteConversation,
+            ..
+        }
+    ) {
+        if let Some(session_id) = current_session_id {
+            relay.retire_session(session_id).await?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+async fn handle_conversation_lifecycle(
+    id: String,
+    payload: &Value,
+    acp: &Arc<AcpManager>,
+    relay: &Arc<WsRelaySink>,
+    mutation: ConversationWsMutation,
+) -> WsReply {
+    let parsed: ConversationLifecycleWsPayload = match serde_json::from_value(payload.clone()) {
+        Ok(value) => value,
+        Err(error) => {
+            return WsReply::err_with_code(
+                id,
+                "VALIDATION_ERROR",
+                format!("malformed Conversation lifecycle payload: {error}"),
+            )
+        }
+    };
+    let conversation_id =
+        match crate::conversation::ConversationId::parse_path_component(&parsed.conversation_id) {
+            Ok(value) => value,
+            Err(error) => {
+                return WsReply::err_with_code(id, "CONVERSATION_INVALID_ID", error.to_string())
+            }
+        };
+    let Some(pty) = acp.pty_manager() else {
+        return WsReply::err_with_code(
+            id,
+            "CONVERSATION_RECOVERY_REQUIRED",
+            "bootstrap-published PtyManager is unavailable",
+        );
+    };
+    let service =
+        match crate::conversation::ConversationLifecycleService::from_manager(Arc::clone(acp), pty)
+        {
+            Ok(service) => service,
+            Err(error) => return WsReply::err_with_code(id, error.code.as_str(), error.detail),
+        };
+    let current_session_id = if matches!(mutation, ConversationWsMutation::Delete) {
+        acp.conversation_creation()
+            .and_then(|creation| creation.repository().current_binding(conversation_id).ok())
+            .flatten()
+            .map(|binding| binding.agent_session_id)
+    } else {
+        None
+    };
+    let result = match mutation {
+        ConversationWsMutation::Detach => {
+            service
+                .detach_agent_binding(conversation_id, parsed.expected_revision)
+                .await
+        }
+        ConversationWsMutation::Rebind => {
+            service
+                .rebind_detached_binding(conversation_id, parsed.expected_revision)
+                .await
+        }
+        ConversationWsMutation::Suspend => {
+            service
+                .suspend_agent_binding(conversation_id, parsed.expected_revision)
+                .await
+        }
+        ConversationWsMutation::Replace => match parsed.request {
+            Some(request) => {
+                service
+                    .replace_agent_binding(conversation_id, request, parsed.expected_revision)
+                    .await
+            }
+            None => {
+                return WsReply::err_with_code(
+                    id,
+                    "VALIDATION_ERROR",
+                    "replace_binding requires request",
+                )
+            }
+        },
+        ConversationWsMutation::Delete => {
+            service
+                .delete_conversation(conversation_id, parsed.expected_revision)
+                .await
+        }
+    };
+    match result {
+        Ok(outcome) => {
+            if retire_ws_deleted_binding_if_updated(relay, current_session_id.as_deref(), &outcome)
+                .await
+                .is_err()
+            {
+                return WsReply::err_with_code(
+                    id,
+                    "CONVERSATION_RETIREMENT_FAILED",
+                    "Conversation auxiliary retirement failed",
+                );
+            }
+            match relay.emit(&AcpEvent {
+                sid: None,
+                type_: "conversation_lifecycle",
+                payload: serde_json::to_value(&outcome)
+                    .expect("Conversation lifecycle outcome serializes"),
+            }) {
+                Ok(_) => ok_with_payload(id, &outcome),
+                Err(error) => WsReply::err_with_code(
+                    id,
+                    error.code,
+                    "conversation lifecycle event delivery degraded",
+                ),
+            }
+        }
+        Err(error) => WsReply::err_with_code(id, error.code.as_str(), error.detail),
+    }
+}
+
+async fn handle_conversation_lifecycle_with_service(
+    id: String,
+    payload: &Value,
+    service: Option<&Arc<crate::conversation::ConversationApplicationService>>,
+    relay: &Arc<WsRelaySink>,
+    mutation: ConversationWsMutation,
+) -> WsReply {
+    let parsed: ConversationLifecycleWsPayload = match serde_json::from_value(payload.clone()) {
+        Ok(value) => value,
+        Err(error) => {
+            return WsReply::err_with_code(
+                id,
+                "VALIDATION_ERROR",
+                format!("malformed Conversation lifecycle payload: {error}"),
+            )
+        }
+    };
+    let conversation_id =
+        match crate::conversation::ConversationId::parse_path_component(&parsed.conversation_id) {
+            Ok(value) => value,
+            Err(error) => {
+                return WsReply::err_with_code(id, "CONVERSATION_INVALID_ID", error.to_string())
+            }
+        };
+    let Some(service) = service else {
+        return WsReply::err_with_code(
+            id,
+            "CONVERSATION_SERVICE_UNAVAILABLE",
+            "bootstrap-published Conversation application service is unavailable",
+        );
+    };
+    let current_session_id = if matches!(mutation, ConversationWsMutation::Delete) {
+        match service
+            .writer()
+            .repository()
+            .current_binding(conversation_id)
+        {
+            Ok(binding) => binding.map(|binding| binding.agent_session_id),
+            Err(_) => {
+                return WsReply::err_with_code(
+                    id,
+                    "CONVERSATION_RECOVERY_REQUIRED",
+                    "failed to resolve Conversation binding before delete",
+                )
+            }
+        }
+    } else {
+        None
+    };
+    let result = match mutation {
+        ConversationWsMutation::Detach => {
+            service
+                .detach_binding(conversation_id, parsed.expected_revision)
+                .await
+        }
+        ConversationWsMutation::Rebind => {
+            service
+                .rebind_binding(conversation_id, parsed.expected_revision)
+                .await
+        }
+        ConversationWsMutation::Suspend => {
+            service
+                .suspend_binding(conversation_id, parsed.expected_revision)
+                .await
+        }
+        ConversationWsMutation::Replace => match parsed.request {
+            Some(request) => {
+                service
+                    .replace_binding(conversation_id, request, parsed.expected_revision)
+                    .await
+            }
+            None => {
+                return WsReply::err_with_code(
+                    id,
+                    "VALIDATION_ERROR",
+                    "replace_binding requires request",
+                )
+            }
+        },
+        ConversationWsMutation::Delete => {
+            service
+                .delete_conversation(conversation_id, parsed.expected_revision)
+                .await
+        }
+    };
+    match result {
+        Ok(outcome) => {
+            if retire_ws_deleted_binding_if_updated(relay, current_session_id.as_deref(), &outcome)
+                .await
+                .is_err()
+            {
+                return WsReply::err_with_code(
+                    id,
+                    "CONVERSATION_RETIREMENT_FAILED",
+                    "Conversation auxiliary retirement failed",
+                );
+            }
+            match relay.emit(&AcpEvent {
+                sid: None,
+                type_: "conversation_lifecycle",
+                payload: serde_json::to_value(&outcome)
+                    .expect("Conversation lifecycle outcome serializes"),
+            }) {
+                Ok(_) => ok_with_payload(id, &outcome),
+                Err(error) => WsReply::err_with_code(
+                    id,
+                    error.code,
+                    "conversation lifecycle event delivery degraded",
+                ),
+            }
+        }
+        Err(error) => WsReply::err_with_code(id, error.code, error.detail),
     }
 }
 
@@ -1691,6 +3190,32 @@ async fn handle_kill_agent(
 /// `list_agents` → `AcpManager::list_agents()`. Reply = `AgentId[]` (JSON array).
 fn handle_list_agents(id: String, acp: &Arc<AcpManager>) -> WsReply {
     ok_with_payload(id, &acp.list_agents())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetPermissionPolicyPayload {
+    agent_id: AgentId,
+    policy: PermissionPolicy,
+}
+
+fn handle_set_permission_policy(id: String, payload: &Value, acp: &Arc<AcpManager>) -> WsReply {
+    let parsed: SetPermissionPolicyPayload = match serde_json::from_value(payload.clone()) {
+        Ok(value) => value,
+        Err(error) => {
+            return WsReply::err(
+                id,
+                WsErrorCode::Unsupported,
+                format!(
+                    "malformed set_permission_policy payload (want agentId and policy): {error}"
+                ),
+            )
+        }
+    };
+    match acp.set_permission_policy(&parsed.agent_id, parsed.policy) {
+        Ok(()) => WsReply::ok(id, Some(json!({}))),
+        Err(error) => acp_err_to_reply(id, error),
+    }
 }
 
 // --- CAP-6 / Story 8: ACP catalog WS handlers ------------------------------
@@ -1871,11 +3396,7 @@ struct StoreDeletePayload {
 
 /// `store_read` → `WebStore::read`. Reply = `{ value: <json | null> }`.
 /// Degrade-mode (`store: None`) returns `STORE_UNAVAILABLE`.
-async fn handle_store_read(
-    id: String,
-    payload: &Value,
-    store: Option<&Arc<WebStore>>,
-) -> WsReply {
+async fn handle_store_read(id: String, payload: &Value, store: Option<&Arc<WebStore>>) -> WsReply {
     let parsed: StoreReadPayload = match serde_json::from_value(payload.clone()) {
         Ok(p) => p,
         Err(e) => {
@@ -1895,17 +3416,17 @@ async fn handle_store_read(
         Ok(Err(e)) => WsReply::err_with_code(id, "STORE_UNAVAILABLE", e.to_string()),
         Err(join_err) => {
             tracing::warn!("store_read task failed: {join_err}");
-            WsReply::err_with_code(id, "STORE_UNAVAILABLE", format!("store read task failed: {join_err}"))
+            WsReply::err_with_code(
+                id,
+                "STORE_UNAVAILABLE",
+                format!("store read task failed: {join_err}"),
+            )
         }
     }
 }
 
 /// `store_write` → `WebStore::write` (atomic replace). Reply = `{}`.
-async fn handle_store_write(
-    id: String,
-    payload: &Value,
-    store: Option<&Arc<WebStore>>,
-) -> WsReply {
+async fn handle_store_write(id: String, payload: &Value, store: Option<&Arc<WebStore>>) -> WsReply {
     let parsed: StoreWritePayload = match serde_json::from_value(payload.clone()) {
         Ok(p) => p,
         Err(e) => {
@@ -1925,13 +3446,22 @@ async fn handle_store_write(
     let store_clone = store.clone();
     let result = tokio::task::spawn_blocking(move || {
         store_clone.write(&parsed.key, parsed.value, parsed.expected)
-    }).await;
+    })
+    .await;
     match result {
         Ok(Ok(true)) => WsReply::ok(id, Some(json!({}))),
-        Ok(Ok(false)) => WsReply::err_with_code(id, "STORE_CAS_FAILED", "store write rejected: value changed concurrently"),
+        Ok(Ok(false)) => WsReply::err_with_code(
+            id,
+            "STORE_CAS_FAILED",
+            "store write rejected: value changed concurrently",
+        ),
         Ok(Err(error)) => {
             tracing::warn!("store_write failed: {error}");
-            WsReply::err_with_code(id, "STORE_WRITE_FAILED", format!("store write failed: {error}"))
+            WsReply::err_with_code(
+                id,
+                "STORE_WRITE_FAILED",
+                format!("store write failed: {error}"),
+            )
         }
         Err(join_err) => {
             tracing::warn!("store_write task failed: {join_err}");
@@ -1960,18 +3490,24 @@ async fn handle_store_delete(
         return WsReply::err_with_code(id, "STORE_UNAVAILABLE", "server store is unavailable");
     };
     let store_clone = store.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        store_clone.delete(&parsed.key)
-    }).await;
+    let result = tokio::task::spawn_blocking(move || store_clone.delete(&parsed.key)).await;
     match result {
         Ok(Ok(existed)) => WsReply::ok(id, Some(json!({ "existed": existed }))),
         Ok(Err(error)) => {
             tracing::warn!("store_delete failed: {error}");
-            WsReply::err_with_code(id, "STORE_DELETE_FAILED", format!("store delete failed: {error}"))
+            WsReply::err_with_code(
+                id,
+                "STORE_DELETE_FAILED",
+                format!("store delete failed: {error}"),
+            )
         }
         Err(join_err) => {
             tracing::warn!("store_delete task failed: {join_err}");
-            WsReply::err_with_code(id, "STORE_DELETE_FAILED", format!("task failed: {join_err}"))
+            WsReply::err_with_code(
+                id,
+                "STORE_DELETE_FAILED",
+                format!("task failed: {join_err}"),
+            )
         }
     }
 }
@@ -2037,6 +3573,18 @@ struct CreateSessionPayload {
     mcp_servers: Vec<agent_client_protocol::schema::v1::McpServer>,
     #[serde(default)]
     ephemeral: bool,
+    #[serde(default)]
+    conversation_id: Option<crate::conversation::ConversationId>,
+    #[serde(default)]
+    project_attachment: Option<crate::conversation::ProjectAttachment>,
+    #[serde(default)]
+    execution_target: Option<crate::conversation::ExecutionTarget>,
+}
+
+struct CurrentConversationRefs<'a> {
+    session: &'a Arc<parking_lot::Mutex<Option<crate::acp::SessionId>>>,
+    conversation: &'a Arc<parking_lot::Mutex<Option<crate::conversation::ConversationId>>>,
+    project: &'a Arc<parking_lot::Mutex<Option<String>>>,
 }
 
 async fn handle_create_session(
@@ -2045,8 +3593,7 @@ async fn handle_create_session(
     acp: &Arc<AcpManager>,
     registry: &Arc<ProjectRegistry>,
     current_agent: &mut Option<crate::acp::AgentId>,
-    current_session: &Arc<parking_lot::Mutex<Option<crate::acp::SessionId>>>,
-    current_project: &Arc<parking_lot::Mutex<Option<String>>>,
+    current: CurrentConversationRefs<'_>,
 ) -> WsReply {
     let parsed: CreateSessionPayload = match serde_json::from_value(payload.clone()) {
         Ok(p) => p,
@@ -2081,6 +3628,9 @@ async fn handle_create_session(
             SessionCreationContext {
                 project_id,
                 ephemeral: parsed.ephemeral,
+                conversation_id: parsed.conversation_id,
+                project_attachment: parsed.project_attachment,
+                execution_target: parsed.execution_target,
                 ..Default::default()
             },
         )
@@ -2090,10 +3640,11 @@ async fn handle_create_session(
             if !parsed.ephemeral {
                 // Track the agent + new session for `switch_project` cwd switching.
                 *current_agent = Some(parsed.agent_id.clone());
-                *current_session.lock() = Some(outcome.session_id.clone());
+                *current.session.lock() = Some(outcome.session_id.clone());
+                *current.conversation.lock() = outcome.conversation_id;
                 // Generic session creation carries a cwd, not a registry-owned
                 // project id. Leave it unknown so the next switch is always real.
-                *current_project.lock() = None;
+                *current.project.lock() = None;
             }
             ok_with_payload(id, &outcome)
         }
@@ -2153,9 +3704,9 @@ async fn handle_set_default_project(
                 error = %e,
                 "set_default_project: malformed payload (want projectId)"
             );
-            return WsReply::err(
+            return WsReply::err_with_code(
                 id,
-                WsErrorCode::Unsupported,
+                operation_policy::VALIDATION_ERROR,
                 format!("malformed set_default_project payload (want projectId): {e}"),
             );
         }
@@ -2169,9 +3720,9 @@ async fn handle_set_default_project(
             project_id = %parsed.project_id,
             "set_default_project: project not found or not switchable"
         );
-        return WsReply::err(
+        return WsReply::err_with_code(
             id,
-            WsErrorCode::NotFound,
+            operation_policy::NOT_FOUND,
             format!(
                 "project '{}' not found or not switchable",
                 parsed.project_id
@@ -2209,9 +3760,9 @@ async fn handle_set_default_project(
                 error = %error,
                 "set_default_project: persistence failed (rolled back)"
             );
-            return WsReply::err(
+            return WsReply::err_with_code(
                 id,
-                WsErrorCode::Unsupported,
+                operation_policy::PERSIST_FAILED,
                 format!("failed to persist default project: {error}"),
             );
         }
@@ -2238,9 +3789,9 @@ async fn handle_set_default_project(
             project_id = %parsed.project_id,
             "set_default_project: target became unavailable before commit (file rolled back)"
         );
-        return WsReply::err(
+        return WsReply::err_with_code(
             id,
-            WsErrorCode::NotFound,
+            operation_policy::NOT_FOUND,
             "target project became unavailable before commit",
         );
     }
@@ -2388,12 +3939,22 @@ async fn try_reopen_session_for_switch(
     // cheap error. Any failure (capability, purged session, agent error) →
     // fall back to a new session.
     match acp
-        .resume_session(agent_id, session_id.clone(), target.cwd.clone())
+        .resume_session(
+            agent_id,
+            session_id.clone(),
+            target.cwd.clone(),
+            target.mcp_servers.clone(),
+        )
         .await
     {
         Ok(_) => Ok(Some(session_id)),
         Err(resume_err) => match acp
-            .load_session(agent_id, session_id.clone(), target.cwd.clone())
+            .load_session(
+                agent_id,
+                session_id.clone(),
+                target.cwd.clone(),
+                target.mcp_servers.clone(),
+            )
             .await
         {
             Ok(_) => Ok(Some(session_id)),
@@ -2518,8 +4079,9 @@ async fn run_switch_queue(
     agent_id: AgentId,
     acp: Arc<AcpManager>,
     relay: Arc<WsRelaySink>,
-    out_tx: mpsc::UnboundedSender<Outbound>,
+    out_tx: OutboundSender,
     current_session: Arc<parking_lot::Mutex<Option<SessionId>>>,
+    current_conversation: Arc<parking_lot::Mutex<Option<crate::conversation::ConversationId>>>,
     current_project: Arc<parking_lot::Mutex<Option<String>>>,
     switch_queue: Arc<tokio::sync::Mutex<ProjectSwitchQueue>>,
 ) {
@@ -2542,12 +4104,14 @@ async fn run_switch_queue(
                 queue.pending.take()
             };
             if let Some(failed) = failed {
-                let _ = out_tx.send(Outbound::Event(project_switch_failed_event(
-                    failed.request_id,
-                    failed.target.project_id,
-                    failed.previous_session_id,
-                    error,
-                )));
+                let _ = out_tx
+                    .send_event(project_switch_failed_event(
+                        failed.request_id,
+                        failed.target.project_id,
+                        failed.previous_session_id,
+                        error,
+                    ))
+                    .await;
             }
             switch_queue.lock().await.worker_running = false;
             return;
@@ -2577,6 +4141,8 @@ async fn run_switch_queue(
                 cwd,
                 mcp_server_count,
             }) => {
+                *current_conversation.lock() =
+                    acp.conversation_id_for_current_session(&session_id.0);
                 let event = SequencedEvent::new(
                     Some(pending.previous_session_id.0.clone()),
                     0,
@@ -2592,7 +4158,7 @@ async fn run_switch_queue(
                     })
                     .unwrap_or_else(|_| json!({})),
                 );
-                let _ = out_tx.send(Outbound::Event(event));
+                let _ = out_tx.send_event(event).await;
             }
             Ok(SwitchProjectOutcome::Queued { .. }) => {}
             // `execute_project_switch` never returns `Selected` (only
@@ -2600,12 +4166,14 @@ async fn run_switch_queue(
             // exhaustiveness now that the enum has a `Selected` variant.
             Ok(SwitchProjectOutcome::Selected { .. }) => {}
             Err(error) => {
-                let _ = out_tx.send(Outbound::Event(project_switch_failed_event(
-                    pending.request_id,
-                    pending.target.project_id,
-                    pending.previous_session_id,
-                    error,
-                )));
+                let _ = out_tx
+                    .send_event(project_switch_failed_event(
+                        pending.request_id,
+                        pending.target.project_id,
+                        pending.previous_session_id,
+                        error,
+                    ))
+                    .await;
             }
         }
         let mut queue = switch_queue.lock().await;
@@ -2624,9 +4192,10 @@ async fn handle_switch_project(
     acp: &Arc<AcpManager>,
     relay: &Arc<WsRelaySink>,
     registry: &Arc<ProjectRegistry>,
-    out_tx: &mpsc::UnboundedSender<Outbound>,
+    out_tx: &OutboundSender,
     current_agent: &mut Option<AgentId>,
     current_session: &Arc<parking_lot::Mutex<Option<SessionId>>>,
+    current_conversation: &Arc<parking_lot::Mutex<Option<crate::conversation::ConversationId>>>,
     current_project: &Arc<parking_lot::Mutex<Option<String>>>,
     switch_queue: &Arc<tokio::sync::Mutex<ProjectSwitchQueue>>,
 ) -> WsReply {
@@ -2696,7 +4265,13 @@ async fn handle_switch_project(
         )
         .await
         {
-            Ok(outcome) => ok_with_payload(id, &outcome),
+            Ok(outcome) => {
+                if let SwitchProjectOutcome::Completed { session_id, .. } = &outcome {
+                    *current_conversation.lock() =
+                        acp.conversation_id_for_current_session(&session_id.0);
+                }
+                ok_with_payload(id, &outcome)
+            }
             Err(error) => acp_err_to_reply(id, error),
         },
         Ok(true) => {
@@ -2726,6 +4301,7 @@ async fn handle_switch_project(
                     Arc::clone(relay),
                     out_tx.clone(),
                     Arc::clone(current_session),
+                    Arc::clone(current_conversation),
                     Arc::clone(current_project),
                     Arc::clone(switch_queue),
                 ));
@@ -2744,6 +4320,10 @@ struct LoadResumeSessionPayload {
     agent_id: crate::acp::AgentId,
     session_id: crate::acp::SessionId,
     cwd: String,
+    #[serde(default)]
+    conversation_id: Option<String>,
+    #[serde(default)]
+    mcp_servers: Vec<agent_client_protocol::schema::v1::McpServer>,
 }
 
 async fn handle_load_session(
@@ -2752,6 +4332,7 @@ async fn handle_load_session(
     acp: &Arc<AcpManager>,
     current_agent: &mut Option<crate::acp::AgentId>,
     current_session: &Arc<parking_lot::Mutex<Option<crate::acp::SessionId>>>,
+    current_conversation: &Arc<parking_lot::Mutex<Option<crate::conversation::ConversationId>>>,
     current_project: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> WsReply {
     let parsed: LoadResumeSessionPayload = match serde_json::from_value(payload.clone()) {
@@ -2768,12 +4349,21 @@ async fn handle_load_session(
     // we still need the session id to track it for `switch_project`.
     let agent_id = parsed.agent_id.clone();
     let session_id = parsed.session_id.clone();
+    let load_conversation_id = parsed.conversation_id.clone();
+    // `session/load` may emit updates before replying. Install the canonical
+    // persistence route first so those in-flight notifications are durable.
+    if let Some(raw) = &load_conversation_id {
+        if let Ok(conversation_id) = crate::conversation::ConversationId::parse(raw) {
+            acp.register_conversation_binding(&session_id.0, conversation_id);
+        }
+    }
     match acp
-        .load_session(&agent_id, parsed.session_id, parsed.cwd)
+        .load_session(&agent_id, parsed.session_id, parsed.cwd, parsed.mcp_servers)
         .await
     {
         Ok(outcome) => {
             *current_agent = Some(agent_id);
+            *current_conversation.lock() = acp.conversation_id_for_current_session(&session_id.0);
             *current_session.lock() = Some(session_id);
             *current_project.lock() = None;
             ok_with_payload(id, &outcome)
@@ -2790,6 +4380,7 @@ async fn handle_resume_session(
     acp: &Arc<AcpManager>,
     current_agent: &mut Option<crate::acp::AgentId>,
     current_session: &Arc<parking_lot::Mutex<Option<crate::acp::SessionId>>>,
+    current_conversation: &Arc<parking_lot::Mutex<Option<crate::conversation::ConversationId>>>,
     current_project: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> WsReply {
     let parsed: LoadResumeSessionPayload = match serde_json::from_value(payload.clone()) {
@@ -2806,12 +4397,20 @@ async fn handle_resume_session(
     // we still need the session id to track it for `switch_project`.
     let agent_id = parsed.agent_id.clone();
     let session_id = parsed.session_id.clone();
+    let resume_conversation_id = parsed.conversation_id.clone();
+    // `session/resume` can stream before returning; bind before dispatch.
+    if let Some(raw) = &resume_conversation_id {
+        if let Ok(conversation_id) = crate::conversation::ConversationId::parse(raw) {
+            acp.register_conversation_binding(&session_id.0, conversation_id);
+        }
+    }
     match acp
-        .resume_session(&agent_id, parsed.session_id, parsed.cwd)
+        .resume_session(&agent_id, parsed.session_id, parsed.cwd, parsed.mcp_servers)
         .await
     {
         Ok(outcome) => {
             *current_agent = Some(agent_id);
+            *current_conversation.lock() = acp.conversation_id_for_current_session(&session_id.0);
             *current_session.lock() = Some(session_id);
             *current_project.lock() = None;
             ok_with_payload(id, &outcome)
@@ -2855,6 +4454,13 @@ async fn handle_dispose_ephemeral_session(
         .await
     {
         Ok(()) => {
+            if let Err(code) = relay.retire_session(&disposed_session_id.0).await {
+                return WsReply::err_with_code(
+                    id,
+                    "CONVERSATION_RETIREMENT_FAILED",
+                    format!("session auxiliary retirement failed ({code})"),
+                );
+            }
             subscribed_clients.retain(|(session_id, client_id)| {
                 if session_id == &disposed_session_id.0 {
                     relay.unsubscribe(session_id, *client_id);
@@ -2867,7 +4473,6 @@ async fn handle_dispose_ephemeral_session(
                 *current_session.lock() = None;
                 *current_project.lock() = None;
             }
-            relay.forget_session(&disposed_session_id.0).await;
             WsReply::ok(id, Some(json!({})))
         }
         Err(e) => acp_err_to_reply(id, e),
@@ -2878,6 +4483,7 @@ async fn handle_close_session(
     id: String,
     payload: &Value,
     acp: &Arc<AcpManager>,
+    relay: &Arc<WsRelaySink>,
     current_session: &Arc<parking_lot::Mutex<Option<SessionId>>>,
     current_project: &Arc<parking_lot::Mutex<Option<String>>>,
 ) -> WsReply {
@@ -2892,15 +4498,62 @@ async fn handle_close_session(
         }
     };
     let closing_session_id = parsed.session_id.clone();
-    match acp.close_session(&parsed.agent_id, parsed.session_id).await {
+    let close_result = if let Some(conversation_id) =
+        acp.conversation_id_for_current_session(&closing_session_id.0)
+    {
+        let Some(pty) = acp.pty_manager() else {
+            return WsReply::err_with_code(
+                id,
+                "CONVERSATION_RECOVERY_REQUIRED",
+                "bootstrap-published PtyManager is unavailable",
+            );
+        };
+        let service = match crate::conversation::ConversationLifecycleService::from_manager(
+            Arc::clone(acp),
+            pty,
+        ) {
+            Ok(service) => service,
+            Err(error) => return WsReply::err_with_code(id, error.code.as_str(), error.detail),
+        };
+        let expected_revision = match acp
+            .conversation_creation()
+            .and_then(|creation| creation.repository().get_conversation(conversation_id).ok())
+        {
+            Some(record) => record.last_seq,
+            None => {
+                return WsReply::err_with_code(
+                    id,
+                    "CONVERSATION_RECOVERY_REQUIRED",
+                    "canonical Conversation revision is unavailable",
+                )
+            }
+        };
+        service
+            .suspend_agent_binding(conversation_id, expected_revision)
+            .await
+            .map(|_| ())
+            .map_err(|error| (error.code.as_str(), error.detail))
+    } else {
+        acp.close_session(&parsed.agent_id, parsed.session_id)
+            .await
+            .map_err(|error| ("agent_crashed".to_string(), error))
+    };
+    match close_result {
         Ok(()) => {
+            if let Err(code) = relay.retire_session(&closing_session_id.0).await {
+                return WsReply::err_with_code(
+                    id,
+                    "CONVERSATION_RETIREMENT_FAILED",
+                    format!("session auxiliary retirement failed ({code})"),
+                );
+            }
             if current_session.lock().as_ref() == Some(&closing_session_id) {
                 *current_session.lock() = None;
                 *current_project.lock() = None;
             }
             WsReply::ok(id, Some(json!({})))
         }
-        Err(e) => acp_err_to_reply(id, e),
+        Err((code, detail)) => WsReply::err_with_code(id, code, detail),
     }
 }
 
@@ -3166,16 +4819,28 @@ async fn accept_send_prompt(
         "content": content.clone(),
     });
     if !ephemeral {
-        relay
-            .persist_user_prompt(parsed.session_id.0.as_str(), prompt_payload)
-            .await
-            .map_err(|error| {
-                WsReply::err(
-                    id.clone(),
-                    WsErrorCode::NotImplemented,
-                    format!("failed to persist accepted prompt: {error}"),
-                )
-            })?;
+        // Unbound legacy sessions have no durable home; dispatch without
+        // history instead of surfacing a red persistence error.
+        let bound = acp
+            .conversation_id_for_current_session(&parsed.session_id.0)
+            .is_some();
+        if bound {
+            relay
+                .persist_user_prompt(parsed.session_id.0.as_str(), prompt_payload)
+                .await
+                .map_err(|error| {
+                    WsReply::err(
+                        id.clone(),
+                        WsErrorCode::NotImplemented,
+                        format!("failed to persist accepted prompt: {error}"),
+                    )
+                })?;
+        } else {
+            warn!(
+                "[ws] accepted prompt not persisted: session {} has no Conversation binding",
+                parsed.session_id.0
+            );
+        }
     }
 
     let started = acp
@@ -3327,7 +4992,7 @@ async fn handle_subscribe(
     id: String,
     payload: &Value,
     relay: &Arc<WsRelaySink>,
-    out_tx: &mpsc::UnboundedSender<Outbound>,
+    out_tx: &OutboundSender,
     subscribed_clients: &mut Vec<(String, ClientId)>,
 ) -> WsReply {
     let parsed: SubscribePayload = match serde_json::from_value(payload.clone()) {
@@ -3342,6 +5007,19 @@ async fn handle_subscribe(
     };
     if parsed.session_id.is_empty() {
         return WsReply::err(id, WsErrorCode::Unsupported, "sessionId is required");
+    }
+    let distinct_subscriptions = subscribed_clients
+        .iter()
+        .map(|(session_id, _)| session_id)
+        .collect::<std::collections::HashSet<_>>();
+    if !distinct_subscriptions.contains(&parsed.session_id)
+        && distinct_subscriptions.len() >= MAX_CONNECTION_SUBSCRIPTIONS
+    {
+        return WsReply::err_with_code(
+            id,
+            "SUBSCRIPTION_LIMIT_EXCEEDED",
+            "one connection may subscribe to at most 64 sessions",
+        );
     }
 
     // CAP-1: Reopen the durable session writer before subscribing so every
@@ -3371,10 +5049,25 @@ async fn handle_subscribe(
         .map(|(_, client_id)| *client_id)
         .collect();
 
-    let (client_id, mut rx, replay) = relay.subscribe(&parsed.session_id, parsed.last_seq).await;
+    let connection_client = subscribed_clients.first().map(|(_, client_id)| *client_id);
+    let (client_id, mut receiver, replay) = if let Some(client_id) = connection_client {
+        (
+            client_id,
+            None,
+            relay
+                .subscribe_existing(client_id, &parsed.session_id, parsed.last_seq)
+                .await,
+        )
+    } else {
+        let (client_id, receiver, replay) =
+            relay.subscribe(&parsed.session_id, parsed.last_seq).await;
+        (client_id, Some(receiver), replay)
+    };
     match replay {
         ReplayResult::Stale => {
-            relay.unregister_client(client_id);
+            if connection_client.is_none() {
+                relay.unregister_client(client_id);
+            }
             WsReply::err(
                 id,
                 WsErrorCode::Stale,
@@ -3382,26 +5075,32 @@ async fn handle_subscribe(
             )
         }
         ReplayResult::Ok(replayed) => {
-            subscribed_clients.retain(|(sid, cid)| {
-                if sid == &parsed.session_id && prior_clients.contains(cid) {
-                    relay.unsubscribe(sid, *cid);
-                    false
-                } else {
-                    true
-                }
-            });
+            if connection_client.is_none() {
+                subscribed_clients.retain(|(sid, cid)| {
+                    if sid == &parsed.session_id && prior_clients.contains(cid) {
+                        relay.unsubscribe(sid, *cid);
+                        false
+                    } else {
+                        true
+                    }
+                });
+            } else {
+                subscribed_clients.retain(|(sid, _)| sid != &parsed.session_id);
+            }
             subscribed_clients.push((parsed.session_id.clone(), client_id));
             if let Some(rendezvous) = relay.rendezvous() {
                 rendezvous.cancel_disconnect_grace(&parsed.session_id);
             }
-            let forward_tx = out_tx.clone();
-            tokio::spawn(async move {
-                while let Some(evt) = rx.recv().await {
-                    if forward_tx.send(Outbound::Event(evt)).is_err() {
-                        break;
+            if let Some(mut rx) = receiver.take() {
+                let forward_tx = out_tx.clone();
+                tokio::spawn(async move {
+                    while let Some(event) = rx.recv().await {
+                        if forward_tx.send_event(event).await.is_err() {
+                            break;
+                        }
                     }
-                }
-            });
+                });
+            }
             WsReply::ok(
                 id,
                 Some(json!({
@@ -3667,6 +5366,53 @@ async fn handle_answer_question(
 }
 
 #[cfg(test)]
+pub(crate) async fn dispatch_conversation_golden_request(
+    text: &str,
+    authed: &mut bool,
+    service: &Arc<crate::conversation::ConversationApplicationService>,
+) -> WsReply {
+    let relay = Arc::new(WsRelaySink::new());
+    let acp = Arc::new(AcpManager::new(vec![]));
+    let registry = Arc::new(ProjectRegistry::new());
+    let (out_tx, _out_rx) = outbound_channel();
+    let mut subscribed_clients = Vec::new();
+    let mut current_agent = None;
+    let current_session = Arc::new(parking_lot::Mutex::new(None));
+    let current_conversation = Arc::new(parking_lot::Mutex::new(None));
+    let current_project = Arc::new(parking_lot::Mutex::new(None));
+    let switch_queue = Arc::new(tokio::sync::Mutex::new(ProjectSwitchQueue::default()));
+    let authority = Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token"));
+    let mut principal =
+        (*authed).then(|| authority.verify_bearer("test-remote-access-token").unwrap());
+    handle_request_with_conversation(
+        text,
+        authed,
+        &mut principal,
+        &acp,
+        &relay,
+        &registry,
+        None,
+        None,
+        &out_tx,
+        &mut subscribed_clients,
+        &mut current_agent,
+        &current_session,
+        &current_conversation,
+        &current_project,
+        &switch_queue,
+        HistoryMode::LiveOnly,
+        None,
+        None,
+        None,
+        Some(service),
+        &authority,
+        SocketAddr::from(([127, 0, 0, 1], 3000)),
+        None,
+    )
+    .await
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
@@ -3853,7 +5599,7 @@ mod tests {
         let (release, entered) =
             acp.install_test_agent_with_prompt_gate(AgentId("agent-long".to_string()), sessions);
         let registry = Arc::new(ProjectRegistry::new());
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = outbound_channel();
         let subscriptions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let mut current_agent = None;
         let current_session = Arc::new(parking_lot::Mutex::new(None));
@@ -3982,7 +5728,7 @@ mod tests {
             sessions,
         );
         let registry = Arc::new(ProjectRegistry::new());
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, mut rx) = outbound_channel();
         let subscriptions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let mut current_agent = None;
         let current_session = Arc::new(parking_lot::Mutex::new(None));
@@ -4128,7 +5874,7 @@ mod tests {
         sessions.insert("session-resume".to_string());
         let (release, entered) =
             acp.install_test_agent_with_prompt_gate(AgentId("agent-resume".to_string()), sessions);
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = outbound_channel();
         let subscriptions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent = None;
@@ -4212,7 +5958,7 @@ mod tests {
     ) -> WsReply {
         let relay = Arc::new(WsRelaySink::new());
         let acp = Arc::new(AcpManager::new(vec![]));
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut subs = Vec::new();
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent: Option<AgentId> = None;
@@ -4314,7 +6060,7 @@ mod tests {
     async fn handle_request_without_catalog(text: &str) -> WsReply {
         let relay = Arc::new(WsRelaySink::new());
         let acp = Arc::new(AcpManager::new(vec![]));
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut subs = Vec::new();
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent: Option<AgentId> = None;
@@ -4393,7 +6139,7 @@ mod tests {
     async fn handle_request_with_store(text: &str, store: &Arc<WebStore>) -> WsReply {
         let relay = Arc::new(WsRelaySink::new());
         let acp = Arc::new(AcpManager::new(vec![]));
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut subs = Vec::new();
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent: Option<AgentId> = None;
@@ -4464,7 +6210,8 @@ mod tests {
 
     #[tokio::test]
     async fn store_read_missing_key_returns_null_value() {
-        let dir = std::env::temp_dir().join(format!("termul-ws-store-miss-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("termul-ws-store-miss-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = Arc::new(WebStore::open(dir.join("store.json")));
         let reply = handle_request_with_store(
@@ -4473,13 +6220,17 @@ mod tests {
         )
         .await;
         assert!(reply.ok, "missing key is not an error: {:?}", reply.err);
-        assert_eq!(reply.payload.as_ref().and_then(|p| p.get("value")), Some(&Value::Null));
+        assert_eq!(
+            reply.payload.as_ref().and_then(|p| p.get("value")),
+            Some(&Value::Null)
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
     async fn store_delete_removes_and_reports_existed() {
-        let dir = std::env::temp_dir().join(format!("termul-ws-store-del-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("termul-ws-store-del-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = Arc::new(WebStore::open(dir.join("store.json")));
         store.write("k", json!("v"), None).unwrap();
@@ -4490,7 +6241,10 @@ mod tests {
         )
         .await;
         assert!(del.ok, "delete ok: {:?}", del.err);
-        assert_eq!(del.payload.as_ref().and_then(|p| p.get("existed")), Some(&json!(true)));
+        assert_eq!(
+            del.payload.as_ref().and_then(|p| p.get("existed")),
+            Some(&json!(true))
+        );
         assert_eq!(store.read("k").unwrap(), None);
 
         let del2 = handle_request_with_store(
@@ -4498,8 +6252,15 @@ mod tests {
             &store,
         )
         .await;
-        assert!(del2.ok, "delete of missing key is not an error: {:?}", del2.err);
-        assert_eq!(del2.payload.as_ref().and_then(|p| p.get("existed")), Some(&json!(false)));
+        assert!(
+            del2.ok,
+            "delete of missing key is not an error: {:?}",
+            del2.err
+        );
+        assert_eq!(
+            del2.payload.as_ref().and_then(|p| p.get("existed")),
+            Some(&json!(false))
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -4520,15 +6281,14 @@ mod tests {
 
     #[tokio::test]
     async fn store_malformed_payload_returns_validation_error() {
-        let dir = std::env::temp_dir().join(format!("termul-ws-store-bad-{}", uuid::Uuid::new_v4()));
+        let dir =
+            std::env::temp_dir().join(format!("termul-ws-store-bad-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = Arc::new(WebStore::open(dir.join("store.json")));
         // Missing `key` fails the payload serde.
-        let reply = handle_request_with_store(
-            r#"{"id":"r1","type":"store_read","payload":{}}"#,
-            &store,
-        )
-        .await;
+        let reply =
+            handle_request_with_store(r#"{"id":"r1","type":"store_read","payload":{}}"#, &store)
+                .await;
         assert!(!reply.ok);
         assert_eq!(reply.err.as_ref().unwrap().code, "VALIDATION_ERROR");
         // store_write without a `value` also fails serde.
@@ -4689,6 +6449,29 @@ mod tests {
         assert!(!is_os_fulfilled_cap("unknown/cap"));
     }
 
+    #[tokio::test]
+    async fn sixty_fifth_distinct_subscription_is_rejected_before_allocation() {
+        let relay = Arc::new(WsRelaySink::new());
+        let (tx, _rx) = outbound_channel();
+        let shared_client = ClientId::new();
+        let mut subscriptions = (0..MAX_CONNECTION_SUBSCRIPTIONS)
+            .map(|ordinal| (format!("session-{ordinal}"), shared_client))
+            .collect::<Vec<_>>();
+        let before = relay.auxiliary_stats();
+        let reply = handle_subscribe(
+            "subscribe-65".to_string(),
+            &json!({"sessionId":"session-64"}),
+            &relay,
+            &tx,
+            &mut subscriptions,
+        )
+        .await;
+        assert!(!reply.ok);
+        assert_eq!(reply.err.unwrap().code, "SUBSCRIPTION_LIMIT_EXCEEDED");
+        assert_eq!(relay.auxiliary_stats(), before);
+        assert_eq!(subscriptions.len(), MAX_CONNECTION_SUBSCRIPTIONS);
+    }
+
     #[test]
     fn human_cap_boundary() {
         assert!(is_human_relayed_cap("request_permission"));
@@ -4728,6 +6511,112 @@ mod tests {
         // Payload is passed through verbatim (camelCase preserved — AC3).
         assert_eq!(v["payload"]["agentId"], "a1");
         assert_eq!(v["payload"]["sessionId"], "sess-1");
+    }
+
+    #[tokio::test]
+    async fn ws_conversation_delete_retires_on_success_and_retains_on_blocked_or_error() {
+        use crate::conversation::{
+            ConversationLifecycleAction, ConversationLifecycleErrorCode,
+            ConversationLifecycleOutcome, ConversationLifecycleState,
+        };
+        let relay = WsRelaySink::new();
+        let conversation_id = crate::conversation::ConversationId::new_v4();
+        relay.turn_watermark().mark_seen("ws-delete", "turn-1");
+        let blocked = ConversationLifecycleOutcome::Blocked {
+            action: ConversationLifecycleAction::DeleteConversation,
+            conversation_id,
+            revision: 4,
+            code: ConversationLifecycleErrorCode::ConversationLiveResources,
+            blockers: Vec::new(),
+        };
+        retire_ws_deleted_binding_if_updated(&relay, Some("ws-delete"), &blocked)
+            .await
+            .unwrap();
+        assert!(relay.turn_watermark().is_seen("ws-delete", "turn-1"));
+        let simulated_error: Result<(), &str> = Err("delete failed");
+        assert!(simulated_error.is_err());
+        assert!(relay.turn_watermark().is_seen("ws-delete", "turn-1"));
+        let updated = ConversationLifecycleOutcome::Updated {
+            action: ConversationLifecycleAction::DeleteConversation,
+            conversation_id,
+            previous_revision: 4,
+            revision: 5,
+            workspace_cwd: "/opaque/workspace".to_string(),
+            lifecycle_state: ConversationLifecycleState::Deleted,
+            current_binding: None,
+            previous_agent_session_id: Some("ws-delete".to_string()),
+        };
+        retire_ws_deleted_binding_if_updated(&relay, Some("ws-delete"), &updated)
+            .await
+            .unwrap();
+        assert!(!relay.turn_watermark().is_seen("ws-delete", "turn-1"));
+    }
+
+    #[tokio::test]
+    async fn ws_close_retires_on_success_and_retains_on_error() {
+        let relay = WsRelaySink::new();
+        relay.turn_watermark().mark_seen("ws-close", "turn-1");
+        let close_result: Result<(), &str> = Err("close failed");
+        assert!(close_result.is_err());
+        assert!(relay.turn_watermark().is_seen("ws-close", "turn-1"));
+        relay.retire_session("ws-close").await.unwrap();
+        assert!(!relay.turn_watermark().is_seen("ws-close", "turn-1"));
+    }
+
+    #[tokio::test]
+    async fn ws_ephemeral_dispose_retires_on_success_and_retains_on_error() {
+        let relay = WsRelaySink::new();
+        relay.turn_watermark().mark_seen("ws-ephemeral", "turn-1");
+        let dispose_result: Result<(), &str> = Err("dispose failed");
+        assert!(dispose_result.is_err());
+        assert!(relay.turn_watermark().is_seen("ws-ephemeral", "turn-1"));
+        relay.retire_session("ws-ephemeral").await.unwrap();
+        assert!(!relay.turn_watermark().is_seen("ws-ephemeral", "turn-1"));
+    }
+
+    #[test]
+    fn generation_revocation_sends_only_reauthentication_required_without_credential_and_closes() {
+        let authority = RemoteAccessAuthority::for_tests("first-generation-token");
+        let first = authority.verify_bearer("first-generation-token").unwrap();
+        let generation_rx = authority.subscribe_generation();
+        let rotated = authority.rotate_desktop_credential().unwrap();
+        let current = *generation_rx.borrow();
+        assert!(generation_requires_reauthentication(
+            first.generation(),
+            current
+        ));
+        assert!(authority
+            .authorize(&first, RemoteCapability::Connect)
+            .is_err());
+
+        let event = reauthentication_required_event();
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert_eq!(event.type_, "reauthentication_required");
+        assert_eq!(event.payload, json!({"code":"REAUTHENTICATION_REQUIRED"}));
+        for forbidden in [
+            "first-generation-token",
+            rotated.bearer(),
+            "access_url",
+            "accessUrl",
+            "bearer",
+            "pairing",
+            "QRCode",
+        ] {
+            assert!(!encoded.contains(forbidden));
+        }
+        let source = include_str!("ws.rs");
+        let branch = source
+            .split("generation_requires_reauthentication(authenticated, current)")
+            .nth(1)
+            .unwrap()
+            .split("() = write_disconnect.notified()")
+            .next()
+            .unwrap();
+        assert_eq!(
+            branch.matches("reauthentication_required_event()").count(),
+            1
+        );
+        assert_eq!(branch.matches("Message::Close(None)").count(), 1);
     }
 
     #[test]
@@ -4833,7 +6722,7 @@ mod tests {
         // manager (`vec![]` sinks) returns fast `Err`s for the ACP command
         // methods (no agent spawned) which the handlers map to `WsErrorCode`.
         let acp = Arc::new(AcpManager::new(vec![]));
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut subs = Vec::new();
         // Epic-4 bridge: `handle_request` now also takes the project registry +
         // per-connection agent/session tracking (for `switch_project`). The
@@ -4883,14 +6772,87 @@ mod tests {
     }
 
     #[test]
-    fn handle_request_authenticate_marks_authed() {
+    fn authentication_valid_token_marks_connection_authed() {
         let mut authed = false;
         let reply = handle_sync(
-            r#"{"id":"r1","type":"authenticate","payload":{"token":"any"}}"#,
+            r#"{"id":"r1","type":"authenticate","payload":{"token":"test-remote-access-token"}}"#,
             &mut authed,
         );
         assert!(reply.ok);
         assert!(authed, "authenticate must flip authed");
+    }
+
+    #[test]
+    fn authentication_missing_and_wrong_tokens_are_rejected() {
+        for frame in [
+            r#"{"id":"missing","type":"authenticate","payload":{}}"#,
+            r#"{"id":"empty","type":"authenticate","payload":{"token":""}}"#,
+            r#"{"id":"wrong","type":"authenticate","payload":{"token":"wrong"}}"#,
+        ] {
+            let mut authed = false;
+            let reply = handle_sync(frame, &mut authed);
+            assert!(!reply.ok);
+            assert_eq!(reply.err.unwrap().code, "UNAUTHORIZED");
+            assert!(!authed);
+        }
+    }
+
+    #[tokio::test]
+    async fn authentication_sixth_failed_attempt_is_rate_limited_before_dispatch() {
+        let relay = Arc::new(WsRelaySink::new());
+        let acp = Arc::new(AcpManager::new(vec![]));
+        let registry = Arc::new(ProjectRegistry::new());
+        let (tx, _rx) = outbound_channel();
+        let mut subscriptions = Vec::new();
+        let mut current_agent = None;
+        let current_session = Arc::new(parking_lot::Mutex::new(None));
+        let current_conversation = Arc::new(parking_lot::Mutex::new(None));
+        let current_project = Arc::new(parking_lot::Mutex::new(None));
+        let switch_queue = Arc::new(tokio::sync::Mutex::new(ProjectSwitchQueue::default()));
+        let authority = Arc::new(RemoteAccessAuthority::for_tests("expected-token"));
+        let peer = SocketAddr::from(([192, 0, 2, 44], 3000));
+        let mut authed = false;
+        let mut principal = None;
+
+        for attempt in 1..=6 {
+            let reply = handle_request_with_conversation(
+                &format!(
+                    r#"{{"id":"auth-{attempt}","type":"authenticate","payload":{{"token":"wrong"}}}}"#
+                ),
+                &mut authed,
+                &mut principal,
+                &acp,
+                &relay,
+                &registry,
+                None,
+                None,
+                &tx,
+                &mut subscriptions,
+                &mut current_agent,
+                &current_session,
+                &current_conversation,
+                &current_project,
+                &switch_queue,
+                HistoryMode::LiveOnly,
+                None,
+                None,
+                None,
+                None,
+                &authority,
+                peer,
+                None,
+            )
+            .await;
+            assert_eq!(
+                reply.err.unwrap().code,
+                if attempt == 6 {
+                    "RATE_LIMITED"
+                } else {
+                    "UNAUTHORIZED"
+                }
+            );
+            assert!(!authed);
+        }
     }
 
     #[test]
@@ -4982,8 +6944,14 @@ mod tests {
     fn peer_frame_type_extracts_background_and_foreground() {
         // CAP-3: id-less lifecycle frames are recognized by `type` without a
         // strict `WsRequest` parse (which requires `id`).
-        assert_eq!(peer_frame_type(r#"{"type":"background"}"#).as_deref(), Some("background"));
-        assert_eq!(peer_frame_type(r#"{"type":"foreground"}"#).as_deref(), Some("foreground"));
+        assert_eq!(
+            peer_frame_type(r#"{"type":"background"}"#).as_deref(),
+            Some("background")
+        );
+        assert_eq!(
+            peer_frame_type(r#"{"type":"foreground"}"#).as_deref(),
+            Some("foreground")
+        );
         // Normal ACP request frames still report their type (dispatched below).
         assert_eq!(
             peer_frame_type(r#"{"id":"p1","type":"send_prompt","payload":{}}"#).as_deref(),
@@ -5001,13 +6969,28 @@ mod tests {
         // normal request frame is NOT consumed (dispatched).
         let flag = Arc::new(AtomicBool::new(false));
         // Unauthed background: consumed, no flag set.
-        assert!(handle_lifecycle_signal(r#"{"type":"background"}"#, false, &flag));
-        assert!(!flag.load(Ordering::Relaxed), "unauthed background does not set flag");
+        assert!(handle_lifecycle_signal(
+            r#"{"type":"background"}"#,
+            false,
+            &flag
+        ));
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "unauthed background does not set flag"
+        );
         // Authed background: consumed, flag set.
-        assert!(handle_lifecycle_signal(r#"{"type":"background"}"#, true, &flag));
+        assert!(handle_lifecycle_signal(
+            r#"{"type":"background"}"#,
+            true,
+            &flag
+        ));
         assert!(flag.load(Ordering::Relaxed), "authed background sets flag");
         // Authed foreground: consumed, flag cleared.
-        assert!(handle_lifecycle_signal(r#"{"type":"foreground"}"#, true, &flag));
+        assert!(handle_lifecycle_signal(
+            r#"{"type":"foreground"}"#,
+            true,
+            &flag
+        ));
         assert!(!flag.load(Ordering::Relaxed), "foreground clears flag");
         // Normal request frame: NOT consumed (returns false) — dispatched.
         assert!(!handle_lifecycle_signal(
@@ -5057,6 +7040,7 @@ mod tests {
             "set_config_option",
             "spawn_agent",
             "kill_agent",
+            "set_permission_policy",
             "switch_project",
         ] {
             let reply = handle_sync(
@@ -5186,7 +7170,7 @@ mod tests {
         let acp = Arc::new(AcpManager::new(vec![]));
         let relay = Arc::new(WsRelaySink::new());
         let registry = Arc::new(ProjectRegistry::new());
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut subs: Vec<(String, ClientId)> = Vec::new();
         let mut current_agent: Option<AgentId> = None;
         let current_session = Arc::new(parking_lot::Mutex::new(None::<SessionId>));
@@ -5206,11 +7190,11 @@ mod tests {
             &mut current_agent,
             &current_session,
             &current_project,
-            &switch_queue,                HistoryMode::LiveOnly,
-                None,
-                Some(&store),
-                None,
-
+            &switch_queue,
+            HistoryMode::LiveOnly,
+            None,
+            Some(&store),
+            None,
         )
         .await;
         assert!(!reply.ok, "unknown agent must fail");
@@ -5376,7 +7360,7 @@ mod tests {
         relay.set_rendezvous(Arc::new(
             crate::web::permissions::PermissionRendezvous::default(),
         ));
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut subs = Vec::new();
         let mut authed = true;
         let registry = Arc::new(ProjectRegistry::new());
@@ -5438,17 +7422,19 @@ mod tests {
                 .map(|id| serde_json::json!({ "optionId": id, "name": id, "kind": "auto" }))
                 .collect(),
         );
-        relay.emit(&AcpEvent {
-            sid: Some(session_id.to_string()),
-            type_: "acp:permission_request",
-            payload: serde_json::json!({
-                "agentId": agent_id,
-                "sessionId": session_id,
-                "requestId": request_id,
-                "toolCall": { "toolCallId": "tc-1" },
-                "options": options_value,
-            }),
-        });
+        relay
+            .emit(&AcpEvent {
+                sid: Some(session_id.to_string()),
+                type_: "acp:permission_request",
+                payload: serde_json::json!({
+                    "agentId": agent_id,
+                    "sessionId": session_id,
+                    "requestId": request_id,
+                    "toolCall": { "toolCallId": "tc-1" },
+                    "options": options_value,
+                }),
+            })
+            .expect("permission request relay admission");
         (relay, subs)
     }
 
@@ -5467,7 +7453,7 @@ mod tests {
     fn handle_respond_permission_wrong_agent_is_permission_denied() {
         let (relay, subs) = relay_with_subscribed_permission("a1", "sess-1", "perm-1", &["allow"]);
         let acp = Arc::new(AcpManager::new(vec![]));
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut authed = true;
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -5511,15 +7497,17 @@ mod tests {
         ));
         let (_other_client, _rx, _replay) = block_on(relay.subscribe("sess-B", None));
         let subs: Vec<(String, ClientId)> = vec![("sess-B".to_string(), ClientId::new())];
-        relay.emit(&AcpEvent {
-            sid: Some("sess-A".to_string()),
-            type_: "acp:permission_request",
-            payload: serde_json::json!({
-                "agentId": "a1", "sessionId": "sess-A", "requestId": "perm-A",
-                "toolCall": { "toolCallId": "tc-1" }, "options": [{ "optionId": "allow" }]
-            }),
-        });
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        relay
+            .emit(&AcpEvent {
+                sid: Some("sess-A".to_string()),
+                type_: "acp:permission_request",
+                payload: serde_json::json!({
+                    "agentId": "a1", "sessionId": "sess-A", "requestId": "perm-A",
+                    "toolCall": { "toolCallId": "tc-1" }, "options": [{ "optionId": "allow" }]
+                }),
+            })
+            .expect("permission request relay admission");
+        let (tx, _rx) = outbound_channel();
         let mut authed = true;
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -5557,7 +7545,7 @@ mod tests {
     fn handle_respond_permission_resolves_then_second_is_stale() {
         let (relay, subs) = relay_with_subscribed_permission("a1", "sess-1", "perm-1", &["allow"]);
         let acp = Arc::new(AcpManager::new(vec![]));
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut authed = true;
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -5615,7 +7603,7 @@ mod tests {
         let (relay, subs) =
             relay_with_subscribed_permission("a1", "sess-1", "perm-1", &["allow", "deny"]);
         let acp = Arc::new(AcpManager::new(vec![]));
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut authed = true;
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -5668,17 +7656,19 @@ mod tests {
                 .map(|v| serde_json::json!({ "value": v, "label": v }))
                 .collect(),
         );
-        relay.emit(&AcpEvent {
-            sid: Some(session_id.to_string()),
-            type_: "acp:question_request",
-            payload: serde_json::json!({
-                "agentId": agent_id,
-                "sessionId": session_id,
-                "questionId": question_id,
-                "question": "Which approach?",
-                "options": options_value,
-            }),
-        });
+        relay
+            .emit(&AcpEvent {
+                sid: Some(session_id.to_string()),
+                type_: "acp:question_request",
+                payload: serde_json::json!({
+                    "agentId": agent_id,
+                    "sessionId": session_id,
+                    "questionId": question_id,
+                    "question": "Which approach?",
+                    "options": options_value,
+                }),
+            })
+            .expect("question request relay admission");
         (relay, subs)
     }
 
@@ -5704,7 +7694,7 @@ mod tests {
             crate::web::permissions::QuestionRendezvous::default(),
         ));
         let acp = Arc::new(AcpManager::new(vec![]));
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut authed = true;
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -5741,7 +7731,7 @@ mod tests {
     fn handle_answer_question_wrong_agent_is_permission_denied() {
         let (relay, subs) = relay_with_subscribed_question("a1", "sess-1", "q-1", &["plan-a"]);
         let acp = Arc::new(AcpManager::new(vec![]));
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut authed = true;
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -5783,15 +7773,17 @@ mod tests {
         ));
         let (_other_client, _rx, _replay) = block_on(relay.subscribe("sess-B", None));
         let subs: Vec<(String, ClientId)> = vec![("sess-B".to_string(), ClientId::new())];
-        relay.emit(&AcpEvent {
-            sid: Some("sess-A".to_string()),
-            type_: "acp:question_request",
-            payload: serde_json::json!({
-                "agentId": "a1", "sessionId": "sess-A", "questionId": "q-A",
-                "question": "Q", "options": [{ "value": "plan-a", "label": "Plan A" }]
-            }),
-        });
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        relay
+            .emit(&AcpEvent {
+                sid: Some("sess-A".to_string()),
+                type_: "acp:question_request",
+                payload: serde_json::json!({
+                    "agentId": "a1", "sessionId": "sess-A", "questionId": "q-A",
+                    "question": "Q", "options": [{ "value": "plan-a", "label": "Plan A" }]
+                }),
+            })
+            .expect("question request relay admission");
+        let (tx, _rx) = outbound_channel();
         let mut authed = true;
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -5828,7 +7820,7 @@ mod tests {
     fn handle_answer_question_resolves_then_second_is_stale() {
         let (relay, subs) = relay_with_subscribed_question("a1", "sess-1", "q-1", &["plan-a"]);
         let acp = Arc::new(AcpManager::new(vec![]));
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut authed = true;
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -5884,7 +7876,7 @@ mod tests {
     fn handle_answer_question_invalid_option_is_permission_denied() {
         let (relay, subs) = relay_with_subscribed_question("a1", "sess-1", "q-1", &["plan-a"]);
         let acp = Arc::new(AcpManager::new(vec![]));
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut authed = true;
         let registry = Arc::new(ProjectRegistry::new());
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -5930,14 +7922,16 @@ mod tests {
         // means after 3 emits base advances. Use subscribe with huge last_seq gap.
         use crate::web::sink::{AcpEvent, EventSink};
         for i in 1..=3 {
-            relay.emit(&AcpEvent {
-                sid: Some("s1".to_string()),
-                type_: "acp:message_chunk",
-                payload: json!({"i": i}),
-            });
+            relay
+                .emit(&AcpEvent {
+                    sid: Some("s1".to_string()),
+                    type_: "acp:message_chunk",
+                    payload: json!({"i": i}),
+                })
+                .expect("message chunk relay admission");
         }
         // Evicted seq 1; last_seq=0 → next wanted 1 < base → Stale
-        let (tx, mut rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, mut rx) = outbound_channel();
         let mut subs = Vec::new();
         let mut authed = true;
         let registry = Arc::new(ProjectRegistry::new());
@@ -6080,7 +8074,7 @@ mod tests {
             }],
             None,
         );
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut subs = Vec::new();
         let mut authed = true;
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -6140,7 +8134,7 @@ mod tests {
             }],
             Some("p-1".to_string()),
         );
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut subs = Vec::new();
         let mut authed = true;
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -6257,7 +8251,7 @@ mod tests {
             }],
             Some("p-1".to_string()),
         );
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut subs = Vec::new();
         let mut authed = true;
         let mut current_agent: Option<crate::acp::AgentId> = Some(crate::acp::AgentId::new());
@@ -6831,7 +8825,7 @@ mod tests {
             )
             .await;
             assert!(!reply.ok, "{bad} should be rejected");
-            assert_eq!(reply.err.unwrap().code, "not_found");
+            assert_eq!(reply.err.unwrap().code, operation_policy::NOT_FOUND);
             // Default unchanged.
             assert_eq!(
                 registry.snapshot().default_project_id.as_deref(),
@@ -7008,7 +9002,7 @@ mod tests {
         let (_client_a, mut rx_a, _replay_a) = relay.subscribe("sess-a", None).await;
         let (_client_b, mut rx_b, _replay_b) = relay.subscribe("sess-b", None).await;
 
-        let (tx, _rx) = mpsc::unbounded_channel::<Outbound>();
+        let (tx, _rx) = outbound_channel();
         let mut subs = Vec::new();
         let mut authed = true;
         let mut current_agent: Option<crate::acp::AgentId> = None;
@@ -7125,11 +9119,441 @@ mod tests {
         assert!(leaked.is_none(), "switch must not write the projects file");
     }
 
+    mod conversation_application {
+        use super::*;
+        use crate::conversation::contracts::{
+            parse_created_at_utc, ConversationCreator, ConversationLifecycleState,
+            ConversationRecordV2, CreationPartition, ExecutionTarget, CONVERSATION_SCHEMA_VERSION,
+        };
+        use crate::conversation::migration::{
+            CreatedAtSource, IdentityDecision, MigrationHostMode, MigrationMapEntryV1,
+            MigrationMapV1, MigrationPhase, ReaderPrecedence, RecoveryItemV1, RecoveryKind,
+            RecoveryProvenanceV1, RecoveryQueueV1, RecoverySeverity, MIGRATION_MAP_SCHEMA_VERSION,
+        };
+        use crate::conversation::{
+            ConversationApplicationService, ConversationId, ConversationMutation,
+            ConversationReader, ConversationRepository, ConversationWriteAuthority,
+            ConversationWriter, LegacyConversationReader, SessionWorkspaceService,
+        };
+
+        const ID: &str = "018f7a1c-1b4d-7c8a-9f01-0123456789ab";
+
+        async fn fixture(
+            precedence: ReaderPrecedence,
+        ) -> (
+            tempfile::TempDir,
+            Arc<ConversationRepository>,
+            Arc<ConversationApplicationService>,
+        ) {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp
+                .path()
+                .canonicalize()
+                .unwrap()
+                .join("state/conversations/v2");
+            let (repository, _) = ConversationRepository::open(root).unwrap();
+            let seed_writer = ConversationWriter::for_test(Arc::clone(&repository));
+            let conversation_id = ConversationId::parse(ID).unwrap();
+            let created_at = parse_created_at_utc("2026-08-15T09:45:15.123Z").unwrap();
+            seed_writer
+                .create_conversation(
+                    ConversationRecordV2 {
+                        schema_version: CONVERSATION_SCHEMA_VERSION,
+                        conversation_id,
+                        created_at_utc: created_at,
+                        creation_partition: CreationPartition::from_created_at(created_at),
+                        workspace_cwd: "/visible/conversation".to_string(),
+                        execution_target: ExecutionTarget::Workspace,
+                        project_attachment: None,
+                        lifecycle_state: ConversationLifecycleState::Ready,
+                        last_seq: 0,
+                        created_by: ConversationCreator::Termul,
+                        title: None,
+                        title_source: None,
+                    },
+                    ConversationMutation::CreateConversation,
+                )
+                .await
+                .unwrap();
+            let migration_map = MigrationMapV1 {
+                schema_version: MIGRATION_MAP_SCHEMA_VERSION,
+                operation_id: uuid::Uuid::new_v4(),
+                entries: vec![MigrationMapEntryV1 {
+                    source_key: "legacy_chat_history:0:payloads/history-one.json".to_string(),
+                    legacy_storage_key: Some("storage-one".to_string()),
+                    legacy_agent_session_id: Some("agent-one".to_string()),
+                    conversation_id,
+                    identity_decision: IdentityDecision::AllocatedInvalidUuid,
+                    created_at_source: Some(CreatedAtSource::HostMetadata),
+                    source_record_sha256: "a".repeat(64),
+                }],
+            };
+            let reader = Arc::new(ConversationReader::new(
+                Arc::clone(&repository),
+                LegacyConversationReader::default(),
+                precedence,
+            ));
+            let authority = Arc::new(ConversationWriteAuthority::new(
+                repository.as_ref(),
+                precedence,
+                migration_map
+                    .entries
+                    .iter()
+                    .map(|entry| entry.conversation_id),
+            ));
+            let writer =
+                Arc::new(ConversationWriter::new(Arc::clone(&repository), authority).unwrap());
+            let workspace = Arc::new(SessionWorkspaceService::new(Arc::clone(&writer)));
+            let service = Arc::new(ConversationApplicationService::new(
+                reader,
+                writer,
+                workspace,
+                &migration_map,
+                MigrationHostMode::Standalone,
+                if precedence == ReaderPrecedence::HybridLegacyFirst {
+                    MigrationPhase::RolledBack
+                } else {
+                    MigrationPhase::Finalized
+                },
+                precedence,
+            ));
+            (temp, repository, service)
+        }
+
+        fn seed_recovery(
+            repository: &ConversationRepository,
+        ) -> crate::conversation::migration::RecoveryItemV1 {
+            let item = RecoveryItemV1::new(
+                RecoveryKind::AmbiguousWorkspaceManifest,
+                RecoverySeverity::Warning,
+                vec!["legacy_workspace_manifests/0/shared.json".to_string()],
+                vec![ConversationId::parse(ID).unwrap()],
+                vec!["e".repeat(64)],
+                vec![json!({"candidate":"preserved"})],
+                vec![RecoveryProvenanceV1 {
+                    source_kind: "legacy_workspace_manifests".to_string(),
+                    relative_path: "legacy_workspace_manifests/0/shared.json".to_string(),
+                    sha256: "e".repeat(64),
+                    preserved_read_only: true,
+                }],
+            );
+            let state_root = repository
+                .root()
+                .parent()
+                .and_then(std::path::Path::parent)
+                .unwrap();
+            let operation_dir = state_root
+                .join("conversation-migrations")
+                .join("workspace-recovery-v1");
+            RecoveryQueueV1::new(uuid::Uuid::new_v4(), vec![item.clone()])
+                .persist(&operation_dir)
+                .unwrap();
+            item
+        }
+
+        #[tokio::test]
+        async fn conversation_reads_legacy_resolution_and_current_conversation_are_canonical() {
+            let (_temp, _repository, service) = fixture(ReaderPrecedence::ConversationV2Only).await;
+            let current = Arc::new(parking_lot::Mutex::new(None));
+
+            for (source_kind, value) in [
+                ("legacyStorageKey", "storage-one"),
+                ("legacyAgentSessionId", "agent-one"),
+                ("legacyChatHistoryId", "history-one"),
+            ] {
+                let reply = handle_conversation_application(
+                    "legacy".to_string(),
+                    "resolve_legacy_conversation_id",
+                    &json!({"sourceKind":source_kind,"value":value}),
+                    Some(&service),
+                    &current,
+                )
+                .await;
+                assert!(reply.ok, "{source_kind}: {:?}", reply.err);
+                assert_eq!(
+                    reply.payload.unwrap()["canonicalRoute"],
+                    format!("#/c/{ID}")
+                );
+            }
+
+            let open = handle_conversation_application(
+                "open".to_string(),
+                "open_conversation",
+                &json!({"conversationId":ID}),
+                Some(&service),
+                &current,
+            )
+            .await;
+            assert!(open.ok, "open: {:?}", open.err);
+            assert_eq!(
+                current.lock().as_ref().map(ToString::to_string).as_deref(),
+                Some(ID)
+            );
+
+            let missing = handle_conversation_application(
+                "missing".to_string(),
+                "resolve_legacy_conversation_id",
+                &json!({"sourceKind":"legacyStorageKey","value":"missing"}),
+                Some(&service),
+                &current,
+            )
+            .await;
+            assert_eq!(missing.err.unwrap().code, "CONVERSATION_NOT_FOUND");
+        }
+
+        #[tokio::test]
+        async fn conversation_recovery_actions_keep_exact_camel_case_and_immutable_sources() {
+            let cases = [
+                ("inspect", json!({}), None),
+                (
+                    "associateConversation",
+                    json!({"conversationId":ID}),
+                    Some("21aee10a-56b8-4624-a5e7-586c25dc8d1f"),
+                ),
+                (
+                    "startEmptyWorkspace",
+                    json!({"conversationId":ID,"expectedWorkspaceRevision":null}),
+                    Some("d70c2b93-71bc-4df0-85a5-15bd1b7cf452"),
+                ),
+                (
+                    "dismissPreservedSource",
+                    json!({"reasonCode":"deferLegacyProjection"}),
+                    Some("b025313d-df5d-4254-af4f-535b47ea570f"),
+                ),
+            ];
+            for (action, payload, idempotency_key) in cases {
+                let (_temp, repository, service) =
+                    fixture(ReaderPrecedence::ConversationV2Only).await;
+                let item = seed_recovery(&repository);
+                let mut request = json!({
+                    "recoveryId":item.recovery_id,
+                    "expectedRevision":item.revision,
+                    "action":action,
+                    "payload":payload
+                });
+                if let Some(key) = idempotency_key {
+                    request
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("idempotencyKey".to_string(), json!(key));
+                }
+                let current = Arc::new(parking_lot::Mutex::new(None));
+                let reply = handle_conversation_application(
+                    action.to_string(),
+                    "resolve_recovery_item",
+                    &request,
+                    Some(&service),
+                    &current,
+                )
+                .await;
+                assert!(reply.ok, "{action}: {:?}", reply.err);
+                let result = reply.payload.unwrap();
+                assert_eq!(result["action"], action);
+                assert_eq!(result["sourcePaths"], json!(item.source_paths));
+                assert_eq!(result["sourceSha256"], json!(item.source_sha256));
+            }
+        }
+
+        #[tokio::test]
+        async fn conversation_requests_require_ws_authentication_before_service_dispatch() {
+            let (_temp, _repository, service) = fixture(ReaderPrecedence::ConversationV2Only).await;
+            let acp = Arc::new(AcpManager::new(vec![]));
+            let relay = Arc::new(WsRelaySink::new());
+            let registry = Arc::new(ProjectRegistry::new());
+            let (tx, _rx) = outbound_channel();
+            let mut subscriptions = Vec::new();
+            let mut current_agent = None;
+            let current_session = Arc::new(parking_lot::Mutex::new(None));
+            let current_conversation = Arc::new(parking_lot::Mutex::new(None));
+            let current_project = Arc::new(parking_lot::Mutex::new(None));
+            let switch_queue = Arc::new(tokio::sync::Mutex::new(ProjectSwitchQueue::default()));
+            let mut authed = false;
+            let mut principal = None;
+            let reply = handle_request_with_conversation(
+                r#"{"id":"legacy","type":"resolve_legacy_conversation_id","payload":{"sourceKind":"legacyStorageKey","value":"storage-one"}}"#,
+                &mut authed,
+                &mut principal,
+                &acp,
+                &relay,
+                &registry,
+                None,
+                None,
+                &tx,
+                &mut subscriptions,
+                &mut current_agent,
+                &current_session,
+                &current_conversation,
+                &current_project,
+                &switch_queue,
+                HistoryMode::LiveOnly,
+                None,
+                None,
+                None,
+                Some(&service),
+                &Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token")),
+                SocketAddr::from(([127, 0, 0, 1], 3000)),
+                None,
+            )
+            .await;
+            assert_eq!(reply.err.unwrap().code, "UNAUTHORIZED");
+        }
+
+        #[tokio::test]
+        async fn conversation_mutation_of_mapped_legacy_id_is_read_only() {
+            let (_temp, _repository, service) = fixture(ReaderPrecedence::HybridLegacyFirst).await;
+            let relay = Arc::new(WsRelaySink::new());
+            let reply = handle_conversation_lifecycle_with_service(
+                "detach".to_string(),
+                &json!({"conversationId":ID,"expectedRevision":0}),
+                Some(&service),
+                &relay,
+                ConversationWsMutation::Detach,
+            )
+            .await;
+            assert_eq!(reply.err.unwrap().code, "LEGACY_COMPATIBILITY_READ_ONLY");
+        }
+    }
+
     /// P17 — `connection_already_on_project` gate: when the connection's
     /// `current_project` already matches the target, the switch returns early
     /// (a no-op `Completed` with the previous session). The cold-tab test
     /// (`execute_cold_tab_select_is_per_connection_no_persistence_no_broadcast`)
     /// covers the non-matching path; this test pins the matching path.
+    mod conversation_lifecycle {
+        use super::*;
+        use crate::conversation::contracts::{
+            parse_created_at_utc, AgentSessionBinding, AgentSessionBindingState,
+            ConversationCreator, ConversationLifecycleState, ConversationRecordV2,
+            CreationPartition, ExecutionTarget, AGENT_SESSION_BINDING_SCHEMA_VERSION,
+            CONVERSATION_SCHEMA_VERSION,
+        };
+        use crate::conversation::{
+            ConversationCreationService, ConversationLocator, ConversationMutation,
+            ConversationPersistenceAdapter, ConversationReader, ConversationRepository,
+            ConversationWriter, LegacyConversationReader, ReaderPrecedence,
+            SessionWorkspaceLocator,
+        };
+
+        const ID: &str = "018f7a1c-1b4d-7c8a-9f01-0123456789ab";
+
+        async fn fixture() -> (
+            tempfile::TempDir,
+            Arc<AcpManager>,
+            Arc<crate::pty::PtyManager>,
+            Arc<WsRelaySink>,
+            u64,
+        ) {
+            let temp = tempfile::tempdir().unwrap();
+            let base = temp.path().canonicalize().unwrap();
+            let private = base.join("private");
+            let visible = base.join("visible");
+            std::fs::create_dir_all(&visible).unwrap();
+            let (repository, _) = ConversationRepository::open(private.clone()).unwrap();
+            let writer = ConversationWriter::for_test(Arc::clone(&repository));
+            let conversation_id = crate::conversation::ConversationId::parse(ID).unwrap();
+            let created_at = parse_created_at_utc("2026-08-15T09:45:15.123Z").unwrap();
+            let workspace = visible.join("sessions/2026/08/15").join(ID);
+            std::fs::create_dir_all(&workspace).unwrap();
+            writer
+                .create_conversation(
+                    ConversationRecordV2 {
+                        schema_version: CONVERSATION_SCHEMA_VERSION,
+                        conversation_id,
+                        created_at_utc: created_at,
+                        creation_partition: CreationPartition::from_created_at(created_at),
+                        workspace_cwd: workspace.to_string_lossy().into_owned(),
+                        execution_target: ExecutionTarget::Workspace,
+                        project_attachment: None,
+                        lifecycle_state: ConversationLifecycleState::Ready,
+                        last_seq: 0,
+                        created_by: ConversationCreator::Termul,
+                        title: None,
+                        title_source: None,
+                    },
+                    ConversationMutation::CreateConversation,
+                )
+                .await
+                .unwrap();
+            writer
+                .bind_agent_session(
+                    conversation_id,
+                    AgentSessionBinding {
+                        schema_version: AGENT_SESSION_BINDING_SCHEMA_VERSION,
+                        binding_id: uuid::Uuid::new_v4(),
+                        agent_session_id: "opaque/ws".to_string(),
+                        runtime_agent_id: "agent-ws".to_string(),
+                        stable_agent_namespace: "config:ws".to_string(),
+                        execution_cwd: workspace.to_string_lossy().into_owned(),
+                        bound_at_utc: chrono::Utc::now(),
+                        state: AgentSessionBindingState::Active,
+                    },
+                    chrono::Utc::now(),
+                )
+                .await
+                .unwrap();
+            let creation = Arc::new(
+                ConversationCreationService::new(
+                    Arc::clone(&writer),
+                    ConversationLocator::new(private).unwrap(),
+                    SessionWorkspaceLocator::new(visible).unwrap(),
+                )
+                .unwrap(),
+            );
+            let reader = Arc::new(ConversationReader::new(
+                Arc::clone(&repository),
+                LegacyConversationReader::default(),
+                ReaderPrecedence::ConversationV2Only,
+            ));
+            let persistence = Arc::new(ConversationPersistenceAdapter::new(writer, reader));
+            let relay = Arc::new(WsRelaySink::new());
+            let acp = Arc::new(AcpManager::with_conversation_services(
+                vec![relay.clone()],
+                creation,
+                persistence,
+            ));
+            let pty = crate::web::test_pty_manager();
+            acp.set_pty_manager(&pty);
+            let revision = repository
+                .get_conversation(conversation_id)
+                .unwrap()
+                .last_seq;
+            (temp, acp, pty, relay, revision)
+        }
+
+        #[tokio::test]
+        async fn detach_and_stale_revision_match_other_transports() {
+            let (_temp, acp, _pty, relay, revision) = fixture().await;
+            let reply = handle_conversation_lifecycle(
+                "detach-1".to_string(),
+                &json!({"conversationId":ID,"expectedRevision":revision}),
+                &acp,
+                &relay,
+                ConversationWsMutation::Detach,
+            )
+            .await;
+            assert!(reply.ok, "detach reply: {:?}", reply.err);
+            assert_eq!(reply.payload.as_ref().unwrap()["action"], "detachBinding");
+            assert_eq!(
+                reply.payload.as_ref().unwrap()["currentBinding"]["state"],
+                "detached"
+            );
+
+            let stale = handle_conversation_lifecycle(
+                "delete-1".to_string(),
+                &json!({"conversationId":ID,"expectedRevision":revision}),
+                &acp,
+                &relay,
+                ConversationWsMutation::Delete,
+            )
+            .await;
+            assert!(!stale.ok);
+            assert_eq!(
+                stale.err.expect("stale reply has an error").code,
+                "CONVERSATION_CONFLICT"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn execute_project_switch_returns_early_when_already_on_project() {
         let relay = Arc::new(WsRelaySink::new());
@@ -7182,5 +9606,315 @@ mod tests {
         assert_eq!(cwd, "/a");
         // current_session unchanged (no new session).
         assert_eq!(current_session.lock().as_ref().unwrap().0, "s-prev");
+    }
+
+    async fn policy_request(
+        authority: &Arc<RemoteAccessAuthority>,
+        text: &str,
+        authed: &mut bool,
+        principal: &mut Option<RemotePrincipal>,
+        relay: &Arc<WsRelaySink>,
+        registry: &Arc<ProjectRegistry>,
+        subscribed: &mut Vec<(String, ClientId)>,
+    ) -> WsReply {
+        let acp = Arc::new(AcpManager::new(vec![]));
+        let (tx, _rx) = outbound_channel();
+        let mut current_agent = None;
+        let current_session = Arc::new(parking_lot::Mutex::new(None));
+        let current_conversation = Arc::new(parking_lot::Mutex::new(None));
+        let current_project = Arc::new(parking_lot::Mutex::new(None));
+        let switch_queue = Arc::new(tokio::sync::Mutex::new(ProjectSwitchQueue::default()));
+        handle_request_with_conversation(
+            text,
+            authed,
+            principal,
+            &acp,
+            relay,
+            registry,
+            None,
+            None,
+            &tx,
+            subscribed,
+            &mut current_agent,
+            &current_session,
+            &current_conversation,
+            &current_project,
+            &switch_queue,
+            HistoryMode::Server,
+            None,
+            None,
+            None,
+            None,
+            authority,
+            SocketAddr::from(([127, 0, 0, 1], 3000)),
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn recover_session_snapshot_reuses_connection_client_and_64_cap() {
+        let relay = Arc::new(WsRelaySink::new());
+        let (client_id, _rx, _) = relay.subscribe("keep-client", None).await;
+        let mut subscribed = vec![("keep-client".to_string(), client_id)];
+        let before = relay.auxiliary_stats().clients;
+        let reply = handle_recover_session_snapshot(
+            "r1".to_string(),
+            &json!({ "sessionId": "second" }),
+            &relay,
+            &outbound_channel().0,
+            &mut subscribed,
+            HistoryMode::Server,
+        )
+        .await;
+        assert!(reply.ok, "{:?}", reply.err);
+        assert_eq!(relay.auxiliary_stats().clients, before);
+        assert!(subscribed.iter().all(|(_, id)| *id == client_id));
+        assert!(subscribed.len() <= MAX_CONNECTION_SUBSCRIPTIONS);
+    }
+
+    #[tokio::test]
+    async fn recover_session_snapshot_65th_session_is_rejected() {
+        let relay = Arc::new(WsRelaySink::new());
+        let (client_id, _rx, _) = relay.subscribe("s0", None).await;
+        let mut subscribed = vec![("s0".to_string(), client_id)];
+        for ordinal in 1..MAX_CONNECTION_SUBSCRIPTIONS {
+            let sid = format!("s{ordinal}");
+            let _ = relay.subscribe_existing(client_id, &sid, None).await;
+            subscribed.push((sid, client_id));
+        }
+        let reply = handle_recover_session_snapshot(
+            "r1".to_string(),
+            &json!({ "sessionId": "s64" }),
+            &relay,
+            &outbound_channel().0,
+            &mut subscribed,
+            HistoryMode::Server,
+        )
+        .await;
+        assert!(!reply.ok);
+        assert_eq!(reply.err.unwrap().code, "SUBSCRIPTION_LIMIT_EXCEEDED");
+        assert_eq!(subscribed.len(), MAX_CONNECTION_SUBSCRIPTIONS);
+    }
+
+    #[tokio::test]
+    async fn get_session_payload_enforces_cumulative_encoded_byte_ceiling_on_blocking_pool() {
+        let record = json!({ "pad": "y".repeat(8_192) });
+        let mut total = 0usize;
+        let mut rejected = false;
+        for _ in 0..2_000 {
+            match charge_compat_history_bytes(total, &record) {
+                Ok(next) => total = next,
+                Err(code) => {
+                    assert_eq!(
+                        code,
+                        crate::conversation::CONVERSATION_HISTORY_PAGING_REQUIRED
+                    );
+                    rejected = true;
+                    break;
+                }
+            }
+        }
+        assert!(rejected, "ceiling 4194304 must reject");
+        assert!(total <= MAX_COMPAT_HISTORY_ENCODED_BYTES);
+        assert!(charge_compat_history_bytes(MAX_COMPAT_HISTORY_ENCODED_BYTES, &"x").is_err());
+    }
+
+    #[tokio::test]
+    async fn public_ws_set_default_project_returns_forbidden() {
+        let authority = Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token"));
+        authority.set_ingress_provenance(IngressProvenance::PublicTunnel);
+        let relay = Arc::new(WsRelaySink::new());
+        let registry = Arc::new(ProjectRegistry::new());
+        let mut authed = false;
+        let mut principal = None;
+        let mut subscribed = Vec::new();
+        let auth = policy_request(
+            &authority,
+            r#"{"id":"a","type":"authenticate","payload":{"token":"test-remote-access-token"}}"#,
+            &mut authed,
+            &mut principal,
+            &relay,
+            &registry,
+            &mut subscribed,
+        )
+        .await;
+        assert!(auth.ok, "{:?}", auth.err);
+        let reply = policy_request(
+            &authority,
+            r#"{"id":"r1","type":"set_default_project","payload":{"projectId":"p-1"}}"#,
+            &mut authed,
+            &mut principal,
+            &relay,
+            &registry,
+            &mut subscribed,
+        )
+        .await;
+        assert!(!reply.ok);
+        assert_eq!(reply.err.unwrap().code, operation_policy::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn public_ws_set_catalog_opt_in_returns_forbidden() {
+        let authority = Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token"));
+        authority.set_ingress_provenance(IngressProvenance::PublicTunnel);
+        let relay = Arc::new(WsRelaySink::new());
+        let registry = Arc::new(ProjectRegistry::new());
+        let mut authed = false;
+        let mut principal = None;
+        let mut subscribed = Vec::new();
+        assert!(policy_request(
+            &authority,
+            r#"{"id":"a","type":"authenticate","payload":{"token":"test-remote-access-token"}}"#,
+            &mut authed,
+            &mut principal,
+            &relay,
+            &registry,
+            &mut subscribed,
+        )
+        .await
+        .ok);
+        let reply = policy_request(
+            &authority,
+            r#"{"id":"r1","type":"set_catalog_opt_in","payload":{"enabled":true}}"#,
+            &mut authed,
+            &mut principal,
+            &relay,
+            &registry,
+            &mut subscribed,
+        )
+        .await;
+        assert_eq!(reply.err.unwrap().code, operation_policy::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn public_ws_install_acp_agent_returns_forbidden() {
+        let authority = Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token"));
+        authority.set_ingress_provenance(IngressProvenance::PublicTunnel);
+        let relay = Arc::new(WsRelaySink::new());
+        let registry = Arc::new(ProjectRegistry::new());
+        let mut authed = false;
+        let mut principal = None;
+        let mut subscribed = Vec::new();
+        assert!(policy_request(
+            &authority,
+            r#"{"id":"a","type":"authenticate","payload":{"token":"test-remote-access-token"}}"#,
+            &mut authed,
+            &mut principal,
+            &relay,
+            &registry,
+            &mut subscribed,
+        )
+        .await
+        .ok);
+        let reply = policy_request(
+            &authority,
+            r#"{"id":"r1","type":"install_acp_agent","payload":{"agentId":"opencode"}}"#,
+            &mut authed,
+            &mut principal,
+            &relay,
+            &registry,
+            &mut subscribed,
+        )
+        .await;
+        assert_eq!(reply.err.unwrap().code, operation_policy::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn authenticated_generation_published_atomically_with_admission() {
+        let slot = AtomicU64::new(0);
+        let admitted = publish_authenticated_generation(
+            Some(&slot),
+            7,
+            crate::web::auth::RemoteGenerationState {
+                generation: 7,
+                active: true,
+            },
+        );
+        assert!(admitted);
+        assert_eq!(slot.load(Ordering::Acquire), 7);
+        assert!(!publish_authenticated_generation(
+            Some(&slot),
+            7,
+            crate::web::auth::RemoteGenerationState {
+                generation: 8,
+                active: true,
+            },
+        ));
+        let authority = Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token"));
+        let relay = Arc::new(WsRelaySink::new());
+        let registry = Arc::new(ProjectRegistry::new());
+        let acp = Arc::new(AcpManager::new(vec![]));
+        let (tx, _rx) = outbound_channel();
+        let mut subscribed = Vec::new();
+        let mut current_agent = None;
+        let current_session = Arc::new(parking_lot::Mutex::new(None));
+        let current_conversation = Arc::new(parking_lot::Mutex::new(None));
+        let current_project = Arc::new(parking_lot::Mutex::new(None));
+        let switch_queue = Arc::new(tokio::sync::Mutex::new(ProjectSwitchQueue::default()));
+        let mut authed = false;
+        let mut principal = None;
+        let live = AtomicU64::new(0);
+        let reply = handle_request_with_conversation(
+            r#"{"id":"a","type":"authenticate","payload":{"token":"test-remote-access-token"}}"#,
+            &mut authed,
+            &mut principal,
+            &acp,
+            &relay,
+            &registry,
+            None,
+            None,
+            &tx,
+            &mut subscribed,
+            &mut current_agent,
+            &current_session,
+            &current_conversation,
+            &current_project,
+            &switch_queue,
+            HistoryMode::LiveOnly,
+            None,
+            None,
+            None,
+            None,
+            &authority,
+            SocketAddr::from(([127, 0, 0, 1], 3000)),
+            Some(&live),
+        )
+        .await;
+        assert!(reply.ok, "{:?}", reply.err);
+        assert_ne!(live.load(Ordering::Acquire), 0);
+        assert_eq!(
+            live.load(Ordering::Acquire),
+            principal.as_ref().unwrap().generation()
+        );
+    }
+
+    #[tokio::test]
+    async fn set_default_project_ws_uses_http_application_codes() {
+        let relay = Arc::new(WsRelaySink::new());
+        let registry = Arc::new(ProjectRegistry::new());
+        let malformed = handle_set_default_project(
+            "r1".to_string(),
+            &json!({ "nope": true }),
+            &relay,
+            &registry,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(
+            malformed.err.unwrap().code,
+            operation_policy::VALIDATION_ERROR
+        );
+        let missing = handle_set_default_project(
+            "r2".to_string(),
+            &json!({ "projectId": "missing" }),
+            &relay,
+            &registry,
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(missing.err.unwrap().code, operation_policy::NOT_FOUND);
     }
 }

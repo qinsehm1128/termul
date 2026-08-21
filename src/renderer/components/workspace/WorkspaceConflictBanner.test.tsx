@@ -1,147 +1,161 @@
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-// Hoist the spy so the vi.mock factory (also hoisted) can reference it.
-const { resolveManifestMock } = vi.hoisted(() => ({
-  resolveManifestMock: vi.fn().mockResolvedValue(undefined)
+const { conflictMock, conversationApiMock } = vi.hoisted(() => ({
+  conflictMock: vi.fn(),
+  conversationApiMock: {
+    resolveRecovery: vi.fn()
+  }
 }))
 
-vi.mock('@/hooks/use-workspace-manifest-sync', () => ({
-  resolveManifestConflict: (...args: unknown[]) => resolveManifestMock(...args)
+vi.mock('@/hooks/use-session-workspace-sync', () => ({
+  resolveSessionWorkspaceConflict: conflictMock
 }))
 
-import { useProjectStore } from '@/stores/project-store'
-import { useWorkspaceManifestSyncStore } from '@/stores/workspace-manifest-sync-store'
-// Import the component AFTER the mock is registered so it picks up the mock.
+vi.mock('@/lib/conversation-api', () => ({
+  conversationApi: conversationApiMock
+}))
+
+vi.mock('@/lib/log-api', () => ({ logFrontendError: vi.fn() }))
+
+import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
 import { WorkspaceConflictBanner } from './WorkspaceConflictBanner'
 
-const CONFLICT = {
-  projectId: 'proj-1',
-  currentRevision: 5,
-  currentUpdatedAt: 1234567890,
-  currentUpdateIdentity: 'other-client'
+const one = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+const two = '5f7a1c01-4d1b-4c8a-af01-0123456789ab'
+const recoveryItem = {
+  recoveryId: 'a'.repeat(64),
+  kind: 'ambiguous_workspace_manifest' as const,
+  severity: 'warning' as const,
+  sourcePaths: ['legacy_workspace_manifests/0/shared.json'],
+  conversationIds: [one, two],
+  sourceSha256: ['e'.repeat(64)],
+  candidateFacts: [],
+  provenance: [
+    {
+      sourceKind: 'legacy_workspace_manifests',
+      relativePath: 'legacy_workspace_manifests/0/shared.json',
+      sha256: 'e'.repeat(64),
+      preservedReadOnly: true as const
+    }
+  ],
+  status: 'unresolved' as const,
+  suggestedActions: [
+    'inspect',
+    'associateConversation',
+    'startEmptyWorkspace',
+    'dismissPreservedSource'
+  ] as const,
+  revision: 7,
+  associationDecisions: []
 }
 
 beforeEach(() => {
-  resolveManifestMock.mockClear()
-  useWorkspaceManifestSyncStore.setState({
-    pendingConflict: null,
-    basedRevisionByProject: {},
-    manifestRestoreInProgressByProject: {}
+  vi.clearAllMocks()
+  conversationApiMock.resolveRecovery.mockImplementation(async (request) => ({
+    success: true,
+    data: {
+      recoveryId: request.recoveryId,
+      action: request.action,
+      authorization: request.action === 'inspect' ? 'read' : 'mutation',
+      status: 'unresolved',
+      recoveryRevision: 7,
+      workspaceRevision: null,
+      workspaceChanged: false,
+      sourcePaths: recoveryItem.sourcePaths,
+      sourceSha256: recoveryItem.sourceSha256,
+      candidateFacts: recoveryItem.candidateFacts,
+      provenance: recoveryItem.provenance
+    }
+  }))
+  useSessionWorkspaceSyncStore.setState({
+    activeConversationId: one,
+    basedRevisionByConversation: {},
+    conflictsByConversation: {},
+    recoveryByConversation: {},
+    loadOutcomeByConversation: {},
+    restoreInProgressByConversation: {}
   })
-  // Default: the active project matches the conflict's project so the banner
-  // is visible. P1 tests override this to a different project.
-  useProjectStore.setState({ activeProjectId: 'proj-1' })
 })
 
-afterEach(() => {
-  cleanup()
-})
+afterEach(cleanup)
 
 describe('WorkspaceConflictBanner', () => {
-  it('renders nothing when there is no pending conflict', () => {
-    const { container } = render(<WorkspaceConflictBanner />)
-    expect(container.firstChild).toBeNull()
-  })
-
-  it('renders the banner with three actions when a conflict is pending for the active project', () => {
-    useWorkspaceManifestSyncStore.setState({ pendingConflict: CONFLICT })
-    render(<WorkspaceConflictBanner />)
-
-    expect(screen.getByText('Workspace changed elsewhere')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Reload from host' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Overwrite with local' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeInTheDocument()
+  it('scopes a stale conflict to the active Conversation, not the project store', () => {
+    useSessionWorkspaceSyncStore.getState().setConflict(one, {
+      conversationId: one,
+      currentRevision: 5,
+      currentUpdatedAtUtc: '2026-08-15T10:00:00.000Z',
+      currentUpdateIdentity: 'other-client'
+    })
+    const { rerender } = render(<WorkspaceConflictBanner />)
+    expect(screen.getByRole('alert')).toHaveAttribute('data-conversation-id', one)
     expect(screen.getByText(/revision 5/)).toBeInTheDocument()
-  })
 
-  it('P1: renders nothing when the conflict is for a different (non-active) project', () => {
-    useWorkspaceManifestSyncStore.setState({ pendingConflict: CONFLICT })
-    useProjectStore.setState({ activeProjectId: 'proj-B' })
-
-    const { container } = render(<WorkspaceConflictBanner />)
-    expect(container.firstChild).toBeNull()
-  })
-
-  it('P1: renders the banner when the active project switches back to the conflicted project', () => {
-    useWorkspaceManifestSyncStore.setState({ pendingConflict: CONFLICT })
-    useProjectStore.setState({ activeProjectId: 'proj-B' })
-
-    const { container, rerender } = render(<WorkspaceConflictBanner />)
-    expect(container.firstChild).toBeNull()
-
-    act(() => {
-      useProjectStore.setState({ activeProjectId: 'proj-1' })
-    })
+    act(() => useSessionWorkspaceSyncStore.getState().setActiveConversationId(two))
     rerender(<WorkspaceConflictBanner />)
-    expect(container.firstChild).not.toBeNull()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 
-  it('P14: displays currentUpdatedAt and currentUpdateIdentity when present', () => {
-    useWorkspaceManifestSyncStore.setState({ pendingConflict: CONFLICT })
-    render(<WorkspaceConflictBanner />)
-
-    // currentUpdateIdentity is rendered with a "by" prefix.
-    expect(screen.getByText(/by other-client/)).toBeInTheDocument()
-    // currentUpdatedAt is rendered as a formatted timestamp.
-    expect(screen.getByText(/revision 5 \(/)).toBeInTheDocument()
-  })
-
-  it('calls resolveManifestConflict with "reload" when Reload is clicked', () => {
-    useWorkspaceManifestSyncStore.setState({ pendingConflict: CONFLICT })
-    render(<WorkspaceConflictBanner />)
-
+  it('calls Conversation-scoped conflict actions', () => {
+    useSessionWorkspaceSyncStore.getState().setConflict(one, {
+      conversationId: one,
+      currentRevision: 5,
+      currentUpdatedAtUtc: '2026-08-15T10:00:00.000Z'
+    })
+    render(<WorkspaceConflictBanner conversationId={one} />)
     fireEvent.click(screen.getByRole('button', { name: 'Reload from host' }))
-
-    expect(resolveManifestMock).toHaveBeenCalledWith('proj-1', 'reload')
-  })
-
-  it('calls resolveManifestConflict with "overwrite" when Overwrite is clicked', () => {
-    useWorkspaceManifestSyncStore.setState({ pendingConflict: CONFLICT })
-    render(<WorkspaceConflictBanner />)
-
     fireEvent.click(screen.getByRole('button', { name: 'Overwrite with local' }))
-
-    expect(resolveManifestMock).toHaveBeenCalledWith('proj-1', 'overwrite')
-  })
-
-  it('calls resolveManifestConflict with "dismiss" when Dismiss is clicked', () => {
-    useWorkspaceManifestSyncStore.setState({ pendingConflict: CONFLICT })
-    render(<WorkspaceConflictBanner />)
-
     fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
-
-    expect(resolveManifestMock).toHaveBeenCalledWith('proj-1', 'dismiss')
+    expect(conflictMock).toHaveBeenNthCalledWith(1, one, 'reload')
+    expect(conflictMock).toHaveBeenNthCalledWith(2, one, 'overwrite')
+    expect(conflictMock).toHaveBeenNthCalledWith(3, one, 'dismiss')
   })
 
-  it('auto-dismisses (renders nothing) once the conflict is cleared', () => {
-    useWorkspaceManifestSyncStore.setState({ pendingConflict: CONFLICT })
-    const { rerender, container } = render(<WorkspaceConflictBanner />)
-    expect(container.firstChild).not.toBeNull()
-
-    act(() => {
-      useWorkspaceManifestSyncStore.setState({ pendingConflict: null })
-    })
-    rerender(<WorkspaceConflictBanner />)
-
-    expect(container.firstChild).toBeNull()
+  it('renders immutable source/checksum context and the exact shared recovery actions', () => {
+    useSessionWorkspaceSyncStore.getState().setRecoveryItems(one, [recoveryItem])
+    render(<WorkspaceConflictBanner conversationId={one} />)
+    expect(
+      screen.getByRole('region', {
+        name: new RegExp(`ambiguous_workspace_manifest ${'a'.repeat(64)}`)
+      })
+    ).toBeVisible()
+    expect(
+      screen.getAllByText(/legacy_workspace_manifests\/0\/shared.json/).length
+    ).toBeGreaterThan(0)
+    expect(screen.getAllByText(new RegExp(`sha256:${'e'.repeat(64)}`)).length).toBeGreaterThan(0)
+    for (const action of recoveryItem.suggestedActions) {
+      expect(document.querySelector(`[data-recovery-action="${action}"]`)).toBeVisible()
+    }
   })
 
-  it('renders an accessible alert region (role=alert)', () => {
-    useWorkspaceManifestSyncStore.setState({ pendingConflict: CONFLICT })
-    render(<WorkspaceConflictBanner />)
-
-    expect(screen.getByRole('alert')).toBeInTheDocument()
+  it('invokes every exact recovery action with RecoveryItem revision and action payloads', async () => {
+    useSessionWorkspaceSyncStore.getState().setRecoveryItems(one, [recoveryItem])
+    render(<WorkspaceConflictBanner conversationId={one} />)
+    for (const action of recoveryItem.suggestedActions) {
+      const button = document.querySelector<HTMLButtonElement>(`[data-recovery-action="${action}"]`)
+      expect(button).toBeVisible()
+      fireEvent.click(button!)
+      await waitFor(() =>
+        expect(conversationApiMock.resolveRecovery).toHaveBeenCalledWith(
+          expect.objectContaining({
+            recoveryId: recoveryItem.recoveryId,
+            expectedRevision: 7,
+            action
+          })
+        )
+      )
+    }
+    expect(conversationApiMock.resolveRecovery).toHaveBeenCalledTimes(4)
   })
 
-  it('uses type="button" on all action buttons (useButtonType compliance)', () => {
-    useWorkspaceManifestSyncStore.setState({ pendingConflict: CONFLICT })
-    render(<WorkspaceConflictBanner />)
-
-    const buttons = screen.getAllByRole('button')
-    expect(buttons.length).toBe(3)
-    for (const button of buttons) {
-      expect(button.getAttribute('type')).toBe('button')
+  it('uses accessible buttons and responsive wrapping', () => {
+    useSessionWorkspaceSyncStore.getState().setRecoveryItems(one, [recoveryItem])
+    render(<WorkspaceConflictBanner conversationId={one} />)
+    expect(screen.getByRole('alert')).toHaveAttribute('aria-live', 'polite')
+    for (const button of screen.getAllByRole('button')) {
+      expect(button).toHaveAttribute('type', 'button')
+      expect(button.parentElement?.className).toContain('grid-cols-2')
     }
   })
 })

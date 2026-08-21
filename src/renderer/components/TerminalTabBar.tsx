@@ -12,6 +12,7 @@ import {
 } from 'react'
 import { useTranslation } from 'react-i18next'
 import { shellApi } from '@/lib/api'
+import { isPreferredShell } from '@/lib/shell-api'
 import { cn } from '@/lib/utils'
 import { useProjectStore } from '@/stores/project-store'
 import type { Terminal } from '@/types/project'
@@ -113,8 +114,8 @@ export function TerminalTabBar({
 
   const sortedShells = shells?.available?.slice().sort((a, b) => {
     if (defaultShell) {
-      if (a.name === defaultShell) return -1
-      if (b.name === defaultShell) return 1
+      if (isPreferredShell(a, defaultShell)) return -1
+      if (isPreferredShell(b, defaultShell)) return 1
     }
     return a.displayName.localeCompare(b.displayName)
   })
@@ -193,12 +194,12 @@ export function TerminalTabBar({
                         onClick={() => handleSelectShell(shell)}
                         className={cn(
                           'w-full px-3 py-2 text-left text-sm hover:bg-secondary flex items-center gap-2',
-                          shell.name === defaultShell && 'text-primary'
+                          isPreferredShell(shell, defaultShell) && 'text-primary'
                         )}
                       >
                         <TerminalIcon size={12} />
                         <span>{shell.displayName}</span>
-                        {shell.name === defaultShell && (
+                        {isPreferredShell(shell, defaultShell) && (
                           <span className="ml-auto text-xs text-muted-foreground">
                             {t('terminalTabs.default')}
                           </span>
@@ -341,7 +342,7 @@ function TerminalTab({ terminal, isActive, onSelect, onClose, onRename }: Termin
             e.stopPropagation()
             onClose()
           }}
-          className="ml-auto p-0.5 rounded-md hover:bg-secondary opacity-0 group-hover:opacity-100 transition-opacity"
+          className="ml-auto p-0.5 rounded-md text-muted-foreground opacity-70 hover:bg-secondary hover:text-foreground group-hover:opacity-100 transition-opacity"
           aria-label={t('terminalTabs.closeTerminal', { name: terminal.name })}
         >
           <X size={11} />

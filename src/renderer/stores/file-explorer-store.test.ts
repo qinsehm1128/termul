@@ -52,6 +52,7 @@ beforeEach(async () => {
   mockApi.filesystem.unwatchDirectory.mockReset().mockResolvedValue({ success: true })
 
   useFileExplorerStore.setState({
+    roots: [],
     rootPath: null,
     expandedDirs: new Set<string>(),
     directoryContents: new Map<string, DirectoryEntry[]>(),
@@ -60,7 +61,8 @@ beforeEach(async () => {
     clipboard: null,
     isVisible: true,
     loadingDirs: new Set<string>(),
-    rootLoadError: null
+    rootLoadError: null,
+    rootLoadErrors: new Map()
   })
 })
 
@@ -102,6 +104,58 @@ describe('file-explorer-store', () => {
 
       expect(mockApi.filesystem.unwatchDirectory).toHaveBeenCalledWith('/project')
       expect(mockApi.filesystem.unwatchDirectory).toHaveBeenCalledWith('/project/src')
+    })
+  })
+
+  describe('multi-root project groups', () => {
+    it('registers ordered roots and focuses the preferred root', () => {
+      useFileExplorerStore.getState().setRoots(
+        [
+          { projectId: 'web', name: 'Web', path: '/workspace/web' },
+          { projectId: 'api', name: 'API', path: '/workspace/api' }
+        ],
+        '/workspace/api'
+      )
+
+      const state = useFileExplorerStore.getState()
+      expect(state.roots.map((root) => root.projectId)).toEqual(['web', 'api'])
+      expect(state.rootPath).toBe('/workspace/api')
+      expect(state.scopeRoot).toBe('/workspace/api')
+    })
+
+    it('changes the focused root without clearing loaded trees', () => {
+      useFileExplorerStore.getState().setRoots([
+        { projectId: 'web', name: 'Web', path: '/workspace/web' },
+        { projectId: 'api', name: 'API', path: '/workspace/api' }
+      ])
+      useFileExplorerStore.setState({
+        directoryContents: new Map([
+          ['/workspace/web', mockEntries],
+          ['/workspace/api', []]
+        ])
+      })
+
+      useFileExplorerStore.getState().setFocusedRoot('/workspace/api')
+
+      const state = useFileExplorerStore.getState()
+      expect(state.rootPath).toBe('/workspace/api')
+      expect(state.directoryContents.size).toBe(2)
+    })
+
+    it('refreshes every root and expanded child', async () => {
+      useFileExplorerStore.getState().setRoots([
+        { projectId: 'web', name: 'Web', path: '/workspace/web' },
+        { projectId: 'api', name: 'API', path: '/workspace/api' }
+      ])
+      useFileExplorerStore.setState({
+        expandedDirs: new Set(['/workspace/web', '/workspace/web/src', '/workspace/api'])
+      })
+
+      await useFileExplorerStore.getState().refreshTree()
+
+      expect(mockApi.filesystem.readDirectory).toHaveBeenCalledWith('/workspace/web')
+      expect(mockApi.filesystem.readDirectory).toHaveBeenCalledWith('/workspace/web/src')
+      expect(mockApi.filesystem.readDirectory).toHaveBeenCalledWith('/workspace/api')
     })
   })
 

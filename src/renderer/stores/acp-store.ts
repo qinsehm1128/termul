@@ -22,7 +22,18 @@
  * prepared-chat reaping) and is **not** a cross-tab isolation boundary.
  */
 
+import {
+  type ConversationRecordV2,
+  type ExecutionTarget,
+  isConversationId,
+  type ProjectAttachment
+} from '@shared/types/conversation.types'
+import type {
+  ConversationLifecycleOutcome,
+  ConversationReplacementRequest
+} from '@shared/types/conversation-lifecycle.types'
 import { type PersistedComposerOptions, PersistenceKeys } from '@shared/types/persistence.types'
+import type { ScheduledTaskRecordV1 } from '@shared/types/scheduled-task.types'
 import type {
   ProjectSwitchCompletedEvent,
   ProjectSwitchFailedEvent,
@@ -31,6 +42,7 @@ import type {
 import { toast } from 'sonner'
 import { create } from 'zustand'
 import { useShallow } from 'zustand/shallow'
+import { canonicalizeClaudeModelId } from '@/components/chat/chat-input-bar-config'
 import { runtimeT } from '@/i18n/runtime'
 import {
   loadAgentConfigs as loadAgentConfigsFromDisk,
@@ -66,6 +78,7 @@ import {
   type ProbeStatus,
   type PromptCompleteEvent,
   type QuestionOption,
+  type ScheduledTaskDraftEvent,
   type SessionClosedEvent,
   type SessionConfigOption,
   type SessionCreatedEvent,
@@ -88,13 +101,14 @@ import { AcpConnectionCoordinator, type AcpRecovery } from '@/lib/acp-connection
 import {
   deriveTitle,
   getCachedSessionPayload,
+  type HistoryPageProgress,
   loadSessionIndex as loadSessionIndexFromDisk,
   loadSessionPayload,
   markSessionPayloadPinned,
   maxPayloadSeq,
-  queueSessionPayloadDelete,
   restoredToolCalls,
   type SessionIndexEntry,
+  type SessionPayload,
   setCachedSessionPayload,
   unpinSessionPayload
 } from '@/lib/acp-history-persistence'
@@ -120,11 +134,25 @@ import {
 } from '@/lib/agents/acp-spawn-errors'
 import { persistenceApi } from '@/lib/api'
 import { deleteSessionTempFiles } from '@/lib/attachment-temp-cleanup'
+import { resolveConversationSessionId } from '@/lib/conversation-binding'
+import {
+  hydrateComposerControls,
+  persistConversationComposer,
+  readComposerSnapshotForSession,
+  sessionHasComposerControls,
+  snapshotSessionComposer
+} from '@/lib/conversation-composer'
+import {
+  ConversationLifecycleApiError,
+  conversationLifecycleApi
+} from '@/lib/conversation-lifecycle-api'
 import { logFrontendError } from '@/lib/log-api'
 import { isTauriContext } from '@/lib/tauri-runtime'
 import { randomUUID } from '@/lib/uuid'
 import { getTabFocusedSessionId, setTabFocusedSessionId } from '@/lib/web-tab-session'
+import { getCurrentConversation, useConversationStore } from '@/stores/conversation-store'
 import { useProjectStore } from '@/stores/project-store'
+import { useTerminalStore } from '@/stores/terminal-store'
 import { useWorkspaceStore } from '@/stores/workspace-store'
 import {
   appendQueuedPrompt,
@@ -154,6 +182,15 @@ export interface AgentOptionsCacheEntry {
   updatedAt: number
 }
 
+export interface HistoryBackfillState {
+  loading: boolean
+  complete: boolean
+  loadedRecordCount: number
+  nextCursor: number
+  targetLastSeq: number
+  errorCode?: string
+}
+
 export interface ChatMessage {
   id: string
   role: MessageRole
@@ -171,6 +208,8 @@ export interface ChatMessage {
 
 export interface AcpSession {
   id: SessionId
+  /** Canonical Termul-owned Conversation identity for durable workspace/history operations. */
+  conversationId?: string
   agentId: AgentId
   cwd: string
   /**
@@ -300,6 +339,8 @@ interface AcpState {
 
   /** Session ids whose `openHistorySession` is in flight (drives reconnect banners). */
   openingHistoryIds: Record<string, true>
+  /** Progressive durable-history page state; installed transcript pages remain visible on error. */
+  historyBackfill: Record<SessionId, HistoryBackfillState>
   /**
    * Session ids whose newly focused chat tab should show the branded restore
    * preload. This clears once usable content is ready, independently of a
@@ -360,6 +401,7 @@ interface AcpState {
   toolCalls: Record<SessionId, ToolCall[]>
   /** ACP agent-plan entries per session (`session/update` plan, full replace). */
   plans: Record<SessionId, PlanEntry[]>
+  scheduledTaskDrafts: Record<SessionId, ScheduledTaskRecordV1>
   commands: Record<SessionId, AvailableCommand[]>
   pendingPermissions: Record<string, PendingPermission> // P3 renders, keyed by requestId
   pendingQuestions: Record<string, PendingQuestion> // issue #411, keyed by questionId
@@ -406,9 +448,22 @@ interface AcpState {
       /** Worktree path + branch (CAP-3) — persisted onto the durable record. */
       worktreePath?: string
       worktreeBranch?: string
+      conversationId?: string
+      projectAttachment?: ProjectAttachment
+      executionTarget?: ExecutionTarget
     }
   ) => Promise<SessionId>
   closeSession: (sessionId: SessionId) => Promise<void>
+  /** Renderer-local view close. Never calls ACP, canonical deletion, temp cleanup, or terminals. */
+  closeChatView: (conversationId: string) => void
+  detachAgentBinding: (conversationId: string) => Promise<ConversationLifecycleOutcome>
+  rebindDetachedBinding: (conversationId: string) => Promise<ConversationLifecycleOutcome>
+  suspendAgentBinding: (conversationId: string) => Promise<ConversationLifecycleOutcome>
+  replaceAgentBinding: (conversationId: string) => Promise<ConversationLifecycleOutcome>
+  deleteConversation: (
+    conversationId: string,
+    removeWorkspace?: boolean
+  ) => Promise<ConversationLifecycleOutcome>
   setActiveSession: (sessionId: SessionId | null) => void
   switchProject: (projectId: string) => Promise<SwitchProjectReply>
   setFailedProjectSwitch: (projectId: string | null) => void
@@ -445,7 +500,15 @@ interface AcpState {
     cwd: string,
     mcpServers: McpServer[] | undefined,
     projectId: string,
-    opts?: { worktreePath?: string; worktreeBranch?: string }
+    opts?: {
+      worktreePath?: string
+      worktreeBranch?: string
+      conversationId?: string
+      projectAttachment?: ProjectAttachment
+      executionTarget?: ExecutionTarget
+      /** Reconnect already tried load/resume; do not reopen the closed predecessor. */
+      skipHistoryReopen?: boolean
+    }
   ) => Promise<SessionId>
   /**
    * Take ownership of a prepared session so launcher unmount cleanup cannot
@@ -500,6 +563,9 @@ interface AcpState {
      */
     worktreePath?: string
     worktreeBranch?: string
+    conversationId?: string
+    projectAttachment?: ProjectAttachment
+    executionTarget?: ExecutionTarget
   }) => Promise<SessionId>
   /** Apply launcher pending model/mode/config selections to a live session. */
   applyPendingLauncherOptions: (
@@ -522,7 +588,19 @@ interface AcpState {
 
   // Actions — chat history (P5)
   loadSessionIndex: () => Promise<void>
-  openHistorySession: (id: string) => Promise<void>
+  openHistorySession: (
+    id: string,
+    opts?: { requireLive?: boolean; skipRestorePreload?: boolean }
+  ) => Promise<void>
+  /**
+   * User-initiated reconnect for a closed chat. Prefers the same ACP session id
+   * (`session/load` or `session/resume`). If the agent cannot load/resume that
+   * id, continues the same Conversation with a replacement session instead of
+   * minting a second history row.
+   */
+  reconnectClosedSession: (sessionId: SessionId) => Promise<SessionId>
+  /** Resume only the retained durable-history traversal; never reconnect or spawn an agent. */
+  retryHistoryBackfill: (id: string) => Promise<void>
   /** R1: Proactively reattach a still-running ACP session on refresh. Mirrors
    * `openHistorySessionInner`'s transcript-install + resume but skips
    * `ensureLiveAgent` (no cold-spawn): the caller passes the authoritative
@@ -634,6 +712,7 @@ interface AcpState {
   _onToolCall: (e: ToolCallEvent) => void
   _onToolCallUpdate: (e: ToolCallUpdateEvent) => void
   _onPlanUpdate: (e: PlanUpdateEvent) => void
+  _onScheduledTaskDraft: (e: ScheduledTaskDraftEvent) => void
   _onCommandsUpdate: (e: CommandsUpdateEvent) => void
   _onModeUpdate: (e: ModeUpdateEvent) => void
   _onConfigOptionsUpdate: (e: ConfigOptionsUpdateEvent) => void
@@ -647,6 +726,7 @@ interface AcpState {
   _onAgentCrashed: (e: AgentCrashedEvent) => void
   _onAgentDisconnected: (e: AgentDisconnectedEvent) => void
   _onSessionClosed: (e: SessionClosedEvent) => void
+  _onConversationLifecycle: (outcome: ConversationLifecycleOutcome) => void
 }
 
 function newId(prefix: string): string {
@@ -805,6 +885,105 @@ function finalizeStreaming(
     ...messages,
     [sessionId]: list.map((m) => (m.streaming ? { ...m, streaming: false } : m))
   }
+}
+
+function copyClosedSessionTranscript(
+  fromId: SessionId,
+  toId: SessionId,
+  get: () => AcpState,
+  set: TurnEndSetter
+): void {
+  const sourceMessages = get().messages[fromId] ?? []
+  const sourceTools = get().toolCalls[fromId] ?? []
+  const destMessages = get().messages[toId] ?? []
+  if (destMessages.length > 0 || (sourceMessages.length === 0 && sourceTools.length === 0)) return
+  set((state) => ({
+    messages: { ...state.messages, [toId]: sourceMessages },
+    toolCalls: { ...state.toolCalls, [toId]: sourceTools }
+  }))
+}
+
+/** Fold a closed predecessor into the replacement session so reconnect does not mint a second history row. */
+function collapseClosedPredecessor(
+  fromId: SessionId,
+  toId: SessionId,
+  conversationId: string | undefined,
+  get: () => AcpState,
+  set: TurnEndSetter
+): void {
+  if (fromId === toId) return
+  set((state) => {
+    const source = state.sessions[fromId]
+    const target = state.sessions[toId]
+    if (!target) return {}
+    const sessions = { ...state.sessions }
+    delete sessions[fromId]
+    sessions[toId] = {
+      ...source,
+      ...target,
+      id: toId,
+      conversationId: conversationId ?? target.conversationId ?? source?.conversationId,
+      status: 'active',
+      title: target.title ?? source?.title ?? null,
+      lastError: null
+    }
+    const remap = <T>(record: Record<SessionId, T>): Record<SessionId, T> =>
+      remapRecordKey(record, fromId, toId)
+    return {
+      sessions,
+      messages: remap(state.messages),
+      toolCalls: remap(state.toolCalls),
+      plans: remap(state.plans),
+      commands: remap(state.commands),
+      sessionUsage: remap(state.sessionUsage),
+      historyBackfill: remap(state.historyBackfill),
+      promptQueues: remap(state.promptQueues),
+      suppressQueueFlush: remap(state.suppressQueueFlush),
+      restoringChatIds: remap(state.restoringChatIds),
+      launchingSessionIds: dropRecordKey(state.launchingSessionIds, fromId),
+      degradedRecoverySessions: remap(state.degradedRecoverySessions),
+      sessionIndex: state.sessionIndex
+        .filter((entry) => entry.id !== fromId)
+        .map((entry) =>
+          entry.id === toId ||
+          (conversationId !== undefined && entry.conversationId === conversationId)
+            ? {
+                ...entry,
+                id: toId,
+                conversationId: conversationId ?? entry.conversationId,
+                status: 'active'
+              }
+            : entry
+        ),
+      activeSessionId: state.activeSessionId === fromId ? toId : state.activeSessionId
+    }
+  })
+  useWorkspaceStore.getState().remapAgentChatSession?.(fromId, toId)
+}
+
+function reconnectContext(
+  get: () => AcpState,
+  sessionId: SessionId
+): {
+  conversationId?: string
+  configId?: string
+  cwd: string
+  projectId: string
+} {
+  const session = get().sessions[sessionId]
+  const index = get().sessionIndex.find((entry) => entry.id === sessionId)
+  const conversationId = session?.conversationId ?? index?.conversationId
+  const conversation = conversationId
+    ? getCurrentConversation(useConversationStore.getState(), conversationId)
+    : undefined
+  const configId =
+    index?.agentConfigId ??
+    get().sessionIndex.find((entry) => entry.conversationId === conversationId)?.agentConfigId ??
+    (session?.agentId ? configIdForAgentId(get(), session.agentId) : null) ??
+    undefined
+  const cwd = (session?.cwd || index?.cwd || conversation?.workspaceCwd || '').trim()
+  const projectId = session?.projectId || index?.projectId || ''
+  return { conversationId, configId, cwd, projectId }
 }
 
 /** Mark a reopened history session live after a successful load/resume IPC call. */
@@ -1112,6 +1291,17 @@ function dropRecordKey<T>(
   return next
 }
 
+function remapRecordKey<T>(
+  record: Record<SessionId, T>,
+  fromSessionId: SessionId,
+  toSessionId: SessionId
+): Record<SessionId, T> {
+  if (fromSessionId === toSessionId || !(fromSessionId in record)) return record
+  const next = { ...record, [toSessionId]: record[fromSessionId] }
+  delete next[fromSessionId]
+  return next
+}
+
 /**
  * Maximum number of messages retained per session in the live React window.
  * Generous so normal single-session use never trims — only the multi-hour /
@@ -1154,9 +1344,15 @@ function trimLiveWindow(messages: ChatMessage[], sessionId: SessionId): ChatMess
  * Call only after any needed `persistSession` so the last mirror is flushed.
  */
 function dropSessionTranscriptState(
-  state: Pick<AcpState, 'messages' | 'toolCalls' | 'commands' | 'sessionUsage' | 'plans'>,
+  state: Pick<
+    AcpState,
+    'messages' | 'toolCalls' | 'commands' | 'sessionUsage' | 'plans' | 'historyBackfill'
+  >,
   sessionId: SessionId
-): Pick<AcpState, 'messages' | 'toolCalls' | 'commands' | 'sessionUsage' | 'plans'> {
+): Pick<
+  AcpState,
+  'messages' | 'toolCalls' | 'commands' | 'sessionUsage' | 'plans' | 'historyBackfill'
+> {
   // Drop per-session module-level bookkeeping too so a closed/deleted session
   // never leaks a backfill allowance or an in-flight load guard.
   backfillCounts.delete(sessionId)
@@ -1167,7 +1363,8 @@ function dropSessionTranscriptState(
     toolCalls: dropRecordKey(state.toolCalls, sessionId),
     commands: dropRecordKey(state.commands, sessionId),
     sessionUsage: dropRecordKey(state.sessionUsage, sessionId),
-    plans: dropRecordKey(state.plans, sessionId)
+    plans: dropRecordKey(state.plans, sessionId),
+    historyBackfill: dropRecordKey(state.historyBackfill, sessionId)
   }
 }
 
@@ -1331,6 +1528,92 @@ function scheduleTurnEnd(
   }, 0)
 }
 
+function resolvePersistedAgentConfigId(
+  state: {
+    configToLiveAgent: Record<string, AgentId>
+    sessionIndex: SessionIndexEntry[]
+  },
+  session: Pick<AcpSession, 'agentId' | 'conversationId'>,
+  existingEntry?: SessionIndexEntry
+): string | undefined {
+  const reuseKey = Object.keys(state.configToLiveAgent).find(
+    (k) => state.configToLiveAgent[k] === session.agentId
+  )
+  return (
+    (reuseKey ? configIdFromReuseKey(reuseKey) : undefined) ??
+    existingEntry?.agentConfigId ??
+    (session.conversationId
+      ? state.sessionIndex.find((entry) => entry.conversationId === session.conversationId)
+          ?.agentConfigId
+      : undefined)
+  )
+}
+
+function persistConversationComposerFromState(
+  state: {
+    sessions: Record<SessionId, AcpSession>
+    sessionIndex: SessionIndexEntry[]
+    configToLiveAgent: Record<string, AgentId>
+  },
+  sessionId: SessionId
+): void {
+  if (ephemeralSessionIds.has(sessionId)) return
+  const session = state.sessions[sessionId]
+  const conversationId = session?.conversationId
+  if (!session || !conversationId) return
+  const agentConfigId = resolvePersistedAgentConfigId(
+    state,
+    session,
+    state.sessionIndex.find((entry) => entry.id === sessionId)
+  )
+  persistConversationComposer(conversationId, snapshotSessionComposer(session, agentConfigId))
+}
+
+async function hydrateSessionComposer(
+  get: () => AcpState,
+  set: TurnEndSetter,
+  sessionId: SessionId
+): Promise<void> {
+  const session = get().sessions[sessionId]
+  if (!session || sessionHasComposerControls(session)) return
+  const agentConfigId = resolvePersistedAgentConfigId(
+    get(),
+    session,
+    get().sessionIndex.find((entry) => entry.id === sessionId)
+  )
+  try {
+    const snapshot = await readComposerSnapshotForSession({
+      conversationId: session.conversationId,
+      agentConfigId
+    })
+    if (!snapshot) return
+    const cache = agentConfigId ? get().agentOptionsCache[agentConfigId] : null
+    const controls = hydrateComposerControls(snapshot, cache)
+    if (!sessionHasComposerControls(controls)) return
+    set((state) => {
+      const current = state.sessions[sessionId]
+      if (!current || sessionHasComposerControls(current)) return {}
+      return {
+        sessions: {
+          ...state.sessions,
+          [sessionId]: {
+            ...current,
+            models: controls.models,
+            modes: controls.modes,
+            configOptions: controls.configOptions
+          }
+        }
+      }
+    })
+  } catch (error) {
+    void logFrontendError({
+      level: 'warn',
+      source: 'acp.hydrateSessionComposer',
+      message: `sessionId=${sessionId} ${error instanceof Error ? error.message : String(error)}`
+    })
+  }
+}
+
 /**
  * Update the local session-index projection for a session using the current
  * store snapshot (CAP-2: the host event/session layer now authors durable
@@ -1360,17 +1643,15 @@ function persistSession(
   const liveMessages = (state.messages[sessionId] ?? []).map((m) =>
     m.streaming ? { ...m, streaming: false } : m
   )
-  const reuseKey = Object.keys(state.configToLiveAgent).find(
-    (k) => state.configToLiveAgent[k] === session.agentId
-  )
-  const agentConfigId = reuseKey ? configIdFromReuseKey(reuseKey) : undefined
   const existingEntry = state.sessionIndex.find((e) => e.id === sessionId)
+  const agentConfigId = resolvePersistedAgentConfigId(state, session, existingEntry)
   // Keep a placeholder stable once assigned: reuse the existing index title
   // (including a prior `Untitled Chat N`) instead of regenerating one on every
   // persist. `rebaseUntitledCounter` keeps fresh numbers from colliding.
   const fallbackTitle = existingEntry?.title ?? nextUntitledTitle()
   const entry: SessionIndexEntry = {
     id: sessionId,
+    conversationId: session.conversationId ?? existingEntry?.conversationId,
     agentId: session.agentId,
     agentConfigId,
     title: session.title ?? deriveTitle(liveMessages, fallbackTitle),
@@ -1379,9 +1660,9 @@ function persistSession(
     createdAt: session.createdAt,
     lastActivityAt: Date.now(),
     messageCount: liveMessages.length,
-    lastSeq: liveMessages.reduce(
-      (max, m) => Math.max(max, typeof m.seq === 'number' ? m.seq : 0),
-      0
+    lastSeq: Math.max(
+      existingEntry?.lastSeq ?? 0,
+      liveMessages.reduce((max, m) => Math.max(max, typeof m.seq === 'number' ? m.seq : 0), 0)
     ),
     status: session.status,
     // Preserve the origin flag so a discovered (external) session re-projected
@@ -1406,6 +1687,32 @@ function persistSession(
  * locally and not yet flushed to the durable index). The initial empty-load
  * case (no local entries) applies the host response verbatim.
  */
+function conversationLifecycleRecord(conversationId: string): ConversationRecordV2 {
+  if (!isConversationId(conversationId)) {
+    throw new ConversationLifecycleApiError(
+      'VALIDATION_ERROR',
+      'conversationId must be a canonical lowercase-hyphenated UUID'
+    )
+  }
+  const record = getCurrentConversation(useConversationStore.getState(), conversationId)
+  if (!record) {
+    throw new ConversationLifecycleApiError(
+      'CONVERSATION_NOT_FOUND',
+      `Conversation ${conversationId} is not present in ConversationStore`
+    )
+  }
+  return record
+}
+
+function replacementRequest(record: ConversationRecordV2): ConversationReplacementRequest {
+  return {
+    schemaVersion: 1,
+    conversationId: record.conversationId,
+    projectAttachment: record.projectAttachment,
+    executionTarget: record.executionTarget
+  }
+}
+
 function mergeSessionIndexEntries(
   local: SessionIndexEntry[],
   host: SessionIndexEntry[],
@@ -1431,6 +1738,8 @@ function mergeSessionIndexEntries(
           merged[idx] = {
             ...hostEntry,
             ...entry,
+            conversationId: entry.conversationId ?? hostEntry.conversationId,
+            agentConfigId: entry.agentConfigId ?? hostEntry.agentConfigId,
             messageCount: Math.max(entry.messageCount ?? 0, hostEntry.messageCount ?? 0),
             lastSeq: Math.max(entry.lastSeq ?? 0, hostEntry.lastSeq ?? 0)
           }
@@ -1467,18 +1776,18 @@ function refreshHostOwnedIndex(get: () => AcpState): void {
 const inFlightWarms = new Map<string, Promise<AgentId | null>>()
 
 /**
- * Agents that have completed ACP `authenticate` in this process lifetime, so
- * `createSession` does not re-authenticate a reused agent on every session. An
- * auth-category `session/new` failure clears the agent from this set (see
- * `createSession`) so a manual Sign-in + retry can re-authenticate. Held outside
- * reactive state (identity set, not UI data).
+ * Agents that have completed ACP `authenticate` in this process lifetime, so a
+ * later `session/new` that itself requires auth does not immediately fire a
+ * second `authenticate`. An auth-category `session/new` failure clears the
+ * agent from this set (see `createSession`) so a manual Sign-in + retry can
+ * re-authenticate. Held outside reactive state (identity set, not UI data).
  */
 const authenticatedAgents = new Set<AgentId>()
 
 /**
  * In-flight `authenticate` promises keyed by agentId so concurrent
- * `createSession` calls (e.g. two panes preparing at once) share a single
- * authenticate round-trip instead of racing duplicate `authenticate` requests.
+ * `createSession` / Sign-in calls share a single authenticate round-trip
+ * instead of racing duplicate `authenticate` requests.
  */
 const inFlightAuth = new Map<AgentId, Promise<void>>()
 
@@ -1686,6 +1995,16 @@ export function persistComposerOptions(
   sessionId?: SessionId
 ): void {
   if (sessionId && ephemeralSessionIds.has(sessionId)) return
+  if (patch.modelId) patch = { ...patch, modelId: canonicalizeClaudeModelId(patch.modelId) }
+  if (patch.configValues) {
+    const configValues = { ...patch.configValues }
+    for (const [optionId, value] of Object.entries(configValues)) {
+      if (optionId === 'model' || optionId.endsWith('/model')) {
+        configValues[optionId] = canonicalizeClaudeModelId(value)
+      }
+    }
+    patch = { ...patch, configValues }
+  }
   const key = PersistenceKeys.lastComposerOptions(configId)
   const prev = composerOptionQueues.get(key) ?? Promise.resolve()
   const next = prev.then(async () => {
@@ -1892,6 +2211,8 @@ type InFlightHistoryOpen = {
 }
 
 const inFlightHistoryOpens = new Map<SessionId, InFlightHistoryOpen>()
+/** History-only retries are deduped independently from agent reconnect/open operations. */
+const inFlightHistoryBackfillRetries = new Map<SessionId, Promise<void>>()
 
 type InFlightDiscoveredOpen = {
   generation: number
@@ -1967,13 +2288,6 @@ function scheduleRestorePreloadEnd(set: TurnEndSetter, sessionId: SessionId, tok
   tracker.timer = setTimeout(clearIfCurrent, remaining)
 }
 
-function invalidateRestorePreload(set: TurnEndSetter, sessionId: SessionId): void {
-  const tracker = restorePreloadTrackers.get(sessionId)
-  if (tracker?.timer) clearTimeout(tracker.timer)
-  restorePreloadTrackers.delete(sessionId)
-  set((s) => ({ restoringChatIds: dropRecordKey(s.restoringChatIds, sessionId) }))
-}
-
 function beginSessionReopen(sessionId: SessionId): number {
   const generation = (sessionReopenGenerations.get(sessionId) ?? 0) + 1
   sessionReopenGenerations.set(sessionId, generation)
@@ -1998,6 +2312,7 @@ export function _resetInFlightHistoryOpensForTesting(): void {
     invalidateSessionReopen(sessionId)
   }
   inFlightHistoryOpens.clear()
+  inFlightHistoryBackfillRetries.clear()
   inFlightDiscoveredOpens.clear()
   for (const tracker of restorePreloadTrackers.values()) {
     if (tracker.timer) clearTimeout(tracker.timer)
@@ -2091,40 +2406,69 @@ function ensureLiveAgent(
   return spawnPromise
 }
 
+/** Usable advertised auth methods (P5: empty/whitespace ids are ignored). */
+function advertisedAuthMethods(get: () => AcpState, agentId: AgentId): AuthMethod[] {
+  const methods = get().agents[agentId]?.authMethods ?? []
+  return methods.filter((m) => typeof m.id === 'string' && m.id.trim().length > 0)
+}
+
 /**
- * Run ACP `authenticate` before `session/new` when the agent advertises auth
- * methods (P1). The spawn response populates `authMethods` synchronously
- * (CAP-4: the response — not the async `acp:agent_spawned` event — is the
- * source of truth), so this reads them directly with no timed fallback:
- *   - no valid method → resolve (no-auth agent; unchanged spawn→session flow),
- *   - exactly one valid method → `authenticate(methodId)`,
- *   - more than one → reject with {@link AmbiguousAuthError} (never silently
- *     choose a method).
- *
- * A method whose id is empty/whitespace is ignored (P5). Concurrent calls for
- * the same agent share one in-flight authenticate (P2). On success the agent is
- * remembered so a reused agent is not re-authenticated.
+ * Share one in-flight `authenticate` per agent (P2). Used by explicit Sign-in
+ * and by the reactive path after `session/new` reports that auth is required.
  */
-function authenticateBeforeSession(get: () => AcpState, agentId: AgentId): Promise<void> {
-  if (authenticatedAgents.has(agentId)) return Promise.resolve()
+function runAuthenticate(agentId: AgentId, methodId: string): Promise<void> {
   const existing = inFlightAuth.get(agentId)
   if (existing) return existing
+  const promise = (async () => {
+    await acpApi.authenticate(agentId, methodId)
+    authenticatedAgents.add(agentId)
+  })().finally(() => {
+    inFlightAuth.delete(agentId)
+  })
+  inFlightAuth.set(agentId, promise)
+  return promise
+}
 
-  const task = (async (): Promise<void> => {
-    try {
-      const methods = get().agents[agentId]?.authMethods ?? []
-      // P5: ignore empty/whitespace ids — an unusable method must not be sent.
-      const valid = methods.filter((m) => typeof m.id === 'string' && m.id.trim().length > 0)
-      if (valid.length === 0) return
-      if (valid.length > 1) throw new AmbiguousAuthError(valid)
-      await acpApi.authenticate(agentId, valid[0].id.trim())
-      authenticatedAgents.add(agentId)
-    } finally {
-      inFlightAuth.delete(agentId)
-    }
-  })()
-  inFlightAuth.set(agentId, task)
-  return task
+/**
+ * After `session/new` fails with an auth-classified error, authenticate only
+ * when the agent advertises exactly one usable method, then tell the caller to
+ * retry `session/new`.
+ *
+ * Advertised methods are a menu of options, not a "you must log in" signal.
+ * Codex ACP always lists ChatGPT + API-key methods even when `~/.codex` already
+ * has credentials — speculative authenticate / multi-auth blocking before
+ * `session/new` would force a Sign-in the user already completed via `codex
+ * login`.
+ *
+ * Multiple methods → {@link AmbiguousAuthError} so the launcher can show a
+ * chooser. Never pick a method automatically.
+ */
+async function authenticateAfterAuthFailure(
+  get: () => AcpState,
+  agentId: AgentId,
+  err: unknown
+): Promise<boolean> {
+  const { category } = classifySetupError(err)
+  if (category !== 'auth') return false
+  const valid = advertisedAuthMethods(get, agentId)
+  if (valid.length === 0) return false
+  if (valid.length > 1) {
+    void logFrontendError({
+      level: 'warn',
+      source: 'acp.authenticateAfterAuthFailure',
+      message: `agentId=${agentId} session/new required authentication; ${valid.length} methods advertised`
+    })
+    throw new AmbiguousAuthError(valid)
+  }
+  if (authenticatedAgents.has(agentId)) return false
+  const methodId = valid[0].id.trim()
+  void logFrontendError({
+    level: 'warn',
+    source: 'acp.authenticateAfterAuthFailure',
+    message: `agentId=${agentId} methodId=${methodId} session/new required authentication`
+  })
+  await runAuthenticate(agentId, methodId)
+  return true
 }
 
 /**
@@ -2212,6 +2556,12 @@ function promotePreparedSession(
  * the session with its local transcript, and run load/resume when the
  * capability allows.
  *
+ * Closed Conversation-backed rows still follow `decideResume` (resume > load >
+ * local) after the durable transcript is installed. Skipping that step left the
+ * session closed, so a later Start Chat / prepared-session promotion minted a
+ * new host session instead of showing history. A follow-up prompt may continue
+ * live only after load/resume activates the same session.
+ *
  * 'load' semantics: the locally persisted transcript stays visible while
  * `session/load` is in flight; the session is marked `replaying: 'pending'`
  * so `_onMessageChunk` accepts the agent's replayed history (the session is
@@ -2269,12 +2619,139 @@ function mergeReopenOutcomeIfUnchanged(
   })
 }
 
+function backfillStateFromProgress(
+  progress: HistoryPageProgress,
+  errorCode?: string
+): HistoryBackfillState {
+  return {
+    loading: !progress.complete && errorCode === undefined,
+    complete: progress.complete,
+    loadedRecordCount: progress.loadedRecordCount,
+    nextCursor: progress.nextCursor,
+    targetLastSeq: progress.targetLastSeq,
+    ...(errorCode ? { errorCode } : {})
+  }
+}
+
+function installHistoryProjection(
+  state: AcpState,
+  sessionId: SessionId,
+  payload: SessionPayload,
+  progress: HistoryPageProgress
+): Pick<AcpState, 'messages' | 'toolCalls' | 'sessionUsage' | 'plans' | 'historyBackfill'> {
+  return {
+    messages: { ...state.messages, [sessionId]: payload.messages },
+    toolCalls: { ...state.toolCalls, [sessionId]: restoredToolCalls(payload) },
+    sessionUsage: payload.sessionUsage
+      ? { ...state.sessionUsage, [sessionId]: payload.sessionUsage }
+      : dropRecordKey(state.sessionUsage, sessionId),
+    plans:
+      payload.plan !== undefined
+        ? payload.plan.length > 0
+          ? { ...state.plans, [sessionId]: payload.plan }
+          : dropPlanForSession(state.plans, sessionId)
+        : state.plans,
+    historyBackfill: {
+      ...state.historyBackfill,
+      [sessionId]: backfillStateFromProgress(progress)
+    }
+  }
+}
+
+function updateHistoryProgress(
+  set: TurnEndSetter,
+  sessionId: SessionId,
+  progress: HistoryPageProgress
+): void {
+  set((state) => {
+    const current = state.historyBackfill[sessionId]
+    if (
+      current &&
+      current.loading === !progress.complete &&
+      current.complete === progress.complete &&
+      current.loadedRecordCount === progress.loadedRecordCount &&
+      current.nextCursor === progress.nextCursor &&
+      current.targetLastSeq === progress.targetLastSeq &&
+      current.errorCode === undefined
+    ) {
+      return {}
+    }
+    return {
+      historyBackfill: {
+        ...state.historyBackfill,
+        [sessionId]: backfillStateFromProgress(progress)
+      }
+    }
+  })
+}
+
+function historyBackfillErrorCode(error: unknown): string {
+  if (typeof error !== 'object' || error === null || !('code' in error)) return 'TRANSPORT_ERROR'
+  const code = typeof error.code === 'string' ? error.code : ''
+  return code && /^[A-Z0-9_]+$|^[a-z][a-z_]*$/.test(code) && code.length <= 64
+    ? code
+    : 'TRANSPORT_ERROR'
+}
+
+function safeHistorySessionIdForLog(sessionId: string): string {
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(sessionId) ? sessionId : '[redacted]'
+}
+
+function rehydratePlanFromHistoryIfNeeded(
+  get: () => AcpState,
+  set: TurnEndSetter,
+  sessionId: SessionId,
+  payload: SessionPayload
+): void {
+  // An explicit canonical PlanUpdate replacement, including `entries: []`, is authoritative and
+  // must never be overwritten by an older renderer-authored termul-plan fence.
+  if (payload.plan !== undefined || get().plans[sessionId]) return
+  const rehydrated = scanPlanFenceFromMessages(payload.messages)
+  if (rehydrated && rehydrated.length > 0) {
+    set((state) => ({ plans: { ...state.plans, [sessionId]: rehydrated } }))
+    return
+  }
+
+  let lastAgent: ChatMessage | undefined
+  for (let index = payload.messages.length - 1; index >= 0; index -= 1) {
+    if (payload.messages[index].role === 'agent') {
+      lastAgent = payload.messages[index]
+      break
+    }
+  }
+  const hasMalformedFence =
+    lastAgent?.blocks.some(
+      (block) => block.type === 'text' && extractTermulPlanFenceJson(block.text) !== null
+    ) ?? false
+  if (hasMalformedFence) {
+    void logFrontendError({
+      level: 'warn',
+      source: 'planRehydrate',
+      message: `Malformed termul-plan fence in history session ${safeHistorySessionIdForLog(sessionId)}; leaving plans empty`
+    })
+  }
+}
+
+type HistoryReopenOptions = {
+  /** Spawn failures and a local-only strategy reject instead of staying read-only. */
+  requireLive?: boolean
+}
+
+async function configuredMcpServersForReopen(
+  get: () => AcpState,
+  agentId: AgentId
+): Promise<McpServer[]> {
+  if (!get().mcpServersLoaded) await get().loadMcpServers()
+  return selectMcpServersForAgent(get().mcpServers, get().agents[agentId]?.capabilities).servers
+}
+
 async function openHistorySessionInner(
   get: () => AcpState,
   set: TurnEndSetter,
   id: string,
   onTranscriptInstalled: () => void,
-  reopenGeneration: number
+  reopenGeneration: number,
+  options: HistoryReopenOptions = {}
 ): Promise<void> {
   // Snapshot before any await so a delete during cold-spawn / capability wait
   // is still detected as a mid-open transition (not "never indexed").
@@ -2288,81 +2765,93 @@ async function openHistorySessionInner(
     })
   }
 
-  const payload = await loadSessionPayload(id)
-  if (!isCurrentSessionReopen(id, reopenGeneration)) return
-  if (!payload) throw new Error(`no persisted history for ${id}`)
-  const meta = payload.metadata
-
-  // Rebase the process-wide seq counter so live events appended after the
-  // restored transcript sort after it (nextSeq() returns > max restored seq).
-  rebaseSeqCounter(maxPayloadSeq(payload))
-
-  // Preserve controls already held by a cached closed session. Persisted
-  // history does not contain them, and optional reopen fields may be omitted.
+  // Preserve controls before the first page callback mutates the session shell.
   const existingControls = captureReopenControlBaseline(get().sessions, id)
+  const indexMetadata = get().sessionIndex.find((entry) => entry.id === id)
+  let latestPayload: SessionPayload | null = null
+  let installedFirstPage = false
 
-  // Register the session record + local transcript BEFORE any agent work, so
-  // the pane shows the conversation instantly; the (possibly ~30s cold-spawn)
-  // reconnect below then only upgrades the session in place. The persisted
-  // `meta.agentId` may be a stale per-process UUID — remapped after spawn.
-  set((s) => ({
-    sessions: {
-      ...s.sessions,
-      [id]: {
-        id,
-        agentId: meta.agentId,
-        cwd: meta.cwd,
-        projectId: meta.projectId,
-        status: 'closed',
-        title: meta.title,
-        activeTurn: false,
-        openTurnId: null,
-        modes: existingControls?.modes ?? null,
-        models: existingControls?.models ?? null,
-        configOptions: existingControls?.configOptions ?? [],
-        lastError: null,
-        createdAt: meta.createdAt,
-        replaying: null,
-        worktreePath: meta.worktreePath,
-        worktreeBranch: meta.worktreeBranch
-      }
-    },
-    messages: { ...s.messages, [id]: trimLiveWindow(payload.messages, id) },
-    // Restore the mirrored tool calls so the timeline shows the tool cards
-    // again — without this only thoughts + replies survive a reopen.
-    toolCalls: { ...s.toolCalls, [id]: restoredToolCalls(payload) }
-  }))
-  onTranscriptInstalled()
-
-  // Rehydrate the sticky plan from the latest assistant message's
-  // `termul-plan` fence (single source of truth). Scans the payload messages
-  // (not the trimmed live window) so the fence is found even when the
-  // trimming boundary lands on the snapshot carrier. Skip silently when a
-  // live `plans[id]` already exists from an in-flight turn — the live plan
-  // owns the active turn; the fence only rehydrates a closed/reopened chat.
-  if (!get().plans[id]) {
-    const rehydrated = scanPlanFenceFromMessages(payload.messages)
-    if (rehydrated && rehydrated.length > 0) {
-      set((s) => ({ plans: { ...s.plans, [id]: rehydrated } }))
-    } else {
-      // Detect a malformed fence (fence present but JSON unparseable / not an
-      // array / empty after coercion) and warn so a corrupted snapshot is
-      // visible without crashing the rehydrate. Leave `plans[id]` empty so
-      // the agent can still emit a fresh plan.
-      const lastAgent = [...payload.messages].reverse().find((m) => m.role === 'agent')
-      const hasMalformedFence =
-        lastAgent?.blocks.some(
-          (b) => b.type === 'text' && extractTermulPlanFenceJson(b.text) !== null
-        ) ?? false
-      if (hasMalformedFence) {
-        void logFrontendError({
-          level: 'warn',
-          source: 'planRehydrate',
-          message: `Malformed termul-plan fence in history session ${id}; leaving plans empty`
-        })
-      }
+  const installPage = (nextPayload: SessionPayload, progress: HistoryPageProgress): void => {
+    if (deletedMidOpen() || !isCurrentSessionReopen(id, reopenGeneration)) return
+    latestPayload = nextPayload
+    const meta = nextPayload.metadata
+    rebaseSeqCounter(maxPayloadSeq(nextPayload))
+    set((s) => ({
+      sessions: {
+        ...s.sessions,
+        [id]: {
+          id,
+          conversationId: meta.conversationId ?? indexMetadata?.conversationId,
+          agentId: meta.agentId,
+          cwd: meta.cwd,
+          projectId: meta.projectId,
+          status: 'closed',
+          title: meta.title,
+          activeTurn: false,
+          openTurnId: null,
+          modes: existingControls?.modes ?? null,
+          models: existingControls?.models ?? null,
+          configOptions: existingControls?.configOptions ?? [],
+          lastError: null,
+          createdAt: meta.createdAt,
+          replaying: null,
+          worktreePath: meta.worktreePath,
+          worktreeBranch: meta.worktreeBranch
+        }
+      },
+      // Page one is visible before page two. Later pages update cursor/count only; a single
+      // retained snapshot is installed on failure and one final replacement lands on completion.
+      ...installHistoryProjection(s, id, nextPayload, progress)
+    }))
+    if (!installedFirstPage) {
+      installedFirstPage = true
+      onTranscriptInstalled()
     }
   }
+
+  let payload: SessionPayload | null
+  try {
+    payload = await loadSessionPayload(id, {
+      metadata: indexMetadata,
+      onPage: installPage,
+      onProgress: (progress) => {
+        if (deletedMidOpen() || !isCurrentSessionReopen(id, reopenGeneration)) return
+        updateHistoryProgress(set, id, progress)
+      }
+    })
+  } catch (error) {
+    const code = historyBackfillErrorCode(error)
+    set((s) => {
+      const current = s.historyBackfill[id]
+      if (!current) return {}
+      return {
+        historyBackfill: {
+          ...s.historyBackfill,
+          [id]: { ...current, loading: false, errorCode: code }
+        }
+      }
+    })
+    throw error
+  }
+  if (!isCurrentSessionReopen(id, reopenGeneration)) return
+  if (!payload) throw new Error(`no persisted history for ${id}`)
+  if (!latestPayload) {
+    installPage(payload, {
+      sessionId: id,
+      pageNumber: 0,
+      pageRecordCount: 0,
+      loadedRecordCount: payload.metadata.lastSeq ?? maxPayloadSeq(payload),
+      nextCursor: payload.metadata.lastSeq ?? maxPayloadSeq(payload),
+      targetLastSeq: payload.metadata.lastSeq ?? maxPayloadSeq(payload),
+      complete: true,
+      inFlightBytes: 0,
+      resumed: true
+    })
+  }
+  const meta = payload.metadata
+
+  // Legacy fences are a fallback only when canonical history contains no PlanUpdate at all.
+  rehydratePlanFromHistoryIfNeeded(get, set, id, payload)
 
   // Resolve the CURRENT live agent for this chat's config+cwd. Without this
   // remap the `agentStatus`/`agents` lookups miss (stale UUID after restart)
@@ -2396,9 +2885,13 @@ async function openHistorySessionInner(
   // to read-only 'local' instead of throwing (spec: do not throw).
   if (meta.agentConfigId && meta.cwd) {
     const ensured = await ensureLiveAgent(get, set, meta.agentConfigId, meta.cwd, {
-      silentSpawnFailure: true
+      silentSpawnFailure: !options.requireLive
     })
     if (ensured) liveAgentId = ensured
+  } else if (options.requireLive) {
+    throw Object.assign(new Error('reconnect requires agent config and workspace'), {
+      code: 'ACP_RECONNECT_MISSING_CONTEXT'
+    })
   }
   // CAP-4: `spawnAgent` seeds capabilities synchronously from the spawn
   // response, so a freshly spawned agent already has them by this point.
@@ -2433,7 +2926,15 @@ async function openHistorySessionInner(
 
   const connected = get().agentStatus[liveAgentId] === 'connected'
   const capabilities = get().agents[liveAgentId]?.capabilities ?? null
-  const strategy = decideResume({ connected, capabilities })
+  const strategy = decideResume({ connected, capabilities, localHistoryAvailable: true })
+  if (options.requireLive && strategy === 'local') {
+    throw Object.assign(new Error('agent cannot load or resume this session'), {
+      code: 'ACP_RECONNECT_FAILED'
+    })
+  }
+  const reopenMcpServers =
+    strategy === 'local' ? [] : await configuredMcpServersForReopen(get, liveAgentId)
+  if (deletedMidOpen() || !isCurrentSessionReopen(id, reopenGeneration)) return
 
   // Point the record at the resolved live agent so streaming events from
   // `session/load` route to this session, and (for 'load') open the replay
@@ -2460,10 +2961,14 @@ async function openHistorySessionInner(
   })
 
   const reopenBaseline = captureReopenControlBaseline(get().sessions, id)
+  const conversationId =
+    get().sessions[id]?.conversationId ?? meta.conversationId ?? indexMetadata?.conversationId
 
-  if (strategy === 'load') {
+  const runLoadFallback = async (): Promise<void> => {
     try {
-      const outcome = (await acpApi.loadSession(liveAgentId, id, meta.cwd)) ?? {}
+      const outcome =
+        (await acpApi.loadSession(liveAgentId, id, meta.cwd, conversationId, reopenMcpServers)) ??
+        {}
       if (deletedMidOpen() || !isCurrentSessionReopen(id, reopenGeneration)) {
         if (isCurrentSessionReopen(id, reopenGeneration)) clearReplayIfPresent()
         return
@@ -2504,9 +3009,15 @@ async function openHistorySessionInner(
       }))
       throw err
     }
+  }
+
+  if (strategy === 'load') {
+    await runLoadFallback()
   } else if (strategy === 'resume') {
     try {
-      const outcome = (await acpApi.resumeSession(liveAgentId, id, meta.cwd)) ?? {}
+      const outcome =
+        (await acpApi.resumeSession(liveAgentId, id, meta.cwd, conversationId, reopenMcpServers)) ??
+        {}
       if (deletedMidOpen() || !isCurrentSessionReopen(id, reopenGeneration)) {
         if (isCurrentSessionReopen(id, reopenGeneration)) clearReplayIfPresent()
         return
@@ -2515,12 +3026,119 @@ async function openHistorySessionInner(
       set((s) => ({ sessions: withSessionActive(s.sessions, id) }))
       scheduleReplayEnd(set, id, reopenGeneration)
     } catch (err) {
-      if (deletedMidOpen() || !isCurrentSessionReopen(id, reopenGeneration)) return
+      if (deletedMidOpen() || !isCurrentSessionReopen(id, reopenGeneration)) {
+        if (isCurrentSessionReopen(id, reopenGeneration)) clearReplayIfPresent()
+        return
+      }
+      if (capabilities?.loadSession === true) {
+        void logFrontendError({
+          level: 'warn',
+          source: 'acp.openHistorySession',
+          message: `session/resume failed for ${safeHistorySessionIdForLog(id)}; falling back to session/load`
+        })
+        set((s) => {
+          const session = s.sessions[id]
+          if (!session) return {}
+          return {
+            sessions: {
+              ...s.sessions,
+              [id]: { ...session, replaying: 'pending' as const }
+            }
+          }
+        })
+        await runLoadFallback()
+        return
+      }
+      clearReplayIfPresent()
       set((s) => ({ sessions: withSessionResumeError(s.sessions, id, err) }))
       throw err
     }
   }
-  // 'local' → nothing more; the transcript is already shown.
+  // Closed / local reopen: restore this Conversation's last agent parameters
+  // so the composer still shows the ACP + model/mode from the last run.
+  await hydrateSessionComposer(get, set, id)
+}
+
+async function retryHistoryBackfillInner(
+  get: () => AcpState,
+  set: TurnEndSetter,
+  sessionId: SessionId
+): Promise<void> {
+  const initial = get().historyBackfill[sessionId]
+  if (!initial || initial.complete) return
+  const metadata = get().sessionIndex.find((entry) => entry.id === sessionId)
+  if (!metadata || !get().sessions[sessionId]) {
+    throw Object.assign(new Error('history session is unavailable'), {
+      code: 'CONVERSATION_NOT_FOUND'
+    })
+  }
+  const stillPresent = (): boolean =>
+    Boolean(get().sessions[sessionId] && get().sessionIndex.some((entry) => entry.id === sessionId))
+
+  set((state) => {
+    const current = state.historyBackfill[sessionId]
+    if (!current || current.complete) return {}
+    const { errorCode: _errorCode, ...retained } = current
+    return {
+      historyBackfill: {
+        ...state.historyBackfill,
+        [sessionId]: { ...retained, loading: true }
+      }
+    }
+  })
+
+  let payload: SessionPayload | null
+  try {
+    payload = await loadSessionPayload(sessionId, {
+      metadata,
+      onPage: (nextPayload, progress) => {
+        if (!stillPresent()) return
+        rebaseSeqCounter(maxPayloadSeq(nextPayload))
+        set((state) => installHistoryProjection(state, sessionId, nextPayload, progress))
+      },
+      onProgress: (progress) => {
+        if (stillPresent()) updateHistoryProgress(set, sessionId, progress)
+      }
+    })
+  } catch (error) {
+    if (stillPresent()) {
+      const code = historyBackfillErrorCode(error)
+      set((state) => {
+        const current = state.historyBackfill[sessionId]
+        if (!current) return {}
+        return {
+          historyBackfill: {
+            ...state.historyBackfill,
+            [sessionId]: { ...current, loading: false, complete: false, errorCode: code }
+          }
+        }
+      })
+    }
+    throw error
+  }
+  if (!stillPresent()) return
+  if (!payload) {
+    const error = Object.assign(new Error('history session is unavailable'), {
+      code: 'CONVERSATION_NOT_FOUND'
+    })
+    set((state) => {
+      const current = state.historyBackfill[sessionId]
+      if (!current) return {}
+      return {
+        historyBackfill: {
+          ...state.historyBackfill,
+          [sessionId]: {
+            ...current,
+            loading: false,
+            complete: false,
+            errorCode: 'CONVERSATION_NOT_FOUND'
+          }
+        }
+      }
+    })
+    throw error
+  }
+  rehydratePlanFromHistoryIfNeeded(get, set, sessionId, payload)
 }
 
 /**
@@ -2864,6 +3482,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
   selectedAgentConfigId: null,
   sessionIndex: [],
   openingHistoryIds: {},
+  historyBackfill: {},
   restoringChatIds: {},
   launchingSessionIds: {},
   discoveredSessions: {},
@@ -2882,6 +3501,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
   messages: {},
   toolCalls: {},
   plans: {},
+  scheduledTaskDrafts: {},
   commands: {},
   pendingPermissions: {},
   pendingQuestions: {},
@@ -2936,9 +3556,9 @@ export const useAcpStore = create<AcpState>((set, get) => ({
 
   killAgent: async (agentId) => {
     await acpApi.killAgent(agentId)
-    // Drop cached auth for the torn-down process so a re-spawn re-authenticates
-    // (the new subprocess has unknown auth state; a stale `authenticatedAgents`
-    // entry would make `authenticateBeforeSession` skip `authenticate`).
+    // Drop cached auth for the torn-down process so a re-spawn can authenticate
+    // again if `session/new` requires it (the new subprocess has unknown auth
+    // state; a stale `authenticatedAgents` entry would skip reactive auth).
     authenticatedAgents.delete(agentId)
     inFlightAuth.delete(agentId)
     set((s) => {
@@ -2977,48 +3597,41 @@ export const useAcpStore = create<AcpState>((set, get) => ({
   },
 
   authenticateAgent: async (agentId, methodId) => {
-    // Share a single in-flight authenticate with `authenticateBeforeSession`
-    // (P2): a launcher Sign-in click concurrent with a background
-    // `prepareChat` must issue one round-trip, not two. Keyed by agent —
-    // auto-auth only fires for the single unambiguous method, the same one
-    // Sign-in uses, so concurrent callers share the same request.
-    const existing = inFlightAuth.get(agentId)
-    if (existing) return existing
-    const promise = (async () => {
-      await acpApi.authenticate(agentId, methodId)
-      // Remember success so the next `createSession` skips its own authenticate.
-      authenticatedAgents.add(agentId)
-    })().finally(() => inFlightAuth.delete(agentId))
-    inFlightAuth.set(agentId, promise)
-    return promise
+    // Share a single in-flight authenticate with the reactive session/new
+    // path (P2): a launcher Sign-in click concurrent with a background
+    // `prepareChat` must issue one round-trip, not two.
+    return runAuthenticate(agentId, methodId)
   },
 
   createSession: async (agentId, cwd, mcpServers, projectId, opts) => {
-    try {
-      // Authenticate (single unambiguous method) BEFORE session/new (P1).
-      await authenticateBeforeSession(get, agentId)
-      const selection =
-        mcpServers === undefined
-          ? selectMcpServersForAgent(get().mcpServers, get().agents[agentId]?.capabilities)
-          : { servers: mcpServers, skipped: [], pending: false }
-      const sessionMcpServers = selection.servers
-      if (!selection.pending && selection.skipped.length > 0) {
-        toast.warning(runtimeT('mcp', 'skippedTitle', 'Some MCP servers were skipped'), {
-          description: runtimeT(
-            'mcp',
-            'skippedDescription',
-            '{{names}} require HTTP or SSE support from this agent.',
-            {
-              names: selection.skipped.map((server) => server.name).join(', ')
-            }
-          )
-        })
-      }
+    const selection =
+      mcpServers === undefined
+        ? selectMcpServersForAgent(get().mcpServers, get().agents[agentId]?.capabilities)
+        : { servers: mcpServers, skipped: [], pending: false }
+    const sessionMcpServers = selection.servers
+    if (!selection.pending && selection.skipped.length > 0) {
+      toast.warning(runtimeT('mcp', 'skippedTitle', 'Some MCP servers were skipped'), {
+        description: runtimeT(
+          'mcp',
+          'skippedDescription',
+          '{{names}} require HTTP or SSE support from this agent.',
+          {
+            names: selection.skipped.map((server) => server.name).join(', ')
+          }
+        )
+      })
+    }
+
+    const openNewSession = async (): Promise<SessionId> => {
+      const hasExplicitTarget = Boolean(opts?.executionTarget)
       const outcome = await acpApi.newSession(agentId, cwd, sessionMcpServers, {
         ephemeral: opts?.backendEphemeral ?? false,
-        ...(projectId ? { projectId } : {}),
+        ...(!hasExplicitTarget && projectId ? { projectId } : {}),
         ...(opts?.worktreePath ? { worktreePath: opts.worktreePath } : {}),
-        ...(opts?.worktreeBranch ? { worktreeBranch: opts.worktreeBranch } : {})
+        ...(opts?.worktreeBranch ? { worktreeBranch: opts.worktreeBranch } : {}),
+        ...(opts?.conversationId ? { conversationId: opts.conversationId } : {}),
+        ...(opts?.projectAttachment ? { projectAttachment: opts.projectAttachment } : {}),
+        ...(opts?.executionTarget ? { executionTarget: opts.executionTarget } : {})
       })
       const sessionId = outcome.sessionId
       invalidateSessionReopen(sessionId)
@@ -3031,8 +3644,12 @@ export const useAcpStore = create<AcpState>((set, get) => ({
             ...s.sessions,
             [sessionId]: {
               id: sessionId,
+              conversationId:
+                outcome.persistence === 'conversation'
+                  ? outcome.conversationId
+                  : existing?.conversationId,
               agentId,
-              cwd,
+              cwd: outcome.persistence === 'conversation' ? outcome.executionCwd : cwd,
               projectId,
               status: existing?.status === 'closed' ? 'closed' : 'active',
               title: existing?.title ?? null,
@@ -3053,6 +3670,9 @@ export const useAcpStore = create<AcpState>((set, get) => ({
           activeSessionId: opts?.ephemeral ? s.activeSessionId : (s.activeSessionId ?? sessionId)
         }
       })
+      if (outcome.persistence === 'conversation') {
+        await useConversationStore.getState().openConversation(outcome.conversationId)
+      }
       // Track un-promoted pooled sessions so disconnect/close can drop (not persist) them.
       if (opts?.ephemeral) ephemeralSessionIds.add(sessionId)
       // Mirror to disk (index + payload). Skipped for ephemeral (pooled) sessions,
@@ -3061,6 +3681,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       if (!opts?.ephemeral) {
         const st = get()
         persistSession(st, sessionId, (entries) => set({ sessionIndex: entries }))
+        persistConversationComposerFromState(st, sessionId)
       }
       // Cache models/modes even for ephemeral prepares so the launcher can paint
       // instantly from the warm pool.
@@ -3073,7 +3694,9 @@ export const useAcpStore = create<AcpState>((set, get) => ({
         })
       }
       return sessionId
-    } catch (err) {
+    }
+
+    const handleCreateSessionFailure = async (err: unknown): Promise<void> => {
       const { category } = classifySetupError(err)
       if (category === 'transport') {
         // Broken stream/connection: discard the process so retry spawns fresh.
@@ -3082,7 +3705,28 @@ export const useAcpStore = create<AcpState>((set, get) => ({
         // Allow a manual Sign-in + retry to re-authenticate (P3).
         authenticatedAgents.delete(agentId)
       }
-      throw err
+    }
+
+    try {
+      return await openNewSession()
+    } catch (err) {
+      let retry = false
+      try {
+        retry = await authenticateAfterAuthFailure(get, agentId, err)
+      } catch (authErr) {
+        await handleCreateSessionFailure(authErr)
+        throw authErr
+      }
+      if (!retry) {
+        await handleCreateSessionFailure(err)
+        throw err
+      }
+      try {
+        return await openNewSession()
+      } catch (retryErr) {
+        await handleCreateSessionFailure(retryErr)
+        throw retryErr
+      }
     }
   },
 
@@ -3169,50 +3813,129 @@ export const useAcpStore = create<AcpState>((set, get) => ({
   closeSession: async (sessionId) => {
     invalidateSessionReopen(sessionId)
     const session = get().sessions[sessionId]
+    if (session?.conversationId) {
+      await get().suspendAgentBinding(session.conversationId)
+      return
+    }
     if (session && session.status !== 'closed') {
-      try {
-        await acpApi.closeSession(session.agentId, sessionId)
-      } catch (error) {
-        void logFrontendError({
-          level: 'warn',
-          source: 'acp.closeSession',
-          message: `Failed to close session ${sessionId}: ${String(error)}`
-        })
-      }
+      await acpApi.closeSession(session.agentId, sessionId)
     }
-    // Reclaim app-owned temp files (pasted screenshots) staged for this session
-    // now that no further turns can read them.
     void deleteSessionTempFiles(sessionId)
-    set((s) => {
-      const sessions = { ...s.sessions }
-      if (sessions[sessionId]) {
-        sessions[sessionId] = {
-          ...sessions[sessionId],
-          status: 'closed',
-          activeTurn: false,
-          openTurnId: null,
-          replaying: null
-        }
+    set((s) => ({
+      sessions: s.sessions[sessionId]
+        ? {
+            ...s.sessions,
+            [sessionId]: {
+              ...s.sessions[sessionId],
+              status: 'closed',
+              activeTurn: false,
+              openTurnId: null,
+              replaying: null
+            }
+          }
+        : s.sessions,
+      pendingPermissions: dropPermissionsForSession(s.pendingPermissions, sessionId),
+      pendingQuestions: dropQuestionsForSession(s.pendingQuestions, sessionId),
+      promptQueues: dropPromptQueueForSession(s.promptQueues, sessionId),
+      suppressQueueFlush: dropRecordKey(s.suppressQueueFlush, sessionId)
+    }))
+  },
+
+  closeChatView: (conversationId) => {
+    const state = get()
+    const session = Object.values(state.sessions).find(
+      (candidate) => candidate.conversationId === conversationId
+    )
+    const entry = state.sessionIndex.find(
+      (candidate) => candidate.conversationId === conversationId
+    )
+    const sessionId = session?.id ?? entry?.id
+    const workspace = useWorkspaceStore.getState()
+    workspace.closeChatView(conversationId)
+    if (sessionId && state.activeSessionId === sessionId) {
+      const activeTab = workspace.getActiveTab()
+      if (activeTab?.type !== 'agent-chat') {
+        set({ activeSessionId: null })
+        return
       }
-      return {
-        sessions,
-        pendingPermissions: dropPermissionsForSession(s.pendingPermissions, sessionId),
-        pendingQuestions: dropQuestionsForSession(s.pendingQuestions, sessionId),
-        promptQueues: dropPromptQueueForSession(s.promptQueues, sessionId),
-        suppressQueueFlush: dropRecordKey(s.suppressQueueFlush, sessionId)
-      }
-    })
-    // Flush closed status + last transcript to disk while maps still hold it,
-    // then drop in-memory maps so WebView2 can reclaim heap. Ephemeral (warm
-    // pool) sessions are never mirrored.
-    if (
-      !ephemeralSessionIds.has(sessionId) &&
-      get().sessions[sessionId] &&
-      sessionId in get().messages
-    ) {
-      persistSession(get(), sessionId, (entries) => set({ sessionIndex: entries }))
+      const nextSessionId = activeTab.sessionId
+        ? activeTab.sessionId
+        : Object.values(get().sessions).find(
+            (candidate) => candidate.conversationId === activeTab.conversationId
+          )?.id
+      set({ activeSessionId: nextSessionId ?? null })
     }
-    set((s) => dropSessionTranscriptState(s, sessionId))
+  },
+
+  detachAgentBinding: async (conversationId) => {
+    const record = conversationLifecycleRecord(conversationId)
+    const outcome = await conversationLifecycleApi.detachBinding(
+      record.conversationId,
+      record.lastSeq
+    )
+    if (useConversationStore.getState().applyLifecycleOutcome(outcome)) {
+      get()._onConversationLifecycle(outcome)
+    }
+    return outcome
+  },
+
+  rebindDetachedBinding: async (conversationId) => {
+    const record = conversationLifecycleRecord(conversationId)
+    const outcome = await conversationLifecycleApi.rebindDetachedBinding(
+      record.conversationId,
+      record.lastSeq
+    )
+    if (useConversationStore.getState().applyLifecycleOutcome(outcome)) {
+      get()._onConversationLifecycle(outcome)
+    }
+    return outcome
+  },
+
+  suspendAgentBinding: async (conversationId) => {
+    const record = conversationLifecycleRecord(conversationId)
+    const outcome = await conversationLifecycleApi.suspendBinding(
+      record.conversationId,
+      record.lastSeq
+    )
+    if (useConversationStore.getState().applyLifecycleOutcome(outcome)) {
+      get()._onConversationLifecycle(outcome)
+    }
+    return outcome
+  },
+
+  replaceAgentBinding: async (conversationId) => {
+    const record = conversationLifecycleRecord(conversationId)
+    const outcome = await conversationLifecycleApi.replaceBinding(
+      record.conversationId,
+      replacementRequest(record),
+      record.lastSeq
+    )
+    if (useConversationStore.getState().applyLifecycleOutcome(outcome)) {
+      get()._onConversationLifecycle(outcome)
+    }
+    return outcome
+  },
+
+  deleteConversation: async (conversationId, removeWorkspace) => {
+    const terminals = useTerminalStore
+      .getState()
+      .terminals.filter((terminal) => terminal.conversationId === conversationId)
+    for (const terminal of terminals) {
+      const didTerminate = await useTerminalStore.getState().terminateTerminalResource(terminal.id)
+      if (didTerminate) {
+        useWorkspaceStore.getState().closeTerminalView(terminal.id)
+      }
+    }
+    const record = conversationLifecycleRecord(conversationId)
+    const outcome = await conversationLifecycleApi.deleteConversation(
+      record.conversationId,
+      record.lastSeq,
+      removeWorkspace
+    )
+    if (useConversationStore.getState().applyLifecycleOutcome(outcome)) {
+      get()._onConversationLifecycle(outcome)
+    }
+    return outcome
   },
 
   setActiveSession: (sessionId) => set({ activeSessionId: sessionId }),
@@ -3246,6 +3969,24 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     // Do not kill warm agents here — that remains deleteAgentConfig's job.
     if (agentConfigIdentityChanged(prev, config)) {
       invalidateAgentOptionsCache(set, config.id)
+    }
+    const configKeys = new Set<string>([config.id])
+    if (config.configId) configKeys.add(config.configId)
+    const liveAgentIds = new Set<AgentId>()
+    for (const [reuseKey, agentId] of Object.entries(get().configToLiveAgent)) {
+      if (configKeys.has(configIdFromReuseKey(reuseKey))) liveAgentIds.add(agentId)
+    }
+    const permissionPolicy = config.permissionPolicy ?? 'ask'
+    for (const agentId of liveAgentIds) {
+      try {
+        await acpApi.setPermissionPolicy(agentId, permissionPolicy)
+      } catch (error) {
+        void logFrontendError({
+          level: 'warn',
+          source: 'acp.saveAgentConfig.permissionPolicy',
+          message: `agentId=${agentId} policy=${permissionPolicy} sync_failed=${error instanceof Error ? error.message : String(error)}`
+        })
+      }
     }
   },
 
@@ -3382,7 +4123,8 @@ export const useAcpStore = create<AcpState>((set, get) => ({
           return
         }
         const sessionId = await get().createSession(agentId, trimmedCwd, mcpServers, projectId, {
-          ephemeral: true
+          ephemeral: true,
+          backendEphemeral: true
         })
         // Disconnect race: if the agent died mid-prepare, don't register a dead
         // session — drop it (createSession added it to `ephemeralSessionIds`) and
@@ -3484,32 +4226,79 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     const trimmedCwd = cwd.trim()
     const config = get().agentConfigs.find((c) => c.id === configId)
     if (!config) throw new Error(`unknown agent config ${configId}`)
+    let predecessorId: string | null = null
+    if (opts?.conversationId) {
+      try {
+        await get().loadSessionIndex()
+      } catch {
+        // Keep the current index; live sessions can still resume.
+      }
+      const existing = resolveConversationSessionId(get(), opts.conversationId)
+      if (existing) {
+        const live = get().sessions[existing]
+        if (live && live.status !== 'closed') {
+          get().setActiveSession(existing)
+          return existing
+        }
+        if (!opts.skipHistoryReopen && (!live || live.status === 'closed')) {
+          await get().openHistorySession(existing)
+        }
+        const afterOpen = get().sessions[existing]
+        if (afterOpen && afterOpen.status !== 'closed') {
+          get().setActiveSession(existing)
+          return existing
+        }
+        // History-only / local reopen: keep the transcript, then create a live
+        // session so the composer (model, pi, modes) is available again.
+        predecessorId = existing
+      }
+    }
     const key = prepareChatKey(configId, trimmedCwd, mcpServers)
     // Loop so a cancelled in-flight prepare that returns null can pick up a
     // newer prepare that started during the await (cancel+reopen race).
     for (;;) {
       const prepared = get().preparedSessions[key]
       if (prepared) {
-        promotePreparedSession(key, prepared, projectId, get, set)
-        return prepared
+        const preparedSession = get().sessions[prepared]
+        if (
+          opts?.conversationId &&
+          preparedSession?.conversationId &&
+          preparedSession.conversationId !== opts.conversationId
+        ) {
+          get().cancelPreparedChat(key)
+          break
+        }
+        if (preparedSession?.conversationId) {
+          promotePreparedSession(key, prepared, projectId, get, set)
+          return prepared
+        }
+        get().cancelPreparedChat(key)
+        break
       }
       const inFlight = inFlightPrepared.get(key)
       if (!inFlight) break
       const sessionId = await inFlight
-      if (sessionId) {
+      if (sessionId && get().sessions[sessionId]?.conversationId) {
         promotePreparedSession(key, sessionId, projectId, get, set)
         return sessionId
       }
-      // null: cancelled or failed — re-check for a newer prepare before spawning.
+      if (sessionId) get().cancelPreparedChat(key)
+      // null or backend-ephemeral warm session: create one canonical Conversation.
     }
     const agentId = await ensureLiveAgent(get, set, configId, trimmedCwd)
     if (!agentId) throw new Error(`failed to spawn agent for config ${configId}`)
-    return get().createSession(agentId, trimmedCwd, mcpServers, projectId, opts)
+    const created = await get().createSession(agentId, trimmedCwd, mcpServers, projectId, opts)
+    if (predecessorId && created !== predecessorId) {
+      copyClosedSessionTranscript(predecessorId, created, get, set)
+      collapseClosedPredecessor(predecessorId, created, opts?.conversationId, get, set)
+      persistSession(get(), created, (entries) => set({ sessionIndex: entries }))
+    }
+    return created
   },
 
   claimPreparedChat: (key, projectId) => {
     const sessionId = get().preparedSessions[key]
-    if (!sessionId) return null
+    if (!sessionId || !get().sessions[sessionId]?.conversationId) return null
     promotePreparedSession(key, sessionId, projectId, get, set)
     return sessionId
   },
@@ -3651,10 +4440,11 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     }
     let modelConfigIdHandled: string | null = null
     if (pending.modelId) {
+      const modelId = canonicalizeClaudeModelId(pending.modelId)
       let applied = false
       if (session.models) {
         try {
-          await get().setModel(sessionId, pending.modelId)
+          await get().setModel(sessionId, modelId)
           applied = true
         } catch {
           // native setModel rejected; fall through to a model config option
@@ -3664,7 +4454,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
         const modelOpt = session.configOptions.find((o) => o.category === 'model')
         if (modelOpt) {
           try {
-            await get().setConfigOption(sessionId, modelOpt.id, pending.modelId)
+            await get().setConfigOption(sessionId, modelOpt.id, modelId)
             applied = true
             modelConfigIdHandled = modelOpt.id
           } catch {
@@ -3685,7 +4475,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
               'store.modelUnavailableDescription',
               'The model "{{model}}" is not advertised by the agent and no model config option exists. Falling back to the agent\'s default model.',
               {
-                model: pending.modelId
+                model: modelId
               }
             )
           }
@@ -3709,12 +4499,18 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     initialBlocks,
     adoptSession,
     worktreePath,
-    worktreeBranch
+    worktreeBranch,
+    conversationId,
+    projectAttachment,
+    executionTarget
   }) => {
     try {
       const sessionId = await get().startChat(configId, cwd, mcpServers, projectId, {
         worktreePath,
-        worktreeBranch
+        worktreeBranch,
+        conversationId,
+        projectAttachment,
+        executionTarget
       })
 
       // Move optimistic UI onto the real session, then remap the tab before send
@@ -4048,24 +4844,27 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     set({ sessionIndex: merged })
   },
 
-  openHistorySession: async (id) => {
+  openHistorySession: async (id, opts) => {
     const cached = get().sessions[id]
     // Only skip reload for a genuinely live session (active/initializing/error).
     // Still show the click feedback briefly before revealing the already-usable
     // chat, matching every other history-row open.
     if (cached && cached.status !== 'closed') {
-      const restoreToken = beginRestorePreload(set, id)
-      scheduleRestorePreloadEnd(set, id, restoreToken)
+      if (!opts?.skipRestorePreload) {
+        const restoreToken = beginRestorePreload(set, id)
+        scheduleRestorePreloadEnd(set, id, restoreToken)
+      }
       return
     }
 
     // Coalesce only with the current session incarnation. Delete/recreate bumps
     // the generation and detaches the old task so a replacement can start.
+    // A requireLive reconnect must not join a silent history-only reopen.
     const currentGeneration = sessionReopenGenerations.get(id) ?? 0
     const inFlight = inFlightHistoryOpens.get(id)
-    if (inFlight?.generation === currentGeneration) return inFlight.promise
+    if (!opts?.requireLive && inFlight?.generation === currentGeneration) return inFlight.promise
 
-    const restoreToken = beginRestorePreload(set, id)
+    const restoreToken = opts?.skipRestorePreload ? null : beginRestorePreload(set, id)
     const reopenGeneration = beginSessionReopen(id)
     let transcriptInstalled = false
     let task!: Promise<void>
@@ -4077,12 +4876,15 @@ export const useAcpStore = create<AcpState>((set, get) => ({
           id,
           () => {
             transcriptInstalled = true
-            scheduleRestorePreloadEnd(set, id, restoreToken)
+            if (restoreToken !== null) scheduleRestorePreloadEnd(set, id, restoreToken)
           },
-          reopenGeneration
+          reopenGeneration,
+          { requireLive: opts?.requireLive }
         )
       } finally {
-        if (!transcriptInstalled) scheduleRestorePreloadEnd(set, id, restoreToken)
+        if (!transcriptInstalled && restoreToken !== null) {
+          scheduleRestorePreloadEnd(set, id, restoreToken)
+        }
         const current = inFlightHistoryOpens.get(id)
         if (current?.generation === reopenGeneration && current.promise === task) {
           inFlightHistoryOpens.delete(id)
@@ -4092,6 +4894,101 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     })()
     inFlightHistoryOpens.set(id, { generation: reopenGeneration, promise: task })
     set((s) => ({ openingHistoryIds: { ...s.openingHistoryIds, [id]: true } }))
+    return task
+  },
+
+  reconnectClosedSession: async (sessionId) => {
+    void logFrontendError({
+      level: 'warn',
+      source: 'acp.reconnectClosedSession.start',
+      message: `sessionId=${sessionId}`
+    })
+    set((state) => ({
+      launchingSessionIds: { ...state.launchingSessionIds, [sessionId]: true }
+    }))
+    let created = sessionId
+    try {
+      try {
+        await get().openHistorySession(sessionId, {
+          requireLive: true,
+          skipRestorePreload: true
+        })
+      } catch (error) {
+        void logFrontendError({
+          level: 'warn',
+          source: 'acp.reconnectClosedSession.load',
+          message: `sessionId=${sessionId} ${error instanceof Error ? error.message : String(error)}`,
+          stack: error instanceof Error ? error.stack : undefined
+        })
+      }
+      const loaded = get().sessions[sessionId]
+      if (loaded && loaded.status !== 'closed') {
+        get().setActiveSession(sessionId)
+        return sessionId
+      }
+      const context = reconnectContext(get, sessionId)
+      if (!context.conversationId || !context.configId || !context.cwd) {
+        throw Object.assign(new Error('reconnect requires agent config and workspace'), {
+          code: 'ACP_RECONNECT_MISSING_CONTEXT'
+        })
+      }
+      const snapshot = await readComposerSnapshotForSession({
+        conversationId: context.conversationId,
+        agentConfigId: context.configId
+      })
+      created = await get().startChat(context.configId, context.cwd, undefined, context.projectId, {
+        conversationId: context.conversationId,
+        skipHistoryReopen: true
+      })
+      const live = get().sessions[created]
+      if (!live || live.status === 'closed') {
+        throw Object.assign(new Error('reconnect failed'), { code: 'ACP_RECONNECT_FAILED' })
+      }
+      if (snapshot) {
+        try {
+          await get().applyPendingLauncherOptions(created, {
+            modelId: snapshot.modelId,
+            modeId: snapshot.modeId,
+            configValues: snapshot.configValues ?? {}
+          })
+        } catch (error) {
+          void logFrontendError({
+            level: 'warn',
+            source: 'acp.reconnectClosedSession.composer',
+            message: `sessionId=${created} ${error instanceof Error ? error.message : String(error)}`
+          })
+        }
+      }
+      get().setActiveSession(created)
+      return created
+    } catch (error) {
+      void logFrontendError({
+        level: 'warn',
+        source: 'acp.reconnectClosedSession',
+        message: `sessionId=${sessionId} ${error instanceof Error ? error.message : String(error)}`,
+        stack: error instanceof Error ? error.stack : undefined
+      })
+      throw error
+    } finally {
+      set((state) => ({
+        launchingSessionIds: dropRecordKey(
+          dropRecordKey(state.launchingSessionIds, sessionId),
+          created
+        )
+      }))
+    }
+  },
+
+  retryHistoryBackfill: async (id) => {
+    const existing = inFlightHistoryBackfillRetries.get(id)
+    if (existing) return existing
+    let task!: Promise<void>
+    task = retryHistoryBackfillInner(get, set, id).finally(() => {
+      if (inFlightHistoryBackfillRetries.get(id) === task) {
+        inFlightHistoryBackfillRetries.delete(id)
+      }
+    })
+    inFlightHistoryBackfillRetries.set(id, task)
     return task
   },
 
@@ -4112,6 +5009,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
         ...s.sessions,
         [id]: {
           id,
+          conversationId: meta.conversationId,
           agentId,
           cwd: meta.cwd,
           projectId: meta.projectId,
@@ -4142,10 +5040,17 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       toolCalls: { ...s.toolCalls, [id]: restoredToolCalls(payload) }
     }))
     try {
+      const reopenMcpServers = await configuredMcpServersForReopen(get, agentId)
       // `acpApi.resumeSession` routes to `acp_resume_session` (desktop) or the
       // `resume_session` WS request (web). On web it auto-re-subscribes with
       // `this.lastSeq.get(sid) ?? 0`, so the hook seeds the server cursor first.
-      await acpApi.resumeSession(agentId, id, cwd)
+      await acpApi.resumeSession(
+        agentId,
+        id,
+        cwd,
+        get().sessions[id]?.conversationId,
+        reopenMcpServers
+      )
       // Gap-replay has landed on the restored transcript; clear the resume
       // window. `withSessionActive` alone leaves `replaying: 'streaming'`,
       // which would disable rAF coalescing for live chunks after resume.
@@ -4245,37 +5150,30 @@ export const useAcpStore = create<AcpState>((set, get) => ({
 
   deleteHistorySession: async (id) => {
     invalidateSessionReopen(id)
-    inFlightHistoryOpens.delete(id)
-    inFlightDiscoveredOpens.delete(id)
-    invalidateRestorePreload(set, id)
-    try {
-      await queueSessionPayloadDelete(id)
-      set((s) => {
-        // Only publish deletion after the Rust store confirms the durable
-        // payload/index removal, so a failed delete cannot diverge on restart.
-        const sessions = { ...s.sessions }
-        if (sessions[id]) {
-          sessions[id] = {
-            ...sessions[id],
-            status: 'closed',
-            activeTurn: false,
-            openTurnId: null,
-            replaying: null
-          }
-        }
-        return {
-          sessionIndex: s.sessionIndex.filter((e) => e.id !== id),
-          sessions,
-          openingHistoryIds: dropRecordKey(s.openingHistoryIds, id),
-          discoveredReopenContexts: dropRecordKey(s.discoveredReopenContexts, id),
-          ...dropSessionTranscriptState(s, id)
-        }
-      })
-      // Reclaim any app-owned temp files staged for this session.
-      void deleteSessionTempFiles(id)
-    } catch (e) {
-      console.error('[acp] failed to delete session history', e)
+    const state = get()
+    const entry = state.sessionIndex.find((candidate) => candidate.id === id)
+    const conversationId = state.sessions[id]?.conversationId ?? entry?.conversationId
+    if (conversationId) {
+      await get().deleteConversation(conversationId)
+      return
     }
+    if (ephemeralSessionIds.has(id)) {
+      ephemeralSessionIds.delete(id)
+      set((current) => ({
+        ...dropEphemeralSessionState(current, id),
+        sessionIndex: current.sessionIndex.filter((candidate) => candidate.id !== id),
+        openingHistoryIds: dropRecordKey(current.openingHistoryIds, id),
+        restoringChatIds: dropRecordKey(current.restoringChatIds, id)
+      }))
+      return
+    }
+    // Repeated cleanup of an already-removed ephemeral session is idempotent. A present legacy
+    // index/session still fails closed below because compatibility sources are read-only.
+    if (!entry && !state.sessions[id]) return
+    throw new ConversationLifecycleApiError(
+      'CONVERSATION_NOT_FOUND',
+      'LEGACY_STORE_READ_ONLY: legacy chat history cannot be deleted'
+    )
   },
 
   // --- Live window: scroll-up lazy-load -------------------------------------
@@ -4452,7 +5350,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     const task = (async () => {
       const connected = get().agentStatus[agentId] === 'connected'
       const capabilities = get().agents[agentId]?.capabilities ?? null
-      const strategy = decideResume({ connected, capabilities })
+      const strategy = decideResume({ connected, capabilities, localHistoryAvailable: false })
 
       if (strategy === 'local') {
         set((s) => ({
@@ -4462,6 +5360,8 @@ export const useAcpStore = create<AcpState>((set, get) => ({
           'agent does not support loading or resuming sessions (no loadSession or sessionCapabilities.resume)'
         )
       }
+      const reopenMcpServers = await configuredMcpServersForReopen(get, agentId)
+      if (!isCurrentSessionReopen(sessionId, reopenGeneration)) return
 
       // Preserve controls from an existing discovered record when the reopen
       // response omits optional fields. An explicit configOptions: [] below still
@@ -4503,7 +5403,14 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       if (strategy === 'load') {
         // Agent replays history via session/update into the empty transcript.
         try {
-          const outcome = (await acpApi.loadSession(agentId, sessionId, cwd)) ?? {}
+          const outcome =
+            (await acpApi.loadSession(
+              agentId,
+              sessionId,
+              cwd,
+              get().sessions[sessionId]?.conversationId,
+              reopenMcpServers
+            )) ?? {}
           if (!isCurrentSessionReopen(sessionId, reopenGeneration)) return
           mergeReopenOutcomeIfUnchanged(set, sessionId, reopenGeneration, reopenBaseline, outcome)
           set((s) => {
@@ -4539,7 +5446,14 @@ export const useAcpStore = create<AcpState>((set, get) => ({
         }
       } else if (strategy === 'resume') {
         try {
-          const outcome = (await acpApi.resumeSession(agentId, sessionId, cwd)) ?? {}
+          const outcome =
+            (await acpApi.resumeSession(
+              agentId,
+              sessionId,
+              cwd,
+              get().sessions[sessionId]?.conversationId,
+              reopenMcpServers
+            )) ?? {}
           if (!isCurrentSessionReopen(sessionId, reopenGeneration)) return
           mergeReopenOutcomeIfUnchanged(set, sessionId, reopenGeneration, reopenBaseline, outcome)
           set((s) => ({
@@ -4807,15 +5721,28 @@ export const useAcpStore = create<AcpState>((set, get) => ({
   setConfigOption: async (sessionId, configId, valueId) => {
     const session = get().sessions[sessionId]
     if (!session) throw new Error(`unknown session ${sessionId}`)
-    const updated = await acpApi.setConfigOption(session.agentId, sessionId, configId, valueId)
+    const option = session.configOptions.find((entry) => entry.id === configId)
+    const resolvedValueId =
+      option?.category === 'model' ? canonicalizeClaudeModelId(valueId) : valueId
+    const updated = await acpApi.setConfigOption(
+      session.agentId,
+      sessionId,
+      configId,
+      resolvedValueId
+    )
     set((s) => ({
       sessions: { ...s.sessions, [sessionId]: { ...s.sessions[sessionId], configOptions: updated } }
     }))
     const agentConfigId = configIdForAgentId(get(), session.agentId)
     if (agentConfigId) {
       writeAgentOptionsCache(set, agentConfigId, { configOptions: updated })
-      persistComposerOptions(agentConfigId, { configValues: { [configId]: valueId } }, sessionId)
+      persistComposerOptions(
+        agentConfigId,
+        { configValues: { [configId]: resolvedValueId } },
+        sessionId
+      )
     }
+    persistConversationComposerFromState(get(), sessionId)
   },
 
   setMode: async (sessionId, modeId) => {
@@ -4840,12 +5767,14 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     if (configId) {
       persistComposerOptions(configId, { modeId }, sessionId)
     }
+    persistConversationComposerFromState(get(), sessionId)
   },
 
   setModel: async (sessionId, modelId) => {
     const session = get().sessions[sessionId]
     if (!session) throw new Error(`unknown session ${sessionId}`)
-    await acpApi.setModel(session.agentId, sessionId, modelId)
+    const resolvedModelId = canonicalizeClaudeModelId(modelId)
+    await acpApi.setModel(session.agentId, sessionId, resolvedModelId)
     set((s) => {
       const current = s.sessions[sessionId]
       if (!current?.models) return {}
@@ -4854,7 +5783,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
           ...s.sessions,
           [sessionId]: {
             ...current,
-            models: { ...current.models, currentModelId: modelId }
+            models: { ...current.models, currentModelId: resolvedModelId }
           }
         }
       }
@@ -4862,8 +5791,9 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     cacheOptionsFromSession(set, get, sessionId)
     const configId = configIdForAgentId(get(), session.agentId)
     if (configId) {
-      persistComposerOptions(configId, { modelId }, sessionId)
+      persistComposerOptions(configId, { modelId: resolvedModelId }, sessionId)
     }
+    persistConversationComposerFromState(get(), sessionId)
   },
 
   respondPermission: async (requestId, optionId) => {
@@ -4920,9 +5850,9 @@ export const useAcpStore = create<AcpState>((set, get) => ({
             // entries the response hasn't set yet (e.g., event arrives before
             // the response resolves on desktop).
             capabilities: existing?.capabilities ?? e.capabilities,
-            // Retain advertised auth methods so `authenticateBeforeSession`
-            // can authenticate a single unambiguous method before
-            // `session/new`. Same preserve-then-fallback pattern.
+            // Retain advertised auth methods so a later auth-classified
+            // `session/new` can authenticate (single method) or show a
+            // chooser (multiple). Same preserve-then-fallback pattern.
             authMethods: existing?.authMethods ?? e.authMethods ?? []
           }
         },
@@ -4980,7 +5910,9 @@ export const useAcpStore = create<AcpState>((set, get) => ({
   _onUserPrompt: (e) =>
     set((s) => {
       const session = s.sessions[e.sessionId]
-      if (!session) return {}
+      // Closed history and in-flight load/resume must not grow a new user turn —
+      // replayed user text arrives as session/update chunks, not user_prompt.
+      if (!acceptsSessionTranscriptEvents(session) || session.replaying) return {}
       const list = s.messages[e.sessionId] ?? []
       const sameBlocks = (left: ContentBlock[], right: ContentBlock[]): boolean =>
         JSON.stringify(left) === JSON.stringify(right)
@@ -5183,6 +6115,17 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       // Do not re-grow plan cache for closed/unknown sessions after eviction.
       if (!acceptsSessionTranscriptEvents(s.sessions[e.sessionId])) return {}
       return { plans: { ...s.plans, [e.sessionId]: entries } }
+    }),
+
+  _onScheduledTaskDraft: (e) =>
+    set((state) => {
+      if (!acceptsSessionTranscriptEvents(state.sessions[e.sessionId])) return {}
+      return {
+        scheduledTaskDrafts: {
+          ...state.scheduledTaskDrafts,
+          [e.sessionId]: e.task
+        }
+      }
     }),
 
   _onCommandsUpdate: (e) =>
@@ -5633,11 +6576,14 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     // free WebView heap for every session this disconnect retired.
     for (const id of affected) {
       persistSession(get(), id, (entries) => set({ sessionIndex: entries }))
+      persistConversationComposerFromState(get(), id)
     }
     if (dropTranscriptIds.length > 0) {
       set((s) => {
-        let next: Pick<AcpState, 'messages' | 'toolCalls' | 'commands' | 'sessionUsage' | 'plans'> =
-          s
+        let next: Pick<
+          AcpState,
+          'messages' | 'toolCalls' | 'commands' | 'sessionUsage' | 'plans' | 'historyBackfill'
+        > = s
         for (const id of dropTranscriptIds) {
           next = dropSessionTranscriptState(next, id)
         }
@@ -5658,12 +6604,15 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       )
       return
     }
+    const conversationBacked = Boolean(get().sessions[e.sessionId]?.conversationId)
     // Flush coalesced updates so transcript eviction sees the final state.
     flushCoalescedSync()
     invalidateSessionReopen(e.sessionId)
-    // Reclaim app-owned temp files staged for this session (e.g. agent
-    // disconnected) so they do not linger in the OS temp dir.
-    void deleteSessionTempFiles(e.sessionId)
+    // Legacy/ephemeral sessions reclaim staged files on close. Canonical Conversation suspend
+    // retains renderer state and attachments; explicit delete cleanup is a separate concern.
+    if (!conversationBacked) {
+      void deleteSessionTempFiles(e.sessionId)
+    }
     if (ephemeralSessionIds.has(e.sessionId)) {
       const hasContent = (get().messages[e.sessionId]?.length ?? 0) > 0
       if (!hasContent) {
@@ -5723,12 +6672,108 @@ export const useAcpStore = create<AcpState>((set, get) => ({
         }
       }
     })
-    // Persist while transcript maps still hold content, then free WebView heap.
+    // Persist while transcript maps still hold content. Canonical Conversation-backed sessions
+    // retain their renderer transcript across suspend; legacy sessions may still free it.
     if (get().sessions[e.sessionId]) {
       persistSession(get(), e.sessionId, (entries) => set({ sessionIndex: entries }))
+      persistConversationComposerFromState(get(), e.sessionId)
     }
-    set((s) => dropSessionTranscriptState(s, e.sessionId))
+    if (!conversationBacked) {
+      set((s) => dropSessionTranscriptState(s, e.sessionId))
+    }
     refreshHostOwnedIndex(get)
+  },
+
+  _onConversationLifecycle: (outcome) => {
+    if (outcome.status === 'blocked') return
+
+    let sourceId: SessionId | undefined
+    let targetId: SessionId | undefined
+    const deleting = outcome.action === 'deleteConversation'
+    set((state) => {
+      const sourceEntry = state.sessionIndex.find(
+        (entry) => entry.conversationId === outcome.conversationId
+      )
+      const sourceSession = Object.values(state.sessions).find(
+        (session) => session.conversationId === outcome.conversationId
+      )
+      sourceId = sourceSession?.id ?? sourceEntry?.id
+      targetId = outcome.currentBinding?.agentSessionId ?? sourceId
+
+      if (deleting) {
+        if (!sourceId) {
+          return {
+            sessionIndex: state.sessionIndex.filter(
+              (entry) => entry.conversationId !== outcome.conversationId
+            )
+          }
+        }
+        const sessions = { ...state.sessions }
+        delete sessions[sourceId]
+        const transcript = dropSessionTranscriptState(state, sourceId)
+        return {
+          sessions,
+          sessionIndex: state.sessionIndex.filter(
+            (entry) => entry.conversationId !== outcome.conversationId
+          ),
+          activeSessionId: state.activeSessionId === sourceId ? null : state.activeSessionId,
+          pendingPermissions: dropPermissionsForSession(state.pendingPermissions, sourceId),
+          pendingQuestions: dropQuestionsForSession(state.pendingQuestions, sourceId),
+          promptQueues: dropPromptQueueForSession(state.promptQueues, sourceId),
+          suppressQueueFlush: dropRecordKey(state.suppressQueueFlush, sourceId),
+          ...transcript
+        }
+      }
+
+      const bindingState = outcome.currentBinding?.state
+      const nextStatus: SessionStatus = bindingState === 'active' ? 'active' : 'closed'
+      let sessions = state.sessions
+      if (sourceId && sourceSession && targetId) {
+        sessions = { ...sessions }
+        if (targetId !== sourceId) delete sessions[sourceId]
+        sessions[targetId] = {
+          ...sourceSession,
+          id: targetId,
+          conversationId: outcome.conversationId,
+          status: nextStatus,
+          activeTurn: false,
+          openTurnId: null,
+          replaying: null
+        }
+      }
+
+      const remap = <T>(record: Record<SessionId, T>): Record<SessionId, T> =>
+        sourceId && targetId ? remapRecordKey(record, sourceId, targetId) : record
+
+      return {
+        sessions,
+        messages: remap(state.messages),
+        toolCalls: remap(state.toolCalls),
+        plans: remap(state.plans),
+        commands: remap(state.commands),
+        sessionUsage: remap(state.sessionUsage),
+        historyBackfill: remap(state.historyBackfill),
+        promptQueues: remap(state.promptQueues),
+        suppressQueueFlush: remap(state.suppressQueueFlush),
+        restoringChatIds: remap(state.restoringChatIds),
+        launchingSessionIds: remap(state.launchingSessionIds),
+        degradedRecoverySessions: remap(state.degradedRecoverySessions),
+        sessionIndex: state.sessionIndex.map((entry) =>
+          entry.conversationId === outcome.conversationId
+            ? {
+                ...entry,
+                id: targetId ?? entry.id,
+                status: nextStatus,
+                lastSeq: outcome.revision
+              }
+            : entry
+        ),
+        activeSessionId:
+          sourceId && state.activeSessionId === sourceId
+            ? (targetId ?? sourceId)
+            : state.activeSessionId
+      }
+    })
   }
 }))
 
@@ -5984,6 +7029,9 @@ export function initAcpEventListeners(): () => void {
     acpApi.onEvent<PlanUpdateEvent>(ACP_EVENTS.planUpdate, (e) =>
       useAcpStore.getState()._onPlanUpdate(e)
     ),
+    acpApi.onEvent<ScheduledTaskDraftEvent>(ACP_EVENTS.scheduledTaskDraft, (e) =>
+      useAcpStore.getState()._onScheduledTaskDraft(e)
+    ),
     acpApi.onEvent<CommandsUpdateEvent>(ACP_EVENTS.commandsUpdate, (e) =>
       useAcpStore.getState()._onCommandsUpdate(e)
     ),
@@ -6084,8 +7132,29 @@ export function selectAgentIdentity(state: AcpState, agentId: AgentId | null): A
   return { name: config?.name ?? null, templateId: config?.templateId ?? null }
 }
 
+export function selectSessionAgentIdentity(
+  state: AcpState,
+  session: Pick<AcpSession, 'id' | 'agentId' | 'conversationId'> | null | undefined
+): AgentIdentity {
+  if (!session) return { name: null, templateId: null }
+  const live = selectAgentIdentity(state, session.agentId)
+  if (live.name || live.templateId) return live
+  const configId =
+    state.sessionIndex.find((entry) => entry.id === session.id)?.agentConfigId ??
+    (session.conversationId
+      ? state.sessionIndex.find((entry) => entry.conversationId === session.conversationId)
+          ?.agentConfigId
+      : undefined)
+  const config = configId ? state.agentConfigs.find((entry) => entry.id === configId) : undefined
+  return { name: config?.name ?? null, templateId: config?.templateId ?? null }
+}
+
 export const useAgentIdentity = (agentId: AgentId | null): AgentIdentity =>
   useAcpStore(useShallow((s) => selectAgentIdentity(s, agentId)))
+
+export const useSessionAgentIdentity = (
+  session: Pick<AcpSession, 'id' | 'agentId' | 'conversationId'> | null | undefined
+): AgentIdentity => useAcpStore(useShallow((s) => selectSessionAgentIdentity(s, session)))
 
 /**
  * Resolve an agent's template id by `agentConfigId` (from a history entry) when

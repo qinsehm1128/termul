@@ -13,6 +13,11 @@
  * (`.message` is the human string callers already toast).
  */
 
+import type { ConversationApplicationRequestType } from '@shared/types/conversation-api.types'
+import type {
+  ConversationLifecycleOutcome,
+  ConversationReplacementRequest
+} from '@shared/types/conversation-lifecycle.types'
 import type { IpcResult } from '@shared/types/ipc.types'
 import type {
   ProjectSwitchCompletedEvent,
@@ -21,6 +26,10 @@ import type {
 import {
   type AcpAuthenticateReply,
   type AcpRuntimePolicy,
+  type AuthenticatePayload,
+  assertConversationHistoryPage,
+  assertConversationHistoryPageRequest,
+  type ConversationHistoryPageV1,
   type HistoryMode,
   type PersistedSessionSummary,
   type SessionSnapshotEvent,
@@ -44,7 +53,9 @@ import type {
   ListSessionsResponse,
   McpServer,
   McpServerConfig,
+  NewSessionOptions,
   NewSessionOutcome,
+  PermissionPolicy,
   ProbeResult,
   SessionConfigOption,
   SessionId,
@@ -109,6 +120,7 @@ export interface AcpTransport {
   setSessionNewTimeout(secs: number | null): Promise<void>
   setSessionReopenTimeout(secs: number | null): Promise<void>
   setFirstPromptWarmupTimeout(secs: number | null): Promise<void>
+  setPreferLocalNpmInstall(prefer: boolean): Promise<void>
   fetchRegistrySnapshot(forceRefresh?: boolean): Promise<AcpRegistrySnapshot>
   /**
    * On-demand MCP client probe (Termul's own rmcp client connection — NOT the
@@ -124,20 +136,27 @@ export interface AcpTransport {
   spawnAgent(config: AgentConfig): Promise<SpawnAgentResult>
   killAgent(agentId: AgentId): Promise<void>
   listAgents(): Promise<AgentId[]>
+  setPermissionPolicy(agentId: AgentId, policy: PermissionPolicy): Promise<void>
   newSession(
     agentId: AgentId,
     cwd: string,
     mcpServers?: McpServer[],
-    options?: {
-      ephemeral?: boolean
-      projectId?: string
-      /** Worktree path + branch (CAP-3) — desktop-only; ignored on the WS path. */
-      worktreePath?: string
-      worktreeBranch?: string
-    }
+    options?: NewSessionOptions
   ): Promise<NewSessionOutcome>
-  loadSession(agentId: AgentId, sessionId: SessionId, cwd: string): Promise<SessionReopenOutcome>
-  resumeSession(agentId: AgentId, sessionId: SessionId, cwd: string): Promise<SessionReopenOutcome>
+  loadSession(
+    agentId: AgentId,
+    sessionId: SessionId,
+    cwd: string,
+    conversationId?: string,
+    mcpServers?: McpServer[]
+  ): Promise<SessionReopenOutcome>
+  resumeSession(
+    agentId: AgentId,
+    sessionId: SessionId,
+    cwd: string,
+    conversationId?: string,
+    mcpServers?: McpServer[]
+  ): Promise<SessionReopenOutcome>
   closeSession(agentId: AgentId, sessionId: SessionId): Promise<void>
   disposeEphemeralSession(agentId: AgentId, sessionId: SessionId): Promise<void>
   listSessions(agentId: AgentId, cwd?: string, cursor?: string): Promise<ListSessionsResponse>
@@ -174,15 +193,28 @@ export interface AcpTransport {
   answerQuestion(agentId: AgentId, questionId: string, values?: string[]): Promise<void>
   /** Agent ACP auth (methodId) — NOT the WS relay token gate. */
   authenticate(agentId: AgentId, methodId: string): Promise<void>
+  conversationRequest?<T>(type: ConversationApplicationRequestType, payload: unknown): Promise<T>
+  conversationLifecycle?(
+    action: 'detach' | 'rebind' | 'suspend' | 'replace' | 'delete',
+    conversationId: string,
+    expectedRevision: number,
+    request?: ConversationReplacementRequest
+  ): Promise<ConversationLifecycleOutcome>
   /** Web/remote only: switch now or report that the switch was queued. */
   switchProject?(projectId: string): Promise<SwitchProjectReply>
   historyMode?(): HistoryMode | 'tauri_store'
   listPersistedSessions?(): Promise<PersistedSessionSummary[]>
   openPersistedSession?(sessionId: SessionId, lastSeq?: number): Promise<void>
-  /** Web/remote: fetch the full stored transcript for a session (server mode). */
+  /** Compatibility full read. Production history loading uses getSessionPayloadPage. */
   getSessionPayload?(
     sessionId: SessionId
   ): Promise<import('@/lib/acp-history-persistence').SessionPayload | null>
+  /** Web/remote bounded history page. Calls are serialized per session. */
+  getSessionPayloadPage?(
+    sessionId: SessionId,
+    afterSeq: number,
+    limit: number
+  ): Promise<ConversationHistoryPageV1>
   onEvent<T>(eventName: string, callback: (payload: T) => void): () => void
   /** Web: open socket + placeholder authenticate. No-op on Tauri. */
   connect(): Promise<void>
@@ -257,6 +289,8 @@ function createTauriAcpTransport(): AcpTransport {
     setSessionReopenTimeout: (secs) => invoke<void>('acp_set_session_reopen_timeout', { secs }),
     setFirstPromptWarmupTimeout: (secs) =>
       invoke<void>('acp_set_first_prompt_warmup_timeout', { secs }),
+    setPreferLocalNpmInstall: (prefer) =>
+      invoke<void>('acp_set_prefer_local_npm_install', { prefer }),
     fetchRegistrySnapshot: (forceRefresh = false) =>
       invoke<AcpRegistrySnapshot>('acp_fetch_registry_snapshot', { forceRefresh }),
     probeMcpServer: (server) => invoke<ProbeResult>('acp_probe_mcp_server', { server }),
@@ -265,20 +299,51 @@ function createTauriAcpTransport(): AcpTransport {
       await invoke('acp_kill_agent', { agentId })
     },
     listAgents: () => invoke<AgentId[]>('acp_list_agents'),
-    newSession: (agentId, cwd, mcpServers, options) =>
-      invoke<NewSessionOutcome>('acp_new_session', {
+    setPermissionPolicy: async (agentId, policy) => {
+      await invoke('acp_set_permission_policy', { agentId, policy })
+    },
+    newSession: (agentId, cwd, mcpServers, options) => {
+      const executionTarget =
+        options?.executionTarget ??
+        (options?.projectId && options.worktreePath && options.worktreeBranch
+          ? {
+              kind: 'worktree' as const,
+              projectId: options.projectId,
+              worktreePath: options.worktreePath,
+              worktreeBranch: options.worktreeBranch
+            }
+          : options?.projectId
+            ? { kind: 'project_root' as const, projectId: options.projectId, projectRoot: cwd }
+            : { kind: 'workspace' as const })
+      return invoke<NewSessionOutcome>('acp_new_session', {
         agentId,
         cwd,
         mcpServers,
         ...(options?.ephemeral ? { ephemeral: true } : {}),
         ...(options?.projectId ? { projectId: options.projectId } : {}),
         ...(options?.worktreePath ? { worktreePath: options.worktreePath } : {}),
-        ...(options?.worktreeBranch ? { worktreeBranch: options.worktreeBranch } : {})
+        ...(options?.worktreeBranch ? { worktreeBranch: options.worktreeBranch } : {}),
+        ...(options?.conversationId ? { conversationId: options.conversationId } : {}),
+        ...(options?.projectAttachment ? { projectAttachment: options.projectAttachment } : {}),
+        ...(!options?.ephemeral ? { executionTarget } : {})
+      })
+    },
+    loadSession: (agentId, sessionId, cwd, conversationId, mcpServers) =>
+      invoke<SessionReopenOutcome>('acp_load_session', {
+        agentId,
+        sessionId,
+        cwd,
+        conversationId: conversationId ?? null,
+        mcpServers: mcpServers ?? []
       }),
-    loadSession: (agentId, sessionId, cwd) =>
-      invoke<SessionReopenOutcome>('acp_load_session', { agentId, sessionId, cwd }),
-    resumeSession: (agentId, sessionId, cwd) =>
-      invoke<SessionReopenOutcome>('acp_resume_session', { agentId, sessionId, cwd }),
+    resumeSession: (agentId, sessionId, cwd, conversationId, mcpServers) =>
+      invoke<SessionReopenOutcome>('acp_resume_session', {
+        agentId,
+        sessionId,
+        cwd,
+        conversationId: conversationId ?? null,
+        mcpServers: mcpServers ?? []
+      }),
     closeSession: async (agentId, sessionId) => {
       await invoke('acp_close_session', { agentId, sessionId })
     },
@@ -364,6 +429,45 @@ export function resolveWsUrl(
   return `${proto}//${locationLike.host}/ws`
 }
 
+/** Process-memory-only credential shared by authenticated HTTP and WebSocket transports. */
+let remoteAccessCredential: string | null = null
+let remoteAccessCredentialConsumed = false
+
+/**
+ * Consume the QR-delivered credential fragment exactly once. Fragments are not
+ * sent to the server; clearing it immediately keeps the credential out of
+ * browser history updates, query parameters, storage, and later copied URLs.
+ */
+export function getRemoteAccessCredential(): string {
+  if (remoteAccessCredentialConsumed) return remoteAccessCredential ?? ''
+  if (typeof window === 'undefined') return ''
+
+  remoteAccessCredentialConsumed = true
+  const rawHash = window.location.hash.startsWith('#')
+    ? window.location.hash.slice(1)
+    : window.location.hash
+  const fragment = new URLSearchParams(rawHash)
+  remoteAccessCredential = fragment.get('access_token')
+  if (fragment.has('access_token')) {
+    window.history.replaceState(null, '', `${window.location.pathname}${window.location.search}`)
+  }
+  return remoteAccessCredential ?? ''
+}
+
+/** Add the in-memory bearer credential without persisting or logging it. */
+export function remoteAccessHeaders(initial?: HeadersInit): Headers {
+  const headers = new Headers(initial)
+  const credential = getRemoteAccessCredential()
+  if (credential) headers.set('authorization', `Bearer ${credential}`)
+  return headers
+}
+
+/** @internal test helper */
+export function _resetRemoteAccessCredentialForTests(): void {
+  remoteAccessCredential = null
+  remoteAccessCredentialConsumed = false
+}
+
 const REQUEST_TIMEOUT_MS = 60_000
 /**
  * Grace margin added on top of the server turn budget so the server's typed
@@ -420,6 +524,8 @@ const HEARTBEAT_INTERVAL_MS = 30_000
  * never fires (the server→client reply path is broken but client→server works).
  */
 const HEARTBEAT_FAILURE_THRESHOLD = 2
+export const MAX_HISTORY_PAGE_TARGETS = 64
+export const HISTORY_PAGE_TARGET_TTL_MS = 300_000
 
 type Pending = {
   resolve: (value: unknown) => void
@@ -436,6 +542,11 @@ type Pending = {
 }
 
 type EventListener = (payload: unknown) => void
+
+export type AcpTransportTerminalState = Readonly<{
+  code: 'REAUTHENTICATION_REQUIRED'
+  rePairRequired: true
+}>
 
 /**
  * Multiplexed ACP WS client.
@@ -471,6 +582,10 @@ export class WsAcpTransport implements AcpTransport {
   /** Coalesces overlapping foreground/pageshow/resume/online health checks. */
   private resumeValidation: Promise<void> | null = null
   private readonly pending = new Map<string, Pending>()
+  /** Completion tails serialize bounded history requests independently per session. */
+  private readonly historyPageRequests = new Map<string, Promise<void>>()
+  /** First-page canonical frontier pinned across every later page for that session. */
+  private readonly historyPageTargets = new Map<string, { target: number; storedAt: number }>()
   private readonly listeners = new Map<string, Set<EventListener>>()
   /** Per-session last contiguous delivered seq. */
   private readonly lastSeq = new Map<string, number>()
@@ -484,6 +599,9 @@ export class WsAcpTransport implements AcpTransport {
   private reconnectPriorityProvider?: () => SessionId[]
   private readonly wsUrl: string
   private readonly webSocketCtor: typeof WebSocket
+  private remoteAccessToken: string
+  private terminalState: AcpTransportTerminalState | null = null
+  private onTerminalStateChange?: (state: AcpTransportTerminalState) => void
   /**
    * Story 5.3 (AC3): transport-level reconnect listener. Fired `true` when
    * `scheduleReconnect` runs (WS drop detected) and `false` when `reconnect`
@@ -494,9 +612,10 @@ export class WsAcpTransport implements AcpTransport {
    */
   private onReconnectStateChange?: (reconnecting: boolean) => void
 
-  constructor(opts?: { url?: string; WebSocketImpl?: typeof WebSocket }) {
+  constructor(opts?: { url?: string; token?: string; WebSocketImpl?: typeof WebSocket }) {
     this.wsUrl =
       opts?.url ?? (typeof window !== 'undefined' ? resolveWsUrl() : 'ws://127.0.0.1:8080/ws')
+    this.remoteAccessToken = opts?.token ?? getRemoteAccessCredential()
     this.webSocketCtor = opts?.WebSocketImpl ?? WebSocket
   }
 
@@ -508,6 +627,14 @@ export class WsAcpTransport implements AcpTransport {
    */
   setReconnectListener(listener: (reconnecting: boolean) => void): void {
     this.onReconnectStateChange = listener
+  }
+
+  setTerminalStateListener(listener: (state: AcpTransportTerminalState) => void): void {
+    this.onTerminalStateChange = listener
+  }
+
+  getTerminalState(): AcpTransportTerminalState | null {
+    return this.terminalState
   }
 
   setRecoveryHandler(
@@ -545,6 +672,12 @@ export class WsAcpTransport implements AcpTransport {
   }
 
   async connect(): Promise<void> {
+    if (this.terminalState) {
+      throw new AcpTransportError(
+        this.terminalState.code,
+        runtimeT('chat', 'transport.rePairRequired', 'Remote access must be paired again')
+      )
+    }
     if (this.disposed) return
     this.attachVisibilityListeners()
     if (this.socket?.readyState === WebSocket.OPEN && this.authed) return
@@ -561,10 +694,7 @@ export class WsAcpTransport implements AcpTransport {
     this.disposed = true
     this.detachVisibilityListeners()
     this.clearHeartbeat()
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer)
-      this.reconnectTimer = null
-    }
+    this.clearReconnectTimer()
     for (const [, p] of this.pending) {
       if (p.timer) clearTimeout(p.timer)
       p.reject(
@@ -575,8 +705,41 @@ export class WsAcpTransport implements AcpTransport {
       )
     }
     this.pending.clear()
+    this.historyPageTargets.clear()
     this.socket?.close()
     this.socket = null
+  }
+
+  historyPageTargetSizeForTesting(): number {
+    this.evictHistoryPageTargets()
+    return this.historyPageTargets.size
+  }
+
+  rememberHistoryPageTargetForTesting(
+    sessionId: string,
+    target: number,
+    storedAt = Date.now()
+  ): void {
+    this.rememberHistoryPageTarget(sessionId, target, storedAt)
+  }
+
+  private evictHistoryPageTargets(now = Date.now()): void {
+    for (const [sessionId, entry] of [...this.historyPageTargets.entries()]) {
+      if (now - entry.storedAt > HISTORY_PAGE_TARGET_TTL_MS) {
+        this.historyPageTargets.delete(sessionId)
+      }
+    }
+    while (this.historyPageTargets.size > MAX_HISTORY_PAGE_TARGETS) {
+      const oldest = this.historyPageTargets.keys().next().value
+      if (oldest === undefined) break
+      this.historyPageTargets.delete(oldest)
+    }
+  }
+
+  private rememberHistoryPageTarget(sessionId: string, target: number, now = Date.now()): void {
+    this.historyPageTargets.delete(sessionId)
+    this.historyPageTargets.set(sessionId, { target, storedAt: now })
+    this.evictHistoryPageTargets(now)
   }
 
   async subscribeSession(
@@ -738,6 +901,11 @@ export class WsAcpTransport implements AcpTransport {
     // the first-prompt warmup timeout via TERMUL_ACP_FIRST_PROMPT_WARMUP_SECS.
   }
 
+  async setPreferLocalNpmInstall(_prefer: boolean): Promise<void> {
+    // Desktop-only: the standalone server has no settings surface and
+    // configures local npm install via TERMUL_ACP_PREFER_LOCAL_NPM.
+  }
+
   /**
    * CAP-6 / Story 8: fetchRegistrySnapshot is replaced by the host-resolved
    * catalog. The web client calls `acpCatalogApi.listCatalog()` (the facade)
@@ -788,6 +956,54 @@ export class WsAcpTransport implements AcpTransport {
     await this.request('open_persisted_session', { sessionId, lastSeq })
   }
 
+  async getSessionPayloadPage(
+    sessionId: SessionId,
+    afterSeq: number,
+    limit: number
+  ): Promise<ConversationHistoryPageV1> {
+    assertConversationHistoryPageRequest(afterSeq, limit)
+    const previous = this.historyPageRequests.get(sessionId)
+    const request = (async () => {
+      if (previous) await previous.catch(() => undefined)
+      if (afterSeq === 0) this.historyPageTargets.delete(sessionId)
+      this.evictHistoryPageTargets()
+      const targetLastSeq = this.historyPageTargets.get(sessionId)?.target
+      const payload: {
+        sessionId: string
+        afterSeq: number
+        limit: number
+        targetLastSeq?: number
+      } = { sessionId, afterSeq, limit }
+      if (targetLastSeq != null) payload.targetLastSeq = targetLastSeq
+      const page = await this.request<ConversationHistoryPageV1>(
+        'get_session_payload_page',
+        payload
+      )
+      assertConversationHistoryPage(page, { sessionId, afterSeq, limit })
+      if (targetLastSeq != null && page.targetLastSeq !== targetLastSeq) {
+        throw new AcpTransportError(
+          'stale',
+          runtimeT('chat', 'transport.historyFrontierChanged', 'History paging frontier changed')
+        )
+      }
+      if (page.complete) this.historyPageTargets.delete(sessionId)
+      else this.rememberHistoryPageTarget(sessionId, page.targetLastSeq)
+      return page
+    })()
+    const completion = request.then(
+      () => undefined,
+      () => undefined
+    )
+    this.historyPageRequests.set(sessionId, completion)
+    try {
+      return await request
+    } finally {
+      if (this.historyPageRequests.get(sessionId) === completion) {
+        this.historyPageRequests.delete(sessionId)
+      }
+    }
+  }
+
   async getSessionPayload(
     sessionId: SessionId
   ): Promise<import('@/lib/acp-history-persistence').SessionPayload | null> {
@@ -816,28 +1032,42 @@ export class WsAcpTransport implements AcpTransport {
     return this.request<AgentId[]>('list_agents', {})
   }
 
+  async setPermissionPolicy(agentId: AgentId, policy: PermissionPolicy): Promise<void> {
+    await this.request('set_permission_policy', { agentId, policy })
+  }
+
   // --- WS-mapped session/prompt methods ------------------------------------
 
   async newSession(
     agentId: AgentId,
     cwd: string,
     mcpServers?: McpServer[],
-    options?: {
-      ephemeral?: boolean
-      projectId?: string
-      worktreePath?: string
-      worktreeBranch?: string
-    }
+    options?: NewSessionOptions
   ): Promise<NewSessionOutcome> {
     // Web/remote: the host attributes the session to a project by resolving
     // `cwd` against its registry (CAP-2), so no explicit projectId is sent.
     // Worktree fields are desktop-only (CAP-3) and ignored on the WS path —
     // the host-owned durable record keys state isolation on `cwd` regardless.
+    const executionTarget =
+      options?.executionTarget ??
+      (options?.projectId && options.worktreePath && options.worktreeBranch
+        ? {
+            kind: 'worktree' as const,
+            projectId: options.projectId,
+            worktreePath: options.worktreePath,
+            worktreeBranch: options.worktreeBranch
+          }
+        : options?.projectId
+          ? { kind: 'project_root' as const, projectId: options.projectId, projectRoot: cwd }
+          : { kind: 'workspace' as const })
     const outcome = await this.request<NewSessionOutcome>('create_session', {
       agentId,
       cwd,
       mcpServers,
-      ephemeral: options?.ephemeral ?? false
+      ephemeral: options?.ephemeral ?? false,
+      ...(options?.conversationId ? { conversationId: options.conversationId } : {}),
+      ...(options?.projectAttachment ? { projectAttachment: options.projectAttachment } : {}),
+      ...(!options?.ephemeral ? { executionTarget } : {})
     })
     if (outcome?.sessionId && !options?.ephemeral) {
       await this.subscribeSession(outcome.sessionId, null)
@@ -864,12 +1094,16 @@ export class WsAcpTransport implements AcpTransport {
   async loadSession(
     agentId: AgentId,
     sessionId: SessionId,
-    cwd: string
+    cwd: string,
+    conversationId?: string,
+    mcpServers?: McpServer[]
   ): Promise<SessionReopenOutcome> {
     const outcome = await this.request<SessionReopenOutcome>('load_session', {
       agentId,
       sessionId,
-      cwd
+      cwd,
+      mcpServers: mcpServers ?? [],
+      ...(conversationId ? { conversationId } : {})
     })
     await this.subscribeSession(sessionId, this.lastSeq.get(sessionId) ?? 0, true)
     return outcome
@@ -878,12 +1112,16 @@ export class WsAcpTransport implements AcpTransport {
   async resumeSession(
     agentId: AgentId,
     sessionId: SessionId,
-    cwd: string
+    cwd: string,
+    conversationId?: string,
+    mcpServers?: McpServer[]
   ): Promise<SessionReopenOutcome> {
     const outcome = await this.request<SessionReopenOutcome>('resume_session', {
       agentId,
       sessionId,
-      cwd
+      cwd,
+      mcpServers: mcpServers ?? [],
+      ...(conversationId ? { conversationId } : {})
     })
     await this.subscribeSession(sessionId, this.lastSeq.get(sessionId) ?? 0, true)
     return outcome
@@ -893,6 +1131,33 @@ export class WsAcpTransport implements AcpTransport {
     await this.request('close_session', { agentId, sessionId })
     this.subscribed.delete(sessionId)
     this.lastSeq.delete(sessionId)
+  }
+
+  conversationRequest<T>(type: ConversationApplicationRequestType, payload: unknown): Promise<T> {
+    return this.request<T>(type, payload)
+  }
+
+  async conversationLifecycle(
+    action: 'detach' | 'rebind' | 'suspend' | 'replace' | 'delete',
+    conversationId: string,
+    expectedRevision: number,
+    request?: ConversationReplacementRequest
+  ): Promise<ConversationLifecycleOutcome> {
+    const requestType =
+      action === 'detach'
+        ? 'detach_binding'
+        : action === 'rebind'
+          ? 'rebind_binding'
+          : action === 'suspend'
+            ? 'suspend_binding'
+            : action === 'replace'
+              ? 'replace_binding'
+              : 'delete_conversation'
+    return this.request<ConversationLifecycleOutcome>(requestType, {
+      conversationId,
+      expectedRevision,
+      ...(request ? { request } : {})
+    })
   }
 
   async listSessions(
@@ -1085,6 +1350,46 @@ export class WsAcpTransport implements AcpTransport {
         }
       }, REQUEST_TIMEOUT_MS)
     })
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+  }
+
+  private enterReauthenticationRequired(): void {
+    if (this.terminalState) return
+    this.terminalState = { code: 'REAUTHENTICATION_REQUIRED', rePairRequired: true }
+    this.remoteAccessToken = ''
+    remoteAccessCredential = null
+    remoteAccessCredentialConsumed = true
+    this.clearReconnectTimer()
+    this.clearHeartbeat()
+    this.detachVisibilityListeners()
+    this.resumeValidation = null
+    this.reconnectAttempt = 0
+    this.reconnecting = false
+    this.rejectAllPending(
+      'REAUTHENTICATION_REQUIRED',
+      runtimeT('chat', 'transport.rePairRequired', 'Remote access must be paired again')
+    )
+    const socket = this.socket
+    this.socket = null
+    this.authed = false
+    if (socket) {
+      socket.onclose = null
+      socket.onerror = null
+      socket.onmessage = null
+      try {
+        socket.close()
+      } catch {
+        // Already closed.
+      }
+    }
+    this.onReconnectStateChange?.(false)
+    this.onTerminalStateChange?.(this.terminalState)
   }
 
   private rejectAllPending(code: string, message: string): void {
@@ -1296,7 +1601,7 @@ export class WsAcpTransport implements AcpTransport {
    * machinery runs unchanged.
    */
   private forceReconnect(reason: string): void {
-    if (this.disposed) return
+    if (this.disposed || this.terminalState) return
     // An active reconnect that has already progressed past socket creation
     // (in-flight `reconnect()` with no pending timer) means the socket is
     // being re-established — don't interfere. A pending timer or an in-flight
@@ -1381,7 +1686,7 @@ export class WsAcpTransport implements AcpTransport {
   }
 
   private scheduleReconnect(): void {
-    if (this.disposed || this.reconnectTimer) return
+    if (this.disposed || this.terminalState || this.reconnectTimer) return
     const delay = Math.min(RECONNECT_BASE_MS * 2 ** this.reconnectAttempt, RECONNECT_MAX_MS)
     this.reconnectAttempt += 1
     // Story 5.3 (AC3): fire the reconnect listener BEFORE setting the timer so
@@ -1399,6 +1704,7 @@ export class WsAcpTransport implements AcpTransport {
   }
 
   private async reconnect(): Promise<void> {
+    if (this.terminalState) return
     try {
       await this.connect()
       const prioritized = this.reconnectPriorityProvider?.() ?? []
@@ -1488,6 +1794,9 @@ export class WsAcpTransport implements AcpTransport {
   }
 
   private handleReply(reply: WsReply): void {
+    if (!reply.ok && String(reply.err.code) === 'REAUTHENTICATION_REQUIRED') {
+      this.enterReauthenticationRequired()
+    }
     const pending = this.pending.get(reply.id)
     if (!pending) return
     if (pending.timer) clearTimeout(pending.timer)
@@ -1500,14 +1809,18 @@ export class WsAcpTransport implements AcpTransport {
   }
 
   private async handleEvent(evt: WsEvent): Promise<void> {
+    if (String(evt.type) === 'reauthentication_required') {
+      this.enterReauthenticationRequired()
+      this.emitLocal('reauthentication_required', this.terminalState)
+      return
+    }
     if (evt.type === 'auth_required') {
-      // Placeholder relay token until Epic 2 — never store in localStorage/query.
-      // Send directly (socket is already open); do NOT call request()→connect()
-      // or we deadlock on the in-flight connect promise.
+      // Send the fragment-delivered credential directly (socket is already
+      // open); do NOT call request()→connect() or we deadlock on the in-flight
+      // connect promise. The token remains process-memory-only.
       try {
-        const auth = await this.sendWhenOpen<AcpAuthenticateReply>('authenticate', {
-          token: 'dev'
-        })
+        const payload: AuthenticatePayload = { token: this.remoteAccessToken }
+        const auth = await this.sendWhenOpen<AcpAuthenticateReply>('authenticate', payload)
         this.negotiatedHistoryMode = auth?.historyMode ?? 'live_only'
         this.runtimePolicy = auth?.runtimePolicy ?? null
         this.authed = true
@@ -1753,7 +2066,7 @@ let singleton: AcpTransport | null = null
 /** Create (or return) the process-wide ACP transport. */
 export function createAcpTransport(opts?: {
   force?: 'tauri' | 'ws'
-  ws?: { url?: string; WebSocketImpl?: typeof WebSocket }
+  ws?: { url?: string; token?: string; WebSocketImpl?: typeof WebSocket }
 }): AcpTransport {
   if (opts?.force === 'tauri') return createTauriAcpTransport()
   if (opts?.force === 'ws') return new WsAcpTransport(opts.ws)

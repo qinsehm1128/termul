@@ -24,7 +24,8 @@ const {
   mockSetTurnIdleTimeout,
   mockSetSessionNewTimeout,
   mockSetSessionReopenTimeout,
-  mockSetFirstPromptWarmupTimeout
+  mockSetFirstPromptWarmupTimeout,
+  mockSetPreferLocalNpmInstall
 } = vi.hoisted(() => ({
   mockPersistenceRead: vi.fn(),
   mockPersistenceWrite: vi.fn(),
@@ -34,7 +35,8 @@ const {
   mockSetTurnIdleTimeout: vi.fn(),
   mockSetSessionNewTimeout: vi.fn(),
   mockSetSessionReopenTimeout: vi.fn(),
-  mockSetFirstPromptWarmupTimeout: vi.fn()
+  mockSetFirstPromptWarmupTimeout: vi.fn(),
+  mockSetPreferLocalNpmInstall: vi.fn()
 }))
 
 vi.mock('@/lib/api', () => ({
@@ -43,7 +45,8 @@ vi.mock('@/lib/api', () => ({
     setTurnIdleTimeout: mockSetTurnIdleTimeout,
     setSessionNewTimeout: mockSetSessionNewTimeout,
     setSessionReopenTimeout: mockSetSessionReopenTimeout,
-    setFirstPromptWarmupTimeout: mockSetFirstPromptWarmupTimeout
+    setFirstPromptWarmupTimeout: mockSetFirstPromptWarmupTimeout,
+    setPreferLocalNpmInstall: mockSetPreferLocalNpmInstall
   },
   persistenceApi: {
     read: mockPersistenceRead,
@@ -76,6 +79,7 @@ describe('use-app-settings', () => {
     mockSetSessionNewTimeout.mockResolvedValue(undefined)
     mockSetSessionReopenTimeout.mockResolvedValue(undefined)
     mockSetFirstPromptWarmupTimeout.mockResolvedValue(undefined)
+    mockSetPreferLocalNpmInstall.mockResolvedValue(undefined)
   })
 
   it('hydrates sidebar and file explorer visibility from persisted app settings', async () => {
@@ -106,7 +110,8 @@ describe('use-app-settings', () => {
         acpTurnIdleTimeoutSecs: 1800,
         acpSessionNewTimeoutSecs: 120,
         acpSessionReopenTimeoutSecs: 300,
-        acpFirstPromptWarmupSecs: 0
+        acpFirstPromptWarmupSecs: 0,
+        acpPreferLocalNpmInstall: false
       }
     })
 
@@ -119,6 +124,7 @@ describe('use-app-settings', () => {
       expect(mockSetSessionNewTimeout).toHaveBeenCalledWith(120)
       expect(mockSetSessionReopenTimeout).toHaveBeenCalledWith(300)
       expect(mockSetFirstPromptWarmupTimeout).toHaveBeenCalledWith(0)
+      expect(mockSetPreferLocalNpmInstall).toHaveBeenCalledWith(false)
     })
   })
 
@@ -134,6 +140,21 @@ describe('use-app-settings', () => {
     await waitFor(() => {
       expect(useAppSettingsStore.getState().isLoaded).toBe(true)
       expect(useAppSettingsStore.getState().settings.terminalUrlOpenMode).toBe('system')
+    })
+  })
+
+  it('keeps screen reader mode disabled for legacy persisted settings', async () => {
+    const { terminalScreenReaderMode: _terminalScreenReaderMode, ...legacySettings } =
+      DEFAULT_APP_SETTINGS
+    mockPersistenceRead.mockResolvedValueOnce({
+      success: true,
+      data: legacySettings
+    })
+
+    renderHook(() => useAppSettingsLoader())
+
+    await waitFor(() => {
+      expect(useAppSettingsStore.getState().settings.terminalScreenReaderMode).toBe(false)
     })
   })
 
@@ -369,6 +390,7 @@ describe('use-app-settings', () => {
     expect(mockSetSessionNewTimeout).toHaveBeenCalledWith(null)
     expect(mockSetSessionReopenTimeout).toHaveBeenCalledWith(null)
     expect(mockSetFirstPromptWarmupTimeout).toHaveBeenCalledWith(null)
+    expect(mockSetPreferLocalNpmInstall).toHaveBeenCalledWith(true)
   })
 
   it('waits for queued panel writes before close-flow synchronization', async () => {

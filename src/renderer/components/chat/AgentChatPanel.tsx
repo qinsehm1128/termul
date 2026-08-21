@@ -13,6 +13,7 @@ import { extractSkillNames } from '@/lib/skill-tokens'
 import { isTauriContext } from '@/lib/tauri-runtime'
 import { getDefaultCwdForProject, getProjectRootPath } from '@/lib/worktree-context'
 import { useAcpMessages, useAcpSession, useAcpStore, usePromptQueue } from '@/stores/acp-store'
+import { useConversationStore } from '@/stores/conversation-store'
 import { isAgentDeadError } from '@/stores/prompt-queue-orchestration'
 import { AgentConnectionLamp } from './AgentConnectionLamp'
 import { AskUserQuestion } from './AskUserQuestion'
@@ -22,6 +23,19 @@ import { ChatMessageList } from './ChatMessageList'
 import { buildTimeline, consolidateThoughtGroups } from './chat-timeline'
 import { PermissionDialog } from './PermissionDialog'
 import { PlanPanel } from './PlanPanel'
+import { ScheduledTaskDraftCard } from './ScheduledTaskDraftCard'
+
+function settingErrorMessage(
+  err: unknown,
+  fallback: string,
+  t: (key: 'lifecycle.errors.CONVERSATION_BINDING_NOT_FOUND') => string
+): string {
+  const text = err instanceof Error ? err.message : String(err)
+  if (text.includes('CONVERSATION_BINDING_NOT_FOUND')) {
+    return t('lifecycle.errors.CONVERSATION_BINDING_NOT_FOUND')
+  }
+  return fallback
+}
 
 /** Concatenate the text blocks of a message into a single string. */
 function messageText(blocks: ContentBlock[]): string {
@@ -60,6 +74,7 @@ function ChatRestorePreload(): React.JSX.Element {
 
 interface AgentChatPanelProps {
   sessionId: SessionId
+  paneId?: string
   /**
    * Whether this panel's tab is the pane's active tab. Gates the restored-tab
    * rehydrate so only visible chats trigger `openHistorySession` (a hidden
@@ -82,11 +97,20 @@ export function AgentChatPanel({
   // Available skills (with paths) so retry can re-frame the wire from the
   // token names in the last user message (skill paths are not persisted with
   // the message — see the spec's Never: no new ContentBlock type).
-  // Skills live at {project.path}/.agents/skills/ which is gitignored and
-  // excluded from worktree symlinks, so resolve against the main project root
-  // — not session.cwd which may be a worktree path with no .agents/skills/.
-  const skillsProjectRoot = session ? getProjectRootPath(session.projectId) : undefined
-  const { skills: availableSkills } = useAgentSkills(skillsProjectRoot)
+  // Managed skills belong to the Conversation workspace, independent of the
+  // selected execution target (project root or worktree).
+  const conversationWorkspace = useConversationStore((state) => {
+    const conversationId = session?.conversationId
+    if (!conversationId) return undefined
+    return (
+      state.detailsById[conversationId]?.conversation.workspaceCwd ??
+      state.summariesById[conversationId]?.workspaceCwd
+    )
+  })
+  const skillsRoot =
+    conversationWorkspace ??
+    (session ? (getProjectRootPath(session.projectId) ?? session.cwd) : undefined)
+  const { skills: availableSkills } = useAgentSkills(skillsRoot)
   const imageCapable = useAcpStore((s) =>
     session ? Boolean(s.agents[session.agentId]?.capabilities?.promptCapabilities?.image) : false
   )
@@ -98,6 +122,7 @@ export function AgentChatPanel({
   const commands = useAcpStore((s) => s.commands[sessionId] ?? EMPTY_COMMANDS)
   const toolCalls = useAcpStore((s) => s.toolCalls[sessionId] ?? EMPTY_TOOL_CALLS)
   const plan = useAcpStore((s) => s.plans[sessionId] ?? EMPTY_PLAN)
+  const scheduledTaskDraft = useAcpStore((s) => s.scheduledTaskDrafts?.[sessionId])
   // The oldest pending permission for THIS session (resolve one to reveal the next).
   const pendingPermission = useAcpStore(
     useShallow(
@@ -161,10 +186,13 @@ export function AgentChatPanel({
   // record is missing, and history exists for the id, reopen it from history
   // (deduped store-side against a concurrent sidebar open).
   const openHistorySession = useAcpStore((s) => s.openHistorySession)
+  const reconnectClosedSession = useAcpStore((s) => s.reconnectClosedSession)
   const openDiscoveredSession = useAcpStore((s) => s.openDiscoveredSession)
   const discoveredReopenContext = useAcpStore((s) => s.discoveredReopenContexts[sessionId] ?? null)
   const hasHistoryEntry = useAcpStore((s) => s.sessionIndex.some((e) => e.id === sessionId))
   const isOpeningHistory = useAcpStore((s) => Boolean(s.openingHistoryIds[sessionId]))
+  const historyBackfill = useAcpStore((s) => s.historyBackfill[sessionId])
+  const retryHistoryBackfill = useAcpStore((s) => s.retryHistoryBackfill)
   const isRestoringChat = useAcpStore((s) => Boolean(s.restoringChatIds[sessionId]))
   const isLaunchingSession = useAcpStore((s) => Boolean(s.launchingSessionIds[sessionId]))
   const [rehydrateError, setRehydrateError] = useState<string | null>(null)
@@ -227,12 +255,18 @@ export function AgentChatPanel({
     })
   }, [cancelPrompt, sessionId, t])
 
+  const handleRetryHistory = useCallback(() => {
+    void retryHistoryBackfill(sessionId).catch(() => {
+      toast.error(t('history.retryHistoryFailed'))
+    })
+  }, [retryHistoryBackfill, sessionId, t])
+
   const handleSetConfig = useCallback(
     async (configId: string, valueId: string) => {
       try {
         await setConfigOption(sessionId, configId, valueId)
       } catch (err) {
-        toast.error(t('panel.settingFailed'))
+        toast.error(settingErrorMessage(err, t('panel.settingFailed'), t))
         throw err
       }
     },
@@ -244,7 +278,7 @@ export function AgentChatPanel({
       try {
         await setMode(sessionId, modeId)
       } catch (err) {
-        toast.error(t('panel.modeFailed'))
+        toast.error(settingErrorMessage(err, t('panel.modeFailed'), t))
         throw err
       }
     },
@@ -256,7 +290,7 @@ export function AgentChatPanel({
       try {
         await setModel(sessionId, modelId)
       } catch (err) {
-        toast.error(t('panel.modelFailed'))
+        toast.error(settingErrorMessage(err, t('panel.modelFailed'), t))
         throw err
       }
     },
@@ -460,7 +494,7 @@ export function AgentChatPanel({
             <button
               type="button"
               onClick={() => {
-                void openHistorySession(sessionId).catch(() => {
+                void reconnectClosedSession(sessionId).catch(() => {
                   toast.error(t('history.reconnectFailed'))
                 })
               }}
@@ -470,6 +504,42 @@ export function AgentChatPanel({
             </button>
           </div>
         )}
+      {historyBackfill && !historyBackfill.complete && (
+        <div
+          className={`flex flex-wrap items-start justify-between gap-2 border-b px-3 py-2 text-xs ${
+            historyBackfill.errorCode
+              ? 'border-destructive/30 bg-destructive/10 text-destructive'
+              : 'border-warning/30 bg-warning/10 text-warning'
+          }`}
+          role={historyBackfill.errorCode ? 'alert' : 'status'}
+          aria-live={historyBackfill.errorCode ? 'assertive' : 'polite'}
+          aria-atomic="true"
+        >
+          <span className="min-w-0 flex-1 break-words">
+            {historyBackfill.errorCode
+              ? t('history.backfillIncomplete', {
+                  loadedRecordCount: historyBackfill.loadedRecordCount,
+                  targetLastSeq: historyBackfill.targetLastSeq,
+                  nextCursor: historyBackfill.nextCursor,
+                  errorCode: historyBackfill.errorCode
+                })
+              : t('history.backfillProgress', {
+                  loadedRecordCount: historyBackfill.loadedRecordCount,
+                  targetLastSeq: historyBackfill.targetLastSeq,
+                  nextCursor: historyBackfill.nextCursor
+                })}
+          </span>
+          {historyBackfill.errorCode && (
+            <button
+              type="button"
+              onClick={handleRetryHistory}
+              className="shrink-0 rounded-md border border-current/40 px-2 py-1 text-xs font-medium hover:bg-destructive/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              {t('history.retryHistory')}
+            </button>
+          )}
+        </div>
+      )}
       {transportReconnecting && (
         // Story 5.3 (AC3, T5.3): transport-level reconnect overlay. This is
         // DISTINCT from the session-level "Reconnecting to agent…" banner
@@ -493,6 +563,7 @@ export function AgentChatPanel({
         onDismiss={() => setDismissedError(session.lastError)}
       />
       <PlanPanel key={`plan-${session.id}`} entries={plan} />
+      {scheduledTaskDraft ? <ScheduledTaskDraftCard task={scheduledTaskDraft} /> : null}
       <ChatMessageList
         items={timeline}
         sessionId={session.id}
@@ -507,7 +578,7 @@ export function AgentChatPanel({
       ) : (
         <ChatInputBar
           session={session}
-          projectRoot={skillsProjectRoot}
+          projectRoot={skillsRoot}
           busy={session.activeTurn}
           disabled={isClosed}
           imageCapable={imageCapable}

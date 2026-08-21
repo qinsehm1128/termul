@@ -1,6 +1,7 @@
 // Import GitStatus from shared types to ensure consistency
 // between IPC contract and renderer domain models
 import type { GitStatus, TerminalModes } from '@shared/types/ipc.types'
+import type { TerminalResourceHydrationStatus } from '@shared/types/session-workspace.types'
 
 // Re-export for convenience
 export type { GitStatus, TerminalModes }
@@ -28,6 +29,7 @@ export interface ProjectGroup {
   id: string
   name: string
   projectIds: string[]
+  preferredProjectId?: string
   isCollapsed?: boolean
   color?: ProjectColor
 }
@@ -69,13 +71,17 @@ export function isWorktreeTermulManaged(worktree: Worktree): boolean {
   return normalizedPath.includes('.termul/worktrees/')
 }
 
-export type TerminalHealthStatus = 'running' | 'crashed' | 'hibernated' | 'disconnected'
+export type TerminalHealthStatus = TerminalResourceHydrationStatus | 'crashed' | 'hibernated'
+export type TerminalViewState = 'visible' | 'hidden' | 'detached'
 
 export interface Terminal {
   id: string
+  /** Conversation ownership scope; absent for scope-less project terminals. */
+  conversationId?: string
   ptyId?: string
   name: string
-  projectId: string
+  /** Optional attribution/filter only; never ownership or authorization. */
+  projectId?: string
   shell: string
   cwd?: string
   worktreeId?: string
@@ -95,7 +101,11 @@ export interface Terminal {
   detachedOutput?: string // Raw PTY output captured while no renderer is mounted
   rendererAttachmentCount?: number // Number of mounted renderers bound to this PTY
   healthStatus?: TerminalHealthStatus // Terminal health status
-  isHidden?: boolean // Whether terminal is currently hidden within the workspace/pane model
+  /** Latest host replay watermark retained only for renderer-side resume retries. */
+  resumeCursor?: number
+  /** Explicit view lifecycle, independent from the live PTY resource. */
+  viewState?: TerminalViewState
+  isHidden?: boolean // Compatibility mirror of viewState === 'hidden' | 'detached'
   hiddenSince?: number // Timestamp when terminal became hidden within the workspace/pane model
   isAppHidden?: boolean // Whether the entire app/window is currently hidden or minimized
   appHiddenSince?: number // Timestamp when the app-hidden retention window started
@@ -117,6 +127,16 @@ export interface Terminal {
    * kill/close/restart/clearTerminalPtyId.
    */
   claim?: string
+}
+
+/** True when the renderer should keep a workspace tab for this record. */
+export function isOpenTerminalView(terminal: Pick<Terminal, 'viewState' | 'isHidden'>): boolean {
+  return terminal.viewState !== 'hidden' && !terminal.isHidden
+}
+
+/** Conversation-owned PTY: hide can keep the process. Project shells should die on close. */
+export function isConversationScopedTerminal(terminal: Pick<Terminal, 'conversationId'>): boolean {
+  return Boolean(terminal.conversationId)
 }
 
 export interface TerminalLine {

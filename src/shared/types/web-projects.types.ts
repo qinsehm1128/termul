@@ -39,10 +39,31 @@ export interface ProjectSummary {
   isDefault: boolean
 }
 
+/**
+ * A project-group summary exposed to web/remote clients.
+ *
+ * UI-only state such as collapse/expansion is intentionally omitted. Group
+ * membership is identity-only and never widens the host's filesystem boundary.
+ */
+export interface ProjectGroupSummary {
+  /** Stable group id. */
+  id: string
+  /** Display name. */
+  name: string
+  /** Ordered ids of projects in this group. */
+  projectIds: string[]
+  /** Optional group color token. */
+  color: string | null
+  /** Preferred project within `projectIds`, or `null` when none is valid. */
+  preferredProjectId: string | null
+}
+
 /** `GET /projects` response body (wrapped in `IpcResult<T>` by the server). */
 export interface ProjectListPayload {
   /** Non-archived + archived summaries (the web list shows both, archived greyed). */
   projects: ProjectSummary[]
+  /** Project-group summaries. Older hosts/fixtures may omit this; clients use `[]`. */
+  groups: ProjectGroupSummary[]
   /**
    * The host's default project id (seeds a new web client's initial
    * `activeProjectId`), or `null` when none is set.

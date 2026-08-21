@@ -22,13 +22,15 @@ use axum::{
     extract::{Query, State},
     http::StatusCode,
     response::IntoResponse,
-    Json,
+    Extension, Json,
 };
 use serde::Deserialize;
 use tracing::{debug, info, warn};
 
 use crate::acp::{AcpCatalog, SetCatalogOptInRequest};
+use crate::web::auth::IngressProvenance;
 use crate::web::fs_api::IpcBody;
+use crate::web::operation_policy::{self, LocalOnlyOperation};
 use crate::web::ws::AppState;
 
 /// `GET /acp/catalog?refresh=true` query params.
@@ -118,8 +120,17 @@ pub async fn list(
 /// Mirrors the `workspace_api::write` handler pattern.
 pub async fn set_opt_in(
     State(state): State<AppState>,
+    Extension(provenance): Extension<IngressProvenance>,
     body: Bytes,
 ) -> impl IntoResponse {
+    if let Err(denial) =
+        operation_policy::authorize_local_only(provenance, LocalOnlyOperation::SetCatalogOptIn)
+    {
+        return (
+            StatusCode::OK,
+            Json(IpcBody::<()>::err(denial.message, denial.code)),
+        );
+    }
     let req: SetCatalogOptInRequest = match serde_json::from_slice(&body) {
         Ok(req) => req,
         Err(error) => {
@@ -225,6 +236,7 @@ mod tests {
             registry_persistence: None,
             projects_file: None,
             history_mode: HistoryMode::LiveOnly,
+            conversation: None,
             project_root: Arc::new(parking_lot::RwLock::new(std::env::temp_dir())),
             workspace_manifest: None,
             acp_catalog: Some(store),
@@ -247,6 +259,7 @@ mod tests {
             registry_persistence: None,
             projects_file: None,
             history_mode: HistoryMode::LiveOnly,
+            conversation: None,
             project_root: Arc::new(parking_lot::RwLock::new(std::env::temp_dir())),
             workspace_manifest: None,
             acp_catalog: None,
@@ -256,10 +269,18 @@ mod tests {
     }
 
     fn test_router(state: AppState) -> axum::Router {
+        test_router_with_provenance(state, crate::web::auth::IngressProvenance::LocalOperator)
+    }
+
+    fn test_router_with_provenance(
+        state: AppState,
+        provenance: crate::web::auth::IngressProvenance,
+    ) -> axum::Router {
         axum::Router::new()
             .route("/acp/catalog", get(super::list))
             .route("/acp/catalog/opt-in", post(set_opt_in))
             .with_state(state)
+            .layer(axum::Extension(provenance))
     }
 
     async fn body_as_json<T: serde::de::DeserializeOwned>(body: Body) -> T {
@@ -431,6 +452,34 @@ mod tests {
         let body: IpcBody<()> = body_as_json(resp.into_body()).await;
         assert!(!body.success);
         assert_eq!(body.code.as_deref(), Some("VALIDATION_ERROR"));
+    }
+
+    #[tokio::test]
+    async fn http_catalog_opt_in_without_local_operator_returns_forbidden() {
+        let dir = TempDir::new("set-opt-in-public");
+        let state = state_with_store(dir.path()).await;
+        let resp = test_router_with_provenance(
+            state.clone(),
+            crate::web::auth::IngressProvenance::PublicTunnel,
+        )
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/acp/catalog/opt-in")
+                .header("content-type", "application/json")
+                .body(Body::from(br#"{"enabled":true}"#.to_vec()))
+                .expect("build request"),
+        )
+        .await
+        .expect("router response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: IpcBody<()> = body_as_json(resp.into_body()).await;
+        assert!(!body.success);
+        assert_eq!(body.code.as_deref(), Some("FORBIDDEN"));
+        assert!(
+            !state.acp_catalog.as_ref().unwrap().is_opt_in(),
+            "public-tunnel opt-in must not persist"
+        );
     }
 
     // ---- Serde shape tests ----

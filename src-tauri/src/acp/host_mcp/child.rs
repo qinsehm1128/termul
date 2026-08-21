@@ -20,8 +20,10 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
 use crate::acp::host_mcp::{
-    FrameKind, FrameReply, FrameRequest, TermulPlanInput, TermulSetTitleInput, ENV_AGENT_ID,
-    ENV_PORT, ENV_SESSION_ID, ENV_TOKEN,
+    FrameKind, FrameReply, FrameRequest, ScheduledTaskDraftCreateInput,
+    ScheduledTaskDraftUpdateInput, ScheduledTaskGetInput, ScheduledTaskListInput,
+    ScheduledTaskPauseInput, ScheduledTaskPreviewInput, TermulPlanInput, TermulSetTitleInput,
+    ENV_AGENT_ID, ENV_PORT, ENV_SESSION_ID, ENV_TOKEN,
 };
 
 /// Env-derived configuration for the child. Extracted so the arg parser is
@@ -123,6 +125,7 @@ impl TermulPlanServer {
             kind: FrameKind::Plan,
             todos: input.todos,
             title: None,
+            payload: None,
         };
         match forward_to_parent(&self.config, request, "plan updated").await {
             Ok(msg) => msg,
@@ -144,10 +147,115 @@ impl TermulPlanServer {
             kind: FrameKind::SetTitle,
             todos: Vec::new(),
             title: Some(input.title),
+            payload: None,
         };
         match forward_to_parent(&self.config, request, "title updated").await {
             Ok(msg) => msg,
             Err(e) => format!("set_session_title error: {e}"),
+        }
+    }
+
+    #[tool(
+        name = "scheduled_task_list",
+        description = "List Termul scheduled tasks across Conversations and optional project associations. This is read-only."
+    )]
+    async fn scheduled_task_list(
+        &self,
+        Parameters(input): Parameters<ScheduledTaskListInput>,
+    ) -> String {
+        self.forward_scheduled(FrameKind::ScheduledTaskList, input, "tasks listed")
+            .await
+    }
+
+    #[tool(
+        name = "scheduled_task_get",
+        description = "Get one Termul scheduled task and its current review revision/hash. This is read-only."
+    )]
+    async fn scheduled_task_get(
+        &self,
+        Parameters(input): Parameters<ScheduledTaskGetInput>,
+    ) -> String {
+        self.forward_scheduled(FrameKind::ScheduledTaskGet, input, "task loaded")
+            .await
+    }
+
+    #[tool(
+        name = "scheduled_task_preview",
+        description = "Validate and normalize a cron, interval, or one-time schedule and return future executions. Always call this before creating a draft; the host is authoritative for timezone and DST behavior."
+    )]
+    async fn scheduled_task_preview(
+        &self,
+        Parameters(input): Parameters<ScheduledTaskPreviewInput>,
+    ) -> String {
+        self.forward_scheduled(FrameKind::ScheduledTaskPreview, input, "schedule previewed")
+            .await
+    }
+
+    #[tool(
+        name = "scheduled_task_draft_create",
+        description = "Create a review-only scheduled task draft. This never activates or runs the task. Do not include secrets; explain the draft and wait for explicit user confirmation in Termul."
+    )]
+    async fn scheduled_task_draft_create(
+        &self,
+        Parameters(input): Parameters<ScheduledTaskDraftCreateInput>,
+    ) -> String {
+        self.forward_scheduled(
+            FrameKind::ScheduledTaskDraftCreate,
+            input,
+            "task draft created",
+        )
+        .await
+    }
+
+    #[tool(
+        name = "scheduled_task_draft_update",
+        description = "Replace an existing review-only draft using its expected revision. This never activates the task."
+    )]
+    async fn scheduled_task_draft_update(
+        &self,
+        Parameters(input): Parameters<ScheduledTaskDraftUpdateInput>,
+    ) -> String {
+        self.forward_scheduled(
+            FrameKind::ScheduledTaskDraftUpdate,
+            input,
+            "task draft updated",
+        )
+        .await
+    }
+
+    #[tool(
+        name = "scheduled_task_pause",
+        description = "Safely pause future occurrences of a scheduled task using revision CAS. An already-started Conversation is not cancelled."
+    )]
+    async fn scheduled_task_pause(
+        &self,
+        Parameters(input): Parameters<ScheduledTaskPauseInput>,
+    ) -> String {
+        self.forward_scheduled(FrameKind::ScheduledTaskPause, input, "task paused")
+            .await
+    }
+
+    async fn forward_scheduled<T: serde::Serialize>(
+        &self,
+        kind: FrameKind,
+        input: T,
+        success_message: &'static str,
+    ) -> String {
+        let payload = match serde_json::to_value(input) {
+            Ok(payload) => payload,
+            Err(error) => return format!("scheduled task input error: {error}"),
+        };
+        let request = FrameRequest {
+            token: self.config.token.clone(),
+            session_id: self.config.session_id.clone(),
+            kind,
+            todos: Vec::new(),
+            title: None,
+            payload: Some(payload),
+        };
+        match forward_to_parent(&self.config, request, success_message).await {
+            Ok(message) => message,
+            Err(error) => format!("scheduled task error: {error}"),
         }
     }
 }
@@ -197,7 +305,11 @@ async fn forward_to_parent_inner(
     let reply: FrameReply =
         serde_json::from_str(&line).map_err(|e| format!("decode reply: {e}"))?;
     if reply.ok {
-        Ok(success_message.to_string())
+        match reply.result {
+            Some(result) => serde_json::to_string_pretty(&result)
+                .map_err(|error| format!("encode parent result: {error}")),
+            None => Ok(success_message.to_string()),
+        }
     } else {
         Err(reply.error.unwrap_or_else(|| "unknown error".to_string()))
     }

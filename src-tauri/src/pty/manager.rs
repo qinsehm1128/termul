@@ -3,6 +3,7 @@
 //! This module provides terminal spawning, I/O, and lifecycle management
 //! ported from the Electron implementation.
 
+use crate::conversation::{ConversationId, ConversationRecordV2, ExecutionTarget};
 use crate::pty::claims::ClaimError;
 use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEvent, TerminalEventHub};
 use parking_lot::RwLock;
@@ -261,8 +262,7 @@ pub(super) fn parse_powershell_cmd_shim(shim_path: &str) -> Option<ResolvedProgr
 
     let resolve_batch_token = |raw: &str| -> String {
         let shim_dir_str = shim_dir.to_str().unwrap_or(".");
-        let system_root =
-            env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let system_root = env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
         raw.replace("%SystemRoot%", &system_root)
             .replace("%SYSTEMROOT%", &system_root)
             .replace("%SCRIPT_DIR%", shim_dir_str)
@@ -284,9 +284,7 @@ pub(super) fn parse_powershell_cmd_shim(shim_path: &str) -> Option<ResolvedProgr
             .split_whitespace()
             .find(|t| t.to_ascii_lowercase().contains("powershell.exe"))?;
         let ps_exe = resolve_batch_token(ps_exe_token);
-        if !std::path::Path::new(&ps_exe).exists()
-            || !is_directly_executable_windows(&ps_exe)
-        {
+        if !std::path::Path::new(&ps_exe).exists() || !is_directly_executable_windows(&ps_exe) {
             continue;
         }
 
@@ -456,12 +454,16 @@ where
 const GLOBAL_TERMINAL_LIMIT: usize = 30;
 const ORPHAN_TIMEOUT_MS: u64 = 300_000; // 5 minutes
 const ORPHAN_CHECK_INTERVAL_MS: u64 = 30_000; // 30 seconds
+/// One absolute budget shared by child kill/wait and both thread joins.
+pub const TERMINAL_CLEANUP_DEADLINE: Duration = Duration::from_secs(5);
+const TERMINAL_CLEANUP_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 // ADR-002.3: Flusher thread constants
 pub const FLUSH_INTERVAL: Duration = Duration::from_millis(4);
 pub const READ_BUF: usize = 16 * 1024; // 16KB read buffer
 pub const MAX_PENDING: usize = 4 * 1024 * 1024; // 4MB overflow cap
-pub const OVERFLOW_NOTICE: &[u8] = b"\x1bc\x1b[2m[termul: dropped output due to backpressure]\x1b[0m\r\n";
+pub const OVERFLOW_NOTICE: &[u8] =
+    b"\x1bc\x1b[2m[termul: dropped output due to backpressure]\x1b[0m\r\n";
 
 /// Public info emitted to renderer on spawn (also forwarded to ws clients)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -479,14 +481,24 @@ pub struct TerminalInfo {
 ///
 /// Serializes FLATTENED — `{id, shell, cwd, pid, cols, rows, claim}` — so both
 /// transports (desktop `terminal_spawn` IpcResult data and the web `spawn`
-/// reply data) expose the same top-level camelCase shape. This is the only
-/// issuance path for the credential.
-#[derive(Debug, Clone, Serialize)]
+/// reply data) expose the same top-level camelCase shape. This is the initial
+/// issuance path; authenticated resume and explicit rotation can replace it.
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpawnedTerminal {
     #[serde(flatten)]
     pub info: TerminalInfo,
     pub claim: String,
+}
+
+impl std::fmt::Debug for SpawnedTerminal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SpawnedTerminal")
+            .field("info", &self.info)
+            .field("claim", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Shared attach response — byte-identical camelCase shape on both transports
@@ -508,6 +520,25 @@ pub struct TerminalAttachResult {
     pub gap: bool,
 }
 
+/// Cold-renderer resume request. Unknown fields are rejected so this path can
+/// never grow into a raw spawn or environment override surface.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TerminalResumeRequest {
+    pub conversation_id: ConversationId,
+    pub terminal_id: String,
+    pub last_seq: u64,
+}
+
+/// One-time resume handoff. The claim exists only in this authenticated
+/// response and the renderer's memory; it is never persisted or logged.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalResumeGrant {
+    pub terminal: TerminalAttachResult,
+    pub claim: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TerminalOutputChunk {
@@ -521,6 +552,9 @@ pub struct TerminalReplay {
     pub gap: bool,
     pub latest_seq: u64,
     pub receiver: tokio::sync::broadcast::Receiver<TerminalOutputChunk>,
+    /// Exact claim generation authorized for a trusted resume. This is
+    /// process-local control metadata and is never serialized.
+    pub(crate) claim_generation: Option<u64>,
 }
 
 /// Broadcast channel capacity (number of buffered output batches per terminal).
@@ -534,13 +568,96 @@ const TERM_BROADCAST_CAPACITY: usize = 1024;
 /// even for very chatty terminals. Oldest bytes are evicted first.
 pub const SCROLLBACK_CAP: usize = 256 * 1024;
 
-/// Options for spawning a new terminal
+/// Host-authorized remote terminal spawn intent.
+///
+/// Remote callers may select only the canonical Conversation, optional project
+/// attribution, one of the two host-owned cwd sources, and terminal dimensions.
+/// Program, shell, argv, environment, and raw cwd never cross this boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TerminalSpawnIntentV1 {
+    pub conversation_id: ConversationId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
+    pub cwd_source: TerminalCwdSource,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TerminalCwdSource {
+    Workspace,
+    ExecutionTarget,
+}
+
+impl TerminalSpawnIntentV1 {
+    fn into_trusted_options(
+        self,
+        conversation: &ConversationRecordV2,
+    ) -> Result<SpawnOptions, String> {
+        if self.conversation_id != conversation.conversation_id {
+            return Err("terminal spawn scope is unauthorized".to_string());
+        }
+        if self.cols == 0 || self.rows == 0 {
+            return Err("terminal dimensions must be greater than zero".to_string());
+        }
+
+        let authoritative_project_id = match &conversation.execution_target {
+            ExecutionTarget::ProjectRoot { project_id, .. }
+            | ExecutionTarget::Worktree { project_id, .. } => Some(project_id.as_str()),
+            ExecutionTarget::Workspace => conversation
+                .project_attachment
+                .as_ref()
+                .map(|attachment| attachment.project_id.as_str()),
+        };
+        if let Some(project_id) = self.project_id.as_deref() {
+            if project_id.trim().is_empty() || authoritative_project_id != Some(project_id) {
+                return Err("terminal spawn project scope is unauthorized".to_string());
+            }
+        }
+
+        let cwd = match (&self.cwd_source, &conversation.execution_target) {
+            (TerminalCwdSource::Workspace, _)
+            | (TerminalCwdSource::ExecutionTarget, ExecutionTarget::Workspace) => {
+                conversation.workspace_cwd.clone()
+            }
+            (
+                TerminalCwdSource::ExecutionTarget,
+                ExecutionTarget::ProjectRoot { project_root, .. },
+            ) => project_root.clone(),
+            (
+                TerminalCwdSource::ExecutionTarget,
+                ExecutionTarget::Worktree { worktree_path, .. },
+            ) => worktree_path.clone(),
+        };
+
+        Ok(SpawnOptions {
+            shell: None,
+            cwd: Some(cwd),
+            env: None,
+            conversation_id: Some(self.conversation_id),
+            project_id: self.project_id,
+            cols: Some(self.cols),
+            rows: Some(self.rows),
+            program: None,
+            args: None,
+            kind: None,
+        })
+    }
+}
+
+/// Options for spawning a new terminal on trusted local/internal paths.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpawnOptions {
     pub shell: Option<String>,
     pub cwd: Option<String>,
     pub env: Option<HashMap<String, String>>,
+    /// Canonical primary ownership scope for every durable user terminal.
+    #[serde(default)]
+    pub conversation_id: Option<ConversationId>,
+    /// Optional project attribution; never the ownership or authorization key.
     #[serde(default)]
     pub project_id: Option<String>,
     pub cols: Option<u16>,
@@ -563,6 +680,7 @@ impl Default for SpawnOptions {
             shell: None,
             cwd: None,
             env: None,
+            conversation_id: None,
             project_id: None,
             cols: Some(80),
             rows: Some(24),
@@ -573,15 +691,423 @@ impl Default for SpawnOptions {
     }
 }
 
+/// SessionWorkspace refs exist only for conversation-scoped local terminals.
+/// Scope-less project terminals and ephemeral SSH keep a process-local
+/// ConversationId for claims, but they never enter workspace admission.
+pub(crate) fn tracks_session_workspace_ref(options: &SpawnOptions) -> bool {
+    options.kind.as_deref() != Some("ssh") && options.conversation_id.is_some()
+}
+
+/// Observable cleanup phase. These are the only phase names allowed onto the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalCleanupStage {
+    Kill,
+    Wait,
+    FlusherJoin,
+    ReaderJoin,
+}
+
+impl TerminalCleanupStage {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Kill => "kill",
+            Self::Wait => "wait",
+            Self::FlusherJoin => "flusher_join",
+            Self::ReaderJoin => "reader_join",
+        }
+    }
+}
+
+impl std::fmt::Display for TerminalCleanupStage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Conservative resource ownership state. Only `Removed` releases capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalLifecycleState {
+    Active,
+    Terminating,
+    Quarantined,
+    Removed,
+}
+
+impl TerminalLifecycleState {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "Active",
+            Self::Terminating => "Terminating",
+            Self::Quarantined => "Quarantined",
+            Self::Removed => "Removed",
+        }
+    }
+}
+
+/// Successful cleanup receipt. `released_slot` is true for exactly one caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalCleanupReceipt {
+    pub terminal_id: String,
+    pub job_id: u64,
+    pub elapsed_ms: u64,
+    pub attempt: u64,
+    pub released_slot: bool,
+    pub already_removed: bool,
+}
+
+/// Internal classification retained for deterministic tests and sanitized logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalCleanupFailureReason {
+    Error,
+    DeadlineExceeded,
+    ThreadPanicked,
+}
+
+/// Cleanup failed at one stable phase. Process details are deliberately absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalCleanupFailure {
+    pub terminal_id: String,
+    pub job_id: u64,
+    pub stage: TerminalCleanupStage,
+    pub reason: TerminalCleanupFailureReason,
+    pub elapsed_ms: u64,
+    pub attempt: u64,
+    /// True only when the caller deadline elapsed while the retained manager job was still
+    /// running. The terminal identity and capacity remain owned until proven completion.
+    pub in_flight: bool,
+}
+
+impl std::fmt::Display for TerminalCleanupFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "terminal cleanup failed at stage {}",
+            self.stage.as_str()
+        )
+    }
+}
+
+impl std::error::Error for TerminalCleanupFailure {}
+
+/// One manager-owned cleanup job retained for the lifetime of an in-flight attempt. Callers and
+/// retries observe this shared state; none of them owns or detaches the blocking task.
+pub struct TerminalCleanupJob {
+    job_id: u64,
+    attempt: u64,
+    started: Instant,
+    deadline: Instant,
+    stage: Mutex<TerminalCleanupStage>,
+    result: Mutex<Option<Result<TerminalCleanupReceipt, TerminalCleanupFailure>>>,
+    release_receipt_claimed: AtomicBool,
+    completed: tokio::sync::Notify,
+}
+
+impl std::fmt::Debug for TerminalCleanupJob {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TerminalCleanupJob")
+            .field("job_id", &self.job_id)
+            .field("attempt", &self.attempt)
+            .field("stage", &self.stage())
+            .field("completed", &self.is_complete())
+            .finish()
+    }
+}
+
+impl TerminalCleanupJob {
+    fn new(job_id: u64, attempt: u64, started: Instant, deadline: Instant) -> Self {
+        Self {
+            job_id,
+            attempt,
+            started,
+            deadline,
+            stage: Mutex::new(TerminalCleanupStage::Kill),
+            result: Mutex::new(None),
+            release_receipt_claimed: AtomicBool::new(false),
+            completed: tokio::sync::Notify::new(),
+        }
+    }
+
+    #[must_use]
+    pub const fn job_id(&self) -> u64 {
+        self.job_id
+    }
+
+    #[must_use]
+    pub const fn attempt(&self) -> u64 {
+        self.attempt
+    }
+
+    #[must_use]
+    pub fn stage(&self) -> TerminalCleanupStage {
+        *self
+            .stage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn set_stage(&self, stage: TerminalCleanupStage) {
+        *self
+            .stage
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = stage;
+    }
+
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    fn result_for_observer(
+        &self,
+    ) -> Option<Result<TerminalCleanupReceipt, TerminalCleanupFailure>> {
+        let result = self
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        result.map(|result| {
+            result.map(|mut receipt| {
+                if receipt.released_slot
+                    && self
+                        .release_receipt_claimed
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                {
+                    receipt.released_slot = false;
+                    receipt.already_removed = true;
+                }
+                receipt
+            })
+        })
+    }
+
+    fn complete(&self, result: Result<TerminalCleanupReceipt, TerminalCleanupFailure>) {
+        let mut slot = self
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.is_none() {
+            *slot = Some(result);
+            drop(slot);
+            self.completed.notify_waiters();
+        }
+    }
+
+    fn in_flight_deadline_failure(&self, terminal_id: &str) -> TerminalCleanupFailure {
+        TerminalCleanupFailure {
+            terminal_id: terminal_id.to_string(),
+            job_id: self.job_id,
+            stage: self.stage(),
+            reason: TerminalCleanupFailureReason::DeadlineExceeded,
+            elapsed_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            attempt: self.attempt,
+            in_flight: true,
+        }
+    }
+}
+
+/// Aggregate host receipt for a bounded all-terminal shutdown attempt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PtyShutdownReceipt {
+    pub attempted: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub in_flight: usize,
+    pub elapsed_ms: u64,
+}
+
+impl PtyShutdownReceipt {
+    #[must_use]
+    pub const fn clean_success(self) -> bool {
+        self.failed == 0 && self.in_flight == 0 && self.attempted == self.succeeded
+    }
+}
+
+/// Crate-private production seam used by deterministic failure tests. Every method receives the
+/// same absolute deadline; implementations must never mint a per-stage budget.
+pub(crate) trait CleanupDriver: Send + Sync {
+    fn kill(
+        &self,
+        child: &mut dyn Child,
+        deadline: Instant,
+    ) -> Result<(), TerminalCleanupFailureReason>;
+
+    fn try_wait(
+        &self,
+        child: &mut dyn Child,
+        deadline: Instant,
+    ) -> Result<Option<portable_pty::ExitStatus>, TerminalCleanupFailureReason>;
+
+    fn join_thread(
+        &self,
+        stage: TerminalCleanupStage,
+        handle: &mut Option<std::thread::JoinHandle<()>>,
+        deadline: Instant,
+    ) -> Result<(), TerminalCleanupFailureReason>;
+}
+
+#[derive(Debug, Default)]
+struct SystemCleanupDriver;
+
+impl CleanupDriver for SystemCleanupDriver {
+    fn kill(
+        &self,
+        child: &mut dyn Child,
+        deadline: Instant,
+    ) -> Result<(), TerminalCleanupFailureReason> {
+        if Instant::now() >= deadline {
+            return Err(TerminalCleanupFailureReason::DeadlineExceeded);
+        }
+        child
+            .kill()
+            .map_err(|_| TerminalCleanupFailureReason::Error)
+    }
+
+    fn try_wait(
+        &self,
+        child: &mut dyn Child,
+        deadline: Instant,
+    ) -> Result<Option<portable_pty::ExitStatus>, TerminalCleanupFailureReason> {
+        if Instant::now() >= deadline {
+            return Err(TerminalCleanupFailureReason::DeadlineExceeded);
+        }
+        child
+            .try_wait()
+            .map_err(|_| TerminalCleanupFailureReason::Error)
+    }
+
+    fn join_thread(
+        &self,
+        _stage: TerminalCleanupStage,
+        handle: &mut Option<std::thread::JoinHandle<()>>,
+        deadline: Instant,
+    ) -> Result<(), TerminalCleanupFailureReason> {
+        let Some(handle) = handle.take() else {
+            return Ok(());
+        };
+        if Instant::now() >= deadline {
+            // Dropping the JoinHandle detaches the thread so unresolved
+            // spawn_blocking/cleanup work cannot stall Tokio teardown.
+            drop(handle);
+            return Err(TerminalCleanupFailureReason::DeadlineExceeded);
+        }
+        handle
+            .join()
+            .map_err(|_| TerminalCleanupFailureReason::ThreadPanicked)
+    }
+}
+
+/// Deterministic one-shot failure driver shared by PTY, command, and WebSocket tests.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct ScriptedCleanupDriver {
+    failures: Mutex<HashMap<TerminalCleanupStage, usize>>,
+    observed_deadlines: Mutex<Vec<(TerminalCleanupStage, Instant)>>,
+}
+
+#[cfg(test)]
+impl ScriptedCleanupDriver {
+    pub(crate) fn fail_once(&self, stage: TerminalCleanupStage) {
+        let mut failures = self
+            .failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *failures.entry(stage).or_default() += 1;
+    }
+
+    pub(crate) fn observed_deadlines(&self) -> Vec<(TerminalCleanupStage, Instant)> {
+        self.observed_deadlines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn observe_and_should_fail(&self, stage: TerminalCleanupStage, deadline: Instant) -> bool {
+        self.observed_deadlines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((stage, deadline));
+        let mut failures = self
+            .failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(remaining) = failures.get_mut(&stage) else {
+            return false;
+        };
+        if *remaining == 0 {
+            return false;
+        }
+        *remaining -= 1;
+        true
+    }
+}
+
+#[cfg(test)]
+impl CleanupDriver for ScriptedCleanupDriver {
+    fn kill(
+        &self,
+        child: &mut dyn Child,
+        deadline: Instant,
+    ) -> Result<(), TerminalCleanupFailureReason> {
+        if self.observe_and_should_fail(TerminalCleanupStage::Kill, deadline) {
+            return Err(TerminalCleanupFailureReason::Error);
+        }
+        SystemCleanupDriver.kill(child, deadline)
+    }
+
+    fn try_wait(
+        &self,
+        child: &mut dyn Child,
+        deadline: Instant,
+    ) -> Result<Option<portable_pty::ExitStatus>, TerminalCleanupFailureReason> {
+        if self.observe_and_should_fail(TerminalCleanupStage::Wait, deadline) {
+            return Err(TerminalCleanupFailureReason::Error);
+        }
+        SystemCleanupDriver.try_wait(child, deadline)
+    }
+
+    fn join_thread(
+        &self,
+        stage: TerminalCleanupStage,
+        handle: &mut Option<std::thread::JoinHandle<()>>,
+        deadline: Instant,
+    ) -> Result<(), TerminalCleanupFailureReason> {
+        if self.observe_and_should_fail(stage, deadline) {
+            return Err(TerminalCleanupFailureReason::Error);
+        }
+        SystemCleanupDriver.join_thread(stage, handle, deadline)
+    }
+}
+
+#[derive(Debug, Default)]
+struct TerminalCleanupProgress {
+    kill_completed: bool,
+    child_reaped: bool,
+}
+
 /// A running terminal instance
 pub struct TerminalInstance {
     pub id: String,
+    pub conversation_id: ConversationId,
+    pub workspace_ref_tracked: bool,
     pub project_id: Option<String>,
     pub child: Arc<AsyncMutex<Option<Box<dyn Child + Send>>>>,
     pub master: Arc<AsyncMutex<Option<Box<dyn MasterPty + Send>>>>,
     pub writer: Arc<AsyncMutex<Option<Box<dyn Write + Send>>>>,
     pub reader_handle: Arc<AsyncMutex<Option<std::thread::JoinHandle<()>>>>,
     pub flusher_handle: Arc<AsyncMutex<Option<std::thread::JoinHandle<()>>>>,
+    lifecycle_state: Arc<RwLock<TerminalLifecycleState>>,
+    cleanup_gate: Arc<AsyncMutex<()>>,
+    cleanup_job: Arc<Mutex<Option<Arc<TerminalCleanupJob>>>>,
+    cleanup_progress: Arc<Mutex<TerminalCleanupProgress>>,
+    cleanup_attempts: Arc<AtomicU64>,
     pub shell: String,
     pub cwd: String,
     pub pid: u32,
@@ -612,6 +1138,24 @@ pub struct TerminalInstance {
 }
 
 impl TerminalInstance {
+    #[must_use]
+    pub fn lifecycle_state(&self) -> TerminalLifecycleState {
+        *self.lifecycle_state.read()
+    }
+
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.lifecycle_state() == TerminalLifecycleState::Active
+    }
+
+    fn require_active(&self) -> Result<(), String> {
+        if self.is_active() {
+            Ok(())
+        } else {
+            Err("Terminal resource is not active".to_string())
+        }
+    }
+
     /// Update the last activity timestamp
     pub fn update_activity(&self) {
         *self.last_activity.write() = Instant::now();
@@ -682,6 +1226,10 @@ impl TerminalInstance {
         self.protected.store(protected, Ordering::Relaxed);
     }
 
+    pub fn conversation_matches(&self, conversation_id: ConversationId) -> bool {
+        self.conversation_id == conversation_id
+    }
+
     pub fn project_matches(&self, project_id: &str) -> bool {
         self.project_id.as_deref() == Some(project_id)
     }
@@ -707,6 +1255,7 @@ impl TerminalInstance {
             gap,
             latest_seq,
             receiver,
+            claim_generation: None,
         }
     }
 }
@@ -798,6 +1347,7 @@ impl Drop for ClaimRollbackGuard<'_> {
 }
 
 /// Manages all PTY instances
+#[derive(Clone)]
 pub struct PtyManager {
     terminals: Arc<RwLock<HashMap<String, Arc<TerminalInstance>>>>,
     active_terminal_slots: Arc<AtomicUsize>,
@@ -813,6 +1363,8 @@ pub struct PtyManager {
     /// claim lifecycle coupled to the terminal lifecycle: issued at spawn,
     /// removed at kill/reap.
     claims: Arc<crate::pty::claims::TerminalClaimRegistry>,
+    cleanup_driver: Arc<RwLock<Arc<dyn CleanupDriver>>>,
+    cleanup_job_counter: Arc<AtomicU64>,
     /// When true, orphan detection and kill operations are deferred.
     /// Set when the app window is minimized/hidden to prevent
     /// ConPTY lifecycle issues on Windows.
@@ -840,73 +1392,173 @@ impl PtyManager {
             git_tracker,
             exit_code_tracker,
             claims: Arc::new(crate::pty::claims::TerminalClaimRegistry::new()),
+            cleanup_driver: Arc::new(RwLock::new(Arc::new(SystemCleanupDriver))),
+            cleanup_job_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    fn join_reader_with_timeout(reader_handle: std::thread::JoinHandle<()>, timeout: Duration) {
-        let (tx, rx) = std::sync::mpsc::channel::<()>();
-        std::thread::spawn(move || {
-            let _ = reader_handle.join();
-            let _ = tx.send(());
-        });
-        let _ = rx.recv_timeout(timeout);
+    fn cleanup_failure(
+        instance: &TerminalInstance,
+        stage: TerminalCleanupStage,
+        reason: TerminalCleanupFailureReason,
+        job: &TerminalCleanupJob,
+    ) -> TerminalCleanupFailure {
+        TerminalCleanupFailure {
+            terminal_id: instance.id.clone(),
+            job_id: job.job_id,
+            stage,
+            reason,
+            elapsed_ms: u64::try_from(job.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            attempt: job.attempt,
+            in_flight: false,
+        }
     }
 
-    fn cleanup_terminal_resources_sync(instance: Arc<TerminalInstance>, wait_reader_thread: bool) {
-        // a) Drop writer first to close PTY input stream cleanly.
-        let _ = instance.writer.blocking_lock().take();
+    fn sleep_until_next_cleanup_poll(deadline: Instant) {
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(now)
+                .min(TERMINAL_CLEANUP_POLL_INTERVAL),
+        );
+    }
 
-        // b) Kill the child FIRST and wait briefly for it to exit. Once the
-        //    child exits, the OS closes the PTY slave end and the reader
-        //    thread's blocking `reader.read()` returns Ok(0) (EOF), so it
-        //    exits naturally and the joins below complete fast.
-        //
-        //    The previous order (join reader, THEN kill child) left the reader
-        //    blocked because the child was still alive holding the PTY open.
-        //    Every cleanup hit the 3s join timeout, leaking the detached
-        //    watcher thread spawned by `join_reader_with_timeout` plus the
-        //    stuck reader thread. With N terminals, those leaked threads kept
-        //    the process alive in the task manager and spinning CPU after the
-        //    window was closed (issue #390).
-        if let Some(mut child) = instance.child.blocking_lock().take() {
-            let _ = child.kill();
-            // Best-effort wait: give the child up to ~2s to exit so the PTY
-            // EOF propagates to the reader before we join. If it doesn't exit
-            // (stubborn grandchild / ConPTY edge case), proceed anyway — the
-            // join timeout below is the safety net.
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while Instant::now() < deadline {
-                match child.try_wait() {
-                    Ok(Some(_)) => break,
-                    Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-                    Err(_) => break,
+    fn join_thread_until(
+        instance: &TerminalInstance,
+        handle_slot: &AsyncMutex<Option<std::thread::JoinHandle<()>>>,
+        stage: TerminalCleanupStage,
+        driver: &dyn CleanupDriver,
+        job: &TerminalCleanupJob,
+    ) -> Result<(), TerminalCleanupFailure> {
+        job.set_stage(stage);
+        let mut handle = handle_slot.blocking_lock();
+        loop {
+            let Some(current) = handle.as_ref() else {
+                return Ok(());
+            };
+            if current.is_finished() {
+                return driver
+                    .join_thread(stage, &mut handle, job.deadline)
+                    .map_err(|reason| Self::cleanup_failure(instance, stage, reason, job));
+            }
+            if Instant::now() >= job.deadline {
+                return Err(Self::cleanup_failure(
+                    instance,
+                    stage,
+                    TerminalCleanupFailureReason::DeadlineExceeded,
+                    job,
+                ));
+            }
+            Self::sleep_until_next_cleanup_poll(job.deadline);
+        }
+    }
+
+    fn cleanup_terminal_resources_sync(
+        instance: Arc<TerminalInstance>,
+        driver: Arc<dyn CleanupDriver>,
+        job: Arc<TerminalCleanupJob>,
+    ) -> Result<TerminalCleanupReceipt, TerminalCleanupFailure> {
+        // Drop input exactly once. A failed cleanup leaves the remaining child/thread handles in
+        // place so an explicit retry can continue from the last proven stage.
+        instance.writer.blocking_lock().take();
+
+        {
+            let mut progress = instance
+                .cleanup_progress
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !progress.child_reaped {
+                let mut child_slot = instance.child.blocking_lock();
+                if let Some(child) = child_slot.as_mut() {
+                    if !progress.kill_completed {
+                        job.set_stage(TerminalCleanupStage::Kill);
+                        if Instant::now() >= job.deadline {
+                            return Err(Self::cleanup_failure(
+                                &instance,
+                                TerminalCleanupStage::Kill,
+                                TerminalCleanupFailureReason::DeadlineExceeded,
+                                &job,
+                            ));
+                        }
+                        driver
+                            .kill(child.as_mut(), job.deadline)
+                            .map_err(|reason| {
+                                Self::cleanup_failure(
+                                    &instance,
+                                    TerminalCleanupStage::Kill,
+                                    reason,
+                                    &job,
+                                )
+                            })?;
+                        progress.kill_completed = true;
+                    }
+
+                    loop {
+                        job.set_stage(TerminalCleanupStage::Wait);
+                        if Instant::now() >= job.deadline {
+                            return Err(Self::cleanup_failure(
+                                &instance,
+                                TerminalCleanupStage::Wait,
+                                TerminalCleanupFailureReason::DeadlineExceeded,
+                                &job,
+                            ));
+                        }
+                        match driver.try_wait(child.as_mut(), job.deadline) {
+                            Ok(Some(_)) => {
+                                child_slot.take();
+                                progress.child_reaped = true;
+                                break;
+                            }
+                            Ok(None) => Self::sleep_until_next_cleanup_poll(job.deadline),
+                            Err(reason) => {
+                                return Err(Self::cleanup_failure(
+                                    &instance,
+                                    TerminalCleanupStage::Wait,
+                                    reason,
+                                    &job,
+                                ))
+                            }
+                        }
+                    }
+                } else {
+                    progress.child_reaped = true;
                 }
             }
         }
 
-        // c) Wait flusher thread to finish naturally (max 2s). It observes the
-        //    reader's done_flag, which is set once the reader exits on EOF.
-        if let Some(flusher_handle) = instance.flusher_handle.blocking_lock().take() {
-            if wait_reader_thread {
-                Self::join_reader_with_timeout(flusher_handle, Duration::from_secs(2));
-            }
-        }
+        Self::join_thread_until(
+            &instance,
+            &instance.flusher_handle,
+            TerminalCleanupStage::FlusherJoin,
+            driver.as_ref(),
+            &job,
+        )?;
+        Self::join_thread_until(
+            &instance,
+            &instance.reader_handle,
+            TerminalCleanupStage::ReaderJoin,
+            driver.as_ref(),
+            &job,
+        )?;
 
-        // d) Wait reader thread to finish naturally (max 3s). With the child
-        //    already killed above, the reader should have hit EOF and exited;
-        //    this join is a safety net for slow/edge-case exits.
-        if let Some(reader_handle) = instance.reader_handle.blocking_lock().take() {
-            if wait_reader_thread {
-                Self::join_reader_with_timeout(reader_handle, Duration::from_secs(3));
-            }
-        }
-
-        // e) Drop ConPTY handles last
+        // All fallible stages passed. Drop platform/master handles before ownership is removed.
+        instance.master.blocking_lock().take();
         #[cfg(target_os = "windows")]
         if let Some(conpty_handles) = &instance.conpty_handles {
-            let mut guard = conpty_handles.lock();
-            let _ = guard.take();
+            conpty_handles.lock().take();
         }
+
+        Ok(TerminalCleanupReceipt {
+            terminal_id: instance.id.clone(),
+            job_id: job.job_id,
+            elapsed_ms: u64::try_from(job.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            attempt: job.attempt,
+            released_slot: false,
+            already_removed: false,
+        })
     }
 
     fn try_reserve_terminal_slot(&self) -> Option<TerminalSlotReservation> {
@@ -929,16 +1581,7 @@ impl PtyManager {
             return; // Already started
         }
 
-        let terminals = self.terminals.clone();
-        let _terminal_events = self.terminal_events.clone();
-        let cwd_tracker = self.cwd_tracker.clone();
-        let git_tracker = self.git_tracker.clone();
-        let exit_code_tracker = self.exit_code_tracker.clone();
-        let claims = self.claims.clone();
-        let active_slots = self.active_terminal_slots.clone();
-        let enabled = self.orphan_detection_enabled.clone();
-        let timeout_ms = self.orphan_timeout_ms.clone();
-        let is_hidden = self.is_hidden.clone();
+        let manager = self.clone();
 
         tokio::spawn(async move {
             let mut interval =
@@ -947,49 +1590,35 @@ impl PtyManager {
             loop {
                 interval.tick().await;
 
-                // Check if detection is enabled
-                if !enabled.load(Ordering::Relaxed) {
+                if !manager.orphan_detection_enabled.load(Ordering::Relaxed)
+                    || manager.is_hidden.load(Ordering::Relaxed)
+                {
                     continue;
                 }
 
-                // SKIP orphan cleanup when app is hidden to prevent
-                // ConPTY lifecycle issues on Windows
-                if is_hidden.load(Ordering::Relaxed) {
-                    continue;
-                }
-
-                let timeout = Duration::from_millis(timeout_ms.load(Ordering::Relaxed));
-
-                // Find orphaned terminals
-                let orphans: Vec<String> = terminals
+                let timeout =
+                    Duration::from_millis(manager.orphan_timeout_ms.load(Ordering::Relaxed));
+                let orphans: Vec<String> = manager
+                    .terminals
                     .read()
                     .iter()
-                    .filter(|(_, instance)| {
-                        // Never reap terminals that are still owned by an open
-                        // project/tab. A backgrounded project's terminals lose
-                        // their renderer refs (component unmount) but remain
-                        // live and may be running tasks — reaping them caused
-                        // the "Terminal not found"/hang bug.
-                        instance.is_orphan_reapable(timeout)
-                    })
+                    .filter(|(_, instance)| instance.is_orphan_reapable(timeout))
                     .map(|(id, _)| id.clone())
                     .collect();
 
-                // Clean up orphans
                 for id in orphans {
-                    log::info!("Cleaning up orphaned terminal: {}", id);
-
-                    if let Some(instance) = terminals.write().remove(&id) {
-                        active_slots.fetch_sub(1, Ordering::SeqCst);
-                        tokio::task::spawn_blocking(move || {
-                            Self::cleanup_terminal_resources_sync(instance, true);
-                        });
-
-                        // Stop tracking (sync operations)
-                        cwd_tracker.stop_tracking(&id);
-                        git_tracker.remove_terminal(&id);
-                        exit_code_tracker.remove_terminal(&id);
-                        claims.remove(&id);
+                    log::info!(
+                        "[pty-cleanup] terminal_id={} shutdown_phase=orphan_reap stable_result=START",
+                        id
+                    );
+                    if let Err(failure) = manager.terminate(&id).await {
+                        log::warn!(
+                            "[pty-cleanup] terminal_id={} cleanup_stage={} elapsed_ms={} state_transition=Terminating->Quarantined capacity_counter={} shutdown_phase=orphan_reap stable_result=TERMINATE_FAILED",
+                            failure.terminal_id,
+                            failure.stage,
+                            failure.elapsed_ms,
+                            manager.active_terminal_slot_count()
+                        );
                     }
                 }
             }
@@ -1014,11 +1643,18 @@ impl PtyManager {
     /// verification can never diverge). Any failure path rolls the issuance
     /// back via the RAII guard, so a credential never outlives its terminal.
     /// Returns the shared [`SpawnedTerminal`] shape feeding both transports.
+    /// This is initial issuance; authenticated resume may later rotate it.
     pub async fn spawn(
         &self,
         options: SpawnOptions,
         on_data: Option<Channel<Response>>,
     ) -> Result<SpawnedTerminal, String> {
+        if crate::host_admission::HostAdmission::global()
+            .check()
+            .is_err()
+        {
+            return Err(crate::host_admission::HOST_SHUTTING_DOWN.to_string());
+        }
         // Start orphan detection on first spawn (lazy initialization)
         self.start_orphan_detection();
 
@@ -1027,15 +1663,30 @@ impl PtyManager {
             .ok_or_else(|| "Global terminal limit reached".to_string())?;
 
         let id = self.generate_id();
+        // SessionWorkspace refs exist only when the caller supplied a real
+        // Conversation id. Scope-less project terminals and ephemeral SSH still
+        // get a process-local ConversationId so claims have one typed primary
+        // scope, but they must not take the workspace admission/remove path.
+        let tracks_workspace_ref = tracks_session_workspace_ref(&options);
+        let conversation_id = options
+            .conversation_id
+            .unwrap_or_else(ConversationId::new_v4);
 
-        let claim = self.claims.issue(&id, options.project_id.as_deref());
+        let claim = self
+            .claims
+            .issue(&id, conversation_id, options.project_id.as_deref());
         let mut claim_guard = ClaimRollbackGuard {
             claims: &self.claims,
             terminal_id: id.clone(),
             active: true,
         };
 
-        let info = match self.spawn_pty(id.clone(), options, on_data).await {
+        let mut scoped_options = options;
+        scoped_options.conversation_id = Some(conversation_id);
+        let info = match self
+            .spawn_pty(id.clone(), scoped_options, on_data, tracks_workspace_ref)
+            .await
+        {
             Ok(info) => info,
             Err(e) => {
                 // claim_guard drops here and removes the dangling record.
@@ -1048,6 +1699,20 @@ impl PtyManager {
         Ok(SpawnedTerminal { info, claim })
     }
 
+    /// Spawn an interactive terminal from the narrow remote intent. All
+    /// executable, shell, argv, environment, and cwd values are derived from
+    /// host-owned Conversation metadata before entering the ordinary trusted
+    /// spawn path.
+    pub async fn spawn_for_conversation(
+        &self,
+        intent: TerminalSpawnIntentV1,
+        conversation: &ConversationRecordV2,
+        on_data: Option<Channel<Response>>,
+    ) -> Result<SpawnedTerminal, String> {
+        let options = intent.into_trusted_options(conversation)?;
+        self.spawn(options, on_data).await
+    }
+
     /// Platform-specific PTY creation (the former `spawn` body). `id` and the
     /// claim lifecycle are owned by [`spawn`](Self::spawn); slot reservation
     /// commits there too, so a failure on any branch rolls everything back.
@@ -1056,6 +1721,7 @@ impl PtyManager {
         id: String,
         options: SpawnOptions,
         on_data: Option<Channel<Response>>,
+        workspace_ref_tracked: bool,
     ) -> Result<TerminalInfo, String> {
         // ADR-004.2: Resolve the program to run. When `program` is set we run
         // that executable directly (terminal-native agent launch); otherwise we
@@ -1075,11 +1741,8 @@ impl PtyManager {
         } else {
             Vec::new()
         };
-        let program_args: Vec<String> = resolved
-            .prepend_args
-            .into_iter()
-            .chain(user_args)
-            .collect();
+        let program_args: Vec<String> =
+            resolved.prepend_args.into_iter().chain(user_args).collect();
         let shell_path = resolved.program;
 
         // Resolve working directory
@@ -1097,12 +1760,27 @@ impl PtyManager {
         // mirroring the #347 fix for git worktree paths. See `strip_verbatim_prefix`.
         let cwd = std::fs::canonicalize(&cwd)
             .map_err(|e| format!("Invalid working directory '{}': {}", cwd, e))?;
-        let cwd = crate::path_validation::strip_verbatim_prefix(&cwd.to_string_lossy()).into_owned();
+        let cwd =
+            crate::path_validation::strip_verbatim_prefix(&cwd.to_string_lossy()).into_owned();
 
         // Get terminal size
         let cols = options.cols.unwrap_or(80);
         let rows = options.rows.unwrap_or(24);
-        let env = self.merge_environment(options.env.clone());
+        let mut env = self.merge_environment(options.env.clone());
+        if options.program.is_none() {
+            env.insert("SHELL".to_string(), shell_path.clone());
+        }
+        // Identify this PTY as Termul so ~/.zshrc can feature-gate (starship,
+        // shared history) the same way Ghostty/Orca do. Overwrite inherited
+        // Cursor/Ghostty TERM_PROGRAM — the child pane is Termul, not its parent.
+        env.insert("TERM".to_string(), "xterm-256color".to_string());
+        env.insert("COLORTERM".to_string(), "truecolor".to_string());
+        env.insert("TERM_PROGRAM".to_string(), "Termul".to_string());
+        env.insert(
+            "TERM_PROGRAM_VERSION".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        );
+        env.insert("FORCE_HYPERLINK".to_string(), "1".to_string());
 
         // On Windows, use our custom ConPTY implementation to avoid console window
         #[cfg(target_os = "windows")]
@@ -1120,13 +1798,13 @@ impl PtyManager {
                     if cfg!(windows)
                         && (shell_path.contains("powershell") || shell_path.contains("pwsh"))
                     {
-                        "-NoLogo"  // Skip PowerShell banner only (profile still loads)
+                        "-NoLogo" // Skip PowerShell banner only (profile still loads)
                     } else {
                         ""
                     }
                 )
             } else if shell_path.contains("powershell") || shell_path.contains("pwsh") {
-                format!("{} -NoLogo", shell_path)  // Skip PowerShell banner only (profile still loads)
+                format!("{} -NoLogo", shell_path) // Skip PowerShell banner only (profile still loads)
             } else {
                 shell_path.clone()
             };
@@ -1144,12 +1822,21 @@ impl PtyManager {
             // Create terminal instance
             let instance = Arc::new(TerminalInstance {
                 id: id.clone(),
+                conversation_id: options
+                    .conversation_id
+                    .expect("spawn assigned a ConversationId scope"),
+                workspace_ref_tracked,
                 project_id: options.project_id.clone(),
                 child: Arc::new(AsyncMutex::new(Some(Box::new(child)))),
                 master: Arc::new(AsyncMutex::new(None)), // No master for ConPTY
                 writer: Arc::new(AsyncMutex::new(Some(writer))),
                 reader_handle: Arc::new(AsyncMutex::new(None)),
                 flusher_handle: Arc::new(AsyncMutex::new(None)),
+                lifecycle_state: Arc::new(RwLock::new(TerminalLifecycleState::Active)),
+                cleanup_gate: Arc::new(AsyncMutex::new(())),
+                cleanup_job: Arc::new(Mutex::new(None)),
+                cleanup_progress: Arc::new(Mutex::new(TerminalCleanupProgress::default())),
+                cleanup_attempts: Arc::new(AtomicU64::new(0)),
                 shell: shell_path.clone(),
                 cwd: cwd.clone(),
                 pid,
@@ -1255,11 +1942,10 @@ impl PtyManager {
                 .map_err(|e| format!("Failed to open PTY: {}", e))?;
 
             let mut cmd = CommandBuilder::new(&shell_path);
-            // Interactive shells: login flag so profile-sourced PATH is applied (GH-275).
+            // Login + interactive so ~/.zprofile and ~/.zshrc load (GH-275).
             if options.program.is_none() {
-                if let Some(login_arg) = crate::pty::env_refresh::shell_wants_login_arg(&shell_path)
-                {
-                    cmd.arg(login_arg);
+                for arg in crate::pty::env_refresh::shell_startup_args(&shell_path) {
+                    cmd.arg(*arg);
                 }
             }
             // ADR-004.2: In agent mode, append the argv tail as discrete
@@ -1294,12 +1980,21 @@ impl PtyManager {
 
             let instance = Arc::new(TerminalInstance {
                 id: id.clone(),
+                conversation_id: options
+                    .conversation_id
+                    .expect("spawn assigned a ConversationId scope"),
+                workspace_ref_tracked,
                 project_id: options.project_id.clone(),
                 child: Arc::new(AsyncMutex::new(Some(child))),
                 master: Arc::new(AsyncMutex::new(Some(pty_pair.master))),
                 writer: Arc::new(AsyncMutex::new(Some(writer))),
                 reader_handle: Arc::new(AsyncMutex::new(None)),
                 flusher_handle: Arc::new(AsyncMutex::new(None)),
+                lifecycle_state: Arc::new(RwLock::new(TerminalLifecycleState::Active)),
+                cleanup_gate: Arc::new(AsyncMutex::new(())),
+                cleanup_job: Arc::new(Mutex::new(None)),
+                cleanup_progress: Arc::new(Mutex::new(TerminalCleanupProgress::default())),
+                cleanup_attempts: Arc::new(AtomicU64::new(0)),
                 shell: shell_path.clone(),
                 cwd: cwd.clone(),
                 pid,
@@ -1530,7 +2225,9 @@ impl PtyManager {
             let mut total = bytes.load(Ordering::Relaxed) + chunk.data.len();
             guard.push_back(chunk.clone());
             while total > SCROLLBACK_CAP {
-                let Some(evicted) = guard.pop_front() else { break };
+                let Some(evicted) = guard.pop_front() else {
+                    break;
+                };
                 total = total.saturating_sub(evicted.data.len());
             }
             bytes.store(total, Ordering::Relaxed);
@@ -1576,7 +2273,11 @@ impl PtyManager {
                         );
                         if let Some(ch) = channel_ref {
                             if let Err(e) = ch.send(Response::new(final_data)) {
-                                log::error!("[PTY {}] Failed to send final data via channel: {}", id, e);
+                                log::error!(
+                                    "[PTY {}] Failed to send final data via channel: {}",
+                                    id,
+                                    e
+                                );
                             }
                         }
                     }
@@ -1588,41 +2289,33 @@ impl PtyManager {
         log::info!("[PTY {}] Flusher thread ended", id);
     }
 
-    /// Write data to a terminal
+    /// Write data to an active terminal.
     pub async fn write(&self, id: &str, data: &str) -> Result<(), String> {
         let instance = self
-            .terminals
-            .read()
             .get(id)
-            .ok_or_else(|| format!("Terminal not found: {}", id))?
-            .clone();
-
+            .ok_or_else(|| format!("Terminal not found: {id}"))?;
+        instance.require_active()?;
         instance.update_activity();
 
         let mut writer_guard = instance.writer.lock().await;
-
         let writer = writer_guard
             .as_mut()
             .ok_or_else(|| "PTY writer unavailable".to_string())?;
-
         writer
             .write_all(data.as_bytes())
-            .map_err(|e| format!("Failed to write to PTY: {}", e))?;
+            .map_err(|error| format!("Failed to write to PTY: {error}"))?;
         writer
             .flush()
-            .map_err(|e| format!("Failed to flush PTY: {}", e))?;
-
+            .map_err(|error| format!("Failed to flush PTY: {error}"))?;
         Ok(())
     }
 
-    /// Resize a terminal
+    /// Resize an active terminal.
     pub async fn resize(&self, id: &str, cols: u16, rows: u16) -> Result<(), String> {
         let instance = self
-            .terminals
-            .read()
             .get(id)
-            .ok_or_else(|| format!("Terminal not found: {}", id))?
-            .clone();
+            .ok_or_else(|| format!("Terminal not found: {id}"))?;
+        instance.require_active()?;
 
         #[cfg(target_os = "windows")]
         {
@@ -1632,142 +2325,288 @@ impl PtyManager {
                     .as_ref()
                     .ok_or_else(|| "ConPTY handles unavailable".to_string())?;
                 resize_conpty(handles, cols, rows)
-                    .map_err(|e| format!("Failed to resize ConPTY: {}", e))?;
-
+                    .map_err(|error| format!("Failed to resize ConPTY: {error}"))?;
                 *instance.cols.write() = cols;
                 *instance.rows.write() = rows;
                 instance.update_activity();
-
                 return Ok(());
             }
         }
 
         let master_guard = instance.master.lock().await;
-
         let master = master_guard
             .as_ref()
             .ok_or_else(|| "PTY master already consumed".to_string())?;
-
-        let size = PtySize {
-            rows,
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        };
-
         master
-            .resize(size)
-            .map_err(|e| format!("Failed to resize terminal: {}", e))?;
-
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|error| format!("Failed to resize terminal: {error}"))?;
         *instance.cols.write() = cols;
         *instance.rows.write() = rows;
         instance.update_activity();
-
         Ok(())
     }
 
-    /// Kill a terminal
-    /// This is async because cleanup_terminal_resources_sync uses blocking_lock()
-    /// on AsyncMutex fields, which is forbidden inside tokio async runtime.
-    ///
-    /// When app window is hidden, kill is deferred to prevent ConPTY lifecycle
-    /// issues on Windows where minimize can cause terminal processes to die.
-    /// The terminal remains tracked and will be cleaned up on next visible cycle
-    /// or when explicitly killed from the visible state.
-    pub async fn kill(&self, id: &str) -> Result<(), String> {
-        // When app is hidden, defer the kill — the PTY process should survive hide.
-        // ConPTY on Windows can kill processes when the window is minimized.
-        if self.is_hidden.load(Ordering::Relaxed) {
-            log::info!(
-                "[PtyManager] Deferring kill of terminal {} (app window hidden)",
-                id
-            );
-            return Ok(());
+    /// Explicitly terminate a terminal resource under one absolute five-second deadline.
+    /// Failed cleanup remains tracked as `Quarantined` and continues occupying its slot.
+    pub async fn terminate(
+        &self,
+        id: &str,
+    ) -> Result<TerminalCleanupReceipt, TerminalCleanupFailure> {
+        self.terminate_until(id, tokio::time::Instant::now() + TERMINAL_CLEANUP_DEADLINE)
+            .await
+    }
+
+    /// Observe or start the single manager-owned cleanup job for `id`, returning by the earlier of
+    /// the caller deadline and the job's five-second cleanup deadline. A blocking OS kill/wait/join
+    /// may outlive this caller, but its job, identity, and slot remain retained and every retry
+    /// observes the same job until it proves completion.
+    pub async fn terminate_until(
+        &self,
+        id: &str,
+        caller_deadline: tokio::time::Instant,
+    ) -> Result<TerminalCleanupReceipt, TerminalCleanupFailure> {
+        let Some(instance) = self.get(id) else {
+            return Ok(TerminalCleanupReceipt {
+                terminal_id: id.to_string(),
+                job_id: 0,
+                elapsed_ms: 0,
+                attempt: 0,
+                released_slot: false,
+                already_removed: true,
+            });
+        };
+
+        let job = {
+            let _cleanup_guard = instance.cleanup_gate.lock().await;
+            if instance.lifecycle_state() == TerminalLifecycleState::Removed {
+                let current_job = instance
+                    .cleanup_job
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clone();
+                return Ok(TerminalCleanupReceipt {
+                    terminal_id: id.to_string(),
+                    job_id: current_job.as_ref().map_or(0, |job| job.job_id),
+                    elapsed_ms: 0,
+                    attempt: instance.cleanup_attempts.load(Ordering::Acquire),
+                    released_slot: false,
+                    already_removed: true,
+                });
+            }
+
+            let existing = instance
+                .cleanup_job
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if let Some(existing) = existing.filter(|job| !job.is_complete()) {
+                existing
+            } else {
+                let previous_state = instance.lifecycle_state();
+                *instance.lifecycle_state.write() = TerminalLifecycleState::Terminating;
+                let attempt = instance.cleanup_attempts.fetch_add(1, Ordering::AcqRel) + 1;
+                let job_id = self.cleanup_job_counter.fetch_add(1, Ordering::AcqRel) + 1;
+                let started = Instant::now();
+                let deadline = caller_deadline
+                    .into_std()
+                    .min(started + TERMINAL_CLEANUP_DEADLINE);
+                let job = Arc::new(TerminalCleanupJob::new(job_id, attempt, started, deadline));
+                *instance
+                    .cleanup_job
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::clone(&job));
+                log::info!(
+                    "[pty-cleanup] terminal_id={} cleanup_stage=kill elapsed_ms=0 state_transition={}->Terminating capacity_counter={} shutdown_phase=terminal_cleanup stable_result=START attempt={} job_id={}",
+                    id,
+                    previous_state.as_str(),
+                    self.active_terminal_slot_count(),
+                    attempt,
+                    job_id
+                );
+                self.launch_cleanup_job(Arc::clone(&instance), Arc::clone(&job));
+                job
+            }
+        };
+
+        self.observe_cleanup_job(&instance, &job, caller_deadline)
+            .await
+    }
+
+    fn launch_cleanup_job(&self, instance: Arc<TerminalInstance>, job: Arc<TerminalCleanupJob>) {
+        let driver = Arc::clone(&self.cleanup_driver.read());
+        let cleanup_instance = Arc::clone(&instance);
+        let cleanup_job = Arc::clone(&job);
+        let blocking = tokio::task::spawn_blocking(move || {
+            Self::cleanup_terminal_resources_sync(cleanup_instance, driver, cleanup_job)
+        });
+        let manager = self.clone();
+        tokio::spawn(async move {
+            let result = match blocking.await {
+                Ok(result) => result,
+                Err(_) => Err(Self::cleanup_failure(
+                    &instance,
+                    job.stage(),
+                    TerminalCleanupFailureReason::ThreadPanicked,
+                    &job,
+                )),
+            };
+            manager.complete_cleanup_job(instance, job, result);
+        });
+    }
+
+    fn complete_cleanup_job(
+        &self,
+        instance: Arc<TerminalInstance>,
+        job: Arc<TerminalCleanupJob>,
+        result: Result<TerminalCleanupReceipt, TerminalCleanupFailure>,
+    ) {
+        let is_current = instance
+            .cleanup_job
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &job));
+
+        match result {
+            Ok(mut receipt) if is_current => {
+                *instance.lifecycle_state.write() = TerminalLifecycleState::Removed;
+                let removed = {
+                    let mut terminals = self.terminals.write();
+                    let owns_entry = terminals
+                        .get(&instance.id)
+                        .is_some_and(|tracked| Arc::ptr_eq(tracked, &instance));
+                    if owns_entry {
+                        terminals.remove(&instance.id);
+                    }
+                    owns_entry
+                };
+                if removed {
+                    self.release_terminal_slot();
+                    self.cwd_tracker.stop_tracking(&instance.id);
+                    self.git_tracker.remove_terminal(&instance.id);
+                    self.exit_code_tracker.remove_terminal(&instance.id);
+                    self.terminal_events.remove(&instance.id);
+                    self.claims.remove(&instance.id);
+                }
+                receipt.released_slot = removed;
+                receipt.already_removed = !removed;
+                log::info!(
+                    "[pty-cleanup] terminal_id={} cleanup_stage=reader_join elapsed_ms={} state_transition=Terminating->Removed capacity_counter={} shutdown_phase=terminal_cleanup stable_result=OK attempt={} job_id={} released_slot={}",
+                    instance.id,
+                    receipt.elapsed_ms,
+                    self.active_terminal_slot_count(),
+                    receipt.attempt,
+                    receipt.job_id,
+                    receipt.released_slot
+                );
+                job.complete(Ok(receipt));
+            }
+            Ok(mut receipt) => {
+                receipt.released_slot = false;
+                receipt.already_removed = true;
+                job.complete(Ok(receipt));
+            }
+            Err(failure) => {
+                if is_current {
+                    *instance.lifecycle_state.write() = TerminalLifecycleState::Quarantined;
+                }
+                log::warn!(
+                    "[pty-cleanup] terminal_id={} cleanup_stage={} elapsed_ms={} state_transition=Terminating->Quarantined capacity_counter={} shutdown_phase=terminal_cleanup stable_result=TERMINATE_FAILED attempt={} job_id={}",
+                    failure.terminal_id,
+                    failure.stage,
+                    failure.elapsed_ms,
+                    self.active_terminal_slot_count(),
+                    failure.attempt,
+                    failure.job_id
+                );
+                job.complete(Err(failure));
+            }
         }
-
-        let instance = self
-            .terminals
-            .write()
-            .remove(id)
-            .ok_or_else(|| format!("Terminal not found: {}", id))?;
-
-        self.release_terminal_slot();
-
-        // Wrap blocking cleanup in spawn_blocking to avoid panic
-        let instance_clone = instance.clone();
-        tokio::task::spawn_blocking(move || {
-            Self::cleanup_terminal_resources_sync(instance_clone, true);
-        })
-        .await
-        .map_err(|e| format!("spawn_blocking failed for terminal {}: {}", id, e))?;
-
-        // Stop tracking (sync operations, safe to run after spawn_blocking)
-        self.cwd_tracker.stop_tracking(id);
-        self.git_tracker.remove_terminal(id);
-        self.exit_code_tracker.remove_terminal(id);
-        self.terminal_events.remove(id);
-        self.claims.remove(id);
-
-        Ok(())
     }
 
-    /// Force-kill bypassing the desktop `is_hidden` deferral. Used by the web
-    /// handler so that closing a terminal from a browser actually terminates
-    /// the process even when the desktop window is minimized. Desktop callers
-    /// continue to use [`kill`](Self::kill) which preserves the hide behavior.
-    pub async fn force_kill(&self, id: &str) -> Result<(), String> {
-        let instance = self
-            .terminals
-            .write()
-            .remove(id)
-            .ok_or_else(|| format!("Terminal not found: {}", id))?;
-
-        self.release_terminal_slot();
-
-        let instance_clone = instance.clone();
-        tokio::task::spawn_blocking(move || {
-            Self::cleanup_terminal_resources_sync(instance_clone, true);
-        })
-        .await
-        .map_err(|e| format!("spawn_blocking failed for terminal {}: {}", id, e))?;
-
-        self.cwd_tracker.stop_tracking(id);
-        self.git_tracker.remove_terminal(id);
-        self.exit_code_tracker.remove_terminal(id);
-        self.terminal_events.remove(id);
-        self.claims.remove(id);
-
-        Ok(())
+    async fn observe_cleanup_job(
+        &self,
+        instance: &TerminalInstance,
+        job: &Arc<TerminalCleanupJob>,
+        caller_deadline: tokio::time::Instant,
+    ) -> Result<TerminalCleanupReceipt, TerminalCleanupFailure> {
+        // A retry observes the retained job but never inherits a longer wait budget than its own
+        // caller. Shortening observation does not cancel, detach, or replace manager ownership.
+        let deadline = caller_deadline.min(tokio::time::Instant::from_std(job.deadline));
+        loop {
+            let notified = job.completed.notified();
+            if let Some(result) = job.result_for_observer() {
+                return result;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let failure = job.in_flight_deadline_failure(&instance.id);
+                log::warn!(
+                    "[pty-cleanup] terminal_id={} cleanup_stage={} elapsed_ms={} state_transition=Terminating->Terminating capacity_counter={} shutdown_phase=terminal_cleanup stable_result=IN_FLIGHT attempt={} job_id={}",
+                    failure.terminal_id,
+                    failure.stage,
+                    failure.elapsed_ms,
+                    self.active_terminal_slot_count(),
+                    failure.attempt,
+                    failure.job_id
+                );
+                return Err(failure);
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                let failure = job.in_flight_deadline_failure(&instance.id);
+                log::warn!(
+                    "[pty-cleanup] terminal_id={} cleanup_stage={} elapsed_ms={} state_transition=Terminating->Terminating capacity_counter={} shutdown_phase=terminal_cleanup stable_result=IN_FLIGHT attempt={} job_id={}",
+                    failure.terminal_id,
+                    failure.stage,
+                    failure.elapsed_ms,
+                    self.active_terminal_slot_count(),
+                    failure.attempt,
+                    failure.job_id
+                );
+                return Err(failure);
+            }
+        }
     }
 
-    /// Add a renderer reference to a terminal
+    /// Deprecated compatibility alias for [`terminate`](Self::terminate).
+    pub async fn kill(&self, id: &str) -> Result<TerminalCleanupReceipt, TerminalCleanupFailure> {
+        self.terminate(id).await
+    }
+
+    /// Deprecated compatibility alias retained for older web handlers.
+    pub async fn force_kill(
+        &self,
+        id: &str,
+    ) -> Result<TerminalCleanupReceipt, TerminalCleanupFailure> {
+        self.terminate(id).await
+    }
+
+    /// Add a renderer reference to an active terminal.
     pub fn add_renderer_ref(&self, id: &str, renderer_id: &str) -> Result<(), String> {
-        self.terminals
-            .read()
+        let instance = self
             .get(id)
-            .ok_or_else(|| format!("Terminal not found: {}", id))
-            .map(|instance| instance.add_renderer_ref(renderer_id.to_string()))
+            .ok_or_else(|| format!("Terminal not found: {id}"))?;
+        instance.require_active()?;
+        instance.add_renderer_ref(renderer_id.to_string());
+        Ok(())
     }
 
-    /// Remove a renderer reference from a terminal
+    /// Remove a renderer reference from an active terminal.
     pub fn remove_renderer_ref(&self, id: &str, renderer_id: &str) -> Result<(), String> {
-        self.terminals
-            .read()
+        let instance = self
             .get(id)
-            .ok_or_else(|| format!("Terminal not found: {}", id))
-            .map(|instance| instance.remove_renderer_ref(renderer_id))
+            .ok_or_else(|| format!("Terminal not found: {id}"))?;
+        instance.require_active()?;
+        instance.remove_renderer_ref(renderer_id);
+        Ok(())
     }
 
-    /// Update a terminal's orphan-reaping protection.
-    ///
-    /// Protection is enabled at spawn and should be disabled only when the
-    /// terminal is genuinely released by the renderer (its project is closed or
-    /// the terminal tab is closed). Once unprotected AND lacking renderer refs,
-    /// the terminal becomes eligible for orphan reaping again. This is a no-op
-    /// (rather than an error) when the terminal is already gone, so callers can
-    /// release idempotently.
     pub fn set_protected(&self, id: &str, protected: bool) {
-        if let Some(instance) = self.terminals.read().get(id) {
+        if let Some(instance) = self.get(id).filter(|instance| instance.is_active()) {
             instance.set_protected(protected);
         }
     }
@@ -1788,53 +2627,84 @@ impl PtyManager {
         Arc::clone(&self.exit_code_tracker)
     }
 
-    /// Verify a claim credential for a terminal.
-    ///
-    /// The project binding checked is the terminal's OWN write-once
-    /// `project_id` (co-derived with the issuance binding at spawn), so
-    /// issuance and verification can never diverge. Every failure mode —
-    /// unknown terminal, oversized probe, wrong/revoked credential, binding
-    /// mismatch — collapses to the same [`crate::pty::claims::ClaimError`].
     pub fn verify_claim(&self, terminal_id: &str, claim: &str) -> Result<(), ClaimError> {
-        let binding = self
+        let instance = self
             .get(terminal_id)
-            .and_then(|instance| instance.project_id.clone());
-        self.claims
-            .verify(terminal_id, claim, binding.as_deref())
+            .filter(|instance| instance.is_active())
+            .ok_or(ClaimError)?;
+        self.claims.verify(
+            terminal_id,
+            claim,
+            instance.conversation_id,
+            instance.project_id.as_deref(),
+        )
     }
 
-    /// Rotate a claim: possession of the current credential yields a fresh
-    /// credential and atomically invalidates the old one. The generation bump
-    /// is the signal for credential-derived access (desktop attach forwarders)
-    /// to terminate.
     pub fn rotate_claim(&self, terminal_id: &str, claim: &str) -> Result<String, ClaimError> {
-        let binding = self
+        let instance = self
             .get(terminal_id)
-            .and_then(|instance| instance.project_id.clone());
-        self.claims
-            .rotate(terminal_id, claim, binding.as_deref())
+            .filter(|instance| instance.is_active())
+            .ok_or(ClaimError)?;
+        self.claims.rotate(
+            terminal_id,
+            claim,
+            instance.conversation_id,
+            instance.project_id.as_deref(),
+        )
     }
 
-    /// Revoke a claim credential. The PTY itself is untouched — revocation
-    /// only severs credential-derived access (never-clause).
     pub fn revoke_claim(&self, terminal_id: &str, claim: &str) -> Result<(), ClaimError> {
-        let binding = self
+        let instance = self
             .get(terminal_id)
-            .and_then(|instance| instance.project_id.clone());
-        self.claims
-            .revoke(terminal_id, claim, binding.as_deref())
+            .filter(|instance| instance.is_active())
+            .ok_or(ClaimError)?;
+        self.claims.revoke(
+            terminal_id,
+            claim,
+            instance.conversation_id,
+            instance.project_id.as_deref(),
+        )
     }
 
-    /// Current claim generation for a terminal, if a claim record exists.
-    /// Desktop attach forwarders capture this at attach time and terminate
-    /// when it changes (rotate/revoke) or disappears (kill/reap).
+    /// A non-active resource reports no generation, immediately severing every derived stream.
     pub fn claim_generation(&self, terminal_id: &str) -> Option<u64> {
-        self.claims.generation(terminal_id)
+        self.get(terminal_id)
+            .filter(|instance| instance.is_active())
+            .and_then(|_| self.claims.generation(terminal_id))
     }
 
-    /// Build the shared attach result (byte-identical camelCase shape on both
-    /// transports). Resolves the terminal's LIVE cwd from the `CwdTracker`,
-    /// falling back to the spawn-time cwd when no tracked value exists.
+    pub fn resume_for_conversation(
+        &self,
+        conversation_id: ConversationId,
+        terminal_id: &str,
+        last_seq: u64,
+    ) -> Result<(TerminalResumeGrant, TerminalReplay), ClaimError> {
+        let instance = self
+            .get(terminal_id)
+            .filter(|instance| {
+                instance.is_active()
+                    && instance.workspace_ref_tracked
+                    && instance.conversation_matches(conversation_id)
+            })
+            .ok_or(ClaimError)?;
+        let mut replay = instance.subscribe_from(last_seq);
+        let (claim, generation) = self.claims.rotate_for_resume(
+            terminal_id,
+            conversation_id,
+            instance.project_id.as_deref(),
+        )?;
+        replay.claim_generation = Some(generation);
+        let terminal = self.build_attach_result(&instance, &replay);
+        log::info!(
+            "[terminal-resume] granted terminal_id={} conversation_id={} latest_seq={} gap={}",
+            terminal_id,
+            conversation_id,
+            terminal.latest_seq,
+            terminal.gap
+        );
+        Ok((TerminalResumeGrant { terminal, claim }, replay))
+    }
+
     pub fn build_attach_result(
         &self,
         instance: &TerminalInstance,
@@ -1856,62 +2726,101 @@ impl PtyManager {
         }
     }
 
-    /// Get terminal by ID
+    /// Retains `Quarantined` resources so callers can recover their stable identity and retry.
     pub fn get(&self, id: &str) -> Option<Arc<TerminalInstance>> {
         self.terminals.read().get(id).cloned()
     }
 
-    /// Get all terminals
+    pub fn terminal_lifecycle_state(&self, id: &str) -> Option<TerminalLifecycleState> {
+        self.get(id).map(|instance| instance.lifecycle_state())
+    }
+
+    /// Snapshot the retained manager-owned cleanup job for observability and retry coordination.
+    #[must_use]
+    pub fn terminal_cleanup_job(&self, id: &str) -> Option<Arc<TerminalCleanupJob>> {
+        self.get(id).and_then(|instance| {
+            instance
+                .cleanup_job
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        })
+    }
+
+    pub fn get_by_conversation(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Vec<Arc<TerminalInstance>> {
+        self.terminals
+            .read()
+            .values()
+            .filter(|instance| instance.conversation_matches(conversation_id))
+            .cloned()
+            .collect()
+    }
+
     pub fn get_all(&self) -> Vec<Arc<TerminalInstance>> {
         self.terminals.read().values().cloned().collect()
     }
 
-    /// Get terminal count
     pub fn get_count(&self) -> usize {
         self.terminals.read().len()
     }
 
-    /// Check if terminal limit is reached
-    pub fn is_limit_reached(&self) -> bool {
-        self.active_terminal_slots.load(Ordering::SeqCst) >= GLOBAL_TERMINAL_LIMIT
+    #[must_use]
+    pub(crate) fn active_terminal_slot_count(&self) -> usize {
+        self.active_terminal_slots.load(Ordering::SeqCst)
     }
 
-    /// Kill all terminals (best-effort), used as app-exit safety net.
-    /// This is async because cleanup_terminal_resources_sync uses blocking_lock()
-    /// on AsyncMutex fields, which is forbidden inside tokio async runtime.
-    pub async fn kill_all(&self) {
-        let ids: Vec<String> = self.terminals.read().keys().cloned().collect();
+    pub fn is_limit_reached(&self) -> bool {
+        self.active_terminal_slot_count() >= GLOBAL_TERMINAL_LIMIT
+    }
 
-        let cwd_tracker = self.cwd_tracker.clone();
-        let git_tracker = self.git_tracker.clone();
-        let exit_code_tracker = self.exit_code_tracker.clone();
+    #[cfg(test)]
+    pub(crate) fn install_cleanup_driver(&self, driver: Arc<dyn CleanupDriver>) {
+        *self.cleanup_driver.write() = driver;
+    }
 
-        for id in ids {
-            let instance = match self.terminals.write().remove(&id) {
-                Some(i) => i,
-                None => continue,
-            };
-
-            self.release_terminal_slot();
-
-            // Wrap blocking cleanup in spawn_blocking to avoid panic
-            let instance_clone = instance.clone();
-            let id_clone = id.clone();
-            if let Err(e) = tokio::task::spawn_blocking(move || {
-                Self::cleanup_terminal_resources_sync(instance_clone, true);
-            })
-            .await
-            {
-                log::warn!("spawn_blocking failed for terminal {}: {}", id_clone, e);
+    /// Attempt every tracked terminal concurrently under one host deadline. The global terminal
+    /// limit (30) is also the hard concurrency bound, so shutdown never multiplies five seconds by
+    /// terminal count. Failed and still-running jobs remain conservatively retained.
+    pub async fn kill_all_until(&self, deadline: tokio::time::Instant) -> PtyShutdownReceipt {
+        let started = Instant::now();
+        let mut ids: Vec<String> = self.terminals.read().keys().cloned().collect();
+        ids.sort();
+        let attempted = ids.len();
+        let results =
+            futures::future::join_all(ids.iter().map(|id| self.terminate_until(id, deadline)))
+                .await;
+        let mut receipt = PtyShutdownReceipt {
+            attempted,
+            elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            ..PtyShutdownReceipt::default()
+        };
+        for result in results {
+            match result {
+                Ok(_) => receipt.succeeded += 1,
+                Err(failure) if failure.in_flight => receipt.in_flight += 1,
+                Err(_) => receipt.failed += 1,
             }
-
-            // Stop tracking (sync operations)
-            cwd_tracker.stop_tracking(&id);
-            git_tracker.remove_terminal(&id);
-            exit_code_tracker.remove_terminal(&id);
-            self.terminal_events.remove(&id);
-            self.claims.remove(&id);
         }
+        log::info!(
+            "[pty-cleanup] shutdown_phase=kill_all attempted={} succeeded={} failed={} in_flight={} elapsed_ms={} stable_result={}",
+            receipt.attempted,
+            receipt.succeeded,
+            receipt.failed,
+            receipt.in_flight,
+            receipt.elapsed_ms,
+            if receipt.clean_success() { "OK" } else { "PTY_CLEANUP_FAILED" }
+        );
+        receipt
+    }
+
+    /// Compatibility process-exit safety net using one shared five-second deadline.
+    pub async fn kill_all(&self) {
+        let _ = self
+            .kill_all_until(tokio::time::Instant::now() + TERMINAL_CLEANUP_DEADLINE)
+            .await;
     }
 
     /// Update orphan detection settings (timeout in milliseconds)
@@ -1997,7 +2906,8 @@ impl PtyManager {
                             .extension()
                             .and_then(|e| e.to_str())
                             .map(|e| e.to_ascii_lowercase());
-                        if shim_ext.as_deref() == Some("cmd") || shim_ext.as_deref() == Some("bat") {
+                        if shim_ext.as_deref() == Some("cmd") || shim_ext.as_deref() == Some("bat")
+                        {
                             return Err(format!(
                                 "Agent program '{}' is a batch shim that could not be parsed (ADR-004.2)",
                                 trimmed
@@ -2172,16 +3082,8 @@ impl PtyManager {
 
         #[cfg(not(target_os = "windows"))]
         {
-            let candidates = vec![
-                format!("/bin/{}", shell),
-                format!("/usr/bin/{}", shell),
-                format!("/usr/local/bin/{}", shell),
-            ];
-
-            for candidate in candidates {
-                if Path::new(&candidate).exists() {
-                    return Ok(candidate);
-                }
+            if let Some(resolved) = crate::shell_paths::unix_shell_paths::resolve_name(shell) {
+                return Ok(resolved);
             }
         }
 
@@ -2294,11 +3196,9 @@ impl PtyManager {
         &self,
         custom_env: Option<HashMap<String, String>>,
     ) -> HashMap<String, String> {
-        let custom_sets_path = custom_env.as_ref().is_some_and(|custom| {
-            custom
-                .keys()
-                .any(|key| key.eq_ignore_ascii_case("path"))
-        });
+        let custom_sets_path = custom_env
+            .as_ref()
+            .is_some_and(|custom| custom.keys().any(|key| key.eq_ignore_ascii_case("path")));
 
         #[cfg(target_os = "windows")]
         {
@@ -2312,11 +3212,7 @@ impl PtyManager {
                 }
             }
             if !has_windows_env_var(&env_map, "Path") {
-                upsert_windows_env_var(
-                    &mut env_map,
-                    "Path",
-                    env::var("PATH").unwrap_or_default(),
-                );
+                upsert_windows_env_var(&mut env_map, "Path", env::var("PATH").unwrap_or_default());
             }
             if !has_windows_env_var(&env_map, "PATHEXT") {
                 upsert_windows_env_var(
@@ -2610,6 +3506,518 @@ impl portable_pty::Child for WindowsConPtyChild {
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct FakeCleanupChild {
+        exited: bool,
+    }
+
+    #[derive(Debug)]
+    struct FakeCleanupKiller;
+
+    impl portable_pty::ChildKiller for FakeCleanupKiller {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(Self)
+        }
+    }
+
+    impl portable_pty::ChildKiller for FakeCleanupChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.exited = true;
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(FakeCleanupKiller)
+        }
+    }
+
+    impl portable_pty::Child for FakeCleanupChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(self
+                .exited
+                .then(|| portable_pty::ExitStatus::with_exit_code(0)))
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            self.exited = true;
+            Ok(portable_pty::ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            Some(42)
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    fn install_cleanup_fixture(manager: &PtyManager, terminal_id: &str) -> Arc<TerminalInstance> {
+        let conversation_id =
+            ConversationId::parse("018f7a1c-1b4d-7c8a-9f01-0123456789ab").unwrap();
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(8);
+        let instance = Arc::new(TerminalInstance {
+            id: terminal_id.to_string(),
+            conversation_id,
+            workspace_ref_tracked: true,
+            project_id: None,
+            child: Arc::new(AsyncMutex::new(Some(Box::new(FakeCleanupChild {
+                exited: false,
+            })))),
+            master: Arc::new(AsyncMutex::new(None)),
+            writer: Arc::new(AsyncMutex::new(None)),
+            reader_handle: Arc::new(AsyncMutex::new(Some(std::thread::spawn(|| {})))),
+            flusher_handle: Arc::new(AsyncMutex::new(Some(std::thread::spawn(|| {})))),
+            lifecycle_state: Arc::new(RwLock::new(TerminalLifecycleState::Active)),
+            cleanup_gate: Arc::new(AsyncMutex::new(())),
+            cleanup_job: Arc::new(Mutex::new(None)),
+            cleanup_progress: Arc::new(Mutex::new(TerminalCleanupProgress::default())),
+            cleanup_attempts: Arc::new(AtomicU64::new(0)),
+            shell: "test-shell".to_string(),
+            cwd: "/redacted-test-cwd".to_string(),
+            pid: 42,
+            last_activity: Arc::new(RwLock::new(Instant::now())),
+            orphan_since: Arc::new(RwLock::new(None)),
+            renderer_refs: Arc::new(RwLock::new(HashSet::new())),
+            protected: Arc::new(AtomicBool::new(true)),
+            cols: Arc::new(RwLock::new(80)),
+            rows: Arc::new(RwLock::new(24)),
+            broadcast_tx: Arc::new(broadcast_tx),
+            output_log: Arc::new(RwLock::new(std::collections::VecDeque::new())),
+            output_log_bytes: Arc::new(AtomicUsize::new(0)),
+            next_output_seq: Arc::new(AtomicU64::new(0)),
+            #[cfg(target_os = "windows")]
+            conpty_handles: None,
+        });
+        manager
+            .terminals
+            .write()
+            .insert(terminal_id.to_string(), Arc::clone(&instance));
+        manager.active_terminal_slots.fetch_add(1, Ordering::SeqCst);
+        manager.claims.issue(terminal_id, conversation_id, None);
+        instance
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cleanup_driver_failures_quarantine_preserve_capacity_and_retry_exactly_once() {
+        for stage in [
+            TerminalCleanupStage::Kill,
+            TerminalCleanupStage::Wait,
+            TerminalCleanupStage::FlusherJoin,
+            TerminalCleanupStage::ReaderJoin,
+        ] {
+            let manager = crate::web::test_pty_manager();
+            let driver = Arc::new(ScriptedCleanupDriver::default());
+            driver.fail_once(stage);
+            manager.install_cleanup_driver(driver.clone());
+            let terminal_id = format!("cleanup-{stage}");
+            let instance = install_cleanup_fixture(&manager, &terminal_id);
+
+            let started = Instant::now();
+            let failure = manager
+                .terminate(&terminal_id)
+                .await
+                .expect_err("the scripted cleanup stage must fail");
+            assert_eq!(failure.stage, stage);
+            assert!(started.elapsed() <= TERMINAL_CLEANUP_DEADLINE);
+            assert_eq!(
+                instance.lifecycle_state(),
+                TerminalLifecycleState::Quarantined
+            );
+            assert!(manager.get(&terminal_id).is_some());
+            assert_eq!(manager.active_terminal_slot_count(), 1);
+            assert!(manager.claim_generation(&terminal_id).is_none());
+
+            let observations = driver.observed_deadlines();
+            let expected_stages = match stage {
+                TerminalCleanupStage::Kill => vec![TerminalCleanupStage::Kill],
+                TerminalCleanupStage::Wait => {
+                    vec![TerminalCleanupStage::Kill, TerminalCleanupStage::Wait]
+                }
+                TerminalCleanupStage::FlusherJoin => vec![
+                    TerminalCleanupStage::Kill,
+                    TerminalCleanupStage::Wait,
+                    TerminalCleanupStage::FlusherJoin,
+                ],
+                TerminalCleanupStage::ReaderJoin => vec![
+                    TerminalCleanupStage::Kill,
+                    TerminalCleanupStage::Wait,
+                    TerminalCleanupStage::FlusherJoin,
+                    TerminalCleanupStage::ReaderJoin,
+                ],
+            };
+            assert_eq!(
+                observations
+                    .iter()
+                    .map(|(observed_stage, _)| *observed_stage)
+                    .collect::<Vec<_>>(),
+                expected_stages
+            );
+            let shared_deadline = observations[0].1;
+            assert!(observations
+                .iter()
+                .all(|(_, observed_deadline)| *observed_deadline == shared_deadline));
+
+            let debug = format!("{failure:?}");
+            for forbidden in ["redacted-test-cwd", "claim", "environment", "output"] {
+                assert!(!debug.contains(forbidden));
+            }
+
+            let receipt = manager
+                .terminate(&terminal_id)
+                .await
+                .expect("a later retry completes cleanup");
+            assert!(receipt.released_slot);
+            assert!(!receipt.already_removed);
+            assert!(manager.get(&terminal_id).is_none());
+            assert_eq!(manager.active_terminal_slot_count(), 0);
+
+            let duplicate = manager
+                .terminate(&terminal_id)
+                .await
+                .expect("completed removal is idempotent");
+            assert!(!duplicate.released_slot);
+            assert!(duplicate.already_removed);
+            assert_eq!(manager.active_terminal_slot_count(), 0);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_duplicate_terminate_releases_one_quarantined_slot_only() {
+        let manager = Arc::new(crate::web::test_pty_manager());
+        install_cleanup_fixture(&manager, "cleanup-concurrent");
+        let driver = Arc::new(ScriptedCleanupDriver::default());
+        driver.fail_once(TerminalCleanupStage::Kill);
+        manager.install_cleanup_driver(driver);
+        manager
+            .terminate("cleanup-concurrent")
+            .await
+            .expect_err("first attempt quarantines the terminal");
+        assert_eq!(
+            manager.terminal_lifecycle_state("cleanup-concurrent"),
+            Some(TerminalLifecycleState::Quarantined)
+        );
+        assert_eq!(manager.active_terminal_slot_count(), 1);
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let manager = Arc::clone(&manager);
+            let barrier = Arc::clone(&barrier);
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                manager.terminate("cleanup-concurrent").await
+            }));
+        }
+        barrier.wait().await;
+        let results = futures::future::join_all(tasks).await;
+        let receipts = results
+            .into_iter()
+            .map(|result| result.unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            receipts
+                .iter()
+                .filter(|receipt| receipt.released_slot)
+                .count(),
+            1
+        );
+        assert_eq!(manager.active_terminal_slot_count(), 0);
+        assert!(manager.get("cleanup-concurrent").is_none());
+    }
+
+    #[derive(Debug, Default)]
+    struct BlockingCleanupState {
+        entered: usize,
+        released: bool,
+    }
+
+    #[derive(Debug, Default)]
+    struct BlockingCleanupDriver {
+        state: Mutex<BlockingCleanupState>,
+        changed: std::sync::Condvar,
+    }
+
+    impl BlockingCleanupDriver {
+        fn entered(&self) -> usize {
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entered
+        }
+
+        fn release(&self) {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.released = true;
+            self.changed.notify_all();
+        }
+    }
+
+    impl CleanupDriver for BlockingCleanupDriver {
+        fn kill(
+            &self,
+            child: &mut dyn Child,
+            deadline: Instant,
+        ) -> Result<(), TerminalCleanupFailureReason> {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.entered += 1;
+            self.changed.notify_all();
+            while !state.released {
+                state = self
+                    .changed
+                    .wait(state)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            drop(state);
+            SystemCleanupDriver.kill(child, deadline)
+        }
+
+        fn try_wait(
+            &self,
+            child: &mut dyn Child,
+            deadline: Instant,
+        ) -> Result<Option<portable_pty::ExitStatus>, TerminalCleanupFailureReason> {
+            SystemCleanupDriver.try_wait(child, deadline)
+        }
+
+        fn join_thread(
+            &self,
+            stage: TerminalCleanupStage,
+            handle: &mut Option<std::thread::JoinHandle<()>>,
+            deadline: Instant,
+        ) -> Result<(), TerminalCleanupFailureReason> {
+            SystemCleanupDriver.join_thread(stage, handle, deadline)
+        }
+    }
+
+    async fn wait_for_cleanup_state(
+        manager: &PtyManager,
+        terminal_id: &str,
+        expected: TerminalLifecycleState,
+    ) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if manager.terminal_lifecycle_state(terminal_id) == Some(expected) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("cleanup state transition completed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn blocking_cleanup_returns_by_caller_deadline_and_retry_observes_one_retained_job() {
+        let manager = crate::web::test_pty_manager();
+        install_cleanup_fixture(&manager, "cleanup-blocking");
+        let driver = Arc::new(BlockingCleanupDriver::default());
+        manager.install_cleanup_driver(driver.clone());
+
+        let started = Instant::now();
+        let failure = manager
+            .terminate_until(
+                "cleanup-blocking",
+                tokio::time::Instant::now() + Duration::from_millis(150),
+            )
+            .await
+            .expect_err("blocking kill must return an in-flight deadline receipt");
+        assert!(failure.in_flight);
+        assert_eq!(failure.stage, TerminalCleanupStage::Kill);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(manager.active_terminal_slot_count(), 1);
+        assert_eq!(
+            manager.terminal_lifecycle_state("cleanup-blocking"),
+            Some(TerminalLifecycleState::Terminating)
+        );
+        let retained = manager
+            .terminal_cleanup_job("cleanup-blocking")
+            .expect("manager retains the cleanup job");
+        assert_eq!(retained.job_id(), failure.job_id);
+        assert_eq!(retained.attempt(), failure.attempt);
+        assert_eq!(driver.entered(), 1);
+
+        let retry = manager
+            .terminate_until(
+                "cleanup-blocking",
+                tokio::time::Instant::now() + Duration::from_millis(150),
+            )
+            .await
+            .expect_err("retry observes the still-running job");
+        assert!(retry.in_flight);
+        assert_eq!(retry.job_id, failure.job_id);
+        assert_eq!(retry.attempt, failure.attempt);
+        assert_eq!(driver.entered(), 1, "retry must not duplicate child.kill");
+
+        driver.release();
+        wait_for_cleanup_state(
+            &manager,
+            "cleanup-blocking",
+            TerminalLifecycleState::Quarantined,
+        )
+        .await;
+        let completed = manager
+            .terminate_until(
+                "cleanup-blocking",
+                tokio::time::Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .expect("a later attempt completes the retained cleanup");
+        assert!(completed.released_slot);
+        assert_ne!(completed.job_id, failure.job_id);
+        assert_eq!(manager.active_terminal_slot_count(), 0);
+        assert!(manager.get("cleanup-blocking").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn thirty_stalled_terminals_share_one_deadline_without_serial_multiplication() {
+        let manager = crate::web::test_pty_manager();
+        for ordinal in 0..GLOBAL_TERMINAL_LIMIT {
+            install_cleanup_fixture(&manager, &format!("cleanup-batch-{ordinal:02}"));
+        }
+        assert_eq!(manager.active_terminal_slot_count(), GLOBAL_TERMINAL_LIMIT);
+        let driver = Arc::new(BlockingCleanupDriver::default());
+        manager.install_cleanup_driver(driver.clone());
+
+        let started = Instant::now();
+        let receipt = manager
+            .kill_all_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await;
+        assert_eq!(receipt.attempted, GLOBAL_TERMINAL_LIMIT);
+        assert_eq!(receipt.succeeded, 0);
+        assert_eq!(receipt.failed, 0);
+        assert_eq!(receipt.in_flight, GLOBAL_TERMINAL_LIMIT);
+        assert_eq!(
+            receipt.succeeded + receipt.failed + receipt.in_flight,
+            GLOBAL_TERMINAL_LIMIT
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(driver.entered(), GLOBAL_TERMINAL_LIMIT);
+        assert_eq!(manager.active_terminal_slot_count(), GLOBAL_TERMINAL_LIMIT);
+
+        driver.release();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let completed = manager
+                    .get_all()
+                    .iter()
+                    .filter(|instance| {
+                        instance.lifecycle_state() == TerminalLifecycleState::Quarantined
+                    })
+                    .count();
+                if completed == GLOBAL_TERMINAL_LIMIT {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("all retained jobs complete into quarantine");
+
+        let retry = manager
+            .kill_all_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await;
+        assert_eq!(retry.attempted, GLOBAL_TERMINAL_LIMIT);
+        assert_eq!(retry.succeeded, GLOBAL_TERMINAL_LIMIT);
+        assert_eq!(retry.failed + retry.in_flight, 0);
+        assert_eq!(manager.active_terminal_slot_count(), 0);
+    }
+
+    #[derive(Debug, Default)]
+    struct MixedCleanupDriver {
+        kill_calls: AtomicUsize,
+        blocker: BlockingCleanupDriver,
+    }
+
+    impl CleanupDriver for MixedCleanupDriver {
+        fn kill(
+            &self,
+            child: &mut dyn Child,
+            deadline: Instant,
+        ) -> Result<(), TerminalCleanupFailureReason> {
+            match self.kill_calls.fetch_add(1, Ordering::AcqRel) {
+                0 => SystemCleanupDriver.kill(child, deadline),
+                1 => Err(TerminalCleanupFailureReason::Error),
+                _ => self.blocker.kill(child, deadline),
+            }
+        }
+
+        fn try_wait(
+            &self,
+            child: &mut dyn Child,
+            deadline: Instant,
+        ) -> Result<Option<portable_pty::ExitStatus>, TerminalCleanupFailureReason> {
+            SystemCleanupDriver.try_wait(child, deadline)
+        }
+
+        fn join_thread(
+            &self,
+            stage: TerminalCleanupStage,
+            handle: &mut Option<std::thread::JoinHandle<()>>,
+            deadline: Instant,
+        ) -> Result<(), TerminalCleanupFailureReason> {
+            SystemCleanupDriver.join_thread(stage, handle, deadline)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mixed_shutdown_receipt_counts_success_failure_and_in_flight_under_one_deadline() {
+        let manager = crate::web::test_pty_manager();
+        for terminal_id in ["cleanup-mixed-a", "cleanup-mixed-b", "cleanup-mixed-c"] {
+            install_cleanup_fixture(&manager, terminal_id);
+        }
+        let driver = Arc::new(MixedCleanupDriver::default());
+        manager.install_cleanup_driver(driver.clone());
+
+        let receipt = manager
+            .kill_all_until(tokio::time::Instant::now() + Duration::from_millis(200))
+            .await;
+        assert_eq!(receipt.attempted, 3);
+        assert_eq!(receipt.succeeded, 1);
+        assert_eq!(receipt.failed, 1);
+        assert_eq!(receipt.in_flight, 1);
+        assert_eq!(
+            receipt.succeeded + receipt.failed + receipt.in_flight,
+            receipt.attempted
+        );
+        assert!(!receipt.clean_success());
+        assert_eq!(manager.active_terminal_slot_count(), 2);
+
+        driver.blocker.release();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if manager.get_all().iter().all(|instance| {
+                    instance.lifecycle_state() == TerminalLifecycleState::Quarantined
+                }) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("failed and in-flight jobs settle into retryable quarantine");
+
+        manager.install_cleanup_driver(Arc::new(SystemCleanupDriver));
+        let retry = manager
+            .kill_all_until(tokio::time::Instant::now() + Duration::from_secs(2))
+            .await;
+        assert_eq!(retry.attempted, 2);
+        assert_eq!(retry.succeeded, 2);
+        assert!(retry.clean_success());
+        assert_eq!(manager.active_terminal_slot_count(), 0);
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn directly_executable_windows_accepts_only_image_formats() {
@@ -2669,10 +4077,8 @@ mod tests {
         // + extension via is_directly_executable_windows).
         std::fs::write(dir.join("node.exe"), b"MZ").unwrap();
         // Create the target script file.
-        std::fs::create_dir_all(dir.join("node_modules\\opencode-ai\\bin"))
-            .unwrap();
-        std::fs::write(dir.join("node_modules\\opencode-ai\\bin\\opencode"), b"")
-            .unwrap();
+        std::fs::create_dir_all(dir.join("node_modules\\opencode-ai\\bin")).unwrap();
+        std::fs::write(dir.join("node_modules\\opencode-ai\\bin\\opencode"), b"").unwrap();
 
         let shim_path = dir.join("opencode.cmd");
         let shim_content = "@ECHO off\r\n".to_owned()
@@ -2786,7 +4192,10 @@ mod tests {
             resolved.program
         );
         assert!(
-            resolved.prepend_args.iter().any(|a| a.ends_with("cursor-agent.ps1")),
+            resolved
+                .prepend_args
+                .iter()
+                .any(|a| a.ends_with("cursor-agent.ps1")),
             "expected -File script in prepend_args: {:?}",
             resolved.prepend_args
         );
@@ -2927,7 +4336,10 @@ mod tests {
             resolved.program
         );
         assert!(
-            resolved.prepend_args.iter().any(|a| a.ends_with("cursor-agent.ps1")),
+            resolved
+                .prepend_args
+                .iter()
+                .any(|a| a.ends_with("cursor-agent.ps1")),
             "expected -File script prepended, got: {:?}",
             resolved.prepend_args
         );
@@ -2944,8 +4356,8 @@ mod tests {
         let exe_path = dir.join("agent.exe");
         std::fs::write(&exe_path, b"MZ").unwrap();
 
-        let resolved = resolve_spawn_program(exe_path.to_str().unwrap())
-            .expect("native .exe should resolve");
+        let resolved =
+            resolve_spawn_program(exe_path.to_str().unwrap()).expect("native .exe should resolve");
         assert!(resolved.program.ends_with("agent.exe"));
         assert!(
             resolved.prepend_args.is_empty(),
@@ -3037,12 +4449,207 @@ mod tests {
         ));
     }
 
+    fn conversation_record(
+        conversation_id: ConversationId,
+        workspace_cwd: &str,
+        execution_target: ExecutionTarget,
+    ) -> ConversationRecordV2 {
+        let created_at =
+            crate::conversation::parse_created_at_utc("2026-08-15T09:45:15.123Z").unwrap();
+        ConversationRecordV2 {
+            schema_version: crate::conversation::CONVERSATION_SCHEMA_VERSION,
+            conversation_id,
+            created_at_utc: created_at,
+            creation_partition: crate::conversation::CreationPartition::from_created_at(created_at),
+            workspace_cwd: workspace_cwd.to_string(),
+            execution_target,
+            project_attachment: None,
+            lifecycle_state: crate::conversation::ConversationLifecycleState::Ready,
+            last_seq: 0,
+            created_by: crate::conversation::ConversationCreator::Termul,
+            title: None,
+            title_source: None,
+        }
+    }
+
+    #[test]
+    fn trusted_spawn_intent_derives_host_options() {
+        let conversation_id =
+            ConversationId::parse("018f7a1c-1b4d-7c8a-9f01-0123456789ab").unwrap();
+        let record = conversation_record(
+            conversation_id,
+            "/host/workspace",
+            ExecutionTarget::Worktree {
+                project_id: "project-1".to_string(),
+                worktree_path: "/host/worktree".to_string(),
+                worktree_branch: "chat/test".to_string(),
+            },
+        );
+        let intent = TerminalSpawnIntentV1 {
+            conversation_id,
+            project_id: Some("project-1".to_string()),
+            cwd_source: TerminalCwdSource::ExecutionTarget,
+            cols: 120,
+            rows: 40,
+        };
+
+        let options = intent.into_trusted_options(&record).unwrap();
+        assert_eq!(options.conversation_id, Some(conversation_id));
+        assert_eq!(options.project_id.as_deref(), Some("project-1"));
+        assert_eq!(options.cwd.as_deref(), Some("/host/worktree"));
+        assert_eq!(options.cols, Some(120));
+        assert_eq!(options.rows, Some(40));
+        assert!(options.shell.is_none());
+        assert!(options.program.is_none());
+        assert!(options.args.is_none());
+        assert!(options.env.is_none());
+        assert!(options.kind.is_none());
+        assert!(tracks_session_workspace_ref(&options));
+
+        let wrong_project = TerminalSpawnIntentV1 {
+            conversation_id,
+            project_id: Some("project-other".to_string()),
+            cwd_source: TerminalCwdSource::Workspace,
+            cols: 80,
+            rows: 24,
+        };
+        assert!(wrong_project.into_trusted_options(&record).is_err());
+    }
+
+    #[test]
+    fn workspace_ref_tracking_requires_real_conversation_scope() {
+        let conversation_id =
+            ConversationId::parse("018f7a1c-1b4d-7c8a-9f01-0123456789ab").unwrap();
+        assert!(!tracks_session_workspace_ref(&SpawnOptions::default()));
+        assert!(tracks_session_workspace_ref(&SpawnOptions {
+            conversation_id: Some(conversation_id),
+            ..Default::default()
+        }));
+        assert!(!tracks_session_workspace_ref(&SpawnOptions {
+            conversation_id: Some(conversation_id),
+            kind: Some("ssh".to_string()),
+            ..Default::default()
+        }));
+        assert!(!tracks_session_workspace_ref(&SpawnOptions {
+            kind: Some("ssh".to_string()),
+            ..Default::default()
+        }));
+    }
+
+    #[tokio::test]
+    async fn resume_preserves_pty_and_replays_cursor() {
+        let manager = crate::web::test_pty_manager();
+        let conversation_id =
+            ConversationId::parse("018f7a1c-1b4d-7c8a-9f01-0123456789ab").unwrap();
+        let other_conversation_id =
+            ConversationId::parse("5f7a1c01-4d1b-4c8a-af01-0123456789ab").unwrap();
+        let terminal_id = "terminal-resume-test".to_string();
+        let (broadcast_tx, _) = tokio::sync::broadcast::channel(8);
+        let chunks = std::collections::VecDeque::from([
+            TerminalOutputChunk {
+                seq: 1,
+                data: b"one".to_vec(),
+            },
+            TerminalOutputChunk {
+                seq: 2,
+                data: b"two".to_vec(),
+            },
+        ]);
+        let instance = Arc::new(TerminalInstance {
+            id: terminal_id.clone(),
+            conversation_id,
+            workspace_ref_tracked: true,
+            project_id: Some("project-1".to_string()),
+            child: Arc::new(AsyncMutex::new(None)),
+            master: Arc::new(AsyncMutex::new(None)),
+            writer: Arc::new(AsyncMutex::new(None)),
+            reader_handle: Arc::new(AsyncMutex::new(None)),
+            flusher_handle: Arc::new(AsyncMutex::new(None)),
+            lifecycle_state: Arc::new(RwLock::new(TerminalLifecycleState::Active)),
+            cleanup_gate: Arc::new(AsyncMutex::new(())),
+            cleanup_job: Arc::new(Mutex::new(None)),
+            cleanup_progress: Arc::new(Mutex::new(TerminalCleanupProgress::default())),
+            cleanup_attempts: Arc::new(AtomicU64::new(0)),
+            shell: "host-shell".to_string(),
+            cwd: "/host/workspace".to_string(),
+            pid: 42,
+            last_activity: Arc::new(RwLock::new(Instant::now())),
+            orphan_since: Arc::new(RwLock::new(None)),
+            renderer_refs: Arc::new(RwLock::new(HashSet::new())),
+            protected: Arc::new(AtomicBool::new(true)),
+            cols: Arc::new(RwLock::new(80)),
+            rows: Arc::new(RwLock::new(24)),
+            broadcast_tx: Arc::new(broadcast_tx),
+            output_log: Arc::new(RwLock::new(chunks)),
+            output_log_bytes: Arc::new(AtomicUsize::new(6)),
+            next_output_seq: Arc::new(AtomicU64::new(3)),
+            #[cfg(target_os = "windows")]
+            conpty_handles: None,
+        });
+        manager
+            .terminals
+            .write()
+            .insert(terminal_id.clone(), instance);
+        manager.active_terminal_slots.store(1, Ordering::SeqCst);
+        let old_claim = manager
+            .claims
+            .issue(&terminal_id, conversation_id, Some("project-1"));
+        let generation_before = manager.claim_generation(&terminal_id).unwrap();
+
+        assert!(manager
+            .resume_for_conversation(other_conversation_id, &terminal_id, 1)
+            .is_err());
+        assert!(manager
+            .resume_for_conversation(conversation_id, "terminal-unknown", 1)
+            .is_err());
+        assert_eq!(
+            manager.claim_generation(&terminal_id),
+            Some(generation_before)
+        );
+
+        let (grant, replay) = manager
+            .resume_for_conversation(conversation_id, &terminal_id, 1)
+            .unwrap();
+        assert_eq!(grant.terminal.id, terminal_id);
+        assert_eq!(grant.terminal.latest_seq, 2);
+        assert!(!grant.terminal.gap);
+        assert_eq!(replay.chunks.len(), 1);
+        assert_eq!(replay.chunks[0].seq, 2);
+        assert_eq!(replay.chunks[0].data, b"two");
+        assert!(replay.claim_generation.unwrap() > generation_before);
+        assert!(manager.get(&terminal_id).is_some(), "resume preserves PTY");
+        assert_eq!(
+            manager.verify_claim(&terminal_id, &old_claim),
+            Err(ClaimError)
+        );
+        assert!(manager.verify_claim(&terminal_id, &grant.claim).is_ok());
+
+        let first_handoff = grant.claim;
+        let (successor, _) = manager
+            .resume_for_conversation(conversation_id, &terminal_id, 2)
+            .unwrap();
+        assert_eq!(
+            manager.verify_claim(&terminal_id, &first_handoff),
+            Err(ClaimError)
+        );
+        assert!(manager.verify_claim(&terminal_id, &successor.claim).is_ok());
+        assert!(
+            manager.get(&terminal_id).is_some(),
+            "rotation preserves PTY"
+        );
+
+        manager.terminals.write().remove(&terminal_id);
+        manager.claims.remove(&terminal_id);
+        manager.active_terminal_slots.store(0, Ordering::SeqCst);
+    }
+
     #[test]
     fn test_spawn_options_default() {
         let options = SpawnOptions::default();
         assert!(options.shell.is_none());
         assert!(options.cwd.is_none());
         assert!(options.env.is_none());
+        assert!(options.conversation_id.is_none());
         assert_eq!(options.cols, Some(80));
         assert_eq!(options.rows, Some(24));
     }
@@ -3069,8 +4676,13 @@ mod tests {
 
     #[test]
     fn test_spawn_options_deserialization() {
-        let json = r#"{"shell":"cmd.exe","cwd":"C:\\","cols":120,"rows":40}"#;
+        let json = r#"{"conversationId":"018f7a1c-1b4d-7c8a-9f01-0123456789ab","projectId":"project-attribution","shell":"cmd.exe","cwd":"C:\\","cols":120,"rows":40}"#;
         let options: SpawnOptions = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            options.conversation_id,
+            Some(ConversationId::parse("018f7a1c-1b4d-7c8a-9f01-0123456789ab").unwrap())
+        );
+        assert_eq!(options.project_id.as_deref(), Some("project-attribution"));
         assert_eq!(options.shell, Some("cmd.exe".to_string()));
         assert_eq!(options.cwd, Some("C:\\".to_string()));
         assert_eq!(options.cols, Some(120));
@@ -3096,6 +4708,10 @@ mod tests {
             claim: "f3a9".to_string(),
         };
 
+        let debug = format!("{spawned:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains(&spawned.claim));
+
         let value: serde_json::Value = serde_json::to_value(&spawned).unwrap();
         let obj = value.as_object().expect("spawn reply is an object");
 
@@ -3104,7 +4720,10 @@ mod tests {
             !obj.contains_key("info"),
             "SpawnedTerminal must flatten info, not nest it"
         );
-        assert_eq!(obj.get("id").and_then(|v| v.as_str()), Some("terminal-123-0"));
+        assert_eq!(
+            obj.get("id").and_then(|v| v.as_str()),
+            Some("terminal-123-0")
+        );
         assert_eq!(obj.get("shell").and_then(|v| v.as_str()), Some("pwsh"));
         assert_eq!(obj.get("cwd").and_then(|v| v.as_str()), Some("C:\\work"));
         assert_eq!(obj.get("pid").and_then(|v| v.as_u64()), Some(42));
@@ -3153,10 +4772,58 @@ mod tests {
         let keys: std::collections::BTreeSet<&str> = obj.keys().map(String::as_str).collect();
         assert_eq!(
             keys,
-            ["id", "shell", "cwd", "pid", "cols", "rows", "latestSeq", "gap"]
-                .into_iter()
-                .collect::<std::collections::BTreeSet<&str>>()
+            [
+                "id",
+                "shell",
+                "cwd",
+                "pid",
+                "cols",
+                "rows",
+                "latestSeq",
+                "gap"
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<&str>>()
         );
+    }
+
+    #[test]
+    fn terminal_resume_grant_serializes_exact_camelcase_shape() {
+        let grant = TerminalResumeGrant {
+            terminal: TerminalAttachResult {
+                id: "terminal-123-0".to_string(),
+                shell: "pwsh".to_string(),
+                cwd: "C:\\work".to_string(),
+                pid: 42,
+                cols: 120,
+                rows: 32,
+                latest_seq: 87,
+                gap: false,
+            },
+            claim: "one-time-claim".to_string(),
+        };
+
+        let value = serde_json::to_value(grant).unwrap();
+        let object = value.as_object().expect("resume grant is an object");
+        let keys = object
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            ["claim", "terminal"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        let terminal = object["terminal"]
+            .as_object()
+            .expect("terminal metadata is nested");
+        assert_eq!(
+            terminal.get("latestSeq").and_then(|value| value.as_u64()),
+            Some(87)
+        );
+        assert!(!terminal.contains_key("claim"));
+        assert_eq!(object["claim"], "one-time-claim");
     }
 
     // ========== Git Bash resolution tests ==========
@@ -3299,4 +4966,20 @@ mod tests {
     // 1. Compile-time check: kill() is now async and returns impl Future
     // 2. Existing orphan cleanup code at line 403-406 demonstrates the pattern
     // 3. Manual testing during development
+
+    #[test]
+    fn system_cleanup_driver_cannot_block_runtime_after_deadline() {
+        let driver = SystemCleanupDriver;
+        let started = Instant::now();
+        let mut handle = Some(std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }));
+        let result = driver.join_thread(
+            TerminalCleanupStage::ReaderJoin,
+            &mut handle,
+            Instant::now() - std::time::Duration::from_secs(1),
+        );
+        assert_eq!(result, Err(TerminalCleanupFailureReason::DeadlineExceeded));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
 }

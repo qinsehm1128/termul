@@ -1,16 +1,13 @@
 import { useCallback, useEffect, useRef } from 'react'
 import { getAcpTransport } from '@/lib/acp-transport'
-import { persistenceApi, secureStorageApi, syncProjects, terminalApi, worktreeApi } from '@/lib/api'
+import { persistenceApi, secureStorageApi, syncProjects, worktreeApi } from '@/lib/api'
 import { isTauriContext } from '@/lib/tauri-runtime'
-import { setTerminalProtected } from '@/lib/terminal-api'
 import { randomUUID } from '@/lib/uuid'
 import { webServerProjects } from '@/lib/web-server-api'
-import { workspaceManifestApi } from '@/lib/workspace-manifest-api'
 import { useAcpStore } from '@/stores/acp-store'
 import { useProjectStore } from '@/stores/project-store'
 import { useRemoteStatusStore } from '@/stores/remote-status-store'
 import { useTerminalStore } from '@/stores/terminal-store'
-import { useWorkspaceManifestSyncStore } from '@/stores/workspace-manifest-sync-store'
 import type { EnvVariable, Project, ProjectColor, ProjectGroup, Worktree } from '@/types/project'
 import type {
   PersistedProject,
@@ -19,7 +16,7 @@ import type {
   PersistedWorktree
 } from '../../shared/types/persistence.types'
 import { PersistenceKeys } from '../../shared/types/persistence.types'
-import type { ProjectSummary } from '../../shared/types/web-projects.types'
+import type { ProjectGroupSummary, ProjectSummary } from '../../shared/types/web-projects.types'
 
 const REDACTED_VALUE = '[REDACTED]'
 type EnvVariableSnapshot = Pick<EnvVariable, 'key' | 'value' | 'isSecret'>
@@ -253,7 +250,8 @@ async function persistProjectsSnapshot(
   activeProjectId: string,
   writeProjects: (key: string, data: PersistedProjectData) => Promise<unknown>,
   previousProjects?: ProjectSnapshot[],
-  groups?: ProjectGroup[]
+  groups?: ProjectGroup[],
+  activeGroupId?: string | null
 ): Promise<void> {
   const previousProjectsSnapshot = previousProjects ?? (await getPersistedProjectsSnapshot())
   await cleanupRemovedProjects(previousProjectsSnapshot, projects)
@@ -270,6 +268,7 @@ async function persistProjectsSnapshot(
     projects: persistedProjects,
     groups: groups as PersistedProjectGroup[],
     activeProjectId,
+    activeGroupId: activeGroupId ?? null,
     updatedAt: new Date().toISOString()
   }
 
@@ -447,6 +446,30 @@ function summaryToProject(summary: ProjectSummary): Project {
   }
 }
 
+function summaryToProjectGroup(
+  summary: ProjectGroupSummary,
+  previousGroup?: ProjectGroup
+): ProjectGroup {
+  return {
+    id: summary.id,
+    name: summary.name,
+    projectIds: summary.projectIds,
+    preferredProjectId: summary.preferredProjectId ?? undefined,
+    color: summary.color ? (summary.color as ProjectColor) : undefined,
+    isCollapsed: previousGroup?.isCollapsed ?? false
+  }
+}
+
+export function toProjectGroupSummaries(groups: ProjectGroup[]): ProjectGroupSummary[] {
+  return groups.map((group) => ({
+    id: group.id,
+    name: group.name,
+    projectIds: group.projectIds,
+    color: group.color ?? null,
+    preferredProjectId: group.preferredProjectId ?? null
+  }))
+}
+
 export function useProjectsLoader(): void {
   const setProjects = useProjectStore((state) => state.setProjects)
 
@@ -472,6 +495,11 @@ export function useProjectsLoader(): void {
         const result = await webServerProjects.list()
         if (cancelled || !result.success || !result.data) return
         const projects = result.data.projects.map(summaryToProject)
+        const currentState = useProjectStore.getState()
+        const previousGroupsById = new Map(currentState.groups.map((group) => [group.id, group]))
+        const groups = (result.data.groups ?? []).map((group) =>
+          summaryToProjectGroup(group, previousGroupsById.get(group.id))
+        )
         const defaultId = result.data.defaultProjectId
         // P2: validate the host default references a project still in the
         // list (the host may have deleted the default project). Fall back to
@@ -480,16 +508,21 @@ export function useProjectsLoader(): void {
           defaultId && projects.some((p) => p.id === defaultId)
             ? defaultId
             : (projects[0]?.id ?? '')
-        if (!useProjectStore.getState().isLoaded) {
+        if (!currentState.isLoaded) {
           // Initial load: seed activeProjectId from the host default.
-          setProjects(projects, validDefault)
+          setProjects(projects, validDefault, groups, null)
         } else {
           // Subsequent refetch: preserve the client's own activeProjectId.
           // If it's no longer in the list (host deleted it), fall back to the
           // default (or the first project if the default is also gone).
-          const currentActive = useProjectStore.getState().activeProjectId
+          const currentActive = currentState.activeProjectId
           const stillExists = !!currentActive && projects.some((p) => p.id === currentActive)
-          setProjects(projects, stillExists ? currentActive : validDefault)
+          setProjects(
+            projects,
+            stillExists ? currentActive : validDefault,
+            groups,
+            currentState.activeGroupId
+          )
         }
       }
       void fetchMirror()
@@ -517,7 +550,12 @@ export function useProjectsLoader(): void {
           : projects.length > 0
             ? projects[0].id
             : ''
-        setProjects(projects, validActiveId, result.data.groups as ProjectGroup[])
+        setProjects(
+          projects,
+          validActiveId,
+          result.data.groups as ProjectGroup[],
+          result.data.activeGroupId ?? null
+        )
 
         // Reconcile all projects against git in parallel after loading
         for (const project of projects) {
@@ -568,11 +606,12 @@ export function useProjectsAutoSave(): void {
         return
       }
 
-      // Only save if projects, groups or activeProjectId changed
+      // Only save if projects, groups, activeProjectId or activeGroupId changed
       if (
         state.projects === prevState.projects &&
         state.groups === prevState.groups &&
-        state.activeProjectId === prevState.activeProjectId
+        state.activeProjectId === prevState.activeProjectId &&
+        state.activeGroupId === prevState.activeGroupId
       ) {
         return
       }
@@ -583,7 +622,8 @@ export function useProjectsAutoSave(): void {
         state.activeProjectId,
         persistenceApi.writeDebounced,
         prevState.projects,
-        state.groups
+        state.groups,
+        state.activeGroupId
       ).catch((err: unknown) => {
         console.error('Failed to auto-save projects:', err)
       })
@@ -599,7 +639,8 @@ export function useProjectsAutoSave(): void {
             prevState.projects.find((p) => p.isDefault === true)?.id
         syncProjects(
           toProjectSummaries(state.projects, state.activeProjectId),
-          state.activeProjectId || null
+          state.activeProjectId || null,
+          toProjectGroupSummaries(state.groups)
         )
           .then((result) => {
             if (!result.success) {
@@ -632,26 +673,28 @@ export function useProjectsAutoSave(): void {
 
 export function usePersistProjects(): () => Promise<void> {
   return useCallback(async () => {
-    const { projects, activeProjectId, groups } = useProjectStore.getState()
+    const { projects, activeProjectId, activeGroupId, groups } = useProjectStore.getState()
     await persistProjectsSnapshot(
       projects,
       activeProjectId,
       persistenceApi.writeDebounced,
       undefined,
-      groups
+      groups,
+      activeGroupId
     )
   }, [])
 }
 
 export function usePersistProjectsImmediate(): () => Promise<void> {
   return useCallback(async () => {
-    const { projects, activeProjectId, groups } = useProjectStore.getState()
+    const { projects, activeProjectId, activeGroupId, groups } = useProjectStore.getState()
     await persistProjectsSnapshot(
       projects,
       activeProjectId,
       persistenceApi.write,
       undefined,
-      groups
+      groups,
+      activeGroupId
     )
   }, [])
 }
@@ -666,70 +709,23 @@ export function useDeleteProjectWithCascade(): (id: string) => Promise<void> {
       await deleteSecrets(project.id, project.envVars)
     }
 
-    // Kill the project's live PTYs so the backend reclaims them. The terminals
-    // are genuinely released here (the project is being deleted), so they must
-    // not stay alive/protected and leak. kill() removes them from the backend
-    // terminal map; we also drop them from the renderer store.
-    const projectTerminals = useTerminalStore.getState().terminals.filter((t) => t.projectId === id)
-    for (const terminal of projectTerminals) {
-      if (terminal.ptyId) {
-        try {
-          // kill() returns an IpcResult; a soft failure does not throw. The
-          // project is being deleted regardless, so we always proceed to drop
-          // the renderer record below — we just surface a failed kill in logs
-          // (e.g. the backend deferring a kill while the window is hidden still
-          // reports success, so this only logs genuine failures).
-          const result = await terminalApi.kill(terminal.ptyId)
-          if (!result.success) {
-            console.warn('Failed to kill PTY during project delete:', result.error)
-            // Best-effort fallback: allow orphan cleanup if PTY still exists
-            await setTerminalProtected(terminal.ptyId, false).catch((error) => {
-              console.warn('Failed to clear PTY protection during project delete:', error)
-            })
-          }
-        } catch (error) {
-          console.warn('Failed to kill PTY during project delete:', error)
-        }
-      }
-      useTerminalStore.getState().closeTerminal(terminal.id, id)
-    }
+    // Project attribution is secondary to Conversation ownership. Deleting a
+    // project therefore hides its terminal views but never terminates or drops
+    // Conversation-scoped PTYs, claims, or passive workspace refs.
+    useTerminalStore.getState().cleanupProjectTerminals(id)
 
     // Delete the project from the store
     useProjectStore.getState().deleteProject(id)
 
-    // Patch 15: evict the deleted project's entries from the manifest sync
-    // store (basedRevision + restore-in-progress flags) so they don't leak.
-    const syncStore = useWorkspaceManifestSyncStore.getState()
-    syncStore.setBasedRevision(id, null)
-    syncStore.setManifestRestoreInProgress(id, false)
-    // Clear a pending conflict that belonged to the deleted project.
-    if (syncStore.pendingConflict?.projectId === id) {
-      syncStore.setPendingConflict(null)
-    }
-
-    // Cascade delete: remove terminal layout and snapshots for this project.
-    // Story 6: also delete the host-owned workspace manifest (best-effort —
-    // a failure is logged but never blocks the project delete; the host's
-    // delete is idempotent whether or not the manifest file existed).
+    // Cascade delete renderer-local project state only. The preserved legacy workspace manifest
+    // is immutable migration evidence and is never deleted by a normal project operation.
     await Promise.all([
       persistenceApi.delete(PersistenceKeys.terminals(id)),
-      persistenceApi.delete(PersistenceKeys.snapshots(id)),
-      workspaceManifestApi
-        .deleteManifest(id)
-        .then((result) => {
-          if (!result.success) {
-            console.warn(
-              `[projects] manifest delete unsuccessful for ${id}: ${result.error} (${result.code})`
-            )
-          }
-        })
-        .catch((error) => {
-          console.warn(`[projects] manifest delete threw for ${id}:`, error)
-        })
+      persistenceApi.delete(PersistenceKeys.snapshots(id))
     ])
 
     // Persist the updated projects list
-    const { projects, activeProjectId, groups } = useProjectStore.getState()
+    const { projects, activeProjectId, activeGroupId, groups } = useProjectStore.getState()
     const persistedProjects = await Promise.all(
       projects.map((project) => toPersistedProject(project))
     )
@@ -737,6 +733,7 @@ export function useDeleteProjectWithCascade(): (id: string) => Promise<void> {
       projects: persistedProjects,
       groups: groups as PersistedProjectGroup[],
       activeProjectId,
+      activeGroupId,
       updatedAt: new Date().toISOString()
     }
     await persistenceApi.write(PersistenceKeys.projects, data)

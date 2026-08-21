@@ -35,6 +35,8 @@ export const useAppSettings = () => useAppSettingsStore((state) => state.setting
 export const useAppSettingsLoaded = () => useAppSettingsStore((state) => state.isLoaded)
 export const useTerminalFontFamily = () =>
   useAppSettingsStore((state) => state.settings.terminalFontFamily)
+export const useTerminalSymbolFontFamily = () =>
+  useAppSettingsStore((state) => state.settings.terminalSymbolFontFamily)
 export const useTerminalFontSize = () =>
   useAppSettingsStore((state) => state.settings.terminalFontSize)
 export const useDefaultShell = () => useAppSettingsStore((state) => state.settings.defaultShell)
@@ -44,6 +46,8 @@ export const useTerminalBufferSize = () =>
   useAppSettingsStore((state) => state.settings.terminalBufferSize)
 export const useTerminalRenderer = () =>
   useAppSettingsStore((state) => state.settings.terminalRenderer)
+export const useTerminalScreenReaderMode = () =>
+  useAppSettingsStore((state) => state.settings.terminalScreenReaderMode)
 export const useMaxTerminalsPerProject = () =>
   useAppSettingsStore((state) => state.settings.maxTerminalsPerProject)
 export const useOrphanDetectionEnabled = () =>
@@ -75,3 +79,5 @@ export const useAcpSessionReopenTimeout = () =>
   useAppSettingsStore((state) => state.settings.acpSessionReopenTimeoutSecs)
 export const useAcpFirstPromptWarmup = () =>
   useAppSettingsStore((state) => state.settings.acpFirstPromptWarmupSecs)
+export const useAcpPreferLocalNpmInstall = () =>
+  useAppSettingsStore((state) => state.settings.acpPreferLocalNpmInstall)

@@ -97,5 +97,84 @@
     "greeting": "你好，{{name}}",
     "itemCount_one": "{{formattedCount}} 项",
     "itemCount_other": "{{formattedCount}} 项"
+  },
+  "conversationHost": {
+    "ariaLabel": "会话主机状态",
+    "recoveryCount_one": "{{count}} 个恢复项",
+    "recoveryCount_other": "{{count}} 个恢复项",
+    "states": {
+      "ready": "会话服务已就绪",
+      "migrating": "会话服务正在启动",
+      "hybrid": "会话兼容模式",
+      "recovery": "需要恢复会话",
+      "error": "会话服务不可用"
+    }
+  },
+  "conversationNavigation": {
+    "title": "会话",
+    "newChat": "新建聊天",
+    "search": "搜索会话",
+    "clearSearch": "清除会话搜索",
+    "filter": "按项目筛选会话",
+    "allProjects": "全部项目",
+    "projectless": "无项目",
+    "projectView": "项目会话",
+    "empty": "此视图中没有匹配的会话。",
+    "untitled": "未命名对话",
+    "loadMore": "再加载 {{count}} 个",
+    "recoveryBadge_one": "{{count}} 个恢复项",
+    "recoveryBadge_other": "{{count}} 个恢复项"
+  },
+  "conversationRoute": {
+    "opening": "正在打开会话…",
+    "resolvingLegacy": "正在解析旧版会话…",
+    "legacyError": "无法解析此旧版会话链接。",
+    "errors": {
+      "title": "会话不可用",
+      "CONVERSATION_INVALID_ID": "该地址不是规范的 ConversationId。",
+      "CONVERSATION_NOT_FOUND": "未找到该会话。",
+      "LEGACY_ID_AMBIGUOUS": "此旧版标识符匹配多个会话。",
+      "CONVERSATION_RECOVERY_REQUIRED": "打开此会话前需要先完成恢复。",
+      "CONVERSATION_BINDING_OPEN_FAILED": "会话已打开，但无法恢复其代理绑定。",
+      "CONVERSATION_LEGACY_RESOLVE_FAILED": "旧版标识符解析器不可用。",
+      "CONVERSATION_OPEN_FAILED": "无法打开该会话。"
+    }
+  },
+  "scheduledTasks": {
+    "title": "定时任务",
+    "refresh": "刷新定时任务",
+    "empty": "还没有定时任务。可以在任意会话中让 AI 创建草稿。",
+    "selectTask": "请选择一个定时任务查看详情。",
+    "activate": "审核并启用",
+    "pause": "暂停",
+    "resume": "恢复",
+    "runNow": "立即运行",
+    "everySeconds": "每 {{count}} 秒",
+    "prompt": "任务提示词",
+    "agent": "代理：{{agent}}",
+    "project": "关联项目：{{project}}",
+    "noProject": "未关联项目",
+    "workspace": "工作区：{{workspace}}",
+    "revision": "修订：{{revision}}",
+    "hash": "草稿哈希：{{hash}}",
+    "history": "执行历史",
+    "noRuns": "该任务尚未执行。",
+    "audit": "任务审计",
+    "confirmTitle": "要启用这个定时任务吗？",
+    "confirmDescription": "{{name}} 将按 {{schedule}} 执行。你正在确认第 {{revision}} 版及其精确草稿哈希。",
+    "status": {
+      "draft": "草稿",
+      "active": "已启用",
+      "paused": "已暂停"
+    },
+    "runStatus": {
+      "queued": "等待中",
+      "running": "执行中",
+      "succeeded": "成功",
+      "failed": "失败",
+      "cancelled": "已取消",
+      "skipped": "已跳过",
+      "interrupted": "已中断"
+    }
   }
 }

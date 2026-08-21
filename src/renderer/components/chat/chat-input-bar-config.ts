@@ -5,7 +5,12 @@
  * to dedicated chips rendered ahead of generic options
  * (issue #286).
  */
-import type { SessionConfigOption, SessionModelState, SessionModeState } from '@/lib/acp-api'
+import type {
+  SessionConfigOption,
+  SessionConfigOptionValue,
+  SessionModelState,
+  SessionModeState
+} from '@/lib/acp-api'
 
 /** ACP semantic category for reasoning/thinking-depth config options. */
 export const THOUGHT_LEVEL_CATEGORY = 'thought_level'
@@ -28,6 +33,109 @@ export interface ResolvedModelOption {
   source: 'config' | 'models' | null
 }
 
+type WireSelectGroup = {
+  group?: string
+  name?: string
+  options: unknown[]
+}
+
+function isSelectValue(entry: unknown): entry is SessionConfigOptionValue {
+  if (typeof entry !== 'object' || entry === null) return false
+  const rec = entry as SessionConfigOptionValue
+  return typeof rec.value === 'string' && typeof rec.name === 'string'
+}
+
+function isSelectGroup(entry: unknown): entry is WireSelectGroup {
+  if (typeof entry !== 'object' || entry === null) return false
+  const rec = entry as { options?: unknown }
+  return Array.isArray(rec.options) && rec.options.length > 0
+}
+
+/**
+ * Claude ACP groups families (`claude-sonnet`) above versioned leaves
+ * (`claude-sonnet-5[1m]`). A family-only id is not a valid session value.
+ */
+export function canonicalizeClaudeModelId(value: string): string {
+  const match = /^(claude-(?:sonnet|opus|haiku))(\[[^\]]+])?$/.exec(value)
+  if (!match) return value
+  return `${match[1]}-5${match[2] ?? ''}`
+}
+
+function joinSuffixValue(ancestor: string | undefined, value: string): string {
+  if (ancestor && /^\[[^\]]+]$/.test(value)) return `${ancestor}${value}`
+  return value
+}
+
+/**
+ * ACP select options may be a flat `{value,name}[]` or grouped by provider
+ * (`{group,name,options:[]}[]`, e.g. Claude). Families may also carry a
+ * `value` plus nested leaves; recurse whenever `options` is present so the
+ * picker never sends a parent family id. Suffix-only children (`[1m]`) join
+ * the nearest ancestor value.
+ */
+export function flattenConfigOptionValues(
+  options: SessionConfigOption['options'] | null | undefined,
+  ancestorValue?: string
+): SessionConfigOptionValue[] {
+  if (!Array.isArray(options)) return []
+  const flat: SessionConfigOptionValue[] = []
+  for (const entry of options) {
+    if (typeof entry !== 'object' || entry === null) continue
+    const rec = entry as SessionConfigOptionValue & WireSelectGroup & { value?: string }
+    const parentValue = typeof rec.value === 'string' ? rec.value : ancestorValue
+    const groupName = rec.name || rec.group || ''
+    if (isSelectGroup(rec)) {
+      const children = flattenConfigOptionValues(
+        rec.options as SessionConfigOption['options'],
+        parentValue
+      )
+      if (children.length > 0) {
+        for (const child of children) {
+          flat.push({
+            ...child,
+            ...(groupName && !child.group ? { group: groupName } : {})
+          })
+        }
+        continue
+      }
+    }
+    if (isSelectValue(rec)) {
+      flat.push({
+        value: canonicalizeClaudeModelId(joinSuffixValue(ancestorValue, rec.value)),
+        name: rec.name,
+        ...(rec.description != null ? { description: rec.description } : {}),
+        ...(typeof rec.group === 'string' && rec.group ? { group: rec.group } : {})
+      })
+    }
+  }
+  return flat
+}
+
+/** Flatten grouped select values and drop unusable currentValue shapes. */
+export function normalizeSessionConfigOption(option: SessionConfigOption): SessionConfigOption {
+  const raw = option.options
+  const options = flattenConfigOptionValues(raw)
+  const currentValue = canonicalizeClaudeModelId(
+    typeof option.currentValue === 'string' ? option.currentValue : ''
+  )
+  if (
+    Array.isArray(raw) &&
+    raw.every(isSelectValue) &&
+    currentValue === option.currentValue &&
+    options.length === raw.length &&
+    options.every(
+      (entry, index) => entry.value === raw[index]?.value && entry.name === raw[index]?.name
+    )
+  ) {
+    return option
+  }
+  return {
+    ...option,
+    currentValue,
+    options
+  }
+}
+
 /**
  * Split usable config options into promoted `model` / `thought_level` options
  * (first match wins for each) and the rest, preserving the rest's original
@@ -38,7 +146,9 @@ export function partitionConfigOptions(options: SessionConfigOption[]): Partitio
   let model: SessionConfigOption | null = null
   let thoughtLevel: SessionConfigOption | null = null
   const rest: SessionConfigOption[] = []
-  for (const option of options) {
+  for (const raw of options) {
+    const option = normalizeSessionConfigOption(raw)
+    if (option.options.length === 0) continue
     if (model === null && option.category === MODEL_CATEGORY) {
       model = option
     } else if (thoughtLevel === null && option.category === THOUGHT_LEVEL_CATEGORY) {
@@ -59,7 +169,10 @@ export function resolveModelOption(
   configModel: SessionConfigOption | null,
   models: SessionModelState | null | undefined
 ): ResolvedModelOption {
-  if (configModel) return { option: configModel, source: 'config' }
+  if (configModel) {
+    const option = normalizeSessionConfigOption(configModel)
+    if (option.options.length > 0) return { option, source: 'config' }
+  }
   if (!models || models.availableModels.length === 0) return { option: null, source: null }
   return {
     source: 'models',
@@ -68,9 +181,9 @@ export function resolveModelOption(
       name: 'Model',
       category: MODEL_CATEGORY,
       type: 'select',
-      currentValue: models.currentModelId,
+      currentValue: canonicalizeClaudeModelId(models.currentModelId),
       options: models.availableModels.map((model) => ({
-        value: model.modelId,
+        value: canonicalizeClaudeModelId(model.modelId),
         name: model.name,
         description: model.description ?? undefined
       }))

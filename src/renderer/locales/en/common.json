@@ -97,5 +97,84 @@
     "greeting": "Hello, {{name}}",
     "itemCount_one": "{{formattedCount}} item",
     "itemCount_other": "{{formattedCount}} items"
+  },
+  "conversationHost": {
+    "ariaLabel": "Conversation host status",
+    "recoveryCount_one": "{{count}} recovery item",
+    "recoveryCount_other": "{{count}} recovery items",
+    "states": {
+      "ready": "Conversation service ready",
+      "migrating": "Conversation service is starting",
+      "hybrid": "Conversation compatibility mode",
+      "recovery": "Conversation recovery required",
+      "error": "Conversation service unavailable"
+    }
+  },
+  "conversationNavigation": {
+    "title": "Conversations",
+    "newChat": "New Chat",
+    "search": "Search conversations",
+    "clearSearch": "Clear conversation search",
+    "filter": "Filter conversations by project",
+    "allProjects": "All projects",
+    "projectless": "No project",
+    "projectView": "Project conversations",
+    "empty": "No conversations match this view.",
+    "untitled": "Untitled conversation",
+    "loadMore": "Load {{count}} more",
+    "recoveryBadge_one": "{{count}} recovery item",
+    "recoveryBadge_other": "{{count}} recovery items"
+  },
+  "conversationRoute": {
+    "opening": "Opening conversation…",
+    "resolvingLegacy": "Resolving legacy conversation…",
+    "legacyError": "This legacy conversation link could not be resolved.",
+    "errors": {
+      "title": "Conversation unavailable",
+      "CONVERSATION_INVALID_ID": "The address is not a canonical ConversationId.",
+      "CONVERSATION_NOT_FOUND": "The conversation was not found.",
+      "LEGACY_ID_AMBIGUOUS": "This legacy identifier matches more than one conversation.",
+      "CONVERSATION_RECOVERY_REQUIRED": "Recovery is required before this conversation can open.",
+      "CONVERSATION_BINDING_OPEN_FAILED": "The conversation opened, but its agent binding could not be restored.",
+      "CONVERSATION_LEGACY_RESOLVE_FAILED": "The legacy identifier resolver is unavailable.",
+      "CONVERSATION_OPEN_FAILED": "The conversation could not be opened."
+    }
+  },
+  "scheduledTasks": {
+    "title": "Scheduled tasks",
+    "refresh": "Refresh scheduled tasks",
+    "empty": "No scheduled tasks yet. Ask an AI in any Conversation to create a draft.",
+    "selectTask": "Select a scheduled task to inspect it.",
+    "activate": "Review and activate",
+    "pause": "Pause",
+    "resume": "Resume",
+    "runNow": "Run now",
+    "everySeconds": "Every {{count}} seconds",
+    "prompt": "Task prompt",
+    "agent": "Agent: {{agent}}",
+    "project": "Associated project: {{project}}",
+    "noProject": "No project association",
+    "workspace": "Workspace: {{workspace}}",
+    "revision": "Revision: {{revision}}",
+    "hash": "Draft hash: {{hash}}",
+    "history": "Execution history",
+    "noRuns": "This task has not run yet.",
+    "audit": "Task audit",
+    "confirmTitle": "Activate this scheduled task?",
+    "confirmDescription": "{{name}} will run on {{schedule}}. You are confirming revision {{revision}} and its exact draft hash.",
+    "status": {
+      "draft": "Draft",
+      "active": "Active",
+      "paused": "Paused"
+    },
+    "runStatus": {
+      "queued": "Queued",
+      "running": "Running",
+      "succeeded": "Succeeded",
+      "failed": "Failed",
+      "cancelled": "Cancelled",
+      "skipped": "Skipped",
+      "interrupted": "Interrupted"
+    }
   }
 }

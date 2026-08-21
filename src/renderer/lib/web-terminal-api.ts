@@ -11,14 +11,21 @@ import type {
   TerminalExitCodeChangedCallback,
   TerminalGitBranchChangedCallback,
   TerminalGitStatusChangedCallback,
+  TerminalResumeGrant,
+  TerminalResumeRequest,
+  TerminalScopedDataCallback,
   TerminalSpawnOptions
 } from '@shared/types/ipc.types'
-import type {
-  WebTerminalEventPayload,
-  WebTerminalFrame,
-  WebTerminalReply,
-  WebTerminalRequestType
+import {
+  decodeWebTerminalBinaryFrame,
+  readTerminalResourceFailure,
+  WEB_TERMINAL_BINARY_PROTOCOL,
+  type WebTerminalEventPayload,
+  type WebTerminalFrame,
+  type WebTerminalReply,
+  type WebTerminalRequestType
 } from '@shared/types/web-terminal-protocol.types'
+import { logFrontendError } from '@/lib/log-api'
 
 const REQUEST_TIMEOUT_MS = 15_000
 const RECONNECT_BASE_MS = 500
@@ -52,6 +59,8 @@ interface TerminalTracker {
   exited: boolean
   /** Active renderer reference count (detach when it reaches 0). */
   refCount: number
+  /** Whether this websocket currently has an authorized live output stream. */
+  streamAttached: boolean
   /**
    * CAP-3 lease credential for this terminal (in-memory only — never
    * persisted). Adopted ONLY on server-confirmed success (spawn reply or a
@@ -66,6 +75,8 @@ interface TerminalTracker {
    * reconnect scheduling.
    */
   disconnected: boolean
+  /** Cleanup failed after ownership was established; retain only the stable id for retry. */
+  cleanupOnly: boolean
 }
 
 export class WebTerminalClient {
@@ -89,11 +100,13 @@ export class WebTerminalClient {
   private readonly pending = new Map<string, Pending>()
   private readonly trackers = new Map<string, TerminalTracker>()
   private readonly dataCallbacks = new Set<TerminalDataCallback>()
+  private readonly scopedDataCallbacks = new Map<string, Set<TerminalScopedDataCallback>>()
   private readonly exitCallbacks = new Set<TerminalExitCallback>()
   private readonly cwdCallbacks = new Set<TerminalCwdChangedCallback>()
   private readonly branchCallbacks = new Set<TerminalGitBranchChangedCallback>()
   private readonly statusCallbacks = new Set<TerminalGitStatusChangedCallback>()
   private readonly exitCodeCallbacks = new Set<TerminalExitCodeChangedCallback>()
+  private invalidBinaryFrameLogged = false
 
   constructor(
     private readonly url = resolveTerminalWsUrl(),
@@ -122,8 +135,11 @@ export class WebTerminalClient {
       this.pending.set(id, {
         timer,
         resolve: (reply) => {
-          if (reply.success) resolve({ success: true, data: reply.data as T })
-          else resolve({ success: false, error: reply.error, code: reply.code })
+          const result: IpcResult<T> = reply.success
+            ? { success: true, data: reply.data as T }
+            : { success: false, error: reply.error, code: reply.code }
+          this.retainTerminalResourceFailure(result)
+          resolve(result)
         }
       })
       socket.send(JSON.stringify({ id, type, payload }))
@@ -136,7 +152,8 @@ export class WebTerminalClient {
     if (this.socket?.readyState === this.WebSocketImpl.OPEN) return Promise.resolve()
     if (this.connecting) return this.connecting
     this.connecting = new Promise<void>((resolve, reject) => {
-      const socket = new this.WebSocketImpl(this.url)
+      const socket = new this.WebSocketImpl(this.url, WEB_TERMINAL_BINARY_PROTOCOL)
+      socket.binaryType = 'arraybuffer'
       this.socket = socket
       this.connectingReject = reject
       socket.onopen = () => {
@@ -148,7 +165,7 @@ export class WebTerminalClient {
         // re-attached — mark them disconnected (no credential is ever
         // presented id-only, and a rejected credential is never re-presented).
         for (const [terminalId, tracker] of this.trackers) {
-          if (tracker.exited) continue
+          if (tracker.exited || tracker.refCount <= 0 || tracker.cleanupOnly) continue
           if (!tracker.claim) {
             tracker.disconnected = true
             continue
@@ -168,25 +185,25 @@ export class WebTerminalClient {
           }).then((r) => {
             if (r.success) {
               tracker.disconnected = false
+              tracker.streamAttached = true
               return
             }
-            if (r.code !== 'NETWORK_ERROR') {
+            if (r.code !== 'NETWORK_ERROR' && tracker.claim === presentedClaim) {
               // Server rejection (single generic UNAUTHORIZED — the host never
               // distinguishes terminal-gone from credential-gone): the lease is
               // invalid/rotated/revoked or the terminal no longer exists. Drop
               // the credential and stop re-presenting it — but ONLY when a
               // newer claim has not superseded it in the meantime.
-              if (tracker.claim === presentedClaim) {
-                tracker.claim = undefined
-                tracker.disconnected = true
-              }
+              tracker.claim = undefined
+              tracker.disconnected = true
+              tracker.streamAttached = false
             }
             // NETWORK_ERROR keeps the claim for the next reconnect attempt.
           })
         }
         resolve()
       }
-      socket.onmessage = (event) => this.handleFrame(String(event.data))
+      socket.onmessage = (event) => this.handleIncomingFrame(event.data)
       socket.onerror = () => {
         this.connecting = null
         this.connectingReject = null
@@ -196,6 +213,7 @@ export class WebTerminalClient {
         this.connecting = null
         this.connectingReject = null
         this.socket = null
+        for (const tracker of this.trackers.values()) tracker.streamAttached = false
         this.rejectPending()
         this.scheduleReconnect()
       }
@@ -217,7 +235,8 @@ export class WebTerminalClient {
   private async performAttach(
     terminalId: string,
     claim: string | undefined,
-    lastSeq: number | undefined
+    lastSeq: number | undefined,
+    countRendererRef = true
   ): Promise<IpcResult<TerminalAttachResult>> {
     const tracker = this.getOrCreate(terminalId)
     const credential = claim ?? tracker.claim
@@ -225,13 +244,11 @@ export class WebTerminalClient {
       tracker.disconnected = true
       return { success: false, error: 'Unauthorized', code: 'UNAUTHORIZED' }
     }
-    // Snapshot the claim held at request time. A rotate (`severClaim`) that
-    // completes while this request is in flight installs a FRESH claim; the
-    // in-flight attach then resolves with the generic UNAUTHORIZED for the
-    // OLD credential. Clearing unconditionally would discard the fresh claim
-    // and strand the terminal (valid lease held but unattachable). On
-    // rejection, clear ONLY when `tracker.claim` is unchanged since the
-    // snapshot — a newer claim installed by `severClaim` is preserved.
+    // Snapshot the claim held at request time. A rotate or resume that
+    // completes while this request is in flight installs a fresh credential;
+    // the in-flight attach can then reject the predecessor. Clear state only
+    // when the rejected credential is still active (or was never adopted), so
+    // an explicit stale credential cannot erase a newer grant.
     const claimAtRequest = tracker.claim
     const result = await this.request<TerminalAttachResult>('attach', {
       terminalId,
@@ -240,16 +257,23 @@ export class WebTerminalClient {
     })
     if (result.success) {
       // Increment — never `= 1`: in-flight attaches must not discard refs.
-      tracker.refCount += 1
+      if (countRendererRef) tracker.refCount += 1
       tracker.claim = credential
+      tracker.lastSeq = Math.max(tracker.lastSeq, result.data.latestSeq)
       tracker.disconnected = false
+      tracker.streamAttached = true
+      tracker.cleanupOnly = false
     } else if (result.code !== 'NETWORK_ERROR') {
       // Server rejection (generic UNAUTHORIZED): drop the adopted claim and
-      // stop re-presenting it on reconnect — but ONLY when no newer claim was
-      // installed while this request was in flight.
-      if (tracker.claim === claimAtRequest) {
+      // stop re-presenting it on reconnect only when the rejected credential
+      // is still the active one. An explicit stale credential must not erase a
+      // newer resume grant already installed in this tracker.
+      const rejectedActiveClaim = tracker.claim === credential
+      const rejectedUnadoptedClaim = tracker.claim === undefined && claimAtRequest === undefined
+      if (rejectedActiveClaim || rejectedUnadoptedClaim) {
         tracker.claim = undefined
         tracker.disconnected = true
+        tracker.streamAttached = false
       }
     }
     return result
@@ -261,12 +285,18 @@ export class WebTerminalClient {
    */
   async attach(terminalId: string, claim?: string): Promise<IpcResult<void>> {
     const tracker = this.getOrCreate(terminalId)
-    if (tracker.refCount > 0 && claim === undefined) {
-      // Already attached — just increment the ref count (no round trip).
+    if (claim === undefined && tracker.streamAttached) {
+      // Already authorized — add the renderer reference without another replay.
       tracker.refCount++
       return { success: true, data: undefined }
     }
     const result = await this.performAttach(terminalId, claim, undefined)
+    return result.success ? { success: true, data: undefined } : result
+  }
+
+  /** Prime an output stream without manufacturing a renderer reference. */
+  async primeAttachment(terminalId: string, claim: string): Promise<IpcResult<void>> {
+    const result = await this.performAttach(terminalId, claim, undefined, false)
     return result.success ? { success: true, data: undefined } : result
   }
 
@@ -280,6 +310,40 @@ export class WebTerminalClient {
   }
 
   /**
+   * Authenticated cold resume. The host rotates the claim and installs replay
+   * plus a live forwarder; adoption is atomic and memory-only on success.
+   */
+  async resume(request: TerminalResumeRequest): Promise<IpcResult<TerminalResumeGrant>> {
+    const tracker = this.getOrCreate(request.terminalId)
+    const result = await this.request<TerminalResumeGrant>('resume', { ...request })
+    if (!result.success) {
+      if (result.code !== 'NETWORK_ERROR') {
+        tracker.claim = undefined
+        tracker.refCount = 0
+        tracker.disconnected = true
+        tracker.streamAttached = false
+      }
+      return result
+    }
+
+    if (result.data.terminal.id !== request.terminalId || !result.data.claim) {
+      tracker.claim = undefined
+      tracker.refCount = 0
+      tracker.disconnected = true
+      tracker.streamAttached = false
+      return failure('NETWORK_ERROR', 'Invalid terminal resume response')
+    }
+
+    tracker.claim = result.data.claim
+    tracker.lastSeq = Math.max(tracker.lastSeq, result.data.terminal.latestSeq)
+    tracker.exited = false
+    tracker.disconnected = false
+    tracker.streamAttached = true
+    tracker.cleanupOnly = false
+    return result
+  }
+
+  /**
    * Adopt a server-issued credential (spawn issuance / successful rotation).
    * Issuance is server-confirmed by definition, so adoption is immediate.
    */
@@ -287,6 +351,8 @@ export class WebTerminalClient {
     const tracker = this.getOrCreate(terminalId)
     tracker.claim = claim
     tracker.disconnected = claim === undefined
+    tracker.cleanupOnly = false
+    if (!claim) tracker.streamAttached = false
   }
 
   /**
@@ -301,6 +367,7 @@ export class WebTerminalClient {
     tracker.refCount = 0
     tracker.claim = newClaim
     tracker.disconnected = !newClaim
+    tracker.streamAttached = false
   }
 
   /** Detach from a terminal's output stream when ref count reaches 0. */
@@ -309,12 +376,25 @@ export class WebTerminalClient {
     if (!tracker) return
     tracker.refCount = Math.max(0, tracker.refCount - 1)
     if (tracker.refCount <= 0) {
+      tracker.streamAttached = false
       void this.request('detach', { terminalId }).catch(() => {})
       if (tracker.exited) this.trackers.delete(terminalId)
     }
   }
 
-  /** Remove a terminal from tracking (used after kill/exit). */
+  /** Close every renderer attachment while retaining the claim/cursor tracker. */
+  async closeView(terminalId: string): Promise<IpcResult<void>> {
+    const tracker = this.trackers.get(terminalId)
+    if (!tracker) return { success: true, data: undefined }
+    const result = await this.request<void>('close_view', { terminalId })
+    if (result.success) {
+      tracker.refCount = 0
+      tracker.streamAttached = false
+    }
+    return result
+  }
+
+  /** Remove a terminal from tracking (used only after explicit terminate/exit). */
   removeTracker(terminalId: string): void {
     void this.request('detach', { terminalId }).catch(() => {})
     this.trackers.delete(terminalId)
@@ -323,10 +403,34 @@ export class WebTerminalClient {
   private getOrCreate(terminalId: string): TerminalTracker {
     let tracker = this.trackers.get(terminalId)
     if (!tracker) {
-      tracker = { lastSeq: 0, exited: false, refCount: 0, disconnected: false }
+      tracker = {
+        lastSeq: 0,
+        exited: false,
+        refCount: 0,
+        streamAttached: false,
+        disconnected: false,
+        cleanupOnly: false
+      }
       this.trackers.set(terminalId, tracker)
     }
     return tracker
+  }
+
+  /**
+   * A failed cleanup revokes normal I/O authority but does not erase ownership.
+   * Retain only the recoverable id so an explicit terminate retry can target the
+   * quarantined resource; it must never drive reconnect, attach, or respawn.
+   */
+  private retainTerminalResourceFailure(result: IpcResult<unknown>): void {
+    const failure = readTerminalResourceFailure(result)
+    if (!failure) return
+
+    const tracker = this.getOrCreate(failure.terminalId)
+    tracker.claim = undefined
+    tracker.refCount = 0
+    tracker.streamAttached = false
+    tracker.disconnected = true
+    tracker.cleanupOnly = true
   }
 
   private markExited(terminalId: string): void {
@@ -337,6 +441,23 @@ export class WebTerminalClient {
   onData(callback: TerminalDataCallback): () => void {
     this.dataCallbacks.add(callback)
     return () => this.dataCallbacks.delete(callback)
+  }
+  onDataForTerminal(terminalId: string, callback: TerminalScopedDataCallback): () => void {
+    let callbacks = this.scopedDataCallbacks.get(terminalId)
+    if (!callbacks) {
+      callbacks = new Set()
+      this.scopedDataCallbacks.set(terminalId, callbacks)
+    }
+    callbacks.add(callback)
+
+    return () => {
+      const current = this.scopedDataCallbacks.get(terminalId)
+      if (!current) return
+      current.delete(callback)
+      if (current.size === 0) {
+        this.scopedDataCallbacks.delete(terminalId)
+      }
+    }
   }
   onExit(callback: TerminalExitCallback): () => void {
     this.exitCallbacks.add(callback)
@@ -365,9 +486,61 @@ export class WebTerminalClient {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
     this.rejectPending()
     this.socket?.close()
+    this.dataCallbacks.clear()
+    this.scopedDataCallbacks.clear()
   }
 
-  private handleFrame(text: string): void {
+  private handleIncomingFrame(data: unknown): void {
+    if (typeof data === 'string') {
+      this.handleJsonFrame(data)
+      return
+    }
+    if (data instanceof ArrayBuffer) {
+      this.handleBinaryFrame(data)
+      return
+    }
+    if (typeof Blob !== 'undefined' && data instanceof Blob) {
+      void data
+        .arrayBuffer()
+        .then((buffer) => {
+          if (!this.disposed) this.handleBinaryFrame(buffer)
+        })
+        .catch(() => {
+          this.logInvalidBinaryFrame('Could not read terminal WebSocket Blob payload')
+        })
+    }
+  }
+
+  private dispatchData(terminalId: string, bytes: Uint8Array): void {
+    for (const callback of this.dataCallbacks) callback(terminalId, bytes)
+    const scopedCallbacks = this.scopedDataCallbacks.get(terminalId)
+    if (scopedCallbacks) {
+      for (const callback of scopedCallbacks) callback(bytes)
+    }
+  }
+
+  private handleBinaryFrame(buffer: ArrayBuffer): void {
+    const frame = decodeWebTerminalBinaryFrame(buffer)
+    if (!frame) {
+      this.logInvalidBinaryFrame('Rejected malformed terminal WebSocket binary frame')
+      return
+    }
+    const tracker = this.getOrCreate(frame.terminalId)
+    tracker.lastSeq = Math.max(tracker.lastSeq, frame.seq)
+    this.dispatchData(frame.terminalId, frame.data)
+  }
+
+  private logInvalidBinaryFrame(message: string): void {
+    if (this.invalidBinaryFrameLogged) return
+    this.invalidBinaryFrameLogged = true
+    void logFrontendError({
+      level: 'warn',
+      source: 'WebTerminalClient.binaryFrame',
+      message
+    })
+  }
+
+  private handleJsonFrame(text: string): void {
     let frame: WebTerminalFrame
     try {
       frame = JSON.parse(text) as WebTerminalFrame
@@ -388,7 +561,7 @@ export class WebTerminalClient {
         tracker.lastSeq = frame.seq
       }
       const bytes = Uint8Array.from(frame.data)
-      for (const callback of this.dataCallbacks) callback(frame.terminalId, bytes)
+      this.dispatchData(frame.terminalId, bytes)
       return
     }
     if (frame.type === 'replay') {
@@ -396,9 +569,10 @@ export class WebTerminalClient {
       const tracker = this.getOrCreate(frame.terminalId)
       for (const chunk of frame.chunks) {
         const bytes = Uint8Array.from(chunk.data)
-        for (const callback of this.dataCallbacks) callback(frame.terminalId, bytes)
+        this.dispatchData(frame.terminalId, bytes)
         tracker.lastSeq = chunk.seq
       }
+      tracker.lastSeq = Math.max(tracker.lastSeq, frame.latestSeq)
       // If a gap was reported, write a visible marker.
       if (frame.gap) {
         const marker = new Uint8Array([
@@ -413,7 +587,7 @@ export class WebTerminalClient {
           0x30,
           0x6d // ESC[0m (reset)
         ])
-        for (const callback of this.dataCallbacks) callback(frame.terminalId, marker)
+        this.dispatchData(frame.terminalId, marker)
       }
       return
     }
@@ -431,7 +605,7 @@ export class WebTerminalClient {
         0x30,
         0x6d
       ])
-      for (const callback of this.dataCallbacks) callback(frame.terminalId, marker)
+      this.dispatchData(frame.terminalId, marker)
       return
     }
     if (frame.type === 'event') this.handleEvent(frame.payload)
@@ -477,7 +651,7 @@ export class WebTerminalClient {
     // Stop reconnecting if no terminal is both live AND holds a lease
     // credential — exited/disconnected terminals are never re-presented.
     const activeCount = Array.from(this.trackers.values()).filter(
-      (t) => !t.exited && !t.disconnected
+      (t) => !t.exited && !t.disconnected && !t.cleanupOnly && t.refCount > 0
     ).length
     if (activeCount === 0) return
     if (this.reconnectAttempt >= RECONNECT_MAX_ATTEMPTS) return
@@ -617,15 +791,14 @@ export function createWebTerminalApi(): TerminalApi {
       )
       if (result.success) {
         if (result.data.claim) {
-          // Adopt the issued credential, then attach with it so output flows
-          // immediately. Reconnect re-attach afterwards reuses the stored claim.
+          // Adopt the issued credential, then prime the output stream without
+          // manufacturing a renderer reference. addRendererRef accounts for
+          // the actual mounted view after the component is ready.
           client.adoptClaim(result.data.id, result.data.claim)
-          const attachResult = await client.attach(result.data.id, result.data.claim)
+          const attachResult = await client.primeAttachment(result.data.id, result.data.claim)
           if (!attachResult.success) {
-            // Attach failed — the PTY exists but we can't receive output.
-            // Kill it to avoid orphaning, and return the attach failure.
-            void client.request('kill', { terminalId: result.data.id })
-            client.removeTracker(result.data.id)
+            // A failed view attach is non-destructive. The PTY and claim remain
+            // eligible for a later explicit reopen/reconnect.
             return { success: false, error: attachResult.error, code: attachResult.code }
           }
         } else {
@@ -639,6 +812,7 @@ export function createWebTerminalApi(): TerminalApi {
       }
       return result
     },
+    resume: (request) => client.resume(request),
     attach: (terminalId, claim, lastSeq) => client.attachWithCursor(terminalId, claim, lastSeq),
     async rotateClaim(terminalId: string, claim: string): Promise<IpcResult<RotatedClaim>> {
       const result = await client.request<RotatedClaim>('rotate_claim', { terminalId, claim })
@@ -660,14 +834,20 @@ export function createWebTerminalApi(): TerminalApi {
     },
     write: (terminalId, data) => client.request('write', { terminalId, data }),
     resize: (terminalId, cols, rows) => client.request('resize', { terminalId, cols, rows }),
+    closeView: (terminalId) => client.closeView(terminalId),
+    async terminate(terminalId): Promise<IpcResult<void>> {
+      const result = await client.request<void>('terminate', { terminalId })
+      if (result.success) client.removeTracker(terminalId)
+      return result
+    },
+    /** @deprecated compatibility alias for terminate. */
     async kill(terminalId): Promise<IpcResult<void>> {
       const result = await client.request<void>('kill', { terminalId })
-      // Kill is idempotent on the server (not_found = success).
-      // Either way, stop tracking and detach (the claim goes with the tracker).
-      client.removeTracker(terminalId)
+      if (result.success) client.removeTracker(terminalId)
       return result
     },
     onData: (callback) => client.onData(callback),
+    onDataForTerminal: (terminalId, callback) => client.onDataForTerminal(terminalId, callback),
     onExit: (callback) => client.onExit(callback),
     onCwdChanged: (callback) => client.onCwd(callback),
     getCwd: (terminalId) => client.request('get_cwd', { terminalId }),
@@ -687,11 +867,16 @@ export const webTerminalInternals = {
   async addRendererRef(terminalId: string, rendererId: string): Promise<IpcResult<void>> {
     const attached = await client.attach(terminalId)
     if (!attached.success) return attached
-    return client.request<void>('add_renderer_ref', { terminalId, rendererId })
+    const result = await client.request<void>('add_renderer_ref', { terminalId, rendererId })
+    if (!result.success) client.detach(terminalId)
+    return result
   },
-  removeRendererRef: (terminalId: string, rendererId: string) => {
+  async removeRendererRef(terminalId: string, rendererId: string): Promise<IpcResult<void>> {
+    // Remove the backend ref while this connection is still authorized. Only
+    // then detach the output/authorization and decrement the local ref count.
+    const result = await client.request<void>('remove_renderer_ref', { terminalId, rendererId })
     client.detach(terminalId)
-    return client.request<void>('remove_renderer_ref', { terminalId, rendererId })
+    return result
   },
   setProtected: (terminalId: string, protectedState: boolean) =>
     client.request<void>('set_protected', { terminalId, protected: protectedState })

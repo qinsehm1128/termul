@@ -26,6 +26,10 @@ vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn()
 }))
 
+vi.mock('@/lib/tauri-runtime', () => ({
+  isTauriContext: vi.fn(() => true)
+}))
+
 vi.mock('@tauri-apps/api/event', () => ({
   listen: vi.fn()
 }))
@@ -105,6 +109,8 @@ describe('API Bridge (api.ts)', () => {
       expect(typeof terminalApi.spawn).toBe('function')
       expect(typeof terminalApi.write).toBe('function')
       expect(typeof terminalApi.resize).toBe('function')
+      expect(typeof terminalApi.closeView).toBe('function')
+      expect(typeof terminalApi.terminate).toBe('function')
       expect(typeof terminalApi.kill).toBe('function')
     })
 

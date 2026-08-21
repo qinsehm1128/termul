@@ -4,8 +4,8 @@
 //! bytes from `getrandom`, hex-encoded to 64 chars). The host stores ONLY the
 //! SHA-256 digest of the credential — never the raw credential — and verifies
 //! presented credentials in constant time against that digest. Credentials are
-//! never logged and never returned except by the issuance (spawn) and rotation
-//! responses.
+//! never logged and never returned except by initial spawn, possession-based
+//! rotation, and authenticated scope-bound resume responses.
 //!
 //! All verification failures (unknown terminal, oversized probe, wrong
 //! credential, revoked credential, project-binding mismatch) collapse into the
@@ -22,9 +22,10 @@
 //! surface's generic-error policy is the primary leak defense.
 //!
 //! Per-terminal monotonically increasing GENERATION counters are bumped on
-//! rotate/revoke so derived access (e.g. desktop attach output forwarders) can
-//! observe invalidation and terminate.
+//! rotate/revoke/resume so derived access (e.g. desktop attach output
+//! forwarders) can observe invalidation and terminate.
 
+use crate::conversation::ConversationId;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -40,12 +41,21 @@ const DUMMY_DIGEST: [u8; 32] = [0xA5; 32];
 
 /// Wire shape of the rotate response — byte-identical on both transports
 /// (desktop `terminal_rotate_claim` IpcResult data; web `rotate_claim` reply
-/// data). Issuance-on-rotation is the only time a credential leaves the host
-/// besides spawn.
-#[derive(Debug, Clone, serde::Serialize)]
+/// data). Possession-based rotation is one of the explicit response-only
+/// issuance paths, alongside initial spawn and authenticated cold resume.
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RotatedClaim {
     pub claim: String,
+}
+
+impl std::fmt::Debug for RotatedClaim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RotatedClaim")
+            .field("claim", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Single collapsed failure type for every claim operation.
@@ -69,7 +79,9 @@ impl std::fmt::Display for ClaimError {
 struct ClaimRecord {
     /// SHA-256 digest of the currently valid credential (never the raw form).
     digest: [u8; 32],
-    /// Project binding captured at issuance; verified as part of every check.
+    /// Canonical primary ownership scope captured at issuance.
+    conversation_id: ConversationId,
+    /// Optional project attribution. This is secondary context, never ownership.
     project_id: Option<String>,
     /// Monotonically increasing invalidation counter. Bumped on rotate/revoke
     /// so live access derived from the old credential can be torn down.
@@ -96,7 +108,10 @@ fn sha256_digest(bytes: &[u8]) -> [u8; 32] {
 
 const fn hex_digit(byte: u8) -> [u8; 2] {
     const ALPHABET: &[u8; 16] = b"0123456789abcdef";
-    [ALPHABET[(byte >> 4) as usize], ALPHABET[(byte & 0x0F) as usize]]
+    [
+        ALPHABET[(byte >> 4) as usize],
+        ALPHABET[(byte & 0x0F) as usize],
+    ]
 }
 
 fn hex_encode(bytes: &[u8; 32]) -> String {
@@ -115,16 +130,21 @@ impl TerminalClaimRegistry {
         Self::default()
     }
 
-    /// Issue a fresh credential for `terminal_id`, bound to `project_id`.
+    /// Issue the initial fresh credential for `terminal_id`, bound to `project_id`.
     ///
     /// The host retains only the SHA-256 digest; the returned credential string
     /// exists nowhere else in the process. Any previous record for the terminal
     /// is replaced (spawn path issues exactly once per terminal).
-    pub fn issue(&self, terminal_id: &str, project_id: Option<&str>) -> String {
+    pub fn issue(
+        &self,
+        terminal_id: &str,
+        conversation_id: ConversationId,
+        project_id: Option<&str>,
+    ) -> String {
         let mut raw = [0u8; 32];
         getrandom::getrandom(&mut raw).expect("OS CSPRNG is available");
-    let credential = hex_encode(&raw);
-    let digest = sha256_digest(credential.as_bytes());
+        let credential = hex_encode(&raw);
+        let digest = sha256_digest(credential.as_bytes());
         // The random bytes are no longer needed — overwrite before drop.
         for byte in raw.iter_mut() {
             *byte = 0;
@@ -135,6 +155,7 @@ impl TerminalClaimRegistry {
             terminal_id.to_string(),
             ClaimRecord {
                 digest,
+                conversation_id,
                 project_id: project_id.map(|p| p.to_string()),
                 generation: 0,
                 revoked: false,
@@ -142,8 +163,9 @@ impl TerminalClaimRegistry {
         );
 
         log::info!(
-            "[claims] issued terminal_id={} project_id={}",
+            "[claims] issued terminal_id={} conversation_id={} project_id={}",
             terminal_id,
+            conversation_id,
             project_id.unwrap_or("<none>")
         );
         credential
@@ -158,6 +180,7 @@ impl TerminalClaimRegistry {
         &self,
         terminal_id: &str,
         claim: &str,
+        conversation_id: ConversationId,
         project_id: Option<&str>,
     ) -> Result<(), ClaimError> {
         // Amplification guard (amendment R3): probes longer than the issued
@@ -165,8 +188,9 @@ impl TerminalClaimRegistry {
         // strings cost constant work.
         if claim.len() > CLAIM_CREDENTIAL_LEN {
             log::warn!(
-                "[claims] verify failed (oversized credential) terminal_id={} project_id={}",
+                "[claims] verify failed (oversized credential) terminal_id={} conversation_id={} project_id={}",
                 terminal_id,
+                conversation_id,
                 project_id.unwrap_or("<none>")
             );
             return Err(ClaimError);
@@ -175,20 +199,28 @@ impl TerminalClaimRegistry {
         let presented = sha256_digest(claim.as_bytes());
 
         let records = self.records.lock();
-        let outcome = Self::verify_locked(&records, terminal_id, &presented, project_id);
+        let outcome = Self::verify_locked(
+            &records,
+            terminal_id,
+            &presented,
+            conversation_id,
+            project_id,
+        );
         drop(records);
 
         if outcome {
             log::info!(
-                "[claims] verify ok terminal_id={} project_id={}",
+                "[claims] verify ok terminal_id={} conversation_id={} project_id={}",
                 terminal_id,
+                conversation_id,
                 project_id.unwrap_or("<none>")
             );
             Ok(())
         } else {
             log::warn!(
-                "[claims] verify failed terminal_id={} project_id={}",
+                "[claims] verify failed terminal_id={} conversation_id={} project_id={}",
                 terminal_id,
+                conversation_id,
                 project_id.unwrap_or("<none>")
             );
             Err(ClaimError)
@@ -206,6 +238,7 @@ impl TerminalClaimRegistry {
         records: &HashMap<String, ClaimRecord>,
         terminal_id: &str,
         presented: &[u8; 32],
+        conversation_id: ConversationId,
         project_id: Option<&str>,
     ) -> bool {
         match records.get(terminal_id) {
@@ -217,6 +250,8 @@ impl TerminalClaimRegistry {
                 // keeps the comparison length-timing uniform; a None/Some
                 // mismatch is folded into the same Choice arithmetic so the
                 // failure path stays singular.
+                let conversation_ok =
+                    subtle::Choice::from(u8::from(record.conversation_id == conversation_id));
                 let binding_ok = match (&record.project_id, project_id) {
                     (Some(bound), Some(presented_id)) => {
                         bound.as_bytes().ct_eq(presented_id.as_bytes())
@@ -225,7 +260,7 @@ impl TerminalClaimRegistry {
                     _ => subtle::Choice::from(0u8),
                 };
                 let active = subtle::Choice::from(if record.revoked { 0u8 } else { 1u8 });
-                bool::from(digest_ok & binding_ok & active)
+                bool::from(digest_ok & conversation_ok & binding_ok & active)
             }
             // Dummy-digest path: burn the digest comparison work for unknown
             // terminals so timing does not distinguish existence.
@@ -246,12 +281,14 @@ impl TerminalClaimRegistry {
         &self,
         terminal_id: &str,
         current_claim: &str,
+        conversation_id: ConversationId,
         project_id: Option<&str>,
     ) -> Result<String, ClaimError> {
         if current_claim.len() > CLAIM_CREDENTIAL_LEN {
             log::warn!(
-                "[claims] rotate failed (oversized credential) terminal_id={} project_id={}",
+                "[claims] rotate failed (oversized credential) terminal_id={} conversation_id={} project_id={}",
                 terminal_id,
+                conversation_id,
                 project_id.unwrap_or("<none>")
             );
             return Err(ClaimError);
@@ -260,19 +297,26 @@ impl TerminalClaimRegistry {
 
         let mut raw = [0u8; 32];
         getrandom::getrandom(&mut raw).expect("OS CSPRNG is available");
-    let credential = hex_encode(&raw);
-    let digest = sha256_digest(credential.as_bytes());
+        let credential = hex_encode(&raw);
+        let digest = sha256_digest(credential.as_bytes());
         for byte in raw.iter_mut() {
             *byte = 0;
         }
 
         let mut records = self.records.lock();
-        let verified = Self::verify_locked(&records, terminal_id, &presented, project_id);
+        let verified = Self::verify_locked(
+            &records,
+            terminal_id,
+            &presented,
+            conversation_id,
+            project_id,
+        );
         if !verified {
             drop(records);
             log::warn!(
-                "[claims] rotate failed terminal_id={} project_id={}",
+                "[claims] rotate failed terminal_id={} conversation_id={} project_id={}",
                 terminal_id,
+                conversation_id,
                 project_id.unwrap_or("<none>")
             );
             return Err(ClaimError);
@@ -288,12 +332,77 @@ impl TerminalClaimRegistry {
         drop(records);
 
         log::info!(
-            "[claims] rotated terminal_id={} project_id={} generation={}",
+            "[claims] rotated terminal_id={} conversation_id={} project_id={} generation={}",
             terminal_id,
+            conversation_id,
             project_id.unwrap_or("<none>"),
             generation
         );
         Ok(credential)
+    }
+
+    /// Trusted cold-resume rotation after the host has independently
+    /// authorized the exact Conversation/terminal pair through its passive
+    /// SessionWorkspace reference. No old credential is accepted on this path.
+    /// The successor digest and generation are installed under one lock hold;
+    /// every mismatch returns the same data-free [`ClaimError`].
+    pub fn rotate_for_resume(
+        &self,
+        terminal_id: &str,
+        conversation_id: ConversationId,
+        project_id: Option<&str>,
+    ) -> Result<(String, u64), ClaimError> {
+        let mut raw = [0u8; 32];
+        getrandom::getrandom(&mut raw).expect("OS CSPRNG is available");
+        let credential = hex_encode(&raw);
+        let digest = sha256_digest(credential.as_bytes());
+        for byte in raw.iter_mut() {
+            *byte = 0;
+        }
+
+        let mut records = self.records.lock();
+        let Some(record) = records.get_mut(terminal_id) else {
+            drop(records);
+            log::warn!(
+                "[claims] resume rotation failed terminal_id={} conversation_id={} project_id={}",
+                terminal_id,
+                conversation_id,
+                project_id.unwrap_or("<none>")
+            );
+            return Err(ClaimError);
+        };
+        let project_matches = match (&record.project_id, project_id) {
+            (Some(bound), Some(presented)) => {
+                bool::from(bound.as_bytes().ct_eq(presented.as_bytes()))
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if record.conversation_id != conversation_id || !project_matches {
+            drop(records);
+            log::warn!(
+                "[claims] resume rotation failed terminal_id={} conversation_id={} project_id={}",
+                terminal_id,
+                conversation_id,
+                project_id.unwrap_or("<none>")
+            );
+            return Err(ClaimError);
+        }
+
+        record.digest = digest;
+        record.revoked = false;
+        record.generation = record.generation.wrapping_add(1);
+        let generation = record.generation;
+        drop(records);
+
+        log::info!(
+            "[claims] resume claim rotated terminal_id={} conversation_id={} project_id={} generation={}",
+            terminal_id,
+            conversation_id,
+            project_id.unwrap_or("<none>"),
+            generation
+        );
+        Ok((credential, generation))
     }
 
     /// Revoke: invalidate the presented credential. The PTY is untouched —
@@ -305,12 +414,14 @@ impl TerminalClaimRegistry {
         &self,
         terminal_id: &str,
         claim: &str,
+        conversation_id: ConversationId,
         project_id: Option<&str>,
     ) -> Result<(), ClaimError> {
         if claim.len() > CLAIM_CREDENTIAL_LEN {
             log::warn!(
-                "[claims] revoke failed (oversized credential) terminal_id={} project_id={}",
+                "[claims] revoke failed (oversized credential) terminal_id={} conversation_id={} project_id={}",
                 terminal_id,
+                conversation_id,
                 project_id.unwrap_or("<none>")
             );
             return Err(ClaimError);
@@ -318,12 +429,19 @@ impl TerminalClaimRegistry {
         let presented = sha256_digest(claim.as_bytes());
 
         let mut records = self.records.lock();
-        let verified = Self::verify_locked(&records, terminal_id, &presented, project_id);
+        let verified = Self::verify_locked(
+            &records,
+            terminal_id,
+            &presented,
+            conversation_id,
+            project_id,
+        );
         if !verified {
             drop(records);
             log::warn!(
-                "[claims] revoke failed terminal_id={} project_id={}",
+                "[claims] revoke failed terminal_id={} conversation_id={} project_id={}",
                 terminal_id,
+                conversation_id,
                 project_id.unwrap_or("<none>")
             );
             return Err(ClaimError);
@@ -337,8 +455,9 @@ impl TerminalClaimRegistry {
         drop(records);
 
         log::info!(
-            "[claims] revoked terminal_id={} project_id={} generation={}",
+            "[claims] revoked terminal_id={} conversation_id={} project_id={} generation={}",
             terminal_id,
+            conversation_id,
             project_id.unwrap_or("<none>"),
             generation
         );
@@ -374,10 +493,18 @@ impl TerminalClaimRegistry {
 mod tests {
     use super::*;
 
+    fn conversation_id() -> ConversationId {
+        ConversationId::parse("018f7a1c-1b4d-7c8a-9f01-0123456789ab").unwrap()
+    }
+
+    fn other_conversation_id() -> ConversationId {
+        ConversationId::parse("5f7a1c01-4d1b-4c8a-af01-0123456789ab").unwrap()
+    }
+
     #[test]
     fn issuance_returns_64_char_hex_credential() {
         let registry = TerminalClaimRegistry::new();
-        let credential = registry.issue("t1", Some("p1"));
+        let credential = registry.issue("t1", conversation_id(), Some("p1"));
         assert_eq!(credential.len(), CLAIM_CREDENTIAL_LEN);
         assert!(
             credential.chars().all(|c| c.is_ascii_hexdigit()),
@@ -386,31 +513,45 @@ mod tests {
     }
 
     #[test]
+    fn rotated_claim_debug_output_is_redacted() {
+        let rotated = RotatedClaim {
+            claim: "raw-claim-must-not-reach-logs".to_string(),
+        };
+        let debug = format!("{rotated:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains(&rotated.claim));
+    }
+
+    #[test]
     fn issued_credentials_are_unguessable_distinct() {
         let registry = TerminalClaimRegistry::new();
-        let a = registry.issue("t1", Some("p1"));
-        let b = registry.issue("t2", Some("p1"));
+        let a = registry.issue("t1", conversation_id(), Some("p1"));
+        let b = registry.issue("t2", conversation_id(), Some("p1"));
         assert_ne!(a, b);
     }
 
     #[test]
     fn verify_accepts_correct_credential_with_matching_binding() {
         let registry = TerminalClaimRegistry::new();
-        let credential = registry.issue("t1", Some("p1"));
-        assert!(registry.verify("t1", &credential, Some("p1")).is_ok());
+        let credential = registry.issue("t1", conversation_id(), Some("p1"));
+        assert!(registry
+            .verify("t1", &credential, conversation_id(), Some("p1"))
+            .is_ok());
     }
 
     #[test]
     fn verify_accepts_terminal_with_no_project_binding() {
         let registry = TerminalClaimRegistry::new();
-        let credential = registry.issue("t1", None);
-        assert!(registry.verify("t1", &credential, None).is_ok());
+        let credential = registry.issue("t1", conversation_id(), None);
+        assert!(registry
+            .verify("t1", &credential, conversation_id(), None)
+            .is_ok());
     }
 
     #[test]
     fn host_stores_only_the_digest_not_the_raw_credential() {
         let registry = TerminalClaimRegistry::new();
-        let credential = registry.issue("t1", Some("p1"));
+        let credential = registry.issue("t1", conversation_id(), Some("p1"));
 
         // 1. The stored digest equals a recomputed SHA-256 of the credential —
         //    proving the credential is recoverable ONLY as a one-way digest.
@@ -436,10 +577,10 @@ mod tests {
     #[test]
     fn unknown_terminal_uses_dummy_digest_path_and_fails_identically() {
         let registry = TerminalClaimRegistry::new();
-        let credential = registry.issue("t1", Some("p1"));
+        let credential = registry.issue("t1", conversation_id(), Some("p1"));
         // Probe an unknown terminal with a plausible credential — same error.
-        let unknown = registry.verify("t-unknown", &credential, Some("p1"));
-        let wrong = registry.verify("t1", "not-the-credential", Some("p1"));
+        let unknown = registry.verify("t-unknown", &credential, conversation_id(), Some("p1"));
+        let wrong = registry.verify("t1", "not-the-credential", conversation_id(), Some("p1"));
         assert_eq!(unknown, Err(ClaimError));
         assert_eq!(wrong, Err(ClaimError));
         assert_eq!(unknown, wrong, "failures must be indistinguishable");
@@ -448,75 +589,151 @@ mod tests {
     #[test]
     fn rotation_invalidates_old_credential_and_issues_new() {
         let registry = TerminalClaimRegistry::new();
-        let old = registry.issue("t1", Some("p1"));
+        let old = registry.issue("t1", conversation_id(), Some("p1"));
         let gen0 = registry.generation("t1");
 
-        let new = registry.rotate("t1", &old, Some("p1")).unwrap();
+        let new = registry
+            .rotate("t1", &old, conversation_id(), Some("p1"))
+            .unwrap();
         assert_ne!(new, old);
         assert_eq!(new.len(), CLAIM_CREDENTIAL_LEN);
 
         // Old credential stops working immediately; new one verifies.
-        assert_eq!(registry.verify("t1", &old, Some("p1")), Err(ClaimError));
-        assert!(registry.verify("t1", &new, Some("p1")).is_ok());
+        assert_eq!(
+            registry.verify("t1", &old, conversation_id(), Some("p1")),
+            Err(ClaimError)
+        );
+        assert!(registry
+            .verify("t1", &new, conversation_id(), Some("p1"))
+            .is_ok());
         assert_ne!(registry.generation("t1"), gen0);
+    }
+
+    #[test]
+    fn resume_rotates_scope_bound_claim() {
+        let registry = TerminalClaimRegistry::new();
+        let old = registry.issue("t1", conversation_id(), Some("p1"));
+        let old_generation = registry.generation("t1").unwrap();
+
+        assert_eq!(
+            registry.rotate_for_resume("t1", other_conversation_id(), Some("p1")),
+            Err(ClaimError)
+        );
+        assert_eq!(
+            registry.rotate_for_resume("missing", conversation_id(), Some("p1")),
+            Err(ClaimError)
+        );
+        assert_eq!(registry.generation("t1"), Some(old_generation));
+        assert!(registry
+            .verify("t1", &old, conversation_id(), Some("p1"))
+            .is_ok());
+
+        let (successor, generation) = registry
+            .rotate_for_resume("t1", conversation_id(), Some("p1"))
+            .unwrap();
+        assert_ne!(successor, old);
+        assert!(generation > old_generation);
+        assert_eq!(
+            registry.verify("t1", &old, conversation_id(), Some("p1")),
+            Err(ClaimError)
+        );
+        assert!(registry
+            .verify("t1", &successor, conversation_id(), Some("p1"))
+            .is_ok());
     }
 
     #[test]
     fn rotate_requires_current_valid_credential() {
         let registry = TerminalClaimRegistry::new();
-        let credential = registry.issue("t1", Some("p1"));
-        registry.revoke("t1", &credential, Some("p1")).unwrap();
+        let credential = registry.issue("t1", conversation_id(), Some("p1"));
+        registry
+            .revoke("t1", &credential, conversation_id(), Some("p1"))
+            .unwrap();
         // A revoked credential cannot rotate (no re-issue path this story).
-        assert_eq!(registry.rotate("t1", &credential, Some("p1")), Err(ClaimError));
+        assert_eq!(
+            registry.rotate("t1", &credential, conversation_id(), Some("p1")),
+            Err(ClaimError)
+        );
     }
 
     #[test]
     fn revocation_invalidates_credential_and_bumps_generation() {
         let registry = TerminalClaimRegistry::new();
-        let credential = registry.issue("t1", Some("p1"));
+        let credential = registry.issue("t1", conversation_id(), Some("p1"));
         let gen0 = registry.generation("t1").unwrap();
 
-        registry.revoke("t1", &credential, Some("p1")).unwrap();
+        registry
+            .revoke("t1", &credential, conversation_id(), Some("p1"))
+            .unwrap();
 
-        assert_eq!(registry.verify("t1", &credential, Some("p1")), Err(ClaimError));
+        assert_eq!(
+            registry.verify("t1", &credential, conversation_id(), Some("p1")),
+            Err(ClaimError)
+        );
         assert_eq!(registry.generation("t1").unwrap(), gen0 + 1);
         // Double-revoke with the now-invalid credential fails generically.
-        assert_eq!(registry.revoke("t1", &credential, Some("p1")), Err(ClaimError));
+        assert_eq!(
+            registry.revoke("t1", &credential, conversation_id(), Some("p1")),
+            Err(ClaimError)
+        );
     }
 
     #[test]
     fn revoke_with_wrong_credential_fails_generically() {
         let registry = TerminalClaimRegistry::new();
-        let _credential = registry.issue("t1", Some("p1"));
-        assert_eq!(registry.revoke("t1", "wrong", Some("p1")), Err(ClaimError));
+        let _credential = registry.issue("t1", conversation_id(), Some("p1"));
+        assert_eq!(
+            registry.revoke("t1", "wrong", conversation_id(), Some("p1")),
+            Err(ClaimError)
+        );
     }
 
     #[test]
-    fn binding_mismatch_fails() {
+    fn conversation_scope_is_primary_and_project_attribution_is_secondary() {
         let registry = TerminalClaimRegistry::new();
-        let credential = registry.issue("t1", Some("project-a"));
-        // Correct credential, different project context → reject.
-        assert_eq!(registry.verify("t1", &credential, Some("project-b")), Err(ClaimError));
+        let credential = registry.issue("t1", conversation_id(), Some("project-a"));
+        assert_eq!(
+            registry.verify(
+                "t1",
+                &credential,
+                other_conversation_id(),
+                Some("project-a")
+            ),
+            Err(ClaimError)
+        );
+        // Correct Conversation scope, different project attribution → reject.
+        assert_eq!(
+            registry.verify("t1", &credential, conversation_id(), Some("project-b")),
+            Err(ClaimError)
+        );
         // None vs Some also mismatches.
-        assert_eq!(registry.verify("t1", &credential, None), Err(ClaimError));
+        assert_eq!(
+            registry.verify("t1", &credential, conversation_id(), None),
+            Err(ClaimError)
+        );
     }
 
     #[test]
     fn identical_failure_semantics_across_all_failure_modes() {
         let registry = TerminalClaimRegistry::new();
-        let credential = registry.issue("t1", Some("p1"));
+        let credential = registry.issue("t1", conversation_id(), Some("p1"));
 
         let modes = [
-            registry.verify("t-missing", &credential, Some("p1")), // unknown terminal
-            registry.verify("t1", "deadbeef", Some("p1")),          // wrong credential
-            registry.verify("t1", &credential, Some("p-other")),    // binding mismatch
+            registry.verify("t-missing", &credential, conversation_id(), Some("p1")), // unknown terminal
+            registry.verify("t1", "deadbeef", conversation_id(), Some("p1")), // wrong credential
+            registry.verify("t1", &credential, conversation_id(), Some("p-other")), // binding mismatch
         ];
         for outcome in &modes {
             assert_eq!(*outcome, Err(ClaimError));
         }
         // Revoked adds a fourth identical mode.
-        registry.revoke("t1", &credential, Some("p1")).unwrap();
-        assert_eq!(registry.verify("t1", &credential, Some("p1")), Err(ClaimError));
+        registry
+            .revoke("t1", &credential, conversation_id(), Some("p1"))
+            .unwrap();
+        assert_eq!(
+            registry.verify("t1", &credential, conversation_id(), Some("p1")),
+            Err(ClaimError)
+        );
 
         // Single collapsed variant: every failure debug-renders identically.
         let rendered: std::collections::HashSet<String> = modes
@@ -529,31 +746,48 @@ mod tests {
     #[test]
     fn claim_length_cap_rejects_oversized_probes_before_hashing() {
         let registry = TerminalClaimRegistry::new();
-        let credential = registry.issue("t1", Some("p1"));
+        let credential = registry.issue("t1", conversation_id(), Some("p1"));
 
         let oversized = "a".repeat(CLAIM_CREDENTIAL_LEN + 1);
-        assert_eq!(registry.verify("t1", &oversized, Some("p1")), Err(ClaimError));
+        assert_eq!(
+            registry.verify("t1", &oversized, conversation_id(), Some("p1")),
+            Err(ClaimError)
+        );
         // Cap is inclusive at the issued length: a max-length wrong credential
         // still reaches the (bounded) hash path and fails identically.
         let max_len_wrong = "b".repeat(CLAIM_CREDENTIAL_LEN);
-        assert_eq!(registry.verify("t1", &max_len_wrong, Some("p1")), Err(ClaimError));
+        assert_eq!(
+            registry.verify("t1", &max_len_wrong, conversation_id(), Some("p1")),
+            Err(ClaimError)
+        );
         // Rotation/revocation honor the same cap.
-        assert_eq!(registry.rotate("t1", &oversized, Some("p1")), Err(ClaimError));
-        assert_eq!(registry.revoke("t1", &oversized, Some("p1")), Err(ClaimError));
+        assert_eq!(
+            registry.rotate("t1", &oversized, conversation_id(), Some("p1")),
+            Err(ClaimError)
+        );
+        assert_eq!(
+            registry.revoke("t1", &oversized, conversation_id(), Some("p1")),
+            Err(ClaimError)
+        );
         // A real credential still verifies after oversized probes.
-        assert!(registry.verify("t1", &credential, Some("p1")).is_ok());
+        assert!(registry
+            .verify("t1", &credential, conversation_id(), Some("p1"))
+            .is_ok());
     }
 
     #[test]
     fn remove_clears_record_and_generation() {
         let registry = TerminalClaimRegistry::new();
-        let credential = registry.issue("t1", Some("p1"));
+        let credential = registry.issue("t1", conversation_id(), Some("p1"));
         assert!(registry.generation("t1").is_some());
 
         registry.remove("t1");
 
         assert!(registry.generation("t1").is_none());
-        assert_eq!(registry.verify("t1", &credential, Some("p1")), Err(ClaimError));
+        assert_eq!(
+            registry.verify("t1", &credential, conversation_id(), Some("p1")),
+            Err(ClaimError)
+        );
         // Removing an unknown terminal is a no-op.
         registry.remove("t1");
     }
@@ -561,14 +795,18 @@ mod tests {
     #[test]
     fn generation_bumps_are_monotonic_across_rotate_and_revoke() {
         let registry = TerminalClaimRegistry::new();
-        let c0 = registry.issue("t1", Some("p1"));
+        let c0 = registry.issue("t1", conversation_id(), Some("p1"));
         let g0 = registry.generation("t1").unwrap();
 
-        let c1 = registry.rotate("t1", &c0, Some("p1")).unwrap();
+        let c1 = registry
+            .rotate("t1", &c0, conversation_id(), Some("p1"))
+            .unwrap();
         let g1 = registry.generation("t1").unwrap();
         assert!(g1 > g0);
 
-        registry.revoke("t1", &c1, Some("p1")).unwrap();
+        registry
+            .revoke("t1", &c1, conversation_id(), Some("p1"))
+            .unwrap();
         let g2 = registry.generation("t1").unwrap();
         assert!(g2 > g1);
     }
@@ -581,13 +819,15 @@ mod tests {
         // verify-then-mutate implementation without the single-lock hold
         // would let multiple racers each receive a "fresh" credential.
         let registry = std::sync::Arc::new(TerminalClaimRegistry::new());
-        let old = registry.issue("t1", Some("p1"));
+        let old = registry.issue("t1", conversation_id(), Some("p1"));
 
         let mut handles = Vec::new();
         for _ in 0..8 {
             let reg = std::sync::Arc::clone(&registry);
             let credential = old.clone();
-            handles.push(std::thread::spawn(move || reg.rotate("t1", &credential, Some("p1"))));
+            handles.push(std::thread::spawn(move || {
+                reg.rotate("t1", &credential, conversation_id(), Some("p1"))
+            }));
         }
         let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
@@ -602,7 +842,12 @@ mod tests {
             "all other racers fail with the collapsed error"
         );
         // The single winner's credential is the only valid one afterwards.
-        assert!(registry.verify("t1", successes[0], Some("p1")).is_ok());
-        assert_eq!(registry.verify("t1", &old, Some("p1")), Err(ClaimError));
+        assert!(registry
+            .verify("t1", successes[0], conversation_id(), Some("p1"))
+            .is_ok());
+        assert_eq!(
+            registry.verify("t1", &old, conversation_id(), Some("p1")),
+            Err(ClaimError)
+        );
     }
 }

@@ -1,10 +1,16 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { MemoryRouter } from 'react-router-dom'
+import { type MutableRefObject, useEffect } from 'react'
+import { MemoryRouter, Route, Routes, useNavigate } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TooltipProvider } from '@/components/ui/tooltip'
+import { persistState, restoreProjectWorkspace } from '@/hooks/use-editor-persistence'
+import WorkspaceDashboard from '@/pages/WorkspaceDashboard'
+import { useConversationStore } from '@/stores/conversation-store'
 import { useFileExplorerStore } from '@/stores/file-explorer-store'
+import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
 import { useSidebarStore } from '@/stores/sidebar-store'
 import { useThemePickerStore } from '@/stores/theme-picker-store'
+import { useWorkspaceStore } from '@/stores/workspace-store'
 import type { Project, ProjectColor, Terminal } from '@/types/project'
 import WorkspaceLayout from './WorkspaceLayout'
 
@@ -58,10 +64,16 @@ const mockUseTerminals = vi.fn((): Terminal[] => [])
 const mockUseAllTerminals = vi.fn((): Terminal[] => [])
 const mockUseActiveTerminal = vi.fn((): Terminal | null => null)
 const mockUseActiveTerminalId = vi.fn((): string => '')
+const mockCloseTerminalView = vi.fn(async () => true)
+const mockTerminateTerminalResource = vi.fn(async () => true)
 const mockUseTerminalActions = vi.fn(() => ({
   selectTerminal: vi.fn(),
   addTerminal: vi.fn(),
   closeTerminal: vi.fn(),
+  closeTerminalView: mockCloseTerminalView,
+  reopenTerminalView: vi.fn(),
+  terminateTerminalResource: mockTerminateTerminalResource,
+  restartTerminalResource: vi.fn(async () => true),
   renameTerminal: vi.fn(),
   reorderTerminals: vi.fn(),
   setTerminalPtyId: vi.fn(),
@@ -98,7 +110,19 @@ vi.mock('@/stores/project-store', () => ({
 }))
 
 vi.mock('@/stores/terminal-store', () => ({
-  useTerminalStore: vi.fn((selector) => selector({ terminals: [] })),
+  useTerminalStore: Object.assign(
+    vi.fn((selector) => selector({ terminals: mockUseTerminals() })),
+    {
+      getState: () => ({
+        terminals: mockUseTerminals(),
+        activeTerminalId: mockUseActiveTerminalId(),
+        findTerminalByPtyId: (ptyId: string) =>
+          mockUseTerminals().find((terminal) => terminal.ptyId === ptyId),
+        selectTerminal: vi.fn(),
+        isTerminalLimitReached: vi.fn(() => false)
+      })
+    }
+  ),
   useTerminals: () => mockUseTerminals(),
   useAllTerminals: () => mockUseAllTerminals(),
   useActiveTerminal: () => mockUseActiveTerminal(),
@@ -119,6 +143,7 @@ vi.mock('@/stores/app-settings-store', () => ({
   useTerminalFontSize: vi.fn(() => 14),
   useUiZoomLevel: vi.fn(() => 1),
   useTerminalFontFamily: vi.fn(() => 'monospace'),
+  useTerminalSymbolFontFamily: vi.fn(() => ''),
   useTerminalBufferSize: vi.fn(() => 10000),
   useDefaultShell: vi.fn(() => 'bash'),
   useMaxTerminalsPerProject: vi.fn(() => 10),
@@ -231,7 +256,9 @@ vi.mock('@/hooks/use-file-watcher', () => ({
 
 vi.mock('@/hooks/use-editor-persistence', () => ({
   useEditorPersistence: vi.fn(),
-  persistState: vi.fn()
+  persistState: vi.fn(),
+  restoreProjectWorkspace: vi.fn().mockResolvedValue(false),
+  subscribeProjectWorkspaceRestored: vi.fn(() => () => {})
 }))
 
 // P17: shared canonical mock shape for the Story 6 sync hook + banner —
@@ -242,6 +269,14 @@ vi.mock('@/hooks/use-workspace-manifest-sync', () => ({
   loadWorkspaceManifest: vi.fn().mockResolvedValue(false),
   resolveManifestConflict: vi.fn().mockResolvedValue(undefined),
   performManifestWrite: vi.fn().mockResolvedValue(undefined)
+}))
+vi.mock('@/hooks/use-session-workspace-sync', () => ({
+  useSessionWorkspaceSync: vi.fn(),
+  useSessionWorkspaceBootstrap: vi.fn(),
+  loadSessionWorkspace: vi.fn().mockResolvedValue(false),
+  resolveSessionWorkspaceConflict: vi.fn().mockResolvedValue(undefined),
+  resolveSessionWorkspaceRecovery: vi.fn().mockResolvedValue(undefined),
+  performSessionWorkspaceWrite: vi.fn().mockResolvedValue('skipped')
 }))
 vi.mock('@/components/workspace/WorkspaceConflictBanner', () => ({
   WorkspaceConflictBanner: () => <div data-testid="workspace-conflict-banner" />
@@ -263,6 +298,10 @@ vi.mock('@/components/file-explorer/FileExplorer', () => ({
   FileExplorer: () => <div data-testid="file-explorer" />
 }))
 
+vi.mock('@/components/workspace/PaneRenderer', () => ({
+  PaneRenderer: () => <div data-testid="pane-renderer" />
+}))
+
 // Mock the active Tauri API seam used by WorkspaceLayout and nested components.
 const { mockApi } = vi.hoisted(() => ({
   mockApi: {
@@ -282,6 +321,8 @@ const { mockApi } = vi.hoisted(() => ({
       onExit: vi.fn(() => vi.fn()),
       spawn: vi.fn().mockResolvedValue({ success: true, data: 'mock-pty-id' }),
       resize: vi.fn().mockResolvedValue({ success: true }),
+      closeView: vi.fn().mockResolvedValue({ success: true }),
+      terminate: vi.fn().mockResolvedValue({ success: true }),
       kill: vi.fn().mockResolvedValue({ success: true }),
       write: vi.fn().mockResolvedValue({ success: true })
     },
@@ -387,9 +428,15 @@ beforeEach(() => {
   mockUseAllTerminals.mockReturnValue([])
   mockUseActiveTerminal.mockReturnValue(null)
   mockUseActiveTerminalId.mockReturnValue('')
+  mockCloseTerminalView.mockReset()
+  mockCloseTerminalView.mockResolvedValue(true)
+  mockTerminateTerminalResource.mockReset()
+  mockTerminateTerminalResource.mockResolvedValue(true)
   mockUpdatePanelVisibility.mockReset()
   mockWaitForPendingAppSettingsPersistence.mockReset()
+  useConversationStore.getState().reset()
   useFileExplorerStore.setState({ isVisible: true })
+  useSessionWorkspaceSyncStore.setState({ activeConversationId: null })
   useSidebarStore.setState({ isVisible: true })
   useThemePickerStore.getState().close()
   mockApi.filesystem.watchDirectory.mockReset()
@@ -409,7 +456,7 @@ afterEach(() => {
 })
 
 // Helper to render with router
-const renderWithRouter = (initialEntries = ['/']) => {
+const renderWithRouter = (initialEntries = ['/c/018f7a1c-1b4d-7c8a-9f01-0123456789ab']) => {
   return render(
     <TooltipProvider>
       <MemoryRouter initialEntries={initialEntries}>
@@ -419,7 +466,61 @@ const renderWithRouter = (initialEntries = ['/']) => {
   )
 }
 
+function WorkspaceLayoutWithNavigate({
+  navigateRef
+}: {
+  navigateRef: MutableRefObject<((to: string) => void) | null>
+}) {
+  const navigate = useNavigate()
+  useEffect(() => {
+    navigateRef.current = navigate
+  }, [navigate, navigateRef])
+  return <WorkspaceLayout />
+}
+
 describe('WorkspaceLayout - Empty States', () => {
+  it('renders the regular project workspace at root without the conversation area', async () => {
+    render(
+      <TooltipProvider>
+        <MemoryRouter initialEntries={['/']}>
+          <Routes>
+            <Route path="/" element={<WorkspaceLayout />}>
+              <Route path="conversations" element={<WorkspaceDashboard />} />
+            </Route>
+          </Routes>
+        </MemoryRouter>
+      </TooltipProvider>
+    )
+
+    expect(await screen.findByTestId('pane-renderer')).toBeVisible()
+    expect(
+      screen.queryByRole('heading', { name: 'Your Conversation workspace' })
+    ).not.toBeInTheDocument()
+    // Exclusive sidebars: root shows the project sidebar, never the conversation one.
+    expect(screen.queryByLabelText('Search conversations')).not.toBeInTheDocument()
+  })
+
+  it('renders the independent conversation area only on the conversations route', async () => {
+    render(
+      <TooltipProvider>
+        <MemoryRouter initialEntries={['/conversations']}>
+          <Routes>
+            <Route path="/" element={<WorkspaceLayout />}>
+              <Route path="conversations" element={<WorkspaceDashboard />} />
+            </Route>
+          </Routes>
+        </MemoryRouter>
+      </TooltipProvider>
+    )
+
+    expect(
+      await screen.findByRole('heading', { name: 'Your Conversation workspace' })
+    ).toBeVisible()
+    expect(screen.getByRole('button', { name: 'New Chat' })).toBeEnabled()
+    expect(screen.getByLabelText('Search conversations')).toBeVisible()
+    expect(screen.queryByTestId('pane-renderer')).not.toBeInTheDocument()
+  })
+
   it('renders a full-width macOS titlebar zone above workspace chrome', () => {
     platformState.isMac = true
 
@@ -460,9 +561,10 @@ describe('WorkspaceLayout - Empty States', () => {
 
     renderWithRouter()
 
-    // Patch 19: the Story 6 sync hook is mounted with the active project id.
-    const { useWorkspaceManifestSync } = await import('@/hooks/use-workspace-manifest-sync')
-    expect(useWorkspaceManifestSync).toHaveBeenCalledWith('project-1')
+    const conversationId = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+    act(() => useConversationStore.getState().setActiveConversationId(conversationId))
+    const { useSessionWorkspaceSync } = await import('@/hooks/use-session-workspace-sync')
+    expect(useSessionWorkspaceSync).toHaveBeenCalledWith(conversationId)
 
     window.dispatchEvent(new Event('beforeunload'))
 
@@ -471,61 +573,33 @@ describe('WorkspaceLayout - Empty States', () => {
     })
   })
 
-  describe('No Projects Empty State', () => {
+  describe('Zero-project Conversation state', () => {
     beforeEach(() => {
-      // Ensure no projects
       mockUseProjects.mockReturnValue([])
       mockUseActiveProject.mockReturnValue(null)
       mockUseActiveProjectId.mockReturnValue('')
     })
 
-    it('should render no projects empty state when projects array is empty', () => {
+    it('keeps the workspace and global Conversation navigation usable with no projects', () => {
       renderWithRouter()
 
-      expect(screen.getByText('No Projects Yet')).toBeInTheDocument()
-      expect(
-        screen.getByText(
-          'Create your first project to organize your terminals, snapshots, and commands'
-        )
-      ).toBeInTheDocument()
+      expect(screen.getByText('Conversations')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'New Chat' })).toBeEnabled()
+      expect(screen.getByTestId('pane-renderer')).toBeInTheDocument()
     })
 
-    it('should show descriptive message about creating first project', () => {
+    it('keeps project-only file explorer and Git controls gated', () => {
       renderWithRouter()
 
-      const description = screen.getByText(
-        'Create your first project to organize your terminals, snapshots, and commands'
-      )
-      expect(description).toBeInTheDocument()
-      expect(description.tagName).toBe('P')
+      expect(screen.queryByTestId('file-explorer')).not.toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Open git changes' })).toBeDisabled()
     })
 
-    it('should have a button to create first project', () => {
-      renderWithRouter()
-
-      const button = screen.getByText('Create Your First Project')
-      expect(button).toBeInTheDocument()
-      expect(button.tagName).toBe('BUTTON')
-    })
-
-    it('shows the create-first-project CTA on web (isTauriContext false)', () => {
-      const prev = tauriRef.current
+    it('keeps project-less New Chat enabled on the web root', () => {
       tauriRef.current = false
-      try {
-        renderWithRouter()
-        const button = screen.getByText('Create Your First Project')
-        expect(button).toBeInTheDocument()
-        expect(button.tagName).toBe('BUTTON')
-      } finally {
-        tauriRef.current = prev
-      }
-    })
-
-    it('should not show terminal-related elements when no projects', () => {
       renderWithRouter()
 
-      expect(screen.queryByText('No Terminals Yet')).not.toBeInTheDocument()
-      expect(screen.queryByText('Create Your First Terminal')).not.toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'New Chat' })).toBeEnabled()
     })
   })
 
@@ -583,86 +657,29 @@ describe('WorkspaceLayout - Empty States', () => {
     })
   })
 
-  describe('Empty State Styling', () => {
-    it('should center no projects empty state', () => {
+  describe('Zero-project styling', () => {
+    it('keeps the Conversation sidebar and workspace pane visible', () => {
       mockUseProjects.mockReturnValue([])
       mockUseActiveProject.mockReturnValue(null)
       mockUseActiveProjectId.mockReturnValue('')
 
       renderWithRouter()
 
-      const emptyStateContainer = screen.getByText('No Projects Yet').closest('div')?.parentElement
-      expect(emptyStateContainer?.className).toContain('items-center')
-      expect(emptyStateContainer?.className).toContain('justify-center')
-    })
-
-    it.skip('should center empty pane hint in workspace area', () => {
-      mockUseProjects.mockReturnValue([
-        {
-          id: '1',
-          name: 'Test Project',
-          color: 'blue',
-          path: '/test/project',
-          gitBranch: 'main',
-          isActive: true
-        }
-      ])
-      mockUseActiveProject.mockReturnValue({
-        id: '1',
-        name: 'Test Project',
-        color: 'blue',
-        path: '/test/project',
-        gitBranch: 'main',
-        isActive: true
-      })
-      mockUseActiveProjectId.mockReturnValue('1')
-      mockUseTerminals.mockReturnValue([])
-      mockUseAllTerminals.mockReturnValue([])
-      mockUseActiveTerminal.mockReturnValue(null)
-      mockUseActiveTerminalId.mockReturnValue('')
-
-      renderWithRouter()
-
-      const emptyHint = screen.getByText('Drag a tab or file here')
-      const emptyStateContainer = emptyHint.closest('div')
-      expect(emptyStateContainer?.className).toContain('items-center')
-      expect(emptyStateContainer?.className).toContain('justify-center')
-    })
-
-    it('should apply correct text styling to titles', () => {
-      mockUseProjects.mockReturnValue([])
-      mockUseActiveProject.mockReturnValue(null)
-      mockUseActiveProjectId.mockReturnValue('')
-
-      renderWithRouter()
-
-      const title = screen.getByText('No Projects Yet')
-      expect(title.className).toContain('text-xl')
-      expect(title.className).toContain('font-semibold')
-    })
-
-    it('should apply muted styling to descriptions', () => {
-      mockUseProjects.mockReturnValue([])
-      mockUseActiveProject.mockReturnValue(null)
-      mockUseActiveProjectId.mockReturnValue('')
-
-      renderWithRouter()
-
-      const description = screen.getByText(/Create your first project to organize your terminals/)
-      expect(description.className).toContain('text-muted-foreground')
+      expect(screen.getByText('Conversations')).toBeVisible()
+      expect(screen.getByTestId('pane-renderer')).toBeVisible()
     })
   })
 
   describe('Transitions Between States', () => {
-    it('should show no projects state when no projects exist', () => {
+    it('keeps project-less New Chat and the workspace pane visible', () => {
       mockUseProjects.mockReturnValue([])
       mockUseActiveProject.mockReturnValue(null)
       mockUseActiveProjectId.mockReturnValue('')
 
       renderWithRouter()
 
-      expect(screen.getByText('No Projects Yet')).toBeInTheDocument()
-      expect(screen.queryByText('No Terminals Yet')).not.toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'New Chat' })).toBeEnabled()
+      expect(screen.getByTestId('pane-renderer')).toBeInTheDocument()
     })
 
     it.skip('should show empty pane hint when project exists but has no tabs', () => {
@@ -894,7 +911,7 @@ describe('WorkspaceLayout - Empty States', () => {
       expect(
         await screen.findByRole('dialog', { name: 'Color theme picker' }, { timeout: 10000 })
       ).toBeInTheDocument()
-    })
+    }, 15_000)
   })
 
   describe('Close flow persistence coordination', () => {
@@ -1118,6 +1135,63 @@ describe('WorkspaceLayout - Empty States', () => {
       })
     })
 
+    it('surfaces hidden live Conversation terminals as reopenable on desktop', () => {
+      const projects = [createProject('a', '/workspace/a', 'blue')]
+      const terminal = {
+        id: 'terminal-hidden',
+        conversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab',
+        projectId: 'a',
+        name: 'Hidden shell',
+        shell: 'bash',
+        ptyId: 'pty-hidden',
+        claim: 'memory-only',
+        viewState: 'hidden',
+        healthStatus: 'running'
+      } as Terminal
+      useConversationStore
+        .getState()
+        .setActiveConversationId('018f7a1c-1b4d-7c8a-9f01-0123456789ab')
+      useSessionWorkspaceSyncStore.setState({
+        activeConversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+      })
+      mockUseProjects.mockReturnValue(projects)
+      mockUseTerminals.mockReturnValue([terminal])
+      mockUseAllTerminals.mockReturnValue([terminal])
+      mockUseActiveProject.mockReturnValue(projects[0])
+      mockUseActiveProjectId.mockReturnValue('a')
+
+      renderWithRouter()
+
+      expect(screen.getByText('Hidden running terminals')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Reopen Hidden shell' })).toHaveClass('h-9')
+      expect(screen.getByRole('button', { name: 'Stop' })).toBeInTheDocument()
+    })
+
+    it('surfaces hidden live project terminals so they can be reopened or stopped', () => {
+      const projects = [createProject('a', '/workspace/a', 'blue')]
+      const terminal = {
+        id: 'terminal-project-hidden',
+        projectId: 'a',
+        name: 'zsh',
+        shell: 'zsh',
+        ptyId: 'pty-project-hidden',
+        viewState: 'hidden',
+        healthStatus: 'running'
+      } as Terminal
+      mockUseProjects.mockReturnValue(projects)
+      mockUseTerminals.mockReturnValue([terminal])
+      mockUseAllTerminals.mockReturnValue([terminal])
+      mockUseActiveProject.mockReturnValue(projects[0])
+      mockUseActiveProjectId.mockReturnValue('a')
+
+      renderWithRouter(['/'])
+
+      expect(screen.getByText('Hidden running terminals')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Reopen zsh' })).toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
+      expect(screen.getByText('Terminate terminal process?')).toBeInTheDocument()
+    })
+
     it.skip('does not re-run terminal sync when terminal ids stay unchanged across rerenders', async () => {
       const projects = [createProject('a', '/workspace/a', 'blue')]
       const terminal = {
@@ -1203,6 +1277,113 @@ describe('WorkspaceLayout - Empty States', () => {
         tauriRef.current = prev
         mockApi.filesystem.watchDirectory.mockResolvedValue({ success: true })
       }
+    }, 15_000)
+  })
+})
+
+describe('WorkspaceLayout - conversation area navigation', () => {
+  afterEach(() => {
+    useWorkspaceStore.getState().resetLayout()
+    vi.mocked(restoreProjectWorkspace).mockReset()
+    vi.mocked(restoreProjectWorkspace).mockResolvedValue(false)
+    vi.mocked(persistState).mockReset()
+  })
+
+  function setupActiveProject(): void {
+    const projects = [createProject('a', '/workspace/a', 'blue')]
+    mockUseProjects.mockReturnValue(projects)
+    mockUseActiveProject.mockReturnValue(projects[0])
+    mockUseActiveProjectId.mockReturnValue('a')
+  }
+
+  it('does not restore the project workspace when leaving an open chat for the conversation list', async () => {
+    setupActiveProject()
+    const navigateRef: MutableRefObject<((to: string) => void) | null> = { current: null }
+    vi.mocked(restoreProjectWorkspace).mockClear()
+
+    render(
+      <TooltipProvider>
+        <MemoryRouter initialEntries={['/c/018f7a1c-1b4d-7c8a-9f01-0123456789ab']}>
+          <WorkspaceLayoutWithNavigate navigateRef={navigateRef} />
+        </MemoryRouter>
+      </TooltipProvider>
+    )
+
+    await waitFor(() => {
+      expect(navigateRef.current).not.toBeNull()
+    })
+
+    act(() => {
+      navigateRef.current?.('/conversations')
+    })
+
+    await waitFor(() => {
+      expect(vi.mocked(restoreProjectWorkspace)).not.toHaveBeenCalled()
+    })
+  })
+
+  it('restores the project workspace only when leaving the conversation area for projects', async () => {
+    setupActiveProject()
+    const terminal = {
+      id: 'terminal-a',
+      projectId: 'a',
+      name: 'zsh',
+      shell: 'zsh',
+      ptyId: 'pty-a',
+      viewState: 'open',
+      healthStatus: 'running'
+    } as Terminal
+    mockUseTerminals.mockReturnValue([terminal])
+    mockUseAllTerminals.mockReturnValue([terminal])
+    useWorkspaceStore.getState().addTerminalTab('terminal-a')
+    const navigateRef: MutableRefObject<((to: string) => void) | null> = { current: null }
+    vi.mocked(restoreProjectWorkspace).mockReset()
+    vi.mocked(restoreProjectWorkspace).mockResolvedValue(true)
+
+    render(
+      <TooltipProvider>
+        <MemoryRouter initialEntries={['/c/018f7a1c-1b4d-7c8a-9f01-0123456789ab']}>
+          <WorkspaceLayoutWithNavigate navigateRef={navigateRef} />
+        </MemoryRouter>
+      </TooltipProvider>
+    )
+
+    await waitFor(() => {
+      expect(navigateRef.current).not.toBeNull()
+    })
+
+    act(() => {
+      navigateRef.current?.('/')
+    })
+
+    await waitFor(() => {
+      expect(vi.mocked(restoreProjectWorkspace)).toHaveBeenCalledWith('a')
+    })
+  })
+
+  it('persists the project layout when entering the conversation list from the project workspace', async () => {
+    setupActiveProject()
+    const navigateRef: MutableRefObject<((to: string) => void) | null> = { current: null }
+    vi.mocked(persistState).mockClear()
+
+    render(
+      <TooltipProvider>
+        <MemoryRouter initialEntries={['/']}>
+          <WorkspaceLayoutWithNavigate navigateRef={navigateRef} />
+        </MemoryRouter>
+      </TooltipProvider>
+    )
+
+    await waitFor(() => {
+      expect(navigateRef.current).not.toBeNull()
+    })
+
+    act(() => {
+      navigateRef.current?.('/conversations')
+    })
+
+    await waitFor(() => {
+      expect(vi.mocked(persistState)).toHaveBeenCalledWith('a')
     })
   })
 })

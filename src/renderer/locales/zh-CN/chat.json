@@ -32,6 +32,21 @@
     "sendFailed": "无法发送消息，请重试。",
     "updateMcpFailed": "无法更新 MCP 服务器，已恢复之前的设置。"
   },
+  "permissionPolicy": {
+    "title": "工具权限",
+    "description": "选择此 ACP 代理使用工具前是否必须询问。该设置会应用到使用此代理的所有会话。",
+    "allowAll": "完全允许工具请求",
+    "allowAllHint": "自动接受代理提供的允许选项。",
+    "askShort": "询问",
+    "allowAllShort": "完全允许",
+    "open": "工具权限策略：{{policy}}",
+    "toggle": "完全允许工具请求",
+    "confirmTitle": "完全允许这个代理的请求？",
+    "confirmDescription": "代理之后提供的允许选项将不再逐次询问，可能会修改文件或执行命令。请只对你信任的代理和工作区启用。",
+    "keepAsking": "继续逐次询问",
+    "enableFullAccess": "启用完全允许",
+    "updateFailed": "无法更新工具权限：{{message}}"
+  },
   "connection": {
     "connected": "已连接",
     "disconnected": "已断开",
@@ -108,6 +123,10 @@
     "openFailed": "无法打开该对话，请重试。",
     "reconnectFailed": "无法重新连接，请重试。",
     "deleteFailed": "无法删除该对话，请重试。",
+    "backfillProgress": "正在加载历史：已加载 {{loadedRecordCount}} 条 · 下一游标 {{nextCursor}} · 目标前沿 {{targetLastSeq}}。",
+    "backfillIncomplete": "历史不完整：已加载 {{loadedRecordCount}} 条 · 下一游标 {{nextCursor}} · 目标前沿 {{targetLastSeq}} · 错误代码 {{errorCode}}。",
+    "retryHistory": "重试历史记录",
+    "retryHistoryFailed": "无法加载剩余历史记录，请重试。",
     "search": "搜索对话…",
     "empty": "暂无对话。请使用“新建对话”按钮开始。",
     "noMatches": "没有匹配项。",
@@ -115,6 +134,78 @@
     "today": "今天",
     "yesterday": "昨天",
     "earlier": "更早"
+  },
+  "lifecycle": {
+    "actions": "对话操作",
+    "actionsFor": "{{title}} 的对话操作",
+    "legacyReadOnly": "旧版对话历史为只读",
+    "closeView": "关闭对话视图",
+    "detach": "分离代理绑定",
+    "rebind": "重新绑定已分离代理",
+    "suspend": "暂停代理",
+    "replace": "替换代理",
+    "delete": "删除对话",
+    "confirm": {
+      "detach": {
+        "title": "分离代理绑定？",
+        "message": "要从“{{title}}”分离代理吗？代理会继续运行，但在重新绑定前不会再向此对话路由事件。",
+        "confirm": "分离绑定"
+      },
+      "rebind": {
+        "title": "重新绑定代理？",
+        "message": "要将“{{title}}”重新连接到同一个仍在运行的代理会话吗？",
+        "confirm": "重新绑定代理"
+      },
+      "suspend": {
+        "title": "暂停代理？",
+        "message": "要关闭“{{title}}”的代理会话吗？对话、记录、工作区和终端都会保留。",
+        "confirm": "暂停代理"
+      },
+      "replace": {
+        "title": "替换代理？",
+        "message": "要为“{{title}}”创建新的代理会话，同时保留同一个对话和工作区吗？",
+        "confirm": "替换代理"
+      },
+      "delete": {
+        "title": "删除对话？",
+        "message": "将永久删除“{{title}}”及其工作区目录（含其中的文件）。仍在运行的代理会话和终端进程会一并结束。",
+        "confirm": "删除对话"
+      }
+    },
+    "success": {
+      "detach": "代理绑定已分离",
+      "rebind": "代理绑定已恢复",
+      "suspend": "代理已暂停",
+      "replace": "代理已替换",
+      "delete": "对话已删除"
+    },
+    "blocked": {
+      "title": "对话仍有存活资源",
+      "description": "无法结束这些终端进程，删除已取消：{{resources}}"
+    },
+    "errors": {
+      "CONVERSATION_CONFLICT": "对话已发生变化，请刷新后重试。",
+      "CONVERSATION_NOT_FOUND": "找不到该对话。",
+      "CONVERSATION_BINDING_NOT_FOUND": "该对话没有代理绑定。",
+      "CONVERSATION_BINDING_NOT_ACTIVE": "此操作需要活动的代理绑定。",
+      "CONVERSATION_BINDING_NOT_DETACHED": "此操作需要已分离的代理绑定。",
+      "CONVERSATION_BINDING_NOT_ADDRESSABLE": "已分离的代理会话已无法访问。",
+      "CONVERSATION_LIVE_RESOURCES": "仍有终端进程无法结束，删除已取消。",
+      "CONVERSATION_RECOVERY_REQUIRED": "执行此操作前需要先恢复对话。",
+      "CONVERSATION_DURABILITY_FAILED": "无法安全保存生命周期变更。",
+      "ACP_CLOSE_UNSUPPORTED": "此代理不支持暂停。",
+      "ACP_CLOSE_FAILED": "无法暂停代理。",
+      "ACP_REPLACE_FAILED": "无法创建替换代理会话。",
+      "VALIDATION_ERROR": "生命周期请求无效。",
+      "FORBIDDEN": "当前连接不允许执行此生命周期操作。",
+      "NETWORK_ERROR": "生命周期请求无法连接到主机。"
+    },
+    "rename": "重命名",
+    "renameTitle": "重命名对话",
+    "renamePlaceholder": "输入新名称（1-120 字符）",
+    "renameCancel": "取消",
+    "renameConfirm": "保存",
+    "renameSuccess": "已重命名"
   },
   "question": {
     "sendFailed": "无法发送回答，请重试。",
@@ -302,5 +393,12 @@
     "temporarySessionClosed": "临时 ACP 会话意外关闭",
     "worktreeCreationFailed": "创建工作树失败：{{error}}",
     "unknownError": "未知错误"
+  },
+  "scheduledTaskDraft": {
+    "title": "定时任务草稿",
+    "review": "审核",
+    "everySeconds": "每 {{count}} 秒",
+    "revisionHash": "第 {{revision}} 版 · {{hash}}…",
+    "notActive": "该草稿在你审核并确认精确修订与哈希前不会执行。"
   }
 }

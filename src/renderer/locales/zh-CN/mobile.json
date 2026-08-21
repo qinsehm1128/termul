@@ -13,6 +13,8 @@
     "browseFiles": "浏览文件",
     "commandPalette": "命令面板",
     "gitChanges": "Git 更改",
+    "executionTarget": "执行目标与项目上下文",
+    "executionTargetDescription": "附加或移除项目上下文，并在不更改会话身份和工作区的情况下切换执行目标。",
     "restartTerminal": "重启终端",
     "closeTerminal": "关闭终端",
     "newChat": "新建聊天",
@@ -25,7 +27,10 @@
     "newTerminal": "新建终端",
     "noOpenTerminals": "没有打开的终端",
     "terminal": "终端",
-    "renameTerminal": "重命名终端"
+    "renameTerminal": "重命名终端",
+    "closeTerminalView": "关闭终端视图",
+    "terminateTerminal": "终止终端进程",
+    "reopenTerminal": "重新打开"
   },
   "files": {
     "title": "文件",

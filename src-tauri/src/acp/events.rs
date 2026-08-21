@@ -8,14 +8,20 @@
 //! Event names are namespaced under `acp:` and centralized as `const` strings
 //! so the manager and any future renderer bridge stay in sync.
 
+use std::sync::Arc;
+
 use crate::acp::config::{AgentId, SessionId};
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, AvailableCommand, ContentBlock, PermissionOption, Plan,
-    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
-    SessionConfigSelectOptions, SessionMode, SessionModeId, StopReason, ToolCall, ToolCallUpdate,
+    AgentCapabilities, AvailableCommand, ContentBlock, PermissionOption, Plan, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOptions, SessionMode,
+    SessionModeId, StopReason, ToolCall, ToolCallUpdate,
 };
 use serde::Serialize;
 
+use crate::conversation::{
+    ConversationPersistenceAdapter, CONVERSATION_PERSISTENCE_COMMIT_INDETERMINATE,
+    DEFAULT_DELIVERY_COMMIT_TIMEOUT,
+};
 /// Re-export the transport-neutral fan-out helper so the `acp` dispatcher emits
 /// through `Vec<Arc<dyn EventSink>>` instead of `AppHandle::emit` directly
 /// (Story 1.1 / architecture D2). Call sites read `events::fan_out(sinks, sid,
@@ -24,7 +30,213 @@ use serde::Serialize;
 ///
 /// The ONLY place that still calls `AppHandle::emit` for `acp:*` events is
 /// `crate::web::TauriEventSink::emit` (the desktop's sink). See AC7.
-pub(crate) use crate::web::fan_out;
+///
+/// Re-export the typed receipt/error alongside the function so ACP producers
+/// can stay within the `events::` namespace when they classify durable
+/// admission failures.
+pub(crate) use crate::web::sink::{fan_out, FanOutError, FanOutReceipt};
+use crate::web::EventSink;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryFailureClass {
+    RetryableBackpressure,
+    Fatal,
+    Indeterminate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryError {
+    pub code: &'static str,
+    pub source_code: Option<&'static str>,
+    pub class: DeliveryFailureClass,
+    pub delivered_count: usize,
+}
+
+impl DeliveryError {
+    #[must_use]
+    pub const fn circuit_open(source_code: &'static str) -> Self {
+        Self {
+            code: crate::web::sink::CONVERSATION_PERSISTENCE_REJECTED,
+            source_code: Some(source_code),
+            class: DeliveryFailureClass::Fatal,
+            delivered_count: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_retryable(&self) -> bool {
+        matches!(self.class, DeliveryFailureClass::RetryableBackpressure)
+    }
+
+    #[must_use]
+    pub const fn is_durable_rejection(&self) -> bool {
+        self.source_code.is_some()
+    }
+
+    #[must_use]
+    pub fn is_unbound_session(&self) -> bool {
+        self.source_code == Some(crate::web::sink::CONVERSATION_BINDING_NOT_FOUND)
+    }
+
+    #[must_use]
+    pub fn should_open_session_circuit(&self) -> bool {
+        self.is_durable_rejection() && !self.is_retryable() && !self.is_unbound_session()
+    }
+}
+
+impl std::fmt::Display for DeliveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.code)
+    }
+}
+
+impl std::error::Error for DeliveryError {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryReceipt {
+    pub sink_count: usize,
+    pub delivered_count: usize,
+    pub durable_admission_count: usize,
+    pub session_seq: Option<u64>,
+    pub canonical_seq: Option<u64>,
+}
+
+impl DeliveryReceipt {
+    #[must_use]
+    pub const fn empty(sink_count: usize) -> Self {
+        Self {
+            sink_count,
+            delivered_count: 0,
+            durable_admission_count: 0,
+            session_seq: None,
+            canonical_seq: None,
+        }
+    }
+}
+
+/// One serialize-once fan-out result whose durable frontier can be awaited without publishing the
+/// event again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeliveryTicket {
+    session_id: Option<String>,
+    receipt: FanOutReceipt,
+}
+
+impl DeliveryTicket {
+    #[must_use]
+    pub fn admitted(session_id: Option<&str>, receipt: FanOutReceipt) -> Self {
+        Self {
+            session_id: session_id.map(str::to_string),
+            receipt,
+        }
+    }
+
+    pub async fn committed(
+        self,
+        persistence: Option<&ConversationPersistenceAdapter>,
+    ) -> Result<DeliveryReceipt, DeliveryError> {
+        let canonical_seq = match (
+            persistence,
+            self.session_id.as_deref(),
+            self.receipt.session_seq,
+            self.receipt.durable_admission_count,
+        ) {
+            (Some(persistence), Some(session_id), Some(target_seq), count) if count > 0 => Some(
+                persistence
+                    .await_committed_seq(session_id, target_seq, DEFAULT_DELIVERY_COMMIT_TIMEOUT)
+                    .await
+                    .map_err(|error| DeliveryError {
+                        code: error.code,
+                        source_code: Some(error.code),
+                        class: if error.code == CONVERSATION_PERSISTENCE_COMMIT_INDETERMINATE {
+                            DeliveryFailureClass::Indeterminate
+                        } else {
+                            classify_source_code(error.code)
+                        },
+                        delivered_count: self.receipt.delivered_count,
+                    })?,
+            ),
+            (Some(_), Some(_), None, count) if count > 0 => {
+                return Err(DeliveryError {
+                    code: CONVERSATION_PERSISTENCE_COMMIT_INDETERMINATE,
+                    source_code: Some(CONVERSATION_PERSISTENCE_COMMIT_INDETERMINATE),
+                    class: DeliveryFailureClass::Indeterminate,
+                    delivered_count: self.receipt.delivered_count,
+                });
+            }
+            _ => None,
+        };
+        Ok(DeliveryReceipt {
+            sink_count: self.receipt.sink_count,
+            delivered_count: self.receipt.delivered_count,
+            durable_admission_count: self.receipt.durable_admission_count,
+            session_seq: self.receipt.session_seq,
+            canonical_seq,
+        })
+    }
+}
+
+fn classify_source_code(code: &'static str) -> DeliveryFailureClass {
+    match code {
+        "CONVERSATION_PERSISTENCE_BYTES_SATURATED"
+        | "CONVERSATION_PERSISTENCE_QUEUE_SATURATED"
+        | "SESSION_PERSISTENCE_QUEUE_FULL" => DeliveryFailureClass::RetryableBackpressure,
+        CONVERSATION_PERSISTENCE_COMMIT_INDETERMINATE
+        | "CONVERSATION_EVENT_APPEND_FAILED"
+        | "CONVERSATION_PERSISTENCE_FRONTIER_MISMATCH" => DeliveryFailureClass::Indeterminate,
+        _ => DeliveryFailureClass::Fatal,
+    }
+}
+
+fn map_fan_out_error(error: FanOutError) -> DeliveryError {
+    let class = error
+        .source_code
+        .map_or(DeliveryFailureClass::Fatal, classify_source_code);
+    DeliveryError {
+        code: error.code,
+        source_code: error.source_code,
+        class,
+        delivered_count: error.delivered_count,
+    }
+}
+
+/// Serialize once, fan out once, and return a ticket for the canonical commit frontier.
+pub fn fan_out_ticket<P: Serialize>(
+    sinks: &[Arc<dyn EventSink>],
+    session_id: Option<&str>,
+    type_: &'static str,
+    payload: &P,
+) -> Result<DeliveryTicket, DeliveryError> {
+    if crate::conversation::contracts::encoded_json_len_bounded(
+        payload,
+        crate::conversation::MAX_CONVERSATION_RECORD_BYTES,
+    )
+    .is_none()
+    {
+        return Err(DeliveryError {
+            code: crate::web::sink::EVENT_DELIVERY_FAILED,
+            source_code: Some("CONVERSATION_RECORD_TOO_LARGE"),
+            class: DeliveryFailureClass::Fatal,
+            delivered_count: 0,
+        });
+    }
+    fan_out(sinks, session_id, type_, payload)
+        .map(|receipt| DeliveryTicket::admitted(session_id, receipt))
+        .map_err(map_fan_out_error)
+}
+
+/// Convenience path for ACP producers that must not return before durable admission commits.
+pub async fn deliver<P: Serialize>(
+    sinks: &[Arc<dyn EventSink>],
+    persistence: Option<&ConversationPersistenceAdapter>,
+    session_id: Option<&str>,
+    type_: &'static str,
+    payload: &P,
+) -> Result<DeliveryReceipt, DeliveryError> {
+    fan_out_ticket(sinks, session_id, type_, payload)?
+        .committed(persistence)
+        .await
+}
 
 /// A single selectable model advertised by an ACP agent.
 ///
@@ -113,9 +325,7 @@ pub(crate) fn models_from_config_options(
 /// `configId` is the agent-provided option id (conventionally `"model"` but not
 /// guaranteed). This extracts the real id so `set_model` targets it precisely.
 #[allow(clippy::module_name_repetitions)]
-pub(crate) fn model_config_id_from_options(
-    opts: Option<&[SessionConfigOption]>,
-) -> Option<String> {
+pub(crate) fn model_config_id_from_options(opts: Option<&[SessionConfigOption]>) -> Option<String> {
     let opts = opts?;
     let opt = opts
         .iter()
@@ -449,6 +659,18 @@ mod tests {
     use agent_client_protocol::schema::v1::SessionConfigSelectOption;
 
     #[test]
+    fn unbound_session_delivery_does_not_open_circuit() {
+        let unbound = DeliveryError {
+            code: crate::web::sink::CONVERSATION_PERSISTENCE_REJECTED,
+            source_code: Some(crate::web::sink::CONVERSATION_BINDING_NOT_FOUND),
+            class: DeliveryFailureClass::Fatal,
+            delivered_count: 0,
+        };
+        assert!(unbound.is_unbound_session());
+        assert!(!unbound.should_open_session_circuit());
+    }
+
+    #[test]
     fn agent_spawned_serializes_camel_case() {
         let event = AgentSpawnedEvent {
             agent_id: AgentId("agent-1".to_string()),
@@ -553,7 +775,10 @@ mod tests {
         assert_eq!(value["stopReason"], "end_turn");
         // Story 1.8 T3.2: `turnId` is absent when `None` (byte-identical to
         // pre-1.8 desktop payloads — `skip_serializing_if = "Option::is_none"`).
-        assert!(value.get("turnId").is_none(), "turnId must be absent when None");
+        assert!(
+            value.get("turnId").is_none(),
+            "turnId must be absent when None"
+        );
     }
 
     #[test]
@@ -655,7 +880,7 @@ mod tests {
             agent_id: AgentId("a1".to_string()),
             session_id: SessionId::new("sess-1"),
             question_id: "q-7".to_string(),
-            question: "Which approach?" .to_string(),
+            question: "Which approach?".to_string(),
             options: vec![
                 QuestionOption {
                     value: "plan-a".to_string(),
@@ -735,10 +960,13 @@ mod tests {
     #[test]
     fn models_from_config_options_returns_none_without_model_category() {
         // A non-Model-category select option must not populate the picker.
-        let opt =
-            SessionConfigOption::select("mode", "Mode", "build", Vec::<SessionConfigSelectOption>::new()).category(
-                SessionConfigOptionCategory::Mode,
-            );
+        let opt = SessionConfigOption::select(
+            "mode",
+            "Mode",
+            "build",
+            Vec::<SessionConfigSelectOption>::new(),
+        )
+        .category(SessionConfigOptionCategory::Mode);
         assert!(models_from_config_options(Some(&[opt])).is_none());
         assert!(models_from_config_options(None).is_none());
         assert!(models_from_config_options(Some(&[])).is_none());
@@ -754,10 +982,13 @@ mod tests {
             Some("llm_model".to_string())
         );
         // Falls back to None when no Model-category option is advertised.
-        let non_model =
-            SessionConfigOption::select("mode", "Mode", "build", Vec::<SessionConfigSelectOption>::new()).category(
-                SessionConfigOptionCategory::Mode,
-            );
+        let non_model = SessionConfigOption::select(
+            "mode",
+            "Mode",
+            "build",
+            Vec::<SessionConfigSelectOption>::new(),
+        )
+        .category(SessionConfigOptionCategory::Mode);
         assert_eq!(model_config_id_from_options(Some(&[non_model])), None);
     }
 }

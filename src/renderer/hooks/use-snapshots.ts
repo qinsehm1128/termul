@@ -2,6 +2,7 @@ import { useCallback, useEffect } from 'react'
 import { terminalApi } from '@/lib/api'
 import { resolveEnvForSpawn } from '@/lib/env-parser'
 import { useProjectStore } from '@/stores/project-store'
+import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
 import { useSnapshotActions } from '@/stores/snapshot-store'
 import { useTerminalStore } from '@/stores/terminal-store'
 import type { Snapshot } from '@/types/project'
@@ -111,6 +112,8 @@ export function useRestoreSnapshot(): (snapshotId: string) => Promise<void> {
 async function restoreFromSnapshot(projectId: string, snapshot: PersistedSnapshot): Promise<void> {
   const terminalStore = useTerminalStore.getState()
   const projectStore = useProjectStore.getState()
+  const conversationId = useSessionWorkspaceSyncStore.getState().activeConversationId
+  if (!conversationId) return
   const project = projectStore.projects.find((p) => p.id === projectId)
 
   // Resolve project env vars for spawn
@@ -123,7 +126,7 @@ async function restoreFromSnapshot(projectId: string, snapshot: PersistedSnapsho
   for (const terminal of existingTerminals) {
     if (terminal.ptyId) {
       try {
-        await terminalApi.kill(terminal.ptyId)
+        await terminalApi.terminate(terminal.ptyId)
       } catch {
         // Continue with close even if kill fails
       }
@@ -137,6 +140,7 @@ async function restoreFromSnapshot(projectId: string, snapshot: PersistedSnapsho
 
   for (const persistedTerminal of snapshot.terminals) {
     const spawnResult = await terminalApi.spawn({
+      conversationId,
       projectId,
       shell: persistedTerminal.shell as 'powershell' | 'cmd' | 'bash' | 'zsh' | 'fish' | undefined,
       cwd: persistedTerminal.cwd,
@@ -152,7 +156,8 @@ async function restoreFromSnapshot(projectId: string, snapshot: PersistedSnapsho
       projectId,
       persistedTerminal.shell as 'powershell' | 'cmd' | 'bash' | 'zsh' | 'fish' | undefined,
       persistedTerminal.cwd,
-      persistedTerminal.scrollback
+      persistedTerminal.scrollback,
+      conversationId
     )
     terminalStore.setTerminalPtyId(created.id, spawnResult.data.id)
     // CAP-3: the snapshot re-spawn issues a fresh lease — capture it

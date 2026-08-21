@@ -57,6 +57,7 @@ const {
     setActiveFilePath: vi.fn()
   },
   mockTerminalStoreState: {
+    terminals: [],
     activeTerminalId: '',
     selectTerminal: vi.fn(),
     setTerminalPtyId: vi.fn()
@@ -238,7 +239,10 @@ vi.mock('@/hooks/use-file-watcher', () => ({
 }))
 
 vi.mock('@/hooks/use-editor-persistence', () => ({
-  useEditorPersistence: () => undefined
+  useEditorPersistence: () => undefined,
+  persistState: vi.fn(),
+  restoreProjectWorkspace: vi.fn().mockResolvedValue(false),
+  subscribeProjectWorkspaceRestored: vi.fn(() => () => {})
 }))
 
 // P17: shared canonical mock shape for the Story 6 sync hook + banner —

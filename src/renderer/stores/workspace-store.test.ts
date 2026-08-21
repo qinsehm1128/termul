@@ -1,5 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { setRouterNavigate } from '@/lib/router-navigate'
 import type { LeafNode, SplitNode } from '@/types/workspace.types'
+import { useTerminalStore } from './terminal-store'
 import type { WorkspaceState } from './workspace-store'
 import { flattenSameDirection, useWorkspaceStore } from './workspace-store'
 
@@ -35,6 +37,12 @@ describe('workspace-store split/move invariants', () => {
     vi.spyOn(globalThis.crypto, 'randomUUID').mockImplementation(
       () => `00000000-0000-0000-0000-00000000000${++seq}`
     )
+    useTerminalStore.setState({
+      terminals: [],
+      activeTerminalId: '',
+      ptyIdIndex: new Map(),
+      cleanupRecoveries: {}
+    })
     useWorkspaceStore.setState(() => {
       const root: LeafNode = { type: 'leaf', id: 'pane-root', tabs: [], activeTabId: null }
       return {
@@ -199,6 +207,24 @@ describe('workspace-store split/move invariants', () => {
     expect(pane.activeTabId).toBe(editorTab.id)
   })
 
+  it('closeChatView removes only the chat tab, preserves terminals, and clears its route', () => {
+    const store = useWorkspaceStore.getState()
+    const navigate = vi.fn()
+    setRouterNavigate(navigate)
+    window.location.hash = '#/c/conversation-session'
+    store.addTerminalTab('terminal-live')
+    store.addAgentChatTab('conversation-session')
+
+    store.closeChatView('conversation-session')
+
+    const pane = useWorkspaceStore.getState().root as LeafNode
+    expect(pane.tabs).toEqual([
+      { type: 'terminal', id: 'term-terminal-live', terminalId: 'terminal-live' }
+    ])
+    expect(navigate).toHaveBeenCalledWith('/conversations')
+    setRouterNavigate(null)
+  })
+
   it('ensureTerminalTab can activate inserted terminal when requested', () => {
     const store = useWorkspaceStore.getState()
     const editorTab = createEditorTab('edit-/focused.ts')
@@ -233,6 +259,29 @@ describe('workspace-store split/move invariants', () => {
 
     expect(left.tabs).toEqual([{ type: 'terminal', id: 'term-a', terminalId: 'a' }])
     expect(right.tabs).toEqual([])
+  })
+
+  it('syncTerminalTabs does not recreate a tab for a hidden close-view terminal', () => {
+    useTerminalStore.setState({
+      terminals: [
+        {
+          id: 'hidden-term',
+          projectId: 'project-1',
+          name: 'Hidden',
+          shell: 'zsh',
+          ptyId: 'pty-hidden',
+          viewState: 'hidden',
+          isHidden: true,
+          healthStatus: 'running'
+        }
+      ]
+    })
+    const store = useWorkspaceStore.getState()
+
+    store.syncTerminalTabs(['hidden-term'])
+
+    const pane = useWorkspaceStore.getState().root as LeafNode
+    expect(pane.tabs).toEqual([])
   })
 
   it('syncTerminalTabs is a no-op when the terminal set is unchanged', () => {

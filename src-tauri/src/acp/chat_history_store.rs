@@ -52,6 +52,10 @@ pub struct ChatHistoryIndexEntry {
     pub worktree_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_branch: Option<String>,
+    /// Canonical Conversation identity when `storage_key` is a ConversationId.
+    /// Absent on legacy rows whose storage key is the opaque ACP session id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,6 +87,7 @@ pub enum ChatHistoryStoreError {
     InvalidSessionId,
     InvalidPayload(String),
     SessionNotFound,
+    LegacyStoreReadOnly,
 }
 
 impl std::fmt::Display for ChatHistoryStoreError {
@@ -96,6 +101,7 @@ impl std::fmt::Display for ChatHistoryStoreError {
             Self::InvalidSessionId => write!(f, "invalid chat history session id"),
             Self::InvalidPayload(message) => write!(f, "invalid chat history payload: {message}"),
             Self::SessionNotFound => write!(f, "chat history session not found"),
+            Self::LegacyStoreReadOnly => write!(f, "LEGACY_STORE_READ_ONLY"),
         }
     }
 }
@@ -121,6 +127,7 @@ struct StoreState {
 pub struct ChatHistoryStore {
     root: PathBuf,
     state: Mutex<StoreState>,
+    read_only: bool,
 }
 
 impl ChatHistoryStore {
@@ -130,6 +137,14 @@ impl ChatHistoryStore {
     }
 
     pub fn open(root: PathBuf) -> Result<Arc<Self>> {
+        Self::open_mode(root, false)
+    }
+
+    pub fn open_read_only(root: PathBuf) -> Result<Arc<Self>> {
+        Self::open_mode(root, true)
+    }
+
+    fn open_mode(root: PathBuf, read_only: bool) -> Result<Arc<Self>> {
         if root.exists() && !root.is_dir() {
             return Err(io::Error::other(format!(
                 "chat history root '{}' is not a directory",
@@ -137,15 +152,31 @@ impl ChatHistoryStore {
             ))
             .into());
         }
-        fs::create_dir_all(root.join(PAYLOADS_DIR))?;
+        if !root.exists() {
+            if read_only {
+                return Ok(Arc::new(Self {
+                    root,
+                    state: Mutex::new(StoreState {
+                        sessions: Vec::new(),
+                        legacy_import_complete: false,
+                    }),
+                    read_only,
+                }));
+            }
+            fs::create_dir_all(root.join(PAYLOADS_DIR))?;
+        } else if !read_only {
+            fs::create_dir_all(root.join(PAYLOADS_DIR))?;
+        }
         let legacy_import_complete = load_legacy_import_state(&root.join(LEGACY_IMPORT_FILE))?;
         let index_path = root.join(INDEX_FILE);
-        let mut sessions = match load_index(&index_path)? {
+        let mut sessions = match load_index(&index_path, read_only)? {
             Some(index) => index.sessions,
             None => {
-                let mut recovered = recover_payload_index(&root)?;
+                let mut recovered = recover_payload_index(&root, read_only)?;
                 sort_sessions(&mut recovered);
-                persist_index(&root, &recovered)?;
+                if !read_only {
+                    persist_index(&root, &recovered)?;
+                }
                 recovered
             }
         };
@@ -156,6 +187,7 @@ impl ChatHistoryStore {
                 sessions,
                 legacy_import_complete,
             }),
+            read_only,
         }))
     }
 
@@ -231,6 +263,7 @@ impl ChatHistoryStore {
     }
 
     pub fn save(&self, session_id: &str, payload: Value) -> Result<()> {
+        self.ensure_writable()?;
         validate_session_id(session_id)?;
         let (mut entry, message_count) = validate_payload(&payload, Some(session_id))?;
         entry.message_count = message_count;
@@ -261,6 +294,7 @@ impl ChatHistoryStore {
     }
 
     pub fn delete(&self, session_id: &str) -> Result<()> {
+        self.ensure_writable()?;
         validate_session_id(session_id)?;
         let path = self.payload_path(session_id)?;
         let mut state = self.state.lock();
@@ -283,6 +317,7 @@ impl ChatHistoryStore {
     }
 
     pub fn mark_legacy_import_complete(&self) -> Result<()> {
+        self.ensure_writable()?;
         let marker = LegacyImportFile {
             schema_version: CHAT_HISTORY_SCHEMA_VERSION,
             complete: true,
@@ -296,6 +331,7 @@ impl ChatHistoryStore {
     }
 
     pub fn flush(&self) -> Result<()> {
+        self.ensure_writable()?;
         let state = self.state.lock();
         persist_index(&self.root, &state.sessions)?;
         sync_if_present(&self.root.join(INDEX_FILE))?;
@@ -305,6 +341,15 @@ impl ChatHistoryStore {
         }
         sync_dir(&self.root.join(PAYLOADS_DIR))?;
         Ok(())
+    }
+
+    fn ensure_writable(&self) -> Result<()> {
+        if self.read_only {
+            log::warn!("[acp-history] legacy mutation rejected code=LEGACY_STORE_READ_ONLY");
+            Err(ChatHistoryStoreError::LegacyStoreReadOnly)
+        } else {
+            Ok(())
+        }
     }
 
     fn payload_path(&self, session_id: &str) -> Result<PathBuf> {
@@ -362,7 +407,7 @@ fn max_message_seq(payload: &Value) -> u64 {
         .unwrap_or(0)
 }
 
-fn load_index(path: &Path) -> Result<Option<IndexFile>> {
+fn load_index(path: &Path, read_only: bool) -> Result<Option<IndexFile>> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -374,13 +419,15 @@ fn load_index(path: &Path) -> Result<Option<IndexFile>> {
             Err(ChatHistoryStoreError::UnsupportedVersion { found })
         }
         Err(_) => {
-            quarantine(path, &bytes)?;
+            if !read_only {
+                quarantine(path, &bytes)?;
+            }
             Ok(None)
         }
     }
 }
 
-fn recover_payload_index(root: &Path) -> Result<Vec<ChatHistoryIndexEntry>> {
+fn recover_payload_index(root: &Path, read_only: bool) -> Result<Vec<ChatHistoryIndexEntry>> {
     let payloads_dir = root.join(PAYLOADS_DIR);
     let mut sessions = Vec::new();
     for dir_entry in fs::read_dir(&payloads_dir)? {
@@ -420,7 +467,9 @@ fn recover_payload_index(root: &Path) -> Result<Vec<ChatHistoryIndexEntry>> {
             | Err(ChatHistoryStoreError::Json(_))
             | Err(ChatHistoryStoreError::InvalidPayload(_))
             | Err(ChatHistoryStoreError::UnsupportedVersion { .. }) => {
-                quarantine(&path, &bytes)?;
+                if !read_only {
+                    quarantine(&path, &bytes)?;
+                }
             }
             Err(error) => return Err(error),
         }
@@ -700,6 +749,94 @@ mod tests {
             "b"
         );
         drop(store);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_only_mode_performs_zero_writes_and_rejects_all_mutations() {
+        let root = temp_dir("read-only");
+        let writable = ChatHistoryStore::open(root.clone()).unwrap();
+        writable.save("session", payload("session", 2)).unwrap();
+        writable.mark_legacy_import_complete().unwrap();
+        drop(writable);
+        let before = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    let children = fs::read_dir(&path)
+                        .unwrap()
+                        .flatten()
+                        .map(|child| (child.file_name(), fs::read(child.path()).unwrap()))
+                        .collect::<Vec<_>>();
+                    (entry.file_name(), None, children)
+                } else {
+                    (
+                        entry.file_name(),
+                        Some(fs::read(&path).unwrap()),
+                        Vec::new(),
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let read_only = ChatHistoryStore::open_read_only(root.clone()).unwrap();
+        assert_eq!(read_only.get("session").unwrap(), payload("session", 2));
+        assert!(matches!(
+            read_only.save("other", payload("other", 3)),
+            Err(ChatHistoryStoreError::LegacyStoreReadOnly)
+        ));
+        assert!(matches!(
+            read_only.delete("session"),
+            Err(ChatHistoryStoreError::LegacyStoreReadOnly)
+        ));
+        assert!(matches!(
+            read_only.mark_legacy_import_complete(),
+            Err(ChatHistoryStoreError::LegacyStoreReadOnly)
+        ));
+        assert!(matches!(
+            read_only.flush(),
+            Err(ChatHistoryStoreError::LegacyStoreReadOnly)
+        ));
+        drop(read_only);
+
+        let after = fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    let children = fs::read_dir(&path)
+                        .unwrap()
+                        .flatten()
+                        .map(|child| (child.file_name(), fs::read(child.path()).unwrap()))
+                        .collect::<Vec<_>>();
+                    (entry.file_name(), None, children)
+                } else {
+                    (
+                        entry.file_name(),
+                        Some(fs::read(&path).unwrap()),
+                        Vec::new(),
+                    )
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(before, after);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_only_corrupt_index_is_not_quarantined_or_rewritten() {
+        let root = temp_dir("read-only-corrupt");
+        fs::create_dir_all(root.join(PAYLOADS_DIR)).unwrap();
+        let corrupt = b"not-json";
+        fs::write(root.join(INDEX_FILE), corrupt).unwrap();
+        let store = ChatHistoryStore::open_read_only(root.clone()).unwrap();
+        assert!(store.list().0.is_empty());
+        drop(store);
+        assert_eq!(fs::read(root.join(INDEX_FILE)).unwrap(), corrupt);
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 2);
         let _ = fs::remove_dir_all(root);
     }
 

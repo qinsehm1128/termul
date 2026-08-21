@@ -2,6 +2,7 @@ import agentsEn from '@/locales/en/agents.json'
 import browserEn from '@/locales/en/browser.json'
 import chatEn from '@/locales/en/chat.json'
 import commonEn from '@/locales/en/common.json'
+import conversationEn from '@/locales/en/conversation.json'
 import gitEn from '@/locales/en/git.json'
 import mcpEn from '@/locales/en/mcp.json'
 import mobileEn from '@/locales/en/mobile.json'
@@ -15,6 +16,7 @@ import agentsZhCn from '@/locales/zh-CN/agents.json'
 import browserZhCn from '@/locales/zh-CN/browser.json'
 import chatZhCn from '@/locales/zh-CN/chat.json'
 import commonZhCn from '@/locales/zh-CN/common.json'
+import conversationZhCn from '@/locales/zh-CN/conversation.json'
 import gitZhCn from '@/locales/zh-CN/git.json'
 import mcpZhCn from '@/locales/zh-CN/mcp.json'
 import mobileZhCn from '@/locales/zh-CN/mobile.json'
@@ -30,6 +32,7 @@ export const defaultNS = 'common'
 export const resources = {
   en: {
     common: commonEn,
+    conversation: conversationEn,
     shell: shellEn,
     settings: settingsEn,
     projects: projectsEn,
@@ -45,6 +48,7 @@ export const resources = {
   },
   'zh-CN': {
     common: commonZhCn,
+    conversation: conversationZhCn,
     shell: shellZhCn,
     settings: settingsZhCn,
     projects: projectsZhCn,

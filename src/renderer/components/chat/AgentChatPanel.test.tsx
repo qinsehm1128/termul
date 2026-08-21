@@ -1,31 +1,54 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { i18n } from '@/i18n'
 import type { AcpSession } from '@/stores/acp-store'
 
 const {
   mockOpen,
+  mockReconnect,
   mockOpenDiscovered,
+  mockRetryHistory,
   sessionRef,
+  messagesRef,
   indexRef,
   openingRef,
+  backfillRef,
   restoringRef,
   launchingRef,
   oskRef,
+  mobileShellRef,
   transportReconnectingRef,
   discoveredContextRef
 } = vi.hoisted(() => ({
   mockOpen: vi.fn(),
+  mockReconnect: vi.fn(),
   mockOpenDiscovered: vi.fn(),
+  mockRetryHistory: vi.fn(),
   // AcpSession shape; typed loosely here because vi.hoisted runs before the
   // type-only import below is usable at runtime. `seedLiveSession` constructs
   // the value with a `satisfies AcpSession` check.
   sessionRef: { current: null as object | null },
+  messagesRef: { current: [] as Array<Record<string, unknown>> },
   indexRef: { current: [] as Array<{ id: string }> },
   openingRef: { current: {} as Record<string, true> },
+  backfillRef: {
+    current: {} as Record<
+      string,
+      {
+        loading: boolean
+        complete: boolean
+        loadedRecordCount: number
+        nextCursor: number
+        targetLastSeq: number
+        errorCode?: string
+      }
+    >
+  },
   restoringRef: { current: {} as Record<string, true> },
   launchingRef: { current: {} as Record<string, true> },
   // Story 5.3 (AC1/AC3): test seams for OSK + reconnect overlay.
   oskRef: { current: { isOskOpen: false, keyboardHeight: 0, height: 0, offsetTop: 0 } },
+  mobileShellRef: { current: true },
   transportReconnectingRef: { current: false },
   discoveredContextRef: {
     current: {} as Record<string, { agentId: string; cwd: string; projectId: string }>
@@ -44,11 +67,14 @@ vi.mock('@/stores/acp-store', () => {
     configToLiveAgent: {},
     sessionIndex: indexRef.current,
     openingHistoryIds: openingRef.current,
+    historyBackfill: backfillRef.current,
     restoringChatIds: restoringRef.current,
     launchingSessionIds: launchingRef.current,
     discoveredReopenContexts: discoveredContextRef.current,
     transportReconnecting: transportReconnectingRef.current,
     openHistorySession: mockOpen,
+    reconnectClosedSession: mockReconnect,
+    retryHistoryBackfill: mockRetryHistory,
     openDiscoveredSession: mockOpenDiscovered,
     sendPrompt: vi.fn(),
     sendPromptBlocks: vi.fn(),
@@ -63,7 +89,7 @@ vi.mock('@/stores/acp-store', () => {
   return {
     useAcpStore: (sel: (s: unknown) => unknown) => sel(state()),
     useAcpSession: () => sessionRef.current,
-    useAcpMessages: () => [],
+    useAcpMessages: () => messagesRef.current,
     usePromptQueue: () => [],
     configIdFromReuseKey: (key: string) => key
   }
@@ -75,19 +101,30 @@ vi.mock('@/hooks/use-osk-viewport', () => ({
   useOskViewport: () => oskRef.current
 }))
 vi.mock('@/hooks/use-mobile-web-shell', () => ({
-  useMobileWebShell: () => true
+  useMobileWebShell: () => mobileShellRef.current
 }))
 
 // Child components pull in heavy chat rendering; the states under test render
 // before any of them mount.
+vi.mock('@/components/agents/AgentLauncher', () => ({
+  AgentLauncher: () => <div data-testid="agent-launcher" />
+}))
 vi.mock('./ChatErrorNotice', () => ({ ChatErrorNotice: () => null }))
-vi.mock('./ChatInputBar', () => ({ ChatInputBar: () => null }))
-vi.mock('./ChatMessageList', () => ({ ChatMessageList: () => null }))
+vi.mock('./ChatInputBar', () => ({
+  ChatInputBar: ({ disabled }: { disabled?: boolean }) => (
+    <div data-testid="chat-input-bar" data-disabled={disabled ? 'true' : 'false'} />
+  )
+}))
+vi.mock('./ChatMessageList', () => ({
+  ChatMessageList: ({ items }: { items: unknown[] }) => (
+    <div data-testid="message-list" data-message-count={items.length} />
+  )
+}))
 vi.mock('./PermissionDialog', () => ({ PermissionDialog: () => null }))
 vi.mock('./AskUserQuestion', () => ({ AskUserQuestion: () => null }))
 vi.mock('./PlanPanel', () => ({ PlanPanel: () => null }))
 vi.mock('./chat-timeline', () => ({
-  buildTimeline: () => [],
+  buildTimeline: (items: unknown[]) => items,
   consolidateThoughtGroups: (items: unknown[]) => items
 }))
 
@@ -114,13 +151,18 @@ function seedLiveSession(id: string, lastError: string | null = null): void {
 describe('AgentChatPanel restored-tab rehydration', () => {
   beforeEach(() => {
     mockOpen.mockReset().mockResolvedValue(undefined)
+    mockReconnect.mockReset().mockResolvedValue('s1')
     mockOpenDiscovered.mockReset().mockResolvedValue(undefined)
+    mockRetryHistory.mockReset().mockResolvedValue(undefined)
     sessionRef.current = null
+    messagesRef.current = []
     indexRef.current = []
     openingRef.current = {}
+    backfillRef.current = {}
     restoringRef.current = {}
     launchingRef.current = {}
     oskRef.current = { isOskOpen: false, keyboardHeight: 0, height: 0, offsetTop: 0 }
+    mobileShellRef.current = true
     transportReconnectingRef.current = false
     discoveredContextRef.current = {}
   })
@@ -224,7 +266,100 @@ describe('AgentChatPanel restored-tab rehydration', () => {
     indexRef.current = [{ id: 's1' }]
     render(<AgentChatPanel sessionId="s1" isVisible />)
     fireEvent.click(screen.getByRole('button', { name: 'Reconnect' }))
-    expect(mockOpen).toHaveBeenCalledWith('s1')
+    expect(mockReconnect).toHaveBeenCalledWith('s1')
+    expect(mockOpen).not.toHaveBeenCalled()
+  })
+
+  it('renders aria-live per-page history progress with the retained transcript on phone and desktop DOM', () => {
+    seedLiveSession('s1')
+    messagesRef.current = [
+      {
+        id: 'retained',
+        role: 'user',
+        blocks: [{ type: 'text', text: 'retained prefix' }],
+        streaming: false,
+        timestamp: 1,
+        seq: 1
+      }
+    ]
+    backfillRef.current = {
+      s1: {
+        loading: true,
+        complete: false,
+        loadedRecordCount: 250,
+        nextCursor: 250,
+        targetLastSeq: 1_000
+      }
+    }
+    const { rerender } = render(<AgentChatPanel sessionId="s1" isVisible />)
+    const progress = screen.getByRole('status')
+    expect(progress).toHaveAttribute('aria-live', 'polite')
+    expect(progress).toHaveTextContent(
+      'Loading history: 250 entries loaded · next cursor 250 · target frontier 1000.'
+    )
+    expect(screen.getByTestId('message-list')).toHaveAttribute('data-message-count', '1')
+
+    mobileShellRef.current = false
+    rerender(<AgentChatPanel sessionId="s1" isVisible />)
+    expect(screen.getByRole('status')).toHaveTextContent('250 entries loaded')
+    expect(screen.getByTestId('message-list')).toHaveAttribute('data-message-count', '1')
+  })
+
+  it('shows one accessible incomplete-history alert and retries history without agent reconnect', () => {
+    seedLiveSession('s1')
+    indexRef.current = [{ id: 's1' }]
+    messagesRef.current = [
+      {
+        id: 'retained',
+        role: 'user',
+        blocks: [{ type: 'text', text: 'retained prefix' }],
+        streaming: false,
+        timestamp: 1,
+        seq: 1
+      }
+    ]
+    backfillRef.current = {
+      s1: {
+        loading: false,
+        complete: false,
+        loadedRecordCount: 250,
+        nextCursor: 250,
+        targetLastSeq: 1_000,
+        errorCode: 'CONVERSATION_PAGE_TOO_LARGE'
+      }
+    }
+    const { rerender } = render(<AgentChatPanel sessionId="s1" isVisible />)
+    const alert = screen.getByRole('alert')
+    expect(alert).toHaveAttribute('aria-live', 'assertive')
+    expect(alert).toHaveTextContent(
+      'History incomplete: 250 entries loaded · next cursor 250 · target frontier 1000 · error code CONVERSATION_PAGE_TOO_LARGE.'
+    )
+    const retryHistory = screen.getByRole('button', { name: 'Retry history' })
+    const reconnect = screen.getByRole('button', { name: 'Reconnect' })
+    expect(retryHistory).not.toBe(reconnect)
+    expect(retryHistory.tagName).toBe('BUTTON')
+    expect(retryHistory).toHaveAttribute('type', 'button')
+    retryHistory.focus()
+    expect(document.activeElement).toBe(retryHistory)
+    fireEvent.click(retryHistory)
+    expect(mockRetryHistory).toHaveBeenCalledWith('s1')
+    expect(mockOpen).not.toHaveBeenCalled()
+    expect(mockReconnect).not.toHaveBeenCalled()
+    expect(screen.getByTestId('message-list')).toHaveAttribute('data-message-count', '1')
+
+    backfillRef.current = {
+      s1: {
+        loading: false,
+        complete: true,
+        loadedRecordCount: 1_000,
+        nextCursor: 1_000,
+        targetLastSeq: 1_000
+      }
+    }
+    rerender(<AgentChatPanel sessionId="s1" isVisible />)
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Retry history' })).not.toBeInTheDocument()
+    expect(screen.getByTestId('message-list')).toHaveAttribute('data-message-count', '1')
   })
 
   it('surfaces a read-only banner when a closed session has history and no reopen context (CAP-4)', () => {
@@ -236,19 +371,32 @@ describe('AgentChatPanel restored-tab rehydration', () => {
     expect(screen.getByText(/read-only/)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Reconnect' })).toBeInTheDocument()
   })
+
+  it('keeps the existing composer instead of the new-chat launcher when a closed conversation is open', () => {
+    seedLiveSession('s1')
+    indexRef.current = [{ id: 's1' }]
+    render(<AgentChatPanel sessionId="s1" paneId="pane-1" isVisible />)
+    expect(screen.getByTestId('chat-input-bar')).toHaveAttribute('data-disabled', 'true')
+    expect(screen.queryByTestId('agent-launcher')).not.toBeInTheDocument()
+  })
 })
 
 // Story 5.3 (AC1, AC3, AC4) — OSK spacer + reconnect overlay.
 describe('AgentChatPanel OSK + reconnect overlay (Story 5.3)', () => {
   beforeEach(() => {
     mockOpen.mockReset().mockResolvedValue(undefined)
+    mockReconnect.mockReset().mockResolvedValue('s1')
     mockOpenDiscovered.mockReset().mockResolvedValue(undefined)
+    mockRetryHistory.mockReset().mockResolvedValue(undefined)
     sessionRef.current = null
+    messagesRef.current = []
     indexRef.current = []
     openingRef.current = {}
+    backfillRef.current = {}
     restoringRef.current = {}
     launchingRef.current = {}
     oskRef.current = { isOskOpen: false, keyboardHeight: 0, height: 0, offsetTop: 0 }
+    mobileShellRef.current = true
     transportReconnectingRef.current = false
     discoveredContextRef.current = {}
   })
@@ -328,5 +476,32 @@ describe('AgentChatPanel pending question rendering (issue #411)', () => {
     // AskUserQuestion is mocked to null; assert no crash and the panel area
     // exists (the store selector runs with the seeded question below).
     expect(screen.queryByTestId('ask-user-question')).toBeNull()
+  })
+
+  it('incomplete history copy does not label frontier as record total', async () => {
+    const { readFileSync } = await import('node:fs')
+    const { resolve } = await import('node:path')
+    const en = readFileSync(resolve(process.cwd(), 'src/renderer/locales/en/chat.json'), 'utf8')
+    const zh = readFileSync(resolve(process.cwd(), 'src/renderer/locales/zh-CN/chat.json'), 'utf8')
+    expect(en).not.toMatch(/of \{\{targetLastSeq\}\} records/)
+    expect(zh).not.toContain('条记录')
+    seedLiveSession('s1')
+    backfillRef.current = {
+      s1: {
+        loading: false,
+        complete: false,
+        loadedRecordCount: 250,
+        nextCursor: 250,
+        targetLastSeq: 1_000,
+        errorCode: 'CONVERSATION_PAGE_TOO_LARGE'
+      }
+    }
+    const { rerender } = render(<AgentChatPanel sessionId="s1" isVisible />)
+    expect(screen.getByRole('alert').textContent ?? '').not.toMatch(/of 1000 records/)
+    expect(screen.getByRole('alert').textContent ?? '').not.toContain('条记录')
+    await i18n.changeLanguage('zh-CN')
+    rerender(<AgentChatPanel sessionId="s1" isVisible />)
+    expect(screen.getByRole('alert').textContent ?? '').not.toMatch(/of 1000 records/)
+    expect(screen.getByRole('alert').textContent ?? '').not.toContain('条记录')
   })
 })

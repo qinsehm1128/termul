@@ -77,7 +77,7 @@ Termul treats workspaces as first-class citizens, allowing you to organize termi
 | Domain            | Key Components                                                                     | Zustand Store                                      |
 | ----------------- | ---------------------------------------------------------------------------------- | -------------------------------------------------- |
 | **Workspace**     | `WorkspaceLayout`, `PaneRenderer`, `PaneContent`, `WorkspaceTabBar`                | `workspace-store`                                  |
-| **Terminal**      | `ConnectedTerminal`, `XTerminal`, `TerminalSearchBar`, `ActivityIndicator`         | `terminal-store`                                   |
+| **Terminal**      | `ConnectedTerminal`, `TerminalSearchBar`, `ActivityIndicator`                      | `terminal-store`                                   |
 | **Editor**        | `EditorPanel`, `CodeEditor`, `MarkdownEditor`, `EditorToolbar`, `MermaidBlock`     | `editor-store`                                     |
 | **Browser**       | `BrowserPanel`, `BrowserControls`, `AnnotationPanel`, `AnnotationExportModal`      | `browser-session-store`, `annotation-store`        |
 | **File Explorer** | `FileExplorer`, `FileTreeNode`, `FileTreeContextMenu`                              | —                                                  |
@@ -291,7 +291,7 @@ Build output: `src-tauri/target/release/bundle/`
 | Build Tool         | [Vite](https://vitejs.dev)                                                           |
 | Styling            | [Tailwind CSS](https://tailwindcss.com) + [shadcn/ui](https://ui.shadcn.com)         |
 | State Management   | [Zustand](https://zustand-demo.pmnd.rs)                                              |
-| Terminal Emulation | [tauri-pty](https://github.com/nicegram/tauri-pty) + [xterm.js](https://xtermjs.org) |
+| Terminal Emulation | Rust [`portable-pty`](https://crates.io/crates/portable-pty) + [xterm.js](https://xtermjs.org) |
 | Animations         | [Framer Motion](https://www.framer.com/motion)                                       |
 
 #### Tauri Plugins

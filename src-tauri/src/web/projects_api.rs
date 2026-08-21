@@ -11,13 +11,12 @@
 //! Carries NO env-var values — [`ProjectSummary`] redacts-by-omission (frozen
 //! constraint). Only the identity/display fields a project switcher needs.
 
-use std::net::SocketAddr;
-
-use axum::extract::{ConnectInfo, State};
+use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use crate::web::auth::IngressProvenance;
 use crate::web::project_registry::ProjectListPayload;
 use crate::web::sink::broadcast_projects_changed;
 use crate::web::ws::AppState;
@@ -99,27 +98,23 @@ pub async fn list(State(state): State<AppState>) -> impl IntoResponse {
 /// Body: `{ "projectId": "<id>" }`.
 pub async fn set_default_project(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Extension(provenance): axum::Extension<IngressProvenance>,
     Json(req): Json<SetDefaultProjectRequest>,
 ) -> impl IntoResponse {
     // Loopback-only guard — this route mutates host state (persists the default
     // to `FileProjectRegistry` and broadcasts `projects_changed` to ALL
     // connected clients), so a LAN peer on a `0.0.0.0` bind must not reach it.
     // Mirrors the fs/git/workspace write routes' `check_local_only` (CWE-306).
-    if !peer.ip().is_loopback() {
-        return Json(IpcBody::<()>::err(
-            format!("host-state write routes are localhost-only (peer {peer} is not loopback)"),
-            "FORBIDDEN",
-        ));
+    if let Err(denial) = crate::web::operation_policy::authorize_local_only(
+        provenance,
+        crate::web::operation_policy::LocalOnlyOperation::SetDefaultProject,
+    ) {
+        return Json(IpcBody::<()>::err(denial.message, denial.code));
     }
     let project_id = req.project_id;
     // Validate via switch_context (same path as `switch_project`).
     if state.registry.switch_context(&project_id).is_none() {
-        tracing::warn!(
-            target: "termul::web::projects_api",
-            project_id = %project_id,
-            "set_default_project: project not found or not switchable"
-        );
+        log::warn!(target: "termul::web::projects_api", "operation=projects_api stable_code=REJECTED");
         return Json(IpcBody::<()>::err(
             format!("project '{project_id}' not found or not switchable"),
             "NOT_FOUND",
@@ -131,9 +126,10 @@ pub async fn set_default_project(
     // returns false after the file was already persisted, the file is restored
     // + re-saved before returning the error).
     let mut persisted_old_default: Option<Option<String>> = None;
-    if let (Some(file_registry), Some(path)) =
-        (state.registry_persistence.as_ref(), state.projects_file.as_deref())
-    {
+    if let (Some(file_registry), Some(path)) = (
+        state.registry_persistence.as_ref(),
+        state.projects_file.as_deref(),
+    ) {
         let persistence_result = {
             let mut file_registry = file_registry.lock();
             let old_default = file_registry.default_project_id().map(str::to_string);
@@ -152,12 +148,7 @@ pub async fn set_default_project(
             }
         };
         if let Err(error) = persistence_result {
-            tracing::error!(
-                target: "termul::web::projects_api",
-                project_id = %project_id,
-                error = %error,
-                "set_default_project: persistence failed (rolled back)"
-            );
+            log::error!(target: "termul::web::projects_api", "operation=projects_api stable_code=FAILED");
             return Json(IpcBody::<()>::err(
                 format!("failed to persist default project: {error}"),
                 "PERSIST_FAILED",
@@ -175,30 +166,18 @@ pub async fn set_default_project(
         ) {
             let mut file_registry = file_registry.lock();
             file_registry.restore_default_project(old_default);
-            if let Err(error) = file_registry.save_atomic(path) {
-                tracing::warn!(
-                    target: "termul::web::projects_api",
-                    error = %error,
-                    "set_default_project: failed to persist in-memory-set rollback"
-                );
+            if let Err(_error) = file_registry.save_atomic(path) {
+                log::warn!(target: "termul::web::projects_api", "operation=projects_api stable_code=REJECTED");
             }
         }
-        tracing::warn!(
-            target: "termul::web::projects_api",
-            project_id = %project_id,
-            "set_default_project: target became unavailable before commit (file rolled back)"
-        );
+        log::warn!(target: "termul::web::projects_api", "operation=projects_api stable_code=REJECTED");
         return Json(IpcBody::<()>::err(
             "target project became unavailable before commit".to_string(),
             "NOT_FOUND",
         ));
     }
     broadcast_projects_changed(&state.relay, Some(&project_id));
-    tracing::info!(
-        target: "termul::web::projects_api",
-        project_id = %project_id,
-        "set_default_project: host default updated + broadcast"
-    );
+    log::info!(target: "termul::web::projects_api", "operation=projects_api stable_code=OK");
     Json(IpcBody::ok(()))
 }
 
@@ -206,7 +185,9 @@ pub async fn set_default_project(
 mod tests {
     use super::*;
     use crate::acp::{AcpManager, FileProjectRegistry};
-    use crate::web::project_registry::{seed_from_file, ProjectRegistry, ProjectSummary};
+    use crate::web::project_registry::{
+        seed_from_file, ProjectGroupSummary, ProjectRegistry, ProjectSummary,
+    };
     use crate::web::sink::WsRelaySink;
     use crate::web::test_pty_manager;
     use axum::body::Body;
@@ -230,6 +211,7 @@ mod tests {
             registry_persistence: None,
             projects_file: None,
             history_mode: crate::web::ws::HistoryMode::LiveOnly,
+            conversation: None,
             project_root: Arc::new(parking_lot::RwLock::new(std::path::PathBuf::new())),
             workspace_manifest: None,
             acp_catalog: None,
@@ -259,6 +241,7 @@ mod tests {
             registry_persistence: Some(file_registry),
             projects_file: Some(Arc::new(projects_file)),
             history_mode: crate::web::ws::HistoryMode::LiveOnly,
+            conversation: None,
             project_root: Arc::new(parking_lot::RwLock::new(std::path::PathBuf::new())),
             workspace_manifest: None,
             acp_catalog: None,
@@ -278,15 +261,26 @@ mod tests {
         }
     }
 
+    fn group(id: &str, project_ids: &[&str], preferred: Option<&str>) -> ProjectGroupSummary {
+        ProjectGroupSummary {
+            id: id.to_string(),
+            name: format!("Group {id}"),
+            project_ids: project_ids.iter().map(|id| (*id).to_string()).collect(),
+            color: Some("purple".to_string()),
+            preferred_project_id: preferred.map(str::to_string),
+        }
+    }
+
     #[tokio::test]
     async fn projects_returns_synced_list() {
         let registry = Arc::new(ProjectRegistry::new());
-        registry.set(
+        registry.set_with_groups(
             vec![
                 summary("p-1", Some("/a"), false, true),
                 summary("p-2", Some("/b"), false, false),
                 summary("p-old", Some("/c"), true, false),
             ],
+            vec![group("g-1", &["p-2", "p-1"], Some("p-2"))],
             Some("p-1".to_string()),
         );
         let app = axum::Router::new()
@@ -311,6 +305,9 @@ mod tests {
         assert!(parsed.success);
         let data = parsed.data.expect("data");
         assert_eq!(data.projects.len(), 3);
+        assert_eq!(data.groups.len(), 1);
+        assert_eq!(data.groups[0].project_ids, ["p-2", "p-1"]);
+        assert_eq!(data.groups[0].preferred_project_id.as_deref(), Some("p-2"));
         assert_eq!(data.default_project_id.as_deref(), Some("p-1"));
         assert_eq!(data.projects[0].id, "p-1");
         assert!(data.projects[0].is_default);
@@ -349,7 +346,9 @@ mod tests {
         let parsed: IpcBody<ProjectListPayload> =
             serde_json::from_slice(&body).expect("parse body");
         assert!(parsed.success);
-        assert!(parsed.data.unwrap().projects.is_empty());
+        let data = parsed.data.unwrap();
+        assert!(data.projects.is_empty());
+        assert!(data.groups.is_empty());
     }
 
     /// Minimal std-only temp dir (reuses `web::config`'s pid+nanos pattern —
@@ -515,7 +514,10 @@ mod tests {
             Some("p-1".to_string()),
         );
         let app = axum::Router::new()
-            .route("/projects/default", axum::routing::post(set_default_project))
+            .route(
+                "/projects/default",
+                axum::routing::post(set_default_project),
+            )
             .with_state(state_with(Arc::clone(&registry)));
 
         let resp = app
@@ -525,6 +527,7 @@ mod tests {
                     .uri("/projects/default")
                     .header("content-type", "application/json")
                     .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 54321))))
+                    .extension(IngressProvenance::LocalOperator)
                     .body(Body::from(
                         serde_json::json!({ "projectId": "p-2" }).to_string(),
                     ))
@@ -558,7 +561,10 @@ mod tests {
             Some("p-1".to_string()),
         );
         let app = axum::Router::new()
-            .route("/projects/default", axum::routing::post(set_default_project))
+            .route(
+                "/projects/default",
+                axum::routing::post(set_default_project),
+            )
             .with_state(state_with(Arc::clone(&registry)));
 
         for bad in ["missing", "p-archived", "p-pathless"] {
@@ -570,6 +576,7 @@ mod tests {
                         .uri("/projects/default")
                         .header("content-type", "application/json")
                         .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 54321))))
+                        .extension(IngressProvenance::LocalOperator)
                         .body(Body::from(
                             serde_json::json!({ "projectId": bad }).to_string(),
                         ))
@@ -650,6 +657,7 @@ mod tests {
                     .uri("/projects/default")
                     .header("content-type", "application/json")
                     .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 54321))))
+                    .extension(IngressProvenance::LocalOperator)
                     .body(Body::from(
                         serde_json::json!({ "projectId": "p-2" }).to_string(),
                     ))
@@ -662,7 +670,10 @@ mod tests {
             .await
             .expect("read body");
         let parsed: IpcBody<()> = serde_json::from_slice(&body).expect("parse body");
-        assert!(parsed.success, "VPS set_default_project succeeds: {parsed:?}");
+        assert!(
+            parsed.success,
+            "VPS set_default_project succeeds: {parsed:?}"
+        );
 
         // The in-memory registry default updated.
         let snap = registry.snapshot();
@@ -696,6 +707,7 @@ mod tests {
                     .uri("/projects/default")
                     .header("content-type", "application/json")
                     .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 54321))))
+                    .extension(IngressProvenance::LocalOperator)
                     .body(Body::from(
                         serde_json::json!({ "projectId": "missing" }).to_string(),
                     ))
@@ -727,7 +739,10 @@ mod tests {
             Some("p-1".to_string()),
         );
         let app = axum::Router::new()
-            .route("/projects/default", axum::routing::post(set_default_project))
+            .route(
+                "/projects/default",
+                axum::routing::post(set_default_project),
+            )
             .with_state(state_with(Arc::clone(&registry)));
 
         let resp = app
@@ -738,6 +753,7 @@ mod tests {
                     .header("content-type", "application/json")
                     // A LAN peer (10.0.0.5), not loopback.
                     .extension(ConnectInfo(SocketAddr::from(([10, 0, 0, 5], 54321))))
+                    .extension(IngressProvenance::PublicTunnel)
                     .body(Body::from(
                         serde_json::json!({ "projectId": "p-1" }).to_string(),
                     ))

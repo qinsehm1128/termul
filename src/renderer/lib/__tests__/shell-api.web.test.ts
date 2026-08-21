@@ -23,7 +23,7 @@ vi.mock('@tauri-apps/api/core', () => ({
   invoke: mockInvoke
 }))
 
-import { _resetShellCacheForTesting, shellApi } from '../shell-api'
+import { _resetShellCacheForTesting, isPreferredShell, shellApi } from '../shell-api'
 
 function jsonResponse(body: unknown, status = 200): Response {
   return {
@@ -101,5 +101,16 @@ describe('shellApi.getAvailableShells (web vs desktop branch)', () => {
     expect(result.success).toBe(true)
     expect(mockInvoke).toHaveBeenCalledWith('detect_shells', undefined)
     expect(mockFetch).not.toHaveBeenCalled()
+  })
+})
+
+describe('isPreferredShell', () => {
+  const zsh = { name: 'zsh', path: '/opt/homebrew/bin/zsh', displayName: 'Zsh' }
+
+  it('matches a stored path or name', () => {
+    expect(isPreferredShell(zsh, '/opt/homebrew/bin/zsh')).toBe(true)
+    expect(isPreferredShell(zsh, 'zsh')).toBe(true)
+    expect(isPreferredShell(zsh, '/bin/zsh')).toBe(false)
+    expect(isPreferredShell(zsh, undefined)).toBe(false)
   })
 })

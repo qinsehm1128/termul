@@ -47,6 +47,11 @@ describe('app-settings-store', () => {
       expect(isLoaded).toBe(false)
     })
 
+    it('should prefer local npm install for npx agents by default', () => {
+      const { settings } = useAppSettingsStore.getState()
+      expect(settings.acpPreferLocalNpmInstall).toBe(true)
+    })
+
     it('should default terminal URL open mode to system', () => {
       const { settings } = useAppSettingsStore.getState()
       expect(settings.terminalUrlOpenMode).toBe('system')

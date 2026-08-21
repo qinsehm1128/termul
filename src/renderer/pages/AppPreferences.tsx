@@ -46,6 +46,7 @@ import { isAurUpdateMode } from '@/lib/tauri-updater-api'
 import { cn } from '@/lib/utils'
 import {
   useAcpFirstPromptWarmup,
+  useAcpPreferLocalNpmInstall,
   useAcpSessionNewTimeout,
   useAcpSessionReopenTimeout,
   useAcpTurnIdleTimeout,
@@ -62,6 +63,8 @@ import {
   useTerminalFontFamily,
   useTerminalFontSize,
   useTerminalRenderer,
+  useTerminalScreenReaderMode,
+  useTerminalSymbolFontFamily,
   useTerminalUrlOpenMode,
   useUiLanguage,
   useUiZoomLevel
@@ -81,6 +84,7 @@ import {
   FONT_FAMILY_OPTIONS,
   MAX_TERMINALS_OPTIONS,
   ORPHAN_TIMEOUT_OPTIONS,
+  SYMBOL_FONT_OPTIONS,
   TERMINAL_RENDERER_OPTIONS,
   TERMINAL_URL_OPEN_MODE_OPTIONS,
   type TerminalUrlOpenMode,
@@ -118,6 +122,12 @@ const APP_PREF_SEARCH_DEFS = [
   },
   {
     categoryId: 'appearance',
+    labelKey: 'appearance.symbolFont',
+    descriptionKey: 'appearance.symbolFontHint',
+    keywords: ['nerd font', 'glyph', 'icons', 'symbols']
+  },
+  {
+    categoryId: 'appearance',
     labelKey: 'appearance.fontSizeLabel',
     descriptionKey: 'appearance.fontSizeHint',
     keywords: ['text size', 'zoom']
@@ -145,6 +155,12 @@ const APP_PREF_SEARCH_DEFS = [
     labelKey: 'appearance.renderer',
     descriptionKey: 'appearance.rendererHint',
     keywords: ['webgl', 'dom', 'gpu']
+  },
+  {
+    categoryId: 'appearance',
+    labelKey: 'appearance.screenReader',
+    descriptionKey: 'appearance.screenReaderHint',
+    keywords: ['accessibility', 'screen reader', 'voiceover', 'nvda']
   },
   {
     categoryId: 'shell',
@@ -193,6 +209,12 @@ const APP_PREF_SEARCH_DEFS = [
     labelKey: 'categories.aiAgents',
     descriptionKey: 'aiAgents.description',
     keywords: ['acp', 'agent', 'coding assistant']
+  },
+  {
+    categoryId: 'ai-agents',
+    labelKey: 'aiAgents.preferLocalNpmInstall',
+    descriptionKey: 'aiAgents.preferLocalNpmInstallHint',
+    keywords: ['npx', 'npm', 'local install', 'codex', 'claude']
   },
   {
     categoryId: 'ai-agents',
@@ -298,11 +320,13 @@ export default function AppPreferences(): React.JSX.Element {
       ? tSettings('options.halfSecond')
       : tSettings('options.seconds', { count: milliseconds / 1000 })
   const fontFamily = useTerminalFontFamily()
+  const symbolFontFamily = useTerminalSymbolFontFamily()
   const fontSize = useTerminalFontSize()
   const uiZoomLevel = useUiZoomLevel()
   const languagePreference = useUiLanguage()
   const bufferSize = useTerminalBufferSize()
   const terminalRenderer = useTerminalRenderer()
+  const terminalScreenReaderMode = useTerminalScreenReaderMode()
   const defaultShell = useDefaultShell()
   const defaultProjectColor = useDefaultProjectColor() as ProjectColor
   const maxTerminals = useMaxTerminalsPerProject()
@@ -317,6 +341,7 @@ export default function AppPreferences(): React.JSX.Element {
   const acpSessionNewTimeoutSecs = useAcpSessionNewTimeout()
   const acpSessionReopenTimeoutSecs = useAcpSessionReopenTimeout()
   const acpFirstPromptWarmupSecs = useAcpFirstPromptWarmup()
+  const acpPreferLocalNpmInstall = useAcpPreferLocalNpmInstall()
   const updateSetting = useUpdateAppSetting()
   const resetSettings = useResetAppSettings()
 
@@ -364,6 +389,10 @@ export default function AppPreferences(): React.JSX.Element {
     updateSetting('terminalFontFamily', value)
   }
 
+  const handleSymbolFontChange = (value: string) => {
+    updateSetting('terminalSymbolFontFamily', value)
+  }
+
   const handleFontSizeChange = (value: number) => {
     updateSetting('terminalFontSize', value)
   }
@@ -390,6 +419,10 @@ export default function AppPreferences(): React.JSX.Element {
     if (value === 'auto' || value === 'webgl' || value === 'dom') {
       updateSetting('terminalRenderer', value)
     }
+  }
+
+  const handleScreenReaderModeToggle = (enabled: boolean) => {
+    updateSetting('terminalScreenReaderMode', enabled)
   }
 
   const handleDefaultShellChange = (value: string) => {
@@ -488,6 +521,15 @@ export default function AppPreferences(): React.JSX.Element {
       await acpApi.setSessionReopenTimeout(value)
     } catch (error) {
       console.error('Failed to apply ACP session reopen timeout:', error)
+    }
+  }
+
+  const handleAcpPreferLocalNpmInstallToggle = async (enabled: boolean) => {
+    await updateSetting('acpPreferLocalNpmInstall', enabled)
+    try {
+      await acpApi.setPreferLocalNpmInstall(enabled)
+    } catch (error) {
+      console.error('Failed to apply ACP local npm install preference:', error)
     }
   }
 
@@ -636,6 +678,27 @@ export default function AppPreferences(): React.JSX.Element {
                   </p>
                 </div>
 
+                {/* Symbol Font */}
+                <div>
+                  <label className="block text-sm font-medium text-secondary-foreground mb-2">
+                    {tSettings('appearance.symbolFont')}
+                  </label>
+                  <select
+                    value={symbolFontFamily}
+                    onChange={(e) => handleSymbolFontChange(e.target.value)}
+                    className="w-full bg-secondary/50 border border-border rounded-lg px-3 py-2 text-sm text-foreground focus:ring-2 focus:ring-primary focus:border-transparent outline-none transition-shadow"
+                  >
+                    {SYMBOL_FONT_OPTIONS.map((option) => (
+                      <option key={option.label} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    {tSettings('appearance.symbolFontHint')}
+                  </p>
+                </div>
+
                 {/* Font Size */}
                 <div>
                   <label className="block text-sm font-medium text-secondary-foreground mb-2">
@@ -723,6 +786,36 @@ export default function AppPreferences(): React.JSX.Element {
                   <p className="text-xs text-muted-foreground mt-1">
                     {tSettings('appearance.rendererHint')}
                   </p>
+                </div>
+
+                {/* Terminal screen reader accessibility */}
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <div className="text-sm font-medium text-secondary-foreground">
+                      {tSettings('appearance.screenReader')}
+                    </div>
+                    <div className="mt-0.5 text-xs text-muted-foreground">
+                      {tSettings('appearance.screenReaderHint')}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={terminalScreenReaderMode}
+                    aria-label={tSettings('appearance.screenReader')}
+                    onClick={() => handleScreenReaderModeToggle(!terminalScreenReaderMode)}
+                    className={cn(
+                      'relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2',
+                      terminalScreenReaderMode ? 'bg-primary' : 'bg-input'
+                    )}
+                  >
+                    <span
+                      className={cn(
+                        'inline-block h-4 w-4 transform rounded-full bg-white transition-transform',
+                        terminalScreenReaderMode ? 'translate-x-6' : 'translate-x-1'
+                      )}
+                    />
+                  </button>
                 </div>
 
                 {/* Preview */}
@@ -1015,6 +1108,42 @@ export default function AppPreferences(): React.JSX.Element {
               </div>
               <div className="w-2/3 space-y-4">
                 <AcpAgentsSettings />
+                <div>
+                  <label className="block text-sm font-medium text-secondary-foreground mb-2">
+                    {tSettings('aiAgents.preferLocalNpmInstall')}
+                  </label>
+                  <div className="flex items-center justify-between bg-secondary/30 border border-border rounded-md px-4 py-3">
+                    <div className="flex-1">
+                      <div className="text-sm text-foreground">
+                        {tSettings('aiAgents.preferLocalNpmInstall')}
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-0.5">
+                        {tSettings('aiAgents.preferLocalNpmInstallHint')}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={acpPreferLocalNpmInstall}
+                      aria-label={tSettings('aiAgents.preferLocalNpmInstall')}
+                      disabled={!isTauriContext()}
+                      onClick={() =>
+                        handleAcpPreferLocalNpmInstallToggle(!acpPreferLocalNpmInstall)
+                      }
+                      className={cn(
+                        'relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed',
+                        acpPreferLocalNpmInstall ? 'bg-primary' : 'bg-input'
+                      )}
+                    >
+                      <span
+                        className={cn(
+                          'inline-block h-4 w-4 transform rounded-full bg-white transition-transform',
+                          acpPreferLocalNpmInstall ? 'translate-x-6' : 'translate-x-1'
+                        )}
+                      />
+                    </button>
+                  </div>
+                </div>
                 <div>
                   <label className="block text-sm font-medium text-secondary-foreground mb-2">
                     {tSettings('aiAgents.turnTimeout')}

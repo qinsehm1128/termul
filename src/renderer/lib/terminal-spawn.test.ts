@@ -66,6 +66,14 @@ vi.mock('@/stores/app-settings-store', () => ({
   }
 }))
 
+vi.mock('@/stores/session-workspace-sync-store', () => ({
+  useSessionWorkspaceSyncStore: {
+    getState: () => ({
+      activeConversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+    })
+  }
+}))
+
 vi.mock('@/lib/log-api', () => ({
   logFrontendError: mockLogFrontendError
 }))

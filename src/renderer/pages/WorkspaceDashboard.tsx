@@ -1,6 +1,61 @@
-// WorkspaceDashboard is now a simple empty component
-// The actual workspace layout (sidebar, terminals, etc.) is handled by WorkspaceLayout
-// This component exists for routing purposes but renders nothing
+import { MessageSquarePlus } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
+import { ConversationList } from '@/components/conversation/ConversationList'
+import { useConversationStore } from '@/stores/conversation-store'
+import { useWorkspaceStore } from '@/stores/workspace-store'
+
 export default function WorkspaceDashboard(): React.JSX.Element {
-  return <></>
+  const { t } = useTranslation('conversation')
+  const loading = useConversationStore((state) => state.loadingList)
+  const conversationIds = useConversationStore((state) => state.conversationIds)
+  const activeConversationId = useConversationStore((state) => state.activeConversationId)
+  const activeConversation = useConversationStore((state) =>
+    activeConversationId ? state.summariesById[activeConversationId] : undefined
+  )
+
+  return (
+    <section
+      className="flex h-full min-h-0 flex-col bg-background p-4"
+      aria-labelledby="conversation-dashboard-title"
+    >
+      <div className="mx-auto flex w-full max-w-3xl flex-1 flex-col gap-4">
+        <header className="rounded-xl border border-border bg-card p-5">
+          <MessageSquarePlus className="mb-3 size-8 text-primary" aria-hidden="true" />
+          <h1 id="conversation-dashboard-title" className="text-xl font-semibold">
+            {t('dashboard.title')}
+          </h1>
+          <p className="mt-1 text-sm text-muted-foreground">{t('dashboard.description')}</p>
+          <button
+            type="button"
+            className="mt-4 inline-flex min-h-9 items-center gap-1.5 rounded-lg bg-primary px-3 text-xs font-medium text-primary-foreground hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            onClick={() => {
+              const paneId = useWorkspaceStore.getState().activePaneId
+              if (paneId) useWorkspaceStore.getState().showAgentLauncher(paneId)
+            }}
+          >
+            <MessageSquarePlus className="size-4" aria-hidden="true" />
+            {t('navigation.newChat')}
+          </button>
+          {activeConversation ? (
+            <div className="mt-4 rounded-lg bg-muted/50 p-3 text-xs">
+              <span className="font-medium">{t('dashboard.workspace')}:</span>{' '}
+              <code className="break-all font-mono">{activeConversation.workspaceCwd}</code>
+            </div>
+          ) : null}
+        </header>
+
+        <div className="min-h-0 flex-1 overflow-y-auto rounded-xl border border-border bg-card">
+          {loading ? (
+            <div role="status" className="p-5 text-sm text-muted-foreground">
+              {t('dashboard.loading')}
+            </div>
+          ) : conversationIds.length === 0 ? (
+            <div className="p-5 text-sm text-muted-foreground">{t('dashboard.empty')}</div>
+          ) : (
+            <ConversationList />
+          )}
+        </div>
+      </div>
+    </section>
+  )
 }

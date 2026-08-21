@@ -15,7 +15,8 @@
 //! desktop binary and the standalone `termul-server` (no `AppHandle`).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 use parking_lot::Mutex;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -27,6 +28,7 @@ use crate::acp::host_mcp::{
     emit_plan_update, map_todos_to_plan_entries, FrameKind, FrameReply, FrameRequest, PlanStore,
 };
 use crate::acp::session_persistence::SessionPersistence;
+use crate::conversation::ConversationPersistenceAdapter;
 use crate::web::EventSink;
 
 /// Per-session auth + routing context, keyed by the random token.
@@ -65,12 +67,16 @@ pub struct HostPlanServer {
     /// retrying. Cleared on `unregister_session`. In-memory only — a resumed
     /// session in a new process can set the title once again.
     title_set_for_session: Mutex<HashSet<String>>,
-    /// Per-session plan cache (emit-and-cache). v1 doesn't persist; this is
-    /// the seam a future persistence layer reads from on resume. Updated in
-    /// `process_request` (set on emit) + `unregister_*` (drop on close).
+    /// Per-session plan cache. Cold binds hydrate the latest canonical full replacement; live
+    /// updates replace it only after durable acknowledgement, including empty clears.
     plan_store: PlanStore,
     /// Durable store used by the title tool. Absent in live-only tests/modes.
     persistence: Option<Arc<SessionPersistence>>,
+    /// Canonical Conversation history used for durable plan acknowledgement and cold hydration.
+    conversation_persistence: Option<Arc<ConversationPersistenceAdapter>>,
+    /// Installed after host bootstrap constructs the scheduled-task service.
+    /// Weak avoids a cycle through AcpScheduledTaskExecutor -> AcpManager.
+    scheduled_tasks: Mutex<Option<Weak<crate::scheduled_tasks::ScheduledTaskService>>>,
 }
 
 impl HostPlanServer {
@@ -86,6 +92,22 @@ impl HostPlanServer {
         sinks: Vec<Arc<dyn EventSink>>,
         persistence: Option<Arc<SessionPersistence>>,
     ) -> Arc<Self> {
+        Self::start_inner(sinks, persistence, None)
+    }
+
+    #[must_use]
+    pub fn start_with_conversation_persistence(
+        sinks: Vec<Arc<dyn EventSink>>,
+        persistence: Arc<ConversationPersistenceAdapter>,
+    ) -> Arc<Self> {
+        Self::start_inner(sinks, None, Some(persistence))
+    }
+
+    fn start_inner(
+        sinks: Vec<Arc<dyn EventSink>>,
+        persistence: Option<Arc<SessionPersistence>>,
+        conversation_persistence: Option<Arc<ConversationPersistenceAdapter>>,
+    ) -> Arc<Self> {
         let server = Arc::new(Self {
             port: std::sync::OnceLock::new(),
             sinks,
@@ -94,6 +116,8 @@ impl HostPlanServer {
             title_set_for_session: Mutex::new(HashSet::new()),
             plan_store: PlanStore::new(),
             persistence,
+            conversation_persistence,
+            scheduled_tasks: Mutex::new(None),
         });
         let server_for_thread = Arc::clone(&server);
         let (port_tx, port_rx) = std::sync::mpsc::channel::<u16>();
@@ -189,24 +213,54 @@ impl HostPlanServer {
         (port, token, provisional_sid)
     }
 
+    pub fn set_scheduled_tasks(&self, service: &Arc<crate::scheduled_tasks::ScheduledTaskService>) {
+        *self.scheduled_tasks.lock() = Some(Arc::downgrade(service));
+    }
+
+    #[must_use]
+    pub fn scheduled_tasks(&self) -> Option<Arc<crate::scheduled_tasks::ScheduledTaskService>> {
+        self.scheduled_tasks.lock().as_ref().and_then(Weak::upgrade)
+    }
+
     /// Bind the real ACP session_id (returned by `session/new`) to a token.
     /// Called by `AcpManager::new_session_with_context` after the agent
     /// responds. No-op (logged) if the token is unknown (e.g. the session was
     /// for an ephemeral background gen that wasn't registered).
     pub fn bind_session(&self, token: &str, real_session_id: &str) {
-        let mut sessions = self.sessions.lock();
-        match sessions.get_mut(token) {
-            Some(auth) => {
-                auth.real_session_id = Some(real_session_id.to_string());
-                log::debug!(
-                    "[host-mcp] bound token → session {real_session_id} (agent {})",
-                    auth.agent_id
-                );
+        let bound = {
+            let mut sessions = self.sessions.lock();
+            match sessions.get_mut(token) {
+                Some(auth) => {
+                    auth.real_session_id = Some(real_session_id.to_string());
+                    log::debug!(
+                        "[host-mcp] bound token → session {real_session_id} (agent {})",
+                        auth.agent_id
+                    );
+                    true
+                }
+                None => {
+                    log::warn!(
+                        "[host-mcp] bind_session: unknown token (session {real_session_id} not registered)"
+                    );
+                    false
+                }
             }
-            None => {
-                log::warn!(
-                    "[host-mcp] bind_session: unknown token (session {real_session_id} not registered)"
-                );
+        };
+        if !bound {
+            return;
+        }
+        if let Some(persistence) = &self.conversation_persistence {
+            match persistence.latest_durable_plan(real_session_id) {
+                Ok(Some(entries)) => self.plan_store.set(real_session_id, entries),
+                Ok(None) => {}
+                Err(error) => {
+                    let code = if error.code == "CONVERSATION_READ_FAILED" {
+                        "CONVERSATION_RECOVERY_REQUIRED"
+                    } else {
+                        error.code
+                    };
+                    log::error!("[host-mcp] durable plan hydration failed code={code}");
+                }
             }
         }
     }
@@ -407,14 +461,32 @@ impl HostPlanServer {
                 let agent_id = AgentId(auth.agent_id.clone());
                 let session_id = SessionId(real_session_id.clone());
                 let count = entries.len();
-                self.plan_store.set(&real_session_id, entries.clone());
-                emit_plan_update(&self.sinks, &agent_id, &session_id, entries);
-                log::info!(
-                    "[host-mcp] emitted plan_update for session {} ({} entries)",
-                    session_id,
-                    count
-                );
-                FrameReply::ok()
+                match emit_plan_update(
+                    &self.sinks,
+                    self.conversation_persistence.as_deref(),
+                    &agent_id,
+                    &session_id,
+                    entries.clone(),
+                )
+                .await
+                {
+                    Ok(_) => {
+                        self.plan_store.set(&real_session_id, entries);
+                        log::info!(
+                            "[host-mcp] emitted plan_update for session {} ({} entries)",
+                            session_id,
+                            count
+                        );
+                        FrameReply::ok()
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "[host-mcp] plan_update delivery rejected code={}",
+                            error.code
+                        );
+                        FrameReply::err(error.code)
+                    }
+                }
             }
             FrameKind::SetTitle => {
                 if !req.todos.is_empty() {
@@ -427,11 +499,7 @@ impl HostPlanServer {
                 // the same session are a success no-op (the agent is told it
                 // succeeded so it stops retrying — no churn to the sidebar
                 // title, no duplicate persistence records).
-                if self
-                    .title_set_for_session
-                    .lock()
-                    .contains(&real_session_id)
-                {
+                if self.title_set_for_session.lock().contains(&real_session_id) {
                     log::debug!(
                         "[host-mcp] title call no-op: session {real_session_id} already has a title"
                     );
@@ -462,6 +530,211 @@ impl HostPlanServer {
                     }
                 }
             }
+            kind @ (FrameKind::ScheduledTaskList
+            | FrameKind::ScheduledTaskGet
+            | FrameKind::ScheduledTaskPreview
+            | FrameKind::ScheduledTaskDraftCreate
+            | FrameKind::ScheduledTaskDraftUpdate
+            | FrameKind::ScheduledTaskPause) => {
+                if !req.todos.is_empty() || req.title.is_some() {
+                    return FrameReply::err("scheduled task frame has incompatible fields");
+                }
+                self.process_scheduled_task_request(
+                    kind,
+                    req.payload,
+                    &auth.agent_id,
+                    &real_session_id,
+                )
+            }
+        }
+    }
+
+    fn process_scheduled_task_request(
+        &self,
+        kind: FrameKind,
+        payload: Option<serde_json::Value>,
+        agent_id: &str,
+        real_session_id: &str,
+    ) -> FrameReply {
+        let started = Instant::now();
+        log::info!(
+            "[host-mcp] boundary=scheduled_task_request_started kind={kind:?} agent_id={} session_id={}",
+            agent_id,
+            real_session_id
+        );
+        let service = self.scheduled_tasks.lock().as_ref().and_then(Weak::upgrade);
+        let Some(service) = service else {
+            return FrameReply::err("scheduled task service unavailable");
+        };
+        let payload = payload.unwrap_or_else(|| serde_json::json!({}));
+        let Some(persistence) = self.conversation_persistence.as_ref() else {
+            return FrameReply::err("scheduled task conversation scope unavailable");
+        };
+        let source_conversation_id = persistence
+            .conversation_id_for_session(real_session_id)
+            .map(|id| id.to_string());
+        let Some((
+            associated_project_id,
+            scoped_workspace_cwd,
+            scoped_execution_target,
+            scoped_execution_cwd,
+            scoped_agent_config_id,
+        )) = persistence.scheduled_task_scope_for_session(real_session_id)
+        else {
+            return FrameReply::err("scheduled tasks require an active Conversation");
+        };
+        let context = crate::scheduled_tasks::TaskMutationContextV1 {
+            actor: crate::scheduled_tasks::ScheduledTaskAuditActor::Agent,
+            source_conversation_id: source_conversation_id.clone(),
+            source_tool_call_id: None,
+        };
+
+        let result = match kind {
+            FrameKind::ScheduledTaskList => serde_json::from_value::<
+                crate::acp::host_mcp::ScheduledTaskListInput,
+            >(payload)
+            .map_err(|error| error.to_string())
+            .and_then(|_input| service.list_tasks(None).map_err(|error| error.to_string()))
+            .and_then(|tasks| serde_json::to_value(tasks).map_err(|error| error.to_string())),
+            FrameKind::ScheduledTaskGet => {
+                serde_json::from_value::<crate::acp::host_mcp::ScheduledTaskGetInput>(payload)
+                    .map_err(|error| error.to_string())
+                    .and_then(|input| {
+                        service
+                            .get_task(&input.task_id)
+                            .map_err(|error| error.to_string())
+                    })
+                    .and_then(|task| serde_json::to_value(task).map_err(|error| error.to_string()))
+            }
+            FrameKind::ScheduledTaskPreview => serde_json::from_value::<
+                crate::acp::host_mcp::ScheduledTaskPreviewInput,
+            >(payload)
+            .map_err(|error| error.to_string())
+            .and_then(|input| {
+                serde_json::from_value::<crate::scheduled_tasks::ScheduleSpecV1>(input.schedule)
+                    .map_err(|error| error.to_string())
+                    .and_then(|schedule| {
+                        service
+                            .preview(&schedule, input.count)
+                            .map_err(|error| error.to_string())
+                    })
+            })
+            .and_then(|preview| serde_json::to_value(preview).map_err(|error| error.to_string())),
+            FrameKind::ScheduledTaskDraftCreate => serde_json::from_value::<
+                crate::acp::host_mcp::ScheduledTaskDraftCreateInput,
+            >(payload)
+            .map_err(|error| error.to_string())
+            .and_then(|input| {
+                serde_json::from_value::<crate::scheduled_tasks::ScheduledTaskDraftInputV1>(
+                    input.draft,
+                )
+                .map_err(|error| error.to_string())
+            })
+            .and_then(|mut draft| {
+                draft.project_id = associated_project_id.clone();
+                draft.workspace_cwd = scoped_workspace_cwd.clone();
+                draft.execution_target = scoped_execution_target.clone();
+                draft.execution_cwd = scoped_execution_cwd.clone();
+                draft.agent_config_id = scoped_agent_config_id.clone();
+                draft.source_conversation_id = source_conversation_id.clone();
+                service
+                    .create_draft(draft, context.clone())
+                    .map_err(|error| error.to_string())
+            })
+            .and_then(|task| {
+                self.emit_scheduled_task_draft(agent_id, real_session_id, &task);
+                serde_json::to_value(task).map_err(|error| error.to_string())
+            }),
+            FrameKind::ScheduledTaskDraftUpdate => serde_json::from_value::<
+                crate::acp::host_mcp::ScheduledTaskDraftUpdateInput,
+            >(payload)
+            .map_err(|error| error.to_string())
+            .and_then(|input| {
+                serde_json::from_value::<crate::scheduled_tasks::ScheduledTaskDraftInputV1>(
+                    input.draft,
+                )
+                .map_err(|error| error.to_string())
+                .map(|mut draft| {
+                    draft.project_id = associated_project_id.clone();
+                    draft.workspace_cwd = scoped_workspace_cwd.clone();
+                    draft.execution_target = scoped_execution_target.clone();
+                    draft.execution_cwd = scoped_execution_cwd.clone();
+                    draft.agent_config_id = scoped_agent_config_id.clone();
+                    draft.source_conversation_id = source_conversation_id.clone();
+                    (input.task_id, input.expected_revision, draft)
+                })
+            })
+            .and_then(|(task_id, expected_revision, draft)| {
+                service
+                    .update_draft(&task_id, expected_revision, draft, context.clone())
+                    .map_err(|error| error.to_string())
+            })
+            .and_then(|task| {
+                self.emit_scheduled_task_draft(agent_id, real_session_id, &task);
+                serde_json::to_value(task).map_err(|error| error.to_string())
+            }),
+            FrameKind::ScheduledTaskPause => {
+                serde_json::from_value::<crate::acp::host_mcp::ScheduledTaskPauseInput>(payload)
+                    .map_err(|error| error.to_string())
+                    .and_then(|input| {
+                        service
+                            .pause(&input.task_id, input.expected_revision, context)
+                            .map_err(|error| error.to_string())
+                    })
+                    .and_then(|task| serde_json::to_value(task).map_err(|error| error.to_string()))
+            }
+            FrameKind::Plan | FrameKind::SetTitle => unreachable!("scheduled match only"),
+        };
+        match result {
+            Ok(value) => {
+                log::info!(
+                    "[host-mcp] boundary=scheduled_task_request_completed kind={kind:?} agent_id={} session_id={} elapsed_ms={}",
+                    agent_id,
+                    real_session_id,
+                    started.elapsed().as_millis()
+                );
+                FrameReply::with_result(value)
+            }
+            Err(error) => {
+                log::warn!(
+                    "[host-mcp] boundary=scheduled_task_request_rejected kind={kind:?} agent_id={} session_id={} elapsed_ms={} error={}",
+                    agent_id,
+                    real_session_id,
+                    started.elapsed().as_millis(),
+                    error.lines().next().unwrap_or("unknown")
+                );
+                FrameReply::err(
+                    error
+                        .lines()
+                        .next()
+                        .unwrap_or("scheduled task request failed"),
+                )
+            }
+        }
+    }
+
+    fn emit_scheduled_task_draft(
+        &self,
+        agent_id: &str,
+        real_session_id: &str,
+        task: &crate::scheduled_tasks::ScheduledTaskV1,
+    ) {
+        let event = crate::web::sink::AcpEvent {
+            sid: Some(real_session_id.to_string()),
+            type_: "acp:scheduled_task_draft",
+            payload: serde_json::json!({
+                "agentId": agent_id,
+                "sessionId": real_session_id,
+                "task": task
+            }),
+        };
+        for sink in &self.sinks {
+            if let Err(error) = sink.emit(&event) {
+                log::warn!(
+                    "[host-mcp] scheduled task draft event delivery failed code={}",
+                    error.code
+                );
+            }
         }
     }
 }
@@ -469,6 +742,15 @@ impl HostPlanServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conversation::write_authority::ConversationMutation;
+    use crate::conversation::{
+        AgentSessionBinding, AgentSessionBindingState, ConversationCreator, ConversationEventType,
+        ConversationId, ConversationLifecycleState, ConversationReader, ConversationRecordV2,
+        ConversationRepository, ConversationWriter, CreationPartition, ExecutionTarget,
+        LegacyConversationReader, ReaderPrecedence, AGENT_SESSION_BINDING_SCHEMA_VERSION,
+        CONVERSATION_SCHEMA_VERSION,
+    };
+    use chrono::{TimeZone, Utc};
     use std::sync::Mutex as StdMutex;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
@@ -480,7 +762,11 @@ mod tests {
     }
 
     impl EventSink for CapturingSink {
-        fn emit(&self, event: &crate::web::sink::AcpEvent) {
+        fn emit(
+            &self,
+            event: &crate::web::sink::AcpEvent,
+        ) -> Result<crate::web::sink::EventDeliveryReceipt, crate::web::sink::EventSinkError>
+        {
             if event.type_ == crate::acp::events::EVENT_PLAN_UPDATE
                 || event.type_ == crate::acp::events::EVENT_SESSION_INFO_UPDATE
             {
@@ -489,6 +775,29 @@ mod tests {
                     .unwrap()
                     .push((event.type_.to_string(), event.payload.clone()));
             }
+            Ok(crate::web::sink::EventDeliveryReceipt::delivered(
+                None, false,
+            ))
+        }
+    }
+
+    struct NoopScheduledTaskExecutor;
+
+    #[async_trait::async_trait]
+    impl crate::scheduled_tasks::ScheduledTaskExecutor for NoopScheduledTaskExecutor {
+        async fn execute(
+            &self,
+            _task: crate::scheduled_tasks::ScheduledTaskV1,
+            _run: crate::scheduled_tasks::ScheduledTaskRunV1,
+        ) -> Result<
+            crate::scheduled_tasks::TaskExecutionOutcome,
+            crate::scheduled_tasks::TaskExecutionError,
+        > {
+            Ok(crate::scheduled_tasks::TaskExecutionOutcome {
+                conversation_id: None,
+                summary: None,
+                usage: None,
+            })
         }
     }
 
@@ -511,6 +820,154 @@ mod tests {
         assert!(!token.is_empty());
         assert!(!provisional.is_empty());
         assert_ne!(token, provisional, "token and provisional sid must differ");
+    }
+
+    #[tokio::test]
+    async fn cold_bind_hydrates_latest_canonical_plan_and_empty_clear() {
+        let temp = tempfile::tempdir().unwrap();
+        let private = temp.path().canonicalize().unwrap().join("private");
+        let visible = temp.path().join("visible");
+        std::fs::create_dir_all(&visible).unwrap();
+        let (repository, _) = ConversationRepository::open(private.clone()).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
+        let conversation_id =
+            ConversationId::parse("66666666-6666-4666-8666-666666666666").unwrap();
+        let created_at = Utc
+            .timestamp_millis_opt(1_766_000_000_000)
+            .single()
+            .unwrap();
+        writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: visible.to_string_lossy().into_owned(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::Ready,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
+                },
+                ConversationMutation::CreateConversation,
+            )
+            .await
+            .unwrap();
+        writer
+            .bind_agent_session(
+                conversation_id,
+                AgentSessionBinding {
+                    schema_version: AGENT_SESSION_BINDING_SCHEMA_VERSION,
+                    binding_id: Uuid::new_v4(),
+                    agent_session_id: "sess-cold-plan".to_string(),
+                    runtime_agent_id: "agent-1".to_string(),
+                    stable_agent_namespace: "config:test".to_string(),
+                    execution_cwd: visible.to_string_lossy().into_owned(),
+                    bound_at_utc: created_at,
+                    state: AgentSessionBindingState::Active,
+                },
+                created_at,
+            )
+            .await
+            .unwrap();
+        writer
+            .append_event(
+                conversation_id,
+                created_at,
+                ConversationEventType::PlanUpdate,
+                serde_json::json!({
+                    "agentId":"agent-1",
+                    "sessionId":"sess-cold-plan",
+                    "plan":{"entries":[{"content":"ship","priority":"high","status":"in_progress"}]}
+                }),
+                ConversationMutation::AcpEventAppend,
+            )
+            .await
+            .unwrap();
+        drop(writer);
+        drop(repository);
+
+        let (repository, _) = ConversationRepository::open(private).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
+        let reader = Arc::new(ConversationReader::new(
+            Arc::clone(&repository),
+            LegacyConversationReader::default(),
+            ReaderPrecedence::ConversationV2Only,
+        ));
+        let adapter = Arc::new(ConversationPersistenceAdapter::new(
+            Arc::clone(&writer),
+            reader,
+        ));
+        let server =
+            HostPlanServer::start_with_conversation_persistence(vec![], Arc::clone(&adapter));
+        let task_store = Arc::new(
+            crate::scheduled_tasks::ScheduledTaskStore::open(
+                temp.path().canonicalize().unwrap().join("scheduled-tasks"),
+            )
+            .unwrap(),
+        );
+        let task_service = crate::scheduled_tasks::ScheduledTaskService::with_max_concurrent_runs(
+            Arc::clone(&task_store),
+            Arc::new(NoopScheduledTaskExecutor),
+            1,
+        );
+        server.set_scheduled_tasks(&task_service);
+        let (port, token, provisional) = server.register_session("agent-1");
+        server.bind_session(&token, "sess-cold-plan");
+        server.begin_turn("agent-1", "sess-cold-plan");
+        let hydrated = server.plan_store.get("sess-cold-plan").unwrap();
+        assert_eq!(hydrated.len(), 1);
+        assert_eq!(hydrated[0].content, "ship");
+        let draft_reply = connect_and_send(
+            port,
+            &serde_json::json!({
+                "token": token,
+                "session_id": provisional,
+                "kind": "scheduled_task_draft_create",
+                "payload": {
+                    "draft": {
+                        "projectId": "agent-selected-project-must-be-ignored",
+                        "name": "Projectless task",
+                        "schedule": {"kind": "at", "at": "2099-01-01T00:00:00Z"},
+                        "prompt": "Run from the Conversation workspace",
+                        "agentConfigId": "agent-selected-config-must-be-ignored",
+                        "executionTarget": {"kind": "workspace"},
+                        "executionCwd": visible,
+                        "workspaceCwd": visible
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(draft_reply["ok"], true, "{draft_reply}");
+        assert_eq!(draft_reply["result"]["projectId"], serde_json::Value::Null);
+        assert_eq!(
+            draft_reply["result"]["sourceConversationId"],
+            conversation_id.to_string()
+        );
+        assert_eq!(task_store.list_tasks(None).unwrap().len(), 1);
+
+        writer
+            .append_event(
+                conversation_id,
+                created_at,
+                ConversationEventType::PlanUpdate,
+                serde_json::json!({
+                    "agentId":"agent-1",
+                    "sessionId":"sess-cold-plan",
+                    "plan":{"entries":[]}
+                }),
+                ConversationMutation::AcpEventAppend,
+            )
+            .await
+            .unwrap();
+        let cleared = HostPlanServer::start_with_conversation_persistence(vec![], adapter);
+        let (_port, token, _provisional) = cleared.register_session("agent-1");
+        cleared.bind_session(&token, "sess-cold-plan");
+        assert_eq!(cleared.plan_store.get("sess-cold-plan"), Some(Vec::new()));
     }
 
     #[test]
@@ -759,14 +1216,15 @@ mod tests {
         // second call for the same session must return `ok` (so the agent
         // stops retrying) without writing a second persistence record or
         // emitting a second session_info_update.
-        let root = std::env::temp_dir()
-            .join(format!("termul-host-mcp-title-noop-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!(
+            "termul-host-mcp-title-noop-{}",
+            uuid::Uuid::new_v4()
+        ));
         let cwd = root.join("cwd");
         std::fs::create_dir_all(&cwd).unwrap();
         let runtime = Runtime::new().unwrap();
         runtime.block_on(async move {
-            let persistence =
-                Arc::new(SessionPersistence::open(root.join("store")).await.unwrap());
+            let persistence = Arc::new(SessionPersistence::open(root.join("store")).await.unwrap());
             persistence
                 .register_session(crate::acp::SessionRegistration {
                     session_id: "sess-real".into(),
@@ -779,8 +1237,7 @@ mod tests {
                 .await
                 .unwrap();
             let sink = Arc::new(CapturingSink::default());
-            let server =
-                HostPlanServer::start(vec![sink.clone()], Some(Arc::clone(&persistence)));
+            let server = HostPlanServer::start(vec![sink.clone()], Some(Arc::clone(&persistence)));
             let (port, token, provisional) = server.register_session("agent-1");
             server.bind_session(&token, "sess-real");
             server.begin_turn("agent-1", "sess-real");
@@ -829,14 +1286,15 @@ mod tests {
         // Per-session (not per-turn): `end_turn` + `begin_turn` for a 2nd turn
         // must NOT reset the title flag — the agent can't set the title again
         // on a later turn.
-        let root = std::env::temp_dir()
-            .join(format!("termul-host-mcp-title-turn-{}", uuid::Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!(
+            "termul-host-mcp-title-turn-{}",
+            uuid::Uuid::new_v4()
+        ));
         let cwd = root.join("cwd");
         std::fs::create_dir_all(&cwd).unwrap();
         let runtime = Runtime::new().unwrap();
         runtime.block_on(async move {
-            let persistence =
-                Arc::new(SessionPersistence::open(root.join("store")).await.unwrap());
+            let persistence = Arc::new(SessionPersistence::open(root.join("store")).await.unwrap());
             persistence
                 .register_session(crate::acp::SessionRegistration {
                     session_id: "sess-real".into(),
@@ -849,8 +1307,7 @@ mod tests {
                 .await
                 .unwrap();
             let sink = Arc::new(CapturingSink::default());
-            let server =
-                HostPlanServer::start(vec![sink.clone()], Some(Arc::clone(&persistence)));
+            let server = HostPlanServer::start(vec![sink.clone()], Some(Arc::clone(&persistence)));
             let (port, token, provisional) = server.register_session("agent-1");
             server.bind_session(&token, "sess-real");
             server.begin_turn("agent-1", "sess-real");
@@ -874,7 +1331,10 @@ mod tests {
                 "title": "Turn 2 title",
             });
             let reply = connect_and_send(port, &second).await;
-            assert_eq!(reply["ok"], true, "2nd-turn title call must succeed (no-op)");
+            assert_eq!(
+                reply["ok"], true,
+                "2nd-turn title call must succeed (no-op)"
+            );
             let metadata = persistence.metadata("sess-real").unwrap();
             assert_eq!(
                 metadata.title.as_deref(),

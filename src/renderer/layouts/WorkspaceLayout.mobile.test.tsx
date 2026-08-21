@@ -1,8 +1,8 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { MemoryRouter } from 'react-router-dom'
+import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { tauriRef, mobileRef, projectRef } = vi.hoisted(() => ({
+const { tauriRef, mobileRef, projectRef, resolveRecoveryMock } = vi.hoisted(() => ({
   // Mutable: mobile branch requires isTauriContext() === false.
   tauriRef: { current: false as boolean },
   // Mutable: gates the mobile shell render path.
@@ -14,7 +14,8 @@ const { tauriRef, mobileRef, projectRef } = vi.hoisted(() => ({
       name?: string
       id?: string
     }
-  }
+  },
+  resolveRecoveryMock: vi.fn()
 }))
 
 vi.mock('@/lib/tauri-runtime', async () => {
@@ -40,9 +41,9 @@ vi.mock('@/lib/platform', async () => {
 
 vi.mock('@/stores/project-store', () => ({
   useProjectsLoaded: () => true,
-  useProjects: () => [projectRef.current],
-  useActiveProject: () => projectRef.current,
-  useActiveProjectId: () => 'p1',
+  useProjects: () => (projectRef.current.id ? [projectRef.current] : []),
+  useActiveProject: () => (projectRef.current.id ? projectRef.current : undefined),
+  useActiveProjectId: () => projectRef.current.id ?? '',
   useProjectActions: () => ({
     selectProject: vi.fn(),
     addProject: vi.fn(),
@@ -63,7 +64,12 @@ vi.mock('@/stores/project-store', () => ({
 }))
 
 vi.mock('@/stores/terminal-store', () => ({
-  useTerminalStore: vi.fn((selector) => selector({ terminals: [] })),
+  useTerminalStore: Object.assign(
+    vi.fn((selector) => selector({ terminals: [] })),
+    {
+      getState: () => ({ terminals: [], findTerminalByPtyId: () => undefined })
+    }
+  ),
   useTerminals: () => [],
   useAllTerminals: () => [],
   useActiveTerminal: () => null,
@@ -72,6 +78,10 @@ vi.mock('@/stores/terminal-store', () => ({
     selectTerminal: vi.fn(),
     addTerminal: vi.fn(),
     closeTerminal: vi.fn(),
+    closeTerminalView: vi.fn(async () => true),
+    reopenTerminalView: vi.fn(),
+    terminateTerminalResource: vi.fn(async () => true),
+    restartTerminalResource: vi.fn(async () => true),
     renameTerminal: vi.fn(),
     reorderTerminals: vi.fn(),
     setTerminalPtyId: vi.fn(),
@@ -92,6 +102,7 @@ vi.mock('@/stores/app-settings-store', () => ({
   useTerminalFontSize: vi.fn(() => 14),
   useUiZoomLevel: vi.fn(() => 1),
   useTerminalFontFamily: vi.fn(() => 'monospace'),
+  useTerminalSymbolFontFamily: vi.fn(() => ''),
   useTerminalBufferSize: vi.fn(() => 10000),
   useDefaultShell: vi.fn(() => 'bash'),
   useMaxTerminalsPerProject: vi.fn(() => 10),
@@ -165,6 +176,9 @@ vi.mock('@/components/CommandPalette', () => ({
 // GitPanel dependencies (rendered inside the mobile git Sheet).
 vi.mock('@/lib/git-api', () => ({ gitApi: { getDiff: vi.fn() } }))
 vi.mock('@/lib/log-api', () => ({ logFrontendError: vi.fn() }))
+vi.mock('@/lib/conversation-api', () => ({
+  conversationApi: { resolveRecovery: resolveRecoveryMock }
+}))
 vi.mock('@/components/git/GitDiffView', () => ({ GitDiffView: () => null }))
 vi.mock('@/stores/acp-store', () => ({
   useAcpStore: (selector: (s: Record<string, unknown>) => unknown) =>
@@ -224,16 +238,27 @@ vi.mock('@/components/workspace/PaneRenderer', () => ({
 
 // P17: shared canonical mock shape for the Story 6 sync hook + banner —
 // identical inline factories across the three WorkspaceLayout suites.
+vi.mock('@/hooks/use-editor-persistence', () => ({
+  useEditorPersistence: vi.fn(),
+  persistState: vi.fn(),
+  restoreProjectWorkspace: vi.fn().mockResolvedValue(false),
+  subscribeProjectWorkspaceRestored: vi.fn(() => () => {})
+}))
+
 vi.mock('@/hooks/use-workspace-manifest-sync', () => ({
   useWorkspaceManifestSync: vi.fn(),
   loadWorkspaceManifest: vi.fn().mockResolvedValue(false),
   resolveManifestConflict: vi.fn().mockResolvedValue(undefined),
   performManifestWrite: vi.fn().mockResolvedValue(undefined)
 }))
-vi.mock('@/components/workspace/WorkspaceConflictBanner', () => ({
-  WorkspaceConflictBanner: () => <div data-testid="workspace-conflict-banner" />
+vi.mock('@/hooks/use-session-workspace-sync', () => ({
+  useSessionWorkspaceSync: vi.fn(),
+  useSessionWorkspaceBootstrap: vi.fn(),
+  loadSessionWorkspace: vi.fn().mockResolvedValue(false),
+  resolveSessionWorkspaceConflict: vi.fn().mockResolvedValue(undefined),
+  resolveSessionWorkspaceRecovery: vi.fn().mockResolvedValue(undefined),
+  performSessionWorkspaceWrite: vi.fn().mockResolvedValue('skipped')
 }))
-vi.mock('@/pages/WorkspaceDashboard', () => ({ default: () => <div>dashboard</div> }))
 vi.mock('@/pages/WorkspaceSnapshots', () => ({ default: () => <div>snapshots</div> }))
 vi.mock('@/pages/AppPreferences', () => ({ default: () => <div>preferences</div> }))
 vi.mock('@/pages/ProjectSettings', () => ({ default: () => <div>project-settings</div> }))
@@ -321,7 +346,59 @@ vi.mock('@/components/ssh/SSHFileExplorer', () => ({
   SSHFileExplorer: () => <div data-testid="ssh-file-explorer-stub" />
 }))
 
+import { ConversationRecoveryPanel } from '@/components/conversation/ConversationRecoveryPanel'
+import WorkspaceDashboard from '@/pages/WorkspaceDashboard'
+import { useConversationStore } from '@/stores/conversation-store'
+import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
 import WorkspaceLayout from './WorkspaceLayout'
+
+const conversationId = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
+const mobileRecoveryItem = {
+  recoveryId: 'a'.repeat(64),
+  kind: 'ambiguous_workspace_manifest' as const,
+  severity: 'warning' as const,
+  sourcePaths: ['legacy_workspace_manifests/0/shared.json'],
+  conversationIds: [conversationId],
+  sourceSha256: ['e'.repeat(64)],
+  candidateFacts: [],
+  provenance: [
+    {
+      sourceKind: 'legacy_workspace_manifests',
+      relativePath: 'legacy_workspace_manifests/0/shared.json',
+      sha256: 'e'.repeat(64),
+      preservedReadOnly: true as const
+    }
+  ],
+  status: 'unresolved' as const,
+  suggestedActions: [
+    'inspect',
+    'associateConversation',
+    'startEmptyWorkspace',
+    'dismissPreservedSource'
+  ] as const,
+  revision: 7,
+  associationDecisions: []
+}
+const redactedHostRecoveryItem = {
+  ...mobileRecoveryItem,
+  sourcePaths: [],
+  sourceSha256: [],
+  candidateFacts: [],
+  provenance: []
+}
+
+function renderMobileRoot(): ReturnType<typeof render> {
+  return render(
+    <MemoryRouter initialEntries={['/']}>
+      <ConversationRecoveryPanel />
+      <Routes>
+        <Route path="/" element={<WorkspaceLayout />}>
+          <Route index element={<WorkspaceDashboard />} />
+        </Route>
+      </Routes>
+    </MemoryRouter>
+  )
+}
 
 describe('WorkspaceLayout mobile branch', () => {
   beforeEach(() => {
@@ -333,6 +410,79 @@ describe('WorkspaceLayout mobile branch', () => {
     gitState.selectedFile = null
     gitState.commitContexts = {}
     sshProfileRef.current = null
+    useConversationStore.getState().reset()
+    useConversationStore.getState().setActiveConversationId(conversationId)
+    resolveRecoveryMock.mockResolvedValue({
+      success: true,
+      data: {
+        recoveryId: redactedHostRecoveryItem.recoveryId,
+        action: 'inspect',
+        authorization: 'read',
+        status: 'unresolved',
+        recoveryRevision: redactedHostRecoveryItem.revision,
+        workspaceRevision: null,
+        workspaceChanged: false,
+        sourcePaths: mobileRecoveryItem.sourcePaths,
+        sourceSha256: mobileRecoveryItem.sourceSha256,
+        candidateFacts: mobileRecoveryItem.candidateFacts,
+        provenance: mobileRecoveryItem.provenance
+      }
+    })
+    useSessionWorkspaceSyncStore.setState({
+      activeConversationId: conversationId,
+      basedRevisionByConversation: {},
+      conflictsByConversation: {},
+      recoveryByConversation: {},
+      loadOutcomeByConversation: {},
+      restoreInProgressByConversation: {}
+    })
+  })
+
+  it('renders the dashboard index and authenticated recovery inspection at the phone root', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 })
+    const originalSnapshot = structuredClone(redactedHostRecoveryItem)
+    useConversationStore.getState().setRecoveryItems([redactedHostRecoveryItem])
+
+    renderMobileRoot()
+
+    expect(
+      await screen.findByRole('heading', { name: 'Your Conversation workspace' })
+    ).toBeVisible()
+    expect(screen.getByLabelText('New chat')).toBeEnabled()
+    expect(document.querySelector('[data-pane-renderer-stub]')).not.toBeInTheDocument()
+    expect(screen.queryByText(/legacy_workspace_manifests\/0\/shared.json/)).not.toBeInTheDocument()
+    expect(document.querySelectorAll('[data-conversation-recovery-panel]')).toHaveLength(1)
+    expect(document.querySelectorAll('[data-recovery-action]')).toHaveLength(
+      redactedHostRecoveryItem.suggestedActions.length
+    )
+    for (const action of redactedHostRecoveryItem.suggestedActions) {
+      expect(document.querySelectorAll(`[data-recovery-action="${action}"]`)).toHaveLength(1)
+    }
+
+    fireEvent.click(screen.getByRole('button', { name: 'Inspect preserved source' }))
+
+    expect(
+      (await screen.findAllByText(/legacy_workspace_manifests\/0\/shared.json/)).length
+    ).toBeGreaterThan(0)
+    expect(resolveRecoveryMock).toHaveBeenCalledWith({
+      recoveryId: redactedHostRecoveryItem.recoveryId,
+      expectedRevision: redactedHostRecoveryItem.revision,
+      action: 'inspect',
+      payload: {}
+    })
+    expect(redactedHostRecoveryItem).toEqual(originalSnapshot)
+  })
+
+  it('keeps project-less New chat enabled while project-only tools stay gated', async () => {
+    projectRef.current = {}
+    render(
+      <MemoryRouter>
+        <WorkspaceLayout />
+      </MemoryRouter>
+    )
+
+    expect(await screen.findByLabelText('New chat')).toBeEnabled()
+    expect(screen.getByLabelText('Git changes')).toBeDisabled()
   })
 
   it('mounts MobileChatShell and threads the command-palette + git-changes triggers', async () => {
@@ -346,6 +496,25 @@ describe('WorkspaceLayout mobile branch', () => {
     await waitFor(() => expect(document.querySelector('[data-mobile-chat-shell]')).toBeTruthy())
     expect(screen.getByLabelText('Command palette')).toBeInTheDocument()
     expect(screen.getByLabelText('Git changes')).not.toBeDisabled()
+  })
+
+  it('keeps immutable recovery context and exact actions usable at phone width', async () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 390 })
+    useSessionWorkspaceSyncStore.getState().setRecoveryItems(conversationId, [mobileRecoveryItem])
+    render(
+      <MemoryRouter>
+        <WorkspaceLayout />
+      </MemoryRouter>
+    )
+
+    expect(await screen.findByRole('alert')).toHaveAttribute('data-conversation-id', conversationId)
+    expect(
+      screen.getAllByText(/legacy_workspace_manifests\/0\/shared.json/).length
+    ).toBeGreaterThan(0)
+    expect(screen.getAllByText(new RegExp(`sha256:${'e'.repeat(64)}`)).length).toBeGreaterThan(0)
+    for (const action of mobileRecoveryItem.suggestedActions) {
+      expect(document.querySelector(`[data-recovery-action="${action}"]`)).toBeVisible()
+    }
   })
 
   it('opens the CommandPalette overlay when the mobile trigger is tapped', async () => {

@@ -106,7 +106,7 @@ function renderPage(): ReturnType<typeof render> {
   )
 }
 
-describe('AppPreferences editor auto-save controls (GH-539)', () => {
+describe('AppPreferences settings controls', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     useAppSettingsStore.setState({ settings: { ...DEFAULT_APP_SETTINGS }, isLoaded: true })
@@ -145,5 +145,19 @@ describe('AppPreferences editor auto-save controls (GH-539)', () => {
     await waitFor(() => {
       expect(useAppSettingsStore.getState().settings.editorAutoSaveDelayMs).toBe(2000)
     })
+  })
+
+  it('keeps screen reader mode opt-in and persists the user toggle', async () => {
+    renderPage()
+
+    const toggle = await screen.findByRole('switch', { name: 'Screen reader mode' })
+    expect(toggle).toHaveAttribute('aria-checked', 'false')
+
+    fireEvent.click(toggle)
+
+    await waitFor(() => {
+      expect(useAppSettingsStore.getState().settings.terminalScreenReaderMode).toBe(true)
+    })
+    expect(mockWriteDebounced).toHaveBeenCalled()
   })
 })

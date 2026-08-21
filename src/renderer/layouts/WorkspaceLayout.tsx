@@ -1,15 +1,16 @@
 import type { ShellInfo } from '@shared/types/ipc.types'
 import type { SFTPEntry } from '@shared/types/ssh.types'
 import { motion } from 'framer-motion'
-import { FolderKanban } from 'lucide-react'
+import { FolderGit2, SquareTerminal, X } from 'lucide-react'
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 import { toast } from 'sonner'
 import { ActivityRail } from '@/components/ActivityRail'
-import { ChatRoute } from '@/components/ChatRoute'
+import { AgentLauncher } from '@/components/agents/AgentLauncher'
 import { ConfirmDialog } from '@/components/ConfirmDialog'
 import { CreateSnapshotModal } from '@/components/CreateSnapshotModal'
+import { ConversationSidebar } from '@/components/conversation/ConversationSidebar'
 import { NewProjectModal } from '@/components/NewProjectModal'
 import { ProjectSidebar } from '@/components/ProjectSidebar'
 import { ResizeEdges } from '@/components/ResizeEdges'
@@ -20,6 +21,13 @@ import {
   SidebarToggleButton,
   titlebarNoDragStyle
 } from '@/components/TitlebarPanelToggles'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle
+} from '@/components/ui/dialog'
 import { Sheet, SheetContent } from '@/components/ui/sheet'
 import { Skeleton } from '@/components/ui/skeleton'
 import { PaneRenderer } from '@/components/workspace/PaneRenderer'
@@ -34,15 +42,21 @@ import {
   useCommandHistory,
   useCommandHistoryLoader
 } from '@/hooks/use-command-history'
-import { useEditorPersistence } from '@/hooks/use-editor-persistence'
+import {
+  persistState,
+  restoreProjectGroupWorkspace,
+  restoreProjectWorkspace,
+  subscribeProjectWorkspaceRestored,
+  useEditorPersistence
+} from '@/hooks/use-editor-persistence'
 import { useFileWatcher } from '@/hooks/use-file-watcher'
 import { useMobileWebShell } from '@/hooks/use-mobile-web-shell'
 import { PaneDndProvider } from '@/hooks/use-pane-dnd'
 import { usePinnedCommandsLoader } from '@/hooks/use-pinned-commands'
 import { useRecentCommandsLoader } from '@/hooks/use-recent-commands'
+import { useSessionWorkspaceSync } from '@/hooks/use-session-workspace-sync'
 import { useCreateSnapshot, useSnapshotLoader } from '@/hooks/use-snapshots'
 import { useSSHConnection } from '@/hooks/use-ssh-connection'
-import { useWorkspaceManifestSync } from '@/hooks/use-workspace-manifest-sync'
 import { useWorktreeShortcuts } from '@/hooks/use-worktree-shortcuts'
 import { saveTerminalLayout } from '@/hooks/useTerminalAutoSave'
 import { runtimeT } from '@/i18n/runtime'
@@ -59,9 +73,11 @@ import {
   windowApi
 } from '@/lib/api'
 import { browserTabHide, browserTabShow } from '@/lib/browser-api'
+import { getColorClasses } from '@/lib/colors'
 import { isSaveFileShortcut, requestSaveEditorFile } from '@/lib/editor-save'
+import { logFrontendError } from '@/lib/log-api'
 import { isMac, macOsTitlebarStripClass } from '@/lib/platform'
-import { setRouterNavigate } from '@/lib/router-navigate'
+import { isConversationAreaPath, setRouterNavigate } from '@/lib/router-navigate'
 import { listen, type UnlistenFn } from '@/lib/tauri-event'
 import { spawnTerminalInPane } from '@/lib/terminal-spawn'
 import { getEffectiveThemeId } from '@/lib/themes'
@@ -79,6 +95,7 @@ import {
 } from '@/stores/app-settings-store'
 import { useBrowserSessionStore } from '@/stores/browser-session-store'
 import { useCommandHistoryStore } from '@/stores/command-history-store'
+import { useConversationStore } from '@/stores/conversation-store'
 import { useEditorStore } from '@/stores/editor-store'
 import { useFileExplorerStore, useFileExplorerVisible } from '@/stores/file-explorer-store'
 import { matchesShortcut, useKeyboardShortcutsStore } from '@/stores/keyboard-shortcuts-store'
@@ -86,6 +103,7 @@ import {
   useActiveProject,
   useActiveProjectId,
   useProjectActions,
+  useProjectStore,
   useProjects,
   useProjectsLoaded
 } from '@/stores/project-store'
@@ -108,14 +126,15 @@ import { useThemePickerOpen, useThemePickerStore } from '@/stores/theme-picker-s
 import {
   editorTabId,
   findPaneById,
-  findPaneContainingTab,
   getActiveFilePathFromTree,
   getActiveTerminalIdFromTree,
+  getAllLeafPanes,
   useActiveTab,
   useFullscreenPaneId,
   usePaneRoot,
   useWorkspaceStore
 } from '@/stores/workspace-store'
+import { isConversationScopedTerminal, isOpenTerminalView } from '@/types/project'
 import { UI_ZOOM_DEFAULT, UI_ZOOM_MAX, UI_ZOOM_MIN, UI_ZOOM_STEP } from '@/types/settings'
 
 const SSHWorkspace = lazy(() =>
@@ -175,9 +194,12 @@ function getShortcutTargetContext(target: EventTarget | null): {
  * stays a window-drag zone; the toggle sits in a separate no-drag container.
  */
 const macOsTrafficLightClearance = 'w-[80px] shrink-0'
-
 function MacOsTitlebarStrip(): React.JSX.Element | null {
   const activeProject = useActiveProject()
+  const activeGroupName = useProjectStore((state) => {
+    if (!state.activeGroupId) return null
+    return state.groups.find((group) => group.id === state.activeGroupId)?.name ?? null
+  })
 
   if (!isMac) return null
 
@@ -196,9 +218,9 @@ function MacOsTitlebarStrip(): React.JSX.Element | null {
         <SidebarToggleButton />
       </div>
 
-      {activeProject && (
+      {(activeGroupName || activeProject) && (
         <span className="absolute left-1/2 -translate-x-1/2 text-sm text-muted-foreground pointer-events-none select-none truncate max-w-[50%]">
-          {activeProject.name}
+          {activeGroupName ?? activeProject?.name}
         </span>
       )}
 
@@ -235,12 +257,22 @@ export default function WorkspaceLayout(): React.JSX.Element {
   } | null>(null)
   const [closeConfirmLoading, setCloseConfirmLoading] = useState(false)
   const [closeConfirmRememberChoice, setCloseConfirmRememberChoice] = useState(false)
+  const [terminateConfirmTerminal, setTerminateConfirmTerminal] = useState<{
+    terminalId: string
+    tabId?: string
+  } | null>(null)
+  const [terminateConfirmLoading, setTerminateConfirmLoading] = useState(false)
   const [closingTerminalIds, setClosingTerminalIds] = useState<string[]>([])
   const [dirtyCloseFilePath, setDirtyCloseFilePath] = useState<string | null>(null)
   const [isCommandHistoryOpen, setIsCommandHistoryOpen] = useState(false)
+  const [pendingTerminalRoot, setPendingTerminalRoot] = useState<{
+    paneId: string
+    shellName?: string
+  } | null>(null)
   const [isAppCloseDialogOpen, setIsAppCloseDialogOpen] = useState(false)
   // Mobile-only full-width Sheet rendering GitPanel (single-column mobile branch).
   const [gitSheetOpen, setGitSheetOpen] = useState(false)
+  const [projectEnterNonce, setProjectEnterNonce] = useState(0)
   const [appCloseDirtyCount, setAppCloseDirtyCount] = useState(0)
 
   const isLoaded = useProjectsLoaded()
@@ -253,21 +285,48 @@ export default function WorkspaceLayout(): React.JSX.Element {
   const confirmTerminalClose = useConfirmTerminalClose()
   const projects = useProjects()
   const activeProject = useActiveProject()
+  const activeGroupId = useProjectStore((state) => state.activeGroupId) ?? null
   const activeProjectId = useActiveProjectId()
+  const groups = useProjectStore((state) => state.groups) ?? []
+  const activeGroup = useMemo(
+    () => groups.find((group) => group.id === activeGroupId),
+    [activeGroupId, groups]
+  )
+  const activeGroupProjects = useMemo(() => {
+    if (!activeGroup) return []
+    const projectsById = new Map(projects.map((project) => [project.id, project]))
+    return activeGroup.projectIds.flatMap((projectId) => {
+      const project = projectsById.get(projectId)
+      return project && project.isArchived !== true && project.path ? [project] : []
+    })
+  }, [activeGroup, projects])
+  const editorPersistenceScopeKey = activeGroupId ? `group-${activeGroupId}` : activeProjectId
+  const activeConversationId = useConversationStore((state) => state.activeConversationId)
+  const activeConversation = useConversationStore((state) =>
+    activeConversationId ? state.summariesById[activeConversationId] : undefined
+  )
   const {
     selectProject,
+    selectGroup,
     addProject,
     updateProject,
     deleteProject,
     archiveProject,
     restoreProject,
-    reorderProjects
+    reorderProjects,
+    updateGroup
   } = useProjectActions()
 
   const terminals = useTerminals()
   const activeTerminal = useActiveTerminal()
   const activeTerminalId = useActiveTerminalId()
-  const { addTerminal, closeTerminal, renameTerminal } = useTerminalActions()
+  const {
+    addTerminal,
+    closeTerminalView,
+    terminateTerminalResource,
+    restartTerminalResource,
+    renameTerminal
+  } = useTerminalActions()
 
   // File explorer & editor state
   const isExplorerVisible = useFileExplorerVisible()
@@ -432,10 +491,47 @@ export default function WorkspaceLayout(): React.JSX.Element {
 
   const handleSelectProject = useCallback(
     (id: string) => {
+      useWorkspaceStore.getState().hideAgentLauncher()
       selectProject(id)
       selectSSHProfile(null) // Deselect SSH when switching to project
+      enteredProjectRef.current = null
+      projectTerminalDismissedRef.current = false
+      if (location.pathname !== '/') {
+        setProjectEnterNonce((nonce) => nonce + 1)
+        navigate('/')
+        return
+      }
+      void restoreProjectWorkspace(id).then((restored) => {
+        useConversationStore.getState().setActiveConversationId(null)
+        if (!restored) useWorkspaceStore.getState().resetLayout()
+        enteredProjectRef.current = null
+        setProjectEnterNonce((nonce) => nonce + 1)
+      })
     },
-    [selectProject, selectSSHProfile]
+    [location.pathname, navigate, selectProject, selectSSHProfile]
+  )
+  const handleSelectGroup = useCallback(
+    (groupId: string) => {
+      const group = groups.find((candidate) => candidate.id === groupId)
+      if (!group) return
+      useWorkspaceStore.getState().hideAgentLauncher()
+      selectGroup(groupId)
+      selectSSHProfile(null)
+      enteredProjectRef.current = null
+      projectTerminalDismissedRef.current = false
+      if (location.pathname !== '/') {
+        setProjectEnterNonce((nonce) => nonce + 1)
+        navigate('/')
+        return
+      }
+      void restoreProjectGroupWorkspace(groupId, group.projectIds).then((restored) => {
+        useConversationStore.getState().setActiveConversationId(null)
+        if (!restored) useWorkspaceStore.getState().resetLayout()
+        enteredProjectRef.current = null
+        setProjectEnterNonce((nonce) => nonce + 1)
+      })
+    },
+    [groups, location.pathname, navigate, selectGroup, selectSSHProfile]
   )
   const activeTab = useActiveTab()
   const paneRoot = usePaneRoot()
@@ -449,6 +545,12 @@ export default function WorkspaceLayout(): React.JSX.Element {
   const prevProjectIdRef = useRef<string>('')
   const watchedRootPathRef = useRef<string | null>(null)
   const projectSwitchRequestIdRef = useRef(0)
+  const enteredProjectRef = useRef<string | null>(null)
+  const lastProjectEnterKeyRef = useRef('')
+  const projectTerminalDismissedRef = useRef(false)
+  const closingTerminalIdsRef = useRef<string[]>([])
+  closingTerminalIdsRef.current = closingTerminalIds
+  const ensureVisibleProjectTerminalRef = useRef<(projectId: string) => void>(() => {})
 
   // Ref for terminal close handler — used inside keydown effect to avoid
   // declaration-order dependency. The ref is updated each render.
@@ -475,7 +577,12 @@ export default function WorkspaceLayout(): React.JSX.Element {
       useBrowserSessionStore.getState().removeTab(activeTab.browserTabId)
       useWorkspaceStore.getState().removeTab(activeTab.id)
     } else if (activeTab.type === 'agent-chat') {
-      useWorkspaceStore.getState().removeTab(activeTab.id)
+      const acp = useAcpStore.getState()
+      const conversationId =
+        activeTab.conversationId ??
+        (activeTab.sessionId ? acp.sessions[activeTab.sessionId]?.conversationId : undefined)
+      if (conversationId) acp.closeChatView(conversationId)
+      else if (activeTab.sessionId) useWorkspaceStore.getState().removeTab(activeTab.id)
     }
   }, [activeTab])
 
@@ -485,9 +592,16 @@ export default function WorkspaceLayout(): React.JSX.Element {
   useEffect(() => {
     const persistBeforeUnload = () => {
       if (!activeProjectId) return
-      void saveTerminalLayout(activeProjectId).catch((error) => {
-        console.warn('Failed to persist terminal layout before reload:', error)
-      })
+      persistState(editorPersistenceScopeKey)
+      const terminalProjectIds =
+        activeGroupProjects.length > 0
+          ? activeGroupProjects.map((project) => project.id)
+          : [activeProjectId]
+      for (const projectId of terminalProjectIds) {
+        void saveTerminalLayout(projectId).catch((error) => {
+          console.warn('Failed to persist terminal layout before reload:', error)
+        })
+      }
       // R4: force-flush a non-debounced snapshot of every live ACP session's
       // cached payload on refresh unload so the durable copy is at worst one
       // turn behind (never truncated by a live-window trim). Best-effort: a
@@ -511,17 +625,37 @@ export default function WorkspaceLayout(): React.JSX.Element {
       window.removeEventListener('beforeunload', persistBeforeUnload)
       window.removeEventListener('pagehide', persistBeforeUnload)
     }
-  }, [activeProjectId])
+  }, [activeGroupProjects, activeProjectId, editorPersistenceScopeKey])
 
   // Worktree shortcut handlers
   useWorktreeShortcuts()
 
   // Sync file explorer root path and register project root watcher when project changes
-  // biome-ignore lint/correctness/useExhaustiveDependencies: activeProject?.path covers the only property used
   useEffect(() => {
+    if (activeGroupId) {
+      const groupScopeKey = `group:${activeGroupId}:${activeGroupProjects
+        .map((project) => `${project.id}:${project.path}`)
+        .join('|')}`
+      if (groupScopeKey === prevProjectIdRef.current) return
+      if (watchedRootPathRef.current) {
+        filesystemApi.unwatchDirectory(watchedRootPathRef.current)
+        watchedRootPathRef.current = null
+      }
+      useFileExplorerStore.getState().setRoots(
+        activeGroupProjects.map((project) => ({
+          projectId: project.id,
+          name: project.name,
+          path: project.path ?? ''
+        })),
+        activeProject?.path
+      )
+      prevProjectIdRef.current = groupScopeKey
+      return
+    }
+
     const nextRootPathCandidate = activeProject?.path
     if (
-      !activeProject ||
+      !activeProjectId ||
       typeof nextRootPathCandidate !== 'string' ||
       nextRootPathCandidate === ''
     ) {
@@ -609,15 +743,80 @@ export default function WorkspaceLayout(): React.JSX.Element {
     return () => {
       cancelled = true
     }
-  }, [activeProject?.path, activeProjectId])
+  }, [activeGroupId, activeGroupProjects, activeProject?.path, activeProjectId])
+
+  // The file tree follows the open Conversation's workspace directory while in
+  // the Conversation area, and the active project elsewhere. Project switches
+  // keep their dedicated effect above; this one only owns scope transitions.
+  useEffect(() => {
+    const inConversationScope = location.pathname.startsWith('/c/')
+    if (!inConversationScope && activeGroupId) {
+      useFileExplorerStore.getState().setRoots(
+        activeGroupProjects.map((project) => ({
+          projectId: project.id,
+          name: project.name,
+          path: project.path ?? ''
+        })),
+        activeProject?.path
+      )
+      watchedRootPathRef.current = null
+      return
+    }
+    const desiredRoot = inConversationScope
+      ? (activeConversation?.workspaceCwd ?? '')
+      : (activeProject?.path ?? '')
+    if (!desiredRoot || desiredRoot === watchedRootPathRef.current) return
+    const previousWatchedRoot = watchedRootPathRef.current
+    let cancelled = false
+    void filesystemApi.watchDirectory(desiredRoot).then((watchResult) => {
+      if (cancelled) return
+      if (!watchResult.success && watchResult.code !== 'WEB_UNSUPPORTED') {
+        useFileExplorerStore.getState().setRootLoadError({
+          message: watchResult.error ?? 'Failed to watch directory',
+          code: watchResult.code ?? 'WATCH_FAILED'
+        })
+        return
+      }
+      useFileExplorerStore.getState().setRootPath(desiredRoot)
+      if (previousWatchedRoot && previousWatchedRoot !== desiredRoot) {
+        filesystemApi.unwatchDirectory(previousWatchedRoot)
+      }
+      watchedRootPathRef.current = desiredRoot
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [
+    location.pathname,
+    activeConversation?.workspaceCwd,
+    activeGroupId,
+    activeGroupProjects,
+    activeProject?.path
+  ])
 
   // Editor state persistence
-  useEditorPersistence(activeProjectId)
+  useEditorPersistence(
+    isConversationAreaPath(location.pathname) || activeConversationId
+      ? ''
+      : editorPersistenceScopeKey,
+    activeGroupId
+      ? {
+          projectIds: activeGroupProjects.map((project) => project.id),
+          rootPaths: activeGroupProjects.flatMap((project) => (project.path ? [project.path] : [])),
+          manifestProjectId: null,
+          notificationProjectId: activeProjectId
+        }
+      : {
+          projectIds: activeProjectId ? [activeProjectId] : [],
+          rootPaths: activeProject?.path ? [activeProject.path] : [],
+          manifestProjectId: activeProjectId || null,
+          notificationProjectId: activeProjectId
+        }
+  )
 
-  // Story 6: cross-client workspace manifest sync (load happens inside
-  // useEditorPersistence's restore flow via loadAndRestoreManifest; this hook
-  // wires the debounced write side + conflict surfacing).
-  useWorkspaceManifestSync(activeProjectId)
+  // SessionWorkspace is keyed only by canonical ConversationId. The legacy
+  // project manifest remains a read-only migration input and receives no live writes.
+  useSessionWorkspaceSync(activeConversationId)
 
   useEffect(() => {
     return () => {
@@ -638,7 +837,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
   const syncDebounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
-    const terminalIds = terminals.map((terminal) => terminal.id)
+    const terminalIds = terminals.filter(isOpenTerminalView).map((terminal) => terminal.id)
 
     // Clear any pending debounce — only the latest mutation triggers a sync.
     if (syncDebounceTimerRef.current) {
@@ -992,8 +1191,29 @@ export default function WorkspaceLayout(): React.JSX.Element {
     [uiZoomLevel, updateAppSetting]
   )
 
-  // Determine if we should show the terminal area (only on workspace dashboard)
-  const isWorkspaceRoute = location.pathname === '/' || location.pathname.startsWith('/c/')
+  // Desktop: the independent Conversation area (list dashboard + open conversations) is
+  // entered from the Activity Rail chat toggle; the portable index route owns the regular
+  // project workspace with terminal panes, so the two areas never render side by side.
+  // The phone shell keeps its own navigation and still owns the dashboard at its root.
+  const isConversationListRoute = location.pathname === '/conversations'
+  const isOpenConversationRoute = location.pathname.startsWith('/c/')
+  // File explorer visibility follows the Conversation workspace in the
+  // Conversation area and the active project elsewhere.
+  const explorerRootVisible = location.pathname.startsWith('/c/')
+    ? Boolean(activeConversation?.workspaceCwd)
+    : Boolean(activeProject?.path)
+  const isConversationRoute =
+    isConversationListRoute ||
+    location.pathname.startsWith('/c/') ||
+    (isMobileWebShell && location.pathname === '/')
+  const isWorkspaceRoute =
+    location.pathname.startsWith('/c/') || (!isMobileWebShell && location.pathname === '/')
+
+  useEffect(() => {
+    if (isOpenConversationRoute) {
+      useWorkspaceStore.getState().hideAgentLauncher()
+    }
+  }, [isOpenConversationRoute])
 
   // Unified tab cycling - cycles through ALL workspace tabs in active pane
   const cycleTab = useCallback(
@@ -1010,13 +1230,26 @@ export default function WorkspaceLayout(): React.JSX.Element {
 
   // Terminal creation callbacks - defined before keyboard shortcut useEffect
   const handleCreateTerminalInPane = useCallback(
-    async (paneId: string, shellName?: string) => {
-      const cwd = getDefaultCwdForProject(activeProjectId)
+    async (paneId: string, shellName?: string, targetProjectId?: string) => {
+      // Terminals are Conversation-scoped only inside an open Conversation;
+      // the regular project workspace keeps scope-less project terminals.
+      const inConversationScope =
+        location.pathname.startsWith('/c/') && Boolean(activeConversationId)
+      if (!inConversationScope && activeGroupProjects.length > 1 && !targetProjectId) {
+        setPendingTerminalRoot({ paneId, shellName })
+        return
+      }
+      const terminalProjectId = targetProjectId ?? activeProjectId
+      const terminalProject = projects.find((project) => project.id === terminalProjectId)
+      const cwd = inConversationScope
+        ? (activeConversation?.workspaceCwd ?? getDefaultCwdForProject(activeProjectId))
+        : getDefaultCwdForProject(terminalProjectId)
 
-      const result = await spawnTerminalInPane(paneId, activeProjectId, cwd, {
-        shell: shellName || activeProject?.defaultShell || appDefaultShell || undefined,
-        envVars: activeProject?.envVars,
-        maxTerminalsPerProject: maxTerminals
+      const result = await spawnTerminalInPane(paneId, terminalProjectId, cwd, {
+        shell: shellName || terminalProject?.defaultShell || appDefaultShell || undefined,
+        envVars: terminalProject?.envVars,
+        maxTerminalsPerProject: maxTerminals,
+        conversationId: inConversationScope ? (activeConversationId ?? undefined) : undefined
       })
       if (!result.success) {
         toast.error(
@@ -1026,11 +1259,14 @@ export default function WorkspaceLayout(): React.JSX.Element {
       }
     },
     [
-      activeProject?.defaultShell,
-      activeProject?.envVars,
+      activeConversation?.workspaceCwd,
+      activeConversationId,
+      activeGroupProjects,
       activeProjectId,
       appDefaultShell,
-      maxTerminals
+      location.pathname,
+      maxTerminals,
+      projects
     ]
   )
 
@@ -1072,6 +1308,122 @@ export default function WorkspaceLayout(): React.JSX.Element {
     [handleCreateTerminalInPane]
   )
 
+  const ensureVisibleProjectTerminal = useCallback(
+    (projectId: string) => {
+      if (locationPathRef.current !== '/') return
+      // The user just hid the last project terminal. Do not undo that close
+      // by spawning or reopening from the project-enter timer/restore path.
+      if (projectTerminalDismissedRef.current) {
+        void logFrontendError({
+          level: 'warn',
+          source: 'workspace-layout.project-terminal',
+          message: `skip auto-open after user close projectId=${projectId}`
+        })
+        return
+      }
+      const workspace = useWorkspaceStore.getState()
+      const terminals = useTerminalStore
+        .getState()
+        .terminals.filter((terminal) => terminal.projectId === projectId)
+      const hasVisibleProjectTerminal = getAllLeafPanes(workspace.root).some((leaf) =>
+        leaf.tabs.some((tab) => {
+          if (tab.type !== 'terminal') return false
+          return terminals.some((terminal) => terminal.id === tab.terminalId)
+        })
+      )
+      if (hasVisibleProjectTerminal) return
+      const hiddenLive = terminals.find(
+        (terminal) => terminal.ptyId && !isOpenTerminalView(terminal)
+      )
+      if (hiddenLive) {
+        useWorkspaceStore.getState().reopenTerminalView(hiddenLive.id)
+        return
+      }
+      const liveVisible = terminals.find(
+        (terminal) => terminal.ptyId && isOpenTerminalView(terminal)
+      )
+      if (liveVisible) {
+        useWorkspaceStore.getState().ensureTerminalTab(liveVisible.id, undefined, true)
+        return
+      }
+      const hasOtherProjectContent = getAllLeafPanes(workspace.root).some((leaf) =>
+        leaf.tabs.some(
+          (tab) =>
+            tab.type === 'editor' ||
+            tab.type === 'browser' ||
+            tab.type === 'git' ||
+            tab.type === 'git-history'
+        )
+      )
+      if (!hasOtherProjectContent) {
+        workspace.resetLayout()
+      }
+      useWorkspaceStore.getState().hideAgentLauncher()
+      handleAddTerminal(undefined)
+    },
+    [handleAddTerminal]
+  )
+  ensureVisibleProjectTerminalRef.current = ensureVisibleProjectTerminal
+
+  // Entering a project (sidebar click or startup with a restored active project)
+  // always lands in the regular project workspace: leave the independent
+  // Conversation area and open one terminal when the project has none yet, so
+  // the project section is entered instead of the chat launcher empty state.
+  const locationPathRef = useRef(location.pathname)
+  locationPathRef.current = location.pathname
+  const conversationWorkspaceActiveRef = useRef(isConversationAreaPath(location.pathname))
+
+  // Opening a conversation replaces the pane tree. Persist the project layout
+  // when entering the conversation area (list or an open chat), and restore it
+  // only when leaving that area for the project workspace — not when closing
+  // or deleting a chat back to /conversations.
+  useEffect(() => {
+    const inConversationWorkspace = isConversationAreaPath(location.pathname)
+    const wasInConversationWorkspace = conversationWorkspaceActiveRef.current
+    conversationWorkspaceActiveRef.current = inConversationWorkspace
+    if (!wasInConversationWorkspace && inConversationWorkspace && activeProjectId) {
+      persistState(activeProjectId)
+      return
+    }
+    if (!wasInConversationWorkspace || inConversationWorkspace || isMobileWebShell) return
+    const projectId = activeProjectId
+    let cancelled = false
+    void (async () => {
+      const restored = projectId ? await restoreProjectWorkspace(projectId) : false
+      if (cancelled) return
+      useConversationStore.getState().setActiveConversationId(null)
+      if (!restored) useWorkspaceStore.getState().resetLayout()
+      if (projectId) {
+        projectTerminalDismissedRef.current = false
+        ensureVisibleProjectTerminal(projectId)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [activeProjectId, ensureVisibleProjectTerminal, isMobileWebShell, location.pathname])
+  useEffect(() => {
+    if (isMobileWebShell || !isLoaded || !activeProjectId) return
+    if (location.pathname !== '/') return
+    const enterKey = `${activeProjectId}:${projectEnterNonce}`
+    if (lastProjectEnterKeyRef.current === enterKey) return
+    lastProjectEnterKeyRef.current = enterKey
+    enteredProjectRef.current = activeProjectId
+    projectTerminalDismissedRef.current = false
+    const timer = setTimeout(() => {
+      ensureVisibleProjectTerminalRef.current(activeProjectId)
+    }, 400)
+    return () => clearTimeout(timer)
+  }, [activeProjectId, isLoaded, isMobileWebShell, location.pathname, projectEnterNonce])
+
+  useEffect(() => {
+    return subscribeProjectWorkspaceRestored((projectId) => {
+      if (locationPathRef.current !== '/') return
+      if (useProjectStore.getState().activeProjectId !== projectId) return
+      ensureVisibleProjectTerminal(projectId)
+    })
+  }, [ensureVisibleProjectTerminal])
+
   const handleNewBrowserTab = useCallback((paneId?: string) => {
     const resolvedPaneId = paneId ?? useWorkspaceStore.getState().activePaneId
     if (resolvedPaneId) {
@@ -1082,10 +1434,14 @@ export default function WorkspaceLayout(): React.JSX.Element {
   }, [])
 
   const handleOpenAgentChat = useCallback(() => {
-    if (!activeProject?.path) return
     const open = (): void => {
       const paneId = useWorkspaceStore.getState().activePaneId
       if (paneId) useWorkspaceStore.getState().showAgentLauncher(paneId)
+    }
+    if (!isMobileWebShell && isConversationRoute) {
+      if (location.pathname !== '/conversations') navigate('/conversations')
+      requestAnimationFrame(open)
+      return
     }
     // The launcher overlay only renders on the workspace route; navigate there
     // first when invoked from a child route (e.g. preferences/settings).
@@ -1095,7 +1451,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
     } else {
       open()
     }
-  }, [activeProject?.path, location.pathname, navigate])
+  }, [isConversationRoute, isMobileWebShell, location.pathname, navigate])
 
   const handleAddGitTab = useCallback(
     (paneId?: string) => {
@@ -1436,103 +1792,104 @@ export default function WorkspaceLayout(): React.JSX.Element {
     })
   }, [cycleTab, applyZoomAction, handleOpenThemePicker, updatePanelVisibility, isSidebarVisible])
 
-  const closeTerminalByRecordId = useCallback(
+  const requestTerminateTerminal = useCallback((terminalId: string, tabId?: string) => {
+    setCloseConfirmTerminal(null)
+    setTerminateConfirmTerminal({ terminalId, tabId })
+  }, [])
+
+  const terminateTerminalByRecordId = useCallback(
+    async (terminalId: string): Promise<boolean> => {
+      const didTerminate = await terminateTerminalResource(terminalId)
+      if (!didTerminate) {
+        toast.error(
+          runtimeT('terminal', 'lifecycle.terminateFailed', 'Failed to terminate terminal process.')
+        )
+        return false
+      }
+      useWorkspaceStore.getState().closeTerminalView(terminalId)
+      return true
+    },
+    [terminateTerminalResource]
+  )
+
+  const closeTerminalViewByRecordId = useCallback(
     async (terminalRecordId: string): Promise<boolean> => {
-      const terminalToClose = useTerminalStore
-        .getState()
-        .terminals.find((t) => t.id === terminalRecordId)
-
-      if (!terminalToClose) {
-        return false
-      }
-
-      if (closingTerminalIds.includes(terminalRecordId)) {
-        return false
-      }
-
+      if (closingTerminalIdsRef.current.includes(terminalRecordId)) return false
       setClosingTerminalIds((current) => [...current, terminalRecordId])
-
       try {
-        if (terminalToClose.ptyId) {
-          const result = await terminalApi.kill(terminalToClose.ptyId)
-          if (!result.success) {
-            console.error('Failed to close terminal PTY:', result.error)
-            toast.error(
-              result.error ||
-                runtimeT(
-                  'workspace',
-                  'errors.closeTerminalProcess',
-                  'Failed to close terminal process. Please try again.'
-                )
+        const didClose = await closeTerminalView(terminalRecordId)
+        if (!didClose) {
+          toast.error(
+            runtimeT(
+              'terminal',
+              'lifecycle.closeViewFailed',
+              'Failed to close terminal view. The process is still running.'
             )
-            return false
-          }
+          )
+          return false
         }
-
-        closeTerminal(terminalRecordId, activeProjectId)
+        useWorkspaceStore.getState().closeTerminalView(terminalRecordId)
+        const projectId = useProjectStore.getState().activeProjectId
+        const stillHasVisibleProjectTab = getAllLeafPanes(useWorkspaceStore.getState().root).some(
+          (leaf) =>
+            leaf.tabs.some((tab) => {
+              if (tab.type !== 'terminal') return false
+              const record = useTerminalStore
+                .getState()
+                .terminals.find((terminal) => terminal.id === tab.terminalId)
+              return record?.projectId === projectId && isOpenTerminalView(record)
+            })
+        )
+        if (!stillHasVisibleProjectTab) {
+          projectTerminalDismissedRef.current = true
+        }
         return true
       } finally {
         setClosingTerminalIds((current) => current.filter((id) => id !== terminalRecordId))
       }
     },
-    [activeProjectId, closeTerminal, closingTerminalIds]
-  )
-
-  const closeTerminalTabByTabId = useCallback(
-    async (tabId: string): Promise<boolean> => {
-      const root = useWorkspaceStore.getState().root
-      const containingPane = findPaneContainingTab(root, tabId)
-      if (!containingPane) {
-        return false
-      }
-
-      const tab = containingPane.tabs.find((t) => t.id === tabId)
-      if (tab?.type !== 'terminal') {
-        return false
-      }
-
-      const didClose = await closeTerminalByRecordId(tab.terminalId)
-      if (!didClose) {
-        return false
-      }
-      useWorkspaceStore.getState().closeTab(containingPane.id, tabId)
-      return true
-    },
-    [closeTerminalByRecordId]
+    [closeTerminalView]
   )
 
   const handleCloseTerminal = useCallback(
     (id: string, tabId: string) => {
-      if (closingTerminalIds.includes(id)) {
+      if (closingTerminalIdsRef.current.includes(id)) return
+      const terminal = useTerminalStore
+        .getState()
+        .terminals.find((candidate) => candidate.id === id)
+      // Project shells are not conversation resources. Closing the tab must
+      // stop the PTY; otherwise the process keeps consuming memory with no tab.
+      if (!terminal || !isConversationScopedTerminal(terminal)) {
+        if (confirmTerminalClose) {
+          requestTerminateTerminal(id, tabId)
+          return
+        }
+        void terminateTerminalByRecordId(id)
         return
       }
-
       if (!confirmTerminalClose) {
-        void closeTerminalTabByTabId(tabId)
+        void closeTerminalViewByRecordId(id)
         return
       }
-
       setCloseConfirmRememberChoice(false)
       setCloseConfirmTerminal({ terminalId: id, tabId })
     },
-    [closeTerminalTabByTabId, closingTerminalIds, confirmTerminalClose]
+    [
+      closeTerminalViewByRecordId,
+      confirmTerminalClose,
+      requestTerminateTerminal,
+      terminateTerminalByRecordId
+    ]
   )
 
-  // Keep ref in sync so the keydown effect can call it without declaration-order issues
-  handleCloseTerminalRef.current = handleCloseTerminal
-
   const handleConfirmCloseTerminal = useCallback(async () => {
-    if (!closeConfirmTerminal) {
-      return
-    }
-
+    if (!closeConfirmTerminal) return
     setCloseConfirmLoading(true)
     try {
       if (closeConfirmRememberChoice) {
         await updateAppSetting('confirmTerminalClose', false)
       }
-
-      const didClose = await closeTerminalTabByTabId(closeConfirmTerminal.tabId)
+      const didClose = await closeTerminalViewByRecordId(closeConfirmTerminal.terminalId)
       if (didClose) {
         setCloseConfirmTerminal(null)
         setCloseConfirmRememberChoice(false)
@@ -1540,16 +1897,34 @@ export default function WorkspaceLayout(): React.JSX.Element {
     } finally {
       setCloseConfirmLoading(false)
     }
-  }, [closeConfirmRememberChoice, closeConfirmTerminal, closeTerminalTabByTabId, updateAppSetting])
+  }, [
+    closeConfirmRememberChoice,
+    closeConfirmTerminal,
+    closeTerminalViewByRecordId,
+    updateAppSetting
+  ])
+
+  const handleConfirmTerminateTerminal = useCallback(async () => {
+    if (!terminateConfirmTerminal) return
+    setTerminateConfirmLoading(true)
+    try {
+      const didTerminate = await terminateTerminalByRecordId(terminateConfirmTerminal.terminalId)
+      if (didTerminate) {
+        setTerminateConfirmTerminal(null)
+      }
+    } finally {
+      setTerminateConfirmLoading(false)
+    }
+  }, [terminateConfirmTerminal, terminateTerminalByRecordId])
 
   const handleCancelCloseTerminal = useCallback(() => {
-    if (closeConfirmLoading) {
-      return
-    }
-
+    if (closeConfirmLoading) return
     setCloseConfirmRememberChoice(false)
     setCloseConfirmTerminal(null)
   }, [closeConfirmLoading])
+
+  // Keep ref in sync so the keydown effect can call it without declaration-order issues
+  handleCloseTerminalRef.current = handleCloseTerminal
 
   // Dirty file close handlers
   const handleCloseEditorTab = useCallback((filePath: string) => {
@@ -1639,7 +2014,21 @@ export default function WorkspaceLayout(): React.JSX.Element {
     clearHistory(activeProjectId)
   }, [activeProjectId])
 
-  const terminalToClose = terminals.find((t) => t.id === closeConfirmTerminal?.terminalId)
+  const terminalToClose = useTerminalStore
+    .getState()
+    .terminals.find(
+      (terminal) =>
+        terminal.id === (terminateConfirmTerminal?.terminalId ?? closeConfirmTerminal?.terminalId)
+    )
+  const hiddenRunningTerminals = terminals.filter((terminal) => {
+    if (!terminal.ptyId || isOpenTerminalView(terminal)) return false
+    if (activeConversationId && terminal.conversationId === activeConversationId) return true
+    return (
+      Boolean(activeProjectId) &&
+      terminal.projectId === activeProjectId &&
+      !isConversationScopedTerminal(terminal)
+    )
+  })
 
   // Show loading state while projects are being loaded
   if (!isLoaded) {
@@ -1661,7 +2050,6 @@ export default function WorkspaceLayout(): React.JSX.Element {
             <ActivityRail
               isShortcutsOpen={isShortcutMenuOpen}
               onShortcutsOpenChange={setIsShortcutMenuOpen}
-              onOpenCommandPalette={() => setIsCommandPaletteOpen(true)}
               canOpenGitChanges={false}
             />
             <div className="flex-1 flex flex-col min-w-0">
@@ -1682,35 +2070,36 @@ export default function WorkspaceLayout(): React.JSX.Element {
         <Suspense fallback={<ShellSkeleton />}>
           <SSHWorkspace profile={sshProfileWithPassword!} conn={sshConn} />
         </Suspense>
-      ) : projects.length === 0 ? (
-        <div className="flex flex-1 flex-col items-center justify-center bg-background px-6 rounded-xl">
-          <motion.div
-            initial={{ opacity: 0, scale: 0.9 }}
-            animate={{ opacity: 1, scale: 1 }}
-            transition={{ duration: 0.4, ease: 'easeOut' }}
-            className="flex max-w-md flex-col items-center text-center"
-          >
-            <div className="mb-6">
-              <FolderKanban className="h-24 w-24 text-muted-foreground/50" />
-            </div>
-            <h2 className="mb-2 text-xl font-semibold text-foreground">{t('noProjectsTitle')}</h2>
-            <p className="mb-6 text-sm leading-relaxed text-muted-foreground">
-              {t('noProjectsDescription')}
-            </p>
-            <button
-              type="button"
-              onClick={() => setIsNewProjectModalOpen(true)}
-              className="rounded-xl bg-primary px-6 py-2.5 text-sm font-medium text-primary-foreground shadow-sm transition-colors hover:bg-primary/90 hover:shadow"
-            >
-              {t('createFirstProject')}
-            </button>
-          </motion.div>
-        </div>
       ) : (
         <>
           {isWorkspaceRoute ? (
             <>
-              <ChatRoute />
+              <Outlet />
+              {hiddenRunningTerminals.length > 0 && (
+                <div className="flex shrink-0 items-center gap-2 overflow-x-auto border-b border-border/60 px-2 py-1">
+                  <span className="text-xs text-muted-foreground">
+                    {runtimeT('terminal', 'lifecycle.hiddenRunning', 'Hidden running terminals')}
+                  </span>
+                  {hiddenRunningTerminals.map((terminal) => (
+                    <div key={terminal.id} className="flex shrink-0 items-center gap-1">
+                      <button
+                        type="button"
+                        className="h-9 rounded-md border border-border px-3 text-xs hover:bg-accent"
+                        onClick={() => useWorkspaceStore.getState().reopenTerminalView(terminal.id)}
+                      >
+                        {runtimeT('terminal', 'lifecycle.reopen', 'Reopen')} {terminal.name}
+                      </button>
+                      <button
+                        type="button"
+                        className="h-9 rounded-md border border-border px-3 text-xs text-destructive hover:bg-destructive/10"
+                        onClick={() => requestTerminateTerminal(terminal.id)}
+                      >
+                        {runtimeT('terminal', 'lifecycle.stopHidden', 'Stop')}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
               <motion.div
                 key={fullscreenPaneId ? 'fullscreen' : 'normal'}
                 initial={{ opacity: 0.85, scale: 0.97 }}
@@ -1750,6 +2139,73 @@ export default function WorkspaceLayout(): React.JSX.Element {
         onClose={() => setIsNewProjectModalOpen(false)}
         onCreateProject={addProject}
       />
+
+      <Dialog
+        open={pendingTerminalRoot !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingTerminalRoot(null)
+        }}
+      >
+        <DialogContent className="max-w-xl">
+          <DialogHeader>
+            <DialogTitle>
+              {runtimeT('workspace', 'multiRoot.terminalTitle', 'Choose terminal project')}
+            </DialogTitle>
+            <DialogDescription>
+              {runtimeT(
+                'workspace',
+                'multiRoot.terminalDescription',
+                'Choose a project to create the terminal immediately.'
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="max-h-[min(420px,60vh)] space-y-2 overflow-y-auto pr-1">
+            {activeGroupProjects.map((project) => {
+              const color = getColorClasses(project.color)
+              return (
+                <button
+                  key={project.id}
+                  type="button"
+                  className="group flex w-full items-center gap-3 rounded-lg border border-border/70 bg-secondary/20 px-3 py-3 text-left transition-colors hover:border-primary/45 hover:bg-secondary/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  aria-label={`${project.name}: ${project.path}`}
+                  onClick={() => {
+                    const pending = pendingTerminalRoot
+                    if (!pending) return
+                    if (activeGroupId) {
+                      updateGroup(activeGroupId, { preferredProjectId: project.id })
+                    }
+                    setPendingTerminalRoot(null)
+                    void handleCreateTerminalInPane(pending.paneId, pending.shellName, project.id)
+                  }}
+                >
+                  <span
+                    className={cn(
+                      'flex size-9 shrink-0 items-center justify-center rounded-md bg-background/70',
+                      color.text
+                    )}
+                    aria-hidden="true"
+                  >
+                    <FolderGit2 size={18} />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm font-medium text-foreground">
+                      {project.name}
+                    </span>
+                    <span className="mt-0.5 block truncate text-xs text-muted-foreground">
+                      {project.path}
+                    </span>
+                  </span>
+                  <SquareTerminal
+                    size={17}
+                    className="shrink-0 text-muted-foreground transition-colors group-hover:text-primary"
+                    aria-hidden="true"
+                  />
+                </button>
+              )
+            })}
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {isThemePickerOpen && (
         <Suspense fallback={null}>
@@ -1864,9 +2320,16 @@ export default function WorkspaceLayout(): React.JSX.Element {
         message={t('closeTerminal.message', {
           name: terminalToClose?.name || t('closeTerminal.thisTerminal')
         })}
-        confirmLabel={t('tabs.close')}
+        confirmLabel={runtimeT('terminal', 'lifecycle.closeView', 'Close view')}
         cancelLabel={t('cancel')}
-        variant="danger"
+        secondaryAction={{
+          label: runtimeT('terminal', 'lifecycle.terminateProcess', 'Terminate process'),
+          onClick: () => {
+            if (closeConfirmTerminal) {
+              requestTerminateTerminal(closeConfirmTerminal.terminalId, closeConfirmTerminal.tabId)
+            }
+          }
+        }}
         isLoading={closeConfirmLoading}
         onConfirm={handleConfirmCloseTerminal}
         onCancel={handleCancelCloseTerminal}
@@ -1882,6 +2345,24 @@ export default function WorkspaceLayout(): React.JSX.Element {
           {t('closeTerminal.dontAsk')}
         </label>
       </ConfirmDialog>
+
+      <ConfirmDialog
+        isOpen={terminateConfirmTerminal !== null}
+        title={runtimeT('terminal', 'lifecycle.terminateTitle', 'Terminate terminal process?')}
+        message={runtimeT(
+          'terminal',
+          'lifecycle.terminateDescription',
+          'This stops the live process and removes only its terminal resource. Conversation chat and history are preserved.'
+        )}
+        confirmLabel={runtimeT('terminal', 'lifecycle.terminateProcess', 'Terminate process')}
+        cancelLabel={t('cancel')}
+        variant="danger"
+        isLoading={terminateConfirmLoading}
+        onConfirm={handleConfirmTerminateTerminal}
+        onCancel={() => {
+          if (!terminateConfirmLoading) setTerminateConfirmTerminal(null)
+        }}
+      />
 
       {/* Dirty File Close Confirmation */}
       <ConfirmDialog
@@ -1920,35 +2401,31 @@ export default function WorkspaceLayout(): React.JSX.Element {
         <Suspense fallback={<ShellSkeleton />}>
           <MobileChatShell
             onNewChat={handleOpenAgentChat}
-            canNewChat={Boolean(activeProject?.path)}
+            canNewChat
             onOpenCommandPalette={() => setIsCommandPaletteOpen(true)}
             onOpenGitChanges={() => setGitSheetOpen(true)}
             onOpenGitHistory={() => handleAddGitHistoryTab()}
             onNewTerminal={() => handleAddTerminal(undefined)}
             onCloseTerminal={handleCloseTerminal}
+            onTerminateTerminal={(terminalId, tabId) => requestTerminateTerminal(terminalId, tabId)}
             onRenameTerminal={renameTerminal}
             onRestartTerminal={(terminalId) => {
-              // Restart: kill the PTY, close the old tab, then re-spawn.
-              const terminal = useTerminalStore
-                .getState()
-                .terminals.find((t) => t.id === terminalId)
-              if (!terminal?.ptyId) return
-              const root = useWorkspaceStore.getState().root
-              const pane = findPaneContainingTab(root, `term-${terminalId}`)
-              void terminalApi.kill(terminal.ptyId).then(() => {
-                closeTerminal(terminalId, activeProjectId)
-                if (pane) {
-                  useWorkspaceStore.getState().closeTab(pane.id, `term-${terminalId}`)
+              void restartTerminalResource(terminalId).then((restarted) => {
+                if (!restarted) {
+                  toast.error(
+                    runtimeT(
+                      'terminal',
+                      'lifecycle.restartFailed',
+                      'Failed to restart terminal process.'
+                    )
+                  )
                 }
-                handleCreateTerminalInPane(
-                  pane?.id ?? useWorkspaceStore.getState().activePaneId ?? '',
-                  terminal.shell ?? undefined
-                )
               })
             }}
           >
             <PaneDndProvider>
               <main className="flex h-full min-h-0 flex-col overflow-hidden bg-background">
+                <WorkspaceConflictBanner conversationId={activeConversationId} />
                 {workspaceMain}
               </main>
             </PaneDndProvider>
@@ -1987,15 +2464,12 @@ export default function WorkspaceLayout(): React.JSX.Element {
           <ActivityRail
             isShortcutsOpen={isShortcutMenuOpen}
             onShortcutsOpenChange={setIsShortcutMenuOpen}
-            onOpenCommandPalette={() => setIsCommandPaletteOpen(true)}
             onOpenGitChanges={() => handleAddGitTab()}
             canOpenGitChanges={Boolean(activeProject?.path)}
             onOpenGitHistory={() => handleAddGitHistoryTab()}
             canOpenGitHistory={Boolean(activeProject?.path)}
             isThemePickerOpen={isThemePickerOpen}
             onToggleThemePicker={handleToggleThemePicker}
-            onOpenAgentChat={handleOpenAgentChat}
-            canOpenAgentChat={Boolean(activeProject?.path)}
           />
           <div className="flex-1 flex flex-col min-w-0">
             <TitleBar />
@@ -2003,21 +2477,26 @@ export default function WorkspaceLayout(): React.JSX.Element {
             <div className="flex-1 flex overflow-hidden min-h-0 h-full p-2 gap-0">
               {/* Sidebar */}
               {isSidebarVisible && (
-                <div className="mr-2">
-                  <ProjectSidebar
-                    projects={projects}
-                    activeProjectId={activeProjectId}
-                    onSelectProject={handleSelectProject}
-                    onNewProject={() => setIsNewProjectModalOpen(true)}
-                    onUpdateProject={updateProject}
-                    onDeleteProject={deleteProject}
-                    onArchiveProject={archiveProject}
-                    onRestoreProject={restoreProject}
-                    onReorderProjects={reorderProjects}
-                    onSSHConnect={handleSSHConnect}
-                    onSelectSSHProfile={handleSelectSSHProfile}
-                    activeSSHProfileId={activeSSHProfileId}
-                  />
+                <div className="mr-2 flex h-full gap-2">
+                  {isConversationRoute ? (
+                    <ConversationSidebar onNewChat={handleOpenAgentChat} />
+                  ) : (
+                    <ProjectSidebar
+                      projects={projects}
+                      activeProjectId={activeProjectId}
+                      onSelectProject={handleSelectProject}
+                      onSelectGroup={handleSelectGroup}
+                      onNewProject={() => setIsNewProjectModalOpen(true)}
+                      onUpdateProject={updateProject}
+                      onDeleteProject={deleteProject}
+                      onArchiveProject={archiveProject}
+                      onRestoreProject={restoreProject}
+                      onReorderProjects={reorderProjects}
+                      onSSHConnect={handleSSHConnect}
+                      onSelectSSHProfile={handleSelectSSHProfile}
+                      activeSSHProfileId={activeSSHProfileId}
+                    />
+                  )}
                 </div>
               )}
 
@@ -2025,15 +2504,43 @@ export default function WorkspaceLayout(): React.JSX.Element {
               <PaneDndProvider>
                 <div className="flex-1 flex min-h-0 h-full gap-0 overflow-hidden min-w-0">
                   {/* Main Content Area */}
-                  <main className="flex-1 flex flex-col min-w-0 rounded-xl bg-card overflow-hidden">
-                    <WorkspaceConflictBanner />
+                  <main className="relative flex-1 flex flex-col min-w-0 rounded-xl bg-card overflow-hidden">
+                    <WorkspaceConflictBanner conversationId={activeConversationId} />
                     {workspaceMain}
+                    {isConversationListRoute && isAgentLauncherOpen ? (
+                      <div
+                        className="absolute inset-0 z-30 flex flex-col bg-background/95 backdrop-blur-sm"
+                        role="dialog"
+                        aria-modal="true"
+                        aria-label={runtimeT('workspace', 'pane.agentLauncher', 'Agent launcher')}
+                      >
+                        <button
+                          type="button"
+                          className="absolute right-3 top-3 z-10 flex h-8 w-8 items-center justify-center rounded-md text-muted-foreground hover:bg-muted/60 hover:text-foreground"
+                          aria-label={runtimeT(
+                            'workspace',
+                            'pane.closeAgentLauncher',
+                            'Close agent launcher'
+                          )}
+                          onClick={() => useWorkspaceStore.getState().hideAgentLauncher()}
+                        >
+                          <X className="h-4 w-4" aria-hidden="true" />
+                        </button>
+                        <AgentLauncher
+                          paneId={useWorkspaceStore.getState().activePaneId}
+                          onLaunched={(conversationId) => {
+                            useWorkspaceStore.getState().hideAgentLauncher()
+                            navigate(`/c/${conversationId}`)
+                          }}
+                        />
+                      </div>
+                    ) : null}
                   </main>
 
                   {/* File Explorer - separate floating panel */}
-                  {(isExplorerVisible && activeProject?.path) || activeSSHProfile ? (
+                  {(isExplorerVisible && explorerRootVisible) || activeSSHProfile ? (
                     <div className="flex-shrink-0 ml-2 flex flex-col gap-2 h-full">
-                      {isExplorerVisible && activeProject?.path && (
+                      {isExplorerVisible && explorerRootVisible && (
                         <div className={activeSSHProfile ? 'flex-1 min-h-0' : 'h-full'}>
                           <Suspense fallback={<ShellSkeleton />}>
                             <FileExplorer side="right" />
@@ -2044,7 +2551,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
                         <div
                           className={cn(
                             'flex-1 bg-background rounded-xl overflow-hidden min-h-0 flex flex-col border border-border',
-                            !(isExplorerVisible && activeProject?.path) && 'w-64'
+                            !(isExplorerVisible && explorerRootVisible) && 'w-64'
                           )}
                         >
                           <Suspense fallback={<ShellSkeleton />}>

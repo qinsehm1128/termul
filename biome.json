@@ -19,6 +19,8 @@
       "!**/_bmad",
       "!**/_bmad-output",
       "!**/.agents",
+      "!**/.workflow",
+      "!**/.tests",
       "!**/public"
     ]
   },

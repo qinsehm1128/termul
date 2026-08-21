@@ -4,6 +4,10 @@
   "projects": {
     "title": "Projects"
   },
+  "multiRoot": {
+    "terminalTitle": "Choose terminal project",
+    "terminalDescription": "Select a project to create a terminal from its root immediately."
+  },
   "loading": "Loading...",
   "noProjectsTitle": "No Projects Yet",
   "noProjectsDescription": "Create your first project to organize your terminals, snapshots, and commands",
@@ -22,10 +26,10 @@
     "prompt": "Enter password for {{name}}"
   },
   "closeTerminal": {
-    "title": "Close Terminal",
-    "message": "Are you sure you want to close \"{{name}}\"? Any running processes will be terminated.",
+    "title": "Close Terminal View",
+    "message": "Close the view for \"{{name}}\"? The terminal process keeps running and can be reopened.",
     "thisTerminal": "this terminal",
-    "dontAsk": "Don't ask again when closing terminals"
+    "dontAsk": "Don't ask again when closing terminal views"
   },
   "unsaved": {
     "title": "Unsaved Changes",
