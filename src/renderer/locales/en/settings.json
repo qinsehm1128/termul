@@ -17,6 +17,7 @@
     "projectDefaults": "New Project Defaults",
     "aiAgents": "AI Agents",
     "mcpServers": "MCP Servers",
+    "remoteAccess": "Remote Access",
     "shortcuts": "Keyboard Shortcuts",
     "updates": "Updates",
     "diagnostics": "Diagnostics & Logs",
@@ -160,6 +161,45 @@
     "skippedVersion": "Skipped Version",
     "skipping": "You are currently skipping version {{version}}",
     "skippingHint": "This version will not be offered again until a newer version is available."
+  },
+  "remoteAccess": {
+    "description": "Choose how phones reach this desktop: free Cloudflare Quick Tunnel, your own Cloudflare hostname, or an FRP server you operate.",
+    "desktopOnly": "Tunnel providers are configured on the desktop app. The phone client only opens the resulting link.",
+    "loading": "Loading tunnel settings…",
+    "loadFailed": "Could not load tunnel settings.",
+    "saveFailed": "Could not save tunnel settings.",
+    "saved": "Tunnel settings saved.",
+    "provider": "Tunnel provider",
+    "save": "Save tunnel settings",
+    "tokenSet": "A token is already stored in the OS keychain. Enter a new value to replace it.",
+    "providers": {
+      "cloudflareQuick": "Cloudflare Quick Tunnel (free, random hostname)",
+      "cloudflareNamed": "Your Cloudflare named tunnel",
+      "frp": "FRP (your server)"
+    },
+    "hints": {
+      "cloudflareQuick": "Zero setup. Each enable creates a new https://*.trycloudflare.com URL.",
+      "cloudflareNamed": "Uses the bundled cloudflared binary with your tunnel token. Point Cloudflare ingress at http://127.0.0.1 and the local port below.",
+      "frp": "Runs frpc against your frps. Provide a custom domain (HTTP proxy) or a remote port (TCP). Install frpc or set TERMUL_FRPC_PATH."
+    },
+    "namedHostname": "Public hostname",
+    "namedHostnameHint": "The hostname already routed to this named tunnel, for example termul.example.com.",
+    "namedLocalPort": "Local bind port",
+    "namedLocalPortHint": "Stable loopback port (default 18787) so Cloudflare ingress can target http://127.0.0.1:18787.",
+    "namedToken": "Cloudflare tunnel token",
+    "namedTokenHint": "From the Cloudflare Zero Trust tunnel page. Stored only in the OS keychain.",
+    "frpServerAddr": "FRP server address",
+    "frpServerAddrHint": "Host or IP of your frps. Do not include a URL scheme.",
+    "frpServerPort": "FRP server port",
+    "frpServerPortHint": "frps bind port. Defaults to 7000 when left empty.",
+    "frpCustomDomain": "Public domain (HTTP proxy)",
+    "frpCustomDomainHint": "Preferred. frpc publishes this hostname through frps. Leave empty to use a remote TCP port instead.",
+    "frpRemotePort": "Remote TCP port",
+    "frpRemotePortHint": "Used only when no custom domain is set. Put TLS in front of this port if you keep HTTPS enabled.",
+    "frpToken": "FRP auth token",
+    "frpTokenHint": "Must match frps auth.token. Stored only in the OS keychain.",
+    "frpPublicHttps": "QR uses HTTPS",
+    "frpPublicHttpsHint": "Leave on when a reverse proxy terminates TLS. Turn off only for trusted HTTP test setups."
   },
   "diagnostics": {
     "description": "Export or copy application logs to troubleshoot issues.",

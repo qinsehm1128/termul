@@ -139,6 +139,13 @@ export function RemoteAccessPopover(): React.JSX.Element {
                   <QRCodeSVG value={tunnelUrl} size={160} level="M" />
                 </div>
               </div>
+              <p className="text-xs text-muted-foreground">
+                {remoteStatus?.tunnelProvider === 'cloudflareNamed'
+                  ? t('remote.providerNamed')
+                  : remoteStatus?.tunnelProvider === 'frp'
+                    ? t('remote.providerFrp')
+                    : t('remote.providerQuick')}
+              </p>
               <div className="flex items-start gap-2 text-xs text-amber-600 dark:text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-md px-3 py-2">
                 <ShieldAlert className="w-4 h-4 mt-0.5 shrink-0" />
                 <span>{t('remote.securityWarning')}</span>

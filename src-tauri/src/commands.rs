@@ -3304,11 +3304,11 @@ pub async fn sftp_create_file(
 /// Shares the desktop's live `AcpManager` sessions with a phone/browser client.
 ///
 /// Starts the in-process localhost web server (the same one the standalone
-/// `termul-server` binary uses), then brings up a built-in cloudflared
-/// quick-tunnel so the phone can reach it on any network — the popover renders
-/// the ephemeral `https://*.trycloudflare.com` URL as a QR. The `bind_mode`
-/// param is accepted for API stability but ignored (the tunnel targets
-/// localhost). App auth / token-gating land in Epic 2.
+/// `termul-server` binary uses), then brings up the configured tunnel provider
+/// (Cloudflare Quick by default, or a named Cloudflare / FRP tunnel) so the
+/// phone can reach it. The popover renders the public Origin as a QR. The
+/// `bind_mode` param is accepted for API stability but ignored (the tunnel
+/// targets localhost).
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn remote_server_start(
@@ -3320,6 +3320,7 @@ pub async fn remote_server_start(
     workspace_manifest_store: State<'_, HostWorkspaceManifestStore>,
     acp_catalog_store: State<'_, HostAcpCatalogStore>,
     acp_install_store: State<'_, HostAcpInstallStore>,
+    tunnel_store: State<'_, Arc<remote::TunnelConfigStore>>,
     bind_mode: Option<String>,
 ) -> Result<IpcResult<remote::RemoteStatus>, String> {
     // Default to localhost only when the caller omits the bind mode; an
@@ -3348,25 +3349,47 @@ pub async fn remote_server_start(
     // `POST /acp/install` + WS `install_acp_agent`. `None` degrades to
     // `ACP_INSTALL_UNAVAILABLE`.
     let acp_install = acp_install_store.store().map(Arc::clone);
-    let started = remote_state
-        .start(
-            acp_manager.inner().clone(),
-            pty_manager.inner().clone(),
-            ws_relay.inner().clone(),
-            project_registry.inner().clone(),
-            bind_mode,
-            workspace_manifest,
-            acp_catalog,
-            acp_install,
-        )
-        .await;
+    let tunnel_store = tunnel_store.inner();
+    let tunnel_config = match tunnel_store.load() {
+        Ok(config) => config,
+        Err(e) => return Ok(IpcResult::error(e, "TUNNEL_CONFIG_READ_FAILED")),
+    };
+    if let Err(e) = tunnel_config.validate_for_start() {
+        return Ok(IpcResult::error(e, "TUNNEL_CONFIG_INVALID"));
+    }
+    let started = if let Some(bind_port) = tunnel_config.preferred_bind_port() {
+        remote_state
+            .start_on_port(
+                acp_manager.inner().clone(),
+                pty_manager.inner().clone(),
+                ws_relay.inner().clone(),
+                project_registry.inner().clone(),
+                bind_mode,
+                workspace_manifest,
+                acp_catalog,
+                acp_install,
+                bind_port,
+            )
+            .await
+    } else {
+        remote_state
+            .start(
+                acp_manager.inner().clone(),
+                pty_manager.inner().clone(),
+                ws_relay.inner().clone(),
+                project_registry.inner().clone(),
+                bind_mode,
+                workspace_manifest,
+                acp_catalog,
+                acp_install,
+            )
+            .await
+    };
     match started {
         Ok(status) => {
-            // Server is up on localhost. Bring up the cloudflared quick-tunnel so
-            // the phone can reach it on any network — the QR encodes the resulting
-            // ephemeral HTTPS URL (edge TLS via cloudflared; app auth is Epic 2).
-            // On tunnel failure, drain the server and surface the error so the
-            // popover never holds a localhost-only server + a stale toggle.
+            // Server is up on localhost. Bring up the configured tunnel provider
+            // so the phone can reach it — the QR encodes the public Origin plus
+            // the host-owned bearer fragment.
             let port = match status.port {
                 Some(p) => p,
                 None => {
@@ -3376,20 +3399,16 @@ pub async fn remote_server_start(
                     ))
                 }
             };
-            match remote::cloudflared::start_quick_tunnel(port).await {
+            match remote::tunnel::start_configured_tunnel(port, &tunnel_config, tunnel_store).await
+            {
                 Ok(tunnel) => {
-                    // Clone the URL before attach consumes it, so the background
-                    // probe can log reachability without blocking the QR.
                     let probe_url = tunnel.url.clone();
-                    if let Err(e) = remote_state.attach_tunnel(tunnel.url, tunnel.child) {
-                        // Server stopped between start and attach; attach already
-                        // killed the orphan child. Surface the error.
+                    let provider = tunnel.provider.as_str().to_string();
+                    if let Err(e) =
+                        remote_state.attach_tunnel_as(tunnel.url, tunnel.child, &provider)
+                    {
                         return Ok(IpcResult::error(e, "REMOTE_TUNNEL_FAILED"));
                     }
-                    // Best-effort reachability probe in the background — logs
-                    // whether the edge routes to the origin. Non-blocking so the
-                    // QR appears immediately; never hides the QR on probe timeout
-                    // (a slow edge / cold start must not block the connect UI).
                     tokio::spawn(remote::cloudflared::log_tunnel_reachability(probe_url));
                     Ok(IpcResult::success(remote_state.status()))
                 }

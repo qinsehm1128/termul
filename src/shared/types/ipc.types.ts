@@ -444,6 +444,41 @@ export interface VisibilityApi {
 /** Network bind scope for the embedded remote terminal server. */
 export type RemoteBindMode = 'localhost' | 'all'
 
+export type TunnelProviderKind = 'cloudflareQuick' | 'cloudflareNamed' | 'frp'
+
+export interface TunnelConfigView {
+  provider: TunnelProviderKind
+  cloudflareNamedHostname: string | null
+  cloudflareNamedLocalPort: number | null
+  cloudflareNamedTokenSet: boolean
+  frpServerAddr: string | null
+  frpServerPort: number | null
+  frpCustomDomain: string | null
+  frpRemotePort: number | null
+  frpPublicHttps: boolean
+  frpTokenSet: boolean
+}
+
+export interface TunnelConfigUpdate {
+  provider: TunnelProviderKind
+  cloudflareNamedHostname?: string | null
+  cloudflareNamedLocalPort?: number | null
+  /** Omit to leave unchanged; empty string clears the keyring entry. */
+  cloudflareNamedToken?: string | null
+  frpServerAddr?: string | null
+  frpServerPort?: number | null
+  frpCustomDomain?: string | null
+  frpRemotePort?: number | null
+  frpPublicHttps?: boolean
+  /** Omit to leave unchanged; empty string clears the keyring entry. */
+  frpToken?: string | null
+}
+
+export interface TunnelConfigApi {
+  get: () => Promise<IpcResult<TunnelConfigView>>
+  set: (update: TunnelConfigUpdate) => Promise<IpcResult<TunnelConfigView>>
+}
+
 // Remote terminal server status (mirrors Rust remote::RemoteStatus)
 export interface RemoteStatus {
   running: boolean
@@ -453,8 +488,10 @@ export interface RemoteStatus {
   bindMode: RemoteBindMode | null
   /** `127.0.0.1` or `0.0.0.0` while running. */
   bindHost: string | null
-  /** Ephemeral `https://*.trycloudflare.com` tunnel URL (QR-encoded). */
+  /** Public tunnel origin without a separately displayed credential. */
   tunnelUrl: string | null
+  /** Active provider id while a tunnel is attached. */
+  tunnelProvider?: string | null
 }
 
 // Remote terminal server control API

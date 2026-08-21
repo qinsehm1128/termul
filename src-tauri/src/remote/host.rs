@@ -108,10 +108,10 @@ pub struct RemoteStatus {
     pub bind_mode: Option<String>,
     /// Bind host shown in the UI (`127.0.0.1` or `0.0.0.0`).
     pub bind_host: Option<String>,
-    /// Ephemeral `https://*.trycloudflare.com` tunnel URL when the built-in
-    /// cloudflared quick-tunnel is up; `None` when stopped or before the URL
-    /// arrives. The StatusBar QR encodes this (never the local `url`).
+    /// Public tunnel Origin when a provider is up; never contains the bearer fragment.
     pub tunnel_url: Option<String>,
+    /// Active provider id (`cloudflareQuick` / `cloudflareNamed` / `frp`).
+    pub tunnel_provider: Option<String>,
 }
 
 impl RemoteStatus {
@@ -123,6 +123,7 @@ impl RemoteStatus {
             bind_mode: None,
             bind_host: None,
             tunnel_url: None,
+            tunnel_provider: None,
         }
     }
 
@@ -143,7 +144,13 @@ impl RemoteStatus {
             bind_mode: Some(bind_mode.as_str().to_string()),
             bind_host: Some(bind_mode.display_host().to_string()),
             tunnel_url,
+            tunnel_provider: None,
         }
+    }
+
+    fn with_provider(mut self, provider: Option<String>) -> Self {
+        self.tunnel_provider = provider;
+        self
     }
 }
 
@@ -156,8 +163,10 @@ struct RemoteServer {
     serve_handle: Option<tokio::task::JoinHandle<()>>,
     addr: SocketAddr,
     bind_mode: RemoteBindMode,
-    /// Ephemeral trycloudflare URL (set when the quick-tunnel came up).
+    /// Public tunnel Origin (set when a provider attaches).
     tunnel_url: Option<String>,
+    /// Provider id attached with the tunnel (`cloudflareQuick` / …).
+    tunnel_provider: Option<String>,
     /// `true` once the cloudflared watchdog observed the child exit. Read by
     /// `status()` (sync) to drop the stale `tunnel_url` so the renderer poller
     /// clears the QR (it would otherwise offer a link that yields "This site
@@ -247,10 +256,42 @@ impl RemoteServerState {
         pty: Arc<PtyManager>,
         ws_relay: Arc<WsRelaySink>,
         registry: Arc<ProjectRegistry>,
+        bind_mode: RemoteBindMode,
+        workspace_manifest: Option<Arc<WorkspaceManifestService>>,
+        acp_catalog: Option<Arc<AcpCatalogService>>,
+        acp_install: Option<Arc<AcpInstallService>>,
+    ) -> Result<RemoteStatus, String> {
+        self.start_on_port(
+            acp,
+            pty,
+            ws_relay,
+            registry,
+            bind_mode,
+            workspace_manifest,
+            acp_catalog,
+            acp_install,
+            0,
+        )
+        .await
+    }
+
+    /// Start the shared-live server on an explicit loopback port.
+    ///
+    /// `bind_port == 0` keeps the OS-assigned ephemeral port used by Quick Tunnel
+    /// and FRP. Named Cloudflare tunnels pass a stable port so remotely-managed
+    /// ingress can target `http://127.0.0.1:{port}`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_on_port(
+        &self,
+        acp: Arc<AcpManager>,
+        pty: Arc<PtyManager>,
+        ws_relay: Arc<WsRelaySink>,
+        registry: Arc<ProjectRegistry>,
         _bind_mode: RemoteBindMode,
         workspace_manifest: Option<Arc<WorkspaceManifestService>>,
         acp_catalog: Option<Arc<AcpCatalogService>>,
         acp_install: Option<Arc<AcpInstallService>>,
+        bind_port: u16,
     ) -> Result<RemoteStatus, String> {
         // The built-in cloudflared quick-tunnel forwards to localhost, so the
         // desktop-hosted server always binds localhost regardless of the
@@ -332,8 +373,9 @@ impl RemoteServerState {
 
         let cfg = ServerConfig {
             host: bind_mode.host().to_string(),
-            // OS-assigned ephemeral port (avoids fixed-port conflicts).
-            port: 0,
+            // `0` = OS-assigned ephemeral port. Named Cloudflare tunnels pass a
+            // stable port so remotely-managed ingress can target loopback.
+            port: bind_port,
             event_log_capacity: ws_relay.event_log_capacity(),
             permission_timeout_secs: ws_relay
                 .rendezvous()
@@ -414,6 +456,7 @@ impl RemoteServerState {
             // `remote_server_start` — keeps this method testable without a real
             // cloudflared binary (the lifecycle tests bind/stop/status here).
             tunnel_url: None,
+            tunnel_provider: None,
             tunnel_dead: None,
             tunnel_watchdog: None,
         });
@@ -496,6 +539,7 @@ impl RemoteServerState {
             server.tunnel_url = None;
         }
         RemoteStatus::running(server.addr, server.bind_mode, server.tunnel_url.clone())
+            .with_provider(server.tunnel_provider.clone())
     }
 
     /// Attach a started cloudflared quick-tunnel (URL + live child) to the
@@ -508,6 +552,16 @@ impl RemoteServerState {
     /// this out of `start` lets the server-lifecycle unit tests run without a
     /// real cloudflared binary.
     pub fn attach_tunnel(&self, url: String, child: Child) -> Result<(), String> {
+        self.attach_tunnel_as(url, child, "cloudflareQuick")
+    }
+
+    /// Attach a started tunnel (URL + live child + provider id) to the running server.
+    pub fn attach_tunnel_as(
+        &self,
+        url: String,
+        child: Child,
+        provider: &str,
+    ) -> Result<(), String> {
         let mut child = Some(child);
         let mut slot = self.inner.lock().unwrap();
         match slot.as_mut() {
@@ -527,6 +581,7 @@ impl RemoteServerState {
                     flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 });
                 server.tunnel_url = Some(url);
+                server.tunnel_provider = Some(provider.to_string());
                 server.tunnel_dead = Some(dead_flag);
                 server.tunnel_watchdog = Some(watchdog);
                 Ok(())
