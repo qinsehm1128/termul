@@ -31,7 +31,12 @@ import { isTauriContext } from '@/lib/tauri-runtime'
 import { cn } from '@/lib/utils'
 import type { Project, ProjectColor } from '@/types/project'
 
-type CommandShortcutId = 'newTerminal' | 'newBrowserTab' | 'commandHistory' | 'colorThemePicker'
+type CommandShortcutId =
+  | 'newTerminal'
+  | 'newBrowserTab'
+  | 'commandHistory'
+  | 'colorThemePicker'
+  | 'toggleCliSessionPanel'
 
 interface CommandPaletteProps {
   isOpen: boolean
