@@ -16,6 +16,7 @@ import { AgentIcon } from '@/components/agents/AgentIcon'
 import { AgentBadge } from '@/components/chat/AgentBadge'
 import { AgentConnectionLamp } from '@/components/chat/AgentConnectionLamp'
 import { isAgentConnected } from '@/components/chat/is-agent-connected'
+import { pathBasename } from '@/components/lists'
 import { Skeleton } from '@/components/ui/skeleton'
 import { usePaneDnd } from '@/hooks/use-pane-dnd'
 import { clipboardApi, shellApi } from '@/lib/api'
@@ -30,7 +31,7 @@ import { type GitStatusState, useGitStatusStore } from '@/stores/git-status-stor
 import { useTerminalStore } from '@/stores/terminal-store'
 import type { AgentChatTab, WorkspaceTab } from '@/stores/workspace-store'
 import { editorTabId, useLeafCount, useWorkspaceStore } from '@/stores/workspace-store'
-import type { Terminal } from '@/types/project'
+import { isConversationScopedTerminal, type Terminal } from '@/types/project'
 import type { TabReorderPosition } from '@/types/workspace.types'
 import { EditorTab } from './EditorTab'
 import { TabContextMenu } from './tab-context-menu'
@@ -78,16 +79,19 @@ function TabCloseButton({
   onClose,
   disabled = false,
   isActive,
-  spinning = false
+  spinning = false,
+  ariaLabel
 }: {
   onClose: () => void
   disabled?: boolean
   isActive: boolean
   spinning?: boolean
+  ariaLabel?: string
 }): React.JSX.Element {
   return (
     <button
       type="button"
+      aria-label={ariaLabel}
       onClick={(e) => {
         e.stopPropagation()
         if (!disabled) onClose()
@@ -157,6 +161,8 @@ function TerminalTabInline({
   onDragLeave,
   onDrop
 }: TerminalTabInlineProps): React.JSX.Element {
+  const { t } = useTranslation('workspace')
+  const folder = pathBasename(terminal.cwd)
   const [isEditing, setIsEditing] = useState(false)
   const [editName, setEditName] = useState(terminal.name)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -253,16 +259,29 @@ function TerminalTabInline({
         ) : (
           <span
             onDoubleClick={handleDoubleClick}
-            className={cn('text-2xs font-medium', isActive && 'text-foreground')}
+            className={cn(
+              'max-w-[88px] truncate text-2xs font-medium',
+              isActive && 'text-foreground'
+            )}
           >
             {terminal.name}
           </span>
         )}
+        {folder ? (
+          <span className="ml-1 max-w-[64px] truncate text-3xs text-muted-foreground">
+            {folder}
+          </span>
+        ) : null}
         <TabCloseButton
           onClose={onClose}
           disabled={isClosing}
           isActive={isActive}
           spinning={isClosing}
+          ariaLabel={
+            isConversationScopedTerminal(terminal)
+              ? t('tabs.closeView', { name: terminal.name })
+              : t('tabs.terminateProcess', { name: terminal.name })
+          }
         />
       </div>
     </TabContextMenu>

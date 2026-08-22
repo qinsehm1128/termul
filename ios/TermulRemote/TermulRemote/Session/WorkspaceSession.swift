@@ -2,6 +2,13 @@ import Foundation
 import Observation
 import UIKit
 
+enum KeyboardGuard {
+    @MainActor
+    static func resign() {
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+    }
+}
+
 enum SessionPhase: Equatable {
     case idle
     case connecting
@@ -31,14 +38,21 @@ final class WorkspaceSession {
 
     /// Chat sits on a Conversation. A project workspace is terminals only.
     var showChat = true
+    var workspaceTab: WorkspaceTab = .chat
     var workspace: WorkspaceKind = .home
     var phase: SessionPhase = .idle
+    private var isStarting = false
+    private var startEpoch = 0
 
-    init(accessURL: URL) {
-        credentials = HostCredentials(accessURL: accessURL)
+    init(accessURL: URL, bearer: String? = nil) {
+        credentials = HostCredentials(accessURL: accessURL, bearer: bearer)
         origin = credentials.origin
         http = HostHTTP(origin: origin, credentials: credentials)
         chat.attach(socket: acp)
+        chat.onHostConversationsChanged = { [weak self] in
+            guard let self else { return }
+            Task { await self.conversations.refresh() }
+        }
         conversations.attach(http: http)
         projects.attach(http: http, socket: acp)
         files.attach(http: http)
@@ -46,10 +60,26 @@ final class WorkspaceSession {
     }
 
     func start() async {
+        guard !isStarting else { return }
+        startEpoch += 1
+        let epoch = startEpoch
+        isStarting = true
+        defer {
+            if startEpoch == epoch {
+                isStarting = false
+            }
+        }
         phase = .connecting
+        HostLog.session.info("Host connect started")
         do {
+            await HostNetwork.waitUntilReady()
+            try Task.checkCancellation()
+            guard startEpoch == epoch else { return }
             try await http.probeHealth()
-            try await acp.connect(origin: origin, credentials: credentials)
+            try Task.checkCancellation()
+            guard startEpoch == epoch else { return }
+            try await connectAgent()
+            guard startEpoch == epoch else { return }
             await conversations.refresh()
             await projects.refresh()
             do {
@@ -57,10 +87,33 @@ final class WorkspaceSession {
             } catch {
                 terminals.errorMessage = error.localizedDescription
             }
+            guard startEpoch == epoch else { return }
             phase = .connected
+            HostLog.session.info("Host connect succeeded")
+        } catch is CancellationError {
+            HostLog.session.info("Host connect cancelled")
         } catch {
+            guard startEpoch == epoch, !Task.isCancelled else { return }
+            HostLog.session.error("Host connect failed after restart-safe retries")
             phase = .failed(error.localizedDescription)
         }
+    }
+
+    private func connectAgent() async throws {
+        var lastError: Error?
+        for attempt in 0 ..< 3 {
+            do {
+                try await acp.connect(origin: origin, credentials: credentials)
+                return
+            } catch {
+                lastError = error
+                acp.stop()
+                if attempt < 2 {
+                    try await Task.sleep(for: .milliseconds(600 * (1 << attempt)))
+                }
+            }
+        }
+        throw lastError ?? HostError.network(String(localized: "The phone could not open the host WebSocket."))
     }
 
     func retry() async {
@@ -69,9 +122,10 @@ final class WorkspaceSession {
     }
 
     func stop() {
+        startEpoch += 1
+        isStarting = false
         acp.stop()
         terminalSocket.stop()
-        phase = .idle
     }
 
     func handleScene(isBackground: Bool) {
@@ -81,16 +135,19 @@ final class WorkspaceSession {
     func selectConversation(_ conversation: HostConversation) async {
         projects.clearSelection()
         workspace = .conversation
-        showChat = true
+        setWorkspaceTab(.chat)
         _ = await conversations.open(conversation)
+        let opened = conversations.active ?? conversation
+        let binding = await conversations.binding(for: opened)
+        await chat.bindConversation(opened, binding: binding)
         await refreshActiveTerminals()
-        await files.openRoot(conversation.workspaceCwd)
+        await files.openRoot(opened.workspaceCwd)
     }
 
     func selectProject(_ project: HostProject) async {
         conversations.clearSelection()
         workspace = .project
-        showChat = false
+        setWorkspaceTab(.terminal)
         await projects.select(project)
         await refreshActiveTerminals()
         if let path = project.path {
@@ -104,9 +161,8 @@ final class WorkspaceSession {
         projects.clearSelection()
         terminals.terminals = []
         terminals.activeId = nil
-        chat.messages = []
-        chat.activeSessionId = nil
-        showChat = true
+        chat.leave()
+        setWorkspaceTab(.chat)
     }
 
     func leaveConversation() {
@@ -114,12 +170,23 @@ final class WorkspaceSession {
     }
 
     func revealTerminal(_ terminalId: String) async {
-        showChat = false
+        setWorkspaceTab(.terminal)
         await terminals.open(terminalId)
     }
 
     func revealChat() {
-        showChat = true
+        setWorkspaceTab(.chat)
+    }
+
+    func setWorkspaceTab(_ tab: WorkspaceTab) {
+        guard workspaceTab != tab else { return }
+        KeyboardGuard.resign()
+        HostLog.session.info("Workspace tab \(tab.rawValue, privacy: .public)")
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(80))
+            workspaceTab = tab
+            showChat = tab == .chat
+        }
     }
 
     func refreshActiveTerminals() async {

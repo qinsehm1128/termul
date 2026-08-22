@@ -14,6 +14,7 @@ import type {
   TerminalResumeGrant,
   TerminalResumeRequest,
   TerminalScopedDataCallback,
+  TerminalSpawnedEvent,
   TerminalSpawnOptions
 } from '@shared/types/ipc.types'
 import { Channel, type InvokeArgs, invoke } from '@tauri-apps/api/core'
@@ -30,7 +31,8 @@ const IPC_EVENTS = {
   TERMINAL_CWD_CHANGED: 'terminal-cwd-changed',
   TERMINAL_GIT_BRANCH_CHANGED: 'terminal-git-branch-changed',
   TERMINAL_GIT_STATUS_CHANGED: 'terminal-git-status-changed',
-  TERMINAL_EXIT_CODE_CHANGED: 'terminal-exit-code-changed'
+  TERMINAL_EXIT_CODE_CHANGED: 'terminal-exit-code-changed',
+  TERMINAL_SPAWNED: 'terminal-spawned'
 } as const
 
 type EventPayloadMap = {
@@ -40,6 +42,7 @@ type EventPayloadMap = {
   [IPC_EVENTS.TERMINAL_GIT_BRANCH_CHANGED]: { terminalId: string; branch: string | null }
   [IPC_EVENTS.TERMINAL_GIT_STATUS_CHANGED]: { terminalId: string; status: GitStatus | null }
   [IPC_EVENTS.TERMINAL_EXIT_CODE_CHANGED]: { terminalId: string; exitCode: number }
+  [IPC_EVENTS.TERMINAL_SPAWNED]: TerminalSpawnedEvent
 }
 
 type SharedListenerEntry<T> = {
@@ -55,6 +58,7 @@ const IPC_COMMANDS = {
   SPAWN: 'terminal_spawn',
   RESUME: 'terminal_resume',
   ATTACH: 'terminal_attach',
+  WATCH: 'terminal_watch',
   ROTATE_CLAIM: 'terminal_rotate_claim',
   REVOKE_CLAIM: 'terminal_revoke_claim',
   WRITE: 'terminal_write',
@@ -477,6 +481,23 @@ export function createTauriTerminalApi(): TerminalApi {
      * is the desktop reattach cursor.
      */
     attach: attachTerminal,
+
+    async watch(terminalId: string, lastSeq: number): Promise<IpcResult<TerminalAttachResult>> {
+      const onData = createTerminalDataChannel(terminalId)
+      const result = await invokeIpc<TerminalAttachResult>(IPC_COMMANDS.WATCH, {
+        terminalId,
+        lastSeq,
+        onData
+      })
+      if (!result.success) {
+        onData.onmessage = () => {}
+      }
+      return result
+    },
+
+    onSpawned(callback: (event: TerminalSpawnedEvent) => void): () => void {
+      return subscribeSharedEvent(IPC_EVENTS.TERMINAL_SPAWNED, callback, 'terminal-spawned')
+    },
 
     /**
      * CAP-3: possession-based rotation — the returned credential replaces the

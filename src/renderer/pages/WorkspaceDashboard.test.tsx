@@ -129,7 +129,7 @@ describe('WorkspaceDashboard', () => {
 
     const dashboardOnly = renderDashboard()
     expect(screen.getByTestId('conversation-list')).toBeVisible()
-    expect(screen.getByText('No project')).toBeVisible()
+    expect(screen.getByText('Untitled conversation')).toBeVisible()
     expect(document.querySelectorAll('[data-conversation-recovery-panel]')).toHaveLength(0)
     dashboardOnly.unmount()
     cleanup()

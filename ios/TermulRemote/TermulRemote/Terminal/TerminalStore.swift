@@ -25,6 +25,8 @@ final class TerminalStore {
     var isConnecting = false
     var onFeed: (@MainActor (String, Data) -> Void)?
 
+    private var coalesceBuffers: [String: Data] = [:]
+    private var coalesceTask: Task<Void, Never>?
     private var socket: TerminalSocket?
     private var origin: URL?
     private var credentials: HostCredentials?
@@ -37,17 +39,11 @@ final class TerminalStore {
         self.origin = origin
         self.credentials = credentials
         socket.onBytes = { [weak self] terminalId, data in
+            self?.enqueueOutput(terminalId: terminalId, data: data)
+        }
+        socket.onCatalogChanged = { [weak self] in
             guard let self else { return }
-            if let existing = self.terminals.firstIndex(where: { $0.id == terminalId }) {
-                self.terminals[existing].lastSeq += 1
-            }
-            if let onFeed {
-                onFeed(terminalId, data)
-            } else {
-                var buffer = self.pendingOutput[terminalId] ?? Data()
-                buffer.append(data)
-                self.pendingOutput[terminalId] = buffer
-            }
+            Task { await self.refresh(conversationId: self.lastConversationId, projectId: self.lastProjectId) }
         }
         socket.onExit = { [weak self] terminalId in
             guard let self else { return }
@@ -126,7 +122,7 @@ final class TerminalStore {
         }
     }
 
-    func spawn(conversationId: String, projectId: String?, cols: Int = 80, rows: Int = 24) async {
+    func spawn(conversationId: String?, projectId: String?, cols: Int = 80, rows: Int = 24) async {
         isConnecting = true
         defer { isConnecting = false }
         do {
@@ -152,8 +148,10 @@ final class TerminalStore {
             if !terminals.contains(where: { $0.id == live.id }) {
                 terminals.append(live)
             }
+            HostLog.session.info("Created a host terminal from the phone")
             await open(live.id)
         } catch {
+            HostLog.session.error("Phone terminal create failed")
             errorMessage = error.localizedDescription
         }
     }
@@ -174,6 +172,33 @@ final class TerminalStore {
         terminals[index].rows = rows
         guard terminals[index].owned else { return }
         _ = try? await socket.resize(terminalId: activeId, cols: cols, rows: rows)
+    }
+
+    private func enqueueOutput(terminalId: String, data: Data) {
+        coalesceBuffers[terminalId, default: Data()].append(data)
+        if coalesceTask == nil {
+            coalesceTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(16))
+                guard let self else { return }
+                let pending = self.coalesceBuffers
+                self.coalesceBuffers.removeAll()
+                self.coalesceTask = nil
+                for (id, bytes) in pending {
+                    self.deliverOutput(terminalId: id, data: bytes)
+                }
+            }
+        }
+    }
+
+    private func deliverOutput(terminalId: String, data: Data) {
+        if let existing = terminals.firstIndex(where: { $0.id == terminalId }) {
+            terminals[existing].lastSeq += 1
+        }
+        if let onFeed {
+            onFeed(terminalId, data)
+        } else {
+            pendingOutput[terminalId, default: Data()].append(data)
+        }
     }
 
     func consumeOutput(for terminalId: String) -> Data? {

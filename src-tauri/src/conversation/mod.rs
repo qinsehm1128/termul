@@ -25,10 +25,10 @@ mod validation_tests;
 
 pub use application::{
     ConversationAggregateMutationAction, ConversationAggregateMutationOutcome,
-    ConversationApplicationError, ConversationApplicationService, ConversationHostKind,
-    ConversationHostState, ConversationHostStatus, ConversationIdentitySnapshot,
-    ConversationOpenOutcome, LegacyConversationKey, LegacyConversationResolution,
-    LegacyConversationSourceKind,
+    ConversationApplicationError, ConversationApplicationService, ConversationBindingSnapshot,
+    ConversationHostKind, ConversationHostState, ConversationHostStatus,
+    ConversationIdentitySnapshot, ConversationOpenOutcome, LegacyConversationKey,
+    LegacyConversationResolution, LegacyConversationSourceKind,
 };
 pub use bootstrap::{
     BootstrapError, BootstrapOutcome, ConversationBootstrap, HostConversationRoots,

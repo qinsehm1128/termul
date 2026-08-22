@@ -11,11 +11,12 @@ import {
   type WheelEvent
 } from 'react'
 import { useTranslation } from 'react-i18next'
+import { pathBasename } from '@/components/lists'
 import { shellApi } from '@/lib/api'
 import { isPreferredShell } from '@/lib/shell-api'
 import { cn } from '@/lib/utils'
 import { useProjectStore } from '@/stores/project-store'
-import type { Terminal } from '@/types/project'
+import { isConversationScopedTerminal, type Terminal } from '@/types/project'
 import { Skeleton } from './ui/skeleton'
 import { TabContextMenu } from './workspace/tab-context-menu'
 
@@ -323,12 +324,17 @@ function TerminalTab({ terminal, isActive, onSelect, onClose, onRename }: Termin
             <span
               onDoubleClick={handleDoubleClick}
               className={cn(
-                'text-2xs font-medium truncate max-w-[80px]',
+                'max-w-[88px] truncate text-2xs font-medium',
                 isActive && 'text-foreground'
               )}
             >
               {terminal.name}
             </span>
+            {pathBasename(terminal.cwd) ? (
+              <span className="ml-1 max-w-[64px] truncate text-3xs text-muted-foreground">
+                {pathBasename(terminal.cwd)}
+              </span>
+            ) : null}
             {terminalWorktree && (
               <span className="ml-1.5 inline-flex items-center gap-0.5 rounded-sm bg-accent/10 px-1 py-0.5 text-4xs font-medium text-accent-foreground/80 leading-none">
                 <GitBranch size={8} />
@@ -343,7 +349,11 @@ function TerminalTab({ terminal, isActive, onSelect, onClose, onRename }: Termin
             onClose()
           }}
           className="ml-auto rounded-md p-0.5 text-muted-foreground opacity-70 transition-opacity duration-150 hover:bg-secondary hover:text-foreground group-hover:opacity-100"
-          aria-label={t('terminalTabs.closeTerminal', { name: terminal.name })}
+          aria-label={
+            isConversationScopedTerminal(terminal)
+              ? t('terminalTabs.closeView', { name: terminal.name })
+              : t('terminalTabs.terminateProcess', { name: terminal.name })
+          }
         >
           <X size={11} />
         </button>

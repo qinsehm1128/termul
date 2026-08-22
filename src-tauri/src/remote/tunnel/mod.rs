@@ -1,8 +1,8 @@
 //! Pluggable public-tunnel providers for desktop shared-live access.
 //!
-//! The in-process Axum server always binds loopback. A provider then publishes
-//! that origin through Cloudflare Quick Tunnel (zero-config), a named
-//! Cloudflare tunnel (operator hostname + token), or FRP (operator `frps`).
+//! The in-process Axum server binds loopback (or all interfaces for LAN).
+//! A provider then publishes that origin through Cloudflare Quick Tunnel,
+//! a named Cloudflare tunnel, FRP, or SSH reverse (`ssh -R`).
 //! Application auth stays on the bearer fragment; providers only supply the
 //! public Origin.
 
@@ -12,6 +12,7 @@ pub mod config;
 pub mod frp;
 mod process;
 mod sidecar;
+pub mod ssh_reverse;
 
 use tokio::process::Child;
 
@@ -28,7 +29,7 @@ pub struct StartedTunnel {
 
 /// Start the configured provider against an already-bound loopback port.
 ///
-/// Secrets are read from the keyring at start time and never returned.
+/// Secrets are read from the in-memory settings cache (`secrets.json`) and never returned.
 pub async fn start_configured_tunnel(
     local_port: u16,
     config: &TunnelConfig,
@@ -47,5 +48,8 @@ pub async fn start_configured_tunnel(
             cloudflare_named::start_named_tunnel(local_port, config, store).await
         }
         TunnelProviderKind::Frp => frp::start_frp_tunnel(local_port, config, store).await,
+        TunnelProviderKind::SshReverse => {
+            ssh_reverse::start_ssh_reverse_tunnel(local_port, config, store).await
+        }
     }
 }

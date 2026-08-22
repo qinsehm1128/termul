@@ -35,9 +35,10 @@ pub mod workspace_manifest;
 // though nothing inside the crate references them through this path yet.
 #[allow(unused_imports)]
 pub use catalog::{
-    overlay_installed, AcpCatalog, AcpCatalogService, CatalogAgent, CatalogConfigFile,
-    CatalogError, CatalogRuntimeAvailability, CatalogSource, HostCapability, InstalledCatalogInfo,
-    PlatformTarget, SetCatalogOptInRequest, SupportedAcpAgentStatus,
+    apply_host_catalog_overlays, overlay_installed, overlay_running_agents, AcpCatalog,
+    AcpCatalogService, CatalogAgent, CatalogConfigFile, CatalogError, CatalogRuntimeAvailability,
+    CatalogSource, HostCapability, InstalledCatalogInfo, PlatformTarget, SetCatalogOptInRequest,
+    SupportedAcpAgentStatus,
 };
 #[allow(unused_imports)]
 pub use chat_history_store::{

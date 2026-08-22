@@ -175,6 +175,7 @@ export const WS_REQUEST_TYPES = [
   'conversation_host_status',
   'list_conversations',
   'get_conversation',
+  'get_conversation_binding',
   'open_conversation',
   'resolve_legacy_conversation_id',
   'get_session_workspace',
@@ -185,7 +186,8 @@ export const WS_REQUEST_TYPES = [
   'update_execution_target',
   // Host-scanned vendor CLI transcripts (cwd-scoped). Distinct from ACP
   // `list_sessions` / Conversation history.
-  'list_cli_sessions'
+  'list_cli_sessions',
+  'resolve_cli_sessions'
 ] as const
 
 /** Union of all WS request `type` strings. */

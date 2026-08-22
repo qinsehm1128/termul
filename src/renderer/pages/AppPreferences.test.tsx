@@ -46,7 +46,14 @@ vi.mock('@/lib/api', () => ({
         frpCustomDomain: null,
         frpRemotePort: null,
         frpPublicHttps: true,
-        frpTokenSet: false
+        frpTokenSet: false,
+        sshHost: null,
+        sshPort: null,
+        sshUser: null,
+        sshRemotePort: null,
+        sshPublicHostname: null,
+        sshPublicHttps: true,
+        sshPrivateKeySet: false
       }
     }),
     set: vi.fn()

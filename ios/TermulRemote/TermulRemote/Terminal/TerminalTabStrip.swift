@@ -14,11 +14,21 @@ struct TerminalTabStrip: View {
                             Text(item.title)
                                 .font(.subheadline.weight(.semibold))
                                 .lineLimit(1)
-                            if let branch = item.gitBranch, !branch.isEmpty {
+                            if let folder = HostTimestamp.folderName(from: item.cwd) {
+                                Text(folder)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            } else if let branch = item.gitBranch, !branch.isEmpty {
                                 Text(branch)
                                     .font(.caption2)
                                     .foregroundStyle(.secondary)
                             }
+                            Text(session.terminals.activeId == item.id
+                                 ? String(localized: "Active")
+                                 : String(localized: "Idle"))
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
                         }
                         .padding(.horizontal, 12)
                         .padding(.vertical, 8)
@@ -60,8 +70,11 @@ struct TerminalTabStrip: View {
                 projectId: conversation.projectId
             )
         case .project:
-            session.terminals.errorMessage = String(localized: "Open a new terminal on the desktop project. The phone watches it.")
-            return
+            guard let project = session.projects.active else { return }
+            await session.terminals.spawn(
+                conversationId: nil,
+                projectId: project.id
+            )
         case .home:
             return
         }

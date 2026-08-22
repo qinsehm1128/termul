@@ -9,6 +9,10 @@ vi.mock('@/lib/log-api', () => ({
   logFrontendError: vi.fn()
 }))
 
+vi.mock('@/lib/acp-transport', () => ({
+  getRemoteAccessCredential: () => 'test-access-token'
+}))
+
 /**
  * Minimal FakeWebSocket for the terminal protocol (`{id,type,payload}` requests
  * → `{id,success,data}` / `{id,success:false,error,code}` replies). Mirrors the
@@ -599,6 +603,22 @@ describe('WebTerminalClient frame handling & request lifecycle', () => {
     attachReply = 'ok'
   })
 
+  it('sends authenticate after the socket opens and before other requests', async () => {
+    const client = new WebTerminalClient(
+      'ws://test/terminal/ws',
+      FakeWebSocket as unknown as typeof WebSocket
+    )
+    const internals = client as unknown as ClientInternals
+    await client.connect()
+    const first = JSON.parse(internals.socket.sent[0] ?? '{}') as {
+      type?: string
+      payload?: { token?: string }
+    }
+    expect(first.type).toBe('authenticate')
+    expect(first.payload?.token).toBe('test-access-token')
+    client.dispose()
+  })
+
   it('delivers a data frame as a Uint8Array to onData subscribers', async () => {
     vi.useFakeTimers()
     const client = new WebTerminalClient(
@@ -1178,7 +1198,7 @@ describe('WebTerminalClient frame handling & request lifecycle', () => {
       const sentTypes = internals.socket.sent.map(
         (raw) => (JSON.parse(raw) as { type: string }).type
       )
-      expect(sentTypes).toEqual(['spawn'])
+      expect(sentTypes).toEqual(['authenticate', 'spawn'])
       client.dispose()
     })
 

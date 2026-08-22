@@ -1,5 +1,5 @@
 //! Validate client-supplied scope paths. Scan roots always come from the host
-//! home; scopePaths only widen which already-found sessions survive the cap.
+//! home; scopePaths select which vendor project folders are walked.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -63,6 +63,7 @@ pub fn filter_scope_paths(
     (accepted, issues)
 }
 
+#[cfg(test)]
 pub fn is_cwd_in_scope(cwd: Option<&str>, scope_paths: &[PathBuf]) -> bool {
     if scope_paths.is_empty() {
         return true;
@@ -71,9 +72,9 @@ pub fn is_cwd_in_scope(cwd: Option<&str>, scope_paths: &[PathBuf]) -> bool {
         return false;
     };
     let cwd_path = PathBuf::from(cwd);
-    scope_paths.iter().any(|root| {
-        cwd_path == *root || cwd_path.starts_with(root) || root.starts_with(&cwd_path)
-    })
+    scope_paths
+        .iter()
+        .any(|root| cwd_path == *root || cwd_path.starts_with(root) || root.starts_with(&cwd_path))
 }
 
 fn is_within_allowed_roots(path: &Path, allowed_roots: Option<&[PathBuf]>) -> bool {
@@ -94,10 +95,8 @@ mod tests {
 
     #[test]
     fn rejects_relative_and_parent_scope_paths() {
-        let (accepted, issues) = filter_scope_paths(
-            &["../etc".to_string(), "rel".to_string()],
-            None,
-        );
+        let (accepted, issues) =
+            filter_scope_paths(&["../etc".to_string(), "rel".to_string()], None);
         assert!(accepted.is_empty());
         assert_eq!(issues.len(), 2);
     }

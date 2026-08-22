@@ -139,6 +139,20 @@ export function isConversationScopedTerminal(terminal: Pick<Terminal, 'conversat
   return Boolean(terminal.conversationId)
 }
 
+/** Live PTY whose view is closed, scoped to the current Conversation or project shell. */
+export function isHiddenRunningTerminal(
+  terminal: Pick<Terminal, 'ptyId' | 'viewState' | 'isHidden' | 'conversationId' | 'projectId'>,
+  scope: { conversationId?: string | null; projectId?: string | null }
+): boolean {
+  if (!terminal.ptyId || isOpenTerminalView(terminal)) return false
+  if (scope.conversationId && terminal.conversationId === scope.conversationId) return true
+  return (
+    Boolean(scope.projectId) &&
+    terminal.projectId === scope.projectId &&
+    !isConversationScopedTerminal(terminal)
+  )
+}
+
 export interface TerminalLine {
   type: 'command' | 'output' | 'error' | 'warning' | 'info' | 'success'
   content: string

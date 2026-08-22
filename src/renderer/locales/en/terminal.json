@@ -121,6 +121,8 @@
     "stopHidden": "Stop",
     "reconnect": "Reconnect",
     "hiddenRunning": "Hidden running terminals",
+    "hiddenCount": "Hidden {{count}}",
+    "reopenNamed": "Reopen {{name}}",
     "conversationScopeRequired": "Open a Conversation before creating a durable terminal",
     "scopeError": "Terminal requires a valid Conversation scope."
   }

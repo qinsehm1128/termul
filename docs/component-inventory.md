@@ -38,6 +38,7 @@ Supporting these are shared layout, navigation, modal, and design-system compone
 - `mobile/MobileChatShell.tsx` — narrow web shell with terminal creation, selection, and close navigation alongside chat history
 - `mobile/MobileTerminalControls.tsx` — touch-sized Esc/Tab/Ctrl+C/arrows/PgUp/PgDn and clipboard-paste accessory that writes standard terminal sequences
 - `TerminalTabBar.tsx` / `TerminalView.tsx` — legacy or transitional terminal view helpers retained in repository
+- 列表界面盘点与实现顺序：[`list-ui-inventory.md`](./list-ui-inventory.md)
 
 ### Editor Components
 

@@ -72,6 +72,7 @@ export function decodeWebTerminalBinaryFrame(buffer: ArrayBuffer): WebTerminalBi
 }
 
 export type WebTerminalRequestType =
+  | 'authenticate'
   | 'spawn'
   | 'list'
   | 'watch'
@@ -233,6 +234,16 @@ export type WebTerminalEventPayload =
   | { type: 'git_branch_changed'; terminal_id: string; branch: string | null }
   | { type: 'git_status_changed'; terminal_id: string; status: GitStatus | null }
   | { type: 'exit_code_changed'; terminal_id: string; exit_code: number }
+  | {
+      type: 'spawned'
+      terminal_id: string
+      project_id?: string | null
+      conversation_id?: string | null
+      cwd: string
+      cols: number
+      rows: number
+      shell: string
+    }
 
 export interface WebTerminalEventFrame {
   type: 'event'

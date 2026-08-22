@@ -1,6 +1,14 @@
 {
   "title": "工作区",
   "cancel": "取消",
+  "sidePanels": {
+    "resizeSidebar": "拖动以调整侧栏宽度",
+    "resizeSidebarAria": "调整侧栏宽度",
+    "resizeRightRail": "拖动以调整右侧栏宽度",
+    "resizeRightRailAria": "调整右侧栏宽度",
+    "resizeCliSplit": "拖动以调整 CLI 会话高度",
+    "resizeCliSplitAria": "调整 CLI 会话面板高度"
+  },
   "projects": {
     "title": "项目"
   },
@@ -189,7 +197,10 @@
     "killProcess": "终止进程",
     "closeOthers": "关闭其他标签页",
     "closeAll": "全部关闭",
-    "copyPath": "复制路径"
+    "copyPath": "复制路径",
+    "closeView": "关闭视图 {{name}}",
+    "terminateProcess": "结束进程 {{name}}",
+    "hiddenCount": "隐藏 {{count}}"
   },
   "pane": {
     "starting": "正在启动 {{name}}…",

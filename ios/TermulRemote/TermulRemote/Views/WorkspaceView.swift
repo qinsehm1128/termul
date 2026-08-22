@@ -9,30 +9,16 @@ struct WorkspaceView: View {
     init(store: ConnectionStore, link: RemoteLink) {
         self.store = store
         self.link = link
-        _session = State(initialValue: WorkspaceSession(accessURL: link.accessURL))
+        _session = State(initialValue: WorkspaceSession(accessURL: link.accessURL, bearer: link.pairingToken))
     }
 
     var body: some View {
         Group {
             switch session.phase {
             case .connecting, .idle:
-                ProgressView(String(localized: "Connecting to host…"))
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .background(TermulTheme.canvas.ignoresSafeArea())
+                connectingState
             case .failed(let message):
-                ContentUnavailableView {
-                    Label("Could not load session", systemImage: "wifi.exclamationmark")
-                } description: {
-                    Text(message)
-                } actions: {
-                    Button("Retry") {
-                        Task { await session.retry() }
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(TermulTheme.accent)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(TermulTheme.canvas.ignoresSafeArea())
+                failedState(message)
             case .connected:
                 switch session.workspace {
                 case .home:
@@ -48,9 +34,9 @@ struct WorkspaceView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             session.handleScene(isBackground: phase != .active)
-        }
-        .onDisappear {
-            session.stop()
+            if phase == .active, case .failed = session.phase {
+                Task { await session.retry() }
+            }
         }
         .alert(
             String(localized: "Could not load session"),
@@ -58,22 +44,72 @@ struct WorkspaceView: View {
         ) {
             Button("OK", role: .cancel) {}
         } message: {
-            Text(session.chat.errorMessage ?? session.conversations.errorMessage ?? session.projects.errorMessage ?? session.files.errorMessage ?? session.terminals.errorMessage ?? "")
+            Text(session.conversations.errorMessage ?? session.projects.errorMessage ?? session.files.errorMessage ?? session.terminals.errorMessage ?? "")
         }
+    }
+
+    private var connectingState: some View {
+        VStack(spacing: 16) {
+            ProgressView()
+            Text("Connecting to host…")
+                .font(TermulTheme.display)
+            Text(link.title)
+                .font(.body)
+                .foregroundStyle(.secondary)
+        }
+        .padding(28)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(TermulTheme.canvas.ignoresSafeArea())
+        .accessibilityIdentifier("connecting")
+    }
+
+    private func failedState(_ message: String) -> some View {
+        VStack(spacing: 16) {
+            Text("Could not open this desk")
+                .font(TermulTheme.display)
+                .multilineTextAlignment(.center)
+            Text(message)
+                .font(.body)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            VStack(spacing: 10) {
+                Button {
+                    Task { await session.retry() }
+                } label: {
+                    Text("Retry")
+                        .font(.body.bold())
+                        .frame(maxWidth: .infinity)
+                        .frame(minHeight: 48)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(TermulTheme.accent)
+                Button {
+                    store.disconnect()
+                } label: {
+                    Text("Back")
+                        .frame(maxWidth: .infinity)
+                        .frame(minHeight: 44)
+                }
+                .buttonStyle(.bordered)
+            }
+            .frame(maxWidth: 280)
+        }
+        .padding(28)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(TermulTheme.canvas.ignoresSafeArea())
+        .accessibilityIdentifier("connect-error")
     }
 
     private var alertBinding: Binding<Bool> {
         Binding(
             get: {
-                session.chat.errorMessage != nil
-                    || session.conversations.errorMessage != nil
+                session.conversations.errorMessage != nil
                     || session.projects.errorMessage != nil
                     || session.files.errorMessage != nil
                     || session.terminals.errorMessage != nil
             },
             set: { presented in
                 if !presented {
-                    session.chat.errorMessage = nil
                     session.conversations.errorMessage = nil
                     session.projects.errorMessage = nil
                     session.files.errorMessage = nil

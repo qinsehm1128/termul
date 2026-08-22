@@ -74,4 +74,33 @@ describe('cliSessionApi (web vs desktop branch)', () => {
       args: { scopePaths: ['/repo'] }
     })
   })
+
+  it('web: resolveSessions posts to /cli-sessions/resolve', async () => {
+    mockIsTauriContext.mockReturnValue(false)
+    mockFetch.mockResolvedValue(jsonResponse({ success: true, data: { sessions: [], issues: [] } }))
+
+    const result = await cliSessionApi.resolveSessions({
+      files: [{ agentId: 'claude-code', filePath: '/tmp/a.jsonl' }]
+    })
+
+    expect(result).toEqual({ sessions: [], issues: [] })
+    expect(mockFetch).toHaveBeenCalledWith(
+      expect.stringMatching(/\/cli-sessions\/resolve$/),
+      expect.objectContaining({ method: 'POST' })
+    )
+  })
+
+  it('desktop: resolveSessions invokes resolve_cli_sessions_cmd', async () => {
+    mockIsTauriContext.mockReturnValue(true)
+    mockInvoke.mockResolvedValue({ sessions: [], issues: [] })
+
+    const result = await cliSessionApi.resolveSessions({
+      files: [{ agentId: 'claude-code', filePath: '/tmp/a.jsonl' }]
+    })
+
+    expect(result).toEqual({ sessions: [], issues: [] })
+    expect(mockInvoke).toHaveBeenCalledWith('resolve_cli_sessions_cmd', {
+      args: { files: [{ agentId: 'claude-code', filePath: '/tmp/a.jsonl' }] }
+    })
+  })
 })

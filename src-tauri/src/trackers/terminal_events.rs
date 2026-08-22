@@ -33,6 +33,15 @@ pub enum TerminalEvent {
         terminal_id: String,
         exit_code: i32,
     },
+    Spawned {
+        terminal_id: String,
+        project_id: Option<String>,
+        conversation_id: Option<String>,
+        cwd: String,
+        cols: u16,
+        rows: u16,
+        shell: String,
+    },
 }
 
 impl TerminalEvent {
@@ -42,7 +51,8 @@ impl TerminalEvent {
             | Self::CwdChanged { terminal_id, .. }
             | Self::GitBranchChanged { terminal_id, .. }
             | Self::GitStatusChanged { terminal_id, .. }
-            | Self::ExitCodeChanged { terminal_id, .. } => terminal_id,
+            | Self::ExitCodeChanged { terminal_id, .. }
+            | Self::Spawned { terminal_id, .. } => terminal_id,
         }
     }
 }
@@ -105,7 +115,8 @@ impl TerminalEventHub {
                 | TerminalEvent::CwdChanged { terminal_id, .. }
                 | TerminalEvent::GitBranchChanged { terminal_id, .. }
                 | TerminalEvent::GitStatusChanged { terminal_id, .. }
-                | TerminalEvent::ExitCodeChanged { terminal_id, .. } => terminal_id.clone(),
+                | TerminalEvent::ExitCodeChanged { terminal_id, .. }
+                | TerminalEvent::Spawned { terminal_id, .. } => terminal_id.clone(),
             };
             let snapshot = snapshots.entry(terminal_id).or_default();
             match &event {
@@ -123,6 +134,7 @@ impl TerminalEventHub {
                 TerminalEvent::ExitCodeChanged { exit_code, .. } => {
                     snapshot.exit_code = Some(*exit_code)
                 }
+                TerminalEvent::Spawned { cwd, .. } => snapshot.cwd = Some(cwd.clone()),
             }
         }
         let _ = self.tx.send(event.clone());
@@ -162,6 +174,26 @@ impl TerminalEventHub {
             } => app.emit(
                 "terminal-exit-code-changed",
                 serde_json::json!({ "terminalId": terminal_id, "exitCode": exit_code }),
+            ),
+            TerminalEvent::Spawned {
+                terminal_id,
+                project_id,
+                conversation_id,
+                cwd,
+                cols,
+                rows,
+                shell,
+            } => app.emit(
+                "terminal-spawned",
+                serde_json::json!({
+                    "terminalId": terminal_id,
+                    "projectId": project_id,
+                    "conversationId": conversation_id,
+                    "cwd": cwd,
+                    "cols": cols,
+                    "rows": rows,
+                    "shell": shell
+                }),
             ),
         };
         if let Err(error) = result {

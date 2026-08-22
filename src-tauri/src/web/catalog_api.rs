@@ -73,10 +73,13 @@ pub async fn list(
             // Overlay host-installed state so installed agents report `ready`
             // with their resolved command/args — the host is the single
             // source of truth (the web has no renderer persistence).
-            if let Some(install) = state.acp_install.as_ref() {
-                let installed = install.installed_agents();
-                crate::acp::overlay_installed(&mut catalog, &installed);
-            }
+            let installed = state
+                .acp_install
+                .as_ref()
+                .map(|install| install.installed_agents())
+                .unwrap_or_default();
+            let running = state.acp.list_running_namespaces();
+            crate::acp::apply_host_catalog_overlays(&mut catalog, &installed, &running);
             debug!(
                 target: "termul::web::catalog_api",
                 agents = catalog.agents.len(),
@@ -362,6 +365,13 @@ mod tests {
             assert!(!agent.name.is_empty());
             assert!(!agent.version.is_empty());
         }
+        assert!(
+            catalog.agents.iter().any(|agent| {
+                agent.status == crate::acp::SupportedAcpAgentStatus::Ready
+                    && agent.installed.is_none()
+            }),
+            "npx/uvx ready agents stay selectable without an installed overlay"
+        );
     }
 
     #[tokio::test]
@@ -512,6 +522,7 @@ mod tests {
                     arch: "x86_64".to_string(),
                 }],
                 installed: None,
+                running_agent_id: None,
             }],
         };
         let value = serde_json::to_value(&catalog).unwrap();

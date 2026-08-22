@@ -9,13 +9,20 @@ import { create } from 'zustand'
  */
 interface RemoteStatusStore {
   status: RemoteStatus | null
+  restoreError: string | null
   setStatus: (status: RemoteStatus | null) => void
+  setRestoreError: (error: string | null) => void
 }
 
 export const useRemoteStatusStore = create<RemoteStatusStore>((set) => ({
   status: null,
-  setStatus: (status) => set({ status })
+  restoreError: null,
+  setStatus: (status) => set({ status }),
+  setRestoreError: (restoreError) => set({ restoreError })
 }))
 
 /** Selector: current remote status (or null). */
 export const useRemoteStatus = (): RemoteStatus | null => useRemoteStatusStore((s) => s.status)
+
+export const useRemoteRestoreError = (): string | null =>
+  useRemoteStatusStore((s) => s.restoreError)

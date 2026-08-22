@@ -1233,4 +1233,34 @@ describe('terminal-store', () => {
       expect(serialized).not.toContain('"claim"')
     })
   })
+
+  describe('adoptRemoteProjectTerminal', () => {
+    it('adds a phone-created project PTY without stealing the active tab', () => {
+      const adoptedId = useTerminalStore.getState().adoptRemoteProjectTerminal({
+        terminalId: 'pty-phone',
+        projectId: '1',
+        cwd: '/tmp/demo',
+        cols: 80,
+        rows: 24,
+        shell: 'zsh'
+      })
+
+      expect(adoptedId).toBe('pty-phone')
+      expect(useTerminalStore.getState().activeTerminalId).toBe('t1')
+      expect(useTerminalStore.getState().findTerminalByPtyId('pty-phone')?.projectId).toBe('1')
+      expect(
+        useTerminalStore.getState().adoptRemoteProjectTerminal({
+          terminalId: 'pty-phone',
+          projectId: '1',
+          cwd: '/tmp/demo',
+          cols: 80,
+          rows: 24,
+          shell: 'zsh'
+        })
+      ).toBe('pty-phone')
+      expect(
+        useTerminalStore.getState().terminals.filter((item) => item.ptyId === 'pty-phone')
+      ).toHaveLength(1)
+    })
+  })
 })

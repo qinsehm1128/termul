@@ -38,7 +38,14 @@ const VIEW = {
   frpCustomDomain: null,
   frpRemotePort: null,
   frpPublicHttps: true,
-  frpTokenSet: false
+  frpTokenSet: false,
+  sshHost: null,
+  sshPort: null,
+  sshUser: null,
+  sshRemotePort: null,
+  sshPublicHostname: null,
+  sshPublicHttps: true,
+  sshPrivateKeySet: false
 }
 
 describe('RemoteAccessSettings', () => {

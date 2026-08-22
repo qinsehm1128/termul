@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest'
 import { getBuiltInAgent } from '@/lib/agents/agent-registry'
 import {
   buildCliResumeArgv,
+  formatCliResumeCommand,
   normalizeResumeFilePath,
   resumeHandleForSession
 } from '@/lib/agents/cli-session-resume-argv'
@@ -40,13 +41,13 @@ describe('buildCliResumeArgv', () => {
     expect(built).toEqual({ program: 'codex', args: ['resume', 's1'] })
   })
 
-  it('uses --session and the transcript path for pi', () => {
+  it('uses --session and the session id for pi', () => {
     const def = getBuiltInAgent('pi')!
     const built = buildCliResumeArgv(
       def,
       session({
         agentId: 'pi',
-        sessionId: 'file',
+        sessionId: '01a01876-6135-78d2-92e5-1523e69bf9e8',
         filePath: '/home/me/.pi/agent/sessions/a.jsonl',
         resumeFilePath: '/home/me/.pi/agent/sessions/a.jsonl'
       }),
@@ -55,7 +56,7 @@ describe('buildCliResumeArgv', () => {
     )
     expect(built).toEqual({
       program: 'pi',
-      args: ['--session', '/home/me/.pi/agent/sessions/a.jsonl']
+      args: ['--session', '01a01876-6135-78d2-92e5-1523e69bf9e8']
     })
   })
 
@@ -68,17 +69,37 @@ describe('buildCliResumeArgv', () => {
 })
 
 describe('resume path guards', () => {
+  it('quotes resume commands for a login shell', () => {
+    expect(
+      formatCliResumeCommand('pi', ['--session', '01a01876-6135-78d2-92e5-1523e69bf9e8'])
+    ).toBe('pi --session 01a01876-6135-78d2-92e5-1523e69bf9e8')
+    expect(formatCliResumeCommand('claude', ['--resume', "it's"])).toBe(
+      "claude --resume 'it'\\''s'"
+    )
+  })
+
   it('rejects relative and parent paths', () => {
     expect(normalizeResumeFilePath('../x')).toBeNull()
     expect(normalizeResumeFilePath('/ok/../x')).toBeNull()
     expect(normalizeResumeFilePath('/ok/a.jsonl')).toBe('/ok/a.jsonl')
   })
 
-  it('uses resumeFilePath for pi', () => {
+  it('prefers session id for pi and falls back to the transcript path', () => {
     expect(
       resumeHandleForSession(
         session({
           agentId: 'pi',
+          sessionId: '01a01876-6135-78d2-92e5-1523e69bf9e8',
+          resumeFilePath: '/abs/session.jsonl',
+          filePath: '/abs/session.jsonl'
+        })
+      )
+    ).toBe('01a01876-6135-78d2-92e5-1523e69bf9e8')
+    expect(
+      resumeHandleForSession(
+        session({
+          agentId: 'pi',
+          sessionId: '',
           resumeFilePath: '/abs/session.jsonl',
           filePath: '/abs/session.jsonl'
         })

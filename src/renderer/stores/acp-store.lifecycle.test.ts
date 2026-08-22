@@ -2,12 +2,14 @@ import type { ConversationRecordV2 } from '@shared/types/conversation.types'
 import type { ConversationLifecycleOutcome } from '@shared/types/conversation-lifecycle.types'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
-const { closeViewSpy, closeTerminalViewSpy, remapViewSpy, invokeSpy } = vi.hoisted(() => ({
-  closeViewSpy: vi.fn(),
-  closeTerminalViewSpy: vi.fn(),
-  remapViewSpy: vi.fn(),
-  invokeSpy: vi.fn()
-}))
+const { closeViewSpy, closeTerminalViewSpy, remapViewSpy, invokeSpy, logFrontendError } =
+  vi.hoisted(() => ({
+    closeViewSpy: vi.fn(),
+    closeTerminalViewSpy: vi.fn(),
+    remapViewSpy: vi.fn(),
+    invokeSpy: vi.fn(),
+    logFrontendError: vi.fn()
+  }))
 
 vi.mock('@/stores/workspace-store', () => ({
   useWorkspaceStore: {
@@ -30,11 +32,12 @@ vi.mock('@/lib/acp-history-persistence', async (importActual) => {
     queueSessionPayloadSave: vi.fn(async () => {})
   }
 })
-vi.mock('@/lib/log-api', () => ({ logFrontendError: vi.fn() }))
+vi.mock('@/lib/log-api', () => ({ logFrontendError }))
 vi.mock('@/lib/tauri-runtime', () => ({ isTauriContext: () => true }))
 vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeSpy }))
 vi.mock('@tauri-apps/api/event', () => ({ listen: vi.fn() }))
 
+import { conversationApi } from '@/lib/conversation-api'
 import { terminalApi } from '@/lib/terminal-api'
 import { useAcpStore } from './acp-store'
 import { useConversationStore } from './conversation-store'
@@ -377,5 +380,36 @@ describe('ACP Conversation lifecycle store', () => {
       expectedRevision: 4
     })
     terminateSpy.mockRestore()
+  })
+
+  it('reloads the conversation list when the host reports a new session', async () => {
+    const phoneConversationId = '018f7a1c-1b4d-7c8a-9f01-0123456789cd'
+    const phoneConversation: ConversationRecordV2 = {
+      ...conversation,
+      conversationId: phoneConversationId,
+      workspaceCwd: '/visible/phone',
+      lastSeq: 0
+    }
+    const listSpy = vi.spyOn(conversationApi, 'listConversations').mockResolvedValue({
+      success: true,
+      data: [conversation, phoneConversation]
+    })
+
+    useAcpStore.getState()._onSessionCreated({
+      agentId: 'agent-1',
+      sessionId: 'session-phone'
+    })
+
+    await vi.waitFor(() => {
+      expect(listSpy).toHaveBeenCalledTimes(1)
+      expect(useConversationStore.getState().summariesById[phoneConversationId]).toBeDefined()
+    })
+    expect(useAcpStore.getState().sessions['session-phone']?.agentId).toBe('agent-1')
+    expect(logFrontendError).toHaveBeenCalledWith({
+      level: 'warn',
+      source: 'acp-store.sessionCreated',
+      message: 'Reloading conversation list after remote session_created'
+    })
+    listSpy.mockRestore()
   })
 })

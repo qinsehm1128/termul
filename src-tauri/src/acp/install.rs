@@ -999,6 +999,7 @@ mod tests {
                 arch: host().arch,
             }],
             installed: None,
+            running_agent_id: None,
         }
     }
 

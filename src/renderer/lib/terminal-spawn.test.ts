@@ -226,6 +226,16 @@ describe('spawnTerminalInPane', () => {
     expect(mockTerminalApiSpawn).toHaveBeenCalledWith(expect.objectContaining({ shell: 'bash' }))
   })
 
+  it('merges extraEnv into the spawn payload', async () => {
+    await spawnTerminalInPane('pane-1', 'proj-1', '/test/worktree', {
+      extraEnv: { CODEX_HOME: '/tmp/codex-home' }
+    })
+
+    expect(mockTerminalApiSpawn).toHaveBeenCalledWith(
+      expect.objectContaining({ env: { CODEX_HOME: '/tmp/codex-home' } })
+    )
+  })
+
   it('returns error when PTY spawn returns no data with empty error', async () => {
     mockTerminalApiSpawn.mockResolvedValue({
       success: false,

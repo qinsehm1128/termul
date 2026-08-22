@@ -166,6 +166,35 @@ pub(crate) fn is_registry_launcher_on_path(command: &str) -> bool {
     false
 }
 
+/// True when a vendor CLI basename (e.g. `cursor-agent`) exists on PATH.
+/// Unlike [`is_registry_launcher_on_path`], this does not treat Unix
+/// `resolve_spawn_program` passthrough as proof the binary is installed.
+pub(crate) fn is_named_binary_on_path(command: &str) -> bool {
+    let trimmed = command.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('.')
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+    {
+        return false;
+    }
+
+    let mut env_map = HashMap::new();
+    crate::pty::env_refresh::apply_fresh_path(&mut env_map);
+
+    #[cfg(target_os = "windows")]
+    {
+        return crate::pty::manager::resolve_spawn_program(trimmed).is_ok();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        env_map
+            .get("PATH")
+            .is_some_and(|path| resolve_executable_in_path(trimmed, path).is_some())
+    }
+}
+
 /// Availability of package-manager launchers used by the ACP registry.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -418,6 +447,13 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn named_binary_path_probe_rejects_missing_and_relative_names() {
+        assert!(!is_named_binary_on_path(""));
+        assert!(!is_named_binary_on_path("./cursor-agent"));
+        assert!(!is_named_binary_on_path("termul-missing-catalog-bin"));
     }
 
     #[test]

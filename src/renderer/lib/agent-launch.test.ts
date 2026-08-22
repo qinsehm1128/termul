@@ -13,21 +13,27 @@ const {
   mockIsTerminalLimitReached,
   mockAddTabToPane,
   mockTerminalApiSpawn,
+  mockTerminalApiWrite,
+  mockSpawnTerminalInPane,
   mockEnsureWorktreeSymlinks,
-  mockTerminals
+  mockTerminals,
+  mockActiveConversationId
 } = vi.hoisted(() => ({
   mockSetTerminals: vi.fn(),
   mockSelectTerminal: vi.fn(),
   mockIsTerminalLimitReached: vi.fn(),
   mockAddTabToPane: vi.fn(),
   mockTerminalApiSpawn: vi.fn(),
+  mockTerminalApiWrite: vi.fn(),
+  mockSpawnTerminalInPane: vi.fn(),
   mockEnsureWorktreeSymlinks: vi.fn(),
-  mockTerminals: [] as Array<{ projectId: string }>
+  mockTerminals: [] as Array<{ id?: string; projectId: string; ptyId?: string }>,
+  mockActiveConversationId: { current: '018f7a1c-1b4d-7c8a-9f01-0123456789ab' as string | null }
 }))
 
 vi.mock('@/stores/session-workspace-sync-store', () => ({
   useSessionWorkspaceSyncStore: {
-    getState: () => ({ activeConversationId: '018f7a1c-1b4d-7c8a-9f01-0123456789ab' })
+    getState: () => ({ activeConversationId: mockActiveConversationId.current })
   }
 }))
 
@@ -66,7 +72,11 @@ vi.mock('@/stores/app-settings-store', () => ({
 }))
 
 vi.mock('@/lib/api', () => ({
-  terminalApi: { spawn: mockTerminalApiSpawn }
+  terminalApi: { spawn: mockTerminalApiSpawn, write: mockTerminalApiWrite }
+}))
+
+vi.mock('@/lib/terminal-spawn', () => ({
+  spawnTerminalInPane: (...args: unknown[]) => mockSpawnTerminalInPane(...args)
 }))
 
 vi.mock('@/lib/env-parser', () => ({
@@ -92,6 +102,7 @@ describe('launchAgentInPane', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mockTerminals.length = 0
+    mockActiveConversationId.current = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
     mockIsTerminalLimitReached.mockReturnValue(false)
     // CAP-3: spawn is the only claim issuance path — the fixture carries the
     // issued lease credential alongside the terminal info.
@@ -99,6 +110,8 @@ describe('launchAgentInPane', () => {
       success: true,
       data: { id: 'pty-1', shell: 'claude', cwd: '/test', claim: 'claim-agent-1' }
     })
+    mockSpawnTerminalInPane.mockResolvedValue({ success: true, terminalId: 'term-1' })
+    mockTerminalApiWrite.mockResolvedValue({ success: true })
   })
 
   it('spawns with program/args/kind:agent and a positional prompt', async () => {
@@ -217,7 +230,45 @@ describe('launchAgentInPane', () => {
     expect(mockSetTerminals).not.toHaveBeenCalled()
   })
 
+  it('resumes from the project workspace without an open conversation', async () => {
+    mockActiveConversationId.current = null
+    mockTerminals.push({ id: 'term-1', projectId: 'proj-1', ptyId: 'pty-1' })
+    const result = await launchAgentResumeInPane(
+      'pane-1',
+      'proj-1',
+      '/test',
+      claude,
+      {
+        schemaVersion: 1,
+        id: 'claude-code:abc:/tmp/a.jsonl',
+        agentId: 'claude-code',
+        sessionId: 'abc',
+        cwd: '/test',
+        title: 'Hello',
+        createdAt: null,
+        updatedAt: null,
+        messageCount: 1,
+        filePath: '/tmp/a.jsonl',
+        resumable: true
+      },
+      '',
+      '',
+      { shellSettleMs: 0 }
+    )
+    expect(result.success).toBe(true)
+    expect(mockSpawnTerminalInPane).toHaveBeenCalledWith(
+      'pane-1',
+      'proj-1',
+      '/test',
+      expect.objectContaining({ extraEnv: {}, maxTerminalsPerProject: 10 })
+    )
+    expect(mockSpawnTerminalInPane.mock.calls[0][3]).not.toHaveProperty('conversationId')
+    expect(mockTerminalApiSpawn).not.toHaveBeenCalled()
+    expect(mockTerminalApiWrite).toHaveBeenCalledWith('pty-1', 'claude --resume abc\r')
+  })
+
   it('resumes with extras before --resume and without a seed prompt', async () => {
+    mockTerminals.push({ id: 'term-1', projectId: 'proj-1', ptyId: 'pty-1' })
     const result = await launchAgentResumeInPane(
       'pane-1',
       'proj-1',
@@ -237,15 +288,48 @@ describe('launchAgentInPane', () => {
         resumable: true
       },
       '--dangerously-skip-permissions',
-      ''
+      '',
+      { shellSettleMs: 0 }
     )
     expect(result.success).toBe(true)
-    expect(mockTerminalApiSpawn).toHaveBeenCalledWith(
-      expect.objectContaining({
-        program: 'claude',
-        args: ['--dangerously-skip-permissions', '--resume', 'abc'],
-        kind: 'agent'
-      })
+    expect(mockTerminalApiWrite).toHaveBeenCalledWith(
+      'pty-1',
+      'claude --dangerously-skip-permissions --resume abc\r'
     )
+  })
+
+  it('resumes Codex in a project shell with CODEX_HOME', async () => {
+    mockTerminals.push({ id: 'term-1', projectId: 'proj-1', ptyId: 'pty-1' })
+    const result = await launchAgentResumeInPane(
+      'pane-1',
+      'proj-1',
+      '/test',
+      getBuiltInAgent('codex')!,
+      {
+        schemaVersion: 1,
+        id: 'codex:s1:/tmp/a.jsonl',
+        agentId: 'codex',
+        sessionId: 's1',
+        cwd: '/test',
+        title: 'Hello',
+        createdAt: null,
+        updatedAt: null,
+        messageCount: 1,
+        filePath: '/tmp/a.jsonl',
+        codexHome: '/tmp/codex-home',
+        resumable: true
+      },
+      '',
+      '',
+      { shellSettleMs: 0 }
+    )
+    expect(result.success).toBe(true)
+    expect(mockSpawnTerminalInPane).toHaveBeenCalledWith(
+      'pane-1',
+      'proj-1',
+      '/test',
+      expect.objectContaining({ extraEnv: { CODEX_HOME: '/tmp/codex-home' } })
+    )
+    expect(mockTerminalApiWrite).toHaveBeenCalledWith('pty-1', 'codex resume s1\r')
   })
 })

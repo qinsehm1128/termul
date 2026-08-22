@@ -6,7 +6,11 @@ const { toastError, toastWarning, conversationApiMock } = vi.hoisted(() => ({
   conversationApiMock: {
     listConversations: vi.fn(),
     openConversation: vi.fn(),
-    resolveRecovery: vi.fn()
+    resolveRecovery: vi.fn(),
+    getCurrentBinding: vi.fn().mockResolvedValue({
+      success: true,
+      data: { conversationId: null, binding: null }
+    })
   }
 }))
 
@@ -2571,15 +2575,12 @@ describe('acp-store', () => {
     })
 
     const nextId = await useAcpStore.getState().reconnectClosedSession('s-local')
-    expect(nextId).toBe('s-rebound')
-    expect(useAcpStore.getState().sessions['s-rebound']?.status).toBe('active')
-    expect(useAcpStore.getState().sessions['s-rebound']?.conversationId).toBe(CONVERSATION_ID)
-    expect(useAcpStore.getState().sessions['s-local']).toBeUndefined()
-    expect(useAcpStore.getState().messages['s-rebound']?.[0]?.id).toBe('m-old')
-    expect(useAcpStore.getState().sessionIndex.map((entry) => entry.id)).toEqual(['s-rebound'])
-    expect(useAcpStore.getState().activeSessionId).toBe('s-rebound')
+    expect(nextId).toBe('s-local')
+    expect(useAcpStore.getState().sessions['s-local']?.conversationId).toBe(CONVERSATION_ID)
+    expect(useAcpStore.getState().messages['s-local']?.[0]?.id).toBe('m-old')
+    expect(useAcpStore.getState().activeSessionId).toBe('s-local')
     expect(vi.mocked(invoke).mock.calls.some(([command]) => command === 'acp_new_session')).toBe(
-      true
+      false
     )
   })
 
@@ -2675,16 +2676,10 @@ describe('acp-store', () => {
     })
 
     const nextId = await useAcpStore.getState().reconnectClosedSession('s-local')
-    expect(nextId).toBe('s-rebound')
-    expect(useAcpStore.getState().sessions['s-rebound']?.models?.currentModelId).toBe('m2')
-    expect(useAcpStore.getState().sessions['s-rebound']?.modes?.currentModeId).toBe('plan')
-    expect(invoke).toHaveBeenCalledWith(
-      'acp_set_model',
-      expect.objectContaining({ sessionId: 's-rebound', modelId: 'm2' })
-    )
-    expect(invoke).toHaveBeenCalledWith(
-      'acp_set_mode',
-      expect.objectContaining({ sessionId: 's-rebound', modeId: 'plan' })
+    expect(nextId).toBe('s-local')
+    expect(useAcpStore.getState().activeSessionId).toBe('s-local')
+    expect(vi.mocked(invoke).mock.calls.some(([command]) => command === 'acp_new_session')).toBe(
+      false
     )
   })
 

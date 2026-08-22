@@ -223,7 +223,7 @@ impl ConversationWriteAuthority {
                     .to_string(),
             });
         }
-        log::info!(
+        log::debug!(
             "[conversation-write-authority] mutation={} conversation_id={} policy={:?} result=AUTHORIZED",
             mutation.as_str(),
             conversation_id,

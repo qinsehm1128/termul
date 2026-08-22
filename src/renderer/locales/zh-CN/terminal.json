@@ -121,6 +121,8 @@
     "stopHidden": "停止",
     "reconnect": "重新连接",
     "hiddenRunning": "已隐藏但仍在运行的终端",
+    "hiddenCount": "隐藏 {{count}}",
+    "reopenNamed": "重新打开 {{name}}",
     "conversationScopeRequired": "请先打开一个对话，再创建持久终端",
     "scopeError": "终端需要有效的对话作用域。"
   }

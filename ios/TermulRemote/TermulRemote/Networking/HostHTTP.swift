@@ -42,17 +42,33 @@ struct HostHTTP: Sendable {
     }
 
     func probeHealth() async throws {
+        var lastError: Error?
+        for attempt in 0 ..< 5 {
+            do {
+                try await probeHealthOnce()
+                return
+            } catch {
+                lastError = error
+                if attempt < 4 {
+                    try await Task.sleep(for: .milliseconds(400 * (1 << attempt)))
+                }
+            }
+        }
+        throw lastError ?? HostError.network(String(localized: "The phone could not reach the host."))
+    }
+
+    private func probeHealthOnce() async throws {
         var request = URLRequest(url: origin.appendingPathComponent("health"), timeoutInterval: 12)
         request.httpMethod = "GET"
         request.assumesHTTP3Capable = false
         credentials.apply(to: &request)
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200 ..< 300).contains(http.statusCode) else {
-            throw HostError.network(String(localized: "The phone could not reach the tunnel. Quick Tunnels go through Cloudflare, not your LAN."))
-        }
+        let (data, response) = try await HostURLSession.shared.data(for: request)
         let text = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if text != "OK" && http.statusCode != 200 {
-            throw HostError.network(String(localized: "The tunnel did not return a healthy response."))
+        guard let http = response as? HTTPURLResponse, (200 ..< 300).contains(http.statusCode), text == "OK" || text.hasPrefix("OK") else {
+            if RemoteLink.isPrivateNetworkHost(origin.host() ?? "") {
+                throw HostError.network(String(localized: "The phone could not reach the Mac on this Wi-Fi. Confirm remote access is on and both devices are on the same network."))
+            }
+            throw HostError.network(String(localized: "The phone could not reach the host tunnel. Confirm remote access is still on, then retry."))
         }
     }
 
@@ -77,7 +93,7 @@ struct HostHTTP: Sendable {
 
     private func decode<T: Decodable>(_ request: URLRequest) async throws -> IpcResult<T> {
         do {
-            let (data, response) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await HostURLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse else {
                 throw HostError.network(String(localized: "The tunnel returned an unexpected response."))
             }
@@ -114,7 +130,7 @@ struct HostHTTP: Sendable {
             case .cannotFindHost, .dnsLookupFailed:
                 return String(localized: "The phone could not resolve the tunnel hostname. If the Mac uses a VPN, the iPhone needs a working path to Cloudflare too.")
             case .cannotConnectToHost, .networkConnectionLost:
-                return String(localized: "The phone could not reach the tunnel. Quick Tunnels go through Cloudflare, not your LAN.")
+                return String(localized: "The phone could not reach the host tunnel. Confirm remote access is still on, then retry.")
             case .secureConnectionFailed, .serverCertificateUntrusted:
                 return String(localized: "The HTTPS tunnel failed its certificate check.")
             default:

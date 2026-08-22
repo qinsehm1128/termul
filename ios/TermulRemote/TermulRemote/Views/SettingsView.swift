@@ -24,11 +24,11 @@ struct SettingsView: View {
 
                 Section(String(localized: "How it works")) {
                     LabeledContent(String(localized: "Chat")) {
-                        Text("Talks to the host agent over the tunnel WebSocket.")
+                        Text("Continues the desk agent over the tunnel WebSocket.")
                             .foregroundStyle(.secondary)
                     }
                     LabeledContent(String(localized: "Terminal")) {
-                        Text("Opens a live host PTY in a native terminal.")
+                        Text("Watches a live host PTY in a native terminal.")
                             .foregroundStyle(.secondary)
                     }
                 }

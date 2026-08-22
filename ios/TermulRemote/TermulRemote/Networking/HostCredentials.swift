@@ -4,9 +4,9 @@ struct HostCredentials: Sendable {
     let origin: URL
     let bearer: String?
 
-    init(accessURL: URL) {
+    init(accessURL: URL, bearer storedBearer: String? = nil) {
         origin = HostCredentials.origin(from: accessURL)
-        bearer = HostCredentials.accessToken(from: accessURL)
+        bearer = storedBearer ?? RemoteLink.accessToken(in: accessURL)
     }
 
     func apply(to request: inout URLRequest) {
@@ -40,15 +40,4 @@ struct HostCredentials: Sendable {
         return components.url ?? url
     }
 
-    private static func accessToken(from url: URL) -> String? {
-        guard let fragment = url.fragment, !fragment.isEmpty else { return nil }
-        let pairs = fragment.split(separator: "&")
-        for pair in pairs {
-            let parts = pair.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
-            guard parts.count == 2, parts[0] == "access_token" else { continue }
-            let raw = String(parts[1])
-            return raw.removingPercentEncoding ?? raw
-        }
-        return nil
-    }
 }

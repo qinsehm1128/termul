@@ -136,6 +136,10 @@ pub struct CatalogAgent {
     pub platform_targets: Vec<PlatformTarget>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub installed: Option<InstalledCatalogInfo>,
+    /// Runtime agent id when this catalog entry is already spawned on the host.
+    /// Phone/web reuse this instead of launching a second subprocess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_agent_id: Option<String>,
 }
 
 /// The resolved catalog payload served across all three transports.
@@ -601,6 +605,22 @@ fn compute_catalog_agent(
     platform_arch: &str,
     source: CatalogSource,
 ) -> CatalogAgent {
+    compute_catalog_agent_with_probe(
+        agent,
+        host,
+        platform_arch,
+        source,
+        crate::acp::config::is_named_binary_on_path,
+    )
+}
+
+fn compute_catalog_agent_with_probe(
+    agent: &BundledAgent,
+    host: &HostCapability,
+    platform_arch: &str,
+    source: CatalogSource,
+    binary_probe: impl Fn(&str) -> bool,
+) -> CatalogAgent {
     let dist = &agent.distribution;
     let dist_obj = dist.as_object();
 
@@ -609,6 +629,7 @@ fn compute_catalog_agent(
     let has_uvx = dist_obj.is_some_and(|o| o.contains_key("uvx"));
     let has_binary = dist_obj.is_some_and(|o| o.contains_key("binary"));
 
+    let mut path_installed = None;
     let (runtime_reqs, status) = if has_npx {
         // npx is the preferred distribution.
         (
@@ -636,9 +657,9 @@ fn compute_catalog_agent(
             .and_then(|b| b.get(platform_arch))
             .and_then(|t| t.as_object());
 
-        let status =
-            compute_binary_status(target, crate::acp::config::is_registry_launcher_on_path);
-        (Vec::new(), status)
+        let resolved = resolve_binary(target, binary_probe);
+        path_installed = resolved.installed;
+        (Vec::new(), resolved.status)
     } else {
         // No recognized distribution kind.
         (Vec::new(), SupportedAcpAgentStatus::Unavailable)
@@ -662,9 +683,11 @@ fn compute_catalog_agent(
         runtime_requirements: runtime_reqs,
         status,
         platform_targets,
-        // Populated later by `overlay_installed` from the host install manifest;
-        // `None` here — the catalog's own resolution never knows install state.
-        installed: None,
+        // PATH-detected vendor CLIs (e.g. `cursor-agent`) are filled here so
+        // phone/web can spawn without the Termul archive installer. Archive
+        // installs still overlay later via `overlay_installed`.
+        installed: path_installed,
+        running_agent_id: None,
     }
 }
 
@@ -697,20 +720,59 @@ fn parse_binary_platform_targets(dist: &serde_json::Value) -> Vec<PlatformTarget
 ///
 /// The PATH probe is injected so the "binary on PATH → ready" branch (matrix
 /// row 7) is unit-testable without a real binary on PATH.
-fn compute_binary_status(
+struct BinaryResolution {
+    status: SupportedAcpAgentStatus,
+    installed: Option<InstalledCatalogInfo>,
+}
+
+fn command_basename(cmd: &str) -> &str {
+    cmd.rsplit(['/', '\\']).next().unwrap_or(cmd).trim()
+}
+
+fn target_args(target: &serde_json::Map<String, serde_json::Value>) -> Vec<String> {
+    target
+        .get("args")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn resolve_binary(
     target: Option<&serde_json::Map<String, serde_json::Value>>,
     probe: impl Fn(&str) -> bool,
-) -> SupportedAcpAgentStatus {
+) -> BinaryResolution {
     let Some(target) = target else {
-        return SupportedAcpAgentStatus::Unavailable;
+        return BinaryResolution {
+            status: SupportedAcpAgentStatus::Unavailable,
+            installed: None,
+        };
     };
     let cmd = target.get("cmd").and_then(|c| c.as_str()).unwrap_or("");
     let archive = target.get("archive").and_then(|a| a.as_str());
+    let args = target_args(target);
 
-    // If the command is a bare name (not a relative path), probe it on PATH.
+    // Probe a bare PATH name, or the basename of a relative archive cmd
+    // (`./dist-package/cursor-agent` → `cursor-agent`) so a locally installed
+    // vendor CLI is `ready` without a Termul archive install.
     let is_relative = cmd.starts_with("./") || cmd.starts_with(".\\");
-    if !is_relative && !cmd.is_empty() && probe(cmd) {
-        return SupportedAcpAgentStatus::Ready;
+    let probe_name = if is_relative {
+        command_basename(cmd)
+    } else {
+        cmd
+    };
+    if !probe_name.is_empty() && !probe_name.starts_with('.') && probe(probe_name) {
+        return BinaryResolution {
+            status: SupportedAcpAgentStatus::Ready,
+            installed: Some(InstalledCatalogInfo {
+                command: probe_name.to_string(),
+                args,
+            }),
+        };
     }
 
     // Binary not on PATH. Any installable HTTPS archive (zip/tar.gz/tgz) is
@@ -719,10 +781,24 @@ fn compute_binary_status(
     // without integrity verification.
     if let Some(url) = archive {
         if is_https_archive_url(url) {
-            return SupportedAcpAgentStatus::InstallRequired;
+            return BinaryResolution {
+                status: SupportedAcpAgentStatus::InstallRequired,
+                installed: None,
+            };
         }
     }
-    SupportedAcpAgentStatus::ManualInstall
+    BinaryResolution {
+        status: SupportedAcpAgentStatus::ManualInstall,
+        installed: None,
+    }
+}
+
+#[cfg(test)]
+fn compute_binary_status(
+    target: Option<&serde_json::Map<String, serde_json::Value>>,
+    probe: impl Fn(&str) -> bool,
+) -> SupportedAcpAgentStatus {
+    resolve_binary(target, probe).status
 }
 
 /// Check if a URL is HTTPS + an allowed archive format (zip / tar.gz / tgz).
@@ -766,6 +842,47 @@ pub fn overlay_installed(
             });
         }
     }
+}
+
+/// Map a live agent's stable namespace (`config:acp-registry:cursor` or
+/// `config:cursor`) back to the catalog id.
+pub fn catalog_id_from_namespace(namespace: &str) -> Option<&str> {
+    let rest = namespace.strip_prefix("config:")?;
+    Some(rest.strip_prefix("acp-registry:").unwrap_or(rest))
+}
+
+/// Overlay currently spawned agents onto the catalog so phone/web can reuse
+/// the live runtime id instead of launching a second subprocess.
+pub fn overlay_running_agents(catalog: &mut AcpCatalog, running: &[(String, Option<String>)]) {
+    if running.is_empty() {
+        return;
+    }
+    for (agent_id, namespace) in running {
+        let Some(namespace) = namespace.as_deref() else {
+            continue;
+        };
+        let Some(catalog_id) = catalog_id_from_namespace(namespace) else {
+            continue;
+        };
+        if let Some(agent) = catalog
+            .agents
+            .iter_mut()
+            .find(|agent| agent.id == catalog_id)
+        {
+            agent.running_agent_id = Some(agent_id.clone());
+            agent.status = SupportedAcpAgentStatus::Ready;
+        }
+    }
+}
+
+/// Apply install-manifest + live-agent overlays used by every catalog transport.
+pub fn apply_host_catalog_overlays(
+    catalog: &mut AcpCatalog,
+    installed: &[crate::acp::install::InstalledAgent],
+    running: &[(String, Option<String>)],
+) {
+    overlay_installed(catalog, installed);
+    overlay_running_agents(catalog, running);
 }
 
 /// Epoch-millis timestamp (mirrors `workspace_manifest::now_millis`).
@@ -921,7 +1038,7 @@ mod tests {
             serde_json::json!({
                 "binary": {
                     "linux-x86_64": {
-                        "cmd": "./test-agent",
+                        "cmd": "./termul-missing-catalog-bin",
                         "archive": "https://example.com/test-agent-linux-x86_64.tar.gz",
                         "sha256": "abcdef0123456789"
                     }
@@ -929,8 +1046,13 @@ mod tests {
             }),
         );
         let host = host_with_runtimes(false, false);
-        let catalog_agent =
-            compute_catalog_agent(&agent, &host, "linux-x86_64", CatalogSource::Bundled);
+        let catalog_agent = compute_catalog_agent_with_probe(
+            &agent,
+            &host,
+            "linux-x86_64",
+            CatalogSource::Bundled,
+            |_| false,
+        );
         assert_eq!(
             catalog_agent.status,
             SupportedAcpAgentStatus::InstallRequired
@@ -950,15 +1072,20 @@ mod tests {
             serde_json::json!({
                 "binary": {
                     "linux-x86_64": {
-                        "cmd": "./test-agent",
+                        "cmd": "./termul-missing-catalog-bin",
                         "archive": "https://example.com/test-agent-linux-x86_64.tar.gz"
                     }
                 }
             }),
         );
         let host = host_with_runtimes(false, false);
-        let catalog_agent =
-            compute_catalog_agent(&agent, &host, "linux-x86_64", CatalogSource::Bundled);
+        let catalog_agent = compute_catalog_agent_with_probe(
+            &agent,
+            &host,
+            "linux-x86_64",
+            CatalogSource::Bundled,
+            |_| false,
+        );
         assert_eq!(
             catalog_agent.status,
             SupportedAcpAgentStatus::InstallRequired
@@ -976,7 +1103,7 @@ mod tests {
             serde_json::json!({
                 "binary": {
                     "linux-x86_64": {
-                        "cmd": "./test-agent",
+                        "cmd": "./termul-missing-catalog-bin",
                         "archive": "https://example.com/test-agent-linux-x86_64.tar.gz",
                         "sha256": ""
                     }
@@ -984,8 +1111,13 @@ mod tests {
             }),
         );
         let host = host_with_runtimes(false, false);
-        let catalog_agent =
-            compute_catalog_agent(&agent, &host, "linux-x86_64", CatalogSource::Bundled);
+        let catalog_agent = compute_catalog_agent_with_probe(
+            &agent,
+            &host,
+            "linux-x86_64",
+            CatalogSource::Bundled,
+            |_| false,
+        );
         assert_eq!(
             catalog_agent.status,
             SupportedAcpAgentStatus::InstallRequired
@@ -1001,14 +1133,19 @@ mod tests {
             serde_json::json!({
                 "binary": {
                     "linux-x86_64": {
-                        "cmd": "./test-agent"
+                        "cmd": "./termul-missing-catalog-bin"
                     }
                 }
             }),
         );
         let host = host_with_runtimes(false, false);
-        let catalog_agent =
-            compute_catalog_agent(&agent, &host, "linux-x86_64", CatalogSource::Bundled);
+        let catalog_agent = compute_catalog_agent_with_probe(
+            &agent,
+            &host,
+            "linux-x86_64",
+            CatalogSource::Bundled,
+            |_| false,
+        );
         assert_eq!(catalog_agent.status, SupportedAcpAgentStatus::ManualInstall);
     }
 
@@ -1064,6 +1201,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn relative_binary_basename_on_path_is_ready_with_installed() {
+        let target: serde_json::Map<String, serde_json::Value> = serde_json::json!({
+            "cmd": "./dist-package/cursor-agent",
+            "archive": "https://example.com/cursor.tar.gz",
+            "args": ["acp"]
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let resolved = resolve_binary(Some(&target), |name| name == "cursor-agent");
+        assert_eq!(resolved.status, SupportedAcpAgentStatus::Ready);
+        let installed = resolved
+            .installed
+            .expect("PATH basename must populate installed");
+        assert_eq!(installed.command, "cursor-agent");
+        assert_eq!(installed.args, vec!["acp".to_string()]);
+
+        let missing = resolve_binary(Some(&target), |_| false);
+        assert_eq!(missing.status, SupportedAcpAgentStatus::InstallRequired);
+        assert!(missing.installed.is_none());
+    }
+
+    #[test]
+    fn overlay_running_agents_marks_catalog_ready() {
+        let mut catalog = AcpCatalog {
+            host: host_with_runtimes(true, false),
+            agents: vec![CatalogAgent {
+                id: "cursor".to_string(),
+                name: "Cursor".to_string(),
+                version: "1.0.0".to_string(),
+                description: "d".to_string(),
+                source: CatalogSource::Bundled,
+                distribution: serde_json::json!({ "binary": {} }),
+                runtime_requirements: Vec::new(),
+                status: SupportedAcpAgentStatus::InstallRequired,
+                platform_targets: Vec::new(),
+                installed: None,
+                running_agent_id: None,
+            }],
+        };
+        overlay_running_agents(
+            &mut catalog,
+            &[(
+                "runtime-cursor".to_string(),
+                Some("config:acp-registry:cursor".to_string()),
+            )],
+        );
+        assert_eq!(catalog.agents[0].status, SupportedAcpAgentStatus::Ready);
+        assert_eq!(
+            catalog.agents[0].running_agent_id.as_deref(),
+            Some("runtime-cursor")
+        );
+        assert_eq!(
+            catalog_id_from_namespace("config:acp-registry:codex-acp"),
+            Some("codex-acp")
+        );
+        assert_eq!(catalog_id_from_namespace("config:cursor"), Some("cursor"));
+    }
+
     // ---- overlay_installed: host-installed agents → ready + command/args ----
 
     #[test]
@@ -1090,6 +1288,7 @@ mod tests {
                     status: SupportedAcpAgentStatus::InstallRequired,
                     platform_targets: Vec::new(),
                     installed: None,
+                    running_agent_id: None,
                 },
                 CatalogAgent {
                     id: "not-installed".to_string(),
@@ -1107,6 +1306,7 @@ mod tests {
                     status: SupportedAcpAgentStatus::InstallRequired,
                     platform_targets: Vec::new(),
                     installed: None,
+                    running_agent_id: None,
                 },
             ],
         };
@@ -1301,6 +1501,7 @@ mod tests {
                 status: SupportedAcpAgentStatus::Ready,
                 platform_targets: vec![],
                 installed: None,
+                running_agent_id: None,
             }],
         };
         let value = serde_json::to_value(&catalog).unwrap();

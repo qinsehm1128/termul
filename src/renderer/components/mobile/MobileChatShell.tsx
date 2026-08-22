@@ -5,7 +5,9 @@ import {
   GitBranch,
   History,
   Menu,
+  MessageSquare,
   MessageSquarePlus,
+  MoreHorizontal,
   Pencil,
   Plus,
   RotateCcw,
@@ -25,6 +27,7 @@ import { ChatHistoryTab } from '@/components/chat/ChatHistoryTab'
 import { ProjectSwitcherDrawer } from '@/components/chat/ProjectSwitcherDrawer'
 import { CliSessionPanel } from '@/components/cli-sessions/CliSessionPanel'
 import { ExecutionTargetPicker } from '@/components/conversation/ExecutionTargetPicker'
+import { ListEmptyState, ListRow, ListRowMeta, pathBasename } from '@/components/lists'
 import { TermulMark } from '@/components/TermulMark'
 import { Button } from '@/components/ui/button'
 import {
@@ -34,7 +37,9 @@ import {
   SheetHeader,
   SheetTitle
 } from '@/components/ui/sheet'
+import { logFrontendError } from '@/lib/log-api'
 import { isTauriContext } from '@/lib/tauri-runtime'
+import { cn } from '@/lib/utils'
 import { useAcpStore } from '@/stores/acp-store'
 import { useConversationStore } from '@/stores/conversation-store'
 import { useActiveProject, useProjectStore } from '@/stores/project-store'
@@ -42,6 +47,8 @@ import { useTerminalStore } from '@/stores/terminal-store'
 import { getAllLeafPanes, useWorkspaceStore } from '@/stores/workspace-store'
 import { MobileFileExplorer } from './MobileFileExplorer'
 import { MobileTerminalControls } from './MobileTerminalControls'
+
+type MobileWorkspaceTab = 'chat' | 'terminal' | 'files'
 
 interface MobileChatShellProps {
   children: React.ReactNode
@@ -62,8 +69,35 @@ interface MobileChatShellProps {
   onRestartTerminal?: (terminalId: string) => void
 }
 
+function findWorkspaceTab(
+  type: 'agent-chat' | 'terminal',
+  root: Parameters<typeof getAllLeafPanes>[0],
+  paneId: string
+): { paneId: string; tabId: string } | null {
+  const leaves = getAllLeafPanes(root)
+  const activePane = leaves.find((leaf) => leaf.id === paneId) ?? leaves[0]
+  const inActive = activePane?.tabs.find((tab) => tab.type === type)
+  if (inActive && activePane) return { paneId: activePane.id, tabId: inActive.id }
+  for (const leaf of leaves) {
+    const tab = leaf.tabs.find((candidate) => candidate.type === type)
+    if (tab) return { paneId: leaf.id, tabId: tab.id }
+  }
+  return null
+}
+
+function activateWorkspaceTab(paneId: string, tabId: string): void {
+  const workspace = useWorkspaceStore.getState()
+  if (workspace.activePaneId !== paneId) {
+    requestAnimationFrame(() => {
+      useWorkspaceStore.getState().setActiveTab(paneId, tabId)
+    })
+  } else {
+    workspace.setActiveTab(paneId, tabId)
+  }
+}
+
 /**
- * Compact mobile web chrome: slim header + slide-out chat list drawer.
+ * Compact mobile web chrome: slim header + three-tab workspace + overflow.
  * Desktop IDE chrome (ActivityRail, TitleBar, persistent sidebar, tab strip)
  * stays outside this component and must be gated by `useMobileWebShell`.
  */
@@ -81,11 +115,13 @@ export function MobileChatShell({
   onRestartTerminal
 }: MobileChatShellProps): React.JSX.Element {
   const { t } = useTranslation('mobile')
+  const isWeb = !isTauriContext()
   const [drawerOpen, setDrawerOpen] = useState(false)
+  const [overflowOpen, setOverflowOpen] = useState(false)
   const [projectsOpen, setProjectsOpen] = useState(false)
-  const [filesOpen, setFilesOpen] = useState(false)
   const [targetOpen, setTargetOpen] = useState(false)
   const [sessionsOpen, setSessionsOpen] = useState(false)
+  const [surface, setSurface] = useState<MobileWorkspaceTab>('chat')
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const navigate = useNavigate()
@@ -105,8 +141,9 @@ export function MobileChatShell({
   const activeTab = useWorkspaceStore((s) => {
     const leaves = getAllLeafPanes(s.root)
     const pane = leaves.find((p) => p.id === s.activePaneId) ?? leaves[0]
-    return pane?.tabs.find((t) => t.id === pane.activeTabId) ?? null
+    return pane?.tabs.find((tab) => tab.id === pane.activeTabId) ?? null
   })
+  const activePaneId = useWorkspaceStore((s) => s.activePaneId)
 
   // Active terminal — subscribe to the terminal store directly (not via
   // getState() inside the workspace selector) so updates are observed and the
@@ -125,8 +162,8 @@ export function MobileChatShell({
     const leaves = getAllLeafPanes(workspaceRoot)
     return leaves.flatMap((leaf) =>
       (leaf.tabs ?? [])
-        .filter((t) => t.type === 'terminal')
-        .map((t) => ({ tab: t, paneId: leaf.id }))
+        .filter((tab) => tab.type === 'terminal')
+        .map((tab) => ({ tab, paneId: leaf.id }))
     )
   }, [workspaceRoot])
 
@@ -177,27 +214,61 @@ export function MobileChatShell({
             .filter((terminal): terminal is NonNullable<typeof terminal> => Boolean(terminal)),
     [activeConversationId, allTerminals, terminalTabs]
   )
+  const hasLiveTerminal = allTerminals.some((terminal) => Boolean(terminal.ptyId))
 
   const headerTitle = useMemo(() => {
-    if (activeTerminal?.name) return activeTerminal.name
+    if (surface === 'files') return t('chatShell.tabFiles')
+    if (surface === 'terminal' && !activeTerminal?.name) return t('chatShell.tabTerminal')
+    if (activeTerminal?.name && (surface === 'terminal' || activeTab?.type === 'terminal')) {
+      return activeTerminal.name
+    }
     if (sessionTitle) return sessionTitle
     if (activeGroupName) return activeGroupName
     if (activeProject?.name) return activeProject.name
     return 'Termul'
-  }, [activeTerminal?.name, sessionTitle, activeGroupName, activeProject?.name])
+  }, [
+    surface,
+    activeTerminal?.name,
+    activeTab?.type,
+    sessionTitle,
+    activeGroupName,
+    activeProject?.name,
+    t
+  ])
+
+  const headerSubtitle = useMemo(() => {
+    if (surface === 'files') return activeProject?.path ?? null
+    if (surface === 'terminal' && activeTerminal?.cwd) return activeTerminal.cwd
+    if (activeConversation?.workspaceCwd) return activeConversation.workspaceCwd
+    return activeProject?.path ?? null
+  }, [surface, activeProject?.path, activeTerminal?.cwd, activeConversation?.workspaceCwd])
 
   const closeDrawer = (): void => setDrawerOpen(false)
 
-  const selectTerminal = (paneId: string, tabId: string): void => {
-    const workspace = useWorkspaceStore.getState()
-    if (workspace.activePaneId !== paneId) {
-      // Defer tab activation until pane is active.
-      requestAnimationFrame(() => {
-        useWorkspaceStore.getState().setActiveTab(paneId, tabId)
-      })
-    } else {
-      workspace.setActiveTab(paneId, tabId)
+  const selectSurface = (next: MobileWorkspaceTab): void => {
+    if (next === surface) return
+    void logFrontendError({
+      level: 'warn',
+      source: 'mobile-shell.tab',
+      message: `from=${surface} to=${next}`
+    })
+    setSurface(next)
+
+    if (next === 'chat' && activeTab?.type === 'terminal') {
+      const chat = findWorkspaceTab('agent-chat', workspaceRoot, activePaneId)
+      if (chat) activateWorkspaceTab(chat.paneId, chat.tabId)
+      return
     }
+
+    if (next === 'terminal' && activeTab?.type !== 'terminal') {
+      const terminal = findWorkspaceTab('terminal', workspaceRoot, activePaneId)
+      if (terminal) activateWorkspaceTab(terminal.paneId, terminal.tabId)
+    }
+  }
+
+  const selectTerminal = (paneId: string, tabId: string): void => {
+    setSurface('terminal')
+    activateWorkspaceTab(paneId, tabId)
     closeDrawer()
   }
 
@@ -214,14 +285,20 @@ export function MobileChatShell({
     setRenameValue('')
   }
 
+  const closeOverflow = (): void => setOverflowOpen(false)
+
+  const showPaneChildren = surface === 'chat' || (surface === 'terminal' && terminalTabs.length > 0)
+  const showTerminalEmpty = surface === 'terminal' && terminalTabs.length === 0
+  const showFiles = surface === 'files'
+
   return (
     <div className="flex h-full min-h-0 flex-col bg-background" data-mobile-chat-shell="">
-      <header className="flex h-11 shrink-0 items-center gap-1 border-b border-border/70 bg-sidebar px-1.5">
+      <header className="flex min-h-11 shrink-0 items-center gap-1 border-b border-border/70 bg-sidebar px-1.5 py-1">
         <Button
           type="button"
           variant="ghost"
           size="icon"
-          className="size-10 shrink-0"
+          className="size-11 shrink-0"
           aria-label={t('chatShell.openMenu')}
           aria-expanded={drawerOpen}
           aria-controls={drawerOpen ? 'mobile-chat-drawer' : undefined}
@@ -232,142 +309,237 @@ export function MobileChatShell({
 
         <div className="min-w-0 flex-1 text-center">
           <h1 className="truncate text-sm font-medium text-foreground">{headerTitle}</h1>
+          {headerSubtitle && headerSubtitle !== headerTitle ? (
+            <p className="truncate font-mono text-[11px] text-muted-foreground">{headerSubtitle}</p>
+          ) : null}
         </div>
 
-        {!isTauriContext() && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="size-10 shrink-0"
-            aria-label={t('chatShell.switchProject')}
-            onClick={() => setProjectsOpen(true)}
-          >
-            <FolderGit2 size={20} />
-          </Button>
-        )}
-
-        {!isTauriContext() && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="size-10 shrink-0"
-            aria-label={t('chatShell.browseFiles')}
-            aria-expanded={filesOpen}
-            onClick={() => setFilesOpen(true)}
-          >
-            <FolderTree size={20} />
-          </Button>
-        )}
-
-        {!isTauriContext() && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="size-10 shrink-0"
-            aria-label={t('chatShell.cliSessions')}
-            aria-expanded={sessionsOpen}
-            onClick={() => setSessionsOpen(true)}
-          >
-            <History size={20} />
-          </Button>
-        )}
-
-        {!isTauriContext() && onOpenCommandPalette && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="size-10 shrink-0"
-            aria-label={t('chatShell.commandPalette')}
-            onClick={onOpenCommandPalette}
-          >
-            <Search size={20} />
-          </Button>
-        )}
-
-        {!isTauriContext() && onOpenGitChanges && (
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="size-10 shrink-0"
-            aria-label={t('chatShell.gitChanges')}
-            disabled={!activeProject?.path}
-            onClick={onOpenGitChanges}
-          >
-            <GitBranch size={20} />
-          </Button>
-        )}
-
-        {activeTab?.type === 'terminal' ? (
-          <>
-            {onRestartTerminal && (
-              <Button
-                type="button"
-                variant="ghost"
-                size="icon"
-                className="size-10 shrink-0"
-                aria-label={t('chatShell.restartTerminal')}
-                onClick={() => onRestartTerminal(activeTab.terminalId)}
-              >
-                <RotateCcw size={18} />
-              </Button>
-            )}
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="size-10 shrink-0"
-              aria-label={t('chatShell.closeTerminalView')}
-              onClick={() => onCloseTerminal?.(activeTab.terminalId, activeTab.id)}
-            >
-              <X size={20} />
-            </Button>
-          </>
-        ) : (
-          <>
-            {activeConversationId && activeConversation && (
-              <>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon"
-                  className="size-10 shrink-0"
-                  aria-label={t('chatShell.executionTarget')}
-                  aria-expanded={targetOpen}
-                  onClick={() => setTargetOpen(true)}
-                >
-                  <SlidersHorizontal size={18} />
-                </Button>
-                <ConversationLifecycleActions
-                  conversationId={activeConversationId}
-                  title={sessionTitle ?? t('chatShell.chats')}
-                  className="size-10 opacity-100 after:inset-0"
-                />
-              </>
-            )}
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="size-10 shrink-0"
-              aria-label={t('chatShell.newChat')}
-              disabled={!canNewChat}
-              onClick={onNewChat}
-            >
-              <MessageSquarePlus size={20} />
-            </Button>
-          </>
-        )}
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="size-11 shrink-0"
+          aria-label={t('chatShell.more')}
+          aria-expanded={overflowOpen}
+          onClick={() => setOverflowOpen(true)}
+        >
+          <MoreHorizontal size={20} />
+        </Button>
       </header>
 
-      <div className="min-h-0 flex-1 overflow-hidden">{children}</div>
-      {activeTab?.type === 'terminal' && activeTerminal?.ptyId ? (
+      <div
+        className={cn('min-h-0 flex-1 overflow-hidden', !showPaneChildren && 'hidden')}
+        data-mobile-workspace-surface="pane"
+      >
+        {children}
+      </div>
+
+      {showTerminalEmpty ? (
+        <div
+          className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 px-6 text-center"
+          data-mobile-workspace-surface="terminal-empty"
+        >
+          <p className="text-sm text-muted-foreground">{t('chatShell.noOpenTerminals')}</p>
+          <p className="text-xs text-muted-foreground">{t('chatShell.noOpenTerminalsHint')}</p>
+          <Button type="button" className="h-11 min-h-11 px-4" onClick={() => onNewTerminal?.()}>
+            {t('chatShell.newTerminal')}
+          </Button>
+        </div>
+      ) : null}
+
+      {isWeb ? (
+        <div
+          className={cn('min-h-0 flex-1 overflow-hidden', !showFiles && 'hidden')}
+          data-mobile-workspace-surface="files"
+        >
+          <MobileFileExplorer
+            variant="page"
+            open={surface === 'files'}
+            onFileOpened={() => selectSurface('chat')}
+          />
+        </div>
+      ) : showFiles ? (
+        <div
+          className="flex min-h-0 flex-1 items-center justify-center px-6 text-center"
+          data-mobile-workspace-surface="files"
+        >
+          <p className="text-sm text-muted-foreground">
+            {activeProject?.path ? t('files.useDesktopExplorer') : t('files.noProject')}
+          </p>
+        </div>
+      ) : null}
+
+      {surface === 'terminal' && activeTerminal?.ptyId ? (
         <MobileTerminalControls terminalId={activeTerminal.ptyId} />
       ) : null}
+
+      <div
+        role="tablist"
+        aria-label={t('chatShell.workspaceTabs')}
+        data-od-id="workspace-tabs"
+        data-mobile-workspace-tabs=""
+        className="flex shrink-0 border-t border-border/70 bg-card/95 pb-[max(0.25rem,env(safe-area-inset-bottom))] backdrop-blur"
+      >
+        {(
+          [
+            ['chat', MessageSquare, t('chatShell.tabChat')],
+            ['terminal', TerminalSquare, t('chatShell.tabTerminal')],
+            ['files', FolderTree, t('chatShell.tabFiles')]
+          ] as const
+        ).map(([id, Icon, label]) => {
+          const selected = surface === id
+          return (
+            <button
+              key={id}
+              type="button"
+              role="tab"
+              aria-selected={selected}
+              aria-label={label}
+              className={cn(
+                'relative flex min-h-11 flex-1 flex-col items-center justify-center gap-0.5 text-[11px]',
+                selected ? 'text-primary' : 'text-muted-foreground'
+              )}
+              onClick={() => selectSurface(id)}
+            >
+              <Icon size={18} />
+              {id === 'terminal' && hasLiveTerminal ? (
+                <span
+                  className="absolute right-1/2 top-1.5 size-1.5 translate-x-2.5 rounded-full bg-connection"
+                  aria-hidden
+                />
+              ) : null}
+              <span>{label}</span>
+            </button>
+          )
+        })}
+      </div>
+
+      <Sheet open={overflowOpen} onOpenChange={setOverflowOpen}>
+        <SheetContent side="bottom" className="flex max-h-[85dvh] flex-col gap-0 rounded-t-xl p-2">
+          <SheetHeader className="px-3 py-2 text-left">
+            <SheetTitle>{t('chatShell.more')}</SheetTitle>
+            <SheetDescription className="sr-only">{t('chatShell.more')}</SheetDescription>
+          </SheetHeader>
+          <div className="overflow-y-auto pb-2">
+            <OverflowItem
+              label={t('chatShell.newChat')}
+              disabled={!canNewChat}
+              onSelect={() => {
+                closeOverflow()
+                onNewChat()
+              }}
+            >
+              <MessageSquarePlus size={16} />
+            </OverflowItem>
+            {activeConversationId && activeConversation ? (
+              <>
+                <OverflowItem
+                  label={t('chatShell.executionTarget')}
+                  onSelect={() => {
+                    closeOverflow()
+                    setTargetOpen(true)
+                  }}
+                >
+                  <SlidersHorizontal size={16} />
+                </OverflowItem>
+                <div className="flex h-11 min-h-11 items-center px-1">
+                  <ConversationLifecycleActions
+                    conversationId={activeConversationId}
+                    title={sessionTitle ?? t('chatShell.chats')}
+                    className="size-11 w-full justify-start opacity-100 after:inset-0"
+                  />
+                </div>
+              </>
+            ) : null}
+            {surface === 'terminal' && activeTab?.type === 'terminal' && onRestartTerminal ? (
+              <OverflowItem
+                label={t('chatShell.restartTerminal')}
+                onSelect={() => {
+                  closeOverflow()
+                  onRestartTerminal(activeTab.terminalId)
+                }}
+              >
+                <RotateCcw size={16} />
+              </OverflowItem>
+            ) : null}
+            <OverflowItem
+              label={t('chatShell.settings')}
+              onSelect={() => {
+                closeOverflow()
+                navigate('/preferences')
+              }}
+            >
+              <Settings size={16} />
+            </OverflowItem>
+            <OverflowItem
+              label={t('chatShell.snapshots')}
+              onSelect={() => {
+                closeOverflow()
+                navigate('/snapshots')
+              }}
+            >
+              <Camera size={16} />
+            </OverflowItem>
+            {isWeb ? (
+              <>
+                <OverflowItem
+                  label={t('chatShell.switchProject')}
+                  onSelect={() => {
+                    closeOverflow()
+                    setProjectsOpen(true)
+                  }}
+                >
+                  <FolderGit2 size={16} />
+                </OverflowItem>
+                <OverflowItem
+                  label={t('chatShell.cliSessions')}
+                  onSelect={() => {
+                    closeOverflow()
+                    setSessionsOpen(true)
+                  }}
+                >
+                  <History size={16} />
+                </OverflowItem>
+                {onOpenCommandPalette ? (
+                  <OverflowItem
+                    label={t('chatShell.commandPalette')}
+                    onSelect={() => {
+                      closeOverflow()
+                      onOpenCommandPalette()
+                    }}
+                  >
+                    <Search size={16} />
+                  </OverflowItem>
+                ) : null}
+                {onOpenGitChanges ? (
+                  <OverflowItem
+                    label={t('chatShell.gitChanges')}
+                    disabled={!activeProject?.path}
+                    onSelect={() => {
+                      closeOverflow()
+                      onOpenGitChanges()
+                    }}
+                  >
+                    <GitBranch size={16} />
+                  </OverflowItem>
+                ) : null}
+                {onOpenGitHistory ? (
+                  <OverflowItem
+                    label={t('chatShell.gitHistory')}
+                    disabled={!activeProject?.path}
+                    onSelect={() => {
+                      closeOverflow()
+                      onOpenGitHistory()
+                    }}
+                  >
+                    <History size={16} />
+                  </OverflowItem>
+                ) : null}
+              </>
+            ) : null}
+          </div>
+        </SheetContent>
+      </Sheet>
 
       <Sheet open={drawerOpen} onOpenChange={setDrawerOpen}>
         <SheetContent
@@ -385,11 +557,11 @@ export function MobileChatShell({
             </SheetDescription>
           </SheetHeader>
 
-          <div className="flex shrink-0 gap-2 border-b border-border/60 p-2">
+          <div className="flex shrink-0 border-b border-border/60 p-2">
             <Button
               type="button"
               variant="secondary"
-              className="h-9 flex-1 justify-start gap-2"
+              className="h-11 min-h-11 flex-1 justify-start gap-2"
               disabled={!canNewChat}
               onClick={() => {
                 closeDrawer()
@@ -399,49 +571,36 @@ export function MobileChatShell({
               <MessageSquarePlus size={16} />
               {t('chatShell.newChat')}
             </Button>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="size-9 shrink-0"
-              aria-label={t('chatShell.settings')}
-              onClick={() => {
-                closeDrawer()
-                navigate('/preferences')
-              }}
+          </div>
+
+          {isWeb ? (
+            <div
+              className="flex shrink-0 gap-1 border-b border-border/60 p-1"
+              role="tablist"
+              aria-label={t('chatShell.deskSessions')}
             >
-              <Settings size={16} />
-            </Button>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="size-9 shrink-0"
-              aria-label={t('chatShell.snapshots')}
-              onClick={() => {
-                closeDrawer()
-                navigate('/snapshots')
-              }}
-            >
-              <Camera size={16} />
-            </Button>
-            {!isTauriContext() && onOpenGitHistory && (
-              <Button
+              <button
                 type="button"
-                variant="ghost"
-                size="icon"
-                className="size-9 shrink-0"
-                aria-label={t('chatShell.gitHistory')}
-                disabled={!activeProject?.path}
+                role="tab"
+                aria-selected
+                className="flex h-11 min-h-11 flex-1 items-center justify-center rounded-md bg-secondary text-xs font-medium text-foreground"
+              >
+                {t('chatShell.deskSessions')}
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-label={t('chatShell.switchProject')}
+                className="flex h-11 min-h-11 flex-1 items-center justify-center rounded-md text-xs font-medium text-muted-foreground"
                 onClick={() => {
                   closeDrawer()
-                  onOpenGitHistory()
+                  setProjectsOpen(true)
                 }}
               >
-                <History size={16} />
-              </Button>
-            )}
-          </div>
+                {t('chatShell.deskProjects')}
+              </button>
+            </div>
+          ) : null}
 
           <div className="border-b border-border/60 p-2">
             <div className="mb-1 flex items-center justify-between px-2 text-xs font-medium text-muted-foreground">
@@ -450,7 +609,7 @@ export function MobileChatShell({
                 type="button"
                 variant="ghost"
                 size="icon"
-                className="size-8"
+                className="size-11"
                 aria-label={t('chatShell.newTerminal')}
                 onClick={() => {
                   closeDrawer()
@@ -461,96 +620,112 @@ export function MobileChatShell({
               </Button>
             </div>
             {conversationTerminals.length === 0 ? (
-              <p className="px-2 py-2 text-xs text-muted-foreground">
-                {t('chatShell.noOpenTerminals')}
-              </p>
+              <ListEmptyState message={t('chatShell.noOpenTerminals')} />
             ) : (
               conversationTerminals.map((terminal) => {
                 const tabEntry = terminalTabs.find((entry) => entry.tab.terminalId === terminal.id)
                 const isActive = tabEntry?.tab.id === activeTab?.id
                 const isRenaming = renamingId === terminal.id
                 const isHidden = terminal.viewState !== 'visible' || !tabEntry
+                const folder = pathBasename(terminal.cwd)
                 return (
-                  <div key={terminal.id} className="flex items-center gap-1">
-                    <Button
-                      type="button"
-                      variant={isActive ? 'secondary' : 'ghost'}
-                      className="h-11 min-w-0 flex-1 justify-start gap-2"
-                      onClick={() => {
-                        if (tabEntry) selectTerminal(tabEntry.paneId, tabEntry.tab.id)
-                        else {
-                          useWorkspaceStore.getState().reopenTerminalView(terminal.id)
-                          closeDrawer()
-                        }
-                      }}
-                    >
-                      <TerminalSquare size={16} />
-                      <span className="truncate">{terminal.name}</span>
-                      {isHidden && (
-                        <span className="ml-auto text-[10px] text-muted-foreground">
-                          {t('chatShell.reopenTerminal')}
-                        </span>
-                      )}
-                    </Button>
-                    {isRenaming ? (
-                      <input
-                        type="text"
-                        value={renameValue}
-                        onChange={(event) => setRenameValue(event.target.value)}
-                        onBlur={confirmRename}
-                        onKeyDown={(event) => {
-                          if (event.key === 'Enter') confirmRename()
-                          if (event.key === 'Escape') setRenamingId(null)
-                        }}
-                        className="h-11 w-24 rounded border border-border bg-background px-2 text-xs"
-                        autoFocus
+                  <ListRow
+                    key={terminal.id}
+                    density="compact"
+                    active={isActive}
+                    buttonClassName="h-11"
+                    title={
+                      <span className="flex min-w-0 items-center gap-2">
+                        <TerminalSquare size={16} />
+                        <span className="truncate">{terminal.name}</span>
+                      </span>
+                    }
+                    titleAttr={terminal.name}
+                    preview={isHidden ? t('chatShell.reopenTerminal') : folder || undefined}
+                    meta={
+                      <ListRowMeta
+                        items={[
+                          isHidden ? t('chatShell.hidden') : t('chatShell.running'),
+                          terminal.agentName ?? terminal.shell
+                        ]}
                       />
-                    ) : (
-                      onRenameTerminal && (
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="icon"
-                          className="size-11 shrink-0"
-                          aria-label={t('chatShell.renameTerminal')}
-                          onClick={() => startRename(terminal.id, terminal.name)}
-                        >
-                          <Pencil size={14} />
-                        </Button>
-                      )
-                    )}
-                    {!isHidden && tabEntry && onCloseTerminal && (
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        className="size-11 shrink-0"
-                        aria-label={t('chatShell.closeTerminalView')}
-                        onClick={() => onCloseTerminal(terminal.id, tabEntry.tab.id)}
-                      >
-                        <X size={14} />
-                      </Button>
-                    )}
-                    {onTerminateTerminal && (
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="icon"
-                        className="size-11 shrink-0 text-destructive hover:text-destructive"
-                        aria-label={t('chatShell.terminateTerminal')}
-                        onClick={() => onTerminateTerminal(terminal.id, tabEntry?.tab.id)}
-                      >
-                        <Trash2 size={14} />
-                      </Button>
-                    )}
-                  </div>
+                    }
+                    trailing={
+                      <>
+                        {isRenaming ? (
+                          <input
+                            type="text"
+                            value={renameValue}
+                            onChange={(event) => setRenameValue(event.target.value)}
+                            onBlur={confirmRename}
+                            onKeyDown={(event) => {
+                              if (event.key === 'Enter') confirmRename()
+                              if (event.key === 'Escape') setRenamingId(null)
+                            }}
+                            className="h-11 w-24 rounded border border-border bg-background px-2 text-xs"
+                            autoFocus
+                          />
+                        ) : (
+                          onRenameTerminal && (
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              className="size-11 shrink-0"
+                              aria-label={t('chatShell.renameTerminal')}
+                              onClick={() => startRename(terminal.id, terminal.name)}
+                            >
+                              <Pencil size={14} />
+                            </Button>
+                          )
+                        )}
+                        {!isHidden && tabEntry && onCloseTerminal && (
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon"
+                            className="size-11 shrink-0"
+                            aria-label={t('chatShell.closeTerminalView')}
+                            onClick={() => onCloseTerminal(terminal.id, tabEntry.tab.id)}
+                          >
+                            <X size={14} />
+                          </Button>
+                        )}
+                        {onTerminateTerminal && (
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon"
+                            className="size-11 shrink-0 text-destructive hover:text-destructive"
+                            aria-label={t('chatShell.terminateTerminal')}
+                            onClick={() => onTerminateTerminal(terminal.id, tabEntry?.tab.id)}
+                          >
+                            <Trash2 size={14} />
+                          </Button>
+                        )}
+                      </>
+                    }
+                    onClick={() => {
+                      if (tabEntry) selectTerminal(tabEntry.paneId, tabEntry.tab.id)
+                      else {
+                        useWorkspaceStore.getState().reopenTerminalView(terminal.id)
+                        setSurface('terminal')
+                        closeDrawer()
+                      }
+                    }}
+                  />
                 )
               })
             )}
           </div>
 
           <div className="min-h-0 flex-1 overflow-hidden">
-            <ChatHistoryTab onSessionOpened={closeDrawer} />
+            <ChatHistoryTab
+              onSessionOpened={() => {
+                setSurface('chat')
+                closeDrawer()
+              }}
+            />
           </div>
         </SheetContent>
       </Sheet>
@@ -577,13 +752,9 @@ export function MobileChatShell({
         </SheetContent>
       </Sheet>
 
-      {!isTauriContext() && (
-        <ProjectSwitcherDrawer open={projectsOpen} onOpenChange={setProjectsOpen} />
-      )}
+      {isWeb && <ProjectSwitcherDrawer open={projectsOpen} onOpenChange={setProjectsOpen} />}
 
-      {!isTauriContext() && <MobileFileExplorer open={filesOpen} onOpenChange={setFilesOpen} />}
-
-      {!isTauriContext() && (
+      {isWeb && (
         <Sheet open={sessionsOpen} onOpenChange={setSessionsOpen}>
           <SheetContent
             side="right"
@@ -598,5 +769,30 @@ export function MobileChatShell({
         </Sheet>
       )}
     </div>
+  )
+}
+
+function OverflowItem({
+  label,
+  disabled,
+  onSelect,
+  children
+}: {
+  label: string
+  disabled?: boolean
+  onSelect: () => void
+  children: React.ReactNode
+}): React.JSX.Element {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      disabled={disabled}
+      className="flex h-11 min-h-11 w-full items-center gap-3 rounded-md px-3 text-left text-sm hover:bg-accent disabled:pointer-events-none disabled:opacity-45"
+      onClick={onSelect}
+    >
+      {children}
+      <span className="min-w-0 truncate">{label}</span>
+    </button>
   )
 }

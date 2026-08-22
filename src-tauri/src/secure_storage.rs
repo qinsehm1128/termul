@@ -1,41 +1,7 @@
 use keyring::Entry;
 use serde::{Deserialize, Serialize};
 
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 const SERVICE_NAME: &str = "com.termul.manager";
-pub(crate) const KEYRING_DELETE_FAILED: &str = "KEYRING_DELETE_FAILED";
-
-#[cfg(test)]
-static INJECTED_DELETE_FAILURES: AtomicUsize = AtomicUsize::new(0);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct KeyringDeleteError;
-
-impl KeyringDeleteError {
-    #[must_use]
-    pub const fn code(self) -> &'static str {
-        KEYRING_DELETE_FAILED
-    }
-}
-
-/// Host-owned keyring deletion outcome. A failed delete keeps retry ownership
-/// so `RemoteServerState::stop` cannot report success while bearer material remains.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct KeyringDeleteReceipt {
-    pub deleted: bool,
-    pub retry_owner: bool,
-    pub stable_code: Option<&'static str>,
-}
-
-impl std::fmt::Display for KeyringDeleteError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("keyring credential deletion failed")
-    }
-}
-
-impl std::error::Error for KeyringDeleteError {}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SecureStorageRequest {
@@ -110,50 +76,11 @@ pub(crate) fn keyring_set(key: &str, value: &str) -> Result<(), String> {
         .map_err(|_| "keyring credential storage failed".to_string())
 }
 
-/// Delete a host-owned generation credential. A missing entry is idempotent
-/// success; every backend/descriptor failure is collapsed to one stable,
-/// account-free error for aggregate generation-retirement receipts.
-pub(crate) fn keyring_delete_checked(key: &str) -> Result<(), KeyringDeleteError> {
-    #[cfg(test)]
-    if INJECTED_DELETE_FAILURES
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-            remaining.checked_sub(1)
-        })
-        .is_ok()
-    {
-        return Err(KeyringDeleteError);
-    }
-
-    let entry = Entry::new(SERVICE_NAME, key).map_err(|_| KeyringDeleteError)?;
-    match entry.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(_) => Err(KeyringDeleteError),
-    }
-}
-
 pub(crate) fn keyring_delete(key: &str) -> Result<(), String> {
-    keyring_delete_checked(key).map_err(|error| error.to_string())
-}
-
-#[must_use]
-pub(crate) fn keyring_delete_with_receipt(key: &str) -> KeyringDeleteReceipt {
-    match keyring_delete_checked(key) {
-        Ok(()) => KeyringDeleteReceipt {
-            deleted: true,
-            retry_owner: false,
-            stable_code: None,
-        },
-        Err(error) => KeyringDeleteReceipt {
-            deleted: false,
-            retry_owner: true,
-            stable_code: Some(error.code()),
-        },
+    match get_entry(key)?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(_) => Err("keyring credential deletion failed".to_string()),
     }
-}
-
-#[cfg(test)]
-pub(crate) fn fail_next_keyring_deletes_for_tests(count: usize) {
-    INJECTED_DELETE_FAILURES.store(count, Ordering::SeqCst);
 }
 
 #[tauri::command]

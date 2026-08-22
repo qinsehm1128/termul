@@ -22,9 +22,9 @@
 //!
 //! ## Bind model
 //!
-//! Defaults to localhost. `All` (`0.0.0.0`) exposes the server on the LAN; the
-//! status-bar UI surfaces a warning in that case. Auth/token-gating lands in
-//! Epic 2 — until then, LAN exposure is the operator's explicit decision.
+//! `Localhost` (`127.0.0.1`) is used when the phone reaches the desktop only
+//! through a tunnel. `All` (`0.0.0.0`) is used when LAN publish is selected so
+//! a same-Wi-Fi phone can open `http://{lan-ip}:{port}/#access_token=…`.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -83,13 +83,6 @@ impl RemoteBindMode {
     }
 
     /// `true` when bound to all interfaces (LAN-exposed).
-    ///
-    /// Currently unused: the desktop-hosted server always binds localhost
-    /// because the cloudflared quick-tunnel targets it (the LAN `all` mode is
-    /// removed from the popover and deferred — see
-    /// `spec-remote-qr-cloudflared-tunnel`). Retained + tested for the
-    /// deferred LAN-only connect mode.
-    #[allow(dead_code)]
     pub fn is_lan_exposed(self) -> bool {
         matches!(self, Self::All)
     }
@@ -113,9 +106,16 @@ pub struct RemoteStatus {
     pub tunnel_url: Option<String>,
     /// Active provider id (`cloudflareQuick` / `cloudflareNamed` / `frp`).
     pub tunnel_provider: Option<String>,
-    /// Credentialed scan/copy URL for the active generation. The raw bearer is
-    /// materialized only in this response from the host-owned in-memory lease.
+    /// Credentialed scan/copy URL for the active publish mode.
     pub access_url: Option<String>,
+    /// Same-Wi-Fi Origin without the bearer fragment.
+    pub lan_url: Option<String>,
+    /// Credentialed LAN URL (`#access_token=`). Absent when bound loopback-only.
+    pub lan_access_url: Option<String>,
+    /// Credentialed tunnel URL. Absent when no public Origin is attached.
+    pub tunnel_access_url: Option<String>,
+    /// `lan` or `tunnel` — which URL `access_url` currently represents.
+    pub publish_mode: Option<String>,
 }
 
 impl RemoteStatus {
@@ -129,6 +129,10 @@ impl RemoteStatus {
             tunnel_url: None,
             tunnel_provider: None,
             access_url: None,
+            lan_url: None,
+            lan_access_url: None,
+            tunnel_access_url: None,
+            publish_mode: None,
         }
     }
 
@@ -138,20 +142,13 @@ impl RemoteStatus {
         tunnel_url: Option<String>,
         credential_lease: Option<&DesktopCredentialLease>,
     ) -> Self {
-        // The desktop-hosted server always binds localhost (the cloudflared
-        // quick-tunnel targets it), so `url` is a concrete loopback URL — kept
-        // for "open on this machine" diagnostics. The phone-reachable address
-        // is `tunnel_url`, which the popover renders as a QR.
         let url = if addr.ip().is_unspecified() {
             None
         } else {
             Some(format!("http://{}:{}", addr.ip(), addr.port()))
         };
-        let access_url = tunnel_url.as_deref().and_then(|origin| {
-            let lease = credential_lease?;
-            let mut url = url::Url::parse(origin).ok()?;
-            url.set_fragment(Some(&format!("access_token={}", lease.bearer())));
-            Some(url.into())
+        let tunnel_access_url = tunnel_url.as_deref().and_then(|origin| {
+            crate::remote::lan::credentialed_access_url(origin, credential_lease?.bearer())
         });
         Self {
             running: true,
@@ -161,12 +158,40 @@ impl RemoteStatus {
             bind_host: Some(bind_mode.display_host().to_string()),
             tunnel_url,
             tunnel_provider: None,
-            access_url,
+            access_url: tunnel_access_url.clone(),
+            lan_url: None,
+            lan_access_url: None,
+            tunnel_access_url,
+            publish_mode: None,
         }
     }
 
     fn with_provider(mut self, provider: Option<String>) -> Self {
         self.tunnel_provider = provider;
+        self
+    }
+
+    fn with_lan(
+        mut self,
+        lan_url: Option<String>,
+        credential_lease: Option<&DesktopCredentialLease>,
+    ) -> Self {
+        self.lan_access_url = lan_url.as_deref().and_then(|origin| {
+            crate::remote::lan::credentialed_access_url(origin, credential_lease?.bearer())
+        });
+        self.lan_url = lan_url;
+        if self.url.is_none() {
+            self.url = self.lan_url.clone();
+        }
+        self
+    }
+
+    fn with_publish_mode(mut self, mode: crate::remote::PublishMode) -> Self {
+        self.publish_mode = Some(mode.as_str().to_string());
+        self.access_url = match mode {
+            crate::remote::PublishMode::Lan => self.lan_access_url.clone(),
+            crate::remote::PublishMode::Tunnel => self.tunnel_access_url.clone(),
+        };
         self
     }
 }
@@ -198,6 +223,7 @@ struct RemoteServer {
     /// server is active. The authority stores generation metadata + digest.
     credential_lease: Option<DesktopCredentialLease>,
     authority: Arc<RemoteAccessAuthority>,
+    publish_mode: crate::remote::PublishMode,
 }
 
 impl RemoteServer {
@@ -273,13 +299,19 @@ impl Drop for RemoteServer {
 struct PendingCredentialLease {
     authority: Arc<RemoteAccessAuthority>,
     lease: Option<DesktopCredentialLease>,
+    retire_on_drop: bool,
 }
 
 impl PendingCredentialLease {
-    fn new(authority: Arc<RemoteAccessAuthority>, lease: DesktopCredentialLease) -> Self {
+    fn new(
+        authority: Arc<RemoteAccessAuthority>,
+        lease: DesktopCredentialLease,
+        retire_on_drop: bool,
+    ) -> Self {
         Self {
             authority,
             lease: Some(lease),
+            retire_on_drop,
         }
     }
 
@@ -290,6 +322,9 @@ impl PendingCredentialLease {
 
 impl Drop for PendingCredentialLease {
     fn drop(&mut self) {
+        if !self.retire_on_drop {
+            return;
+        }
         if let Some(lease) = self.lease.take() {
             let _ = self.authority.retire_generation(lease.generation());
         }
@@ -301,6 +336,7 @@ pub struct RemoteServerState {
     inner: std::sync::Mutex<Option<RemoteServer>>,
     lifecycle: tokio::sync::Mutex<()>,
     authority: Arc<RemoteAccessAuthority>,
+    pairing: Option<Arc<crate::remote::TunnelConfigStore>>,
 }
 
 impl RemoteServerState {
@@ -309,7 +345,14 @@ impl RemoteServerState {
             inner: std::sync::Mutex::new(None),
             lifecycle: tokio::sync::Mutex::new(()),
             authority,
+            pairing: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_pairing_store(mut self, store: Arc<crate::remote::TunnelConfigStore>) -> Self {
+        self.pairing = Some(store);
+        self
     }
 
     pub fn new() -> Self {
@@ -319,6 +362,7 @@ impl RemoteServerState {
                 inner: std::sync::Mutex::new(None),
                 lifecycle: tokio::sync::Mutex::new(()),
                 authority: Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token")),
+                pairing: None,
             }
         }
         #[cfg(not(test))]
@@ -326,7 +370,28 @@ impl RemoteServerState {
             inner: std::sync::Mutex::new(None),
             lifecycle: tokio::sync::Mutex::new(()),
             authority: Arc::new(RemoteAccessAuthority::unconfigured()),
+            pairing: None,
         }
+    }
+
+    fn load_pairing_token(&self) -> Option<String> {
+        self.pairing
+            .as_ref()
+            .and_then(|store| store.pairing_token().ok().flatten())
+    }
+
+    fn persist_pairing_token(&self, token: &str) -> Result<(), String> {
+        let Some(store) = self.pairing.as_ref() else {
+            return Ok(());
+        };
+        store.set_pairing_token(Some(token))
+    }
+
+    fn clear_pairing_token(&self) -> Result<(), String> {
+        let Some(store) = self.pairing.as_ref() else {
+            return Ok(());
+        };
+        store.set_pairing_token(None)
     }
 
     /// Start the in-process web server sharing the desktop's live `AcpManager`.
@@ -406,13 +471,7 @@ impl RemoteServerState {
         bind_port: u16,
     ) -> Result<RemoteStatus, String> {
         let _lifecycle = self.lifecycle.lock().await;
-        // The built-in cloudflared quick-tunnel forwards to localhost, so the
-        // desktop-hosted server always binds localhost regardless of the
-        // caller's bind mode — the LAN `all` mode is removed from the popover
-        // and deferred (see spec-remote-qr-cloudflared-tunnel). The param stays
-        // for API stability / the standalone binary's parity path; it is
-        // ignored here (`_bind_mode`) to avoid churning every caller.
-        let bind_mode = RemoteBindMode::Localhost;
+        let bind_mode = _bind_mode;
         {
             let slot = self.inner.lock().unwrap();
             if slot.is_some() {
@@ -427,12 +486,19 @@ impl RemoteServerState {
         }
         self.authority
             .set_ingress_provenance(IngressProvenance::PublicTunnel);
-        let pending_credential = PendingCredentialLease::new(
-            Arc::clone(&self.authority),
-            self.authority
-                .rotate_desktop_credential()
-                .map_err(|error| format!("failed to rotate remote credential: {error}"))?,
-        );
+        let stored = self.load_pairing_token();
+        let (lease, issued) = self
+            .authority
+            .adopt_or_issue_desktop_credential(stored.as_deref())
+            .map_err(|error| format!("failed to adopt remote credential: {error}"))?;
+        if issued {
+            if let Err(error) = self.persist_pairing_token(lease.bearer()) {
+                let _ = self.authority.retire_generation(lease.generation());
+                return Err(error);
+            }
+        }
+        let pending_credential =
+            PendingCredentialLease::new(Arc::clone(&self.authority), lease, issued);
 
         // CAP-1 / Story 1: resolve the project-root boundary for the
         // shared-live server from the **active project** (the
@@ -580,7 +646,11 @@ impl RemoteServerState {
             tunnel_watchdog: None,
             credential_lease: Some(pending_credential.into_lease()),
             authority: Arc::clone(&self.authority),
+            publish_mode: crate::remote::PublishMode::Tunnel,
         });
+        if bind_mode == RemoteBindMode::All {
+            register_lan_origin(&self.authority, addr.port());
+        }
         Ok(status)
     }
 
@@ -591,11 +661,33 @@ impl RemoteServerState {
     /// desktop path too. Does NOT call `AcpManager::kill_all` — the desktop's
     /// live agents survive a shared-live toggle-off.
     pub async fn stop(&self) -> Result<RemoteStatus, String> {
+        self.stop_inner(true).await
+    }
+
+    /// Drain the listener and tunnel without retiring the pairing generation.
+    /// Used on Desktop exit so a wanted session can reuse the settings bearer.
+    pub async fn shutdown_keep_credential(&self) -> Result<RemoteStatus, String> {
+        self.stop_inner(false).await
+    }
+
+    async fn stop_inner(&self, retire: bool) -> Result<RemoteStatus, String> {
         let _lifecycle = self.lifecycle.lock().await;
         let receipt = {
             let mut slot = self.inner.lock().unwrap();
             match slot.as_mut() {
-                Some(server) => server.retire_credential("stop"),
+                Some(server) if retire => server.retire_credential("stop"),
+                Some(server) => {
+                    let _ = server.credential_lease.take();
+                    crate::web::auth::GenerationRetirementReceipt {
+                        generation: 0,
+                        credential_invalidated: false,
+                        origins_cleared: false,
+                        failure_state_cleared: false,
+                        keyring_deleted: true,
+                        retry_owner: false,
+                        stable_codes: Vec::new(),
+                    }
+                }
                 None => return Err("Remote server is not running".to_string()),
             }
         };
@@ -643,6 +735,15 @@ impl RemoteServerState {
                         }
                     }
                 }
+                if retire {
+                    if let Err(error) = self.clear_pairing_token() {
+                        log::error!(
+                            target: "termul::remote::host",
+                            "operation=pairing_clear lifecycle_phase=stop stable_code=REMOTE_CREDENTIAL_CLEANUP_FAILED"
+                        );
+                        return Err(error);
+                    }
+                }
                 Ok(RemoteStatus::stopped())
             }
             None => Err("Remote server is not running".to_string()),
@@ -683,41 +784,36 @@ impl RemoteServerState {
                 target: "termul::remote::host",
                 "operation=tunnel_watchdog lifecycle_phase=tunnel_death stable_code=TUNNEL_EXITED"
             );
-            let mut failed = slot.take().expect("dead tunnel server slot");
-            let receipt = failed.retire_credential("tunnel_death");
-            if !receipt.is_clean() {
-                log::error!(
-                    target: "termul::remote::host",
-                    "operation=tunnel_watchdog lifecycle_phase=tunnel_death stable_code=REMOTE_CREDENTIAL_CLEANUP_FAILED generation={} keyring_deleted={} retry_owner={}",
-                    receipt.generation,
-                    receipt.keyring_deleted,
-                    receipt.retry_owner
-                );
-                *slot = Some(failed);
-                return RemoteStatus::running(
-                    slot.as_ref().expect("retry-owned server").addr,
-                    slot.as_ref().expect("retry-owned server").bind_mode,
-                    slot.as_ref()
-                        .expect("retry-owned server")
-                        .tunnel_url
-                        .clone(),
-                    slot.as_ref()
-                        .and_then(|server| server.credential_lease.as_ref()),
-                )
-                .with_provider(
-                    slot.as_ref()
-                        .and_then(|server| server.tunnel_provider.clone()),
-                );
-            }
-            return RemoteStatus::stopped();
+            server.tunnel_url = None;
+            server.tunnel_provider = None;
         }
-        RemoteStatus::running(
-            server.addr,
-            server.bind_mode,
-            server.tunnel_url.clone(),
-            server.credential_lease.as_ref(),
-        )
-        .with_provider(server.tunnel_provider.clone())
+        compose_running_status(server)
+    }
+
+    pub fn set_publish_mode(&self, mode: crate::remote::PublishMode) {
+        if let Some(server) = self.inner.lock().unwrap().as_mut() {
+            server.publish_mode = mode;
+        }
+    }
+
+    /// Replace the active pairing bearer. Origins are re-registered because
+    /// rotation clears the allowlist.
+    pub fn rotate_active_credential(&self) -> Result<RemoteStatus, String> {
+        {
+            let mut slot = self.inner.lock().unwrap();
+            let server = slot
+                .as_mut()
+                .ok_or_else(|| "Remote server is not running".to_string())?;
+            let lease = self
+                .authority
+                .rotate_desktop_credential()
+                .map_err(|error| format!("failed to rotate remote credential: {error}"))?;
+            self.persist_pairing_token(lease.bearer())
+                .map_err(|error| format!("failed to persist rotated credential: {error}"))?;
+            server.credential_lease = Some(lease);
+            reregister_published_origins(server);
+        }
+        Ok(self.status())
     }
 
     fn fail_active_server(&self, lifecycle_phase: &'static str) {
@@ -740,6 +836,7 @@ impl RemoteServerState {
     /// child is killed (sync `start_kill`) so no cloudflared lingers. Keeping
     /// this out of `start` lets the server-lifecycle unit tests run without a
     /// real cloudflared binary.
+    #[cfg(test)]
     pub fn attach_tunnel(&self, url: String, child: Child) -> Result<(), String> {
         self.attach_tunnel_as(url, child, "cloudflareQuick")
     }
@@ -791,29 +888,17 @@ impl RemoteServerState {
             Some(server)
                 if !server.task_finished() && server.credential_lease.as_ref().is_some() =>
             {
-                let generation = server
-                    .credential_lease
-                    .as_ref()
-                    .expect("active credential lease")
-                    .generation();
                 let child = child.take().expect("child present after take");
                 let dead_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let flag = dead_flag.clone();
-                let authority = Arc::clone(&self.authority);
-                let shutdown_tx = Arc::clone(&server.shutdown_tx);
                 // The watchdog owns the child: `wait()` for natural exit, then
                 // flag death so the next `status()` poll clears the stale URL.
-                // Aborted on `stop()`/`Drop`; at that point the owned child is
-                // reaped via its `kill_on_drop`. Owning the child in a task
-                // (not in `RemoteServer`) keeps `status()` sync — no
-                // `try_wait`-across-`.await` + no `!Send` MutexGuard hazard.
+                // A dead tunnel is an availability failure, not a leak — keep
+                // the pairing generation so LAN (and a later tunnel retry) still
+                // work. Aborted on `stop()`/`Drop`.
                 let watchdog = tokio::spawn(async move {
                     let mut child = child;
                     let _ = child.wait().await;
-                    let _ = authority.retire_generation(generation);
-                    if let Some(tx) = shutdown_tx.lock().unwrap().take() {
-                        let _ = tx.send(());
-                    }
                     flag.store(true, std::sync::atomic::Ordering::Release);
                 });
                 server.tunnel_url = Some(public_origin);
@@ -831,6 +916,53 @@ impl RemoteServerState {
                 self.fail_active_server("attach_race");
                 Err("remote server stopped before tunnel attached".to_string())
             }
+        }
+    }
+}
+
+fn compose_running_status(server: &RemoteServer) -> RemoteStatus {
+    let lan_url = if server.bind_mode == RemoteBindMode::All {
+        crate::remote::lan::discover_lan_ipv4()
+            .map(|ip| crate::remote::lan::lan_http_origin(ip, server.addr.port()))
+    } else {
+        None
+    };
+    RemoteStatus::running(
+        server.addr,
+        server.bind_mode,
+        server.tunnel_url.clone(),
+        server.credential_lease.as_ref(),
+    )
+    .with_provider(server.tunnel_provider.clone())
+    .with_lan(lan_url, server.credential_lease.as_ref())
+    .with_publish_mode(server.publish_mode)
+}
+
+fn register_lan_origin(authority: &RemoteAccessAuthority, port: u16) {
+    if let Some(ip) = crate::remote::lan::discover_lan_ipv4() {
+        if let Ok(origin) = url::Url::parse(&crate::remote::lan::lan_http_origin(ip, port)) {
+            if let Err(error) = authority.set_public_origin(origin) {
+                log::warn!(
+                    target: "termul::remote::host",
+                    "operation=lan_origin_register stable_code=REJECTED error_kind={}",
+                    error.code()
+                );
+            }
+        }
+    }
+}
+
+fn reregister_published_origins(server: &RemoteServer) {
+    let port = server.addr.port();
+    if let Ok(origin) = url::Url::parse(&format!("http://127.0.0.1:{port}")) {
+        let _ = server.authority.set_public_origin(origin);
+    }
+    if server.bind_mode == RemoteBindMode::All {
+        register_lan_origin(&server.authority, port);
+    }
+    if let Some(tunnel) = server.tunnel_url.as_deref() {
+        if let Ok(origin) = url::Url::parse(tunnel) {
+            let _ = server.authority.set_public_origin(origin);
         }
     }
 }
@@ -909,6 +1041,10 @@ mod tests {
         assert_eq!(s.bind_host, None);
         assert_eq!(s.tunnel_url, None);
         assert_eq!(s.access_url, None);
+        assert_eq!(s.lan_url, None);
+        assert_eq!(s.lan_access_url, None);
+        assert_eq!(s.tunnel_access_url, None);
+        assert_eq!(s.publish_mode, None);
     }
 
     #[test]
@@ -981,7 +1117,7 @@ mod tests {
         let authority = Arc::new(RemoteAccessAuthority::for_tests("bootstrap-token"));
         let lease = authority.rotate_desktop_credential().unwrap();
         let bearer = lease.bearer().to_string();
-        let pending = PendingCredentialLease::new(Arc::clone(&authority), lease);
+        let pending = PendingCredentialLease::new(Arc::clone(&authority), lease, true);
         drop(pending);
         assert_eq!(
             authority.verify_bearer(&bearer).unwrap_err(),
@@ -1001,15 +1137,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_returns_remote_credential_cleanup_failed_when_keyring_delete_fails() {
+    async fn start_reuses_settings_pairing_token_and_stop_clears_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::remote::TunnelConfigStore::for_path(
+            dir.path().join("config.json"),
+        ));
+        store
+            .set_pairing_token(Some("test-remote-access-token"))
+            .unwrap();
         let (acp, pty, relay, registry) = lifecycle_fixtures();
-        let authority = Arc::new(
-            crate::web::auth::RemoteAccessAuthority::for_desktop_keyring_tests(
-                "test-remote-access-token",
-                "opaque-task002-account",
-            ),
-        );
-        let state = RemoteServerState::with_desktop_authority(authority);
+        let authority = Arc::new(crate::web::auth::RemoteAccessAuthority::desktop_memory());
+        let state = RemoteServerState::with_desktop_authority(authority).with_pairing_store(store.clone());
         state
             .start(
                 acp,
@@ -1023,27 +1161,12 @@ mod tests {
                 None,
             )
             .await
-            .expect("desktop keyring host starts");
+            .expect("settings-backed host starts");
         assert!(state.status().running);
-        let (generation, _) = active_credential(&state);
-        crate::secure_storage::fail_next_keyring_deletes_for_tests(1);
-        let error = state
-            .stop()
-            .await
-            .expect_err("keyring delete must fail stop");
-        assert_eq!(error, "REMOTE_CREDENTIAL_CLEANUP_FAILED");
-        assert!(
-            state.status().running,
-            "retry ownership must keep the host slot when keyring delete fails"
-        );
-        let (retry_generation, _) = active_credential(&state);
-        assert_eq!(retry_generation, generation);
-        crate::secure_storage::fail_next_keyring_deletes_for_tests(0);
-        let stopped = state
-            .stop()
-            .await
-            .expect("retry stop succeeds after keyring recovers");
-        assert!(!stopped.running);
+        let (_, bearer) = active_credential(&state);
+        assert_eq!(bearer, "test-remote-access-token");
+        state.stop().await.expect("stop clears pairing token");
+        assert_eq!(store.pairing_token().unwrap(), None);
     }
 
     /// A real `AcpManager` (zero sinks is legal) + a `WsRelaySink` for the
@@ -1299,10 +1422,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn status_retires_generation_and_listener_when_cloudflared_child_exits() {
-        // Tunnel death ends the entire public generation: the watchdog revokes
-        // the credential, clears Origin/failure state, signals listener drain,
-        // and `status()` removes the server slot.
+    async fn status_clears_tunnel_url_but_keeps_generation_when_child_exits() {
         let (acp, pty, relay, registry) = lifecycle_fixtures();
         let state = RemoteServerState::new();
         let _ = state
@@ -1322,8 +1442,6 @@ mod tests {
 
         let (_, bearer) = active_credential(&state);
 
-        // Attach a tunnel child that exits almost immediately (cross-platform
-        // exit-0). kill_on_drop mirrors the real start_quick_tunnel child.
         let mut cmd = quick_exit_command();
         cmd.kill_on_drop(true);
         let child = cmd.spawn().expect("spawn quick-exit child");
@@ -1331,20 +1449,49 @@ mod tests {
             .attach_tunnel("https://stale.trycloudflare.com".to_string(), child)
             .expect("attach");
 
-        // Poll until the dead-child path retires the complete server.
-        let mut stopped = false;
+        let mut cleared = false;
         for _ in 0..20 {
-            if !state.status().running {
-                stopped = true;
+            let status = state.status();
+            if status.running && status.tunnel_url.is_none() {
+                cleared = true;
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        assert!(stopped, "tunnel death must retire the shared-live listener");
-        assert_eq!(
-            state.authority.verify_bearer(&bearer).unwrap_err(),
-            crate::web::auth::RemoteAuthError::InvalidCredential
-        );
+        assert!(cleared, "tunnel death must drop the public Origin");
+        assert!(state.status().running, "listener stays up for LAN / retry");
+        assert!(state.authority.verify_bearer(&bearer).is_ok());
+        let _ = state.stop().await;
+    }
+
+    #[tokio::test]
+    async fn lan_bind_honors_all_interfaces() {
+        let (acp, pty, relay, registry) = lifecycle_fixtures();
+        let state = RemoteServerState::new();
+        let status = state
+            .start(
+                acp,
+                pty,
+                relay,
+                registry,
+                RemoteBindMode::All,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("LAN bind starts");
+        assert!(status.running);
+        assert_eq!(status.bind_mode.as_deref(), Some("all"));
+        assert_eq!(status.bind_host.as_deref(), Some("0.0.0.0"));
+        state.set_publish_mode(crate::remote::PublishMode::Lan);
+        let published = state.status();
+        assert_eq!(published.publish_mode.as_deref(), Some("lan"));
+        if let Some(access) = published.access_url.as_deref() {
+            assert!(access.contains("#access_token="));
+        }
+        let _ = state.stop().await;
     }
 
     /// A cross-platform command that exits 0 almost immediately, for the

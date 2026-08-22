@@ -16,6 +16,7 @@ import { useCwd } from '@/hooks/use-cwd'
 import { useExitCode } from '@/hooks/use-exit-code'
 import { useGitBranch } from '@/hooks/use-git-branch'
 import { useGitStatus } from '@/hooks/use-git-status'
+import { useHostTerminalCatalog } from '@/hooks/use-host-terminal-catalog'
 import { useKeyboardShortcutsLoader } from '@/hooks/use-keyboard-shortcuts'
 import { useAppliedLanguageSync } from '@/hooks/use-language'
 import { useMenuUpdaterListener } from '@/hooks/use-menu-updater-listener'
@@ -82,6 +83,7 @@ export function PortableAppEffects(): React.JSX.Element | null {
   useUpdateToast()
   useVisibilityState()
   useTerminalExitNotification()
+  useHostTerminalCatalog()
   useRemoteProjects()
   useAcpListeners()
   useAcpAgents()

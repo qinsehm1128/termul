@@ -123,7 +123,18 @@
     "untitled": "Untitled conversation",
     "loadMore": "Load {{count}} more",
     "recoveryBadge_one": "{{count}} recovery item",
-    "recoveryBadge_other": "{{count}} recovery items"
+    "recoveryBadge_other": "{{count}} recovery items",
+    "shownCount": "{{shown}} shown · {{total}} total",
+    "revision": "rev {{count}}",
+    "toggleDetails": "Show conversation details",
+    "detailsWorkspace": "Workspace",
+    "detailsState": "State",
+    "detailsProject": "Project",
+    "rowStatus": {
+      "need": "Need you",
+      "working": "Working",
+      "idle": "Idle"
+    }
   },
   "conversationRoute": {
     "opening": "Opening conversation…",

@@ -1,5 +1,6 @@
 import type {
   IpcResult,
+  RemoteAccessIntent,
   RemoteBindMode,
   RemoteServerApi,
   RemoteStatus,
@@ -27,7 +28,10 @@ import type { StoredMcpServer } from './acp-mcp-persistence'
 const IPC_COMMANDS = {
   START: 'remote_server_start',
   STOP: 'remote_server_stop',
-  STATUS: 'remote_server_status'
+  STATUS: 'remote_server_status',
+  INTENT_GET: 'remote_access_intent_get',
+  INTENT_SET: 'remote_access_intent_set',
+  ROTATE: 'remote_server_rotate_credential'
 } as const
 
 /**
@@ -70,6 +74,18 @@ export const remoteServerApi: RemoteServerApi = {
   /** Query whether the server is running and its current url/port. */
   async status(): Promise<IpcResult<RemoteStatus>> {
     return invokeIpc<RemoteStatus>(IPC_COMMANDS.STATUS)
+  },
+
+  async intent(): Promise<IpcResult<RemoteAccessIntent>> {
+    return invokeIpc<RemoteAccessIntent>(IPC_COMMANDS.INTENT_GET)
+  },
+
+  async setIntent(update: Partial<RemoteAccessIntent>): Promise<IpcResult<RemoteAccessIntent>> {
+    return invokeIpc<RemoteAccessIntent>(IPC_COMMANDS.INTENT_SET, { update })
+  },
+
+  async rotateCredential(): Promise<IpcResult<RemoteStatus>> {
+    return invokeIpc<RemoteStatus>(IPC_COMMANDS.ROTATE)
   }
 }
 

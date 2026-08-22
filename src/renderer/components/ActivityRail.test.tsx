@@ -1,6 +1,7 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { TooltipProvider } from '@/components/ui/tooltip'
 import * as appSettingsHooks from '@/hooks/use-app-settings'
 import { useSSHPanelStore } from '@/stores/ssh-panel-store'
 import { ActivityRail } from './ActivityRail'
@@ -54,9 +55,11 @@ describe('ActivityRail', () => {
 
   function renderRail() {
     return render(
-      <MemoryRouter>
-        <ActivityRail />
-      </MemoryRouter>
+      <TooltipProvider delayDuration={0}>
+        <MemoryRouter>
+          <ActivityRail />
+        </MemoryRouter>
+      </TooltipProvider>
     )
   }
 
@@ -111,6 +114,51 @@ describe('ActivityRail', () => {
     renderRail()
 
     expect(screen.getByRole('img', { name: 'Termul' })).toBeInTheDocument()
+  })
+
+  it('separates project actions from the conversations workspace', () => {
+    const { container } = renderRail()
+
+    const projectActions = screen.getByRole('group', { name: 'Project workspace and tools' })
+    const conversationActions = screen.getByRole('group', { name: 'Conversation workspace' })
+
+    expect(within(projectActions).getByRole('button', { name: 'Open projects' })).toBeVisible()
+    expect(
+      within(conversationActions).getByRole('button', {
+        name: 'Open the conversations area'
+      })
+    ).toBeVisible()
+    expect(
+      within(conversationActions).getByRole('button', { name: 'Open scheduled tasks' })
+    ).toBeVisible()
+    expect(
+      within(projectActions).queryByRole('button', { name: 'Open scheduled tasks' })
+    ).not.toBeInTheDocument()
+    expect(
+      projectActions.compareDocumentPosition(conversationActions) & Node.DOCUMENT_POSITION_FOLLOWING
+    ).toBeTruthy()
+    expect(
+      container.querySelector('[data-activity-rail-divider="workspace-contexts"]')
+    ).toBeInTheDocument()
+  })
+
+  it('provides hover labels for primary and utility actions', () => {
+    const { container } = renderRail()
+
+    for (const label of ['Projects', 'Conversations', 'Preferences', 'Color themes']) {
+      expect(container.querySelector(`[data-rail-tooltip="${label}"]`)).toBeInTheDocument()
+    }
+  })
+
+  it('shows the localized label when an action is hovered', async () => {
+    renderRail()
+
+    const projectsButton = screen.getByRole('button', { name: 'Open projects' })
+    fireEvent.pointerMove(projectsButton, { pointerType: 'mouse' })
+    fireEvent.pointerEnter(projectsButton, { pointerType: 'mouse' })
+    fireEvent.mouseOver(projectsButton)
+
+    expect(await screen.findByRole('tooltip')).toHaveTextContent('Projects')
   })
 
   it('keeps the brand row draggable on macOS for top-left window moves', () => {
@@ -217,7 +265,7 @@ describe('ActivityRail', () => {
       renderRail()
       const sshButton = screen.getByRole('button', { name: /SSH/i })
       expect(sshButton).toBeDisabled()
-      expect(sshButton).toHaveAttribute('title', 'SSH is desktop-only')
+      expect(sshButton.parentElement).toHaveAttribute('data-rail-tooltip', 'SSH is desktop-only')
     } finally {
       tauriRef.current = prev
     }

@@ -2,6 +2,7 @@ import SwiftUI
 
 struct TerminalWorkspaceView: View {
     @Bindable var session: WorkspaceSession
+    @State private var focusToken: UInt64 = 0
 
     var body: some View {
         VStack(spacing: 0) {
@@ -21,7 +22,8 @@ struct TerminalWorkspaceView: View {
                                 feed(data)
                             }
                         }
-                    }
+                    },
+                    focusToken: focusToken
                 )
                 .id(id)
                 .onAppear {
@@ -33,7 +35,7 @@ struct TerminalWorkspaceView: View {
                     systemImage: "apple.terminal",
                     description: Text("Open a terminal on the desktop, or start a new one here.")
                 )
-                if session.workspace == .conversation {
+                if session.workspace == .conversation || session.workspace == .project {
                     Button {
                         Task { await spawnTerminal() }
                     } label: {
@@ -45,39 +47,35 @@ struct TerminalWorkspaceView: View {
                     .padding(.bottom, 24)
                 }
             }
-            shortcuts
+            TerminalInputDock(
+                isEnabled: session.terminals.activeId != nil,
+                onSend: { text in
+                    Task { await session.terminals.write(text) }
+                },
+                onFocusTerminal: {
+                    focusToken &+= 1
+                }
+            )
         }
-    }
-
-    private var shortcuts: some View {
-        HStack(spacing: 8) {
-            shortcut("Esc", "\u{1b}")
-            shortcut("Tab", "\t")
-            shortcut("⌃C", "\u{3}")
-            shortcut("⌃D", "\u{4}")
-            shortcut("↑", "\u{1b}[A")
-            shortcut("↓", "\u{1b}[B")
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
-        .background(.ultraThinMaterial)
-    }
-
-    private func shortcut(_ title: String, _ payload: String) -> some View {
-        Button(title) {
-            Task { await session.terminals.write(payload) }
-        }
-        .buttonStyle(.bordered)
-        .controlSize(.small)
-        .disabled(session.terminals.activeId == nil)
     }
 
     private func spawnTerminal() async {
-        guard let conversation = session.conversations.active else { return }
-        await session.terminals.spawn(
-            conversationId: conversation.id,
-            projectId: conversation.projectId
-        )
+        switch session.workspace {
+        case .conversation:
+            guard let conversation = session.conversations.active else { return }
+            await session.terminals.spawn(
+                conversationId: conversation.id,
+                projectId: conversation.projectId
+            )
+        case .project:
+            guard let project = session.projects.active else { return }
+            await session.terminals.spawn(
+                conversationId: nil,
+                projectId: project.id
+            )
+        case .home:
+            return
+        }
         if let id = session.terminals.activeId {
             await session.revealTerminal(id)
         }

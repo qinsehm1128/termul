@@ -199,9 +199,19 @@ persistence path and wire format.
 ## Web Terminal WebSocket
 
 `GET /terminal/ws` upgrades to the browser terminal transport and is isolated
-from ACP `/ws`. The shared-live and standalone-server routers require an
-authenticated bearer principal with `Mutate` capability and validate the
-request origin before upgrading.
+from ACP `/ws`. The shared-live and standalone-server routers validate the
+request Origin before upgrading. A handshake `Authorization: Bearer` header is
+optional: browsers and some mobile WebSocket stacks cannot send it. When the
+header is missing, the first frame must be `authenticate` with
+`{ "token": "<access token>" }` (same credential as ACP `/ws`). A valid
+handshake bearer still admits the connection immediately. Later operations
+require a `Mutate` principal.
+
+`GET /conversations/{conversationId}/binding` returns the current replaceable
+ACP binding for that Conversation (`{ conversationId, binding }`). `binding` is
+`null` when the Conversation exists but has no current agent session. The same
+snapshot is available over ACP `/ws` as `get_conversation_binding` and on
+desktop as `conversation_get_binding`.
 
 Client request envelope:
 

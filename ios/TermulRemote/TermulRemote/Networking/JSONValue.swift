@@ -44,9 +44,37 @@ enum JSONValue: Sendable, Codable, Hashable {
         return nil
     }
 
+    /// String form of a JSON scalar (`true` / `1` / `"opus"`). Objects and arrays are ignored.
+    var scalarString: String? {
+        switch self {
+        case .string(let value):
+            value
+        case .bool(let value):
+            value ? "true" : "false"
+        case .number(let value):
+            value.rounded() == value ? String(Int(value)) : String(value)
+        default:
+            nil
+        }
+    }
+
     var object: [String: JSONValue]? {
         if case .object(let value) = self { return value }
         return nil
+    }
+
+    var array: [JSONValue]? {
+        if case .array(let value) = self { return value }
+        return nil
+    }
+
+    var stringArray: [String] {
+        array?.compactMap(\.string) ?? []
+    }
+
+    var stringMap: [String: String] {
+        guard let object else { return [:] }
+        return object.compactMapValues(\.string)
     }
 
     func decode<T: Decodable>(_ type: T.Type) throws -> T {

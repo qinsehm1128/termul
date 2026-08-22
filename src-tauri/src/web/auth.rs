@@ -176,8 +176,7 @@ impl RemoteRouteClass {
     fn capability(self, method: &Method) -> Option<RemoteCapability> {
         match self {
             Self::Health => None,
-            Self::AcpWebSocket => Some(RemoteCapability::Connect),
-            Self::TerminalWebSocket => Some(RemoteCapability::Mutate),
+            Self::AcpWebSocket | Self::TerminalWebSocket => Some(RemoteCapability::Connect),
             Self::Recovery => Some(RemoteCapability::RecoveryInspect),
             _ if *method == Method::GET => Some(RemoteCapability::Read),
             _ => Some(RemoteCapability::Mutate),
@@ -185,7 +184,10 @@ impl RemoteRouteClass {
     }
 
     fn requires_http_bearer(self) -> bool {
-        !matches!(self, Self::Health | Self::AcpWebSocket)
+        !matches!(
+            self,
+            Self::Health | Self::AcpWebSocket | Self::TerminalWebSocket
+        )
     }
 
     /// Compatibility fallback for focused routers outside `web::router`.
@@ -334,12 +336,27 @@ struct CredentialState {
     generation: u64,
     digest: Option<[u8; 32]>,
     source: RemoteAuthoritySource,
-    desktop_keyring_account: Option<String>,
+}
+
+/// Distinguishes a real client address from traffic that terminated on loopback
+/// (cloudflared / frpc / ssh -R). Those peers all appear as 127.0.0.1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FailureIdentity {
+    Direct(IpAddr),
+    Proxied,
+}
+
+fn failure_identity(peer: IpAddr) -> FailureIdentity {
+    if peer.is_loopback() {
+        FailureIdentity::Proxied
+    } else {
+        FailureIdentity::Direct(peer)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct FailureKey {
-    peer: IpAddr,
+    identity: FailureIdentity,
     generation: u64,
 }
 
@@ -457,7 +474,6 @@ impl RemoteAccessAuthority {
                 generation: 0,
                 digest: None,
                 source: RemoteAuthoritySource::Unconfigured,
-                desktop_keyring_account: None,
             }),
             allowed_origins: RwLock::new(HashSet::new()),
             failures: Mutex::new(FailureLimiter::default()),
@@ -466,65 +482,25 @@ impl RemoteAccessAuthority {
         }
     }
 
-    /// Load the desktop credential from the OS keyring, or issue and persist a
-    /// 256-bit credential when the entry does not exist. The returned token is
-    /// for the immediate pairing URL only; the authority stores its digest.
-    pub fn issue_or_load_desktop(keyring_account: &str) -> Result<(Self, String), RemoteAuthError> {
-        if keyring_account.trim().is_empty() {
-            return Err(RemoteAuthError::Provisioning);
+    /// Desktop pairing credentials persist in Preferences → Remote Access
+    /// (`secrets.json`). Digest is empty until
+    /// [`Self::adopt_or_issue_desktop_credential`].
+    pub fn desktop_memory() -> Self {
+        let (generation_tx, _generation_rx) = watch::channel(RemoteGenerationState {
+            generation: 0,
+            active: false,
+        });
+        Self {
+            credential: RwLock::new(CredentialState {
+                generation: 0,
+                digest: None,
+                source: RemoteAuthoritySource::DesktopKeyring,
+            }),
+            allowed_origins: RwLock::new(HashSet::new()),
+            failures: Mutex::new(FailureLimiter::default()),
+            ingress: RwLock::new(IngressProvenance::LocalOperator),
+            generation_tx,
         }
-        let (token, issued) = match crate::secure_storage::keyring_get(keyring_account) {
-            Ok(Some(token)) => (token, false),
-            Ok(None) => {
-                let token = generate_token().inspect_err(|error| {
-                    log::error!(
-                        target: "termul::web::auth",
-                        "operation=generate_credential authority_source={} stable_code={}",
-                        RemoteAuthoritySource::DesktopKeyring.as_str(),
-                        error.code()
-                    );
-                })?;
-                crate::secure_storage::keyring_set(keyring_account, &token).map_err(|_| {
-                    log::error!(
-                        target: "termul::web::auth",
-                        "operation=keyring_set authority_source={} stable_code={}",
-                        RemoteAuthoritySource::DesktopKeyring.as_str(),
-                        RemoteAuthError::Provisioning.code()
-                    );
-                    RemoteAuthError::Provisioning
-                })?;
-                (token, true)
-            }
-            Err(_) => {
-                log::error!(
-                    target: "termul::web::auth",
-                    "operation=keyring_get authority_source={} stable_code={}",
-                    RemoteAuthoritySource::DesktopKeyring.as_str(),
-                    RemoteAuthError::Provisioning.code()
-                );
-                return Err(RemoteAuthError::Provisioning);
-            }
-        };
-        validate_token(&token).inspect_err(|error| {
-            log::error!(
-                target: "termul::web::auth",
-                "operation=validate_credential authority_source={} stable_code={}",
-                RemoteAuthoritySource::DesktopKeyring.as_str(),
-                error.code()
-            );
-        })?;
-        let authority = Self::from_token(
-            &token,
-            RemoteAuthoritySource::DesktopKeyring,
-            Some(keyring_account.to_string()),
-        );
-        log::info!(
-            target: "termul::web::auth",
-            "operation=authority_ready authority_source={} generation=1 provisioned={} stable_code=OK",
-            RemoteAuthoritySource::DesktopKeyring.as_str(),
-            issued
-        );
-        Ok((authority, token))
     }
 
     /// Load a standalone credential from one securely opened operator-owned
@@ -547,7 +523,7 @@ impl RemoteAccessAuthority {
                 error.code()
             );
         })?;
-        let authority = Self::from_token(&token, RemoteAuthoritySource::OperatorTokenFile, None);
+        let authority = Self::from_token(&token, RemoteAuthoritySource::OperatorTokenFile);
         log::info!(
             target: "termul::web::auth",
             "operation=authority_ready authority_source={} stable_code=OK",
@@ -556,11 +532,7 @@ impl RemoteAccessAuthority {
         Ok(authority)
     }
 
-    fn from_token(
-        token: &str,
-        source: RemoteAuthoritySource,
-        desktop_keyring_account: Option<String>,
-    ) -> Self {
+    fn from_token(token: &str, source: RemoteAuthoritySource) -> Self {
         let (generation_tx, _generation_rx) = watch::channel(RemoteGenerationState {
             generation: 1,
             active: true,
@@ -570,7 +542,6 @@ impl RemoteAccessAuthority {
                 generation: 1,
                 digest: Some(digest(token.as_bytes())),
                 source,
-                desktop_keyring_account,
             }),
             allowed_origins: RwLock::new(HashSet::new()),
             failures: Mutex::new(FailureLimiter::default()),
@@ -581,16 +552,7 @@ impl RemoteAccessAuthority {
 
     #[cfg(test)]
     pub(crate) fn for_tests(token: &str) -> Self {
-        Self::from_token(token, RemoteAuthoritySource::Test, None)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_desktop_keyring_tests(token: &str, account: &str) -> Self {
-        Self::from_token(
-            token,
-            RemoteAuthoritySource::DesktopKeyring,
-            Some(account.to_string()),
-        )
+        Self::from_token(token, RemoteAuthoritySource::Test)
     }
 
     pub fn set_ingress_provenance(&self, provenance: IngressProvenance) {
@@ -633,22 +595,7 @@ impl RemoteAccessAuthority {
             .checked_add(1)
             .ok_or(RemoteAuthError::Provisioning)?;
         match credential.source {
-            RemoteAuthoritySource::DesktopKeyring => {
-                let account = credential
-                    .desktop_keyring_account
-                    .as_deref()
-                    .ok_or(RemoteAuthError::Provisioning)?;
-                crate::secure_storage::keyring_set(account, &bearer).map_err(|_| {
-                    log::error!(
-                        target: "termul::web::auth",
-                        "operation=rotate_keyring_set authority_source={} stable_code={}",
-                        RemoteAuthoritySource::DesktopKeyring.as_str(),
-                        RemoteAuthError::Provisioning.code()
-                    );
-                    RemoteAuthError::Provisioning
-                })?;
-            }
-            RemoteAuthoritySource::Test => {}
+            RemoteAuthoritySource::DesktopKeyring | RemoteAuthoritySource::Test => {}
             RemoteAuthoritySource::OperatorTokenFile | RemoteAuthoritySource::Unconfigured => {
                 return Err(RemoteAuthError::Provisioning);
             }
@@ -670,6 +617,67 @@ impl RemoteAccessAuthority {
             generation
         );
         Ok(DesktopCredentialLease { generation, bearer })
+    }
+
+    /// Reuse the settings-file pairing bearer when present; otherwise issue a
+    /// new generation. `issued` is true only when this call minted a new token.
+    pub fn adopt_or_issue_desktop_credential(
+        &self,
+        stored_bearer: Option<&str>,
+    ) -> Result<(DesktopCredentialLease, bool), RemoteAuthError> {
+        let source = self.credential.read().source;
+        match source {
+            RemoteAuthoritySource::Test => {
+                return Ok((self.rotate_desktop_credential()?, true));
+            }
+            RemoteAuthoritySource::DesktopKeyring => {}
+            RemoteAuthoritySource::OperatorTokenFile | RemoteAuthoritySource::Unconfigured => {
+                return Err(RemoteAuthError::Provisioning);
+            }
+        }
+        if let Some(token) = stored_bearer {
+            if validate_token(token).is_ok() {
+                let candidate = digest(token.as_bytes());
+                let (generation, changed) = {
+                    let mut credential = self.credential.write();
+                    if credential.digest == Some(candidate) {
+                        (credential.generation, false)
+                    } else {
+                        let generation = if credential.generation == 0 {
+                            1
+                        } else {
+                            credential
+                                .generation
+                                .checked_add(1)
+                                .ok_or(RemoteAuthError::Provisioning)?
+                        };
+                        credential.generation = generation;
+                        credential.digest = Some(candidate);
+                        (generation, true)
+                    }
+                };
+                if changed {
+                    let _ = self.generation_tx.send(RemoteGenerationState {
+                        generation,
+                        active: true,
+                    });
+                }
+                log::info!(
+                    target: "termul::web::auth",
+                    "operation=credential_adopt authority_source={} generation={} issued=false stable_code=OK",
+                    RemoteAuthoritySource::DesktopKeyring.as_str(),
+                    generation
+                );
+                return Ok((
+                    DesktopCredentialLease {
+                        generation,
+                        bearer: token.to_string(),
+                    },
+                    false,
+                ));
+            }
+        }
+        Ok((self.rotate_desktop_credential()?, true))
     }
 
     /// Invalidate only the named generation. A stale compensation path cannot
@@ -700,21 +708,16 @@ impl RemoteAccessAuthority {
     }
 
     /// Retire a desktop generation completely. Digest, Origins, failure state,
-    /// and generation observers are always retired first; keyring deletion is
-    /// attempted afterwards and reported with one stable account-free code.
+    /// and generation observers are cleared; pairing persistence is owned by
+    /// the host settings file, not the OS keyring.
     #[must_use]
     pub fn retire_generation(&self, generation: u64) -> GenerationRetirementReceipt {
-        let (generation_matched, credential_invalidated, keyring_account) = {
+        let (generation_matched, credential_invalidated) = {
             let mut credential = self.credential.write();
             if credential.generation == generation {
-                let invalidated = credential.digest.take().is_some();
-                (
-                    true,
-                    invalidated,
-                    credential.desktop_keyring_account.clone(),
-                )
+                (true, credential.digest.take().is_some())
             } else {
-                (false, false, None)
+                (false, false)
             }
         };
         let origins_cleared = {
@@ -731,48 +734,19 @@ impl RemoteAccessAuthority {
             });
         }
 
-        let mut stable_codes = Vec::new();
-        let keyring_receipt = match keyring_account {
-            Some(account) => crate::secure_storage::keyring_delete_with_receipt(&account),
-            None => crate::secure_storage::KeyringDeleteReceipt {
-                deleted: true,
-                retry_owner: false,
-                stable_code: None,
-            },
-        };
-        let keyring_deleted = keyring_receipt.deleted;
-        if !keyring_deleted {
-            if let Some(code) = keyring_receipt.stable_code {
-                stable_codes.push(code);
-            }
-        }
-        let retry_owner = keyring_receipt.retry_owner;
-        let stable_code = stable_codes.first().copied().unwrap_or("OK");
-        if stable_codes.is_empty() {
-            log::info!(
-                target: "termul::web::auth",
-                "operation=generation_retire generation={} lifecycle_phase=retire stable_code={} keyring_deleted={}",
-                generation,
-                stable_code,
-                keyring_deleted
-            );
-        } else {
-            log::error!(
-                target: "termul::web::auth",
-                "operation=generation_retire generation={} lifecycle_phase=retire stable_code={} keyring_deleted={}",
-                generation,
-                stable_code,
-                keyring_deleted
-            );
-        }
+        log::info!(
+            target: "termul::web::auth",
+            "operation=generation_retire generation={} lifecycle_phase=retire stable_code=OK keyring_deleted=true",
+            generation
+        );
         GenerationRetirementReceipt {
             generation,
             credential_invalidated,
             origins_cleared,
             failure_state_cleared,
-            keyring_deleted,
-            retry_owner,
-            stable_codes,
+            keyring_deleted: true,
+            retry_owner: false,
+            stable_codes: Vec::new(),
         }
     }
 
@@ -790,9 +764,6 @@ impl RemoteAccessAuthority {
             .ok_or(RemoteAuthError::Provisioning)?;
         credential.digest = Some(digest(token.as_bytes()));
         credential.source = source;
-        if source != RemoteAuthoritySource::DesktopKeyring {
-            credential.desktop_keyring_account = None;
-        }
         let generation = credential.generation;
         drop(credential);
         *self.failures.lock() = FailureLimiter::default();
@@ -927,10 +898,13 @@ impl RemoteAccessAuthority {
                     }
                     credential.generation
                 };
-                let reported = self
-                    .failures
-                    .lock()
-                    .record_failure(FailureKey { peer, generation }, now);
+                let reported = self.failures.lock().record_failure(
+                    FailureKey {
+                        identity: failure_identity(peer),
+                        generation,
+                    },
+                    now,
+                );
                 log::warn!(
                     target: "termul::web::auth",
                     "operation=bearer_verify generation={} auth_class=bearer stable_code={}",
@@ -1414,9 +1388,18 @@ pub async fn capability_middleware(
         .unwrap_or_else(|| authority.ingress_provenance());
     let started = Instant::now();
 
-    // ACP WebSocket bearer authentication occurs in its first protocol frame;
-    // this HTTP boundary records only identifier-free route metadata.
+    // ACP and terminal WebSocket bearer authentication occur in the first
+    // protocol frame; this HTTP boundary records only identifier-free route
+    // metadata. Optional handshake Authorization is still honored by the
+    // upgrade handlers when a client can send it.
     if !route_class.requires_http_bearer() {
+        if route_class == RemoteRouteClass::TerminalWebSocket {
+            if let Some(response) =
+                reject_invalid_optional_terminal_bearer(&authority, &request, provenance, started)
+            {
+                return response;
+            }
+        }
         let response = next.run(request).await;
         let stable_code = if response.status().is_success()
             || response.status() == StatusCode::SWITCHING_PROTOCOLS
@@ -1506,6 +1489,53 @@ pub async fn capability_middleware(
         started.elapsed(),
     );
     response
+}
+
+fn reject_invalid_optional_terminal_bearer(
+    authority: &RemoteAccessAuthority,
+    request: &Request<Body>,
+    provenance: IngressProvenance,
+    started: Instant,
+) -> Option<Response> {
+    let token = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|token| !token.is_empty())?;
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map_or(IpAddr::from([0, 0, 0, 0]), |value| value.0.ip());
+    match authority.verify_bearer_for_peer(token, peer) {
+        Ok(principal) => {
+            if let Err(error) = authority.authorize(&principal, RemoteCapability::Mutate) {
+                log_boundary_outcome(
+                    request.method(),
+                    RemoteRouteClass::TerminalWebSocket,
+                    RemoteCapability::Mutate,
+                    provenance,
+                    error.code(),
+                    error.status(),
+                    started.elapsed(),
+                );
+                return Some(auth_error_response(error));
+            }
+            None
+        }
+        Err(error) => {
+            log_boundary_outcome(
+                request.method(),
+                RemoteRouteClass::TerminalWebSocket,
+                RemoteCapability::Mutate,
+                provenance,
+                error.code(),
+                error.status(),
+                started.elapsed(),
+            );
+            Some(auth_error_response(error))
+        }
+    }
 }
 
 fn log_boundary_outcome(
@@ -1776,6 +1806,34 @@ mod tests {
     }
 
     #[test]
+    fn lan_peer_failures_do_not_share_the_proxied_loopback_bucket() {
+        let authority = authority();
+        let loopback = IpAddr::from([127, 0, 0, 1]);
+        let lan_a = IpAddr::from([10, 0, 0, 5]);
+        let lan_b = IpAddr::from([10, 0, 0, 6]);
+        for _ in 0..FAILURE_LIMIT {
+            assert_eq!(
+                authority
+                    .verify_bearer_for_peer("wrong", loopback)
+                    .unwrap_err(),
+                RemoteAuthError::InvalidCredential
+            );
+        }
+        assert_eq!(
+            authority
+                .verify_bearer_for_peer("wrong", loopback)
+                .unwrap_err(),
+            RemoteAuthError::RateLimited
+        );
+        assert_eq!(
+            authority.verify_bearer_for_peer("wrong", lan_a).unwrap_err(),
+            RemoteAuthError::InvalidCredential
+        );
+        assert!(authority.verify_bearer_for_peer(TOKEN, lan_a).is_ok());
+        assert!(authority.verify_bearer_for_peer(TOKEN, lan_b).is_ok());
+    }
+
+    #[test]
     fn forged_proxy_failures_rate_limit_invalid_tokens_but_never_the_valid_bearer() {
         let authority = authority();
         let peer = IpAddr::from([127, 0, 0, 1]);
@@ -1988,29 +2046,39 @@ mod tests {
     }
 
     #[test]
-    fn generation_retirement_reports_sanitized_keyring_failure_and_revokes_state() {
-        let authority = RemoteAccessAuthority::from_token(
-            TOKEN,
-            RemoteAuthoritySource::DesktopKeyring,
-            Some("opaque-test-account".to_string()),
-        );
+    fn generation_retirement_revokes_digest_without_touching_keyring() {
+        let authority = RemoteAccessAuthority::from_token(TOKEN, RemoteAuthoritySource::DesktopKeyring);
         authority
             .set_public_origin(Url::parse("https://retire.example.test").unwrap())
             .unwrap();
-        crate::secure_storage::fail_next_keyring_deletes_for_tests(1);
         let receipt = authority.retire_generation(1);
         assert!(receipt.credential_invalidated);
         assert!(receipt.origins_cleared);
         assert!(receipt.failure_state_cleared);
-        assert!(!receipt.keyring_deleted);
-        assert_eq!(
-            receipt.stable_codes,
-            [crate::secure_storage::KEYRING_DELETE_FAILED]
-        );
+        assert!(receipt.keyring_deleted);
+        assert!(receipt.stable_codes.is_empty());
         assert_eq!(
             authority.verify_bearer(TOKEN).unwrap_err(),
             RemoteAuthError::InvalidCredential
         );
+    }
+
+    #[test]
+    fn adopt_reuses_settings_bearer_and_issue_mints_when_absent() {
+        let authority = RemoteAccessAuthority::desktop_memory();
+        let minted = generate_token().unwrap();
+        let (first, issued) = authority
+            .adopt_or_issue_desktop_credential(Some(&minted))
+            .unwrap();
+        assert!(!issued);
+        assert_eq!(first.bearer(), minted);
+        assert!(authority.verify_bearer(&minted).is_ok());
+
+        let empty = RemoteAccessAuthority::desktop_memory();
+        let (second, issued) = empty.adopt_or_issue_desktop_credential(None).unwrap();
+        assert!(issued);
+        assert_ne!(second.bearer(), minted);
+        assert!(empty.verify_bearer(second.bearer()).is_ok());
     }
 
     fn protected_test_router(authority: Arc<RemoteAccessAuthority>) -> axum::Router {

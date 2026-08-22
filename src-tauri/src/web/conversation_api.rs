@@ -73,6 +73,24 @@ pub async fn get(
     respond(result)
 }
 
+pub async fn current_binding(
+    State(state): State<AppState>,
+    Path(conversation_id): Path<String>,
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    Extension(principal): Extension<RemotePrincipal>,
+) -> impl IntoResponse {
+    let result = require(&authority, &principal, RemoteCapability::Read)
+        .and_then(|()| parse_id(&conversation_id))
+        .and_then(|conversation_id| {
+            service(&state).and_then(|service| {
+                service
+                    .current_binding(conversation_id)
+                    .map_err(|error| (error.code, error.detail))
+            })
+        });
+    respond(result)
+}
+
 pub async fn open(
     State(state): State<AppState>,
     Path(conversation_id): Path<String>,
@@ -96,7 +114,7 @@ pub async fn open(
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct RenameRequest {
+pub struct RenameRequest {
     title: String,
 }
 
@@ -347,8 +365,9 @@ fn respond<T: Serialize>(result: Result<T, (String, String)>) -> (StatusCode, Js
 mod tests {
     use super::*;
     use crate::conversation::contracts::{
-        parse_created_at_utc, ConversationCreator, ConversationLifecycleState,
-        ConversationRecordV2, CreationPartition, ExecutionTarget, CONVERSATION_SCHEMA_VERSION,
+        parse_created_at_utc, AgentSessionBinding, AgentSessionBindingState, ConversationCreator,
+        ConversationLifecycleState, ConversationRecordV2, CreationPartition, ExecutionTarget,
+        AGENT_SESSION_BINDING_SCHEMA_VERSION, CONVERSATION_SCHEMA_VERSION,
     };
     use crate::conversation::migration::{
         CreatedAtSource, IdentityDecision, MigrationHostMode, MigrationMapEntryV1, MigrationMapV1,
@@ -459,6 +478,99 @@ mod tests {
         (temp, state)
     }
 
+    async fn state_with_bound_session() -> (tempfile::TempDir, AppState) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("state/conversations/v2");
+        let (repository, _) = ConversationRepository::open(root).unwrap();
+        let writer = ConversationWriter::for_test(Arc::clone(&repository));
+        let id = ConversationId::parse(ID).unwrap();
+        let created_at = parse_created_at_utc("2026-08-15T09:45:15.123Z").unwrap();
+        writer
+            .create_conversation(
+                ConversationRecordV2 {
+                    schema_version: CONVERSATION_SCHEMA_VERSION,
+                    conversation_id: id,
+                    created_at_utc: created_at,
+                    creation_partition: CreationPartition::from_created_at(created_at),
+                    workspace_cwd: "/visible/conversation".to_string(),
+                    execution_target: ExecutionTarget::Workspace,
+                    project_attachment: None,
+                    lifecycle_state: ConversationLifecycleState::Ready,
+                    last_seq: 0,
+                    created_by: ConversationCreator::Termul,
+                    title: None,
+                    title_source: None,
+                },
+                ConversationMutation::CreateConversation,
+            )
+            .await
+            .unwrap();
+        writer
+            .bind_agent_session(
+                id,
+                AgentSessionBinding {
+                    schema_version: AGENT_SESSION_BINDING_SCHEMA_VERSION,
+                    binding_id: Uuid::new_v4(),
+                    agent_session_id: "opaque/phone-binding".to_string(),
+                    runtime_agent_id: "claude-acp".to_string(),
+                    stable_agent_namespace: "config:acp-registry:claude-acp".to_string(),
+                    execution_cwd: "/visible/conversation".to_string(),
+                    bound_at_utc: created_at,
+                    state: AgentSessionBindingState::Active,
+                },
+                created_at,
+            )
+            .await
+            .unwrap();
+        let reader = Arc::new(ConversationReader::new(
+            Arc::clone(&repository),
+            LegacyConversationReader::default(),
+            ReaderPrecedence::ConversationV2Only,
+        ));
+        let map = MigrationMapV1 {
+            schema_version: MIGRATION_MAP_SCHEMA_VERSION,
+            operation_id: Uuid::new_v4(),
+            entries: vec![],
+        };
+        let workspace = Arc::new(SessionWorkspaceService::new(Arc::clone(&writer)));
+        let conversation = Arc::new(ConversationApplicationService::new(
+            reader,
+            writer,
+            workspace,
+            &map,
+            MigrationHostMode::Standalone,
+            MigrationPhase::Finalized,
+            ReaderPrecedence::ConversationV2Only,
+        ));
+        let pty = crate::web::test_pty_manager();
+        (
+            temp,
+            AppState {
+                acp: Arc::new(crate::acp::AcpManager::new(vec![])),
+                terminal_events: pty.terminal_events(),
+                cwd_tracker: pty.cwd_tracker(),
+                git_tracker: pty.git_tracker(),
+                exit_code_tracker: pty.exit_code_tracker(),
+                pty,
+                relay: Arc::new(crate::web::sink::WsRelaySink::new()),
+                registry: Arc::new(crate::web::ProjectRegistry::new()),
+                registry_persistence: None,
+                projects_file: None,
+                history_mode: HistoryMode::LiveOnly,
+                conversation: Some(conversation),
+                workspace_manifest: None,
+                acp_catalog: None,
+                acp_install: None,
+                store: None,
+                project_root: Arc::new(parking_lot::RwLock::new(std::env::temp_dir())),
+            },
+        )
+    }
+
     fn app(state: AppState) -> axum::Router {
         let authority = Arc::new(RemoteAccessAuthority::for_tests("conversation-api-token"));
         let principal = authority.verify_bearer("conversation-api-token").unwrap();
@@ -467,6 +579,10 @@ mod tests {
             .route("/conversations", get(list))
             .route("/conversations/resolve-legacy", post(resolve_legacy))
             .route("/conversations/{conversationId}", get(super::get))
+            .route(
+                "/conversations/{conversationId}/binding",
+                get(super::current_binding),
+            )
             .route("/conversations/{conversationId}/open", post(open))
             .route("/conversation-recovery/resolve", post(resolve_recovery))
             .with_state(state)
@@ -499,6 +615,23 @@ mod tests {
         assert!(list_body.success);
         assert_eq!(list_body.data.unwrap()[0].conversation_id.to_string(), ID);
 
+        let binding_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/conversations/{ID}/binding"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let binding_body: IpcBody<crate::conversation::ConversationBindingSnapshot> =
+            json(binding_response).await;
+        assert!(binding_body.success);
+        let snapshot = binding_body.data.unwrap();
+        assert_eq!(snapshot.conversation_id.to_string(), ID);
+        assert!(snapshot.binding.is_none());
+
         for (source_kind, value) in [
             ("legacyStorageKey", "storage-one"),
             ("legacyAgentSessionId", "agent-session-one"),
@@ -526,6 +659,27 @@ mod tests {
             assert!(body.success);
             assert_eq!(body.data.unwrap().canonical_route, format!("#/c/{ID}"));
         }
+    }
+
+    #[tokio::test]
+    async fn current_binding_returns_active_agent_session() {
+        let (_temp, state) = state_with_bound_session().await;
+        let response = app(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/conversations/{ID}/binding"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: IpcBody<crate::conversation::ConversationBindingSnapshot> = json(response).await;
+        assert!(body.success);
+        let snapshot = body.data.unwrap();
+        assert_eq!(snapshot.conversation_id.to_string(), ID);
+        let binding = snapshot.binding.expect("active binding");
+        assert_eq!(binding.agent_session_id, "opaque/phone-binding");
+        assert_eq!(binding.runtime_agent_id, "claude-acp");
     }
 
     fn seed_recovery(repository: &ConversationRepository) -> RecoveryItemV1 {

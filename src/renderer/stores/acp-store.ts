@@ -134,7 +134,7 @@ import {
 } from '@/lib/agents/acp-spawn-errors'
 import { persistenceApi } from '@/lib/api'
 import { deleteSessionTempFiles } from '@/lib/attachment-temp-cleanup'
-import { resolveConversationSessionId } from '@/lib/conversation-binding'
+import { fetchHostBoundSession, resolveConversationSessionId } from '@/lib/conversation-binding'
 import {
   hydrateComposerControls,
   persistConversationComposer,
@@ -4226,7 +4226,6 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     const trimmedCwd = cwd.trim()
     const config = get().agentConfigs.find((c) => c.id === configId)
     if (!config) throw new Error(`unknown agent config ${configId}`)
-    let predecessorId: string | null = null
     if (opts?.conversationId) {
       try {
         await get().loadSessionIndex()
@@ -4248,9 +4247,38 @@ export const useAcpStore = create<AcpState>((set, get) => ({
           get().setActiveSession(existing)
           return existing
         }
-        // History-only / local reopen: keep the transcript, then create a live
-        // session so the composer (model, pi, modes) is available again.
-        predecessorId = existing
+        // History-only / local reopen: keep the existing bound session. Do not
+        // mint a replacement unless the operator starts a new chat.
+        get().setActiveSession(existing)
+        void logFrontendError({
+          level: 'warn',
+          source: 'acp.startChat.continueLocalBinding',
+          message: `conversationId=${opts.conversationId}`
+        })
+        return existing
+      }
+      const hostBound = await fetchHostBoundSession(opts.conversationId)
+      if (hostBound) {
+        if (hostBound.sessionId !== existing) {
+          if (!opts.skipHistoryReopen) {
+            try {
+              await get().openHistorySession(hostBound.sessionId)
+            } catch {
+              // History may already be in the local cache.
+            }
+          }
+        }
+        const afterHost = get().sessions[hostBound.sessionId]
+        get().setActiveSession(hostBound.sessionId)
+        void logFrontendError({
+          level: 'warn',
+          source: 'acp.startChat.continueHostBinding',
+          message: `conversationId=${opts.conversationId}`
+        })
+        if (afterHost && afterHost.status !== 'closed') {
+          return hostBound.sessionId
+        }
+        return hostBound.sessionId
       }
     }
     const key = prepareChatKey(configId, trimmedCwd, mcpServers)
@@ -4287,13 +4315,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     }
     const agentId = await ensureLiveAgent(get, set, configId, trimmedCwd)
     if (!agentId) throw new Error(`failed to spawn agent for config ${configId}`)
-    const created = await get().createSession(agentId, trimmedCwd, mcpServers, projectId, opts)
-    if (predecessorId && created !== predecessorId) {
-      copyClosedSessionTranscript(predecessorId, created, get, set)
-      collapseClosedPredecessor(predecessorId, created, opts?.conversationId, get, set)
-      persistSession(get(), created, (entries) => set({ sessionIndex: entries }))
-    }
-    return created
+    return get().createSession(agentId, trimmedCwd, mcpServers, projectId, opts)
   },
 
   claimPreparedChat: (key, projectId) => {
@@ -4906,7 +4928,6 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     set((state) => ({
       launchingSessionIds: { ...state.launchingSessionIds, [sessionId]: true }
     }))
-    let created = sessionId
     try {
       try {
         await get().openHistorySession(sessionId, {
@@ -4927,40 +4948,31 @@ export const useAcpStore = create<AcpState>((set, get) => ({
         return sessionId
       }
       const context = reconnectContext(get, sessionId)
-      if (!context.conversationId || !context.configId || !context.cwd) {
-        throw Object.assign(new Error('reconnect requires agent config and workspace'), {
-          code: 'ACP_RECONNECT_MISSING_CONTEXT'
-        })
-      }
-      const snapshot = await readComposerSnapshotForSession({
-        conversationId: context.conversationId,
-        agentConfigId: context.configId
-      })
-      created = await get().startChat(context.configId, context.cwd, undefined, context.projectId, {
-        conversationId: context.conversationId,
-        skipHistoryReopen: true
-      })
-      const live = get().sessions[created]
-      if (!live || live.status === 'closed') {
-        throw Object.assign(new Error('reconnect failed'), { code: 'ACP_RECONNECT_FAILED' })
-      }
-      if (snapshot) {
-        try {
-          await get().applyPendingLauncherOptions(created, {
-            modelId: snapshot.modelId,
-            modeId: snapshot.modeId,
-            configValues: snapshot.configValues ?? {}
-          })
-        } catch (error) {
-          void logFrontendError({
-            level: 'warn',
-            source: 'acp.reconnectClosedSession.composer',
-            message: `sessionId=${created} ${error instanceof Error ? error.message : String(error)}`
-          })
+      if (context.conversationId) {
+        const hostBound = await fetchHostBoundSession(context.conversationId)
+        if (hostBound?.sessionId && hostBound.sessionId !== sessionId) {
+          try {
+            await get().openHistorySession(hostBound.sessionId, {
+              requireLive: true,
+              skipRestorePreload: true
+            })
+          } catch {
+            // Keep the original bound session for history.
+          }
+          const rebound = get().sessions[hostBound.sessionId]
+          if (rebound && rebound.status !== 'closed') {
+            get().setActiveSession(hostBound.sessionId)
+            return hostBound.sessionId
+          }
         }
       }
-      get().setActiveSession(created)
-      return created
+      get().setActiveSession(sessionId)
+      void logFrontendError({
+        level: 'warn',
+        source: 'acp.reconnectClosedSession.continueBinding',
+        message: `sessionId=${sessionId}`
+      })
+      return sessionId
     } catch (error) {
       void logFrontendError({
         level: 'warn',
@@ -4971,10 +4983,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
       throw error
     } finally {
       set((state) => ({
-        launchingSessionIds: dropRecordKey(
-          dropRecordKey(state.launchingSessionIds, sessionId),
-          created
-        )
+        launchingSessionIds: dropRecordKey(state.launchingSessionIds, sessionId)
       }))
     }
   },
@@ -5864,6 +5873,7 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     }),
 
   _onSessionCreated: (e) => {
+    const remoteSession = !get().sessions[e.sessionId]
     set((s) => {
       if (s.sessions[e.sessionId]) {
         // already created via createSession(); enrich with capability data
@@ -5905,6 +5915,16 @@ export const useAcpStore = create<AcpState>((set, get) => ({
     })
     cacheOptionsFromSession(set, get, e.sessionId)
     refreshHostOwnedIndex(get)
+    // Phone/web create_session writes the same Conversation store. Refresh the
+    // desktop sidebar so a session started on the phone appears here live.
+    void useConversationStore.getState().loadConversations()
+    if (remoteSession) {
+      void logFrontendError({
+        level: 'warn',
+        source: 'acp-store.sessionCreated',
+        message: 'Reloading conversation list after remote session_created'
+      })
+    }
   },
 
   _onUserPrompt: (e) =>

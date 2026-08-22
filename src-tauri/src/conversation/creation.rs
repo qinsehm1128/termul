@@ -280,6 +280,18 @@ impl ConversationCreationService {
         &self.writer
     }
 
+    /// Current Active ACP binding, if this Conversation already has one.
+    pub fn active_binding(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Result<Option<AgentSessionBinding>> {
+        let binding = self
+            .repository
+            .current_binding(conversation_id)
+            .map_err(map_repository_error)?;
+        Ok(binding.filter(|value| value.state == AgentSessionBindingState::Active))
+    }
+
     /// Resolve a replacement execution target against an existing Conversation without mutating
     /// its identity, workspace, attachment, metadata revision, or binding history. The lifecycle
     /// service holds the repository Conversation lock while calling this method and commits the
@@ -896,6 +908,10 @@ impl ConversationCreationService {
             .map_err(map_repository_error)?
             .is_some()
         {
+            log::info!(
+                "[conversation-creation] replacing current ACP binding conversation_id={}",
+                conversation_id
+            );
             self.writer
                 .replace_agent_binding(conversation_id, value, bound_at_utc)
                 .await

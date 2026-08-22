@@ -407,6 +407,11 @@ pub async fn serve_router(
         authority
             .set_public_origin(local_origin)
             .map_err(|error| format!("failed to register listener Origin: {error}"))?;
+    } else if addr.ip().is_unspecified() {
+        let loopback_origin = url::Url::parse(&format!("http://127.0.0.1:{}", addr.port()))?;
+        authority
+            .set_public_origin(loopback_origin)
+            .map_err(|error| format!("failed to register listener Origin: {error}"))?;
     }
     info!(
         ingress_provenance = host_ingress_provenance.as_str(),

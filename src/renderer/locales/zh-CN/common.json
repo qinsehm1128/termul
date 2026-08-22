@@ -123,7 +123,18 @@
     "untitled": "未命名对话",
     "loadMore": "再加载 {{count}} 个",
     "recoveryBadge_one": "{{count}} 个恢复项",
-    "recoveryBadge_other": "{{count}} 个恢复项"
+    "recoveryBadge_other": "{{count}} 个恢复项",
+    "shownCount": "已显示 {{shown}} · 共 {{total}}",
+    "revision": "修订 {{count}}",
+    "toggleDetails": "显示会话详情",
+    "detailsWorkspace": "工作区",
+    "detailsState": "状态",
+    "detailsProject": "项目",
+    "rowStatus": {
+      "need": "需要你",
+      "working": "工作中",
+      "idle": "空闲"
+    }
   },
   "conversationRoute": {
     "opening": "正在打开会话…",

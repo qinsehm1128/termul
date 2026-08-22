@@ -322,12 +322,12 @@ pub async fn acp_send_prompt(
     };
     // Ownership is authoritative driver state, not client input. Reject a
     // cross-agent session id before persisting any durable prompt record
-    // (mirrors the WS `send_prompt` handler ordering).
-    match manager.owns_session(&agent_id, session_id.clone()).await {
-        Ok(true) => {}
-        Ok(false) => return Err("session does not belong to the supplied live agent".to_string()),
-        Err(error) => return Err(error),
-    }
+    // (mirrors the WS `send_prompt` handler ordering). Stale spawn UUIDs from
+    // a previous host process are remapped onto the live agent for this
+    // Conversation binding.
+    let agent_id = manager
+        .ensure_session_on_live_agent(&agent_id, &session_id)
+        .await?;
     // Skip backend-ephemeral sessions — they have no durable history and must
     // not produce a sidebar row. Matches the WS handler's ephemeral gate.
     let ephemeral = match manager
@@ -541,6 +541,7 @@ pub async fn acp_list_catalog(
     refresh: Option<bool>,
     store: State<'_, crate::commands::HostAcpCatalogStore>,
     install_store: State<'_, crate::commands::HostAcpInstallStore>,
+    manager: State<'_, Arc<AcpManager>>,
 ) -> Result<crate::commands::IpcResult<crate::acp::AcpCatalog>, String> {
     let refresh = refresh.unwrap_or(false);
     log::info!("[acp-catalog] list start refresh={refresh}");
@@ -553,15 +554,15 @@ pub async fn acp_list_catalog(
     };
     match service.list_catalog(refresh).await {
         Ok(mut catalog) => {
-            // Overlay host-installed state so installed agents report `ready`
-            // with their resolved command/args. The host is the single source
-            // of truth for "is this agent installed" — desktop and web both
-            // see installed agents as ready (the web has no renderer
-            // persistence, so without this it could not reuse a host install).
-            if let Some(install) = install_store.store() {
-                let installed = install.installed_agents();
-                crate::acp::overlay_installed(&mut catalog, &installed);
-            }
+            // Overlay host-installed + live-agent state so desktop, web, and
+            // phone share one catalog: archive installs, PATH vendor CLIs, and
+            // already-spawned agents are all `ready`.
+            let installed = install_store
+                .store()
+                .map(|install| install.installed_agents())
+                .unwrap_or_default();
+            let running = manager.list_running_namespaces();
+            crate::acp::apply_host_catalog_overlays(&mut catalog, &installed, &running);
             log::info!("[acp-catalog] list success agents={}", catalog.agents.len());
             Ok(crate::commands::IpcResult::success(catalog))
         }

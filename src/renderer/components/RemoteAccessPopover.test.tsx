@@ -15,16 +15,23 @@ vi.mock('qrcode.react', () => ({
 const setStatus = vi.fn()
 vi.mock('@/stores/remote-status-store', () => ({
   useRemoteStatus: vi.fn((): RemoteStatus | null => null),
-  useRemoteStatusStore: { getState: () => ({ setStatus }) }
+  useRemoteRestoreError: vi.fn((): string | null => null),
+  useRemoteStatusStore: { getState: () => ({ setStatus, setRestoreError: vi.fn() }) }
 }))
 
 const startMock = vi.fn()
 const stopMock = vi.fn()
+const intentMock = vi.fn()
+const setIntentMock = vi.fn()
+const rotateMock = vi.fn()
 vi.mock('@/lib/api', () => ({
   remoteServerApi: {
     start: (...args: unknown[]) => startMock(...args),
     stop: () => stopMock(),
-    status: vi.fn()
+    status: vi.fn(),
+    intent: (...args: unknown[]) => intentMock(...args),
+    setIntent: (...args: unknown[]) => setIntentMock(...args),
+    rotateCredential: (...args: unknown[]) => rotateMock(...args)
   },
   syncProjects: vi.fn(() => Promise.resolve({ success: true, data: undefined }))
 }))
@@ -107,6 +114,9 @@ async function openPopover(): Promise<HTMLElement> {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  intentMock.mockResolvedValue({ success: true, data: { wanted: false, publishMode: 'tunnel' } })
+  setIntentMock.mockResolvedValue({ success: true, data: { wanted: true, publishMode: 'tunnel' } })
+  rotateMock.mockResolvedValue({ success: true, data: RUNNING })
   vi.mocked(useRemoteStatus).mockReturnValue(null)
   Object.defineProperty(navigator, 'clipboard', {
     configurable: true,
@@ -139,7 +149,7 @@ describe('RemoteAccessPopover', () => {
     expect(screen.queryByText(RAW_CREDENTIAL)).toBeNull()
     expect(document.body.textContent).not.toContain(RAW_CREDENTIAL)
 
-    const copyButton = screen.getByRole('button', { name: 'Copy tunnel link' })
+    const copyButton = screen.getByRole('button', { name: 'Copy access link' })
     await fireEvent.click(copyButton)
     await waitFor(() => expect(clipboardWrite).toHaveBeenCalledWith(RUNNING.accessUrl))
 
@@ -187,7 +197,7 @@ describe('RemoteAccessPopover', () => {
     expect(document.body.textContent).not.toContain(RAW_CREDENTIAL)
     expect(document.body.textContent).not.toContain(NEXT_RAW_CREDENTIAL)
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Copy tunnel link' }))
+    await fireEvent.click(screen.getByRole('button', { name: 'Copy access link' }))
     await waitFor(() => expect(clipboardWrite).toHaveBeenLastCalledWith(RUNNING_AGAIN.accessUrl))
     expect(clipboardWrite).not.toHaveBeenCalledWith(RUNNING.accessUrl)
 
@@ -219,23 +229,45 @@ describe('RemoteAccessPopover', () => {
     expect(screen.queryByTestId('qr')).toBeNull()
   })
 
-  it('starts remote access with no bind-mode arg on toggle on and seeds the web client', async () => {
+  it('starts remote access with the selected publish bind mode and seeds the web client', async () => {
     startMock.mockResolvedValueOnce({ success: true, data: RUNNING })
     renderPopover()
 
     const toggle = await openPopover()
     await fireEvent.click(toggle)
 
-    // start() is called with no bindMode — the tunnel forces localhost.
     await waitFor(() => {
       expect(startMock).toHaveBeenCalledTimes(1)
     })
-    expect(startMock).toHaveBeenCalledWith()
+    expect(startMock).toHaveBeenCalledWith({ bindMode: 'localhost' })
     expect(setStatus).toHaveBeenCalledWith(RUNNING)
     // Project metadata is seeded; chat history is read directly from the
     // durable Rust provider by the desktop-hosted browser.
     await waitFor(() => {
       expect(syncProjects).toHaveBeenCalledTimes(1)
     })
+  })
+
+  it('uses the credentialed LAN URL when local-network publish is selected', async () => {
+    const lanAccess = `http://192.168.1.8:5123/#access_token=${RAW_CREDENTIAL}`
+    intentMock.mockResolvedValue({ success: true, data: { wanted: true, publishMode: 'lan' } })
+    vi.mocked(useRemoteStatus).mockReturnValue({
+      ...RUNNING,
+      bindMode: 'all',
+      bindHost: '0.0.0.0',
+      publishMode: 'lan',
+      lanUrl: 'http://192.168.1.8:5123',
+      lanAccessUrl: lanAccess,
+      accessUrl: lanAccess,
+      tunnelAccessUrl: RUNNING.accessUrl
+    })
+    renderPopover()
+    await openPopover()
+    expect(screen.getByRole('tab', { name: 'Local network' }).getAttribute('aria-selected')).toBe(
+      'true'
+    )
+    expect(screen.getByTestId('qr').getAttribute('data-value')).toBe(lanAccess)
+    expect(document.body.textContent).not.toContain(RAW_CREDENTIAL)
+    expect(screen.getByText('Same Wi-Fi. HTTP plus the secret in the link.')).toBeDefined()
   })
 })

@@ -27,6 +27,8 @@ export interface SpawnTerminalOptions {
   envVars?: Array<{ key: string; value: string; enabled?: boolean }>
   /** Per-project terminal limit. If set, spawns are blocked when the project's terminal count reaches this value. */
   maxTerminalsPerProject?: number
+  /** Extra env merged after project env (e.g. CODEX_HOME). */
+  extraEnv?: Record<string, string>
 }
 
 export interface SpawnTerminalResult {
@@ -96,14 +98,20 @@ export async function spawnTerminalInPane(
     }
 
     // Resolve project env vars for spawn
-    const { env, hasProjectEnv } = resolveEnvForSpawn(options?.envVars ?? project?.envVars, {})
+    const { env: projectEnv, hasProjectEnv } = resolveEnvForSpawn(
+      options?.envVars ?? project?.envVars,
+      {}
+    )
+    const extraEnv = options?.extraEnv ?? {}
+    const env = { ...projectEnv, ...extraEnv }
+    const hasEnv = hasProjectEnv || Object.keys(extraEnv).length > 0
 
     const spawnResult = await terminalApi.spawn({
       shell,
       cwd,
       conversationId,
       projectId,
-      ...(hasProjectEnv ? { env } : {})
+      ...(hasEnv ? { env } : {})
     })
 
     if (!spawnResult.success) {
@@ -116,6 +124,15 @@ export async function spawnTerminalInPane(
             defaultValue: 'Failed to create terminal'
           })
       }
+    }
+
+    const adopted = terminalStore.findTerminalByPtyId?.(spawnResult.data.id)
+    if (adopted) {
+      if (spawnResult.data.claim) {
+        terminalStore.setTerminalClaim(spawnResult.data.id, spawnResult.data.claim)
+      }
+      workspaceStore.ensureTerminalTab?.(adopted.id, paneId, true)
+      return { success: true, terminalId: adopted.id }
     }
 
     // Create terminal record in store

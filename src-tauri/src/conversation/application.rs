@@ -27,8 +27,9 @@ use crate::conversation::session_workspace::{
 };
 use crate::conversation::write_authority::{ConversationMutation, ConversationWriter};
 use crate::conversation::{
-    CompatibilityError, ConversationId, ConversationReader, ConversationRecordV2,
-    CreationPartition, ExecutionTarget, PrepareConversationRequest, ProjectAttachment,
+    AgentSessionBinding, CompatibilityError, ConversationId, ConversationReader,
+    ConversationRecordV2, CreationPartition, ExecutionTarget, PrepareConversationRequest,
+    ProjectAttachment,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -211,6 +212,15 @@ pub struct ConversationHostStatus {
 pub struct ConversationOpenOutcome {
     pub conversation: ConversationRecordV2,
     pub workspace: SessionWorkspaceLoadOutcome,
+}
+
+/// Current replaceable ACP binding for one Conversation. `binding` is null when
+/// the Conversation exists but has no current agent session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConversationBindingSnapshot {
+    pub conversation_id: ConversationId,
+    pub binding: Option<AgentSessionBinding>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -462,6 +472,39 @@ impl ConversationApplicationService {
             self.host_kind,
             code,
             revision,
+            started,
+        );
+        result
+    }
+
+    pub fn current_binding(
+        &self,
+        conversation_id: ConversationId,
+    ) -> Result<ConversationBindingSnapshot> {
+        let started = Instant::now();
+        let result: Result<ConversationBindingSnapshot> = (|| {
+            self.reader
+                .get(conversation_id)
+                .map_err(map_compatibility_error)?;
+            let binding = self
+                .writer
+                .repository()
+                .current_binding(conversation_id)
+                .map_err(map_repository_error)?;
+            Ok(ConversationBindingSnapshot {
+                conversation_id,
+                binding,
+            })
+        })();
+        let code = result
+            .as_ref()
+            .map_or_else(|error| error.code.as_str(), |_| "OK");
+        log_outcome(
+            "get_conversation_binding",
+            Some(conversation_id),
+            self.host_kind,
+            code,
+            None,
             started,
         );
         result

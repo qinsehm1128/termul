@@ -619,6 +619,7 @@ describe('Conversation production transport golden parity', () => {
       getHostStatus: vi.fn(),
       listConversations: vi.fn(async () => ({ success: true as const, data: [] })),
       getConversation: vi.fn(),
+      getCurrentBinding: vi.fn(),
       openConversation: vi.fn(),
       resolveLegacyConversationId: vi.fn(),
       attachProject: vi.fn(),

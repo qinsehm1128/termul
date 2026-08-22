@@ -20,7 +20,7 @@ export const CLI_SESSION_AGENT_IDS = [
 export type CliSessionAgentId = (typeof CLI_SESSION_AGENT_IDS)[number]
 
 export const CLI_SESSION_SCOPE_PATHS_MAX = 64
-export const CLI_SESSION_DEFAULT_LIMIT_PER_AGENT = 200
+export const CLI_SESSION_DEFAULT_LIMIT_PER_AGENT = 80
 export const CLI_SESSION_ID_MAX_LENGTH = 512
 
 export const CLI_SESSION_AGENT_LABELS: Record<CliSessionAgentId, string> = {
@@ -34,10 +34,10 @@ export const CLI_SESSION_AGENT_LABELS: Record<CliSessionAgentId, string> = {
 
 export interface DiscoveredCliSession {
   schemaVersion: typeof CLI_SESSION_SCHEMA_VERSION
-  /** Stable list key: `{agentId}:{sessionId}:{filePath}`. */
+  /** Stable list key: `{agentId}:{filePath}`. */
   id: string
   agentId: CliSessionAgentId
-  /** Native resume handle (Claude/Codex session id, etc.). */
+  /** Native resume handle from the first JSONL record. Empty until hydrated. */
   sessionId: string
   cwd: string | null
   title: string
@@ -69,6 +69,22 @@ export interface CliSessionListResult {
   sessions: DiscoveredCliSession[]
   issues: CliSessionScanIssue[]
   scannedAt: string
+}
+
+export const CLI_SESSION_RESOLVE_BATCH_MAX = 16
+
+export interface CliSessionResolveFile {
+  agentId: CliSessionAgentId
+  filePath: string
+}
+
+export interface CliSessionResolveArgs {
+  files: CliSessionResolveFile[]
+}
+
+export interface CliSessionResolveResult {
+  sessions: DiscoveredCliSession[]
+  issues: CliSessionScanIssue[]
 }
 
 export interface CliResumeDefaultsV1 {
@@ -141,14 +157,21 @@ export function parseDiscoveredCliSession(value: unknown): DiscoveredCliSession 
   if (value.schemaVersion !== CLI_SESSION_SCHEMA_VERSION) return null
   if (!isCliSessionAgentId(value.agentId)) return null
   if (typeof value.id !== 'string' || !value.id.trim()) return null
-  const sessionId = normalizeCliSessionId(value.sessionId)
-  if (!sessionId) return null
+  if (typeof value.sessionId !== 'string') return null
+  if (typeof value.resumable !== 'boolean') return null
+  let sessionId = value.sessionId
+  if (value.resumable) {
+    const normalized = normalizeCliSessionId(sessionId)
+    if (!normalized) return null
+    sessionId = normalized
+  } else if (sessionId && !normalizeCliSessionId(sessionId)) {
+    return null
+  }
   if (typeof value.title !== 'string') return null
   if (typeof value.filePath !== 'string' || !value.filePath.trim()) return null
   if (typeof value.messageCount !== 'number' || !Number.isFinite(value.messageCount)) {
     return null
   }
-  if (typeof value.resumable !== 'boolean') return null
   if (value.cwd != null && typeof value.cwd !== 'string') return null
   if (value.createdAt != null && typeof value.createdAt !== 'string') return null
   if (value.updatedAt != null && typeof value.updatedAt !== 'string') return null
@@ -178,7 +201,7 @@ export function parseCliSessionListResult(value: unknown): CliSessionListResult 
   const sessions: DiscoveredCliSession[] = []
   for (const entry of value.sessions) {
     const parsed = parseDiscoveredCliSession(entry)
-    if (!parsed) return null
+    if (!parsed) continue
     sessions.push(parsed)
   }
   const issues: CliSessionScanIssue[] = []
@@ -195,6 +218,30 @@ export function parseCliSessionListResult(value: unknown): CliSessionListResult 
   return { sessions, issues, scannedAt: value.scannedAt }
 }
 
+export function parseCliSessionResolveResult(value: unknown): CliSessionResolveResult | null {
+  if (!isRecord(value)) return null
+  if (!Array.isArray(value.sessions) || !Array.isArray(value.issues)) return null
+  const sessions: DiscoveredCliSession[] = []
+  for (const entry of value.sessions) {
+    const parsed = parseDiscoveredCliSession(entry)
+    if (!parsed) continue
+    sessions.push(parsed)
+  }
+  const issues: CliSessionScanIssue[] = []
+  for (const issue of value.issues) {
+    if (!isRecord(issue)) return null
+    if (issue.agentId !== 'unknown' && !isCliSessionAgentId(issue.agentId)) return null
+    if (typeof issue.path !== 'string' || typeof issue.message !== 'string') return null
+    issues.push({
+      agentId: issue.agentId,
+      path: issue.path,
+      message: issue.message
+    })
+  }
+  return { sessions, issues }
+}
+
 export interface CliSessionApi {
   listSessions: (args?: CliSessionListArgs) => Promise<CliSessionListResult>
+  resolveSessions: (args: CliSessionResolveArgs) => Promise<CliSessionResolveResult>
 }

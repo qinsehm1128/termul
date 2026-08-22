@@ -44,9 +44,14 @@ type ExpandChainResult =
 
 interface FileExplorerProps {
   side?: 'left' | 'right'
+  /** Fill the parent rail. The parent owns width and the drag handle. */
+  fillContainer?: boolean
 }
 
-export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.Element {
+export function FileExplorer({
+  side = 'right',
+  fillContainer = false
+}: FileExplorerProps): React.JSX.Element {
   const { t } = useTranslation('workspace')
   const {
     roots: rawRoots,
@@ -1098,8 +1103,11 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
     <div
       id="file-explorer-panel"
       ref={containerRef}
-      className="relative flex h-full min-w-0 flex-shrink-0 flex-col overflow-hidden bg-sidebar text-foreground"
-      style={{ width: explorerWidth }}
+      className={cn(
+        'relative flex h-full min-w-0 flex-col overflow-hidden bg-sidebar text-foreground',
+        fillContainer ? 'w-full' : 'flex-shrink-0'
+      )}
+      style={fillContainer ? undefined : { width: explorerWidth }}
     >
       {/* Header */}
       <div className="flex h-8 shrink-0 items-center justify-between border-b border-sidebar-border/70 px-2.5">
@@ -1538,19 +1546,21 @@ export function FileExplorer({ side = 'right' }: FileExplorerProps): React.JSX.E
         )}
       </div>
 
-      <button
-        type="button"
-        onMouseDown={handleResizeMouseDown}
-        onKeyDown={handleResizeKeyDown}
-        className={`absolute ${side === 'right' ? 'left-0' : 'right-0'} top-0 h-full w-1 cursor-col-resize bg-transparent hover:bg-ring/25 focus-visible:bg-ring/30 focus-visible:outline-none`}
-        title={t('fileExplorer.resizeTitle')}
-        aria-label={t('fileExplorer.resizeAria')}
-        role="separator"
-        aria-controls="file-explorer-panel"
-        aria-valuenow={explorerWidth}
-        aria-valuemin={220}
-        aria-valuemax={560}
-      />
+      {fillContainer ? null : (
+        <button
+          type="button"
+          onMouseDown={handleResizeMouseDown}
+          onKeyDown={handleResizeKeyDown}
+          className={`absolute ${side === 'right' ? 'left-0' : 'right-0'} top-0 h-full w-1 cursor-col-resize bg-transparent hover:bg-ring/25 focus-visible:bg-ring/30 focus-visible:outline-none`}
+          title={t('fileExplorer.resizeTitle')}
+          aria-label={t('fileExplorer.resizeAria')}
+          role="separator"
+          aria-controls="file-explorer-panel"
+          aria-valuenow={explorerWidth}
+          aria-valuemin={220}
+          aria-valuemax={560}
+        />
+      )}
 
       {/* Delete Confirmation Dialog */}
       {deleteConfirm && (

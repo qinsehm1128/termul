@@ -1,9 +1,11 @@
 import {
+  type AgentSessionBinding,
   type ConversationAggregateMutationOutcome,
   type ConversationId,
   type ConversationRecordV2,
   type ExecutionTarget,
   type ProjectAttachment,
+  parseAgentSessionBinding,
   parseConversationId,
   parseConversationRecordV2
 } from './conversation.types'
@@ -75,10 +77,16 @@ export interface ConversationOpenOutcome {
   workspace: SessionWorkspaceLoadOutcome
 }
 
+export interface ConversationBindingSnapshot {
+  conversationId: ConversationId
+  binding: AgentSessionBinding | null
+}
+
 export type ConversationApplicationRequestType =
   | 'conversation_host_status'
   | 'list_conversations'
   | 'get_conversation'
+  | 'get_conversation_binding'
   | 'open_conversation'
   | 'resolve_legacy_conversation_id'
   | 'get_session_workspace'
@@ -92,6 +100,7 @@ export interface ConversationApi {
   getHostStatus(): Promise<IpcResult<ConversationHostStatus>>
   listConversations(): Promise<IpcResult<ConversationRecordV2[]>>
   getConversation(conversationId: ConversationId): Promise<IpcResult<ConversationRecordV2>>
+  getCurrentBinding(conversationId: ConversationId): Promise<IpcResult<ConversationBindingSnapshot>>
   openConversation(conversationId: ConversationId): Promise<IpcResult<ConversationOpenOutcome>>
   renameConversation(
     conversationId: ConversationId,
@@ -230,6 +239,15 @@ export function parseConversationOpenOutcome(value: unknown): ConversationOpenOu
     throw new TypeError('Conversation open workspace belongs to another Conversation')
   }
   return value as ConversationOpenOutcome
+}
+
+/** Validate the current Conversation ACP binding snapshot without cloning it. */
+export function parseConversationBindingSnapshot(value: unknown): ConversationBindingSnapshot {
+  const candidate = runtimeRecord(value, 'conversationBindingSnapshot')
+  exactKeys(candidate, ['conversationId', 'binding'])
+  parseConversationId(typeof candidate.conversationId === 'string' ? candidate.conversationId : '')
+  if (candidate.binding !== null) parseAgentSessionBinding(candidate.binding)
+  return value as ConversationBindingSnapshot
 }
 
 /** Validate an exact legacy resolution and canonical route without cloning it. */

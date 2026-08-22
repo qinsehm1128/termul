@@ -1,4 +1,4 @@
-import type { IpcResult, TerminalResumeGrant } from '@shared/types/ipc.types'
+import type { IpcResult, TerminalResumeGrant, TerminalSpawnedEvent } from '@shared/types/ipc.types'
 import type {
   TerminalResourceDescriptor,
   TerminalResourceHydrationStatus
@@ -71,6 +71,7 @@ export interface TerminalState {
     pendingScrollback?: string[],
     conversationId?: string
   ) => Terminal
+  adoptRemoteProjectTerminal: (event: TerminalSpawnedEvent) => string | null
   closeTerminal: (id: string, projectId: string) => void
   closeTerminalView: (id: string) => Promise<boolean>
   reopenTerminalView: (id: string) => void
@@ -175,6 +176,56 @@ export const useTerminalStore = create<TerminalState>((set, get) => ({
       activeTerminalId: newTerminal.id
     }))
     return newTerminal
+  },
+
+  adoptRemoteProjectTerminal: (event) => {
+    const projectId = event.projectId?.trim()
+    if (!projectId || !event.terminalId.trim()) return null
+    const existing = get().findTerminalByPtyId(event.terminalId)
+    if (existing) return existing.id
+    if (get().terminals.length >= GLOBAL_TERMINAL_LIMIT) {
+      void logFrontendError({
+        level: 'warn',
+        source: 'terminal-store.adoptRemote',
+        message: 'code=GLOBAL_TERMINAL_LIMIT'
+      })
+      return null
+    }
+    const folder = event.cwd.split(/[\\/]/).filter(Boolean).at(-1)
+    const adopted: Terminal = {
+      id: event.terminalId,
+      ptyId: event.terminalId,
+      conversationId: event.conversationId ?? undefined,
+      name:
+        folder && folder.length > 0
+          ? folder
+          : i18n.t('defaultName', {
+              ns: 'terminal',
+              number: formatNumber(get().terminals.length + 1),
+              defaultValue: 'Terminal {{number}}'
+            }),
+      projectId,
+      shell: event.shell || 'shell',
+      cwd: event.cwd,
+      output: [],
+      healthStatus: 'running',
+      viewState: 'visible',
+      isHidden: false
+    }
+    set((state) => {
+      const nextIndex = new Map(state.ptyIdIndex)
+      nextIndex.set(event.terminalId, adopted.id)
+      return {
+        terminals: [...state.terminals, adopted],
+        ptyIdIndex: nextIndex
+      }
+    })
+    void logFrontendError({
+      level: 'warn',
+      source: 'terminal-store.adoptRemote',
+      message: `Adopted host terminal projectId=${projectId}`
+    })
+    return adopted.id
   },
 
   closeTerminal: (id: string, projectId: string): void => {

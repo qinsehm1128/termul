@@ -40,6 +40,7 @@ struct HostHomeView: View {
                 projectList
             }
         }
+        .background(TermulTheme.canvas)
     }
 
     private var header: some View {
@@ -54,12 +55,12 @@ struct HostHomeView: View {
             .accessibilityLabel(Text("Back to home"))
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(link.title)
-                    .font(.headline)
+                Text(deskTitle)
+                    .font(TermulTheme.display)
                     .lineLimit(1)
                 Text(section == .sessions
-                     ? String(localized: "Independent chat sessions")
-                     : String(localized: "Project terminals"))
+                     ? String(localized: "Independent chats, not project terminals")
+                     : String(localized: "Projects already open on the computer"))
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -67,7 +68,14 @@ struct HostHomeView: View {
         }
         .padding(.horizontal, 16)
         .padding(.bottom, 8)
-        .background(.ultraThinMaterial)
+        .overlay(alignment: .bottom) {
+            Rectangle().fill(TermulTheme.stroke).frame(height: 1)
+        }
+    }
+
+    private var deskTitle: String {
+        link.title.split(separator: "·").first.map { String($0).trimmingCharacters(in: .whitespaces) }
+            ?? link.title
     }
 
     @ViewBuilder
@@ -84,20 +92,21 @@ struct HostHomeView: View {
                 Button {
                     Task { await session.selectConversation(conversation) }
                 } label: {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(conversation.displayTitle)
-                            .font(.body.weight(.semibold))
-                            .foregroundStyle(.primary)
-                        Text(conversation.workspaceCwd)
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                    }
-                    .padding(.vertical, 4)
-                    .frame(minHeight: 44, alignment: .leading)
+                    HostListRow(
+                        title: conversation.displayTitle,
+                        preview: conversation.previewText,
+                        previewMono: true,
+                        meta: conversation.countLabel,
+                        status: .idle,
+                        time: conversation.relativeCreatedLabel,
+                        glyph: "bubble.left.and.bubble.right"
+                    )
                 }
+                .listRowBackground(TermulTheme.canvas)
+                .listRowSeparatorTint(TermulTheme.stroke)
             }
             .listStyle(.plain)
+            .scrollContentBackground(.hidden)
         }
     }
 
@@ -116,22 +125,20 @@ struct HostHomeView: View {
                 Button {
                     Task { await session.selectProject(project) }
                 } label: {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(project.name)
-                            .font(.body.weight(.semibold))
-                            .foregroundStyle(.primary)
-                        if let path = project.path {
-                            Text(path)
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                    }
-                    .padding(.vertical, 4)
-                    .frame(minHeight: 44, alignment: .leading)
+                    HostListRow(
+                        title: project.name,
+                        preview: project.path,
+                        previewMono: true,
+                        meta: HostTimestamp.folderName(from: project.path),
+                        glyph: "folder",
+                        showsChevron: true
+                    )
                 }
+                .listRowBackground(TermulTheme.canvas)
+                .listRowSeparatorTint(TermulTheme.stroke)
             }
             .listStyle(.plain)
+            .scrollContentBackground(.hidden)
         }
     }
 }

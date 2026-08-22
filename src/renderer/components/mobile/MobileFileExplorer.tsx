@@ -43,8 +43,12 @@ import { useActiveProjectId } from '@/stores/project-store'
 import { editorTabId, useWorkspaceStore } from '@/stores/workspace-store'
 
 interface MobileFileExplorerProps {
-  open: boolean
-  onOpenChange: (open: boolean) => void
+  /** `sheet` is the leftover drawer; `page` renders the explorer inline as a tab. */
+  variant?: 'page' | 'sheet'
+  open?: boolean
+  onOpenChange?: (open: boolean) => void
+  /** Fired after a file is opened in the editor (page mode should leave Files). */
+  onFileOpened?: () => void
 }
 
 interface CreateState {
@@ -100,9 +104,13 @@ function isWithinRoot(path: string, root: string): boolean {
  * rows drill into a single folder at a time, while files reuse the desktop
  * open-file wiring. Native desktop keeps its existing tree explorer. */
 export function MobileFileExplorer({
+  variant = 'sheet',
   open,
-  onOpenChange
+  onOpenChange,
+  onFileOpened
 }: MobileFileExplorerProps): React.JSX.Element {
+  const isSheet = variant === 'sheet'
+  const isActive = isSheet ? Boolean(open) : (open ?? true)
   const { t } = useTranslation('mobile')
   const {
     roots: rawRoots,
@@ -140,7 +148,7 @@ export function MobileFileExplorer({
   // project switch. Within-session reopens keep the current folder: the
   // component stays mounted across drawer close, so currentPath survives.
   useEffect(() => {
-    if (!open) return
+    if (!isActive) return
     setNavigationDirection(0)
     setActionEntry(null)
     setRenaming(null)
@@ -177,15 +185,15 @@ export function MobileFileExplorer({
     return () => {
       cancelled = true
     }
-  }, [open, rootPath, focusedProjectId])
+  }, [isActive, rootPath, focusedProjectId])
 
   // Web has no directory watcher, so load whichever folder is currently shown.
   useEffect(() => {
-    if (!open || !currentPath) return
+    if (!isActive || !currentPath) return
     if (!directoryContents.has(currentPath) && !loadingDirs.has(currentPath)) {
       void toggleDirectory(currentPath)
     }
-  }, [open, currentPath, directoryContents, loadingDirs, toggleDirectory])
+  }, [isActive, currentPath, directoryContents, loadingDirs, toggleDirectory])
 
   function parentOf(path: string): string {
     const normalized = normalizePath(path)
@@ -218,7 +226,8 @@ export function MobileFileExplorer({
     try {
       await useEditorStore.getState().openFile(entry.path)
       useWorkspaceStore.getState().addEditorTab(entry.path)
-      onOpenChange(false)
+      onFileOpened?.()
+      if (isSheet) onOpenChange?.(false)
     } catch (error) {
       toast.error(t('files.openFailed'), {
         description: error instanceof Error ? error.message : String(error)
@@ -426,263 +435,287 @@ export function MobileFileExplorer({
   const isCurrentLoading = !!currentPath && loadingDirs.has(currentPath)
   const slideDistance = reducedMotion ? 0 : 28
 
+  const folderTitle = isSheet ? (
+    <SheetTitle className="truncate text-base">{currentName}</SheetTitle>
+  ) : (
+    <h2 className="truncate text-base font-semibold tracking-[-0.01em] text-foreground">
+      {currentName}
+    </h2>
+  )
+
+  const explorerBody = (
+    <>
+      <div className="space-y-0 border-b border-border/60 px-3 py-3 text-left">
+        <div className="flex min-w-0 items-center gap-1">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="-ml-2 size-9 shrink-0"
+            aria-label={t('files.back')}
+            disabled={isAtRoot || createSubmitting}
+            onClick={navigateBack}
+          >
+            <ChevronLeft size={19} />
+          </Button>
+          <div className="min-w-0">
+            {folderTitle}
+            <p
+              className="truncate text-xs text-muted-foreground"
+              title={normalizedCurrent ?? undefined}
+            >
+              {isAtRoot ? t('files.projectFiles') : normalizedCurrent?.slice(rootPrefixLength)}
+            </p>
+          </div>
+        </div>
+        {isSheet ? (
+          <SheetDescription className="sr-only">{t('files.browseDescription')}</SheetDescription>
+        ) : (
+          <p className="sr-only">{t('files.browseDescription')}</p>
+        )}
+      </div>
+
+      {roots.length > 1 && (
+        <div
+          className="flex shrink-0 gap-1 overflow-x-auto border-b border-border/60 px-2 py-2"
+          role="group"
+          aria-label={t('files.projectFiles')}
+        >
+          {roots.map((root) => (
+            <Button
+              key={`${root.projectId}:${root.path}`}
+              type="button"
+              variant={root.path === rootPath ? 'secondary' : 'ghost'}
+              size="sm"
+              className="h-8 shrink-0"
+              onClick={() => setFocusedRoot(root.path)}
+            >
+              {root.name}
+            </Button>
+          ))}
+        </div>
+      )}
+
+      <div className="flex shrink-0 items-center gap-1 border-b border-border/60 px-2 py-1">
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="size-9"
+          aria-label={t('files.refresh')}
+          disabled={!currentPath || createSubmitting}
+          onClick={() => currentPath && void refreshDirectory(currentPath)}
+        >
+          <RefreshCw size={16} />
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="size-9"
+          aria-label={t('files.newFile')}
+          disabled={!currentPath || createSubmitting}
+          onClick={() => setCreating({ type: 'file', value: '' })}
+        >
+          <FilePlus size={16} />
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="size-9"
+          aria-label={t('files.newFolder')}
+          disabled={!currentPath || createSubmitting}
+          onClick={() => setCreating({ type: 'directory', value: '' })}
+        >
+          <FolderPlus size={16} />
+        </Button>
+      </div>
+
+      <div className="relative min-h-0 flex-1 overflow-hidden">
+        {rootLoadError && isAtRoot ? (
+          <div className="flex flex-col items-center gap-2 px-4 py-8 text-center">
+            <p className="text-sm text-muted-foreground">{rootLoadError.message}</p>
+            {currentPath && (
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                onClick={() => void refreshDirectory(currentPath)}
+              >
+                {t('files.retry')}
+              </Button>
+            )}
+          </div>
+        ) : !currentPath ? (
+          rootPath ? (
+            <div className="px-4 py-8 text-center text-sm text-muted-foreground">
+              {t('files.loading')}
+            </div>
+          ) : (
+            <div className="px-4 py-8 text-center text-sm text-muted-foreground">
+              {t('files.noProject')}
+            </div>
+          )
+        ) : (
+          <AnimatePresence initial={false} mode="wait" custom={navigationDirection}>
+            <motion.div
+              key={currentPath}
+              custom={navigationDirection}
+              data-testid="mobile-folder-view"
+              data-navigation-direction={
+                navigationDirection === 1 ? 'forward' : navigationDirection === -1 ? 'back' : 'none'
+              }
+              data-reduced-motion={reducedMotion ? 'true' : 'false'}
+              className="absolute inset-0 overflow-y-auto py-1"
+              initial={{ opacity: reducedMotion ? 1 : 0, x: navigationDirection * slideDistance }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{
+                opacity: reducedMotion ? 1 : 0,
+                x: navigationDirection * -slideDistance
+              }}
+              transition={{ duration: reducedMotion ? 0 : 0.18, ease: 'easeOut' }}
+            >
+              {creating ? (
+                <div className="px-2 py-1">
+                  <Input
+                    autoFocus
+                    disabled={createSubmitting}
+                    placeholder={
+                      creating.type === 'file'
+                        ? t('files.newFilePlaceholder')
+                        : t('files.newFolderPlaceholder')
+                    }
+                    onChange={(event) => setCreating({ ...creating, value: event.target.value })}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') void handleCreate()
+                      if (event.key === 'Escape') setCreating(null)
+                    }}
+                    className="h-11"
+                    aria-label={
+                      creating.type === 'file' ? t('files.newFileName') : t('files.newFolderName')
+                    }
+                  />
+                </div>
+              ) : isCurrentLoading && !directoryContents.has(currentPath) ? (
+                <div className="px-4 py-8 text-center text-sm text-muted-foreground">
+                  {t('files.loading')}
+                </div>
+              ) : currentEntries.length === 0 ? (
+                <div className="px-4 py-8 text-center text-sm text-muted-foreground">
+                  {t('files.empty')}
+                </div>
+              ) : (
+                <ul aria-label={t('files.filesIn', { name: currentName })}>
+                  {currentEntries.map(renderRow)}
+                </ul>
+              )}
+            </motion.div>
+          </AnimatePresence>
+        )}
+      </div>
+
+      <Sheet open={!!actionEntry} onOpenChange={(value) => !value && setActionEntry(null)}>
+        <SheetContent
+          side="bottom"
+          className="flex flex-col gap-0 rounded-t-xl p-2"
+          aria-label={actionEntry ? t('files.actionsAria', { name: actionEntry.name }) : undefined}
+        >
+          {actionEntry && (
+            <>
+              <SheetHeader className="px-3 py-2 text-left">
+                <SheetTitle className="truncate text-sm">{actionEntry.name}</SheetTitle>
+              </SheetHeader>
+              <button
+                type="button"
+                className="flex h-11 items-center gap-3 rounded-md px-3 text-sm hover:bg-accent"
+                onClick={() => {
+                  setRenaming({ path: actionEntry.path, value: actionEntry.name })
+                  setActionEntry(null)
+                }}
+              >
+                <Pencil size={16} /> {t('files.rename')}
+              </button>
+              <button
+                type="button"
+                className="flex h-11 items-center gap-3 rounded-md px-3 text-sm hover:bg-accent"
+                onClick={() => {
+                  const entry = actionEntry
+                  setActionEntry(null)
+                  void handleDuplicate(entry)
+                }}
+              >
+                <Copy size={16} /> {t('files.duplicate')}
+              </button>
+              <button
+                type="button"
+                className="flex h-11 items-center gap-3 rounded-md px-3 text-sm text-destructive hover:bg-accent"
+                onClick={() => {
+                  setPendingDelete(actionEntry)
+                  setActionEntry(null)
+                }}
+              >
+                <Trash2 size={16} /> {t('files.delete')}
+              </button>
+            </>
+          )}
+        </SheetContent>
+      </Sheet>
+    </>
+  )
+
+  const deleteDialog = (
+    <AlertDialog
+      open={!!pendingDelete}
+      onOpenChange={(dialogOpen) => {
+        if (!dialogOpen) setPendingDelete(null)
+      }}
+    >
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>
+            {t('files.deleteTitle', { name: pendingDelete?.name ?? '' })}
+          </AlertDialogTitle>
+          <AlertDialogDescription>
+            {pendingDelete?.type === 'directory'
+              ? t('files.deleteFolderDescription')
+              : t('files.deleteFileDescription')}
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel>{t('files.cancel')}</AlertDialogCancel>
+          <AlertDialogAction
+            className="bg-red-500 text-white hover:bg-red-600"
+            onClick={() => {
+              if (pendingDelete) void handleDelete(pendingDelete)
+              setPendingDelete(null)
+            }}
+          >
+            {t('files.delete')}
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  )
+
+  if (!isSheet) {
+    return (
+      <div className="flex h-full min-h-0 flex-col bg-background" data-mobile-file-explorer="page">
+        {explorerBody}
+        {deleteDialog}
+      </div>
+    )
+  }
+
   return (
-    <Sheet open={open} onOpenChange={onOpenChange}>
+    <Sheet open={Boolean(open)} onOpenChange={onOpenChange}>
       <SheetContent
         side="right"
         className="flex w-[min(100vw,26rem)] flex-col gap-0 p-0 sm:max-w-md"
       >
-        <SheetHeader className="space-y-0 border-b border-border/60 px-3 py-3 text-left">
-          <div className="flex min-w-0 items-center gap-1">
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon"
-              className="-ml-2 size-9 shrink-0"
-              aria-label={t('files.back')}
-              disabled={isAtRoot || createSubmitting}
-              onClick={navigateBack}
-            >
-              <ChevronLeft size={19} />
-            </Button>
-            <div className="min-w-0">
-              <SheetTitle className="truncate text-base">{currentName}</SheetTitle>
-              <p
-                className="truncate text-xs text-muted-foreground"
-                title={normalizedCurrent ?? undefined}
-              >
-                {isAtRoot ? t('files.projectFiles') : normalizedCurrent?.slice(rootPrefixLength)}
-              </p>
-            </div>
-          </div>
-          <SheetDescription className="sr-only">{t('files.browseDescription')}</SheetDescription>
-        </SheetHeader>
-
-        {roots.length > 1 && (
-          <div
-            className="flex shrink-0 gap-1 overflow-x-auto border-b border-border/60 px-2 py-2"
-            role="group"
-            aria-label={t('files.projectFiles')}
-          >
-            {roots.map((root) => (
-              <Button
-                key={`${root.projectId}:${root.path}`}
-                type="button"
-                variant={root.path === rootPath ? 'secondary' : 'ghost'}
-                size="sm"
-                className="h-8 shrink-0"
-                onClick={() => setFocusedRoot(root.path)}
-              >
-                {root.name}
-              </Button>
-            ))}
-          </div>
-        )}
-
-        <div className="flex shrink-0 items-center gap-1 border-b border-border/60 px-2 py-1">
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="size-9"
-            aria-label={t('files.refresh')}
-            disabled={!currentPath || createSubmitting}
-            onClick={() => currentPath && void refreshDirectory(currentPath)}
-          >
-            <RefreshCw size={16} />
-          </Button>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="size-9"
-            aria-label={t('files.newFile')}
-            disabled={!currentPath || createSubmitting}
-            onClick={() => setCreating({ type: 'file', value: '' })}
-          >
-            <FilePlus size={16} />
-          </Button>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="size-9"
-            aria-label={t('files.newFolder')}
-            disabled={!currentPath || createSubmitting}
-            onClick={() => setCreating({ type: 'directory', value: '' })}
-          >
-            <FolderPlus size={16} />
-          </Button>
-        </div>
-
-        <div className="relative min-h-0 flex-1 overflow-hidden">
-          {rootLoadError && isAtRoot ? (
-            <div className="flex flex-col items-center gap-2 px-4 py-8 text-center">
-              <p className="text-sm text-muted-foreground">{rootLoadError.message}</p>
-              {currentPath && (
-                <Button
-                  type="button"
-                  variant="secondary"
-                  size="sm"
-                  onClick={() => void refreshDirectory(currentPath)}
-                >
-                  {t('files.retry')}
-                </Button>
-              )}
-            </div>
-          ) : !currentPath ? (
-            rootPath ? (
-              <div className="px-4 py-8 text-center text-sm text-muted-foreground">
-                {t('files.loading')}
-              </div>
-            ) : (
-              <div className="px-4 py-8 text-center text-sm text-muted-foreground">
-                {t('files.noProject')}
-              </div>
-            )
-          ) : (
-            <AnimatePresence initial={false} mode="wait" custom={navigationDirection}>
-              <motion.div
-                key={currentPath}
-                custom={navigationDirection}
-                data-testid="mobile-folder-view"
-                data-navigation-direction={
-                  navigationDirection === 1
-                    ? 'forward'
-                    : navigationDirection === -1
-                      ? 'back'
-                      : 'none'
-                }
-                data-reduced-motion={reducedMotion ? 'true' : 'false'}
-                className="absolute inset-0 overflow-y-auto py-1"
-                initial={{ opacity: reducedMotion ? 1 : 0, x: navigationDirection * slideDistance }}
-                animate={{ opacity: 1, x: 0 }}
-                exit={{
-                  opacity: reducedMotion ? 1 : 0,
-                  x: navigationDirection * -slideDistance
-                }}
-                transition={{ duration: reducedMotion ? 0 : 0.18, ease: 'easeOut' }}
-              >
-                {creating ? (
-                  <div className="px-2 py-1">
-                    <Input
-                      autoFocus
-                      disabled={createSubmitting}
-                      placeholder={
-                        creating.type === 'file'
-                          ? t('files.newFilePlaceholder')
-                          : t('files.newFolderPlaceholder')
-                      }
-                      onChange={(event) => setCreating({ ...creating, value: event.target.value })}
-                      onKeyDown={(event) => {
-                        if (event.key === 'Enter') void handleCreate()
-                        if (event.key === 'Escape') setCreating(null)
-                      }}
-                      className="h-11"
-                      aria-label={
-                        creating.type === 'file' ? t('files.newFileName') : t('files.newFolderName')
-                      }
-                    />
-                  </div>
-                ) : isCurrentLoading && !directoryContents.has(currentPath) ? (
-                  <div className="px-4 py-8 text-center text-sm text-muted-foreground">
-                    {t('files.loading')}
-                  </div>
-                ) : currentEntries.length === 0 ? (
-                  <div className="px-4 py-8 text-center text-sm text-muted-foreground">
-                    {t('files.empty')}
-                  </div>
-                ) : (
-                  <ul aria-label={t('files.filesIn', { name: currentName })}>
-                    {currentEntries.map(renderRow)}
-                  </ul>
-                )}
-              </motion.div>
-            </AnimatePresence>
-          )}
-        </div>
-
-        <Sheet open={!!actionEntry} onOpenChange={(value) => !value && setActionEntry(null)}>
-          <SheetContent
-            side="bottom"
-            className="flex flex-col gap-0 rounded-t-xl p-2"
-            aria-label={
-              actionEntry ? t('files.actionsAria', { name: actionEntry.name }) : undefined
-            }
-          >
-            {actionEntry && (
-              <>
-                <SheetHeader className="px-3 py-2 text-left">
-                  <SheetTitle className="truncate text-sm">{actionEntry.name}</SheetTitle>
-                </SheetHeader>
-                <button
-                  type="button"
-                  className="flex h-11 items-center gap-3 rounded-md px-3 text-sm hover:bg-accent"
-                  onClick={() => {
-                    setRenaming({ path: actionEntry.path, value: actionEntry.name })
-                    setActionEntry(null)
-                  }}
-                >
-                  <Pencil size={16} /> {t('files.rename')}
-                </button>
-                <button
-                  type="button"
-                  className="flex h-11 items-center gap-3 rounded-md px-3 text-sm hover:bg-accent"
-                  onClick={() => {
-                    const entry = actionEntry
-                    setActionEntry(null)
-                    void handleDuplicate(entry)
-                  }}
-                >
-                  <Copy size={16} /> {t('files.duplicate')}
-                </button>
-                <button
-                  type="button"
-                  className="flex h-11 items-center gap-3 rounded-md px-3 text-sm text-destructive hover:bg-accent"
-                  onClick={() => {
-                    setPendingDelete(actionEntry)
-                    setActionEntry(null)
-                  }}
-                >
-                  <Trash2 size={16} /> {t('files.delete')}
-                </button>
-              </>
-            )}
-          </SheetContent>
-        </Sheet>
+        {explorerBody}
       </SheetContent>
-
-      <AlertDialog
-        open={!!pendingDelete}
-        onOpenChange={(dialogOpen) => {
-          if (!dialogOpen) setPendingDelete(null)
-        }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              {t('files.deleteTitle', { name: pendingDelete?.name ?? '' })}
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              {pendingDelete?.type === 'directory'
-                ? t('files.deleteFolderDescription')
-                : t('files.deleteFileDescription')}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>{t('files.cancel')}</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-red-500 text-white hover:bg-red-600"
-              onClick={() => {
-                if (pendingDelete) void handleDelete(pendingDelete)
-                setPendingDelete(null)
-              }}
-            >
-              {t('files.delete')}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      {deleteDialog}
     </Sheet>
   )
 }

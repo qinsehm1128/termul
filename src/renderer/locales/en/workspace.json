@@ -1,6 +1,14 @@
 {
   "title": "Workspace",
   "cancel": "Cancel",
+  "sidePanels": {
+    "resizeSidebar": "Drag to resize sidebar",
+    "resizeSidebarAria": "Resize sidebar",
+    "resizeRightRail": "Drag to resize right sidebar",
+    "resizeRightRailAria": "Resize right sidebar",
+    "resizeCliSplit": "Drag to resize CLI sessions",
+    "resizeCliSplitAria": "Resize CLI sessions panel"
+  },
   "projects": {
     "title": "Projects"
   },
@@ -189,7 +197,10 @@
     "killProcess": "Kill Process",
     "closeOthers": "Close Others",
     "closeAll": "Close All",
-    "copyPath": "Copy Path"
+    "copyPath": "Copy Path",
+    "closeView": "Close view {{name}}",
+    "terminateProcess": "Terminate process {{name}}",
+    "hiddenCount": "Hidden {{count}}"
   },
   "pane": {
     "starting": "Starting {{name}}…",

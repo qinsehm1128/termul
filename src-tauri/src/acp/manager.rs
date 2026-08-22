@@ -457,6 +457,85 @@ pub struct SessionReopenOutcome {
     pub config_options: Option<Vec<SessionConfigOption>>,
 }
 
+impl SessionReopenOutcome {
+    fn empty() -> Self {
+        Self {
+            modes: None,
+            models: None,
+            config_options: None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.modes.is_none() && self.models.is_none() && self.config_options.is_none()
+    }
+}
+
+/// Live-session composer controls so phone/web can read mode/model/thinking
+/// without `session/resume` or `session/load` (those replay the transcript).
+#[derive(Default)]
+struct ComposerControlCache {
+    inner: Mutex<HashMap<String, SessionReopenOutcome>>,
+}
+
+impl ComposerControlCache {
+    fn snapshot(&self, session_id: &str) -> SessionReopenOutcome {
+        self.inner
+            .lock()
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(SessionReopenOutcome::empty)
+    }
+
+    fn remember(&self, session_id: &str, incoming: &SessionReopenOutcome) {
+        if incoming.is_empty() {
+            return;
+        }
+        let mut map = self.inner.lock();
+        let current = map
+            .entry(session_id.to_string())
+            .or_insert_with(SessionReopenOutcome::empty);
+        if incoming.modes.is_some() {
+            current.modes = incoming.modes.clone();
+        }
+        if incoming.config_options.is_some() {
+            current.config_options = incoming.config_options.clone();
+            current.models = events::models_from_config_options(current.config_options.as_deref())
+                .or_else(|| incoming.models.clone());
+        } else if incoming.models.is_some() {
+            current.models = incoming.models.clone();
+        }
+    }
+
+    fn remember_options(&self, session_id: &str, options: Vec<SessionConfigOption>) {
+        self.remember(
+            session_id,
+            &SessionReopenOutcome {
+                modes: None,
+                models: events::models_from_config_options(Some(options.as_slice())),
+                config_options: Some(options),
+            },
+        );
+    }
+
+    fn apply_current_mode(
+        &self,
+        session_id: &str,
+        current_mode_id: agent_client_protocol::schema::v1::SessionModeId,
+    ) {
+        let mut map = self.inner.lock();
+        if let Some(current) = map.get_mut(session_id) {
+            if let Some(modes) = current.modes.as_mut() {
+                modes.current_mode_id = current_mode_id;
+            }
+        }
+    }
+
+    fn forget(&self, session_id: &str) {
+        self.inner.lock().remove(session_id);
+    }
+}
+
 trait IntoSessionReopenOutcome {
     fn into_session_reopen_outcome(self) -> SessionReopenOutcome;
 }
@@ -986,6 +1065,9 @@ pub struct AcpManager {
     /// renders it. See `host_mcp::mod` + the spec
     /// `spec-acp-host-todo-plan-tool.md`.
     host_plan_server: Arc<crate::acp::host_mcp::parent::HostPlanServer>,
+    /// Last advertised mode/model/configOptions per live session. Phone and
+    /// web read this instead of reopening a session the driver already owns.
+    composer_controls: Arc<ComposerControlCache>,
 }
 
 /// Normalize, durably persist, flush, and broadcast a locally generated title.
@@ -1100,6 +1182,7 @@ impl AcpManager {
             replacement_gates: Mutex::new(HashMap::new()),
             warmup_done: Arc::new(Mutex::new(HashSet::new())),
             host_plan_server,
+            composer_controls: Arc::new(ComposerControlCache::default()),
         }
     }
 
@@ -1123,6 +1206,7 @@ impl AcpManager {
             replacement_gates: Mutex::new(HashMap::new()),
             warmup_done: Arc::new(Mutex::new(HashSet::new())),
             host_plan_server,
+            composer_controls: Arc::new(ComposerControlCache::default()),
         }
     }
 
@@ -1148,6 +1232,7 @@ impl AcpManager {
             replacement_gates: Mutex::new(HashMap::new()),
             warmup_done: Arc::new(Mutex::new(HashSet::new())),
             host_plan_server,
+            composer_controls: Arc::new(ComposerControlCache::default()),
         }
     }
 
@@ -1176,6 +1261,28 @@ impl AcpManager {
         })
     }
 
+    /// Live runtime ids plus their durable `config:{configId}` namespaces.
+    /// Used by catalog overlays so phone/web can reuse a desktop-spawned agent.
+    #[must_use]
+    pub fn list_running_namespaces(&self) -> Vec<(String, Option<String>)> {
+        self.agents
+            .lock()
+            .iter()
+            .map(|(agent_id, entry)| (agent_id.0.clone(), entry.stable_namespace.clone()))
+            .collect()
+    }
+
+    fn spawn_outcome_for_live(&self, agent_id: &AgentId) -> Option<SpawnOutcome> {
+        let agents = self.agents.lock();
+        let entry = agents.get(agent_id)?;
+        Some(SpawnOutcome {
+            agent_id: agent_id.clone(),
+            capabilities: entry.capabilities.clone(),
+            auth_methods: Vec::new(),
+            stable_namespace: entry.stable_namespace.clone(),
+        })
+    }
+
     pub fn set_scheduled_tasks(&self, service: &Arc<crate::scheduled_tasks::ScheduledTaskService>) {
         self.host_plan_server.set_scheduled_tasks(service);
     }
@@ -1193,6 +1300,130 @@ impl AcpManager {
         self.conversation_persistence
             .as_ref()
             .and_then(|adapter| adapter.conversation_id_for_current_binding(agent_session_id))
+    }
+
+    /// Map a client-supplied spawn id onto a process that is still running.
+    ///
+    /// Bindings persist the UUID from the process that first created the
+    /// session. After a host restart that UUID is gone; the durable identity is
+    /// the binding's `stable_agent_namespace`. A still-live requested id is
+    /// returned as-is so a cross-agent session id cannot be remapped onto a
+    /// different running process.
+    pub fn resolve_live_agent_id(
+        &self,
+        requested: &AgentId,
+        session_id: Option<&str>,
+    ) -> Result<AgentId, String> {
+        if self.agents.lock().contains_key(requested) {
+            return Ok(requested.clone());
+        }
+        if let Some(session_id) = session_id {
+            if let Some(live) = self.live_agent_for_session(session_id) {
+                log::info!(
+                    "[acp] remapped stale runtime agent to the live process for this session"
+                );
+                return Ok(live);
+            }
+        }
+        if let Some(found) = self.find_agent_by_requested_id(&requested.0) {
+            log::info!("[acp] remapped requested agent id to a live process by config namespace");
+            return Ok(found);
+        }
+        Err(format!("unknown agent: {requested}"))
+    }
+
+    fn find_agent_by_requested_id(&self, requested: &str) -> Option<AgentId> {
+        let trimmed = requested.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Some(found) = self.find_agent_by_config_id(trimmed) {
+            return Some(found);
+        }
+        if !trimmed.starts_with("acp-registry:") {
+            return self.find_agent_by_config_id(&format!("acp-registry:{trimmed}"));
+        }
+        None
+    }
+
+    fn live_agent_for_session(&self, session_id: &str) -> Option<AgentId> {
+        let conversation_id = self.conversation_id_for_current_session(session_id)?;
+        let binding = self
+            .conversation_creation
+            .as_ref()?
+            .active_binding(conversation_id)
+            .ok()??;
+        self.live_agent_for_binding(&binding)
+    }
+
+    fn live_agent_for_binding(&self, binding: &AgentSessionBinding) -> Option<AgentId> {
+        let runtime = AgentId(binding.runtime_agent_id.clone());
+        if self.agents.lock().contains_key(&runtime) {
+            return Some(runtime);
+        }
+        let namespace = binding.stable_agent_namespace.as_str();
+        {
+            let agents = self.agents.lock();
+            if let Some((agent_id, _)) = agents
+                .iter()
+                .find(|(_, entry)| entry.stable_namespace.as_deref() == Some(namespace))
+            {
+                return Some(agent_id.clone());
+            }
+        }
+        let config_id = namespace.strip_prefix("config:").unwrap_or(namespace);
+        self.find_agent_by_config_id(config_id)
+            .or_else(|| self.find_agent_by_requested_id(config_id))
+    }
+
+    fn execution_cwd_for_session(&self, session_id: &str) -> Option<String> {
+        let conversation_id = self.conversation_id_for_current_session(session_id)?;
+        let binding = self
+            .conversation_creation
+            .as_ref()?
+            .active_binding(conversation_id)
+            .ok()??;
+        (!binding.execution_cwd.trim().is_empty()).then_some(binding.execution_cwd)
+    }
+
+    /// Resolve the live process for this session and reopen it when the
+    /// current agent does not yet own the Conversation binding (host restart).
+    pub async fn ensure_session_on_live_agent(
+        &self,
+        agent_id: &AgentId,
+        session_id: &SessionId,
+    ) -> Result<AgentId, String> {
+        let live = self.resolve_live_agent_id(agent_id, Some(&session_id.0))?;
+        if let Some(bound) = self.live_agent_for_session(&session_id.0) {
+            if bound != live {
+                return Err("session does not belong to the supplied live agent".to_string());
+            }
+        }
+        match self.owns_session(&live, session_id.clone()).await {
+            Ok(true) => return Ok(live),
+            Ok(false) => {}
+            Err(error) => return Err(error),
+        }
+        let Some(cwd) = self.execution_cwd_for_session(&session_id.0) else {
+            return Err("session does not belong to the supplied live agent".to_string());
+        };
+        log::info!("[acp] reattaching the conversation session onto the live agent before prompt");
+        let reopened = self
+            .resume_session(&live, session_id.clone(), cwd.clone(), Vec::new())
+            .await
+            .is_ok()
+            || self
+                .load_session(&live, session_id.clone(), cwd, Vec::new())
+                .await
+                .is_ok();
+        if !reopened {
+            return Err("session does not belong to the supplied live agent".to_string());
+        }
+        match self.owns_session(&live, session_id.clone()).await {
+            Ok(true) => Ok(live),
+            Ok(false) => Err("session does not belong to the supplied live agent".to_string()),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn register_conversation_binding(
@@ -1221,6 +1452,19 @@ impl AcpManager {
     /// synchronously from the response (CAP-4: the spawn response — not the
     /// async event — is the source of truth).
     pub async fn spawn(&self, config: AgentConfig) -> Result<SpawnOutcome, String> {
+        if let Some(config_id) = config
+            .config_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            if let Some(existing) = self.find_agent_by_config_id(config_id) {
+                if let Some(outcome) = self.spawn_outcome_for_live(&existing) {
+                    log::info!("[acp] reusing live agent {existing} for config_id={config_id}");
+                    return Ok(outcome);
+                }
+            }
+        }
         let config = match tokio::task::spawn_blocking({
             let config = config.clone();
             move || crate::acp::npm_local::materialize_npx_config(config)
@@ -1274,6 +1518,7 @@ impl AcpManager {
         let thread_warmup_done = self.warmup_done.clone();
         let thread_host_plan_server = self.host_plan_server.clone();
         let thread_permission_policy = permission_policy.clone();
+        let thread_composer_controls = self.composer_controls.clone();
         let stable_namespace = stable_agent_namespace(&config);
 
         let join_handle = std::thread::Builder::new()
@@ -1294,6 +1539,7 @@ impl AcpManager {
                     thread_persistence,
                     thread_conversation_persistence,
                     thread_warmup_done,
+                    thread_composer_controls,
                 );
             })
             .map_err(|e| format!("failed to spawn agent thread: {e}"))?;
@@ -1435,6 +1681,76 @@ impl AcpManager {
             .ok_or_else(|| format!("unknown agent: {agent_id}"))
     }
 
+    /// Continue a Conversation's current Active binding instead of minting a
+    /// replacement provider session. Used when a client opens or sends into an
+    /// existing conversation without an explicit New Chat / replace_binding.
+    async fn continue_existing_binding(
+        &self,
+        agent_id: &AgentId,
+        mcp_servers: Vec<McpServer>,
+        conversation_id: ConversationId,
+        binding: &AgentSessionBinding,
+    ) -> Result<NewSessionOutcome, String> {
+        let record = self
+            .conversation_creation
+            .as_ref()
+            .ok_or_else(|| {
+                "CONVERSATION_BOOTSTRAP_REQUIRED: continue has no ConversationCreationService"
+                    .to_string()
+            })?
+            .repository()
+            .get_conversation(conversation_id)
+            .map_err(|error| error.to_string())?;
+        let session_id = SessionId::new(binding.agent_session_id.clone());
+        let execution_cwd = binding.execution_cwd.clone();
+        let resume_agent = self
+            .live_agent_for_binding(binding)
+            .or_else(|| {
+                self.agents
+                    .lock()
+                    .contains_key(agent_id)
+                    .then(|| agent_id.clone())
+            })
+            .ok_or_else(|| format!("unknown agent: {agent_id}"))?;
+        let reopen = match self
+            .resume_session(
+                &resume_agent,
+                session_id.clone(),
+                execution_cwd.clone(),
+                mcp_servers.clone(),
+            )
+            .await
+        {
+            Ok(outcome) => Some(outcome),
+            Err(_) => self
+                .load_session(
+                    &resume_agent,
+                    session_id.clone(),
+                    execution_cwd.clone(),
+                    mcp_servers,
+                )
+                .await
+                .ok(),
+        };
+        log::info!(
+            "[conversation-creation] continuing existing ACP binding conversation_id={} session_reopened={}",
+            conversation_id,
+            reopen.is_some()
+        );
+        Ok(NewSessionOutcome {
+            persistence: "conversation",
+            conversation_id: Some(conversation_id),
+            workspace_cwd: Some(record.workspace_cwd),
+            execution_cwd: Some(execution_cwd),
+            session_id,
+            modes: reopen.as_ref().and_then(|outcome| outcome.modes.clone()),
+            models: reopen.as_ref().and_then(|outcome| outcome.models.clone()),
+            config_options: reopen
+                .as_ref()
+                .and_then(|outcome| outcome.config_options.clone()),
+        })
+    }
+
     /// Create a new session on the given agent.
     pub async fn new_session(
         &self,
@@ -1551,6 +1867,32 @@ impl AcpManager {
         mcp_servers: Vec<McpServer>,
         context: SessionCreationContext,
     ) -> Result<NewSessionOutcome, String> {
+        if !context.ephemeral {
+            if let Some(conversation_id) = context.conversation_id {
+                if let Some(creation) = &self.conversation_creation {
+                    if let Ok(Some(binding)) = creation.active_binding(conversation_id) {
+                        let resume_agent = self
+                            .live_agent_for_binding(&binding)
+                            .or_else(|| {
+                                self.agents
+                                    .lock()
+                                    .contains_key(agent_id)
+                                    .then(|| agent_id.clone())
+                            })
+                            .ok_or_else(|| format!("unknown agent: {agent_id}"))?;
+                        return self
+                            .continue_existing_binding(
+                                &resume_agent,
+                                mcp_servers,
+                                conversation_id,
+                                &binding,
+                            )
+                            .await;
+                    }
+                }
+            }
+        }
+
         let (caps, stable_agent_namespace) = self
             .agents
             .lock()
@@ -1758,6 +2100,14 @@ impl AcpManager {
                     self.host_plan_server
                         .bind_session(&token, &outcome.session_id.0);
                 }
+                self.composer_controls.remember(
+                    &outcome.session_id.0,
+                    &SessionReopenOutcome {
+                        modes: outcome.modes.clone(),
+                        models: outcome.models.clone(),
+                        config_options: outcome.config_options.clone(),
+                    },
+                );
                 Ok(outcome)
             }
             Err(error) => {
@@ -1814,11 +2164,19 @@ impl AcpManager {
         cwd: String,
         mcp_servers: Vec<McpServer>,
     ) -> Result<SessionReopenOutcome, String> {
-        let caps = self.capabilities(agent_id)?;
+        let agent_id = self.resolve_live_agent_id(agent_id, Some(&session_id.0))?;
+        let caps = self.capabilities(&agent_id)?;
         gate_load_session(&caps)?;
-        let tx = self.command_tx(agent_id)?;
+        if let Some(outcome) = self
+            .skip_reopen_if_owned(&agent_id, &session_id, "session/load")
+            .await
+        {
+            return Ok(outcome);
+        }
+        let tx = self.command_tx(&agent_id)?;
         let (mcp_servers, host_token) =
-            self.prepare_reopen_mcp_servers(agent_id, &session_id, mcp_servers)?;
+            self.prepare_reopen_mcp_servers(&agent_id, &session_id, mcp_servers)?;
+        let session_key = session_id.0.clone();
         let outcome = send_command(&tx, |reply| AcpCommand::LoadSession {
             session_id,
             cwd,
@@ -1828,6 +2186,8 @@ impl AcpManager {
         .await;
         if outcome.is_err() {
             self.host_plan_server.unregister_by_token(&host_token);
+        } else if let Ok(ref snapshot) = outcome {
+            self.composer_controls.remember(&session_key, snapshot);
         }
         outcome
     }
@@ -1840,11 +2200,19 @@ impl AcpManager {
         cwd: String,
         mcp_servers: Vec<McpServer>,
     ) -> Result<SessionReopenOutcome, String> {
-        let caps = self.capabilities(agent_id)?;
+        let agent_id = self.resolve_live_agent_id(agent_id, Some(&session_id.0))?;
+        let caps = self.capabilities(&agent_id)?;
         gate_resume_session(&caps)?;
-        let tx = self.command_tx(agent_id)?;
+        if let Some(outcome) = self
+            .skip_reopen_if_owned(&agent_id, &session_id, "session/resume")
+            .await
+        {
+            return Ok(outcome);
+        }
+        let tx = self.command_tx(&agent_id)?;
         let (mcp_servers, host_token) =
-            self.prepare_reopen_mcp_servers(agent_id, &session_id, mcp_servers)?;
+            self.prepare_reopen_mcp_servers(&agent_id, &session_id, mcp_servers)?;
+        let session_key = session_id.0.clone();
         let outcome = send_command(&tx, |reply| AcpCommand::ResumeSession {
             session_id,
             cwd,
@@ -1854,6 +2222,8 @@ impl AcpManager {
         .await;
         if outcome.is_err() {
             self.host_plan_server.unregister_by_token(&host_token);
+        } else if let Ok(ref snapshot) = outcome {
+            self.composer_controls.remember(&session_key, snapshot);
         }
         outcome
     }
@@ -1894,7 +2264,12 @@ impl AcpManager {
         let caps = self.capabilities(agent_id)?;
         gate_close_session(&caps)?;
         let tx = self.command_tx(agent_id)?;
-        send_command(&tx, |reply| AcpCommand::CloseSession { session_id, reply }).await
+        let session_key = session_id.0.clone();
+        let result = send_command(&tx, |reply| AcpCommand::CloseSession { session_id, reply }).await;
+        if result.is_ok() {
+            self.composer_controls.forget(&session_key);
+        }
+        result
     }
 
     pub async fn dispose_ephemeral_session(
@@ -1915,7 +2290,8 @@ impl AcpManager {
         agent_id: &AgentId,
         session_id: SessionId,
     ) -> Result<bool, String> {
-        let tx = self.command_tx(agent_id)?;
+        let agent_id = self.resolve_live_agent_id(agent_id, Some(&session_id.0))?;
+        let tx = self.command_tx(&agent_id)?;
         send_command(&tx, |reply| AcpCommand::IsEphemeralSession {
             session_id,
             reply,
@@ -1977,7 +2353,8 @@ impl AcpManager {
         if content.is_empty() {
             return Err("prompt content must not be empty".to_string());
         }
-        let tx = self.command_tx(agent_id)?;
+        let agent_id = self.resolve_live_agent_id(agent_id, Some(&session_id.0))?;
+        let tx = self.command_tx(&agent_id)?;
         let (accepted_tx, accepted_rx) = oneshot::channel();
         let (completion_tx, completion_rx) = oneshot::channel();
         tx.send(AcpCommand::SendPrompt {
@@ -2014,8 +2391,41 @@ impl AcpManager {
         agent_id: &AgentId,
         session_id: SessionId,
     ) -> Result<(), String> {
-        let tx = self.command_tx(agent_id)?;
+        let agent_id = self.resolve_live_agent_id(agent_id, Some(&session_id.0))?;
+        let tx = self.command_tx(&agent_id)?;
         send_command(&tx, |reply| AcpCommand::CancelPrompt { session_id, reply }).await
+    }
+
+    /// Skip `session/load` and `session/resume` when the live process already
+    /// has this session. Reopening a live session makes the agent replay the
+    /// whole transcript and persist it again.
+    async fn skip_reopen_if_owned(
+        &self,
+        agent_id: &AgentId,
+        session_id: &SessionId,
+        op: &str,
+    ) -> Option<SessionReopenOutcome> {
+        match self.owns_session(agent_id, session_id.clone()).await {
+            Ok(true) => {
+                let snapshot = self.composer_controls.snapshot(&session_id.0);
+                log::info!(
+                    "[acp] {op} skipped; live agent already owns the session; has_modes={} has_models={} option_count={}",
+                    snapshot.modes.is_some(),
+                    snapshot.models.is_some(),
+                    snapshot
+                        .config_options
+                        .as_ref()
+                        .map(Vec::len)
+                        .unwrap_or(0)
+                );
+                Some(snapshot)
+            }
+            Ok(false) => None,
+            Err(error) => {
+                log::warn!("[acp] {op} ownership check failed: {error}; continuing with reopen");
+                None
+            }
+        }
     }
 
     /// Verify that a live agent's authoritative driver owns this session.
@@ -2025,7 +2435,8 @@ impl AcpManager {
         agent_id: &AgentId,
         session_id: SessionId,
     ) -> Result<bool, String> {
-        let tx = self.command_tx(agent_id)?;
+        let agent_id = self.resolve_live_agent_id(agent_id, Some(&session_id.0))?;
+        let tx = self.command_tx(&agent_id)?;
         send_command(&tx, |reply| AcpCommand::OwnsSession { session_id, reply }).await
     }
 
@@ -2056,13 +2467,22 @@ impl AcpManager {
         session_id: SessionId,
         mode_id: String,
     ) -> Result<(), String> {
-        let tx = self.command_tx(agent_id)?;
-        send_command(&tx, |reply| AcpCommand::SetMode {
+        let agent_id = self.resolve_live_agent_id(agent_id, Some(&session_id.0))?;
+        let tx = self.command_tx(&agent_id)?;
+        let session_key = session_id.0.clone();
+        let result = send_command(&tx, |reply| AcpCommand::SetMode {
             session_id,
-            mode_id,
+            mode_id: mode_id.clone(),
             reply,
         })
-        .await
+        .await;
+        if result.is_ok() {
+            self.composer_controls.apply_current_mode(
+                &session_key,
+                agent_client_protocol::schema::v1::SessionModeId::new(mode_id),
+            );
+        }
+        result
     }
 
     /// Set the session's active model.
@@ -2072,7 +2492,8 @@ impl AcpManager {
         session_id: SessionId,
         model_id: String,
     ) -> Result<(), String> {
-        let tx = self.command_tx(agent_id)?;
+        let agent_id = self.resolve_live_agent_id(agent_id, Some(&session_id.0))?;
+        let tx = self.command_tx(&agent_id)?;
         send_command(&tx, |reply| AcpCommand::SetModel {
             session_id,
             model_id,
@@ -2089,14 +2510,49 @@ impl AcpManager {
         config_id: String,
         value_id: String,
     ) -> Result<Vec<SessionConfigOption>, String> {
-        let tx = self.command_tx(agent_id)?;
-        send_command(&tx, |reply| AcpCommand::SetConfigOption {
+        let agent_id = self.resolve_live_agent_id(agent_id, Some(&session_id.0))?;
+        let tx = self.command_tx(&agent_id)?;
+        let session_key = session_id.0.clone();
+        let result = send_command(&tx, |reply| AcpCommand::SetConfigOption {
             session_id,
             config_id,
             value_id,
             reply,
         })
-        .await
+        .await;
+        if let Ok(ref options) = result {
+            self.composer_controls
+                .remember_options(&session_key, options.clone());
+        }
+        result
+    }
+
+    /// Live composer snapshot for a session the driver already owns.
+    /// Does not call `session/load` or `session/resume`.
+    pub async fn composer_controls(
+        &self,
+        agent_id: &AgentId,
+        session_id: SessionId,
+    ) -> Result<SessionReopenOutcome, String> {
+        let agent_id = self.resolve_live_agent_id(agent_id, Some(&session_id.0))?;
+        match self.owns_session(&agent_id, session_id.clone()).await {
+            Ok(true) => {
+                let snapshot = self.composer_controls.snapshot(&session_id.0);
+                log::info!(
+                    "[acp] composer controls snapshot has_modes={} has_models={} option_count={}",
+                    snapshot.modes.is_some(),
+                    snapshot.models.is_some(),
+                    snapshot
+                        .config_options
+                        .as_ref()
+                        .map(Vec::len)
+                        .unwrap_or(0)
+                );
+                Ok(snapshot)
+            }
+            Ok(false) => Err("session is not live on the host agent".to_string()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Route a permission decision back to a waiting agent request.
@@ -2672,6 +3128,7 @@ fn run_agent(
     persistence: Option<Arc<SessionPersistence>>,
     conversation_persistence: Option<Arc<ConversationPersistenceAdapter>>,
     warmup_done: Arc<Mutex<HashSet<AgentId>>>,
+    composer_controls: Arc<ComposerControlCache>,
 ) {
     // True once `initialize` succeeded and the agent was surfaced to the
     // renderer via `acp:agent_spawned`. We only emit disconnect/error events
@@ -2708,6 +3165,7 @@ fn run_agent(
         persistence.clone(),
         conversation_persistence,
         warmup_done.clone(),
+        composer_controls,
     ));
 
     let was_spawned = spawned.load(Ordering::Acquire);
@@ -2861,6 +3319,7 @@ async fn drive_connection(
     persistence: Option<Arc<SessionPersistence>>,
     conversation_persistence: Option<Arc<ConversationPersistenceAdapter>>,
     warmup_done: Arc<Mutex<HashSet<AgentId>>>,
+    composer_controls: Arc<ComposerControlCache>,
 ) -> Result<(), String> {
     // Agent stderr and JSON-RPC/terminal streams can carry credentials, paths, prompts, and
     // transcript bytes. Operational logging records direction and byte count only; there is no
@@ -2873,7 +3332,7 @@ async fn drive_connection(
                 LineDirection::Stdin => "stdin",
                 LineDirection::Stdout => "stdout",
             };
-            log::debug!(
+            log::trace!(
                 "[acp] {debug_agent_id} stream={stream} bytes={}",
                 line.len()
             );
@@ -2936,6 +3395,8 @@ async fn drive_connection(
     let loop_state = driver_state.clone();
     let loop_spawned = spawned.clone();
     let loop_warmup_done = warmup_done.clone();
+    let loop_composer_controls = composer_controls.clone();
+    let notif_composer_controls = composer_controls;
 
     let connection_result = Client
         .builder()
@@ -2955,6 +3416,21 @@ async fn drive_connection(
                 // the idle timeout. Best-effort: a no-op when no turn is
                 // active for this session.
                 notif_state.lock().signal_idle(&session_id);
+                match &notification.update {
+                    agent_client_protocol::schema::v1::SessionUpdate::CurrentModeUpdate(
+                        update,
+                    ) => {
+                        notif_composer_controls
+                            .apply_current_mode(&session_id, update.current_mode_id.clone());
+                    }
+                    agent_client_protocol::schema::v1::SessionUpdate::ConfigOptionUpdate(
+                        update,
+                    ) => {
+                        notif_composer_controls
+                            .remember_options(&session_id, update.config_options.clone());
+                    }
+                    _ => {}
+                }
                 let tool_call_id = match &notification.update {
                     agent_client_protocol::schema::v1::SessionUpdate::ToolCall(tool_call) => {
                         Some(tool_call.tool_call_id.0.to_string())
@@ -3380,6 +3856,7 @@ async fn drive_connection(
                 persistence,
                 conversation_persistence,
                 loop_warmup_done,
+                loop_composer_controls,
             )
             .await;
             // Driver thread is winding down — kill any live terminal children so
@@ -3409,6 +3886,7 @@ async fn run_command_loop(
     persistence: Option<Arc<SessionPersistence>>,
     conversation_persistence: Option<Arc<ConversationPersistenceAdapter>>,
     warmup_done: Arc<Mutex<HashSet<AgentId>>>,
+    composer_controls: Arc<ComposerControlCache>,
 ) -> Result<(), agent_client_protocol::Error> {
     // Step 1: handshake, bounded by INIT_TIMEOUT so a silent agent can never
     // wedge `acp_spawn_agent` forever (H1). On timeout we report the failure
@@ -3494,6 +3972,7 @@ async fn run_command_loop(
                 let req_state = driver_state.clone();
                 let req_persistence = persistence.clone();
                 let req_warmup_done = warmup_done.clone();
+                let req_composer = composer_controls.clone();
                 spawn_request(&cx, slot, async move {
                     let request = NewSessionRequest::new(cwd.clone()).mcp_servers(mcp_servers);
                     let timeout = session_new_timeout();
@@ -3704,6 +4183,14 @@ async fn run_command_loop(
                                 ),
                                 config_options: response.config_options.clone(),
                             };
+                            req_composer.remember(
+                                &session_id.0,
+                                &SessionReopenOutcome {
+                                    modes: outcome.modes.clone(),
+                                    models: outcome.models.clone(),
+                                    config_options: outcome.config_options.clone(),
+                                },
+                            );
                             // Return the opaque ACP response to the manager, then hold the
                             // renderer-visible success event until the manager has durably bound
                             // it to the pre-created Conversation.
@@ -4321,6 +4808,7 @@ async fn run_command_loop(
                 let req_delivery_circuits = Arc::clone(&delivery_circuits);
                 let req_agent_id = agent_id.clone();
                 let req_state = driver_state.clone();
+                let req_composer = composer_controls.clone();
                 spawn_request(&cx, slot, async move {
                     // ACP 0.14 removed `session/set_model`; the model is now a
                     // `select`-kind config option (category = Model). Its configId
@@ -4339,6 +4827,10 @@ async fn run_command_loop(
                     );
                     match req_cx.send_request(request).block_task().await {
                         Ok(response) => {
+                            req_composer.remember_options(
+                                &session_id.0,
+                                response.config_options.clone(),
+                            );
                             let event = ConfigOptionsUpdateEvent {
                                 agent_id: req_agent_id,
                                 session_id,
@@ -4380,6 +4872,7 @@ async fn run_command_loop(
                 let req_delivery_circuits = Arc::clone(&delivery_circuits);
                 let req_agent_id = agent_id.clone();
                 let req_state = driver_state.clone();
+                let req_composer = composer_controls.clone();
                 spawn_request(&cx, slot, async move {
                     let request = SetSessionConfigOptionRequest::new(
                         &session_id,
@@ -4388,6 +4881,10 @@ async fn run_command_loop(
                     );
                     match req_cx.send_request(request).block_task().await {
                         Ok(response) => {
+                            req_composer.remember_options(
+                                &session_id.0,
+                                response.config_options.clone(),
+                            );
                             // Keep the cached Model-selector configId fresh in case
                             // the agent reorganized its config options.
                             if let Some(id) = events::model_config_id_from_options(Some(
@@ -4626,6 +5123,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_reuses_live_agent_for_same_config_id() {
+        let manager = AcpManager::new(vec![]);
+        let agent_id = AgentId("runtime-codex".to_string());
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        manager.agents.lock().insert(
+            agent_id.clone(),
+            AgentEntry {
+                command_tx,
+                capabilities: AgentCapabilities::default(),
+                stable_namespace: Some("config:acp-registry:codex-acp".to_string()),
+                join_handle: None,
+                killed: Arc::new(AtomicBool::new(false)),
+                permission_policy: Arc::new(Mutex::new(PermissionPolicy::Ask)),
+            },
+        );
+
+        let outcome = manager
+            .spawn(AgentConfig {
+                config_id: Some("acp-registry:codex-acp".to_string()),
+                name: "Codex".to_string(),
+                command: "npx".to_string(),
+                args: vec![
+                    "-y".to_string(),
+                    "@agentclientprotocol/codex-acp@1.3.0".to_string(),
+                ],
+                env: Default::default(),
+                allow_terminal: false,
+                permission_policy: PermissionPolicy::Ask,
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.agent_id, agent_id);
+        assert!(manager
+            .list_running_namespaces()
+            .iter()
+            .any(|(id, namespace)| {
+                id == "runtime-codex"
+                    && namespace.as_deref() == Some("config:acp-registry:codex-acp")
+            }));
+    }
+
+    fn insert_live_agent(manager: &AcpManager, agent_id: AgentId, namespace: &str) {
+        let (command_tx, _command_rx) = mpsc::unbounded_channel();
+        manager.agents.lock().insert(
+            agent_id,
+            AgentEntry {
+                command_tx,
+                capabilities: AgentCapabilities::default(),
+                stable_namespace: Some(namespace.to_string()),
+                join_handle: None,
+                killed: Arc::new(AtomicBool::new(false)),
+                permission_policy: Arc::new(Mutex::new(PermissionPolicy::Ask)),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_live_agent_id_remaps_stale_spawn_uuid_via_binding_namespace() {
+        let temp = tempfile::tempdir().unwrap();
+        let bootstrap = crate::conversation::ConversationBootstrap::run(
+            crate::conversation::HostConversationRoots::desktop(
+                temp.path().join("state"),
+                temp.path().join("visible"),
+            ),
+            crate::conversation::MigrationHostMode::Desktop,
+        )
+        .unwrap();
+        let manager = AcpManager::with_conversation_services(
+            Vec::new(),
+            Arc::clone(&bootstrap.creation),
+            Arc::clone(&bootstrap.persistence_adapter),
+        );
+        let prepared = bootstrap
+            .creation
+            .prepare_conversation(PrepareConversationRequest::new(ExecutionTarget::Workspace))
+            .await
+            .unwrap();
+        let created_at =
+            crate::conversation::parse_created_at_utc(&prepared.created_at_utc).unwrap();
+        let stale = AgentId("470a8293-9a07-48c7-8fd2-1a6c5391a924".to_string());
+        let live = AgentId("live-cursor-after-restart".to_string());
+        bootstrap
+            .writer
+            .bind_agent_session(
+                prepared.conversation_id,
+                AgentSessionBinding {
+                    schema_version: crate::conversation::AGENT_SESSION_BINDING_SCHEMA_VERSION,
+                    binding_id: uuid::Uuid::new_v4(),
+                    agent_session_id: "opaque/hello-there".to_string(),
+                    runtime_agent_id: stale.0.clone(),
+                    stable_agent_namespace: "config:acp-registry:cursor".to_string(),
+                    execution_cwd: prepared.execution_cwd.clone(),
+                    bound_at_utc: created_at,
+                    state: crate::conversation::AgentSessionBindingState::Active,
+                },
+                created_at,
+            )
+            .await
+            .unwrap();
+        insert_live_agent(&manager, live.clone(), "config:acp-registry:cursor");
+
+        assert_eq!(
+            manager
+                .resolve_live_agent_id(&stale, Some("opaque/hello-there"))
+                .unwrap(),
+            live
+        );
+        assert_eq!(
+            manager
+                .resolve_live_agent_id(&live, Some("opaque/hello-there"))
+                .unwrap(),
+            live
+        );
+        assert!(manager
+            .resolve_live_agent_id(&stale, Some("missing-session"))
+            .unwrap_err()
+            .starts_with("unknown agent:"));
+
+        let continued = manager
+            .new_session_with_context(
+                &stale,
+                prepared.execution_cwd,
+                Vec::new(),
+                SessionCreationContext {
+                    conversation_id: Some(prepared.conversation_id),
+                    ..SessionCreationContext::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(continued.session_id.0, "opaque/hello-there");
+        assert_eq!(continued.conversation_id, Some(prepared.conversation_id));
+    }
+
+    #[tokio::test]
     async fn owns_session_queries_authoritative_agent_driver_state() {
         let manager = AcpManager::new(vec![]);
         let agent_id = AgentId::new();
@@ -4655,6 +5287,67 @@ mod tests {
             .owns_session(&agent_id, SessionId::new("owned-session"))
             .await
             .unwrap());
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn skip_reopen_returns_cached_composer_controls_for_live_session() {
+        let manager = AcpManager::new(vec![]);
+        let agent_id = AgentId::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut capabilities = AgentCapabilities::default();
+        capabilities.session_capabilities.resume = Some(Default::default());
+        manager.agents.lock().insert(
+            agent_id.clone(),
+            AgentEntry {
+                command_tx: tx,
+                capabilities,
+                stable_namespace: None,
+                join_handle: None,
+                killed: Arc::new(AtomicBool::new(false)),
+                permission_policy: Arc::new(Mutex::new(PermissionPolicy::Ask)),
+            },
+        );
+        let modes = agent_client_protocol::schema::v1::SessionModeState::new("ask", vec![]);
+        let options = vec![SessionConfigOption::select(
+            "model",
+            "Model",
+            "m1",
+            vec![
+                agent_client_protocol::schema::v1::SessionConfigSelectOption::new("m1", "Fast"),
+                agent_client_protocol::schema::v1::SessionConfigSelectOption::new("m2", "Pro"),
+            ],
+        )
+        .category(agent_client_protocol::schema::v1::SessionConfigOptionCategory::Model)];
+        let models = events::models_from_config_options(Some(options.as_slice()));
+        manager.composer_controls.remember(
+            "live-session",
+            &SessionReopenOutcome {
+                modes: Some(modes.clone()),
+                models: models.clone(),
+                config_options: Some(options.clone()),
+            },
+        );
+        let responder = tokio::spawn(async move {
+            match rx.recv().await.unwrap() {
+                AcpCommand::OwnsSession { reply, .. } => {
+                    let _ = reply.send(Ok(true));
+                }
+                _ => panic!("live-session reopen must not call the agent"),
+            }
+        });
+        let outcome = manager
+            .resume_session(
+                &agent_id,
+                SessionId::new("live-session"),
+                "/work".to_string(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.modes, Some(modes));
+        assert_eq!(outcome.models, models);
+        assert_eq!(outcome.config_options, Some(options));
         responder.await.unwrap();
     }
 
@@ -4793,25 +5486,29 @@ mod tests {
         ));
         let capture = tokio::spawn(async move {
             let mut received = Vec::new();
-            for _ in 0..2 {
+            while received.len() < 2 {
                 let command = command_rx.recv().await.unwrap();
-                let (mcp_servers, reply) = match command {
+                match command {
+                    AcpCommand::OwnsSession { reply, .. } => {
+                        reply.send(Ok(false)).unwrap();
+                    }
                     AcpCommand::ResumeSession {
                         mcp_servers, reply, ..
                     }
                     | AcpCommand::LoadSession {
                         mcp_servers, reply, ..
-                    } => (mcp_servers, reply),
+                    } => {
+                        received.push(mcp_servers);
+                        reply
+                            .send(Ok(SessionReopenOutcome {
+                                modes: None,
+                                models: None,
+                                config_options: None,
+                            }))
+                            .unwrap();
+                    }
                     _ => panic!("unexpected ACP command"),
-                };
-                received.push(mcp_servers);
-                reply
-                    .send(Ok(SessionReopenOutcome {
-                        modes: None,
-                        models: None,
-                        config_options: None,
-                    }))
-                    .unwrap();
+                }
             }
             received
         });

@@ -1,13 +1,14 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use chrono::Utc;
 
-use super::parse::parse_session_file;
-use super::paths::{default_codex_home, is_under_dir, roots_for_agent};
-use super::scope::{filter_scope_paths, is_cwd_in_scope};
+use super::parse::{hydrate_session, is_allowed_transcript_path, scanned_session};
+use super::paths::{default_codex_home, is_under_dir, walk_roots_for_agent};
+use super::scope::filter_scope_paths;
 use super::types::{
-    CliSessionAgentId, CliSessionListArgs, CliSessionListResult, CliSessionScanIssue,
-    DiscoveredCliSession, DEFAULT_LIMIT_PER_AGENT, WALK_LIMIT_PER_AGENT,
+    CliSessionAgentId, CliSessionListArgs, CliSessionListResult, CliSessionResolveArgs,
+    CliSessionResolveResult, CliSessionScanIssue, DiscoveredCliSession, DEFAULT_LIMIT_PER_AGENT,
+    RESOLVE_BATCH_MAX, WALK_LIMIT_PER_AGENT,
 };
 use super::walk::{is_cursor_transcript, is_opencode_session_json, walk_session_files};
 
@@ -67,64 +68,51 @@ fn scan_agent(
     scope_paths: &[PathBuf],
 ) -> (Vec<DiscoveredCliSession>, Vec<CliSessionScanIssue>) {
     let mut issues = Vec::new();
-    let roots = roots_for_agent(agent);
-    if roots.iter().all(|root| !root.is_dir()) {
+    let roots = walk_roots_for_agent(agent, scope_paths);
+    if roots.is_empty() {
         log::info!(
             target: "termul::cli_session",
             "operation=scan_root_missing agent={}",
             agent.as_str()
         );
+        return (Vec::new(), issues);
     }
 
     let mut files = Vec::new();
-    match agent {
-        CliSessionAgentId::ClaudeCode => {
-            for root in &roots {
-                files.extend(walk_session_files(
-                    root,
-                    &["jsonl"],
-                    &["subagents"],
-                    None,
-                    WALK_LIMIT_PER_AGENT,
-                ));
+    for root in &roots {
+        log::info!(
+            target: "termul::cli_session",
+            "operation=scan_root agent={} root={}",
+            agent.as_str(),
+            root.path.display()
+        );
+        let walked = match agent {
+            CliSessionAgentId::ClaudeCode => walk_session_files(
+                &root.path,
+                &["jsonl"],
+                &["subagents"],
+                None,
+                WALK_LIMIT_PER_AGENT,
+            ),
+            CliSessionAgentId::Codex => {
+                walk_session_files(&root.path, &["jsonl"], &[], None, WALK_LIMIT_PER_AGENT)
             }
-        }
-        CliSessionAgentId::Codex => {
-            for root in &roots {
-                files.extend(walk_session_files(
-                    root,
-                    &["jsonl"],
-                    &[],
-                    None,
-                    WALK_LIMIT_PER_AGENT,
-                ));
-            }
-        }
-        CliSessionAgentId::GeminiCli => {
-            for root in &roots {
-                files.extend(walk_session_files(
-                    root,
-                    &["json", "jsonl"],
-                    &[],
-                    None,
-                    WALK_LIMIT_PER_AGENT,
-                ));
-            }
-        }
-        CliSessionAgentId::Cursor => {
-            for root in &roots {
-                files.extend(walk_session_files(
-                    root,
-                    &["jsonl"],
-                    &[],
-                    Some(&is_cursor_transcript),
-                    WALK_LIMIT_PER_AGENT,
-                ));
-            }
-        }
-        CliSessionAgentId::Opencode => {
-            for root in &roots {
-                if let Ok(entries) = std::fs::read_dir(root) {
+            CliSessionAgentId::GeminiCli => walk_session_files(
+                &root.path,
+                &["json", "jsonl"],
+                &[],
+                None,
+                WALK_LIMIT_PER_AGENT,
+            ),
+            CliSessionAgentId::Cursor => walk_session_files(
+                &root.path,
+                &["jsonl"],
+                &[],
+                Some(&is_cursor_transcript),
+                WALK_LIMIT_PER_AGENT,
+            ),
+            CliSessionAgentId::Opencode => {
+                if let Ok(entries) = std::fs::read_dir(&root.path) {
                     for entry in entries.flatten() {
                         let name = entry.file_name().to_string_lossy().to_string();
                         if name.ends_with(".db") {
@@ -137,84 +125,91 @@ fn scan_agent(
                         }
                     }
                 }
-                files.extend(walk_session_files(
-                    root,
+                walk_session_files(
+                    &root.path,
                     &["json"],
                     &[],
                     Some(&is_opencode_session_json),
                     WALK_LIMIT_PER_AGENT,
-                ));
+                )
             }
-        }
-        CliSessionAgentId::Pi => {
-            for root in &roots {
-                files.extend(walk_session_files(
-                    root,
-                    &["jsonl"],
-                    &[],
-                    None,
-                    WALK_LIMIT_PER_AGENT,
-                ));
+            CliSessionAgentId::Pi => {
+                walk_session_files(&root.path, &["jsonl"], &[], None, WALK_LIMIT_PER_AGENT)
             }
+        };
+        for file in walked {
+            files.push((file, root.cwd.clone()));
         }
     }
 
-    files.sort_by(|a, b| b.modified.cmp(&a.modified));
-    files.dedup_by(|a, b| a.path == b.path);
+    files.sort_by(|left, right| right.0.modified.cmp(&left.0.modified));
+    files.dedup_by(|left, right| left.0.path == right.0.path);
 
     let codex_home = default_codex_home();
-    let mut parsed = Vec::new();
-    for file in files {
-        match parse_session_file(agent, &file.path, codex_home.as_deref()) {
-            Some(mut session) => {
-                if agent == CliSessionAgentId::Codex {
-                    if let Some(home) = codex_home.as_ref() {
-                        if !is_default_codex_home(home) {
-                            session.codex_home = Some(home.display().to_string());
-                        }
-                    }
+    let mut matched = Vec::new();
+    for (file, cwd) in files {
+        if matched.len() >= limit {
+            break;
+        }
+        let home = if agent == CliSessionAgentId::Codex {
+            codex_home.as_ref().and_then(|home| {
+                if is_default_codex_home(home) {
+                    None
+                } else {
+                    Some(home.display().to_string())
                 }
-                parsed.push(session);
-            }
-            None => {
-                issues.push(CliSessionScanIssue {
-                    agent_id: agent.as_str().to_string(),
-                    path: file.path.display().to_string(),
-                    message: "failed to parse session metadata".to_string(),
-                });
-            }
-        }
-    }
-
-    let mut in_scope = Vec::new();
-    let mut remainder = Vec::new();
-    for session in parsed {
-        if is_cwd_in_scope(session.cwd.as_deref(), scope_paths) && !scope_paths.is_empty() {
-            in_scope.push(session);
+            })
         } else {
-            remainder.push(session);
+            None
+        };
+        matched.push(scanned_session(agent, &file, cwd, home));
+    }
+
+    (matched, issues)
+}
+
+pub fn resolve_cli_sessions(args: CliSessionResolveArgs) -> CliSessionResolveResult {
+    let mut sessions = Vec::new();
+    let mut issues = Vec::new();
+    let codex_home = default_codex_home();
+    for file in args.files.into_iter().take(RESOLVE_BATCH_MAX) {
+        let path = PathBuf::from(&file.file_path);
+        let home = if file.agent_id == CliSessionAgentId::Codex {
+            codex_home.as_ref().and_then(|home| {
+                if is_default_codex_home(home) {
+                    None
+                } else {
+                    Some(home.display().to_string())
+                }
+            })
+        } else {
+            None
+        };
+        if !is_allowed_transcript_path(file.agent_id, &path) {
+            issues.push(CliSessionScanIssue {
+                agent_id: file.agent_id.as_str().to_string(),
+                path: file.file_path,
+                message: "transcript path is outside the host vendor store".to_string(),
+            });
+            continue;
+        }
+        match hydrate_session(file.agent_id, &path, None, home) {
+            Some(session) => sessions.push(session),
+            None => issues.push(CliSessionScanIssue {
+                agent_id: file.agent_id.as_str().to_string(),
+                path: file.file_path,
+                message: "failed to read first session_id from transcript".to_string(),
+            }),
         }
     }
-
-    if scope_paths.is_empty() {
-        remainder.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
-        remainder.truncate(limit);
-        return (remainder, issues);
-    }
-
-    in_scope.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
-    in_scope.truncate(limit);
-    (in_scope, issues)
+    CliSessionResolveResult { sessions, issues }
 }
 
-fn is_default_codex_home(home: &Path) -> bool {
-    dirs_like_default_codex(home)
-}
-
-fn dirs_like_default_codex(home: &Path) -> bool {
+fn is_default_codex_home(home: &std::path::Path) -> bool {
     std::env::var_os("CODEX_HOME").is_none()
-        && super::paths::user_home()
-            .is_some_and(|user| is_under_dir(home, &user.join(".codex")) || home == user.join(".codex"))
+        && super::paths::user_home().is_some_and(|user| {
+            is_under_dir(home, &user.join(".codex")) || home == user.join(".codex")
+        })
 }
 
 #[cfg(test)]
@@ -224,24 +219,24 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn scope_paths_keep_older_matching_cwd() {
+    fn filename_only_lists_jsonl_names() {
         let dir = tempdir().unwrap();
-        let older = dir.path().join("old.jsonl");
-        let newer = dir.path().join("new.jsonl");
         fs::write(
-            &older,
-            r#"{"type":"user","role":"user","sessionId":"old","cwd":"/keep","content":"one"}
-"#,
+            dir.path().join("sess-keep.jsonl"),
+            "this body must not be read",
         )
         .unwrap();
-        fs::write(
-            &newer,
-            r#"{"type":"user","role":"user","sessionId":"new","cwd":"/other","content":"two"}
-"#,
-        )
-        .unwrap();
-        // Direct parse coverage lives in parse.rs; here we pin cwd matching.
-        assert!(is_cwd_in_scope(Some("/keep"), &[PathBuf::from("/keep")]));
-        assert!(!is_cwd_in_scope(Some("/other"), &[PathBuf::from("/keep")]));
+        fs::write(dir.path().join("notes.txt"), "ignore").unwrap();
+        let files = walk_session_files(dir.path(), &["jsonl"], &["subagents"], None, 100);
+        assert_eq!(files.len(), 1);
+        let session = scanned_session(
+            CliSessionAgentId::ClaudeCode,
+            &files[0],
+            Some("/repo".into()),
+            None,
+        );
+        assert_eq!(session.session_id, "");
+        assert!(!session.resumable);
+        assert_eq!(session.cwd.as_deref(), Some("/repo"));
     }
 }

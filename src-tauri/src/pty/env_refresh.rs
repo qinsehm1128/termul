@@ -238,7 +238,7 @@ pub fn shell_startup_args(shell_path: &str) -> &'static [&'static str] {
 }
 
 /// Whether an interactive shell spawn should pass a login-shell flag.
-#[cfg_attr(windows, allow(dead_code))]
+#[cfg(test)]
 pub fn shell_wants_login_arg(shell_path: &str) -> Option<&'static str> {
     shell_startup_args(shell_path).first().copied()
 }

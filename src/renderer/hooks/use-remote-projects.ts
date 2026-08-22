@@ -1,24 +1,21 @@
 import { useEffect } from 'react'
-import { remoteServerApi } from '@/lib/api'
+import { toProjectGroupSummaries, toProjectSummaries } from '@/hooks/use-projects-persistence'
+import { remoteServerApi, syncProjects } from '@/lib/api'
+import { logFrontendError } from '@/lib/log-api'
 import { isTauriContext } from '@/lib/tauri-runtime'
+import { useProjectStore } from '@/stores/project-store'
 import { useRemoteStatusStore } from '@/stores/remote-status-store'
 
 /**
- * Polls the desktop-hosted web server status into the global status store so
- * the StatusBar shows a compact indicator while the server is running.
- *
- * The legacy project-tree publishing + `remote://spawn-request` handling (the
- * old PTY bridge's `/api/projects` + `/api/spawn` flow) has been removed: the
- * ACP web server shares the desktop's live agent sessions directly over WS, so
- * there is no project-picking step for the phone client to drive.
- *
- * Mounted once near the app root. No-op outside a Tauri context.
+ * Polls the desktop-hosted web server status and restores a wanted session
+ * once after launch. Mounted once near the app root. No-op outside Tauri.
  */
 export function useRemoteProjects(): void {
   useEffect(() => {
     if (!isTauriContext()) return
 
     let disposed = false
+    let restoreAttempted = false
 
     const pollStatus = async (): Promise<void> => {
       if (disposed) return
@@ -27,6 +24,47 @@ export function useRemoteProjects(): void {
         useRemoteStatusStore.getState().setStatus(result.data)
       }
     }
+
+    const restoreWanted = async (): Promise<void> => {
+      if (disposed || restoreAttempted) return
+      restoreAttempted = true
+      const intent = await remoteServerApi.intent()
+      if (!intent.success || !intent.data.wanted) return
+      const current = await remoteServerApi.status()
+      if (current.success && current.data.running) {
+        useRemoteStatusStore.getState().setStatus(current.data)
+        return
+      }
+      const bindMode = intent.data.publishMode === 'lan' ? 'all' : 'localhost'
+      const started = await remoteServerApi.start({ bindMode })
+      if (disposed) return
+      if (started.success) {
+        useRemoteStatusStore.getState().setStatus(started.data)
+        useRemoteStatusStore.getState().setRestoreError(null)
+        const { projects, groups, activeProjectId } = useProjectStore.getState()
+        const syncResult = await syncProjects(
+          toProjectSummaries(projects, activeProjectId),
+          activeProjectId || null,
+          toProjectGroupSummaries(groups)
+        )
+        if (!syncResult.success) {
+          void logFrontendError({
+            level: 'warn',
+            source: 'useRemoteProjects.restore',
+            message: `Failed to seed remote project list: ${syncResult.error}`
+          })
+        }
+        return
+      }
+      useRemoteStatusStore.getState().setRestoreError(started.error)
+      void logFrontendError({
+        level: 'error',
+        source: 'useRemoteProjects.restore',
+        message: `Failed to restore remote access: ${started.error}`
+      })
+    }
+
+    void restoreWanted()
     void pollStatus()
     const statusTimer = setInterval(() => void pollStatus(), 3000)
 

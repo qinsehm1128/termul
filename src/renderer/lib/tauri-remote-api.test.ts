@@ -86,6 +86,31 @@ describe('remoteServerApi', () => {
     }
   })
 
+  it('intent() and rotateCredential() forward the new remote commands', async () => {
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      data: { wanted: true, publishMode: 'lan' }
+    })
+    await remoteServerApi.intent()
+    expect(mockInvoke).toHaveBeenCalledWith('remote_access_intent_get', undefined)
+
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      data: { wanted: true, publishMode: 'tunnel' }
+    })
+    await remoteServerApi.setIntent({ publishMode: 'tunnel' })
+    expect(mockInvoke).toHaveBeenCalledWith('remote_access_intent_set', {
+      update: { publishMode: 'tunnel' }
+    })
+
+    mockInvoke.mockResolvedValueOnce({
+      success: true,
+      data: { running: false, url: null, port: null, bindMode: null, bindHost: null }
+    })
+    await remoteServerApi.rotateCredential()
+    expect(mockInvoke).toHaveBeenCalledWith('remote_server_rotate_credential', undefined)
+  })
+
   it('tunnelConfigApi.get forwards tunnel_config_get', async () => {
     const ipc: IpcResult<{ provider: 'cloudflareQuick' }> = {
       success: true,

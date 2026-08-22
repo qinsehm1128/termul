@@ -45,16 +45,18 @@ final class TerminalSocket {
 
     var onBytes: (@MainActor (String, Data) -> Void)?
     var onExit: (@MainActor (String) -> Void)?
+    var onCatalogChanged: (@MainActor () -> Void)?
 
     private var session: URLSession?
     private var task: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
     private var pending: [String: CheckedContinuation<Data, Error>] = [:]
     private var requestSerial = 0
+    private var openGate: HostWebSocketOpenGate?
 
     func connect(origin: URL, credentials: HostCredentials) async throws {
         stop()
-        guard credentials.bearer?.isEmpty == false else {
+        guard let token = credentials.bearer, !token.isEmpty else {
             throw HostError.unexpected(String(localized: "This access link is missing its token. Scan the QR again."))
         }
         var components = URLComponents(url: origin, resolvingAgainstBaseURL: false) ?? URLComponents()
@@ -65,27 +67,43 @@ final class TerminalSocket {
         guard let wsURL = components.url else {
             throw HostError.unexpected("Invalid terminal URL")
         }
-        var request = URLRequest(url: wsURL, timeoutInterval: 20)
-        request.assumesHTTP3Capable = false
-        credentials.apply(to: &request)
-        let session = URLSession(configuration: .default)
+        var urlRequest = URLRequest(url: wsURL, timeoutInterval: HostTunnelSession.handshakeSeconds)
+        urlRequest.assumesHTTP3Capable = false
+        credentials.apply(to: &urlRequest)
+        let gate = HostWebSocketOpenGate()
+        openGate = gate
+        let session = HostTunnelSession.make(delegate: gate)
         self.session = session
-        let task = session.webSocketTask(with: request)
+        let task = session.webSocketTask(with: urlRequest)
         self.task = task
         task.resume()
         receiveTask = Task { await self.receiveLoop() }
-        isConnected = true
+        do {
+            try await gate.waitForOpen()
+            _ = try await self.request("authenticate", payload: ["token": token], as: EmptyPayload.self)
+            isConnected = true
+            HostLog.session.info("terminal WebSocket authenticated")
+        } catch {
+            HostLog.session.error("terminal WebSocket connect failed: \(error.localizedDescription, privacy: .public)")
+            stop()
+            throw error
+        }
     }
 
-    func spawn(conversationId: String, projectId: String?, cols: Int, rows: Int) async throws -> SpawnedTerminal {
+    func spawn(conversationId: String?, projectId: String?, cols: Int, rows: Int) async throws -> SpawnedTerminal {
         var payload: [String: Any] = [
-            "conversationId": conversationId,
-            "cwdSource": "workspace",
             "cols": cols,
             "rows": rows
         ]
+        if let conversationId, !conversationId.isEmpty {
+            payload["conversationId"] = conversationId
+            payload["cwdSource"] = "workspace"
+        }
         if let projectId, !projectId.isEmpty {
             payload["projectId"] = projectId
+        }
+        if payload["conversationId"] == nil && payload["projectId"] == nil {
+            throw HostError.unexpected(String(localized: "A conversation or project is required."))
         }
         return try await request("spawn", payload: payload, as: SpawnedTerminal.self)
     }
@@ -156,10 +174,9 @@ final class TerminalSocket {
     func stop() {
         receiveTask?.cancel()
         receiveTask = nil
-        for (_, continuation) in pending {
-            continuation.resume(throwing: HostError.network(String(localized: "Disconnected from the host.")))
-        }
-        pending.removeAll()
+        openGate?.failOpen(HostError.network(String(localized: "Disconnected from the host.")))
+        openGate = nil
+        failPending(HostError.network(String(localized: "Disconnected from the host.")))
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
         session?.invalidateAndCancel()
@@ -174,7 +191,13 @@ final class TerminalSocket {
         let data = try WireJSON.data(from: body)
         let reply = try await withCheckedThrowingContinuation { continuation in
             pending[id] = continuation
-            task?.send(.string(String(data: data, encoding: .utf8) ?? "")) { [weak self] error in
+            guard let task else {
+                pending.removeValue(forKey: id)?.resume(
+                    throwing: HostError.network(String(localized: "Disconnected from the host."))
+                )
+                return
+            }
+            task.send(.string(String(data: data, encoding: .utf8) ?? "")) { [weak self] error in
                 Task { @MainActor in
                     if let error {
                         self?.pending.removeValue(forKey: id)?.resume(throwing: HostError.network(error.localizedDescription))
@@ -204,6 +227,7 @@ final class TerminalSocket {
                 handleFrame(data)
             } catch {
                 isConnected = false
+                failPending(HostError.network(error.localizedDescription))
                 return
             }
         }
@@ -230,12 +254,25 @@ final class TerminalSocket {
             }
         case "event":
             if let payload = object["payload"] as? [String: Any],
-               payload["type"] as? String == "exit",
-               let terminalId = payload["terminal_id"] as? String {
-                onExit?(terminalId)
+               let eventType = payload["type"] as? String {
+                if eventType == "exit", let terminalId = payload["terminal_id"] as? String {
+                    onExit?(terminalId)
+                }
+                if eventType == "spawned" || eventType == "exit" {
+                    HostLog.session.info("Host terminal catalog changed")
+                    onCatalogChanged?()
+                }
             }
         default:
             break
+        }
+    }
+
+    private func failPending(_ error: Error) {
+        let pending = self.pending
+        self.pending.removeAll()
+        for (_, continuation) in pending {
+            continuation.resume(throwing: error)
         }
     }
 

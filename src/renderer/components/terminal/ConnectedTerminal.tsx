@@ -203,6 +203,28 @@ async function attachResumedTerminalRenderer(
     return { attached: false, stale: true }
   }
 
+  if (!record.claim && terminalApi.watch) {
+    const watched = await terminalApi.watch(terminalId, record.resumeCursor ?? 0)
+    if (watched.success) {
+      const rendererRef = await addRendererRef(terminalId, rendererId)
+      if (!rendererRef.success) {
+        void logFrontendError({
+          level: 'warn',
+          source: 'connected-terminal.watch',
+          message: `code=${rendererRef.code} terminalRecordId=${record.id}`
+        })
+      }
+      useTerminalStore.getState().setTerminalHealthStatus(record.id, 'running')
+      useTerminalStore.getState().setRendererAttached(terminalId, true)
+      return { attached: true, stale: false }
+    }
+    void logFrontendError({
+      level: 'warn',
+      source: 'connected-terminal.watch',
+      message: `code=${watched.code} terminalRecordId=${record.id}`
+    })
+  }
+
   const resumed = await store.resumeTerminalResource(record.id)
   if (!resumed.success) {
     void logFrontendError({

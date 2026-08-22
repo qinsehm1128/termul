@@ -16,7 +16,11 @@ import { create } from 'zustand'
 import { useShallow } from 'zustand/shallow'
 import { notifyAgentSkillsChanged } from '@/lib/agent-skills-events'
 import { conversationApi } from '@/lib/conversation-api'
-import { isLiveAcpSession, resolveConversationSessionId } from '@/lib/conversation-binding'
+import {
+  fetchHostBoundSession,
+  isLiveAcpSession,
+  resolveConversationSessionId
+} from '@/lib/conversation-binding'
 import { mergeConversationTitle } from '@/lib/conversation-title'
 import { logFrontendError } from '@/lib/log-api'
 import { useSessionWorkspaceSyncStore } from '@/stores/session-workspace-sync-store'
@@ -722,6 +726,56 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       logStaleActivation(conversationId, activationEpoch, 'binding-import')
       return false
     }
+    const seedHostBoundSession = (bound: {
+      sessionId: string
+      runtimeAgentId: string
+      executionCwd: string
+    }): void => {
+      useAcpStore.setState((state) => {
+        const existing = state.sessions[bound.sessionId]
+        const indexEntry = state.sessionIndex.find((entry) => entry.id === bound.sessionId)
+        return {
+          sessions: {
+            ...state.sessions,
+            [bound.sessionId]: {
+              id: bound.sessionId,
+              conversationId,
+              agentId: existing?.agentId ?? bound.runtimeAgentId,
+              cwd: existing?.cwd || bound.executionCwd,
+              projectId: existing?.projectId ?? '',
+              status: existing?.status ?? 'closed',
+              title: existing?.title ?? null,
+              activeTurn: existing?.activeTurn ?? false,
+              openTurnId: existing?.openTurnId ?? null,
+              modes: existing?.modes ?? null,
+              models: existing?.models ?? null,
+              configOptions: existing?.configOptions ?? [],
+              lastError: existing?.lastError ?? null,
+              createdAt: existing?.createdAt ?? Date.now()
+            }
+          },
+          sessionIndex: indexEntry
+            ? state.sessionIndex.map((entry) =>
+                entry.id === bound.sessionId ? { ...entry, conversationId } : entry
+              )
+            : [
+                ...state.sessionIndex,
+                {
+                  id: bound.sessionId,
+                  conversationId,
+                  agentId: bound.runtimeAgentId,
+                  title: '',
+                  cwd: bound.executionCwd,
+                  projectId: '',
+                  createdAt: Date.now(),
+                  lastActivityAt: Date.now(),
+                  messageCount: 0,
+                  status: 'closed' as const
+                }
+              ]
+        }
+      })
+    }
     try {
       await useAcpStore.getState().loadSessionIndex()
     } catch {
@@ -732,7 +786,24 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       return false
     }
     let acp = useAcpStore.getState()
-    const sessionId = bindingSessionId(acp, conversationId)
+    let sessionId = bindingSessionId(acp, conversationId)
+    if (!sessionId) {
+      const hostBound = await fetchHostBoundSession(conversationId)
+      if (!isCurrent()) {
+        logStaleActivation(conversationId, activationEpoch, 'host-binding')
+        return false
+      }
+      if (hostBound) {
+        seedHostBoundSession(hostBound)
+        sessionId = hostBound.sessionId
+        acp = useAcpStore.getState()
+        void logFrontendError({
+          level: 'warn',
+          source: 'conversation-store.activation',
+          message: `conversationId=${conversationId} epoch=${activationEpoch} stage=host-binding`
+        })
+      }
+    }
     if (!sessionId) {
       acp.setActiveSession(null)
       useWorkspaceStore.getState().addAgentChatTab(conversationId, undefined, false)

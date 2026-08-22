@@ -679,6 +679,56 @@ pub async fn terminal_attach(
         return Ok(IpcResult::error("Unauthorized", "UNAUTHORIZED"));
     };
 
+    Ok(install_desktop_output_forwarder(
+        terminal_id,
+        last_seq,
+        generation,
+        on_data,
+        instance,
+        pty_manager.inner().clone(),
+        "terminal-attach",
+    )
+    .await)
+}
+
+/// Watch a live host PTY from the trusted desktop renderer without rotating
+/// the companion claim. Used when the phone created the terminal.
+#[tauri::command]
+pub async fn terminal_watch(
+    terminal_id: String,
+    last_seq: u64,
+    on_data: Channel<Response>,
+    pty_manager: State<'_, Arc<PtyManager>>,
+) -> Result<IpcResult<TerminalAttachResult>, String> {
+    if let Err(error) = require_host_admission() {
+        return Ok(error);
+    }
+    let Some(instance) = pty_manager.get(&terminal_id).filter(|item| item.is_active()) else {
+        return Ok(IpcResult::error("Terminal not found", "TERMINAL_NOT_FOUND"));
+    };
+    let generation = pty_manager.claim_generation(&terminal_id);
+    log::info!("[terminal-watch] watching terminal_id={terminal_id}");
+    Ok(install_desktop_output_forwarder(
+        terminal_id,
+        last_seq,
+        generation,
+        on_data,
+        instance,
+        pty_manager.inner().clone(),
+        "terminal-watch",
+    )
+    .await)
+}
+
+async fn install_desktop_output_forwarder(
+    terminal_id: String,
+    last_seq: u64,
+    generation: Option<u64>,
+    on_data: Channel<Response>,
+    instance: Arc<crate::pty::manager::TerminalInstance>,
+    pty_manager: Arc<PtyManager>,
+    log_label: &'static str,
+) -> IpcResult<TerminalAttachResult> {
     // Bounded replay + live subscription snapshot atomically (existing seq
     // infra, unchanged).
     let replay = instance.subscribe_from(last_seq);
@@ -687,16 +737,15 @@ pub async fn terminal_attach(
     // Single-forwarder invariant: abort the predecessor BEFORE delivering the
     // replay so it cannot interleave a duplicate stream.
     let token = ATTACH_FORWARDER_TOKENS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-    {
+    let replacing_view = {
         let mut forwarders = lock_forwarders();
+        let replacing = forwarders.contains_key(&terminal_id);
         if let Some((_, previous)) = forwarders.remove(&terminal_id) {
             previous.abort();
-            log::info!(
-                "[terminal-attach] aborted previous forwarder terminal_id={}",
-                terminal_id
-            );
+            log::info!("[{log_label}] aborted previous forwarder terminal_id={terminal_id}");
         }
-    }
+        replacing
+    };
 
     for chunk in &replay.chunks {
         if on_data.send(Response::new(chunk.data.clone())).is_err() {
@@ -704,11 +753,11 @@ pub async fn terminal_attach(
                 "[terminal-attach] replay channel closed terminal_id={}",
                 terminal_id
             );
-            return Ok(IpcResult::success(result));
+            return IpcResult::success(result);
         }
     }
 
-    let pty = pty_manager.inner().clone();
+    let pty = Arc::clone(&pty_manager);
     let forwarder_id = terminal_id.clone();
     let handle = tokio::spawn(async move {
         let mut tick = tokio::time::interval(std::time::Duration::from_millis(
@@ -720,8 +769,7 @@ pub async fn terminal_attach(
             // (record gone). Checked every tick AND after every chunk.
             if forwarder_should_terminate(generation, pty.claim_generation(&forwarder_id)) {
                 log::info!(
-                    "[terminal-attach] forwarder terminating (claim invalidated) terminal_id={}",
-                    forwarder_id
+                    "[{log_label}] forwarder terminating (claim invalidated) terminal_id={forwarder_id}"
                 );
                 break;
             }
@@ -737,7 +785,7 @@ pub async fn terminal_attach(
                         // (deferred parity decision) — keep streaming.
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                             log::warn!(
-                                "[terminal-attach] output receiver lagged by {skipped} for {forwarder_id}"
+                                "[{log_label}] output receiver lagged by {skipped} for {forwarder_id}"
                             );
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -772,13 +820,16 @@ pub async fn terminal_attach(
         }
     }
 
+    if !replacing_view {
+        pty_manager.note_view_opened(&terminal_id);
+    }
     log::info!(
-        "[terminal-attach] attached terminal_id={} latest_seq={} gap={}",
+        "[{log_label}] attached terminal_id={} latest_seq={} gap={}",
         terminal_id,
         result.latest_seq,
         result.gap
     );
-    Ok(IpcResult::success(result))
+    IpcResult::success(result)
 }
 
 /// Rotate a terminal's claim credential (CAP-3).
@@ -846,10 +897,22 @@ pub async fn terminal_resize(
 }
 
 /// Close one renderer view without touching the PTY, claim, or passive workspace ref.
+/// The last remaining view also pauses cwd/git polling; the process stays alive.
 #[tauri::command]
-pub async fn terminal_close_view(terminal_id: String) -> Result<IpcResult<()>, String> {
-    if let Some((_, forwarder)) = lock_forwarders().remove(&terminal_id) {
+pub async fn terminal_close_view(
+    terminal_id: String,
+    pty_manager: State<'_, Arc<PtyManager>>,
+) -> Result<IpcResult<()>, String> {
+    let had_forwarder = if let Some((_, forwarder)) = lock_forwarders().remove(&terminal_id) {
         forwarder.abort();
+        true
+    } else {
+        false
+    };
+    if had_forwarder {
+        pty_manager.note_view_closed(&terminal_id);
+    } else {
+        pty_manager.pause_tracking_if_unwatched(&terminal_id);
     }
     log::info!("[terminal-command] close-view terminal_id={terminal_id}");
     Ok(IpcResult::success(()))
@@ -3793,12 +3856,9 @@ pub async fn sftp_create_file(
 ///
 /// Shares the desktop's live `AcpManager` sessions with a phone/browser client.
 ///
-/// Starts the in-process localhost web server (the same one the standalone
-/// `termul-server` binary uses), then brings up the configured tunnel provider
-/// (Cloudflare Quick by default, or a named Cloudflare / FRP tunnel) so the
-/// phone can reach it. The popover renders the public Origin as a QR. The
-/// `bind_mode` param is accepted for API stability but ignored (the tunnel
-/// targets localhost).
+/// Starts the in-process shared-live web server, then the configured tunnel
+/// when the last publish mode is tunnel (or as a best-effort extra when LAN
+/// is selected). `bind_mode` selects localhost vs all interfaces.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn remote_server_start(
@@ -3812,17 +3872,37 @@ pub async fn remote_server_start(
     acp_catalog_store: State<'_, HostAcpCatalogStore>,
     acp_install_store: State<'_, HostAcpInstallStore>,
     tunnel_store: State<'_, Arc<remote::TunnelConfigStore>>,
+    intent_store: State<'_, Arc<remote::RemoteAccessIntentStore>>,
     bind_mode: Option<String>,
 ) -> Result<IpcResult<remote::RemoteStatus>, String> {
-    // Default to localhost only when the caller omits the bind mode; an
-    // explicit-but-unrecognized value (e.g. a typo of "all") is an error — do
-    // not silently downgrade to localhost (the phone would silently fail to
-    // connect).
-    let bind_mode = match bind_mode.as_deref() {
-        None => remote::RemoteBindMode::Localhost,
-        Some(s) => remote::RemoteBindMode::parse(s)
-            .ok_or_else(|| format!("invalid bind mode '{s}': use 'localhost' or 'all'",))?,
+    let stored_intent = intent_store.load().unwrap_or_default();
+    let (bind_mode, publish_mode) = match bind_mode.as_deref() {
+        None => match stored_intent.publish_mode {
+            remote::PublishMode::Lan => (remote::RemoteBindMode::All, remote::PublishMode::Lan),
+            remote::PublishMode::Tunnel => {
+                (remote::RemoteBindMode::Localhost, remote::PublishMode::Tunnel)
+            }
+        },
+        Some(s) => {
+            let bind = remote::RemoteBindMode::parse(s)
+                .ok_or_else(|| format!("invalid bind mode '{s}': use 'localhost' or 'all'"))?;
+            let mode = match bind {
+                remote::RemoteBindMode::All => remote::PublishMode::Lan,
+                remote::RemoteBindMode::Localhost => remote::PublishMode::Tunnel,
+            };
+            (bind, mode)
+        }
     };
+    if let Err(error) = intent_store.save(&remote::RemoteAccessIntent {
+        wanted: true,
+        publish_mode,
+    }) {
+        log::error!(
+            target: "termul::remote::host",
+            "operation=intent_save lifecycle_phase=start stable_code=INTENT_SAVE_FAILED"
+        );
+        return Ok(IpcResult::error(error, "REMOTE_INTENT_SAVE_FAILED"));
+    }
     // CAP-5: thread the desktop's `WorkspaceManifestService` (opened under
     // `<app_data_dir>/workspace-manifests` in `lib.rs`) through to
     // `serve_router` so the web/remote client can read/write a project's
@@ -3880,9 +3960,7 @@ pub async fn remote_server_start(
     };
     match started {
         Ok(status) => {
-            // Server is up on localhost. Bring up the configured tunnel provider
-            // so the phone can reach it — the QR encodes the public Origin plus
-            // the host-owned bearer fragment.
+            remote_state.set_publish_mode(publish_mode);
             let port = match status.port {
                 Some(p) => p,
                 None => {
@@ -3900,12 +3978,27 @@ pub async fn remote_server_start(
                     if let Err(e) =
                         remote_state.attach_tunnel_as(tunnel.url, tunnel.child, &provider)
                     {
+                        if publish_mode == remote::PublishMode::Lan {
+                            log::warn!(
+                                target: "termul::remote::host",
+                                "operation=tunnel_attach lifecycle_phase=start stable_code=REMOTE_TUNNEL_FAILED"
+                            );
+                            return Ok(IpcResult::success(remote_state.status()));
+                        }
+                        let _ = remote_state.stop().await;
                         return Ok(IpcResult::error(e, "REMOTE_TUNNEL_FAILED"));
                     }
                     tokio::spawn(remote::cloudflared::log_tunnel_reachability(probe_url));
                     Ok(IpcResult::success(remote_state.status()))
                 }
                 Err(e) => {
+                    if publish_mode == remote::PublishMode::Lan {
+                        log::warn!(
+                            target: "termul::remote::host",
+                            "operation=tunnel_start lifecycle_phase=start stable_code=REMOTE_TUNNEL_FAILED"
+                        );
+                        return Ok(IpcResult::success(remote_state.status()));
+                    }
                     let _ = remote_state.stop().await;
                     Ok(IpcResult::error(e, "REMOTE_TUNNEL_FAILED"))
                 }
@@ -3924,7 +4017,22 @@ pub async fn remote_server_start(
 pub async fn remote_server_stop(
     remote_state: State<'_, Arc<remote::RemoteServerState>>,
     project_registry: State<'_, Arc<crate::web::ProjectRegistry>>,
+    intent_store: State<'_, Arc<remote::RemoteAccessIntentStore>>,
 ) -> Result<IpcResult<remote::RemoteStatus>, String> {
+    let publish_mode = intent_store
+        .load()
+        .map(|intent| intent.publish_mode)
+        .unwrap_or_default();
+    if let Err(error) = intent_store.save(&remote::RemoteAccessIntent {
+        wanted: false,
+        publish_mode,
+    }) {
+        log::error!(
+            target: "termul::remote::host",
+            "operation=intent_save lifecycle_phase=stop stable_code=INTENT_SAVE_FAILED"
+        );
+        return Ok(IpcResult::error(error, "REMOTE_INTENT_SAVE_FAILED"));
+    }
     let result = remote_state.stop().await;
     // Clear the in-memory project mirror so a stale list does not linger after
     // the server is off (the registry is renderer-fed; it is repopulated on the
@@ -3942,6 +4050,102 @@ pub async fn remote_server_status(
     remote_state: State<'_, Arc<remote::RemoteServerState>>,
 ) -> Result<IpcResult<remote::RemoteStatus>, String> {
     Ok(IpcResult::success(remote_state.status()))
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAccessIntentView {
+    pub wanted: bool,
+    pub publish_mode: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAccessIntentUpdate {
+    pub wanted: Option<bool>,
+    pub publish_mode: Option<String>,
+}
+
+#[tauri::command]
+pub async fn remote_access_intent_get(
+    intent_store: State<'_, Arc<remote::RemoteAccessIntentStore>>,
+) -> Result<IpcResult<RemoteAccessIntentView>, String> {
+    match intent_store.load() {
+        Ok(intent) => Ok(IpcResult::success(RemoteAccessIntentView {
+            wanted: intent.wanted,
+            publish_mode: intent.publish_mode.as_str().to_string(),
+        })),
+        Err(error) => Ok(IpcResult::error(error, "REMOTE_INTENT_READ_FAILED")),
+    }
+}
+
+#[tauri::command]
+pub async fn remote_access_intent_set(
+    update: RemoteAccessIntentUpdate,
+    intent_store: State<'_, Arc<remote::RemoteAccessIntentStore>>,
+    remote_state: State<'_, Arc<remote::RemoteServerState>>,
+) -> Result<IpcResult<RemoteAccessIntentView>, String> {
+    let mut intent = match intent_store.load() {
+        Ok(intent) => intent,
+        Err(error) => return Ok(IpcResult::error(error, "REMOTE_INTENT_READ_FAILED")),
+    };
+    if let Some(wanted) = update.wanted {
+        intent.wanted = wanted;
+    }
+    if let Some(raw) = update.publish_mode.as_deref() {
+        let Some(mode) = remote::PublishMode::parse(raw) else {
+            return Ok(IpcResult::error(
+                "publish mode must be lan or tunnel".to_string(),
+                "REMOTE_INTENT_INVALID",
+            ));
+        };
+        intent.publish_mode = mode;
+        remote_state.set_publish_mode(mode);
+    }
+    if let Err(error) = intent_store.save(&intent) {
+        return Ok(IpcResult::error(error, "REMOTE_INTENT_SAVE_FAILED"));
+    }
+    Ok(IpcResult::success(RemoteAccessIntentView {
+        wanted: intent.wanted,
+        publish_mode: intent.publish_mode.as_str().to_string(),
+    }))
+}
+
+#[tauri::command]
+pub async fn remote_server_rotate_credential(
+    remote_state: State<'_, Arc<remote::RemoteServerState>>,
+    authority: State<'_, Arc<crate::web::RemoteAccessAuthority>>,
+    tunnel_store: State<'_, Arc<remote::TunnelConfigStore>>,
+) -> Result<IpcResult<remote::RemoteStatus>, String> {
+    if remote_state.status().running {
+        match remote_state.rotate_active_credential() {
+            Ok(status) => {
+                log::info!(
+                    target: "termul::remote::host",
+                    "operation=credential_rotate lifecycle_phase=operator stable_code=OK"
+                );
+                Ok(IpcResult::success(status))
+            }
+            Err(error) => Ok(IpcResult::error(error, "REMOTE_ROTATE_FAILED")),
+        }
+    } else {
+        match authority.rotate_desktop_credential() {
+            Ok(lease) => {
+                if let Err(error) = tunnel_store.set_pairing_token(Some(lease.bearer())) {
+                    return Ok(IpcResult::error(error, "REMOTE_ROTATE_FAILED"));
+                }
+                log::info!(
+                    target: "termul::remote::host",
+                    "operation=credential_rotate lifecycle_phase=operator_idle stable_code=OK"
+                );
+                Ok(IpcResult::success(remote_state.status()))
+            }
+            Err(error) => Ok(IpcResult::error(
+                error.to_string(),
+                "REMOTE_ROTATE_FAILED",
+            )),
+        }
+    }
 }
 
 /// Push the desktop renderer's current project + group list into the in-memory
@@ -5154,6 +5358,31 @@ pub fn conversation_get(
     service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
 ) -> Result<IpcResult<crate::conversation::ConversationRecordV2>, String> {
     Ok(conversation_get_inner(service.inner(), &conversation_id))
+}
+
+pub(crate) fn conversation_get_binding_inner(
+    service: &crate::conversation::ConversationApplicationService,
+    conversation_id: &str,
+) -> IpcResult<crate::conversation::ConversationBindingSnapshot> {
+    let conversation_id = match parse_conversation_id(conversation_id) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    match service.current_binding(conversation_id) {
+        Ok(outcome) => IpcResult::success(outcome),
+        Err(error) => conversation_application_failure(error),
+    }
+}
+
+#[tauri::command]
+pub fn conversation_get_binding(
+    conversation_id: String,
+    service: State<'_, Arc<crate::conversation::ConversationApplicationService>>,
+) -> Result<IpcResult<crate::conversation::ConversationBindingSnapshot>, String> {
+    Ok(conversation_get_binding_inner(
+        service.inner(),
+        &conversation_id,
+    ))
 }
 
 #[tauri::command]

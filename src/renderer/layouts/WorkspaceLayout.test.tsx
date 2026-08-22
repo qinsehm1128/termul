@@ -156,8 +156,9 @@ vi.mock('@/stores/app-settings-store', () => ({
 
 vi.mock('@/stores/remote-status-store', () => ({
   useRemoteStatus: vi.fn(() => null),
+  useRemoteRestoreError: vi.fn(() => null),
   useRemoteStatusStore: Object.assign(vi.fn(), {
-    getState: vi.fn(() => ({ setStatus: vi.fn() }))
+    getState: vi.fn(() => ({ setStatus: vi.fn(), setRestoreError: vi.fn() }))
   })
 }))
 
@@ -168,7 +169,12 @@ vi.mock('@/lib/api', async (importOriginal) => {
     remoteServerApi: {
       start: vi.fn(),
       stop: vi.fn(),
-      status: vi.fn()
+      status: vi.fn(),
+      intent: vi.fn(() =>
+        Promise.resolve({ success: true, data: { wanted: false, publishMode: 'tunnel' } })
+      ),
+      setIntent: vi.fn(),
+      rotateCredential: vi.fn()
     },
     openerApi: {
       openUrlWithSystemBrowser: vi.fn(() => Promise.resolve({ success: true, data: undefined }))
@@ -1173,7 +1179,7 @@ describe('WorkspaceLayout - Empty States', () => {
 
       renderWithRouter()
 
-      expect(screen.getByText('Hidden running terminals')).toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: 'Hidden running terminals' }))
       expect(screen.getByRole('button', { name: 'Reopen Hidden shell' })).toHaveClass('h-9')
       expect(screen.getByRole('button', { name: 'Stop' })).toBeInTheDocument()
     })
@@ -1197,7 +1203,7 @@ describe('WorkspaceLayout - Empty States', () => {
 
       renderWithRouter(['/'])
 
-      expect(screen.getByText('Hidden running terminals')).toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: 'Hidden running terminals' }))
       expect(screen.getByRole('button', { name: 'Reopen zsh' })).toBeInTheDocument()
       fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
       expect(screen.getByText('Terminate terminal process?')).toBeInTheDocument()

@@ -14,15 +14,14 @@ struct ConversationPicker: View {
                     }
                 } label: {
                     HStack {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(conversation.displayTitle)
-                                .foregroundStyle(.primary)
-                            Text(conversation.workspaceCwd)
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                        }
-                        Spacer()
+                        HostListRow(
+                            title: conversation.displayTitle,
+                            preview: conversation.previewText,
+                            previewMono: true,
+                            meta: conversation.countLabel,
+                            status: .idle,
+                            time: conversation.relativeCreatedLabel
+                        )
                         if session.conversations.active?.id == conversation.id {
                             Image(systemName: "checkmark")
                                 .foregroundStyle(TermulTheme.accent)

@@ -8,6 +8,7 @@ struct TerminalScreen: UIViewRepresentable {
     var onSend: (String) -> Void
     var onResize: (Int, Int) -> Void
     var onReady: (@escaping (Data) -> Void) -> Void
+    var focusToken: UInt64 = 0
 
     func makeCoordinator() -> Coordinator {
         Coordinator(onSend: onSend, onResize: onResize)
@@ -23,9 +24,6 @@ struct TerminalScreen: UIViewRepresentable {
         onReady { data in
             view.feed(byteArray: [UInt8](data)[...])
         }
-        DispatchQueue.main.async {
-            try? view.setUseMetal(true)
-        }
         return view
     }
 
@@ -33,12 +31,17 @@ struct TerminalScreen: UIViewRepresentable {
         context.coordinator.onSend = onSend
         context.coordinator.onResize = onResize
         uiView.terminalDelegate = context.coordinator
+        if focusToken != context.coordinator.lastFocusToken {
+            context.coordinator.lastFocusToken = focusToken
+            _ = uiView.becomeFirstResponder()
+        }
     }
 
     @MainActor
     final class Coordinator: NSObject, TerminalViewDelegate {
         var onSend: (String) -> Void
         var onResize: (Int, Int) -> Void
+        var lastFocusToken: UInt64 = 0
         private var lastCols = 0
         private var lastRows = 0
 

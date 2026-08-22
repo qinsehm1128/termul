@@ -57,6 +57,9 @@ fn walk_inner(
         let Ok(file_type) = entry.file_type() else {
             continue;
         };
+        if file_type.is_symlink() {
+            continue;
+        }
         if file_type.is_dir() {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if skip_dir_names.iter().any(|skip| *skip == name) {

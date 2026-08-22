@@ -45,14 +45,25 @@ vi.mock('@/lib/worktree-api', () => ({
 // Mock remote status store (StatusBar hosts RemoteAccessPopover)
 vi.mock('@/stores/remote-status-store', () => ({
   useRemoteStatus: vi.fn(() => null),
-  useRemoteStatusStore: vi.fn(() => ({ setStatus: vi.fn() }))
+  useRemoteRestoreError: vi.fn(() => null),
+  useRemoteStatusStore: Object.assign(
+    vi.fn(() => ({ setStatus: vi.fn(), setRestoreError: vi.fn() })),
+    {
+      getState: () => ({ status: null, setStatus: vi.fn(), setRestoreError: vi.fn() })
+    }
+  )
 }))
 
 vi.mock('@/lib/api', () => ({
   remoteServerApi: {
     start: vi.fn(),
     stop: vi.fn(),
-    status: vi.fn()
+    status: vi.fn(),
+    intent: vi.fn(() =>
+      Promise.resolve({ success: true, data: { wanted: false, publishMode: 'tunnel' } })
+    ),
+    setIntent: vi.fn(),
+    rotateCredential: vi.fn()
   },
   openerApi: {
     openUrlWithSystemBrowser: vi.fn(() => Promise.resolve({ success: true, data: undefined }))

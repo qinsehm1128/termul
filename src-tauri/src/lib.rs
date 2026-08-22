@@ -1271,41 +1271,13 @@ fn export_log_to_default<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result
     Ok(())
 }
 
-const LEGACY_DESKTOP_REMOTE_ACCOUNT: &str = "remote-access-v1";
-const DESKTOP_REMOTE_GENERATION_ACCOUNT: &str = "remote-access-generation-v2";
-
-/// Build a desktop generation authority without accepting any credential persisted by an earlier
-/// process. TASK-002 still owns per-start rotation; this seed exists only to select the desktop
-/// authority source and is removed from the keyring before setup publishes command state.
+/// Desktop pairing starts empty. The host adopts the settings-file bearer
+/// only when remote access is actually started — never on app launch.
 fn provision_desktop_remote_authority() -> Result<RemoteAccessAuthority, String> {
-    if crate::secure_storage::keyring_delete(LEGACY_DESKTOP_REMOTE_ACCOUNT).is_err() {
-        log::warn!(
-            "[remote-auth] legacy desktop credential deletion failed stable_code=STALE_CREDENTIAL_DELETE_FAILED"
-        );
-    }
-    crate::secure_storage::keyring_delete(DESKTOP_REMOTE_GENERATION_ACCOUNT)
-        .map_err(|_| "failed to clear the previous desktop credential generation".to_string())?;
-    let (authority, bootstrap_bearer) =
-        RemoteAccessAuthority::issue_or_load_desktop(DESKTOP_REMOTE_GENERATION_ACCOUNT)
-            .map_err(|error| format!("failed to initialize desktop remote authority: {error}"))?;
-    let bootstrap_generation = authority
-        .verify_bearer(&bootstrap_bearer)
-        .map_err(|error| format!("failed to verify desktop authority bootstrap: {error}"))?
-        .generation();
-    authority.invalidate_generation(bootstrap_generation);
-    drop(bootstrap_bearer);
-    crate::secure_storage::keyring_delete(DESKTOP_REMOTE_GENERATION_ACCOUNT)
-        .map_err(|_| "failed to remove the desktop authority bootstrap credential".to_string())?;
-    Ok(authority)
+    Ok(RemoteAccessAuthority::desktop_memory())
 }
 
-fn clear_desktop_remote_generation() {
-    if crate::secure_storage::keyring_delete(DESKTOP_REMOTE_GENERATION_ACCOUNT).is_err() {
-        log::warn!(
-            "[remote-auth] desktop generation deletion failed stable_code=STALE_CREDENTIAL_DELETE_FAILED"
-        );
-    }
-}
+fn clear_desktop_remote_generation() {}
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct DesktopExitDurabilityOutcome {
@@ -1841,38 +1813,26 @@ pub fn run() {
             let ssh_manager = Arc::new(ssh::SSHManager::new(handle.clone()));
             app.manage(ssh_manager);
 
-            // Verify the OS keychain backend actually persists secrets. If this
-            // fails, stored SSH passwords/passphrases silently vanish (mock
-            // store), so surface it loudly in logs.
-            match ssh::credential_store::self_test() {
-                Ok(()) => log::info!("[SSH] Credential keychain self-test passed"),
-                Err(e) => log::error!(
-                    "[SSH] Credential keychain self-test FAILED: {} -- stored SSH credentials will not persist",
-                    e
-                ),
-            }
-
             // Create Migration Manager
             let migration_manager = Arc::new(MigrationManager::new(handle.clone()));
             app.manage(migration_manager.clone());
 
-            // TASK-002 owns every shared-live credential generation. Startup rejects/removes
-            // credentials left by previous processes and publishes only the digest authority;
-            // RemoteServerState::start rotates a fresh in-memory lease before admission.
+            // Pairing bearers persist in remote-tunnel/secrets.json while
+            // wanted. Start adopts that generation; launch does not touch
+            // the OS keyring.
+            let tunnel_store = Arc::new(remote::TunnelConfigStore::new(app_data_dir.clone()));
             let remote_authority = Arc::new(provision_desktop_remote_authority()?);
             app.manage(Arc::clone(&remote_authority));
 
             // The shared-live host receives the exact same authority instance
             // managed above and threads it into the HTTP/ACP WebSocket router.
-            let remote_state = Arc::new(RemoteServerState::with_desktop_authority(
-                remote_authority,
-            ));
+            let remote_state = Arc::new(
+                RemoteServerState::with_desktop_authority(remote_authority)
+                    .with_pairing_store(Arc::clone(&tunnel_store)),
+            );
             app.manage(remote_state);
-            let app_data_dir = handle
-                .path()
-                .app_data_dir()
-                .map_err(|error| format!("failed to resolve app data directory: {error}"))?;
-            app.manage(Arc::new(remote::TunnelConfigStore::new(app_data_dir)));
+            app.manage(tunnel_store);
+            app.manage(Arc::new(remote::RemoteAccessIntentStore::new(app_data_dir)));
 
             // Register default migrations
             register_default_migrations(migration_manager.as_ref());
@@ -1998,6 +1958,7 @@ pub fn run() {
             commands::terminal_spawn,
             commands::terminal_resume,
             commands::terminal_attach,
+            commands::terminal_watch,
             commands::terminal_rotate_claim,
             commands::terminal_revoke_claim,
             commands::terminal_write,
@@ -2176,10 +2137,14 @@ pub fn run() {
             scheduled_tasks::commands::scheduled_task_list_runs,
             scheduled_tasks::commands::scheduled_task_list_audit,
             cli_session::commands::list_cli_sessions_cmd,
+            cli_session::commands::resolve_cli_sessions_cmd,
             // Remote server commands
             commands::remote_server_start,
             commands::remote_server_stop,
             commands::remote_server_status,
+            commands::remote_access_intent_get,
+            commands::remote_access_intent_set,
+            commands::remote_server_rotate_credential,
             remote::tunnel::commands::tunnel_config_get,
             remote::tunnel::commands::tunnel_config_set,
             commands::remote_sync_projects,
@@ -2202,6 +2167,7 @@ pub fn run() {
             commands::conversation_host_status,
             commands::conversation_list,
             commands::conversation_get,
+            commands::conversation_get_binding,
             commands::conversation_rename,
             commands::conversation_open,
             commands::conversation_resolve_legacy_id,
@@ -2290,7 +2256,9 @@ pub fn run() {
                 // Close remote ingress before producer stop. Shared-live remains non-owning and
                 // its stop path never drains Desktop-global Conversation persistence.
                 if let Some(remote_state) = remote_state {
-                    match tokio::time::timeout_at(deadline, remote_state.stop()).await {
+                    match tokio::time::timeout_at(deadline, remote_state.shutdown_keep_credential())
+                        .await
+                    {
                         Ok(Ok(_)) => {}
                         Ok(Err(_)) | Err(_) => log::error!(
                             "[desktop-exit] shutdown_phase=stop_remote stable_code=REMOTE_STOP_TIMEOUT result=FAILED"
@@ -2386,9 +2354,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn desktop_remote_bootstrap_rejects_reusable_legacy_credentials() {
+    fn desktop_remote_bootstrap_uses_memory_authority_until_start() {
         let source = include_str!("lib.rs");
-        assert!(!source.contains("issue_or_load_desktop(\"remote-access-v1\")"));
         let helper_start = source
             .find("fn provision_desktop_remote_authority()")
             .expect("desktop authority helper");
@@ -2397,23 +2364,9 @@ mod tests {
             .map(|offset| helper_start + offset)
             .expect("desktop authority helper boundary");
         let helper = &source[helper_start..helper_end];
-        let delete_position = helper
-            .find("keyring_delete(DESKTOP_REMOTE_GENERATION_ACCOUNT)")
-            .expect("previous generation is deleted before bootstrap");
-        let issue_position = helper
-            .find("issue_or_load_desktop(DESKTOP_REMOTE_GENERATION_ACCOUNT)")
-            .expect("generation authority seed");
-        assert!(delete_position < issue_position);
-        let invalidate_position = helper[issue_position..]
-            .find("authority.invalidate_generation(bootstrap_generation)")
-            .map(|offset| issue_position + offset)
-            .expect("bootstrap digest is invalidated before authority publication");
-        let final_delete_position = helper[issue_position..]
-            .rfind("keyring_delete(DESKTOP_REMOTE_GENERATION_ACCOUNT)")
-            .map(|offset| issue_position + offset)
-            .expect("bootstrap keyring material is removed");
-        assert!(issue_position < invalidate_position);
-        assert!(invalidate_position < final_delete_position);
+        assert!(helper.contains("desktop_memory()"));
+        assert!(!helper.contains("issue_or_load_desktop"));
+        assert!(!helper.contains("keyring"));
     }
 
     #[test]

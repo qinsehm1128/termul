@@ -1,6 +1,22 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "/" : {
+
+    },
+    "%lld turns" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld 轮"
+          }
+        }
+      }
+    },
+    "A conversation or project is required." : {
+
+    },
     "A scanned or pasted link stays here for the next open." : {
       "localizations" : {
         "zh-Hans" : {
@@ -10,6 +26,15 @@
           }
         }
       }
+    },
+    "ACP" : {
+
+    },
+    "Active" : {
+
+    },
+    "Agent" : {
+
     },
     "Appearance" : {
       "localizations" : {
@@ -78,6 +103,9 @@
         }
       }
     },
+    "Collapse" : {
+
+    },
     "Connecting to host…" : {
       "localizations" : {
         "zh-Hans" : {
@@ -87,6 +115,19 @@
           }
         }
       }
+    },
+    "Continues the desk agent over the tunnel WebSocket." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "通过隧道 WebSocket 续上电脑上的智能体。"
+          }
+        }
+      }
+    },
+    "Could not confirm the computer session. Pull to refresh, then try again." : {
+
     },
     "Could not load session" : {
       "localizations" : {
@@ -99,6 +140,7 @@
       }
     },
     "Could not open link" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -107,6 +149,19 @@
           }
         }
       }
+    },
+    "Could not open this desk" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "连不上这台电脑"
+          }
+        }
+      }
+    },
+    "Current" : {
+
     },
     "Dark" : {
       "localizations" : {
@@ -118,8 +173,31 @@
         }
       }
     },
+    "Deleted" : {
+
+    },
     "Deny" : {
 
+    },
+    "Desk actions" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "书桌操作"
+          }
+        }
+      }
+    },
+    "Desk name" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "书桌名称"
+          }
+        }
+      }
     },
     "Disconnected from the host." : {
       "localizations" : {
@@ -154,7 +232,7 @@
         }
       }
     },
-    "File" : {
+    "Expand" : {
 
     },
     "Files" : {
@@ -167,6 +245,9 @@
         }
       }
     },
+    "Host received" : {
+
+    },
     "How it works" : {
       "localizations" : {
         "zh-Hans" : {
@@ -177,7 +258,34 @@
         }
       }
     },
+    "Idle" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "空闲"
+          }
+        }
+      }
+    },
+    "If this session has desktop history, pull to refresh. The phone continues the computer session instead of starting a new one." : {
+
+    },
+    "Independent chats, not project terminals" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "独立对话，不是项目终端"
+          }
+        }
+      }
+    },
+    "Install on desktop" : {
+
+    },
     "iOS only opens HTTPS tunnels. Use a TLS reverse proxy in front of FRP, or Cloudflare." : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -217,7 +325,48 @@
         }
       }
     },
+    "Live input" : {
+
+    },
+    "Manual install" : {
+
+    },
     "Message the host agent" : {
+
+    },
+    "Mode" : {
+
+    },
+    "Mode, model, and thinking come from the host agent after the session is live. If they stay empty, keep this chat open on the Mac once so the agent can advertise them, then pull to refresh." : {
+
+    },
+    "Model" : {
+
+    },
+    "Need you" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "需要你"
+          }
+        }
+      }
+    },
+    "Need you to approve" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "需要你批准"
+          }
+        }
+      }
+    },
+    "Needs a runtime" : {
+
+    },
+    "Needs attention" : {
 
     },
     "New chat" : {
@@ -254,6 +403,9 @@
     "No live terminal" : {
 
     },
+    "No messages yet" : {
+
+    },
     "No projects" : {
 
     },
@@ -276,16 +428,31 @@
     "Not connected." : {
 
     },
+    "Not received" : {
+
+    },
+    "Off" : {
+
+    },
     "OK" : {
 
     },
-    "Open a chat on the desktop. Sessions are independent of projects." : {
+    "On" : {
+
+    },
+    "Open a chat on the desktop. These sessions are not projects." : {
 
     },
     "Open a chat or terminal on the desktop, then pull to refresh." : {
 
     },
+    "Open a project on the desktop to watch its terminals here." : {
+
+    },
     "Open a project on the desktop, then reconnect." : {
+
+    },
+    "Open a session before switching agents." : {
 
     },
     "Open a terminal on the desktop, or start a new one here." : {
@@ -329,7 +496,20 @@
         }
       }
     },
-    "Opens a live host PTY in a native terminal." : {
+    "Open the desk session" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "打开书桌上的会话"
+          }
+        }
+      }
+    },
+    "Opening a chat session…" : {
+
+    },
+    "Opening the existing session on the Mac…" : {
 
     },
     "Opens or focuses a host PTY tab." : {
@@ -374,8 +554,18 @@
         }
       }
     },
-    "Pick a session first." : {
+    "Project" : {
 
+    },
+    "Project view is terminals only. Open a session to talk." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "项目视图只看终端。要对话，回到会话列表。"
+          }
+        }
+      }
     },
     "Projects" : {
       "localizations" : {
@@ -387,7 +577,37 @@
         }
       }
     },
+    "Projects already open on the computer" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "电脑上已打开的项目"
+          }
+        }
+      }
+    },
+    "Public hosts need HTTPS. A LAN address such as 192.168.x.x is allowed over HTTP." : {
+
+    },
+    "Ready" : {
+
+    },
+    "Reasoning" : {
+
+    },
+    "Recent desks" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "最近连接"
+          }
+        }
+      }
+    },
     "Recents" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -407,12 +627,35 @@
         }
       }
     },
+    "Rename desk" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重命名书桌"
+          }
+        }
+      }
+    },
     "Retry" : {
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "重试"
+          }
+        }
+      }
+    },
+    "Running" : {
+
+    },
+    "Save" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "保存"
           }
         }
       }
@@ -447,7 +690,18 @@
         }
       }
     },
+    "Scan the desktop QR, or paste the access link. A LAN address stays on Wi-Fi; a Quick Tunnel still goes through Cloudflare." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "扫描桌面二维码，或粘贴访问链接。局域网地址留在 Wi-Fi；Quick Tunnel 仍会走 Cloudflare。"
+          }
+        }
+      }
+    },
     "Scan the desktop QR, or paste the HTTPS link. Chat and the live terminal stay on the host." : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -458,6 +712,12 @@
       }
     },
     "Send" : {
+
+    },
+    "Send command" : {
+
+    },
+    "Sending…" : {
 
     },
     "Session" : {
@@ -476,6 +736,12 @@
         }
       }
     },
+    "Show keyboard for live terminal input" : {
+
+    },
+    "Sign in on the computer, then wait…" : {
+
+    },
     "Simplified Chinese" : {
       "localizations" : {
         "zh-Hans" : {
@@ -485,6 +751,12 @@
           }
         }
       }
+    },
+    "Starting the agent" : {
+
+    },
+    "Starting the agent on the Mac. First launch can take a few minutes." : {
+
     },
     "System" : {
       "localizations" : {
@@ -496,7 +768,7 @@
         }
       }
     },
-    "Talks to the host agent over the tunnel WebSocket." : {
+    "Tap to show keyboard" : {
 
     },
     "Terminal" : {
@@ -509,8 +781,15 @@
         }
       }
     },
-    "Termul" : {
-
+    "Termul Remote" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Termul Remote"
+          }
+        }
+      }
     },
     "That access link is not a valid URL." : {
       "extractionState" : "stale",
@@ -536,6 +815,9 @@
     "The access token was rejected. Scan the desktop QR again." : {
 
     },
+    "The host did not finish the agent request. Try again, or start the agent on the desktop." : {
+
+    },
     "The host rejected the request." : {
 
     },
@@ -549,7 +831,20 @@
         }
       }
     },
+    "The phone could not open the host WebSocket." : {
+
+    },
+    "The phone could not reach the host tunnel. Confirm remote access is still on, then retry." : {
+
+    },
+    "The phone could not reach the host." : {
+
+    },
+    "The phone could not reach the Mac on this Wi-Fi. Confirm remote access is on and both devices are on the same network." : {
+
+    },
     "The phone could not reach the tunnel. Quick Tunnels go through Cloudflare, not your LAN." : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -580,9 +875,6 @@
         }
       }
     },
-    "The tunnel did not return a healthy response." : {
-
-    },
     "The tunnel returned an unexpected response." : {
 
     },
@@ -596,7 +888,13 @@
         }
       }
     },
+    "Thinking" : {
+
+    },
     "This access link is missing its token. Scan the QR again." : {
+
+    },
+    "This agent cannot be started from the phone. Start it on the desktop, then try again." : {
 
     },
     "This directory has no visible files." : {
@@ -612,6 +910,18 @@
         }
       }
     },
+    "This link is missing the access secret. Copy or scan the full QR from the desktop." : {
+
+    },
+    "Thought" : {
+
+    },
+    "Type a command…" : {
+
+    },
+    "Unavailable" : {
+
+    },
     "Use a physical iPhone, or paste the link instead." : {
       "localizations" : {
         "zh-Hans" : {
@@ -622,7 +932,24 @@
         }
       }
     },
+    "Used %lld tools" : {
+
+    },
+    "Used 1 tool" : {
+
+    },
+    "Watches a live host PTY in a native terminal." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在原生终端里观看主机已有的 PTY。"
+          }
+        }
+      }
+    },
     "What should we work on?" : {
+      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {
@@ -632,8 +959,23 @@
         }
       }
     },
+    "Worked · %lld tools" : {
+
+    },
+    "Working" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "工作中"
+          }
+        }
+      }
+    },
+    "Working…" : {
+
+    },
     "Workspace" : {
-      "extractionState" : "stale",
       "localizations" : {
         "zh-Hans" : {
           "stringUnit" : {

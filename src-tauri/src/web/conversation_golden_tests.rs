@@ -911,6 +911,236 @@ async fn production_router_ws_paging_is_authenticated_and_reads_durable_admissio
     drop(_temp);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn companion_chat_requests_cursor_binding_catalog_and_delta_page() {
+    const TOKEN: &str = "companion-chat-request-token";
+    const SESSION_ID: &str = "opaque/golden/original";
+    let mut fixture = fixture_with_lifecycle().await;
+    let catalog = crate::acp::AcpCatalogService::open(fixture._temp.path().join("catalog"))
+        .await
+        .unwrap();
+    fixture.state.acp_catalog = Some(catalog);
+    let persistence = conversation_persistence(&fixture);
+    let relay = Arc::new(WsRelaySink::with_conversation_persistence(
+        32,
+        Arc::clone(&persistence),
+        None,
+    ));
+    for ordinal in 1..=12_u64 {
+        relay
+            .emit(&AcpEvent {
+                sid: Some(SESSION_ID.to_string()),
+                type_: "acp:message_chunk",
+                payload: json!({"ordinal":ordinal,"role":"agent","content":{"type":"text","text":"x"}}),
+            })
+            .expect("mapped durable admission");
+    }
+    relay.flush_conversation_persistence().await.unwrap();
+    let full_page = persistence.history_page(SESSION_ID, 0, 250).unwrap();
+    let watermark = full_page.target_last_seq;
+    assert!(
+        watermark >= 12,
+        "host watermark should cover the admitted tail"
+    );
+    assert_eq!(full_page.records.len(), 12);
+
+    fixture.state.relay = Arc::clone(&relay);
+    fixture.state.history_mode = HistoryMode::Server;
+    let authority = Arc::new(crate::web::RemoteAccessAuthority::for_tests(TOKEN));
+    let app = production_app(fixture.state.clone(), authority);
+
+    let unauthorized_binding = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/conversations/{ID}/binding"))
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 3000))))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        unauthorized_binding.status(),
+        axum::http::StatusCode::UNAUTHORIZED
+    );
+
+    let unauthorized_catalog = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/acp/catalog")
+                .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 3000))))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        unauthorized_catalog.status(),
+        axum::http::StatusCode::UNAUTHORIZED
+    );
+
+    let conversations = response_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/conversations")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 3000))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(conversations["success"], true);
+    assert_eq!(conversations["data"][0]["conversationId"], ID);
+
+    let binding = response_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/conversations/{ID}/binding"))
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 3000))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(binding["success"], true);
+    assert_eq!(binding["data"]["conversationId"], ID);
+    assert_eq!(binding["data"]["binding"]["agentSessionId"], SESSION_ID);
+    assert_eq!(
+        binding["data"]["binding"]["runtimeAgentId"],
+        "runtime-golden-original"
+    );
+
+    let catalog = response_json(
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/acp/catalog")
+                    .header("authorization", format!("Bearer {TOKEN}"))
+                    .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 3000))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(catalog["success"], true);
+    let agents = catalog["data"]["agents"].as_array().unwrap();
+    assert!(!agents.is_empty());
+    assert!(
+        agents.iter().any(|agent| {
+            agent["status"] == "ready" && agent.get("installed").is_none_or(Value::is_null)
+        }),
+        "ready catalog agents must be selectable without an installed overlay"
+    );
+    assert!(
+        agents
+            .iter()
+            .any(|agent| agent["distribution"]["npx"].is_object()),
+        "catalog must carry npx distribution so the phone can spawn"
+    );
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let origin = format!("http://{address}");
+    let ws_authority = Arc::new(crate::web::RemoteAccessAuthority::for_tests(TOKEN));
+    ws_authority
+        .set_public_origin(Url::parse(&origin).unwrap())
+        .unwrap();
+    let ws_app = production_app(fixture.state.clone(), ws_authority);
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            ws_app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+
+    let mut socket = websocket_connect(address, &origin).await;
+    let auth_required = read_websocket_json(&mut socket).await;
+    assert_eq!(auth_required["type"], "auth_required");
+
+    write_websocket_json(
+        &mut socket,
+        &json!({"id":"auth","type":"authenticate","payload":{"token":TOKEN}}),
+    )
+    .await;
+    let authenticated = read_websocket_reply(&mut socket, "auth").await;
+    assert_eq!(authenticated["ok"], true);
+
+    write_websocket_json(
+        &mut socket,
+        &json!({
+            "id":"cursor",
+            "type":"get_session_cursor",
+            "payload":{"sessionId":SESSION_ID}
+        }),
+    )
+    .await;
+    let cursor = read_websocket_reply(&mut socket, "cursor").await;
+    assert_eq!(cursor["ok"], true);
+    assert_eq!(cursor["payload"]["sessionId"], SESSION_ID);
+    assert_eq!(cursor["payload"]["watermark"], watermark);
+
+    let after_seq = watermark.saturating_sub(3);
+    write_websocket_json(
+        &mut socket,
+        &json!({
+            "id":"delta",
+            "type":"get_session_payload_page",
+            "payload":{"sessionId":SESSION_ID,"afterSeq":after_seq,"limit":80,"targetLastSeq":watermark}
+        }),
+    )
+    .await;
+    let delta = read_websocket_reply(&mut socket, "delta").await;
+    assert_eq!(delta["ok"], true);
+    let records = delta["payload"]["records"].as_array().unwrap();
+    assert!(!records.is_empty());
+    assert!(
+        records.len() < 12,
+        "watermark delta must not reload the full transcript, got {}",
+        records.len()
+    );
+    assert!(records
+        .iter()
+        .all(|record| { record["seq"].as_u64().is_some_and(|seq| seq > after_seq) }));
+    assert_eq!(delta["payload"]["targetLastSeq"], watermark);
+
+    write_websocket_json(
+        &mut socket,
+        &json!({"id":"catalog","type":"list_acp_catalog","payload":{}}),
+    )
+    .await;
+    let ws_catalog = read_websocket_reply(&mut socket, "catalog").await;
+    assert_eq!(ws_catalog["ok"], true);
+    assert_eq!(ws_catalog["payload"]["agents"], catalog["data"]["agents"]);
+
+    write_websocket_json(
+        &mut socket,
+        &json!({"id":"agents","type":"list_agents","payload":{}}),
+    )
+    .await;
+    let agents = read_websocket_reply(&mut socket, "agents").await;
+    assert_eq!(agents["ok"], true);
+    assert_eq!(agents["payload"], json!([]));
+
+    write_websocket_frame(&mut socket, 0x8, &[]).await;
+    server.abort();
+    let _ = server.await;
+    relay.shutdown_conversation_persistence().await.unwrap();
+}
+
 #[tokio::test]
 async fn transport_golden_matrix() {
     let fixture = fixture().await;
@@ -1038,12 +1268,21 @@ async fn authenticated_http_and_terminal_boundaries_fail_closed_with_stable_stat
         .oneshot(
             Request::builder()
                 .uri("/terminal/ws")
+                .extension(ConnectInfo(SocketAddr::from(([192, 0, 2, 10], 43123))))
                 .body(Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(terminal.status(), axum::http::StatusCode::UNAUTHORIZED);
+    assert!(
+        terminal.status().is_client_error(),
+        "terminal upgrade without Origin must fail closed, got {}",
+        terminal.status()
+    );
+    assert_ne!(
+        terminal.status(),
+        axum::http::StatusCode::SWITCHING_PROTOCOLS
+    );
 
     let invalid = secured_app(fixture.state.clone(), Arc::clone(&authority))
         .oneshot(

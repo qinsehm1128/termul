@@ -66,6 +66,7 @@ vi.mock('@/stores/file-explorer-store', () => ({
     toggleDirectory: mockToggleDirectory,
     refreshDirectory: mockRefreshDirectory,
     selectPath: mockSelectPath,
+    setFocusedRoot: vi.fn(),
     collapseAll: mockCollapseAll
   })
 }))
@@ -667,5 +668,28 @@ describe('MobileFileExplorer', () => {
     expect(await screen.findByText('No active project')).toBeInTheDocument()
     // The new-file/new-folder actions are disabled without a root.
     expect(await screen.findByLabelText('New file')).toBeDisabled()
+  })
+
+  it('renders the explorer as an inline page without closing a sheet on file open', async () => {
+    setRoot([entry('a.txt', 'file')])
+    const onOpenChange = vi.fn()
+    const onFileOpened = vi.fn()
+
+    render(
+      <MobileFileExplorer
+        variant="page"
+        open
+        onOpenChange={onOpenChange}
+        onFileOpened={onFileOpened}
+      />
+    )
+
+    expect(document.querySelector('[data-mobile-file-explorer="page"]')).toBeTruthy()
+    expect(await screen.findByRole('heading', { name: 'proj' })).toBeInTheDocument()
+    fireEvent.click(await screen.findByText('a.txt'))
+
+    await waitFor(() => expect(mockAddEditorTab).toHaveBeenCalledWith('/proj/a.txt'))
+    await waitFor(() => expect(onFileOpened).toHaveBeenCalledTimes(1))
+    expect(onOpenChange).not.toHaveBeenCalled()
   })
 })

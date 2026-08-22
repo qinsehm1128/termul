@@ -1,4 +1,5 @@
 import { isConversationId } from '@shared/types/conversation.types'
+import { conversationApi } from '@/lib/conversation-api'
 
 export function isLiveAcpSession(session?: { status?: string } | null): boolean {
   return Boolean(session && session.status && session.status !== 'closed')
@@ -23,6 +24,29 @@ export function resolveConversationSessionId(
     state.sessionIndex.find((entry) => conversationIdForIndexEntry(entry) === conversationId)?.id ??
     null
   )
+}
+
+/** Ask the host for the Conversation's current Active ACP binding. */
+export async function fetchHostBoundSession(conversationId: string): Promise<{
+  sessionId: string
+  runtimeAgentId: string
+  executionCwd: string
+} | null> {
+  if (!isConversationId(conversationId)) return null
+  try {
+    const result = await conversationApi.getCurrentBinding(conversationId)
+    if (!result.success) return null
+    if (!result.data.binding) return null
+    const binding = result.data.binding
+    if (binding.state !== 'active' || !binding.agentSessionId) return null
+    return {
+      sessionId: binding.agentSessionId,
+      runtimeAgentId: binding.runtimeAgentId,
+      executionCwd: binding.executionCwd
+    }
+  } catch {
+    return null
+  }
 }
 
 /** Host summaries expose Conversation identity as `conversationId` or `storageKey`. */

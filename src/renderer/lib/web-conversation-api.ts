@@ -12,10 +12,12 @@ import {
 } from '@shared/types/conversation.types'
 import {
   type ConversationApi,
+  type ConversationBindingSnapshot,
   type ConversationHostStatus,
   type ConversationOpenOutcome,
   type LegacyConversationKey,
   type LegacyConversationResolution,
+  parseConversationBindingSnapshot,
   parseConversationHostStatus,
   parseConversationOpenOutcome,
   parseConversationRecordV2Array,
@@ -101,6 +103,13 @@ export function createWebConversationApi(): ConversationApi {
         requestJson<ConversationRecordV2>(
           `/conversations/${encodeURIComponent(conversationId)}`,
           parseConversationRecordV2
+        )
+      ),
+    getCurrentBinding: (conversationId) =>
+      withConversationId(conversationId, () =>
+        requestJson<ConversationBindingSnapshot>(
+          `/conversations/${encodeURIComponent(conversationId)}/binding`,
+          parseConversationBindingSnapshot
         )
       ),
     openConversation: (conversationId) =>

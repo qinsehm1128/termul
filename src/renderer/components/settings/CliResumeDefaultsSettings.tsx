@@ -7,10 +7,12 @@ import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { useRuntimeTranslation } from '@/i18n/use-runtime-translation'
 import { loadCliResumeDefaults, saveCliResumeDefaults } from '@/lib/cli-resume-defaults'
 import { logFrontendError } from '@/lib/log-api'
 
 export function CliResumeDefaultsSettings(): React.JSX.Element {
+  const t = useRuntimeTranslation('settings')
   const [extraArgsByAgentId, setExtraArgsByAgentId] = useState<
     Partial<Record<CliSessionAgentId, string>>
   >({})
@@ -40,7 +42,11 @@ export function CliResumeDefaultsSettings(): React.JSX.Element {
     const next = { ...extraArgsByAgentId, [agentId]: value }
     setExtraArgsByAgentId(next)
     void saveCliResumeDefaults(next).catch((error) => {
-      toast.error(error instanceof Error ? error.message : 'Failed to save resume defaults')
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : t('aiAgents.cliResumeSaveFailed', 'Failed to save resume defaults')
+      )
       void logFrontendError({
         source: 'CliResumeDefaultsSettings',
         message: error instanceof Error ? error.message : String(error)
@@ -51,10 +57,14 @@ export function CliResumeDefaultsSettings(): React.JSX.Element {
   return (
     <div className="space-y-3">
       <div>
-        <h3 className="text-sm font-medium text-secondary-foreground">CLI resume extra args</h3>
+        <h3 className="text-sm font-medium text-secondary-foreground">
+          {t('aiAgents.cliResumeTitle', 'CLI resume extra args')}
+        </h3>
         <p className="text-xs text-muted-foreground mt-1">
-          Prefixed before the resume flag when launching a scanned session. Edit here or override
-          once in the resume dialog.
+          {t(
+            'aiAgents.cliResumeDescription',
+            'Prefixed before the resume flag when launching a scanned session. Edit here or override once in the resume dialog.'
+          )}
         </p>
       </div>
       <div className="space-y-2">
@@ -66,7 +76,7 @@ export function CliResumeDefaultsSettings(): React.JSX.Element {
               value={extraArgsByAgentId[agentId] ?? ''}
               disabled={!loaded}
               onChange={(event) => persist(agentId, event.target.value)}
-              placeholder="none"
+              placeholder={t('aiAgents.cliResumePlaceholder', 'none')}
             />
           </div>
         ))}

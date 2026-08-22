@@ -1369,6 +1369,9 @@ pub struct PtyManager {
     /// Set when the app window is minimized/hidden to prevent
     /// ConPTY lifecycle issues on Windows.
     is_hidden: Arc<AtomicBool>,
+    /// Live output views (desktop attach + web/iOS attach/watch).
+    /// The last view close pauses cwd/git polling without killing the PTY.
+    view_refs: Arc<parking_lot::Mutex<HashMap<String, u32>>>,
 }
 
 impl PtyManager {
@@ -1394,6 +1397,88 @@ impl PtyManager {
             claims: Arc::new(crate::pty::claims::TerminalClaimRegistry::new()),
             cleanup_driver: Arc::new(RwLock::new(Arc::new(SystemCleanupDriver))),
             cleanup_job_counter: Arc::new(AtomicU64::new(0)),
+            view_refs: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn pause_view_tracking(&self, terminal_id: &str) {
+        self.cwd_tracker.stop_tracking(terminal_id);
+        self.git_tracker.remove_terminal(terminal_id);
+    }
+
+    fn resume_view_tracking(&self, terminal_id: &str) {
+        let Some(instance) = self.get(terminal_id).filter(|instance| instance.is_active()) else {
+            return;
+        };
+        let cwd = self
+            .cwd_tracker
+            .get_cwd(terminal_id)
+            .unwrap_or_else(|| instance.cwd.clone());
+        if self.cwd_tracker.get_cwd(terminal_id).is_none() {
+            self.cwd_tracker.start_tracking(terminal_id, instance.pid, &cwd);
+        }
+        if !self.git_tracker.is_tracking(terminal_id) {
+            self.git_tracker.initialize_terminal(terminal_id, &cwd);
+        }
+    }
+
+    /// A desktop or remote client started watching this PTY.
+    pub fn note_view_opened(&self, terminal_id: &str) {
+        let views = {
+            let mut refs = self.view_refs.lock();
+            let count = refs.entry(terminal_id.to_string()).or_insert(0);
+            *count = count.saturating_add(1);
+            *count
+        };
+        self.resume_view_tracking(terminal_id);
+        log::info!("[pty-view] opened terminal_id={terminal_id} views={views}");
+    }
+
+    /// Hide a tab that never attached on this surface. Pause polling only
+    /// when no other desktop/remote view is still watching.
+    pub fn pause_tracking_if_unwatched(&self, terminal_id: &str) {
+        let watched = self
+            .view_refs
+            .lock()
+            .get(terminal_id)
+            .copied()
+            .unwrap_or(0)
+            > 0;
+        if watched {
+            return;
+        }
+        self.pause_view_tracking(terminal_id);
+        log::info!(
+            "[pty-view] unwatched close-view; pausing cwd/git tracking terminal_id={terminal_id} pty_still_running=true"
+        );
+    }
+
+    /// A desktop or remote client stopped watching this PTY.
+    /// The process stays alive; cwd/git polling stops only when no views remain.
+    pub fn note_view_closed(&self, terminal_id: &str) {
+        let remaining = {
+            let mut refs = self.view_refs.lock();
+            match refs.get_mut(terminal_id) {
+                Some(count) if *count > 1 => {
+                    *count -= 1;
+                    *count
+                }
+                Some(_) => {
+                    refs.remove(terminal_id);
+                    0
+                }
+                None => 0,
+            }
+        };
+        if remaining == 0 {
+            self.pause_view_tracking(terminal_id);
+            log::info!(
+                "[pty-view] last view closed; pausing cwd/git tracking terminal_id={terminal_id} pty_still_running=true"
+            );
+        } else {
+            log::info!(
+                "[pty-view] closed terminal_id={terminal_id} remaining_views={remaining}"
+            );
         }
     }
 
@@ -1683,6 +1768,7 @@ impl PtyManager {
 
         let mut scoped_options = options;
         scoped_options.conversation_id = Some(conversation_id);
+        let catalog_project_id = scoped_options.project_id.clone();
         let info = match self
             .spawn_pty(id.clone(), scoped_options, on_data, tracks_workspace_ref)
             .await
@@ -1696,7 +1782,21 @@ impl PtyManager {
 
         claim_guard.commit();
         slot_reservation.commit();
-        Ok(SpawnedTerminal { info, claim })
+        let spawned = SpawnedTerminal { info, claim };
+        self.terminal_events.emit(TerminalEvent::Spawned {
+            terminal_id: spawned.info.id.clone(),
+            project_id: catalog_project_id,
+            conversation_id: if tracks_workspace_ref {
+                Some(conversation_id.to_string())
+            } else {
+                None
+            },
+            cwd: spawned.info.cwd.clone(),
+            cols: spawned.info.cols,
+            rows: spawned.info.rows,
+            shell: spawned.info.shell.clone(),
+        });
+        Ok(spawned)
     }
 
     /// Spawn an interactive terminal from the narrow remote intent. All
@@ -2487,6 +2587,7 @@ impl PtyManager {
                 };
                 if removed {
                     self.release_terminal_slot();
+                    self.view_refs.lock().remove(&instance.id);
                     self.cwd_tracker.stop_tracking(&instance.id);
                     self.git_tracker.remove_terminal(&instance.id);
                     self.exit_code_tracker.remove_terminal(&instance.id);
@@ -3601,6 +3702,70 @@ mod tests {
         manager.active_terminal_slots.fetch_add(1, Ordering::SeqCst);
         manager.claims.issue(terminal_id, conversation_id, None);
         instance
+    }
+
+    #[tokio::test]
+    async fn last_view_close_pauses_git_and_cwd_tracking_without_removing_pty() {
+        let manager = crate::web::test_pty_manager();
+        install_cleanup_fixture(&manager, "view-t1");
+        manager
+            .cwd_tracker()
+            .start_tracking("view-t1", 42, "/redacted-test-cwd");
+        manager
+            .git_tracker()
+            .initialize_terminal("view-t1", "/redacted-test-cwd");
+        assert!(manager.git_tracker().is_tracking("view-t1"));
+        assert_eq!(
+            manager.cwd_tracker().get_cwd("view-t1").as_deref(),
+            Some("/redacted-test-cwd")
+        );
+
+        manager.note_view_opened("view-t1");
+        manager.note_view_opened("view-t1");
+        manager.note_view_closed("view-t1");
+        assert!(
+            manager.git_tracker().is_tracking("view-t1"),
+            "a remaining remote/desktop view must keep polling"
+        );
+
+        manager.note_view_closed("view-t1");
+        assert!(
+            manager.get("view-t1").is_some(),
+            "close-view must not terminate the PTY"
+        );
+        assert!(
+            !manager.git_tracker().is_tracking("view-t1"),
+            "last view close must drop git polling"
+        );
+        assert!(
+            manager.cwd_tracker().get_cwd("view-t1").is_none(),
+            "last view close must drop cwd polling"
+        );
+
+        manager.note_view_opened("view-t1");
+        assert!(manager.git_tracker().is_tracking("view-t1"));
+        assert_eq!(
+            manager.cwd_tracker().get_cwd("view-t1").as_deref(),
+            Some("/redacted-test-cwd")
+        );
+    }
+
+    #[tokio::test]
+    async fn unwatched_close_view_keeps_polling_while_another_view_is_open() {
+        let manager = crate::web::test_pty_manager();
+        install_cleanup_fixture(&manager, "view-t2");
+        manager
+            .cwd_tracker()
+            .start_tracking("view-t2", 42, "/redacted-test-cwd");
+        manager
+            .git_tracker()
+            .initialize_terminal("view-t2", "/redacted-test-cwd");
+        manager.note_view_opened("view-t2");
+        manager.pause_tracking_if_unwatched("view-t2");
+        assert!(
+            manager.git_tracker().is_tracking("view-t2"),
+            "a live attach/watch must keep git polling after a tab that never attached is hidden"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

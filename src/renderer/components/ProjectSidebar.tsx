@@ -774,7 +774,7 @@ export function ProjectSidebar({
     isSearching && filteredActiveProjects.length === 0 && filteredArchivedProjects.length === 0
 
   return (
-    <aside className="flex h-full w-60 flex-shrink-0 flex-col bg-sidebar">
+    <aside className="flex h-full w-full min-w-0 flex-col bg-sidebar">
       {/* Header with inline + button */}
       <div className="flex h-8 items-center justify-between border-b border-sidebar-border/70 px-2.5">
         <span className="label-section text-sidebar-foreground">{t('title')}</span>

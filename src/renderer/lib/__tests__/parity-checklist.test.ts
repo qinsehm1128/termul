@@ -248,6 +248,7 @@ const P0_DOMAINS: DomainCheck[] = [
       'getHostStatus',
       'listConversations',
       'getConversation',
+      'getCurrentBinding',
       'openConversation',
       'resolveLegacyConversationId',
       'attachProject',
@@ -1144,6 +1145,7 @@ describe('Parity Checklist Automation', () => {
       const protoPath = join(LIB_DIR, '..', '..', 'shared', 'types', 'web-protocol.types.ts')
       const content = readFileSync(protoPath, 'utf-8')
       expect(content).toMatch(/'list_cli_sessions'/)
+      expect(content).toMatch(/'resolve_cli_sessions'/)
     })
 
     it('host router and ws.rs register the third transport', () => {
@@ -1156,7 +1158,9 @@ describe('Parity Checklist Automation', () => {
         'utf-8'
       )
       expect(router).toMatch(/\/cli-sessions/)
+      expect(router).toMatch(/\/cli-sessions\/resolve/)
       expect(ws).toMatch(/"list_cli_sessions"/)
+      expect(ws).toMatch(/"resolve_cli_sessions"/)
     })
   })
 

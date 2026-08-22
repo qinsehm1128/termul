@@ -121,6 +121,17 @@ export interface SpawnedTerminal extends TerminalInfo {
   claim: string
 }
 
+/** Catalog event when any surface creates a host PTY. Never includes a claim. */
+export interface TerminalSpawnedEvent {
+  terminalId: string
+  projectId?: string | null
+  conversationId?: string | null
+  cwd: string
+  cols: number
+  rows: number
+  shell: string
+}
+
 /**
  * CAP-3 attach response — byte-identical camelCase shape on both transports
  * (desktop `terminal_attach` IpcResult data; web `attach` reply data).
@@ -221,6 +232,7 @@ export type TerminalIpcChannels = {
     claim: string,
     lastSeq: number
   ) => IpcResult<TerminalAttachResult>
+  'terminal:watch': (terminalId: string, lastSeq: number) => IpcResult<TerminalAttachResult>
   'terminal:rotate_claim': (terminalId: string, claim: string) => IpcResult<RotatedClaim>
   'terminal:revoke_claim': (terminalId: string, claim: string) => IpcResult<void>
   'terminal:write': (terminalId: string, data: string) => IpcResult<void>
@@ -390,6 +402,14 @@ export interface TerminalApi {
     claim: string,
     lastSeq: number
   ) => Promise<IpcResult<TerminalAttachResult>>
+  /**
+   * Watch a live host PTY without presenting or rotating a claim. Desktop uses
+   * this for terminals the phone created; the web adapter maps to `/terminal/ws`
+   * `watch`.
+   */
+  watch?: (terminalId: string, lastSeq: number) => Promise<IpcResult<TerminalAttachResult>>
+  /** Host catalog event when any surface creates a PTY. */
+  onSpawned?: (callback: (event: TerminalSpawnedEvent) => void) => () => void
   /** CAP-3: possession-based rotation — old credential invalidated atomically. */
   rotateClaim: (terminalId: string, claim: string) => Promise<IpcResult<RotatedClaim>>
   /** CAP-3: revoke the credential; the PTY keeps running. */
@@ -599,7 +619,9 @@ export interface VisibilityApi {
 /** Network bind scope for the embedded remote terminal server. */
 export type RemoteBindMode = 'localhost' | 'all'
 
-export type TunnelProviderKind = 'cloudflareQuick' | 'cloudflareNamed' | 'frp'
+export type TunnelProviderKind = 'cloudflareQuick' | 'cloudflareNamed' | 'frp' | 'sshReverse'
+
+export type RemotePublishMode = 'lan' | 'tunnel'
 
 export interface TunnelConfigView {
   provider: TunnelProviderKind
@@ -612,21 +634,40 @@ export interface TunnelConfigView {
   frpRemotePort: number | null
   frpPublicHttps: boolean
   frpTokenSet: boolean
+  sshHost: string | null
+  sshPort: number | null
+  sshUser: string | null
+  sshRemotePort: number | null
+  sshPublicHostname: string | null
+  sshPublicHttps: boolean
+  sshPrivateKeySet: boolean
 }
 
 export interface TunnelConfigUpdate {
   provider: TunnelProviderKind
   cloudflareNamedHostname?: string | null
   cloudflareNamedLocalPort?: number | null
-  /** Omit to leave unchanged; empty string clears the keyring entry. */
+  /** Omit to leave unchanged; empty string clears the stored secret. */
   cloudflareNamedToken?: string | null
   frpServerAddr?: string | null
   frpServerPort?: number | null
   frpCustomDomain?: string | null
   frpRemotePort?: number | null
   frpPublicHttps?: boolean
-  /** Omit to leave unchanged; empty string clears the keyring entry. */
+  /** Omit to leave unchanged; empty string clears the stored secret. */
   frpToken?: string | null
+  sshHost?: string | null
+  sshPort?: number | null
+  sshUser?: string | null
+  sshRemotePort?: number | null
+  sshPublicHostname?: string | null
+  sshPublicHttps?: boolean
+  sshPrivateKey?: string | null
+}
+
+export interface RemoteAccessIntent {
+  wanted: boolean
+  publishMode: RemotePublishMode
 }
 
 export interface TunnelConfigApi {
@@ -647,8 +688,16 @@ export interface RemoteStatus {
   tunnelUrl: string | null
   /** Active provider id while a tunnel is attached. */
   tunnelProvider?: string | null
-  /** Credentialed scan/copy URL. The credential stays in its fragment and is never displayed alone. */
+  /** Credentialed scan/copy URL for the active publish mode. */
   accessUrl?: string | null
+  /** Same-Wi-Fi origin without the bearer fragment. */
+  lanUrl?: string | null
+  /** Credentialed LAN URL. */
+  lanAccessUrl?: string | null
+  /** Credentialed tunnel URL. */
+  tunnelAccessUrl?: string | null
+  /** Which URL `accessUrl` currently represents. */
+  publishMode?: RemotePublishMode | null
 }
 
 // Remote terminal server control API
@@ -656,6 +705,9 @@ export interface RemoteServerApi {
   start: (options?: { bindMode?: RemoteBindMode }) => Promise<IpcResult<RemoteStatus>>
   stop: () => Promise<IpcResult<RemoteStatus>>
   status: () => Promise<IpcResult<RemoteStatus>>
+  intent: () => Promise<IpcResult<RemoteAccessIntent>>
+  setIntent: (update: Partial<RemoteAccessIntent>) => Promise<IpcResult<RemoteAccessIntent>>
+  rotateCredential: () => Promise<IpcResult<RemoteStatus>>
 }
 
 // Filesystem types re-exported for convenience

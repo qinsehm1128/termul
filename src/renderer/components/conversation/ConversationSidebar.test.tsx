@@ -1,8 +1,9 @@
 import type { ConversationRecordV2 } from '@shared/types/conversation.types'
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import { MemoryRouter, useLocation } from 'react-router-dom'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { i18n } from '@/i18n'
+import { useAcpStore } from '@/stores/acp-store'
 import { useConversationStore } from '@/stores/conversation-store'
 import { useProjectStore } from '@/stores/project-store'
 import { ConversationSidebar } from './ConversationSidebar'
@@ -45,6 +46,12 @@ function summary(
 }
 
 beforeEach(() => {
+  useAcpStore.setState({
+    sessions: {},
+    sessionIndex: [],
+    pendingPermissions: {},
+    pendingQuestions: {}
+  })
   useConversationStore.getState().reset()
   useConversationStore
     .getState()
@@ -74,6 +81,10 @@ beforeEach(() => {
   })
 })
 
+afterEach(async () => {
+  if (i18n.language !== 'en') await i18n.changeLanguage('en')
+})
+
 function LocationProbe(): React.JSX.Element {
   return <output data-testid="location-probe">{useLocation().pathname}</output>
 }
@@ -93,8 +104,14 @@ describe('ConversationSidebar global navigation', () => {
 
     expect(screen.getByText('Projectless chat')).toBeInTheDocument()
     expect(screen.getByText('Attached chat')).toBeInTheDocument()
-    expect(screen.getAllByText('No project')).toHaveLength(2)
-    expect(screen.getAllByText('Demo project')).toHaveLength(2)
+    expect(screen.getByRole('option', { name: 'No project' })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: 'Demo project' })).toBeInTheDocument()
+    expect(screen.getAllByText('Idle')).toHaveLength(2)
+
+    const attached = screen.getByText('Attached chat').closest('[data-conversation-id]')
+    expect(attached).toBeTruthy()
+    fireEvent.click(within(attached as HTMLElement).getByLabelText('Show conversation details'))
+    expect(within(attached as HTMLElement).getByText('Demo project')).toBeInTheDocument()
   })
 
   it('searches the full global list and clears on Escape', () => {
@@ -142,22 +159,27 @@ describe('ConversationSidebar global navigation', () => {
     expect(onNewChat).toHaveBeenCalledTimes(1)
   })
 
-  it('uses the 28px project-rail row, lichen inset, and matching sidebar width', () => {
+  it('marks the active Conversation with the shared list row, not a 28px chip ring', () => {
     useConversationStore.getState().setActiveConversationId(projectlessId)
     renderSidebar()
 
     const sidebar = screen.getByText('Conversations').closest('aside')
-    expect(sidebar).toHaveClass('w-60')
+    expect(sidebar).toHaveClass('w-full')
 
     const row = screen.getByText('Projectless chat').closest('[data-conversation-id]')
-    expect(row).toHaveClass('min-h-7', 'bg-sidebar-accent', 'ring-1', 'duration-150')
-    expect(row?.querySelector('[aria-current="page"]')).not.toBeNull()
+    const active = row?.querySelector('[data-list-row]')
+    expect(active).toHaveAttribute('data-active')
+    expect(active).toHaveClass('bg-sidebar-accent')
+    expect(active).not.toHaveClass('min-h-7', 'ring-1')
 
-    const idle = screen.getByText('Attached chat').closest('[data-conversation-id]')
-    expect(idle).toHaveClass('min-h-7')
+    const idle = screen
+      .getByText('Attached chat')
+      .closest('[data-conversation-id]')
+      ?.querySelector('[data-list-row]')
+    expect(idle).not.toHaveAttribute('data-active')
     expect(idle).not.toHaveClass('bg-sidebar-accent')
-    expect(idle).toHaveTextContent('Demo project')
-    expect(row).toHaveTextContent('No project')
+    expect(idle).toHaveTextContent('rev 3')
+    expect(row).toHaveTextContent('Idle')
   })
 
   it('renders the same global navigation controls from the Chinese locale', async () => {
@@ -168,5 +190,6 @@ describe('ConversationSidebar global navigation', () => {
     expect(screen.getByLabelText('搜索会话')).toBeInTheDocument()
     expect(screen.getByLabelText('按项目筛选会话')).toBeInTheDocument()
     expect(screen.getByLabelText('新建聊天')).toBeInTheDocument()
+    expect(screen.getAllByText('空闲')).toHaveLength(2)
   })
 })

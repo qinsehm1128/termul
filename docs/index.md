@@ -26,6 +26,7 @@ Termul Manager is a project-aware desktop terminal workspace built with Tauri 2.
 - [Architecture](./architecture.md) - Detailed technical architecture
 - [Source Tree Analysis](./source-tree-analysis.md) - Annotated directory structure
 - [Component Inventory](./component-inventory.md) - Catalog of major UI and workspace components
+- [会话列表与终端列表盘点](./list-ui-inventory.md) - 会话、CLI 会话、终端列表的现状盘点与已锁定的实现顺序
 - [Development Guide](./development-guide.md) - Local setup, commands, and developer workflows
 - [API Contracts](./api-contracts.md) - Internal Tauri IPC command/event contracts
 - [Terminal Runtime Evaluation](./terminal-runtime-evaluation.md) - Terminal rendering audit and tmux/RMUX replacement analysis
@@ -83,7 +84,7 @@ This documentation is intended to help AI tools understand and safely extend the
 
 ### When Planning New Features
 
-- **UI-only features:** Reference `architecture.md`, `component-inventory.md`, and `source-tree-analysis.md`
+- **UI-only features:** Reference `architecture.md`, `component-inventory.md`, `list-ui-inventory.md`, and `source-tree-analysis.md`
 - **Runtime/native features:** Reference `architecture.md`, `api-contracts.md`, and `source-tree-analysis.md`
 - **Terminal features:** Start with `architecture.md` and `api-contracts.md`
 - **Browser annotation features:** Start with `architecture.md`, `component-inventory.md`, and `api-contracts.md`

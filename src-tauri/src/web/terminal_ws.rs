@@ -1,9 +1,12 @@
 //! Dedicated interactive terminal websocket.
 //!
-//! This endpoint intentionally stays separate from the ACP relay. The shared
-//! router admits it only after bearer capability middleware succeeds. All
-//! operations are Conversation-scoped: `conversationId` is the primary PTY
-//! ownership/claim scope. `projectId` is optional attribution only.
+//! This endpoint intentionally stays separate from the ACP relay. The HTTP
+//! upgrade validates Origin the same way `/ws` does. A valid `Authorization`
+//! bearer is optional on the handshake (browsers and iOS `URLSessionWebSocketTask`
+//! often cannot send it). If the header is absent, the first frame must be
+//! `authenticate` with the same token. All later operations stay
+//! Conversation-scoped: `conversationId` is the primary PTY ownership/claim
+//! scope. `projectId` is optional attribution only.
 //! Companion clients enumerate live PTYs with `list` (`conversationId` first,
 //! `projectId` as attribution fallback) and subscribe with `watch` without
 //! rotating the desktop claim. The bearer principal and current claim
@@ -14,9 +17,11 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use std::net::{IpAddr, SocketAddr};
+
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::extract::{ConnectInfo, State};
+use axum::http::{header, HeaderMap};
 use axum::response::IntoResponse;
 use axum::Extension;
 use futures_util::{SinkExt, StreamExt};
@@ -25,9 +30,9 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use crate::conversation::ConversationId;
 #[cfg(test)]
 use crate::pty::manager::SpawnOptions;
-use crate::conversation::ConversationId;
 use crate::pty::manager::{TerminalReplay, TerminalResumeRequest, TerminalSpawnIntentV1};
 use crate::web::auth::{
     auth_error_response, RemoteAccessAuthority, RemoteAuthError, RemoteCapability, RemotePrincipal,
@@ -56,6 +61,20 @@ struct Request {
     payload: Value,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthenticatePayload {
+    token: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TerminalProjectSpawnIntent {
+    project_id: String,
+    cols: u16,
+    rows: u16,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AuthorizedTerminalScope {
     conversation_id: crate::conversation::ConversationId,
@@ -69,23 +88,26 @@ pub async fn terminal_ws_upgrade(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
-    Extension(principal): Extension<RemotePrincipal>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(error) = authorize_terminal_upgrade(&authority, &principal, &headers) {
-        warn!(
-            target: "termul::web::terminal_ws",
-            principal_class = ?principal.authority_source(),
-            stable_code = error.code(),
-            "terminal WebSocket upgrade rejected by authentication policy"
-        );
-        return auth_error_response(error);
-    }
+    let peer_ip = peer.ip();
+    let admitted = match admit_terminal_upgrade(&authority, &headers, peer_ip) {
+        Ok(principal) => principal,
+        Err(error) => {
+            warn!(
+                target: "termul::web::terminal_ws",
+                stable_code = error.code(),
+                "terminal WebSocket upgrade rejected by authentication policy"
+            );
+            return auth_error_response(error);
+        }
+    };
     info!(
         target: "termul::web::terminal_ws",
-        principal_class = ?principal.authority_source(),
+        handshake_bearer = admitted.is_some(),
         stable_code = "OK",
-        "terminal WebSocket upgrade authenticated"
+        "terminal WebSocket upgrade Origin accepted"
     );
     let binary_output = supports_binary_subprotocol(&headers);
     let ws = if binary_output {
@@ -98,7 +120,7 @@ pub async fn terminal_ws_upgrade(
         binary_output,
         "terminal WebSocket output protocol selected"
     );
-    ws.on_upgrade(move |socket| run(socket, state, authority, principal, binary_output))
+    ws.on_upgrade(move |socket| run(socket, state, authority, admitted, peer_ip, binary_output))
         .into_response()
 }
 
@@ -111,21 +133,82 @@ fn supports_binary_subprotocol(headers: &HeaderMap) -> bool {
         .any(|protocol| protocol.trim() == BINARY_SUBPROTOCOL)
 }
 
-fn authorize_terminal_upgrade(
+fn admit_terminal_upgrade(
     authority: &RemoteAccessAuthority,
-    principal: &RemotePrincipal,
     headers: &HeaderMap,
-) -> Result<(), RemoteAuthError> {
-    authority.verify_origin(headers.get(axum::http::header::ORIGIN))?;
-    authority.authorize(principal, RemoteCapability::Mutate)
+    peer: IpAddr,
+) -> Result<Option<RemotePrincipal>, RemoteAuthError> {
+    authority.verify_origin(headers.get(header::ORIGIN))?;
+    let Some(authorization) = headers.get(header::AUTHORIZATION) else {
+        return Ok(None);
+    };
+    let token = authorization
+        .to_str()
+        .ok()
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|token| !token.is_empty())
+        .ok_or(RemoteAuthError::InvalidCredential)?;
+    let principal = authority.verify_bearer_for_peer(token, peer)?;
+    authority.authorize(&principal, RemoteCapability::Mutate)?;
+    Ok(Some(principal))
 }
 
 fn principal_generation_mismatch(
     authority: &RemoteAccessAuthority,
-    principal: &RemotePrincipal,
+    principal: Option<&RemotePrincipal>,
 ) -> bool {
+    let Some(principal) = principal else {
+        return false;
+    };
     let current = authority.generation_state();
     !current.active || current.generation != principal.generation()
+}
+
+fn spawn_terminal_event_task(
+    state: AppState,
+    authorized: AuthorizedTerminals,
+    authority: Arc<RemoteAccessAuthority>,
+    principal_generation: u64,
+    tx: mpsc::Sender<Message>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut event_rx = state.terminal_events.subscribe();
+        loop {
+            match event_rx.recv().await {
+                Ok(event) => {
+                    if !should_forward_passive(&authority, principal_generation) {
+                        break;
+                    }
+                    let terminal_id = event.terminal_id().to_string();
+                    let catalog_event = matches!(
+                        event,
+                        crate::trackers::TerminalEvent::Spawned { .. }
+                            | crate::trackers::TerminalEvent::Exit { .. }
+                    );
+                    if !catalog_event
+                        && live_authorized_terminal_scope(&state, &authorized, &terminal_id)
+                            .is_none()
+                    {
+                        continue;
+                    }
+                    if !should_forward_passive(&authority, principal_generation) {
+                        break;
+                    }
+                    let payload = serde_json::to_value(&event).unwrap_or_else(|_| json!({}));
+                    if send_json(&tx, json!({ "type": "event", "payload": payload }))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!("[terminal-ws] lifecycle event receiver lagged by {skipped}");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
 }
 
 fn should_forward_passive(authority: &RemoteAccessAuthority, principal_generation: u64) -> bool {
@@ -151,7 +234,8 @@ async fn run(
     socket: WebSocket,
     state: AppState,
     authority: Arc<RemoteAccessAuthority>,
-    principal: RemotePrincipal,
+    mut principal: Option<RemotePrincipal>,
+    peer: IpAddr,
     binary_output: bool,
 ) {
     let (mut sink, mut stream) = socket.split();
@@ -174,49 +258,20 @@ async fn run(
     // Per-terminal output forwarding tasks.
     let attachments: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
 
-    info!("[terminal-ws] client connected after router authentication");
+    info!(
+        handshake_bearer = principal.is_some(),
+        "[terminal-ws] client connected after Origin admission"
+    );
 
-    let event_tx = tx.clone();
-    let event_state = state.clone();
-    let event_authorized = authorized.clone();
-    let event_authority = Arc::clone(&authority);
-    let event_principal_generation = principal.generation();
-    let mut event_rx = event_state.terminal_events.subscribe();
     let mut generation_rx = authority.subscribe_generation();
-    let event_task = tokio::spawn(async move {
-        loop {
-            match event_rx.recv().await {
-                Ok(event) => {
-                    if !should_forward_passive(&event_authority, event_principal_generation) {
-                        break;
-                    }
-                    let terminal_id = event.terminal_id().to_string();
-                    // Only forward events while the exact Conversation scope
-                    // and claim generation authorized for this connection are
-                    // still live. A cross-connection resume/rotate/revoke
-                    // invalidates event visibility as well as terminal output.
-                    if live_authorized_terminal_scope(&event_state, &event_authorized, &terminal_id)
-                        .is_none()
-                    {
-                        continue;
-                    }
-                    if !should_forward_passive(&event_authority, event_principal_generation) {
-                        break;
-                    }
-                    let payload = serde_json::to_value(&event).unwrap_or_else(|_| json!({}));
-                    if send_json(&event_tx, json!({ "type": "event", "payload": payload }))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!("[terminal-ws] lifecycle event receiver lagged by {skipped}");
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
+    let mut event_task = principal.as_ref().map(|admitted| {
+        spawn_terminal_event_task(
+            state.clone(),
+            authorized.clone(),
+            Arc::clone(&authority),
+            admitted.generation(),
+            tx.clone(),
+        )
     });
 
     let mut ctx = ConnectionContext {
@@ -226,10 +281,10 @@ async fn run(
     };
 
     loop {
-        if principal_generation_mismatch(&authority, &principal) {
+        if principal_generation_mismatch(&authority, principal.as_ref()) {
             info!(
                 target: "termul::web::terminal_ws",
-                generation = principal.generation(),
+                generation = principal.as_ref().map(RemotePrincipal::generation).unwrap_or(0),
                 lifecycle_phase = "generation_mismatch",
                 stable_code = "OK",
                 "terminal WebSocket closing after authority generation change"
@@ -238,10 +293,10 @@ async fn run(
         }
         tokio::select! {
             changed = generation_rx.changed() => {
-                if changed.is_err() || principal_generation_mismatch(&authority, &principal) {
+                if changed.is_err() || principal_generation_mismatch(&authority, principal.as_ref()) {
                     info!(
                         target: "termul::web::terminal_ws",
-                        generation = principal.generation(),
+                        generation = principal.as_ref().map(RemotePrincipal::generation).unwrap_or(0),
                         lifecycle_phase = "generation_mismatch",
                         stable_code = "OK",
                         "terminal WebSocket closing after authority generation change"
@@ -255,7 +310,7 @@ async fn run(
                 let Message::Text(text) = message else {
                     continue;
                 };
-                if principal_generation_mismatch(&authority, &principal) {
+                if principal_generation_mismatch(&authority, principal.as_ref()) {
                     break;
                 }
                 let request = match serde_json::from_str::<Request>(&text) {
@@ -268,7 +323,26 @@ async fn run(
                 let id = request.id.clone();
                 let op_type = request.type_.clone();
                 info!("[terminal-ws] request start type={op_type}");
-                match handle(request, &state, &authority, &principal, &tx, &mut ctx).await {
+                let outcome = if principal.is_none() {
+                    admit_terminal_frame(&request, &authority, peer, &mut principal)
+                } else {
+                    match principal.as_ref() {
+                        Some(admitted) => handle(request, &state, &authority, admitted, &tx, &mut ctx).await,
+                        None => Err(("UNAUTHORIZED", "pre-auth: send an `authenticate` request first".to_string())),
+                    }
+                };
+                if event_task.is_none() {
+                    if let Some(admitted) = principal.as_ref() {
+                        event_task = Some(spawn_terminal_event_task(
+                            state.clone(),
+                            authorized.clone(),
+                            Arc::clone(&authority),
+                            admitted.generation(),
+                            tx.clone(),
+                        ));
+                    }
+                }
+                match outcome {
                     Ok(data) => {
                         info!("[terminal-ws] request success type={op_type}");
                         let _ = send_json(&tx, json!({ "id": id, "success": true, "data": data })).await;
@@ -283,8 +357,19 @@ async fn run(
     }
 
     // Cleanup: abort and join event/attachment tasks. PTYs are preserved.
+    let attached_ids: Vec<String> = ctx.attachments.keys().cloned().collect();
     let attachments = std::mem::take(&mut ctx.attachments);
-    abort_and_join_connection_tasks(event_task, attachments).await;
+    for terminal_id in &attached_ids {
+        state.pty.note_view_closed(terminal_id);
+    }
+    if let Some(event_task) = event_task {
+        abort_and_join_connection_tasks(event_task, attachments).await;
+    } else {
+        for task in attachments.into_values() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
     info!(
         "[terminal-ws] client disconnected; {} PTY(s) preserved",
         ctx.authorized.read().len()
@@ -356,15 +441,85 @@ impl ConnectionContext {
         self.authorized.read().contains_key(terminal_id)
     }
 
-    fn close_view(&mut self, terminal_id: &str) {
+    fn close_view(&mut self, terminal_id: &str) -> bool {
         if let Some(task) = self.attachments.remove(terminal_id) {
             task.abort();
+            true
+        } else {
+            false
         }
     }
 
-    fn detach(&mut self, terminal_id: &str) {
-        self.close_view(terminal_id);
+    fn detach(&mut self, terminal_id: &str) -> bool {
+        let released = self.close_view(terminal_id);
         self.authorized.write().remove(terminal_id);
+        released
+    }
+}
+
+fn release_connection_view(
+    state: &AppState,
+    ctx: &mut ConnectionContext,
+    terminal_id: &str,
+    drop_authorization: bool,
+) {
+    let released = if drop_authorization {
+        ctx.detach(terminal_id)
+    } else {
+        ctx.close_view(terminal_id)
+    };
+    if released {
+        state.pty.note_view_closed(terminal_id);
+    }
+}
+
+fn admit_terminal_frame(
+    request: &Request,
+    authority: &RemoteAccessAuthority,
+    peer: IpAddr,
+    principal: &mut Option<RemotePrincipal>,
+) -> Result<Value, (&'static str, String)> {
+    if request.type_ != "authenticate" {
+        return Err((
+            "UNAUTHORIZED",
+            "pre-auth: send an `authenticate` request first".to_string(),
+        ));
+    }
+    if principal.is_some() {
+        return Ok(json!({}));
+    }
+    let payload: AuthenticatePayload =
+        serde_json::from_value(request.payload.clone()).map_err(|_| {
+            (
+                "UNAUTHORIZED",
+                "pre-auth: send an `authenticate` request first".to_string(),
+            )
+        })?;
+    match authority.verify_bearer_for_peer(&payload.token, peer) {
+        Ok(admitted) => {
+            authority
+                .authorize(&admitted, RemoteCapability::Mutate)
+                .map_err(|_| unauthorized_error("principal"))?;
+            *principal = Some(admitted);
+            info!(
+                target: "termul::web::terminal_ws",
+                request_type = "authenticate",
+                auth_class = "bearer",
+                stable_code = "OK",
+                "terminal WebSocket authentication completed"
+            );
+            Ok(json!({}))
+        }
+        Err(error) => {
+            warn!(
+                target: "termul::web::terminal_ws",
+                request_type = "authenticate",
+                auth_class = "bearer",
+                stable_code = error.code(),
+                "terminal WebSocket authentication rejected"
+            );
+            Err((error.code(), error.to_string()))
+        }
     }
 }
 
@@ -381,7 +536,16 @@ async fn handle(
         .map_err(|_| unauthorized_error("principal"))?;
 
     match request.type_.as_str() {
+        "authenticate" => Ok(json!({})),
         "spawn" => {
+            let has_conversation = request
+                .payload
+                .get("conversationId")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty());
+            if !has_conversation {
+                return spawn_project_terminal(request.payload, state, ctx).await;
+            }
             let intent: TerminalSpawnIntentV1 = serde_json::from_value(request.payload)
                 .map_err(|error| ("VALIDATION_ERROR", error.to_string()))?;
             let conversation_id = intent.conversation_id;
@@ -493,11 +657,7 @@ async fn handle(
                 .into_iter()
                 .filter(|instance| {
                     instance.is_active()
-                        && companion_list_matches(
-                            instance,
-                            conversation_filter,
-                            project_filter,
-                        )
+                        && companion_list_matches(instance, conversation_filter, project_filter)
                 })
                 .map(|instance| {
                     let cwd = state
@@ -570,7 +730,7 @@ async fn handle(
                 ));
             }
             debug_assert!(state.pty.get(terminal_id).is_none(), "scope={scope}");
-            ctx.detach(terminal_id);
+            release_connection_view(state, ctx, terminal_id, true);
             Ok(Value::Null)
         }
         "attach" => {
@@ -648,7 +808,7 @@ async fn handle(
             // (removed from the authorized set). Holders on OTHER connections
             // are severed by the claim-generation check inside their
             // attachment tasks. The PTY keeps running.
-            ctx.detach(&terminal_id);
+            release_connection_view(state, ctx, &terminal_id, true);
             info!("[terminal-ws] claim rotated terminal_id={terminal_id}");
             serde_json::to_value(crate::pty::RotatedClaim { claim: rotated })
                 .map_err(|e| ("NETWORK_ERROR", e.to_string()))
@@ -669,13 +829,13 @@ async fn handle(
             // metadata or output; other connections are severed by the
             // generation check in their attachment tasks. The PTY keeps
             // running.
-            ctx.detach(&terminal_id);
+            release_connection_view(state, ctx, &terminal_id, true);
             info!("[terminal-ws] claim revoked terminal_id={terminal_id}");
             Ok(Value::Null)
         }
         "detach" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
-            ctx.detach(terminal_id);
+            release_connection_view(state, ctx, terminal_id, true);
             info!("[terminal-ws] detached terminal_id={terminal_id}");
             Ok(Value::Null)
         }
@@ -685,7 +845,7 @@ async fn handle(
             // Abort output first but retain authorization long enough for the
             // renderer component's unmount cleanup to remove its backend ref.
             // That cleanup then sends `detach`, which drops authorization.
-            ctx.close_view(terminal_id);
+            release_connection_view(state, ctx, terminal_id, false);
             info!("[terminal-ws] close-view terminal_id={terminal_id}");
             Ok(Value::Null)
         }
@@ -921,6 +1081,7 @@ async fn install_replay_forwarder(
     // Refuse to install any live forwarder for the stale generation.
     authorized_terminal_scope(state, ctx, terminal_id)?;
 
+    let replacing_view = ctx.attachments.contains_key(terminal_id);
     if let Some(previous) = ctx.attachments.remove(terminal_id) {
         previous.abort();
     }
@@ -1020,6 +1181,9 @@ async fn install_replay_forwarder(
         }
     });
     ctx.attachments.insert(terminal_id.to_string(), task);
+    if !replacing_view {
+        state.pty.note_view_opened(terminal_id);
+    }
     Ok(())
 }
 
@@ -1069,6 +1233,83 @@ fn terminal_display_title(cwd: &str, shell: &str) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or(shell)
         .to_string()
+}
+
+async fn spawn_project_terminal(
+    payload: Value,
+    state: &AppState,
+    ctx: &mut ConnectionContext,
+) -> Result<Value, (&'static str, String)> {
+    let intent: TerminalProjectSpawnIntent = serde_json::from_value(payload)
+        .map_err(|error| ("VALIDATION_ERROR", error.to_string()))?;
+    if intent.project_id.trim().is_empty() {
+        return Err(("VALIDATION_ERROR", "missing projectId".to_string()));
+    }
+    if intent.cols == 0 || intent.rows == 0 {
+        return Err((
+            "VALIDATION_ERROR",
+            "terminal dimensions must be greater than zero".to_string(),
+        ));
+    }
+    let project = state
+        .registry
+        .switch_context(&intent.project_id)
+        .ok_or_else(|| ("NOT_FOUND", "project not found or not switchable".to_string()))?;
+    info!(
+        "[terminal-ws] spawn requested project_id={} conversation_id=none cwd_source=project",
+        project.project_id
+    );
+    let options = crate::pty::manager::SpawnOptions {
+        shell: None,
+        cwd: Some(project.cwd),
+        env: None,
+        conversation_id: None,
+        project_id: Some(project.project_id.clone()),
+        cols: Some(intent.cols),
+        rows: Some(intent.rows),
+        program: None,
+        args: None,
+        kind: None,
+    };
+    let spawned = match terminal_workspace_service(state) {
+        Ok(workspace) => {
+            let result = crate::commands::terminal_spawn_resource(
+                options,
+                None,
+                &state.pty,
+                &workspace,
+            )
+            .await;
+            if !result.success {
+                let code = terminal_resource_code(result.code.as_deref());
+                let error = result
+                    .error
+                    .unwrap_or_else(|| "terminal spawn failed".to_string());
+                retain_compound_cleanup_authorization(state, ctx, code, &error);
+                return Err((code, error));
+            }
+            result.data.expect("successful terminal spawn has data")
+        }
+        Err(_) => state
+            .pty
+            .spawn(options, None)
+            .await
+            .map_err(|error| ("SPAWN_FAILED", error))?,
+    };
+    let instance = state
+        .pty
+        .get(&spawned.info.id)
+        .ok_or_else(|| unauthorized_error(&spawned.info.id))?;
+    let generation = state
+        .pty
+        .claim_generation(&spawned.info.id)
+        .ok_or_else(|| unauthorized_error(&spawned.info.id))?;
+    ctx.authorize(&spawned.info.id, instance.conversation_id, generation);
+    info!(
+        "[terminal-ws] spawn success project_id={} terminal_id={} cwd_source=project",
+        project.project_id, spawned.info.id
+    );
+    serde_json::to_value(spawned).map_err(|error| ("SPAWN_FAILED", error.to_string()))
 }
 
 fn optional_conversation_id(
@@ -1382,6 +1623,79 @@ mod tests {
     }
 
     #[test]
+    fn project_spawn_intent_rejects_raw_cwd_and_unknown_fields() {
+        let valid = json!({
+            "projectId": "project-1",
+            "cols": 80,
+            "rows": 24
+        });
+        let intent: TerminalProjectSpawnIntent = serde_json::from_value(valid.clone()).unwrap();
+        assert_eq!(intent.project_id, "project-1");
+
+        for (field, value) in [
+            ("conversationId", json!("018f7a1c-1b4d-7c8a-9f01-0123456789ab")),
+            ("cwd", json!("/caller/path")),
+            ("shell", json!("caller-shell")),
+            ("program", json!("/bin/sh")),
+            ("env", json!({ "SECRET": "never" })),
+            ("unknown", json!(true)),
+        ] {
+            let mut payload = valid.clone();
+            payload
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_string(), value);
+            assert!(
+                serde_json::from_value::<TerminalProjectSpawnIntent>(payload).is_err(),
+                "raw/unknown field must be rejected: {field}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn project_spawn_uses_host_registry_cwd() {
+        let state = terminal_test_state();
+        let cwd = tempfile::tempdir().unwrap();
+        state.registry.set(
+            vec![crate::web::project_registry::ProjectSummary {
+                id: "project-1".into(),
+                name: "Demo".into(),
+                color: "blue".into(),
+                path: Some(cwd.path().to_string_lossy().into_owned()),
+                is_archived: false,
+                is_default: true,
+            }],
+            Some("project-1".into()),
+        );
+        let mut ctx = ConnectionContext {
+            authorized: Arc::new(RwLock::new(HashMap::new())),
+            attachments: HashMap::new(),
+            binary_output: false,
+        };
+        let spawned = spawn_project_terminal(
+            json!({
+                "projectId": "project-1",
+                "cols": 80,
+                "rows": 24
+            }),
+            &state,
+            &mut ctx,
+        )
+        .await
+        .expect("project spawn");
+        let spawned_cwd = spawned["cwd"].as_str().expect("cwd");
+        let expected = cwd.path().canonicalize().unwrap();
+        assert_eq!(
+            std::path::Path::new(spawned_cwd).canonicalize().unwrap(),
+            expected
+        );
+        let terminal_id = spawned["id"].as_str().expect("id");
+        assert!(!terminal_id.is_empty());
+        assert!(spawned.get("claim").and_then(Value::as_str).is_some());
+        state.pty.terminate(terminal_id).await.unwrap();
+    }
+
+    #[test]
     fn spawn_intent_rejects_raw_and_unknown_fields() {
         let valid = json!({
             "conversationId": conversation_id(),
@@ -1517,7 +1831,8 @@ mod tests {
             .oneshot(terminal_upgrade_request(None, Some(allowed_origin), peer))
             .await
             .unwrap();
-        assert_eq!(missing.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_ne!(missing.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_ne!(missing.status(), axum::http::StatusCode::FORBIDDEN);
 
         let wrong = terminal_auth_app(terminal_authority())
             .oneshot(terminal_upgrade_request(
@@ -1530,13 +1845,27 @@ mod tests {
         assert_eq!(wrong.status(), axum::http::StatusCode::UNAUTHORIZED);
 
         let authority = terminal_authority();
-        let principal = authority.verify_bearer("terminal-access-token").unwrap();
         let mut allowed_headers = HeaderMap::new();
         allowed_headers.insert(
             axum::http::header::ORIGIN,
             axum::http::HeaderValue::from_static("https://terminal.example.test"),
         );
-        assert!(authorize_terminal_upgrade(&authority, &principal, &allowed_headers).is_ok());
+        assert!(
+            admit_terminal_upgrade(&authority, &allowed_headers, peer.ip())
+                .unwrap()
+                .is_none()
+        );
+
+        let mut bearer_headers = allowed_headers.clone();
+        bearer_headers.insert(
+            axum::http::header::AUTHORIZATION,
+            axum::http::HeaderValue::from_static("Bearer terminal-access-token"),
+        );
+        assert!(
+            admit_terminal_upgrade(&authority, &bearer_headers, peer.ip())
+                .unwrap()
+                .is_some()
+        );
 
         let mut wrong_headers = HeaderMap::new();
         wrong_headers.insert(
@@ -1544,11 +1873,11 @@ mod tests {
             axum::http::HeaderValue::from_static("https://evil.example.test"),
         );
         assert_eq!(
-            authorize_terminal_upgrade(&authority, &principal, &wrong_headers),
+            admit_terminal_upgrade(&authority, &wrong_headers, peer.ip()),
             Err(RemoteAuthError::InvalidOrigin)
         );
         assert_eq!(
-            authorize_terminal_upgrade(&authority, &principal, &HeaderMap::new()),
+            admit_terminal_upgrade(&authority, &HeaderMap::new(), peer.ip()),
             Err(RemoteAuthError::InvalidOrigin)
         );
 
@@ -1572,7 +1901,30 @@ mod tests {
         }
 
         let source = include_str!("terminal_ws.rs");
-        assert!(source.contains("Extension(principal): Extension<RemotePrincipal>"));
+        assert!(source.contains("pre-auth: send an `authenticate` request first"));
+
+        let mut principal = None;
+        let list = Request {
+            id: "1".into(),
+            type_: "list".into(),
+            payload: json!({}),
+        };
+        let rejected =
+            admit_terminal_frame(&list, &authority, peer.ip(), &mut principal).unwrap_err();
+        assert_eq!(rejected.0, "UNAUTHORIZED");
+        let admitted = admit_terminal_frame(
+            &Request {
+                id: "2".into(),
+                type_: "authenticate".into(),
+                payload: json!({ "token": "terminal-access-token" }),
+            },
+            &authority,
+            peer.ip(),
+            &mut principal,
+        )
+        .unwrap();
+        assert_eq!(admitted, json!({}));
+        assert!(principal.is_some());
     }
 
     #[test]
@@ -1810,7 +2162,7 @@ mod tests {
         let authority = Arc::new(RemoteAccessAuthority::for_tests("test-remote-access-token"));
         let principal = RemotePrincipal::for_tests(1);
         assert!(
-            !principal_generation_mismatch(&authority, &principal),
+            !principal_generation_mismatch(&authority, Some(&principal)),
             "fresh test authority must match principal generation 1"
         );
         let event_task = tokio::spawn(async {
@@ -1829,7 +2181,7 @@ mod tests {
         );
         let receipt = authority.retire_generation(1);
         assert!(receipt.credential_invalidated || !authority.generation_state().active);
-        assert!(principal_generation_mismatch(&authority, &principal));
+        assert!(principal_generation_mismatch(&authority, Some(&principal)));
         abort_and_join_connection_tasks(event_task, attachments).await;
     }
 

@@ -26,6 +26,7 @@ export function createConversationFacadeApi(
     getHostStatus: () => coreApi.getHostStatus(),
     listConversations: () => coreApi.listConversations(),
     getConversation: (conversationId) => coreApi.getConversation(conversationId),
+    getCurrentBinding: (conversationId) => coreApi.getCurrentBinding(conversationId),
     openConversation: (conversationId) => coreApi.openConversation(conversationId),
     renameConversation: (conversationId, title) =>
       coreApi.renameConversation(conversationId, title),

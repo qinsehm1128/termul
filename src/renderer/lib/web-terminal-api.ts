@@ -14,6 +14,7 @@ import type {
   TerminalResumeGrant,
   TerminalResumeRequest,
   TerminalScopedDataCallback,
+  TerminalSpawnedEvent,
   TerminalSpawnOptions
 } from '@shared/types/ipc.types'
 import {
@@ -26,6 +27,7 @@ import {
   type WebTerminalReply,
   type WebTerminalRequestType
 } from '@shared/types/web-terminal-protocol.types'
+import { getRemoteAccessCredential } from '@/lib/acp-transport'
 import { logFrontendError } from '@/lib/log-api'
 
 const REQUEST_TIMEOUT_MS = 15_000
@@ -107,6 +109,7 @@ export class WebTerminalClient {
   private readonly branchCallbacks = new Set<TerminalGitBranchChangedCallback>()
   private readonly statusCallbacks = new Set<TerminalGitStatusChangedCallback>()
   private readonly exitCodeCallbacks = new Set<TerminalExitCodeChangedCallback>()
+  private readonly spawnedCallbacks = new Set<(event: TerminalSpawnedEvent) => void>()
   private invalidBinaryFrameLogged = false
 
   constructor(
@@ -158,51 +161,34 @@ export class WebTerminalClient {
       this.socket = socket
       this.connectingReject = reject
       socket.onopen = () => {
-        this.reconnectAttempt = 0
-        this.connecting = null
-        this.connectingReject = null
-        // CAP-3: re-attach ONLY terminals with a stored lease credential,
-        // using their lastSeq cursor. Terminals without a claim cannot be
-        // re-attached — mark them disconnected (no credential is ever
-        // presented id-only, and a rejected credential is never re-presented).
-        for (const [terminalId, tracker] of this.trackers) {
-          if (tracker.exited || tracker.refCount <= 0 || tracker.cleanupOnly) continue
-          if (!tracker.claim) {
-            tracker.disconnected = true
-            continue
-          }
-          // CAP-3: capture the credential this re-attach is presenting. A
-          // rotate (`severClaim`) that completes while this request is in
-          // flight installs a FRESH claim; the in-flight attach then resolves
-          // with the generic UNAUTHORIZED for the OLD claim. Clearing
-          // unconditionally would discard the fresh claim and strand the
-          // terminal (valid lease held but unattachable). Only clear when the
-          // tracker still holds the SAME credential this attach presented.
-          const presentedClaim = tracker.claim
-          void this.request('attach', {
-            terminalId,
-            claim: tracker.claim,
-            lastSeq: tracker.lastSeq
-          }).then((r) => {
-            if (r.success) {
-              tracker.disconnected = false
-              tracker.streamAttached = true
+        const authId = `terminal-auth-${++this.nextId}`
+        const timer = setTimeout(() => {
+          this.pending.delete(authId)
+          this.connecting = null
+          this.connectingReject = null
+          reject(new Error('Terminal authenticate timed out'))
+        }, REQUEST_TIMEOUT_MS)
+        this.pending.set(authId, {
+          timer,
+          resolve: (reply) => {
+            this.reconnectAttempt = 0
+            this.connecting = null
+            this.connectingReject = null
+            if (!reply.success) {
+              reject(new Error(reply.error || 'Terminal authenticate failed'))
               return
             }
-            if (r.code !== 'NETWORK_ERROR' && tracker.claim === presentedClaim) {
-              // Server rejection (single generic UNAUTHORIZED — the host never
-              // distinguishes terminal-gone from credential-gone): the lease is
-              // invalid/rotated/revoked or the terminal no longer exists. Drop
-              // the credential and stop re-presenting it — but ONLY when a
-              // newer claim has not superseded it in the meantime.
-              tracker.claim = undefined
-              tracker.disconnected = true
-              tracker.streamAttached = false
-            }
-            // NETWORK_ERROR keeps the claim for the next reconnect attempt.
+            this.reattachTrackedTerminals()
+            resolve()
+          }
+        })
+        socket.send(
+          JSON.stringify({
+            id: authId,
+            type: 'authenticate',
+            payload: { token: getRemoteAccessCredential() }
           })
-        }
-        resolve()
+        )
       }
       socket.onmessage = (event) => this.handleIncomingFrame(event.data)
       socket.onerror = () => {
@@ -220,6 +206,50 @@ export class WebTerminalClient {
       }
     })
     return this.connecting
+  }
+
+  private reattachTrackedTerminals(): void {
+    // CAP-3: re-attach ONLY terminals with a stored lease credential,
+    // using their lastSeq cursor. Terminals without a claim cannot be
+    // re-attached — mark them disconnected (no credential is ever
+    // presented id-only, and a rejected credential is never re-presented).
+    for (const [terminalId, tracker] of this.trackers) {
+      if (tracker.exited || tracker.refCount <= 0 || tracker.cleanupOnly) continue
+      if (!tracker.claim) {
+        tracker.disconnected = true
+        continue
+      }
+      // CAP-3: capture the credential this re-attach is presenting. A
+      // rotate (`severClaim`) that completes while this request is in
+      // flight installs a FRESH claim; the in-flight attach then resolves
+      // with the generic UNAUTHORIZED for the OLD claim. Clearing
+      // unconditionally would discard the fresh claim and strand the
+      // terminal (valid lease held but unattachable). Only clear when the
+      // tracker still holds the SAME credential this attach presented.
+      const presentedClaim = tracker.claim
+      void this.request('attach', {
+        terminalId,
+        claim: tracker.claim,
+        lastSeq: tracker.lastSeq
+      }).then((r) => {
+        if (r.success) {
+          tracker.disconnected = false
+          tracker.streamAttached = true
+          return
+        }
+        if (r.code !== 'NETWORK_ERROR' && tracker.claim === presentedClaim) {
+          // Server rejection (single generic UNAUTHORIZED — the host never
+          // distinguishes terminal-gone from credential-gone): the lease is
+          // invalid/rotated/revoked or the terminal no longer exists. Drop
+          // the credential and stop re-presenting it — but ONLY when a
+          // newer claim has not superseded it in the meantime.
+          tracker.claim = undefined
+          tracker.disconnected = true
+          tracker.streamAttached = false
+        }
+        // NETWORK_ERROR keeps the claim for the next reconnect attempt.
+      })
+    }
   }
 
   /**
@@ -487,6 +517,10 @@ export class WebTerminalClient {
     this.exitCallbacks.add(callback)
     return () => this.exitCallbacks.delete(callback)
   }
+  onSpawned(callback: (event: TerminalSpawnedEvent) => void): () => void {
+    this.spawnedCallbacks.add(callback)
+    return () => this.spawnedCallbacks.delete(callback)
+  }
   onCwd(callback: TerminalCwdChangedCallback): () => void {
     this.cwdCallbacks.add(callback)
     return () => this.cwdCallbacks.delete(callback)
@@ -653,6 +687,19 @@ export class WebTerminalClient {
         break
       case 'exit_code_changed':
         for (const callback of this.exitCodeCallbacks) callback(event.terminal_id, event.exit_code)
+        break
+      case 'spawned':
+        for (const callback of this.spawnedCallbacks) {
+          callback({
+            terminalId: event.terminal_id,
+            projectId: event.project_id,
+            conversationId: event.conversation_id,
+            cwd: event.cwd,
+            cols: event.cols,
+            rows: event.rows,
+            shell: event.shell
+          })
+        }
         break
     }
   }
@@ -838,6 +885,8 @@ export function createWebTerminalApi(): TerminalApi {
     },
     resume: (request) => client.resume(request),
     attach: (terminalId, claim, lastSeq) => client.attachWithCursor(terminalId, claim, lastSeq),
+    watch: (terminalId, lastSeq) => client.watch(terminalId, lastSeq),
+    onSpawned: (callback) => client.onSpawned(callback),
     async rotateClaim(terminalId: string, claim: string): Promise<IpcResult<RotatedClaim>> {
       const result = await client.request<RotatedClaim>('rotate_claim', { terminalId, claim })
       if (result.success) {

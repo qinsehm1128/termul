@@ -12,7 +12,10 @@ use serde::Deserialize;
 use tokio::task::spawn_blocking;
 use tracing::{error, info};
 
-use crate::cli_session::{list_cli_sessions, CliSessionListArgs, CliSessionListResult};
+use crate::cli_session::{
+    list_cli_sessions, resolve_cli_sessions, CliSessionListArgs, CliSessionListResult,
+    CliSessionResolveArgs, CliSessionResolveResult,
+};
 use crate::web::fs_api::IpcBody;
 use crate::web::project_registry::ProjectRegistry;
 use crate::web::ws::AppState;
@@ -91,4 +94,23 @@ pub async fn list_post(
     Json(args): Json<CliSessionListArgs>,
 ) -> impl IntoResponse {
     run_list(&state, args).await
+}
+
+pub async fn resolve_post(Json(args): Json<CliSessionResolveArgs>) -> impl IntoResponse {
+    info!(
+        target: "termul::web::cli_session_api",
+        "operation=resolve_cli_sessions files={}",
+        args.files.len()
+    );
+    let body = match spawn_blocking(move || resolve_cli_sessions(args)).await {
+        Ok(result) => IpcBody::ok(result),
+        Err(err) => {
+            error!(
+                target: "termul::web::cli_session_api",
+                "operation=resolve_cli_sessions_failed error=join"
+            );
+            IpcBody::<CliSessionResolveResult>::err(err.to_string(), "RESOLVE_FAILED")
+        }
+    };
+    (StatusCode::OK, Json(body))
 }

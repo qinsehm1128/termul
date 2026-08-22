@@ -521,6 +521,51 @@ describe('resolveSupportedAcpAgents', () => {
     expect(entries[0]?.manualInstall).toBeNull()
   })
 
+  it('builds a spawn config from a PATH-ready catalog overlay (cursor-agent)', async () => {
+    listCatalogMock.mockResolvedValueOnce({
+      success: true,
+      data: {
+        host: {
+          os: 'macos',
+          arch: 'aarch64',
+          runtimes: { npx: true, uvx: false, node: true, bun: false, python3: true }
+        },
+        agents: [
+          {
+            id: 'cursor',
+            name: 'Cursor',
+            version: '2026.08.11',
+            description: 'd',
+            source: 'bundled',
+            distribution: {
+              binary: {
+                'darwin-aarch64': {
+                  cmd: './dist-package/cursor-agent',
+                  archive: 'https://example.com/cursor.tar.gz',
+                  args: ['acp']
+                }
+              }
+            },
+            runtimeRequirements: [],
+            status: 'ready',
+            platformTargets: [],
+            installed: { command: 'cursor-agent', args: ['acp'] },
+            runningAgentId: 'runtime-cursor'
+          }
+        ]
+      }
+    })
+
+    const entries = await resolveSupportedAcpAgents([])
+    expect(entries[0]?.status).toBe('ready')
+    expect(entries[0]?.config).toMatchObject({
+      command: 'cursor-agent',
+      args: ['acp']
+    })
+    expect(entries[0]?.install).toBeNull()
+    expect(entries[0]?.manualInstall).toBeNull()
+  })
+
   it('degrades to an empty list when the catalog is unavailable', async () => {
     listCatalogMock.mockResolvedValueOnce({
       success: false,

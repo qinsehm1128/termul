@@ -15,8 +15,16 @@
  * sees a thrown exception from the network layer.
  */
 
-import type { CliSessionListArgs, CliSessionListResult } from '@shared/types/cli-session.types'
-import { parseCliSessionListResult } from '@shared/types/cli-session.types'
+import type {
+  CliSessionListArgs,
+  CliSessionListResult,
+  CliSessionResolveArgs,
+  CliSessionResolveResult
+} from '@shared/types/cli-session.types'
+import {
+  parseCliSessionListResult,
+  parseCliSessionResolveResult
+} from '@shared/types/cli-session.types'
 import type {
   BranchInfo,
   DetectedShells,
@@ -363,6 +371,13 @@ export const webServerCliSessions = {
     if (!res.success) throw new Error(res.error)
     const parsed = parseCliSessionListResult(res.data)
     if (!parsed) throw new Error('CLI session scan returned an invalid payload')
+    return parsed
+  },
+  async resolve(args: CliSessionResolveArgs): Promise<CliSessionResolveResult> {
+    const res = await postJson<unknown>('/cli-sessions/resolve', args)
+    if (!res.success) throw new Error(res.error)
+    const parsed = parseCliSessionResolveResult(res.data)
+    if (!parsed) throw new Error('CLI session resolve returned an invalid payload')
     return parsed
   }
 }

@@ -12,6 +12,8 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { useRuntimeTranslation } from '@/i18n/use-runtime-translation'
+import { cliSessionListTitle } from '@/lib/cli-session-title'
 
 interface CliSessionResumeDialogProps {
   session: DiscoveredCliSession | null
@@ -28,6 +30,7 @@ export function CliSessionResumeDialog({
   onOpenChange,
   onConfirm
 }: CliSessionResumeDialogProps): React.JSX.Element {
+  const t = useRuntimeTranslation('shell')
   const [onceExtraArgs, setOnceExtraArgs] = useState('')
 
   return (
@@ -40,42 +43,51 @@ export function CliSessionResumeDialog({
     >
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Resume CLI session</DialogTitle>
+          <DialogTitle>{t('cliSessions.resumeTitle', 'Resume CLI session')}</DialogTitle>
           <DialogDescription>
             {session
-              ? `${CLI_SESSION_AGENT_LABELS[session.agentId]} · ${session.title}`
-              : 'Resume a scanned CLI agent session in a new terminal.'}
+              ? `${CLI_SESSION_AGENT_LABELS[session.agentId]} · ${cliSessionListTitle(session, session.sessionId, t('cliSessions.untitled', 'Untitled session'))}`
+              : t(
+                  'cliSessions.resumeDescription',
+                  'Resume a scanned CLI agent session in a new terminal.'
+                )}
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-3">
           <p className="text-xs text-muted-foreground">
-            Default extra args are inserted before the resume flag. One-time args apply only to this
-            launch.
+            {t(
+              'cliSessions.resumeHint',
+              'Default extra args are inserted before the resume flag. One-time args apply only to this launch.'
+            )}
           </p>
           <div className="space-y-1.5">
-            <Label htmlFor="cli-resume-default-args">Default extra args</Label>
+            <Label htmlFor="cli-resume-default-args">
+              {t('cliSessions.defaultExtraArgs', 'Default extra args')}
+            </Label>
             <Input id="cli-resume-default-args" value={defaultExtraArgs} readOnly />
           </div>
           <div className="space-y-1.5">
-            <Label htmlFor="cli-resume-once-args">One-time extra args</Label>
+            <Label htmlFor="cli-resume-once-args">
+              {t('cliSessions.onceExtraArgs', 'One-time extra args')}
+            </Label>
             <Input
               id="cli-resume-once-args"
               value={onceExtraArgs}
               onChange={(event) => setOnceExtraArgs(event.target.value)}
-              placeholder="--yolo"
+              placeholder={t('cliSessions.onceExtraArgsPlaceholder', '--yolo')}
             />
           </div>
         </div>
         <DialogFooter>
           <Button type="button" variant="ghost" onClick={() => onOpenChange(false)} disabled={busy}>
-            Cancel
+            {t('cliSessions.cancel', 'Cancel')}
           </Button>
           <Button
             type="button"
-            disabled={!session || busy}
+            disabled={!session || busy || !session.resumable}
             onClick={() => onConfirm(onceExtraArgs)}
           >
-            Resume
+            {t('cliSessions.resume', 'Resume')}
           </Button>
         </DialogFooter>
       </DialogContent>

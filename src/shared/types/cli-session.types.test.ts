@@ -53,4 +53,47 @@ describe('cli-session.types', () => {
     expect(result?.issues).toHaveLength(1)
     expect(parseCliSessionListResult({ sessions: [], issues: [] })).toBeNull()
   })
+
+  it('allows an empty session id before lazy hydrate', () => {
+    const session = parseDiscoveredCliSession({
+      schemaVersion: 1,
+      id: 'claude-code:/tmp/a.jsonl',
+      agentId: 'claude-code',
+      sessionId: '',
+      cwd: '/repo',
+      title: '',
+      createdAt: null,
+      updatedAt: null,
+      messageCount: 0,
+      filePath: '/tmp/a.jsonl',
+      resumable: false
+    })
+    expect(session?.sessionId).toBe('')
+    expect(session?.resumable).toBe(false)
+  })
+
+  it('skips invalid sessions instead of failing the list', () => {
+    const result = parseCliSessionListResult({
+      sessions: [
+        { schemaVersion: 2 },
+        {
+          schemaVersion: 1,
+          id: 'claude-code:abc:/tmp/a.jsonl',
+          agentId: 'claude-code',
+          sessionId: 'abc',
+          cwd: '/repo',
+          title: 'abc',
+          createdAt: null,
+          updatedAt: null,
+          messageCount: 0,
+          filePath: '/tmp/a.jsonl',
+          resumable: true
+        }
+      ],
+      issues: [],
+      scannedAt: '2026-01-01T00:00:00.000Z'
+    })
+    expect(result?.sessions).toHaveLength(1)
+    expect(result?.sessions[0]?.sessionId).toBe('abc')
+  })
 })

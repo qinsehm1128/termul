@@ -31,6 +31,9 @@ struct ScannerView: View {
     }
 }
 
+/// Starts the camera only after the scanner is in a window. Starting in
+/// `makeUIViewController` races the keyboard InputUI scene and can abort
+/// the app with `No scene exists for identity: com.apple.InputUI.keyboard`.
 private struct DataScannerRepresentable: UIViewControllerRepresentable {
     var onScan: (String) -> Void
 
@@ -46,14 +49,23 @@ private struct DataScannerRepresentable: UIViewControllerRepresentable {
         )
         scanner.delegate = context.coordinator
         context.coordinator.controller = scanner
-        try? scanner.startScanning()
+        let coordinator = context.coordinator
+        DispatchQueue.main.async {
+            coordinator.startIfReady(scanner)
+        }
         return scanner
     }
 
-    func updateUIViewController(_: DataScannerViewController, context _: Context) {}
+    func updateUIViewController(_ scanner: DataScannerViewController, context: Context) {
+        context.coordinator.onScan = onScan
+        context.coordinator.startIfReady(scanner)
+    }
 
-    static func dismantleUIViewController(_ controller: DataScannerViewController, coordinator _: Coordinator) {
-        controller.stopScanning()
+    static func dismantleUIViewController(_ controller: DataScannerViewController, coordinator: Coordinator) {
+        coordinator.handled = true
+        if controller.isScanning {
+            controller.stopScanning()
+        }
     }
 
     func makeCoordinator() -> Coordinator {
@@ -63,9 +75,28 @@ private struct DataScannerRepresentable: UIViewControllerRepresentable {
     final class Coordinator: NSObject, DataScannerViewControllerDelegate {
         var onScan: (String) -> Void
         weak var controller: DataScannerViewController?
+        var handled = false
 
         init(onScan: @escaping (String) -> Void) {
             self.onScan = onScan
+        }
+
+        func startIfReady(_ scanner: DataScannerViewController) {
+            guard scanner.view.window != nil, !scanner.isScanning, !handled else { return }
+            do {
+                try scanner.startScanning()
+            } catch {
+                HostLog.session.error("QR scanner failed to start")
+            }
+        }
+
+        private func accept(_ payload: String) {
+            guard !handled, !payload.isEmpty else { return }
+            handled = true
+            if controller?.isScanning == true {
+                controller?.stopScanning()
+            }
+            onScan(payload)
         }
 
         func dataScanner(
@@ -73,8 +104,7 @@ private struct DataScannerRepresentable: UIViewControllerRepresentable {
             didTapOn item: RecognizedItem
         ) {
             if case let .barcode(barcode) = item, let payload = barcode.payloadStringValue {
-                controller?.stopScanning()
-                onScan(payload)
+                accept(payload)
             }
         }
 
@@ -85,8 +115,7 @@ private struct DataScannerRepresentable: UIViewControllerRepresentable {
         ) {
             guard let item = addedItems.first else { return }
             if case let .barcode(barcode) = item, let payload = barcode.payloadStringValue {
-                controller?.stopScanning()
-                onScan(payload)
+                accept(payload)
             }
         }
     }

@@ -4,8 +4,8 @@
  * Order is always:
  *   `[...baseArgs, ...defaultExtra, ...onceExtra, ...resumeToken, handle]`
  *
- * Extra args never follow the session id. The host does not execute this
- * command — the renderer passes the argv to `terminalApi.spawn`.
+ * Extra args never follow the session id. Resume opens a login shell at the
+ * session cwd, then types this command into that shell.
  */
 import type { CliSessionAgentId, DiscoveredCliSession } from '@shared/types/cli-session.types'
 import { hasUnsafeCliSessionIdChars, normalizeCliSessionId } from '@shared/types/cli-session.types'
@@ -31,10 +31,21 @@ export function normalizeResumeFilePath(value: unknown): string | null {
 }
 
 export function resumeHandleForSession(session: DiscoveredCliSession): string | null {
+  const sessionId = normalizeCliSessionId(session.sessionId)
+  if (sessionId) return sessionId
   if (session.agentId === 'pi') {
     return normalizeResumeFilePath(session.resumeFilePath ?? session.filePath)
   }
-  return normalizeCliSessionId(session.sessionId)
+  return null
+}
+
+export function quoteShellArg(value: string): string {
+  if (/^[A-Za-z0-9_./:=+-]+$/.test(value)) return value
+  return `'${value.replace(/'/g, `'\\''`)}'`
+}
+
+export function formatCliResumeCommand(program: string, args: string[]): string {
+  return [program, ...args.map(quoteShellArg)].join(' ')
 }
 
 export function buildCliResumeArgv(

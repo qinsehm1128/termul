@@ -10,10 +10,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::{
-    extract::{ws::WebSocketUpgrade, State},
-    http::{HeaderMap, StatusCode},
+    extract::{ws::WebSocketUpgrade, ConnectInfo, Request, State},
+    http::{header, HeaderMap, StatusCode},
     middleware,
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Extension, Router,
 };
@@ -24,8 +24,7 @@ use crate::acp::{
 use crate::pty::PtyManager;
 use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub};
 use crate::web::auth::{
-    capability_middleware, IngressProvenance, RemoteAccessAuthority, RemotePrincipal,
-    RemoteRouteClass,
+    capability_middleware, IngressProvenance, RemoteAccessAuthority, RemoteRouteClass,
 };
 use crate::web::catalog_api;
 use crate::web::cli_session_api;
@@ -144,10 +143,12 @@ fn api_routes(provenance: IngressProvenance) -> Router<AppState> {
         RemoteRouteClass::Skill,
     ))
     .merge(classified_routes(
-        Router::<AppState>::new().route(
-            "/cli-sessions",
-            get(cli_session_api::list_get).post(cli_session_api::list_post),
-        ),
+        Router::<AppState>::new()
+            .route(
+                "/cli-sessions",
+                get(cli_session_api::list_get).post(cli_session_api::list_post),
+            )
+            .route("/cli-sessions/resolve", post(cli_session_api::resolve_post)),
         RemoteRouteClass::CliSession,
     ))
     .merge(classified_routes(
@@ -175,6 +176,10 @@ fn api_routes(provenance: IngressProvenance) -> Router<AppState> {
             .route(
                 "/conversations/{conversationId}",
                 get(conversation_api::get),
+            )
+            .route(
+                "/conversations/{conversationId}/binding",
+                get(conversation_api::current_binding),
             )
             .route(
                 "/conversations/{conversationId}/open",
@@ -449,25 +454,46 @@ async fn terminal_ws_upgrade_registered(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
     Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
-    Extension(principal): Extension<RemotePrincipal>,
     Extension(_provenance): Extension<IngressProvenance>,
+    peer: axum::extract::ConnectInfo<std::net::SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let registry = UpgradedConnectionRegistry::global();
     let _ticket = registry.register(UpgradedConnectionKind::Terminal, None);
-    terminal_ws_upgrade(
-        ws,
-        State(state),
-        Extension(authority),
-        Extension(principal),
-        headers,
-    )
-    .await
+    terminal_ws_upgrade(ws, State(state), Extension(authority), peer, headers).await
 }
 
-/// Liveness probe for the ACP web server.
-async fn health_check() -> impl IntoResponse {
-    (StatusCode::OK, "OK")
+/// Liveness probe. Loopback (and tests without ConnectInfo) stay open so the
+/// desktop can check itself. Non-loopback callers must present the pairing bearer.
+async fn health_check(
+    Extension(authority): Extension<Arc<RemoteAccessAuthority>>,
+    request: Request,
+) -> Response {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0.ip());
+    if health_probe_is_local(peer) {
+        return (StatusCode::OK, "OK").into_response();
+    }
+    let token = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or("");
+    match authority.verify_bearer_for_peer(token, peer.unwrap_or(std::net::IpAddr::from([0, 0, 0, 0])))
+    {
+        Ok(_) => (StatusCode::OK, "OK").into_response(),
+        Err(error) => crate::web::auth::auth_error_response(error),
+    }
+}
+
+fn health_probe_is_local(peer: Option<std::net::IpAddr>) -> bool {
+    match peer {
+        None => true,
+        Some(ip) => ip.is_loopback() || ip.is_unspecified(),
+    }
 }
 
 #[cfg(test)]
@@ -669,6 +695,46 @@ mod tests {
             .await
             .expect("read body");
         assert_eq!(&body[..], b"OK");
+    }
+
+    #[tokio::test]
+    async fn health_requires_bearer_from_lan_peer() {
+        const TOKEN: &str = "health-lan-token";
+        let authority = Arc::new(RemoteAccessAuthority::for_tests(TOKEN));
+        let app = api_routes(IngressProvenance::PublicTunnel)
+            .with_state(route_test_state(std::env::temp_dir().as_path()))
+            .layer(Extension(IngressProvenance::PublicTunnel))
+            .layer(Extension(authority));
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [10, 0, 0, 5],
+                        1,
+                    ))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        let allowed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .header(header::AUTHORIZATION, format!("Bearer {TOKEN}"))
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [10, 0, 0, 5],
+                        1,
+                    ))))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::OK);
     }
 
     #[tokio::test]

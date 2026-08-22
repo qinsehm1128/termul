@@ -11,7 +11,7 @@ import { Switch } from '@/components/ui/switch'
 import { tunnelConfigApi } from '@/lib/api'
 import { isTauriContext } from '@/lib/tauri-runtime'
 
-const PROVIDERS: TunnelProviderKind[] = ['cloudflareQuick', 'cloudflareNamed', 'frp']
+const PROVIDERS: TunnelProviderKind[] = ['cloudflareQuick', 'cloudflareNamed', 'frp', 'sshReverse']
 
 const EMPTY_VIEW: TunnelConfigView = {
   provider: 'cloudflareQuick',
@@ -23,7 +23,14 @@ const EMPTY_VIEW: TunnelConfigView = {
   frpCustomDomain: null,
   frpRemotePort: null,
   frpPublicHttps: true,
-  frpTokenSet: false
+  frpTokenSet: false,
+  sshHost: null,
+  sshPort: null,
+  sshUser: null,
+  sshRemotePort: null,
+  sshPublicHostname: null,
+  sshPublicHttps: true,
+  sshPrivateKeySet: false
 }
 
 export function RemoteAccessSettings(): React.JSX.Element {
@@ -38,6 +45,12 @@ export function RemoteAccessSettings(): React.JSX.Element {
   const [frpDomain, setFrpDomain] = useState('')
   const [frpRemotePort, setFrpRemotePort] = useState('')
   const [frpToken, setFrpToken] = useState('')
+  const [sshHost, setSshHost] = useState('')
+  const [sshPort, setSshPort] = useState('')
+  const [sshUser, setSshUser] = useState('')
+  const [sshRemotePort, setSshRemotePort] = useState('')
+  const [sshPublicHostname, setSshPublicHostname] = useState('')
+  const [sshPrivateKey, setSshPrivateKey] = useState('')
   const [busy, setBusy] = useState(false)
   const [loaded, setLoaded] = useState(false)
 
@@ -49,8 +62,14 @@ export function RemoteAccessSettings(): React.JSX.Element {
     setFrpPort(next.frpServerPort ? String(next.frpServerPort) : '')
     setFrpDomain(next.frpCustomDomain ?? '')
     setFrpRemotePort(next.frpRemotePort ? String(next.frpRemotePort) : '')
+    setSshHost(next.sshHost ?? '')
+    setSshPort(next.sshPort ? String(next.sshPort) : '')
+    setSshUser(next.sshUser ?? '')
+    setSshRemotePort(next.sshRemotePort ? String(next.sshRemotePort) : '')
+    setSshPublicHostname(next.sshPublicHostname ?? '')
     setNamedToken('')
     setFrpToken('')
+    setSshPrivateKey('')
   }, [])
 
   useEffect(() => {
@@ -95,7 +114,13 @@ export function RemoteAccessSettings(): React.JSX.Element {
       frpServerPort: frpPort ? Number(frpPort) : null,
       frpCustomDomain: frpDomain,
       frpRemotePort: frpRemotePort ? Number(frpRemotePort) : null,
-      frpPublicHttps: view.frpPublicHttps
+      frpPublicHttps: view.frpPublicHttps,
+      sshHost,
+      sshPort: sshPort ? Number(sshPort) : null,
+      sshUser,
+      sshRemotePort: sshRemotePort ? Number(sshRemotePort) : null,
+      sshPublicHostname,
+      sshPublicHttps: view.sshPublicHttps
     })
   }
 
@@ -110,7 +135,14 @@ export function RemoteAccessSettings(): React.JSX.Element {
       frpCustomDomain: frpDomain,
       frpRemotePort: frpRemotePort ? Number(frpRemotePort) : null,
       frpPublicHttps: view.frpPublicHttps,
-      frpToken: frpToken.trim() ? frpToken.trim() : undefined
+      frpToken: frpToken.trim() ? frpToken.trim() : undefined,
+      sshHost,
+      sshPort: sshPort ? Number(sshPort) : null,
+      sshUser,
+      sshRemotePort: sshRemotePort ? Number(sshRemotePort) : null,
+      sshPublicHostname,
+      sshPublicHttps: view.sshPublicHttps,
+      sshPrivateKey: sshPrivateKey.trim() ? sshPrivateKey.trim() : undefined
     })
   }
 
@@ -252,6 +284,96 @@ export function RemoteAccessSettings(): React.JSX.Element {
                 })
               }}
               aria-label={t('remoteAccess.frpPublicHttps')}
+            />
+          </div>
+        </div>
+      )}
+
+      {view.provider === 'sshReverse' && (
+        <div className="space-y-3">
+          <Field
+            id="ssh-host"
+            label={t('remoteAccess.sshHost')}
+            hint={t('remoteAccess.sshHostHint')}
+            value={sshHost}
+            onChange={setSshHost}
+            placeholder="vps.example.com"
+          />
+          <Field
+            id="ssh-port"
+            label={t('remoteAccess.sshPort')}
+            hint={t('remoteAccess.sshPortHint')}
+            value={sshPort}
+            onChange={setSshPort}
+            placeholder="22"
+            inputMode="numeric"
+          />
+          <Field
+            id="ssh-user"
+            label={t('remoteAccess.sshUser')}
+            hint={t('remoteAccess.sshUserHint')}
+            value={sshUser}
+            onChange={setSshUser}
+            placeholder="ubuntu"
+          />
+          <Field
+            id="ssh-remote-port"
+            label={t('remoteAccess.sshRemotePort')}
+            hint={t('remoteAccess.sshRemotePortHint')}
+            value={sshRemotePort}
+            onChange={setSshRemotePort}
+            placeholder="18787"
+            inputMode="numeric"
+          />
+          <Field
+            id="ssh-public-hostname"
+            label={t('remoteAccess.sshPublicHostname')}
+            hint={t('remoteAccess.sshPublicHostnameHint')}
+            value={sshPublicHostname}
+            onChange={setSshPublicHostname}
+            placeholder="termul.example.com"
+          />
+          <Field
+            id="ssh-private-key"
+            label={t('remoteAccess.sshPrivateKey')}
+            hint={
+              view.sshPrivateKeySet
+                ? t('remoteAccess.tokenSet')
+                : t('remoteAccess.sshPrivateKeyHint')
+            }
+            value={sshPrivateKey}
+            onChange={setSshPrivateKey}
+            type="password"
+            autoComplete="off"
+          />
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <div className="text-sm text-foreground">{t('remoteAccess.sshPublicHttps')}</div>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                {t('remoteAccess.sshPublicHttpsHint')}
+              </p>
+            </div>
+            <Switch
+              checked={view.sshPublicHttps}
+              disabled={busy}
+              onCheckedChange={(checked) => {
+                setView((current) => ({ ...current, sshPublicHttps: checked }))
+                void persist({
+                  provider: 'sshReverse',
+                  cloudflareNamedHostname: hostname,
+                  frpServerAddr: frpAddr,
+                  frpServerPort: frpPort ? Number(frpPort) : null,
+                  frpCustomDomain: frpDomain,
+                  frpRemotePort: frpRemotePort ? Number(frpRemotePort) : null,
+                  sshHost,
+                  sshPort: sshPort ? Number(sshPort) : null,
+                  sshUser,
+                  sshRemotePort: sshRemotePort ? Number(sshRemotePort) : null,
+                  sshPublicHostname,
+                  sshPublicHttps: checked
+                })
+              }}
+              aria-label={t('remoteAccess.sshPublicHttps')}
             />
           </div>
         </div>

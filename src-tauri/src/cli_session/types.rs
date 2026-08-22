@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const SCHEMA_VERSION: u32 = 1;
-pub const DEFAULT_LIMIT_PER_AGENT: usize = 200;
+pub const DEFAULT_LIMIT_PER_AGENT: usize = 80;
 pub const WALK_LIMIT_PER_AGENT: usize = 1000;
 pub const SESSION_ID_MAX_LEN: usize = 512;
 
@@ -100,17 +100,43 @@ pub fn normalize_session_id(value: &str) -> Option<String> {
     if trimmed.is_empty()
         || trimmed.len() > SESSION_ID_MAX_LEN
         || trimmed.starts_with('-')
-        || trimmed.chars().any(|ch| ch <= '\u{001f}' || ch == '\u{007f}')
+        || trimmed
+            .chars()
+            .any(|ch| ch <= '\u{001f}' || ch == '\u{007f}')
     {
         return None;
     }
     Some(trimmed.to_string())
 }
 
-pub fn session_list_id(agent: CliSessionAgentId, session_id: &str, file_path: &str) -> String {
-    format!("{}:{session_id}:{file_path}", agent.as_str())
+pub const RESOLVE_BATCH_MAX: usize = 16;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliSessionResolveFile {
+    pub agent_id: CliSessionAgentId,
+    pub file_path: String,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CliSessionResolveArgs {
+    #[serde(default)]
+    pub files: Vec<CliSessionResolveFile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CliSessionResolveResult {
+    pub sessions: Vec<DiscoveredCliSession>,
+    pub issues: Vec<CliSessionScanIssue>,
+}
+
+pub fn session_list_id(agent: CliSessionAgentId, file_path: &str) -> String {
+    format!("{}:{file_path}", agent.as_str())
+}
+
+#[cfg(test)]
 pub fn first_cwd_wins(current: &mut Option<String>, next: Option<String>) {
     if current.is_some() {
         return;

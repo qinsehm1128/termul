@@ -1,7 +1,8 @@
 import type { ConversationRecordV2 } from '@shared/types/conversation.types'
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, within } from '@testing-library/react'
 import { MemoryRouter, useLocation } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { useAcpStore } from '@/stores/acp-store'
 import { useConversationStore } from '@/stores/conversation-store'
 import { useProjectStore } from '@/stores/project-store'
 import { ChatHistoryTab } from './ChatHistoryTab'
@@ -43,6 +44,12 @@ function LocationProbe(): React.JSX.Element {
 }
 
 beforeEach(() => {
+  useAcpStore.setState({
+    sessions: {},
+    sessionIndex: [],
+    pendingPermissions: {},
+    pendingQuestions: {}
+  })
   useConversationStore.getState().reset()
   useProjectStore.setState({ projects: [], activeProjectId: '' })
 })
@@ -65,8 +72,11 @@ describe('ChatHistoryTab global Conversation navigation', () => {
 
     expect(screen.getByText('Chat 0')).toBeInTheDocument()
     expect(screen.getByText('Chat 1')).toBeInTheDocument()
-    expect(screen.getByText('No project')).toBeInTheDocument()
-    expect(screen.getByText('Demo')).toBeInTheDocument()
+
+    const attached = screen.getByText('Chat 1').closest('[data-conversation-id]')
+    expect(attached).toBeTruthy()
+    fireEvent.click(within(attached as HTMLElement).getByLabelText('Show conversation details'))
+    expect(within(attached as HTMLElement).getByText('Demo')).toBeInTheDocument()
   })
 
   it('shows a stable empty state with zero Conversations', () => {

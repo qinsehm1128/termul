@@ -35,6 +35,7 @@ vi.mock('@/lib/conversation-api', () => ({
   conversationApi: {
     listConversations: vi.fn(),
     openConversation: vi.fn(),
+    getCurrentBinding: vi.fn(),
     attachProject: vi.fn(),
     detachProject: vi.fn(),
     updateExecutionTarget: vi.fn()
@@ -190,6 +191,10 @@ beforeEach(() => {
   openHistorySessionMock.mockResolvedValue(undefined)
   loadSessionIndexMock.mockResolvedValue(undefined)
   startChatMock.mockResolvedValue('opaque/live')
+  vi.mocked(conversationApi.getCurrentBinding).mockResolvedValue({
+    success: true,
+    data: { conversationId: projectlessId, binding: null }
+  })
   useAcpStore.setState({
     sessions: {},
     activeSessionId: null,
@@ -312,6 +317,40 @@ describe('ConversationStore canonical authority', () => {
     expect(loadSessionIndexMock).toHaveBeenCalled()
     expect(openHistorySessionMock).toHaveBeenCalledWith('opaque/history')
     expect(useAcpStore.getState().activeSessionId).toBe('opaque/history')
+    expect(addAgentChatTabMock).toHaveBeenCalledWith(projectlessId, undefined, false)
+  })
+
+  it('reopens history from the host binding when the local index is empty', async () => {
+    vi.mocked(conversationApi.openConversation).mockResolvedValue({
+      success: true,
+      data: {
+        conversation: projectless,
+        workspace: { status: 'missing', conversationId: projectlessId }
+      }
+    })
+    vi.mocked(conversationApi.getCurrentBinding).mockResolvedValue({
+      success: true,
+      data: {
+        conversationId: projectlessId,
+        binding: {
+          schemaVersion: 1,
+          bindingId: '33333333-3333-4333-8333-333333333333',
+          agentSessionId: 'opaque/host',
+          runtimeAgentId: 'runtime-cursor',
+          stableAgentNamespace: 'config:acp-registry:cursor',
+          executionCwd: projectless.workspaceCwd,
+          boundAtUtc: '2026-08-15T10:30:00.000Z',
+          state: 'active'
+        }
+      }
+    })
+
+    const epoch = useConversationStore.getState().beginConversationActivation(projectlessId)
+    await expect(
+      useConversationStore.getState().activateConversation(projectlessId, epoch)
+    ).resolves.toBe(true)
+    expect(openHistorySessionMock).toHaveBeenCalledWith('opaque/host')
+    expect(useAcpStore.getState().activeSessionId).toBe('opaque/host')
     expect(addAgentChatTabMock).toHaveBeenCalledWith(projectlessId, undefined, false)
   })
 

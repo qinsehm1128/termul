@@ -180,8 +180,8 @@ const GIT_COMMAND_TIMEOUT_MS: u64 = 2000;
 #[cfg(target_os = "windows")]
 const WINDOWS_POLL_MULTIPLIER: u32 = 2;
 
-/// Cooldown duration when status hasn't changed (Windows only)
-#[cfg(target_os = "windows")]
+/// Extra wait after an unchanged snapshot so N terminals in one repo do not
+/// each spawn `git status` on every tick.
 const STATUS_UNCHANGED_COOLDOWN_MS: u64 = POLL_INTERVAL_MS * 3;
 
 /// Git status information
@@ -248,8 +248,7 @@ impl Default for GitStatus {
     }
 }
 
-/// Windows-only state for tracking when a CWD was last polled
-#[cfg(target_os = "windows")]
+/// Per-directory poll clock so many terminals in the same repo share one scan.
 #[derive(Debug, Clone)]
 struct CwdPollState {
     last_checked: Instant,
@@ -258,7 +257,6 @@ struct CwdPollState {
     last_snapshot_unchanged: bool,
 }
 
-#[cfg(target_os = "windows")]
 impl CwdPollState {
     fn new() -> Self {
         Self {
@@ -270,7 +268,6 @@ impl CwdPollState {
     }
 }
 
-#[cfg(target_os = "windows")]
 impl Default for CwdPollState {
     fn default() -> Self {
         Self::new()
@@ -281,9 +278,8 @@ type BranchEmit = (String, Option<String>);
 type StatusEmit = (String, Option<GitStatus>);
 type GitResultEmits = (Vec<BranchEmit>, Vec<StatusEmit>);
 
-#[cfg(target_os = "windows")]
 #[derive(Debug, Clone)]
-struct WindowsPollTarget {
+struct CwdPollTarget {
     cwd: String,
     terminal_ids: Vec<String>,
 }
@@ -334,7 +330,8 @@ impl GitState {
 ///
 /// Polls git status periodically and emits events when branch or status changes.
 /// Skips polling when the window is not visible to save resources.
-/// On Windows, uses CWD deduplication and throttling to reduce git.exe spawns.
+/// Polls each unique working directory once, then fans the snapshot out to
+/// every terminal that shares it. Unchanged repos use a longer cooldown.
 pub struct GitTracker {
     terminal_states: Arc<RwLock<HashMap<String, GitState>>>,
     app_handle: Option<AppHandle>,
@@ -343,7 +340,6 @@ pub struct GitTracker {
     poll_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     is_polling_started: Arc<AtomicBool>,
     is_visible: Arc<AtomicBool>,
-    #[cfg(target_os = "windows")]
     cwd_poll_states: Arc<RwLock<HashMap<String, CwdPollState>>>,
 }
 
@@ -358,7 +354,6 @@ impl GitTracker {
             poll_handle: Arc::new(RwLock::new(None)),
             is_polling_started: Arc::new(AtomicBool::new(false)),
             is_visible: Arc::new(AtomicBool::new(true)),
-            #[cfg(target_os = "windows")]
             cwd_poll_states: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -373,36 +368,48 @@ impl GitTracker {
 
     /// Initialize tracking for a terminal with the given working directory
     pub fn initialize_terminal(&self, terminal_id: &str, cwd: &str) {
+        let peer = self
+            .terminal_states
+            .read()
+            .values()
+            .find(|state| state.last_known_cwd == cwd)
+            .cloned();
         let state = GitState {
             _terminal_id: terminal_id.to_string(),
-            last_known_branch: None,
+            last_known_branch: peer.as_ref().and_then(|s| s.last_known_branch.clone()),
             last_known_cwd: cwd.to_string(),
-            last_known_status: None,
+            last_known_status: peer.as_ref().and_then(|s| s.last_known_status.clone()),
         };
 
         self.terminal_states
             .write()
             .insert(terminal_id.to_string(), state);
 
-        let events = self.events.clone();
-        let states = self.terminal_states.clone();
-        let terminal_id_owned = terminal_id.to_string();
-        let cwd_owned = cwd.to_string();
-
-        tokio::spawn(async move {
-            let (status, branch) = Self::poll_git_snapshot(cwd_owned.clone()).await;
-            let terminal_ids = vec![terminal_id_owned.clone()];
-            let (branch_emits, status_emits) =
-                Self::apply_git_results(&states, &terminal_ids, branch, status);
-
-            for (_, branch) in branch_emits {
-                Self::emit_branch_changed_static(&events, &terminal_id_owned, &branch);
+        if let Some(peer) = peer {
+            if peer.last_known_branch.is_some() || peer.last_known_status.is_some() {
+                Self::emit_branch_changed_static(
+                    &self.events,
+                    terminal_id,
+                    &peer.last_known_branch,
+                );
+                Self::emit_status_changed_static(
+                    &self.events,
+                    terminal_id,
+                    &peer.last_known_status,
+                );
             }
-
-            for (_, status) in status_emits {
-                Self::emit_status_changed_static(&events, &terminal_id_owned, &status);
-            }
-        });
+        } else {
+            let events = self.events.clone();
+            let states = self.terminal_states.clone();
+            let cwd_owned = cwd.to_string();
+            tokio::spawn(async move {
+                let (status, branch) = Self::poll_git_snapshot(cwd_owned.clone()).await;
+                let terminal_ids = Self::terminal_ids_for_cwd(&states, &cwd_owned);
+                let (branch_emits, status_emits) =
+                    Self::apply_git_results(&states, &terminal_ids, branch, status);
+                Self::emit_git_updates(&events, branch_emits, status_emits);
+            });
+        }
 
         // Start polling if not already running
         if self
@@ -414,42 +421,31 @@ impl GitTracker {
         }
     }
 
+    /// Whether this terminal is currently included in git polling.
+    pub fn is_tracking(&self, terminal_id: &str) -> bool {
+        self.terminal_states.read().contains_key(terminal_id)
+    }
+
     /// Remove a terminal from tracking
     pub fn remove_terminal(&self, terminal_id: &str) {
-        // On Windows, clean up CWD poll state if no other terminals use this CWD
-        #[cfg(target_os = "windows")]
-        {
-            let cwd_to_remove = self
+        let cwd_to_remove = self
+            .terminal_states
+            .read()
+            .get(terminal_id)
+            .map(|s| s.last_known_cwd.clone());
+
+        self.terminal_states.write().remove(terminal_id);
+
+        if let Some(cwd) = cwd_to_remove {
+            let cwd_still_in_use = self
                 .terminal_states
                 .read()
-                .get(terminal_id)
-                .map(|s| s.last_known_cwd.clone());
-
-            if let Some(cwd) = cwd_to_remove {
-                self.terminal_states.write().remove(terminal_id);
-
-                // Check if any other terminal uses this CWD
-                let cwd_still_in_use = self
-                    .terminal_states
-                    .read()
-                    .values()
-                    .any(|s| s.last_known_cwd == cwd);
-
-                if !cwd_still_in_use {
-                    self.cwd_poll_states.write().remove(&cwd);
-                }
-            } else {
-                self.terminal_states.write().remove(terminal_id);
+                .values()
+                .any(|s| s.last_known_cwd == cwd);
+            if !cwd_still_in_use {
+                self.cwd_poll_states.write().remove(&cwd);
             }
         }
-
-        #[cfg(not(target_os = "windows"))]
-        {
-            self.terminal_states.write().remove(terminal_id);
-        }
-
-        // If no terminals left, we could stop polling but keep it running
-        // for simplicity - it will just skip when empty
     }
 
     /// Update a terminal's tracked CWD from the transport-neutral CWD tracker.
@@ -494,81 +490,29 @@ impl GitTracker {
             Self::sync_terminal_cwds_from_tracker(app_handle, &self.terminal_states);
         }
 
-        #[cfg(target_os = "windows")]
         Self::prune_unused_cwd_poll_states(&self.terminal_states, &self.cwd_poll_states);
 
-        #[cfg(target_os = "windows")]
-        {
-            let cwd_states: HashMap<String, Vec<String>> = {
-                let states_read = self.terminal_states.read();
-                let mut map: HashMap<String, Vec<String>> = HashMap::new();
-                for (id, state) in states_read.iter() {
-                    map.entry(state.last_known_cwd.clone())
-                        .or_default()
-                        .push(id.clone());
-                }
-                map
-            };
+        let now = Instant::now();
+        for (cwd, terminal_ids) in Self::group_terminals_by_cwd(&self.terminal_states) {
+            let new_status = Self::check_status_internal(&cwd);
+            let new_branch = Self::check_branch_internal(&cwd);
 
-            let now = Instant::now();
-            for (cwd, terminal_ids) in cwd_states {
-                let new_status = Self::check_status_internal(&cwd);
-                let new_branch = Self::check_branch_internal(&cwd);
-
-                {
-                    let mut cwd_poll_states = self.cwd_poll_states.write();
-                    let poll_state = cwd_poll_states.entry(cwd).or_default();
-                    poll_state.last_checked = now;
-                    poll_state.last_branch = new_branch.clone();
-                    poll_state.last_status = new_status.clone();
-                    poll_state.last_snapshot_unchanged = false;
-                }
-
-                let (branch_emits, status_emits) = Self::apply_git_results(
-                    &self.terminal_states,
-                    &terminal_ids,
-                    new_branch,
-                    new_status,
-                );
-
-                for (terminal_id, branch) in branch_emits {
-                    Self::emit_branch_changed_static(&self.events, &terminal_id, &branch);
-                }
-
-                for (terminal_id, status) in status_emits {
-                    Self::emit_status_changed_static(&self.events, &terminal_id, &status);
-                }
+            {
+                let mut cwd_poll_states = self.cwd_poll_states.write();
+                let poll_state = cwd_poll_states.entry(cwd).or_default();
+                poll_state.last_checked = now;
+                poll_state.last_branch = new_branch.clone();
+                poll_state.last_status = new_status.clone();
+                poll_state.last_snapshot_unchanged = false;
             }
-        }
 
-        #[cfg(not(target_os = "windows"))]
-        {
-            let terminals: Vec<(String, String)> = self
-                .terminal_states
-                .read()
-                .iter()
-                .map(|(id, state)| (id.clone(), state.last_known_cwd.clone()))
-                .collect();
-
-            for (terminal_id, cwd) in terminals {
-                let new_status = Self::check_status_internal(&cwd);
-                let new_branch = Self::check_branch_internal(&cwd);
-                let terminal_ids = vec![terminal_id.clone()];
-                let (branch_emits, status_emits) = Self::apply_git_results(
-                    &self.terminal_states,
-                    &terminal_ids,
-                    new_branch,
-                    new_status,
-                );
-
-                for (_, branch) in branch_emits {
-                    Self::emit_branch_changed_static(&self.events, &terminal_id, &branch);
-                }
-
-                for (_, status) in status_emits {
-                    Self::emit_status_changed_static(&self.events, &terminal_id, &status);
-                }
-            }
+            let (branch_emits, status_emits) = Self::apply_git_results(
+                &self.terminal_states,
+                &terminal_ids,
+                new_branch,
+                new_status,
+            );
+            Self::emit_git_updates(&self.events, branch_emits, status_emits);
         }
     }
 
@@ -630,7 +574,6 @@ impl GitTracker {
         }
     }
 
-    #[cfg(target_os = "windows")]
     fn prune_unused_cwd_poll_states(
         states: &Arc<RwLock<HashMap<String, GitState>>>,
         cwd_poll_states: &Arc<RwLock<HashMap<String, CwdPollState>>>,
@@ -671,6 +614,76 @@ impl GitTracker {
         }
 
         (branch_emits, status_emits)
+    }
+
+    fn emit_git_updates(
+        events: &TerminalEventHub,
+        branch_emits: Vec<BranchEmit>,
+        status_emits: Vec<StatusEmit>,
+    ) {
+        for (terminal_id, branch) in branch_emits {
+            Self::emit_branch_changed_static(events, &terminal_id, &branch);
+        }
+        for (terminal_id, status) in status_emits {
+            Self::emit_status_changed_static(events, &terminal_id, &status);
+        }
+    }
+
+    fn group_terminals_by_cwd(
+        states: &Arc<RwLock<HashMap<String, GitState>>>,
+    ) -> HashMap<String, Vec<String>> {
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+        for (id, state) in states.read().iter() {
+            map.entry(state.last_known_cwd.clone())
+                .or_default()
+                .push(id.clone());
+        }
+        map
+    }
+
+    fn terminal_ids_for_cwd(
+        states: &Arc<RwLock<HashMap<String, GitState>>>,
+        cwd: &str,
+    ) -> Vec<String> {
+        states
+            .read()
+            .iter()
+            .filter(|(_, state)| state.last_known_cwd == cwd)
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    fn cwd_poll_targets(
+        cwd_states: HashMap<String, Vec<String>>,
+        cwd_poll_states: &Arc<RwLock<HashMap<String, CwdPollState>>>,
+        now: Instant,
+    ) -> Vec<CwdPollTarget> {
+        let mut cwd_poll_states_write = cwd_poll_states.write();
+        let mut targets = Vec::new();
+
+        for (cwd, terminal_ids) in cwd_states {
+            let poll_state = cwd_poll_states_write.entry(cwd.clone()).or_default();
+            let cooldown_ms = if poll_state.last_snapshot_unchanged {
+                STATUS_UNCHANGED_COOLDOWN_MS
+            } else {
+                POLL_INTERVAL_MS
+            };
+            if now.duration_since(poll_state.last_checked) < Duration::from_millis(cooldown_ms) {
+                log::trace!(
+                    "[GitTracker] cwd still in cooldown ({} terminals)",
+                    terminal_ids.len()
+                );
+                continue;
+            }
+            log::trace!(
+                "[GitTracker] polling unique cwd ({} terminals)",
+                terminal_ids.len()
+            );
+            poll_state.last_checked = now;
+            targets.push(CwdPollTarget { cwd, terminal_ids });
+        }
+
+        targets
     }
 
     async fn poll_git_snapshot(cwd: String) -> (Option<GitStatus>, Option<String>) {
@@ -774,7 +787,6 @@ impl GitTracker {
         // Reset the flag so polling can be restarted
         self.is_polling_started.store(false, Ordering::SeqCst);
         self.terminal_states.write().clear();
-        #[cfg(target_os = "windows")]
         self.cwd_poll_states.write().clear();
     }
 }
@@ -1613,16 +1625,13 @@ fn is_git_ignored(cwd: &str, path: &str) -> Result<bool, String> {
 }
 
 impl GitTracker {
-    /// Start the polling task
+    /// Start the polling task.
     ///
-    /// Windows optimizations:
-    /// - Uses CWD deduplication: polls once per unique CWD, fans out results
-    /// - Implements cooldown when status hasn't changed
-    /// - Uses RAII guard to ensure is_polling flag is always reset
+    /// Polls once per unique CWD, fans the snapshot out to every terminal in
+    /// that directory, and backs off when the snapshot is unchanged.
     fn start_polling(&self) {
         let states = self.terminal_states.clone();
         let is_visible = self.is_visible.clone();
-        #[cfg(target_os = "windows")]
         let cwd_poll_states = self.cwd_poll_states.clone();
         let app_handle = self.app_handle.clone();
         let cwd_tracker = self.cwd_tracker.clone();
@@ -1653,7 +1662,7 @@ impl GitTracker {
 
                 // Skip when not visible
                 if !is_visible.load(Ordering::SeqCst) {
-                    log::debug!("[GitTracker] Skipping poll - window not visible");
+                    log::trace!("[GitTracker] Skipping poll - window not visible");
                     continue;
                 }
 
@@ -1667,7 +1676,7 @@ impl GitTracker {
                         );
                         continue;
                     }
-                    log::debug!("[GitTracker] Polling tick: {}", tick_count);
+                    log::trace!("[GitTracker] Polling tick: {}", tick_count);
                 }
 
                 // Use RAII guard - automatically resets is_polling when dropped
@@ -1682,114 +1691,36 @@ impl GitTracker {
                 } else if let Some(app_handle) = &app_handle {
                     Self::sync_terminal_cwds_from_tracker(app_handle, &states);
                 }
-                #[cfg(target_os = "windows")]
                 Self::prune_unused_cwd_poll_states(&states, &cwd_poll_states);
 
-                #[cfg(target_os = "windows")]
-                {
-                    // Windows: CWD deduplication strategy
-                    // Group terminals by CWD, poll once per unique CWD, then fan out results
-                    let cwd_states: HashMap<String, Vec<String>> = {
-                        let states_read = states.read();
-                        let mut map: HashMap<String, Vec<String>> = HashMap::new();
-                        for (id, state) in states_read.iter() {
-                            map.entry(state.last_known_cwd.clone())
-                                .or_default()
-                                .push(id.clone());
-                        }
-                        map
-                    };
+                let poll_targets = Self::cwd_poll_targets(
+                    Self::group_terminals_by_cwd(&states),
+                    &cwd_poll_states,
+                    Instant::now(),
+                );
 
-                    let now = Instant::now();
-                    let poll_targets: Vec<WindowsPollTarget> = {
+                for target in poll_targets {
+                    let (new_status, new_branch) =
+                        Self::poll_git_snapshot(target.cwd.clone()).await;
+
+                    {
                         let mut cwd_poll_states_write = cwd_poll_states.write();
-                        let mut targets = Vec::new();
-
-                        for (cwd, terminal_ids) in cwd_states {
-                            let poll_state = cwd_poll_states_write.entry(cwd.clone()).or_default();
-
-                            let cooldown_ms = if poll_state.last_snapshot_unchanged {
-                                STATUS_UNCHANGED_COOLDOWN_MS
-                            } else {
-                                POLL_INTERVAL_MS
-                            };
-
-                            let elapsed = now.duration_since(poll_state.last_checked);
-                            if elapsed < Duration::from_millis(cooldown_ms) {
-                                log::trace!(
-                                    "[GitTracker] CWD '{}' on cooldown: {:?} remaining",
-                                    cwd,
-                                    Duration::from_millis(cooldown_ms) - elapsed
-                                );
-                                continue;
-                            }
-
-                            log::debug!(
-                                "[GitTracker] Polling CWD: {} ({} terminals)",
-                                cwd,
-                                terminal_ids.len()
-                            );
-                            poll_state.last_checked = now;
-                            targets.push(WindowsPollTarget { cwd, terminal_ids });
-                        }
-
-                        targets
-                    };
-
-                    for target in poll_targets {
-                        let (new_status, new_branch) =
-                            Self::poll_git_snapshot(target.cwd.clone()).await;
-
-                        {
-                            let mut cwd_poll_states_write = cwd_poll_states.write();
-                            if let Some(poll_state) = cwd_poll_states_write.get_mut(&target.cwd) {
-                                poll_state.last_snapshot_unchanged =
-                                    poll_state.last_status.as_ref() == new_status.as_ref()
-                                        && poll_state.last_branch.as_ref() == new_branch.as_ref();
-                                poll_state.last_branch = new_branch.clone();
-                                poll_state.last_status = new_status.clone();
-                            }
-                        }
-
-                        let (branch_emits, status_emits) = Self::apply_git_results(
-                            &states,
-                            &target.terminal_ids,
-                            new_branch,
-                            new_status,
-                        );
-
-                        for (terminal_id, branch) in branch_emits {
-                            Self::emit_branch_changed_static(&events, &terminal_id, &branch);
-                        }
-
-                        for (terminal_id, status) in status_emits {
-                            Self::emit_status_changed_static(&events, &terminal_id, &status);
+                        if let Some(poll_state) = cwd_poll_states_write.get_mut(&target.cwd) {
+                            poll_state.last_snapshot_unchanged = poll_state.last_status.as_ref()
+                                == new_status.as_ref()
+                                && poll_state.last_branch.as_ref() == new_branch.as_ref();
+                            poll_state.last_branch = new_branch.clone();
+                            poll_state.last_status = new_status.clone();
                         }
                     }
-                }
 
-                #[cfg(not(target_os = "windows"))]
-                {
-                    let terminals: Vec<(String, String)> = states
-                        .read()
-                        .iter()
-                        .map(|(id, state)| (id.clone(), state.last_known_cwd.clone()))
-                        .collect();
-
-                    for (terminal_id, cwd) in terminals {
-                        let (new_status, new_branch) = Self::poll_git_snapshot(cwd).await;
-                        let terminal_ids = vec![terminal_id.clone()];
-                        let (branch_emits, status_emits) =
-                            Self::apply_git_results(&states, &terminal_ids, new_branch, new_status);
-
-                        for (_, branch) in branch_emits {
-                            Self::emit_branch_changed_static(&events, &terminal_id, &branch);
-                        }
-
-                        for (_, status) in status_emits {
-                            Self::emit_status_changed_static(&events, &terminal_id, &status);
-                        }
-                    }
+                    let (branch_emits, status_emits) = Self::apply_git_results(
+                        &states,
+                        &target.terminal_ids,
+                        new_branch,
+                        new_status,
+                    );
+                    Self::emit_git_updates(&events, branch_emits, status_emits);
                 }
             }
         });
@@ -1826,7 +1757,7 @@ impl GitTracker {
     /// and returns parsed status.
     /// Returns None if not in a git repository.
     fn check_status_internal(cwd: &str) -> Option<GitStatus> {
-        log::debug!("[GitTracker] Polling git status for cwd: {}", cwd);
+        log::trace!("[GitTracker] Polling git status for cwd: {}", cwd);
         let output = Self::run_git_command(cwd, &["status", "--porcelain"])?;
 
         if !output.status.success() {
@@ -1835,7 +1766,7 @@ impl GitTracker {
 
         let mut status = Self::parse_git_status(&String::from_utf8_lossy(&output.stdout));
 
-        log::debug!("[GitTracker] Fetching ahead/behind for cwd: {}", cwd);
+        log::trace!("[GitTracker] Fetching ahead/behind for cwd: {}", cwd);
         // Get ahead/behind count
         if let Some(rev_output) =
             Self::run_git_command(cwd, &["rev-list", "--left-right", "--count", "HEAD...@{u}"])
@@ -1846,7 +1777,7 @@ impl GitTracker {
                 if parts.len() == 2 {
                     status.ahead = parts[0].parse().unwrap_or(0);
                     status.behind = parts[1].parse().unwrap_or(0);
-                    log::debug!(
+                    log::trace!(
                         "[GitTracker] CWD: {}, ahead: {}, behind: {}",
                         cwd,
                         status.ahead,
@@ -1854,7 +1785,7 @@ impl GitTracker {
                     );
                 }
             } else {
-                log::debug!(
+                log::trace!(
                     "[GitTracker] rev-list failed (possibly no upstream): {}",
                     String::from_utf8_lossy(&rev_output.stderr)
                 );
@@ -2431,9 +2362,8 @@ mod tests {
         assert_eq!(commits[0].subject, "before\u{0}after");
     }
 
-    // ========== Windows-specific tests for CWD dedupe and throttling ==========
+    // ========== CWD dedupe and throttling ==========
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn test_cwd_poll_state_new() {
         let state = CwdPollState::new();
@@ -2443,7 +2373,6 @@ mod tests {
         assert!(now.duration_since(state.last_checked) < Duration::from_secs(61));
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn test_cwd_poll_state_default() {
         let state = CwdPollState::default();
@@ -2508,8 +2437,63 @@ mod tests {
         assert_eq!(cwd_groups.get("/home/user/other").unwrap().len(), 1);
     }
 
+    #[test]
+    fn test_group_terminals_by_cwd_dedupes_shared_repo() {
+        let events = TerminalEventHub::standalone();
+        let tracker = GitTracker::new(None, events);
+        tracker.terminal_states.write().insert(
+            "term-1".to_string(),
+            GitState {
+                _terminal_id: "term-1".to_string(),
+                last_known_branch: Some("main".to_string()),
+                last_known_cwd: "/repo".to_string(),
+                last_known_status: Some(GitStatus::new()),
+            },
+        );
+        tracker.terminal_states.write().insert(
+            "term-2".to_string(),
+            GitState {
+                _terminal_id: "term-2".to_string(),
+                last_known_branch: Some("main".to_string()),
+                last_known_cwd: "/repo".to_string(),
+                last_known_status: Some(GitStatus::new()),
+            },
+        );
+        tracker.terminal_states.write().insert(
+            "term-3".to_string(),
+            GitState {
+                _terminal_id: "term-3".to_string(),
+                last_known_branch: None,
+                last_known_cwd: "/other".to_string(),
+                last_known_status: None,
+            },
+        );
+
+        let groups = GitTracker::group_terminals_by_cwd(&tracker.terminal_states);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups.get("/repo").map(Vec::len), Some(2));
+        assert_eq!(groups.get("/other").map(Vec::len), Some(1));
+        assert!(tracker.is_tracking("term-1"));
+        tracker.remove_terminal("term-1");
+        tracker.remove_terminal("term-2");
+        assert!(!tracker.is_tracking("term-1"));
+        assert!(!tracker.is_tracking("term-2"));
+        assert!(tracker.is_tracking("term-3"));
+        let remaining = GitTracker::group_terminals_by_cwd(&tracker.terminal_states);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining.get("/other").map(Vec::len), Some(1));
+
+        let now = Instant::now();
+        let first = GitTracker::cwd_poll_targets(groups.clone(), &tracker.cwd_poll_states, now);
+        assert_eq!(first.len(), 2);
+        let again = GitTracker::cwd_poll_targets(groups, &tracker.cwd_poll_states, now);
+        assert!(
+            again.is_empty(),
+            "same-tick polls must share one scan per cwd"
+        );
+    }
+
     // Test throttling decision logic
-    #[cfg(target_os = "windows")]
     #[test]
     fn test_throttling_cooldown_with_status() {
         let mut state = CwdPollState::new();
@@ -2523,7 +2507,6 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "windows")]
     #[test]
     fn test_throttling_cooldown_without_status() {
         let mut state = CwdPollState::new();

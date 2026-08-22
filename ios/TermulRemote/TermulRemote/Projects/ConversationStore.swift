@@ -23,6 +23,7 @@ final class ConversationStore {
                 active = conversations.first(where: { $0.id == current.id })
             }
         } catch {
+            HostLog.session.error("Conversation list refresh failed")
             errorMessage = error.localizedDescription
         }
     }
@@ -51,6 +52,19 @@ final class ConversationStore {
         } catch {
             errorMessage = error.localizedDescription
             select(conversation)
+            return nil
+        }
+    }
+
+    func binding(for conversation: HostConversation) async -> AgentSessionBinding? {
+        guard let http else { return nil }
+        do {
+            let snapshot: ConversationBindingSnapshot = try await http.get(
+                "conversations/\(conversation.id)/binding"
+            )
+            return snapshot.binding
+        } catch {
+            HostLog.session.error("Conversation binding lookup failed")
             return nil
         }
     }

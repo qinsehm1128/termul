@@ -1,6 +1,7 @@
 import { expect, it } from 'vitest'
 import { parseConversationRecordV2 } from './conversation.types'
 import {
+  parseConversationBindingSnapshot,
   parseConversationHostStatus,
   parseConversationOpenOutcome,
   parseConversationRecordV2Array,
@@ -74,6 +75,25 @@ it('parses exact conversation API payloads and rejects malformed or extra keys',
   }
   expect(parseConversationOpenOutcome(open)).toBe(open)
 
+  const binding = {
+    conversationId,
+    binding: {
+      schemaVersion: 1 as const,
+      bindingId: 'b2832b54-2ca4-4db4-93fd-f93bf6793114',
+      agentSessionId: 'opaque/session',
+      runtimeAgentId: 'agent-runtime',
+      stableAgentNamespace: 'config:test',
+      executionCwd: '/visible/conversation',
+      boundAtUtc: '2026-08-15T09:45:16.000Z',
+      state: 'active' as const
+    }
+  }
+  expect(parseConversationBindingSnapshot(binding)).toBe(binding)
+  expect(parseConversationBindingSnapshot({ conversationId, binding: null })).toEqual({
+    conversationId,
+    binding: null
+  })
+
   const legacy = { conversationId, canonicalRoute: `#/c/${conversationId}` as const }
   expect(parseLegacyConversationResolution(legacy)).toBe(legacy)
 
@@ -99,6 +119,8 @@ it('parses exact conversation API payloads and rejects malformed or extra keys',
         recoveryItems: [{ ...recoveryItem(), candidateFacts: [{ token: 'forbidden' }] }]
       }),
     () => parseConversationOpenOutcome({ ...open, extra: true }),
+    () => parseConversationBindingSnapshot({ ...binding, extra: true }),
+    () => parseConversationBindingSnapshot({ conversationId, binding: { extra: true } }),
     () =>
       parseConversationOpenOutcome({
         ...open,

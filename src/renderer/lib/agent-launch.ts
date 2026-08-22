@@ -15,9 +15,10 @@
 import type { DiscoveredCliSession } from '@shared/types/cli-session.types'
 import { runtimeT } from '@/i18n/runtime'
 import { buildAgentArgv, type TerminalAgentDefinition } from '@/lib/agents/agent-registry'
-import { buildCliResumeArgv } from '@/lib/agents/cli-session-resume-argv'
+import { buildCliResumeArgv, formatCliResumeCommand } from '@/lib/agents/cli-session-resume-argv'
 import { terminalApi } from '@/lib/api'
 import { resolveEnvForSpawn } from '@/lib/env-parser'
+import { spawnTerminalInPane } from '@/lib/terminal-spawn'
 import { ensureWorktreeSymlinks } from '@/lib/worktree-context'
 import { useAppSettingsStore } from '@/stores/app-settings-store'
 import { useProjectStore } from '@/stores/project-store'
@@ -34,6 +35,8 @@ export interface LaunchAgentOptions {
   argvOverride?: string[]
   /** Extra env merged after project + agent env (e.g. CODEX_HOME). */
   extraEnv?: Record<string, string>
+  /** Delay before typing the resume command into a login shell. */
+  shellSettleMs?: number
 }
 
 export interface LaunchAgentResult {
@@ -118,17 +121,10 @@ export async function launchAgentInPane(
   }
 
   const project = useProjectStore.getState().projects.find((p) => p.id === projectId)
+  // An open Conversation binds a durable workspace terminal. Project-workspace
+  // launches (CLI session resume, launcher from the project rail) omit the id
+  // so the host issues an ephemeral claim scope, same as a regular PTY.
   const conversationId = useSessionWorkspaceSyncStore.getState().activeConversationId
-  if (!conversationId) {
-    return {
-      success: false,
-      error: runtimeT(
-        'terminal',
-        'lifecycle.conversationScopeRequired',
-        'Open a Conversation before creating a durable terminal'
-      )
-    }
-  }
 
   try {
     // Ensure worktree symlinks are present when launching into a worktree path.
@@ -156,7 +152,7 @@ export async function launchAgentInPane(
       : buildAgentArgv(def, prompt)
 
     const spawnResult = await terminalApi.spawn({
-      conversationId,
+      ...(conversationId ? { conversationId } : {}),
       projectId,
       cwd,
       program,
@@ -192,7 +188,7 @@ export async function launchAgentInPane(
       ...latestTerminals,
       {
         id: terminalId,
-        conversationId,
+        ...(conversationId ? { conversationId } : {}),
         name: def.name,
         projectId,
         shell: program,
@@ -273,12 +269,51 @@ export async function launchAgentResumeInPane(
     return { success: false, error: built.error }
   }
 
-  const extraEnv =
-    session.agentId === 'codex' && session.codexHome ? { CODEX_HOME: session.codexHome } : undefined
-
-  return launchAgentInPane(paneId, projectId, cwd, def, undefined, {
-    ...options,
-    argvOverride: built.args,
-    extraEnv: { ...options?.extraEnv, ...extraEnv }
+  const extraEnv = {
+    ...options?.extraEnv,
+    ...(session.agentId === 'codex' && session.codexHome ? { CODEX_HOME: session.codexHome } : {})
+  }
+  const project = useProjectStore.getState().projects.find((p) => p.id === projectId)
+  const maxTerminalsPerProject =
+    options?.maxTerminalsPerProject ??
+    useAppSettingsStore.getState().settings.maxTerminalsPerProject
+  const spawned = await spawnTerminalInPane(paneId, projectId, cwd, {
+    envVars: options?.envVars ?? project?.envVars,
+    maxTerminalsPerProject,
+    extraEnv
   })
+  if (!spawned.success || !spawned.terminalId) {
+    return {
+      success: false,
+      error:
+        spawned.error || runtimeT('terminal', 'errors.createFailed', 'Failed to create terminal')
+    }
+  }
+
+  const terminal = useTerminalStore
+    .getState()
+    .terminals.find((item) => item.id === spawned.terminalId)
+  if (!terminal?.ptyId) {
+    return {
+      success: false,
+      error: runtimeT('terminal', 'errors.createFailed', 'Failed to create terminal')
+    }
+  }
+
+  const settleMs = options?.shellSettleMs ?? 350
+  if (settleMs > 0) {
+    await new Promise<void>((resolve) => {
+      window.setTimeout(resolve, settleMs)
+    })
+  }
+
+  const command = formatCliResumeCommand(built.program, built.args)
+  const written = await terminalApi.write(terminal.ptyId, `${command}\r`)
+  if (!written.success) {
+    return {
+      success: false,
+      error: written.error || runtimeT('terminal', 'errors.writeFailed', 'Failed to write')
+    }
+  }
+  return { success: true, terminalId: spawned.terminalId }
 }

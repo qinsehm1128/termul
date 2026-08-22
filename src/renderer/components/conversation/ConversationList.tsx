@@ -1,9 +1,22 @@
-import { AlertTriangle } from 'lucide-react'
+import { AlertTriangle, ChevronDown } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useNavigate } from 'react-router-dom'
+import { AgentIcon } from '@/components/agents/AgentIcon'
 import { ConversationLifecycleActions } from '@/components/chat/ChatHistoryEntryRow'
+import {
+  ListEmptyState,
+  ListLoadingState,
+  ListRow,
+  ListRowMeta,
+  ListRowStatus
+} from '@/components/lists'
+import { pathBasename } from '@/components/lists/path-basename'
+import { getAgentById } from '@/lib/agents/custom-agents'
+import { agentIdForConversation } from '@/lib/conversation-list-meta'
+import { conversationRowStatus } from '@/lib/conversation-row-status'
 import { displayConversationTitle, sessionTitleForConversation } from '@/lib/conversation-title'
+import { formatRelativeTime } from '@/lib/git-time'
 import { cn } from '@/lib/utils'
 import { useAcpStore } from '@/stores/acp-store'
 import {
@@ -38,8 +51,11 @@ export function ConversationList({
   const listError = useConversationStore((state) => state.listError)
   const sessions = useAcpStore((state) => state.sessions)
   const sessionIndex = useAcpStore((state) => state.sessionIndex)
+  const pendingPermissions = useAcpStore((state) => state.pendingPermissions)
+  const pendingQuestions = useAcpStore((state) => state.pendingQuestions)
   const projects = useProjectStore((state) => state.projects)
   const [visibleCount, setVisibleCount] = useState(pageSize)
+  const [expandedId, setExpandedId] = useState<string | null>(null)
 
   const projected = useMemo(
     () =>
@@ -56,37 +72,19 @@ export function ConversationList({
   if (projected.length === 0) {
     if (listError) {
       return (
-        <div className="px-3 py-5" role="alert">
-          <p className="text-xs font-medium text-foreground">
-            {t('conversationRoute.errors.title')}
-          </p>
-          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{listError.message}</p>
-        </div>
+        <ListEmptyState
+          tone="error"
+          title={t('conversationRoute.errors.title')}
+          message={listError.message}
+        />
       )
     }
 
     if (loadingList) {
-      return (
-        <div className="flex flex-col gap-1 px-2 py-2" role="status" aria-busy="true">
-          <span className="px-1 pb-1 text-xs text-muted-foreground">
-            {tConversation('dashboard.loading')}
-          </span>
-          {Array.from({ length: 5 }, (_, index) => (
-            <div key={index} className="flex h-7 items-center px-2">
-              <span className="h-2.5 w-2/5 animate-pulse rounded-sm bg-muted" />
-            </div>
-          ))}
-        </div>
-      )
+      return <ListLoadingState label={tConversation('dashboard.loading')} />
     }
 
-    return (
-      <div className="px-3 py-5" role="status">
-        <p className="text-xs leading-relaxed text-muted-foreground">
-          {t('conversationNavigation.empty')}
-        </p>
-      </div>
-    )
+    return <ListEmptyState message={t('conversationNavigation.empty')} />
   }
 
   return (
@@ -111,54 +109,102 @@ export function ConversationList({
           conversation.conversationId
         )
         const isActive = activeConversationId === conversation.conversationId
+        const folder = pathBasename(conversation.workspaceCwd)
+        const preview =
+          folder && folder !== title ? <span className="font-mono">{folder}</span> : undefined
+        const agentId = agentIdForConversation(conversation.conversationId, sessions, sessionIndex)
+        const agentLabel = agentId ? (getAgentById(agentId)?.name ?? agentId) : undefined
+        const rowStatus = conversationRowStatus(
+          conversation.conversationId,
+          sessions,
+          sessionIndex,
+          pendingPermissions,
+          pendingQuestions
+        )
+        const expanded = expandedId === conversation.conversationId
         return (
-          <div
-            key={conversation.conversationId}
-            className={cn(
-              'group mx-1 flex min-h-7 items-center gap-0.5 rounded-sm pr-0.5 transition-colors duration-150 ease-[var(--ease-out)]',
-              isActive
-                ? 'bg-sidebar-accent text-foreground ring-1 ring-inset ring-primary/35'
-                : 'hover:bg-sidebar-accent/50'
-            )}
-            data-conversation-id={conversation.conversationId}
-          >
-            <button
-              type="button"
-              className="flex min-h-7 min-w-0 flex-1 items-center gap-2 px-2 py-0.5 text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring"
-              aria-current={isActive ? 'page' : undefined}
+          <div key={conversation.conversationId} data-conversation-id={conversation.conversationId}>
+            <ListRow
+              density="compact"
+              active={isActive}
+              title={
+                <span className="flex min-w-0 items-center gap-1.5">
+                  {agentId ? <AgentIcon agentId={agentId} className="size-3.5" /> : null}
+                  <span className="min-w-0 truncate">{title}</span>
+                  <ListRowStatus
+                    status={rowStatus}
+                    label={t(`conversationNavigation.rowStatus.${rowStatus}`)}
+                  />
+                </span>
+              }
+              titleAttr={title}
+              preview={preview}
+              meta={
+                <ListRowMeta
+                  items={[
+                    formatRelativeTime(conversation.createdAtUtc),
+                    agentLabel,
+                    conversation.lastSeq > 0
+                      ? t('conversationNavigation.revision', { count: conversation.lastSeq })
+                      : null,
+                    recoveryCount > 0 ? (
+                      <span
+                        key="recovery"
+                        role="status"
+                        className="inline-flex items-center gap-0.5 text-destructive"
+                        aria-label={t('conversationNavigation.recoveryBadge', {
+                          count: recoveryCount
+                        })}
+                      >
+                        <AlertTriangle className="size-3" aria-hidden="true" />
+                        {recoveryCount}
+                      </span>
+                    ) : null
+                  ]}
+                />
+              }
+              trailing={
+                <>
+                  <button
+                    type="button"
+                    className="inline-flex size-7 items-center justify-center rounded-md hover:bg-sidebar-accent hover:text-foreground"
+                    aria-expanded={expanded}
+                    aria-label={t('conversationNavigation.toggleDetails')}
+                    onClick={(event) => {
+                      event.stopPropagation()
+                      setExpandedId((current) =>
+                        current === conversation.conversationId ? null : conversation.conversationId
+                      )
+                    }}
+                  >
+                    <ChevronDown
+                      className={cn('size-3.5 transition-transform', expanded && 'rotate-180')}
+                    />
+                  </button>
+                  <ConversationLifecycleActions
+                    conversationId={conversation.conversationId}
+                    title={title}
+                    className="size-7"
+                  />
+                </>
+              }
+              details={
+                <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-2 gap-y-1">
+                  <dt>{t('conversationNavigation.detailsWorkspace')}</dt>
+                  <dd className="truncate" title={conversation.workspaceCwd}>
+                    {conversation.workspaceCwd}
+                  </dd>
+                  <dt>{t('conversationNavigation.detailsProject')}</dt>
+                  <dd className="truncate">{projectLabel}</dd>
+                  <dt>{t('conversationNavigation.detailsState')}</dt>
+                  <dd>{conversation.lifecycleState}</dd>
+                </dl>
+              }
+              expanded={expanded}
               onClick={() => {
                 navigate(`/c/${conversation.conversationId}`)
                 onConversationOpened?.()
               }}
-            >
-              <span className="min-w-0 flex-1">
-                <span
-                  className={cn(
-                    'block truncate text-xs leading-3.5',
-                    isActive ? 'font-medium text-foreground' : 'text-sidebar-foreground'
-                  )}
-                  title={title}
-                >
-                  {title}
-                </span>
-                <span className="block truncate text-2xs leading-3 text-muted-foreground">
-                  {projectLabel}
-                </span>
-              </span>
-              {recoveryCount > 0 && (
-                <span
-                  role="status"
-                  className="inline-flex shrink-0 items-center gap-0.5 text-2xs tabular-nums text-destructive"
-                  aria-label={t('conversationNavigation.recoveryBadge', { count: recoveryCount })}
-                >
-                  <AlertTriangle className="size-3" aria-hidden="true" />
-                  {recoveryCount}
-                </span>
-              )}
-            </button>
-            <ConversationLifecycleActions
-              conversationId={conversation.conversationId}
-              title={title}
             />
           </div>
         )
@@ -166,7 +212,7 @@ export function ConversationList({
       {hasMore && (
         <button
           type="button"
-          className="mx-1 mt-0.5 inline-flex h-7 items-center justify-center rounded-sm px-2 text-xs text-muted-foreground transition-colors duration-150 ease-[var(--ease-out)] hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          className="mx-1 mt-0.5 inline-flex h-8 items-center justify-center rounded-md px-2 text-xs text-muted-foreground transition-colors duration-150 ease-[var(--ease-out)] hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
           onClick={() => setVisibleCount((count) => count + pageSize)}
         >
           {t('conversationNavigation.loadMore', { count: projected.length - visible.length })}

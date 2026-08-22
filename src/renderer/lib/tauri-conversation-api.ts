@@ -16,6 +16,7 @@ import type {
   LegacyConversationResolution
 } from '@shared/types/conversation-api.types'
 import {
+  parseConversationBindingSnapshot,
   parseConversationHostStatus,
   parseConversationOpenOutcome,
   parseConversationRecordV2Array,
@@ -95,6 +96,12 @@ export function createTauriConversationApi(): ConversationApi {
     getConversation: (conversationId) =>
       withConversationId(conversationId, () =>
         invokeConversation('conversation_get', parseConversationRecordV2, { conversationId })
+      ),
+    getCurrentBinding: (conversationId) =>
+      withConversationId(conversationId, () =>
+        invokeConversation('conversation_get_binding', parseConversationBindingSnapshot, {
+          conversationId
+        })
       ),
     openConversation: (conversationId) =>
       withConversationId(conversationId, () =>

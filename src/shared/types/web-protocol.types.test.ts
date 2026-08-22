@@ -69,8 +69,8 @@ describe('web-protocol.types — event/request type registries (AC2)', () => {
     expect(WS_REQUEST_TYPES).toContain('get_session_payload_page')
   })
 
-  it('exports exactly 52 request types including persistence, Conversation-first, and CLI session vault', () => {
-    expect(WS_REQUEST_TYPES).toHaveLength(52)
+  it('exports exactly 54 request types including persistence, Conversation-first, and CLI session vault', () => {
+    expect(WS_REQUEST_TYPES).toHaveLength(54)
     expect(WS_REQUEST_TYPES).toEqual([
       'send_prompt',
       'cancel_prompt',
@@ -120,6 +120,7 @@ describe('web-protocol.types — event/request type registries (AC2)', () => {
       'conversation_host_status',
       'list_conversations',
       'get_conversation',
+      'get_conversation_binding',
       'open_conversation',
       'resolve_legacy_conversation_id',
       'get_session_workspace',
@@ -128,7 +129,8 @@ describe('web-protocol.types — event/request type registries (AC2)', () => {
       'attach_project',
       'detach_project',
       'update_execution_target',
-      'list_cli_sessions'
+      'list_cli_sessions',
+      'resolve_cli_sessions'
     ])
   })
 

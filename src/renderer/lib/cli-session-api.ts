@@ -1,13 +1,16 @@
 /**
  * CLI session discovery facade.
  *
- * Desktop uses Tauri IPC (`list_cli_sessions_cmd`); web/remote uses
- * `POST /cli-sessions`. Both return the same parsed list result.
+ * Desktop uses Tauri IPC; web/remote uses POST /cli-sessions and
+ * POST /cli-sessions/resolve. Scan lists files first; resolve lazily reads
+ * the first JSONL session_id.
  */
 import type {
   CliSessionApi,
   CliSessionListArgs,
-  CliSessionListResult
+  CliSessionListResult,
+  CliSessionResolveArgs,
+  CliSessionResolveResult
 } from '@shared/types/cli-session.types'
 
 import { createTauriCliSessionApi } from './tauri-cli-session-api'
@@ -20,6 +23,10 @@ export const cliSessionApi: CliSessionApi = {
   listSessions(args?: CliSessionListArgs): Promise<CliSessionListResult> {
     if (!isTauriContext()) return webCliSessionApi.listSessions(args)
     return tauriCliSessionApi.listSessions(args)
+  },
+  resolveSessions(args: CliSessionResolveArgs): Promise<CliSessionResolveResult> {
+    if (!isTauriContext()) return webCliSessionApi.resolveSessions(args)
+    return tauriCliSessionApi.resolveSessions(args)
   }
 }
 

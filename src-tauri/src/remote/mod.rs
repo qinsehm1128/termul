@@ -12,7 +12,10 @@
 
 pub mod cloudflared;
 pub mod host;
+pub mod intent;
+pub mod lan;
 pub mod tunnel;
 
 pub use host::{RemoteBindMode, RemoteServerState, RemoteStatus};
+pub use intent::{PublishMode, RemoteAccessIntent, RemoteAccessIntentStore};
 pub use tunnel::TunnelConfigStore;

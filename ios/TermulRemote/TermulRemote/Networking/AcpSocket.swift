@@ -40,7 +40,7 @@ final class AcpSocket {
     private var pending: [String: CheckedContinuation<Data, Error>] = [:]
     private var requestSerial = 0
     private var origin: URL?
-    private var opened: CheckedContinuation<Void, Error>?
+    private var openGate: HostWebSocketOpenGate?
 
     func connect(origin: URL, credentials: HostCredentials) async throws {
         stop()
@@ -50,10 +50,12 @@ final class AcpSocket {
             throw HostError.unexpected(String(localized: "This access link is missing its token. Scan the QR again."))
         }
         let wsURL = Self.wsURL(origin: origin, path: "/ws")
-        var urlRequest = URLRequest(url: wsURL, timeoutInterval: 20)
+        var urlRequest = URLRequest(url: wsURL, timeoutInterval: HostTunnelSession.handshakeSeconds)
         urlRequest.assumesHTTP3Capable = false
         credentials.apply(to: &urlRequest)
-        let session = URLSession(configuration: .default)
+        let gate = HostWebSocketOpenGate()
+        openGate = gate
+        let session = HostTunnelSession.make(delegate: gate)
         self.session = session
         let task = session.webSocketTask(with: urlRequest)
         self.task = task
@@ -61,9 +63,7 @@ final class AcpSocket {
         receiveTask = Task { await self.receiveLoop() }
 
         do {
-            try await withCheckedThrowingContinuation { continuation in
-                opened = continuation
-            }
+            try await gate.waitForOpen()
             let data = try await request("authenticate", payload: ["token": token])
             if let reply = try? JSONDecoder().decode(AcpAuthenticateReply.self, from: data) {
                 historyMode = reply.historyMode ?? "live_only"
@@ -77,13 +77,21 @@ final class AcpSocket {
         }
     }
 
-    func request(_ type: String, payload: [String: Any] = [:]) async throws -> Data {
+    func request(_ type: String, payload: [String: Any] = [:], timeoutSeconds: Double? = 45) async throws -> Data {
         requestSerial += 1
         let id = "ios-\(requestSerial)"
         let body: [String: Any] = ["id": id, "type": type, "payload": payload]
         let data = try WireJSON.data(from: body)
         return try await withCheckedThrowingContinuation { continuation in
             pending[id] = continuation
+            if let timeoutSeconds {
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(for: .seconds(timeoutSeconds))
+                    guard let self, let waiting = self.pending.removeValue(forKey: id) else { return }
+                    HostLog.session.error("ACP request timed out")
+                    waiting.resume(throwing: HostError.network(String(localized: "The host did not finish the agent request. Try again, or start the agent on the desktop.")))
+                }
+            }
             task?.send(.string(String(data: data, encoding: .utf8) ?? "")) { [weak self] error in
                 Task { @MainActor in
                     if let error {
@@ -94,8 +102,13 @@ final class AcpSocket {
         }
     }
 
-    func request<T: Decodable>(_ type: String, payload: [String: Any] = [:], as _: T.Type) async throws -> T {
-        let data = try await request(type, payload: payload)
+    func request<T: Decodable>(
+        _ type: String,
+        payload: [String: Any] = [:],
+        as _: T.Type,
+        timeoutSeconds: Double? = 45
+    ) async throws -> T {
+        let data = try await request(type, payload: payload, timeoutSeconds: timeoutSeconds)
         if T.self == EmptyPayload.self {
             return EmptyPayload() as! T
         }
@@ -122,8 +135,8 @@ final class AcpSocket {
         heartbeat = nil
         receiveTask?.cancel()
         receiveTask = nil
-        opened?.resume(throwing: HostError.network(String(localized: "Disconnected from the host.")))
-        opened = nil
+        openGate?.failOpen(HostError.network(String(localized: "Disconnected from the host.")))
+        openGate = nil
         for (_, continuation) in pending {
             continuation.resume(throwing: HostError.network(String(localized: "Disconnected from the host.")))
         }
@@ -167,8 +180,8 @@ final class AcpSocket {
             } catch {
                 if !Task.isCancelled {
                     failPending(error)
-                    opened?.resume(throwing: HostError.network(error.localizedDescription))
-                    opened = nil
+                    openGate?.failOpen(HostError.network(error.localizedDescription))
+                    openGate = nil
                     if case .connected = state {
                         state = .failed(error.localizedDescription)
                     }
@@ -189,8 +202,6 @@ final class AcpSocket {
             let seq = (object["seq"] as? NSNumber)?.uint64Value ?? 0
             let payload = (try? JSONSerialization.data(withJSONObject: object["payload"] ?? [:])) ?? Data("{}".utf8)
             if type == "auth_required" {
-                opened?.resume()
-                opened = nil
                 return
             }
             onEvent?(type, sid, seq, payload)

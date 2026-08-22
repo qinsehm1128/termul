@@ -1,5 +1,11 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { resolveConversationSessionId } from './conversation-binding'
+
+vi.mock('@/lib/conversation-api', () => ({
+  conversationApi: {
+    getCurrentBinding: vi.fn()
+  }
+}))
 
 const conversationId = '018f7a1c-1b4d-7c8a-9f01-0123456789ab'
 

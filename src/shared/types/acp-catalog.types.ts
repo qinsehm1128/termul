@@ -73,6 +73,11 @@ export interface CatalogAgent {
    * spawn config from the host install. Omitted/null otherwise.
    */
   installed?: { command: string; args: string[] } | null
+  /**
+   * Runtime agent id when this catalog entry is already spawned on the host.
+   * Phone/web reuse this instead of launching a second subprocess.
+   */
+  runningAgentId?: string | null
 }
 
 /** The resolved catalog payload served across all three transports. */

@@ -115,8 +115,9 @@ vi.mock('@/stores/app-settings-store', () => ({
 
 vi.mock('@/stores/remote-status-store', () => ({
   useRemoteStatus: vi.fn(() => null),
+  useRemoteRestoreError: vi.fn(() => null),
   useRemoteStatusStore: Object.assign(vi.fn(), {
-    getState: () => ({ setStatus: vi.fn() })
+    getState: () => ({ setStatus: vi.fn(), setRestoreError: vi.fn() })
   })
 }))
 
@@ -225,7 +226,16 @@ vi.mock('@/lib/api', async () => {
       onSearchFileNamesBatch: vi.fn(() => vi.fn()),
       onSearchFileNamesDone: vi.fn(() => vi.fn())
     },
-    remoteServerApi: { start: vi.fn(), stop: vi.fn(), status: vi.fn() },
+    remoteServerApi: {
+      start: vi.fn(),
+      stop: vi.fn(),
+      status: vi.fn(),
+      intent: vi.fn(() =>
+        Promise.resolve({ success: true, data: { wanted: false, publishMode: 'tunnel' } })
+      ),
+      setIntent: vi.fn(),
+      rotateCredential: vi.fn()
+    },
     openerApi: { openUrlWithSystemBrowser: vi.fn(() => Promise.resolve({ success: true })) }
   }
 })
@@ -403,6 +413,10 @@ function renderMobileRoot(): ReturnType<typeof render> {
   )
 }
 
+async function openMobileOverflow(): Promise<void> {
+  fireEvent.click(await screen.findByLabelText('More'))
+}
+
 describe('WorkspaceLayout mobile branch', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -451,7 +465,9 @@ describe('WorkspaceLayout mobile branch', () => {
     expect(
       await screen.findByRole('heading', { name: 'Your Conversation workspace' })
     ).toBeVisible()
+    await openMobileOverflow()
     expect(screen.getByLabelText('New chat')).toBeEnabled()
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
     expect(document.querySelector('[data-pane-renderer-stub]')).not.toBeInTheDocument()
     expect(screen.queryByText(/legacy_workspace_manifests\/0\/shared.json/)).not.toBeInTheDocument()
     expect(document.querySelectorAll('[data-conversation-recovery-panel]')).toHaveLength(1)
@@ -484,6 +500,7 @@ describe('WorkspaceLayout mobile branch', () => {
       </MemoryRouter>
     )
 
+    await openMobileOverflow()
     expect(await screen.findByLabelText('New chat')).toBeEnabled()
     expect(screen.getByLabelText('Git changes')).toBeDisabled()
   })
@@ -497,6 +514,7 @@ describe('WorkspaceLayout mobile branch', () => {
 
     // MobileChatShell is React.lazy — wait for it to load before asserting.
     await waitFor(() => expect(document.querySelector('[data-mobile-chat-shell]')).toBeTruthy())
+    await openMobileOverflow()
     expect(screen.getByLabelText('Command palette')).toBeInTheDocument()
     expect(screen.getByLabelText('Git changes')).not.toBeDisabled()
   })
@@ -531,6 +549,7 @@ describe('WorkspaceLayout mobile branch', () => {
       screen.queryByPlaceholderText('Search commands, projects, settings...')
     ).not.toBeInTheDocument()
     // MobileChatShell is React.lazy — wait for the trigger button to appear.
+    await openMobileOverflow()
     fireEvent.click(await screen.findByLabelText('Command palette'))
     expect(
       await screen.findByPlaceholderText('Search commands, projects, settings...')
@@ -547,6 +566,7 @@ describe('WorkspaceLayout mobile branch', () => {
     // Sheet starts closed: the GitPanel file-list filter input is absent.
     expect(screen.queryByPlaceholderText('Filter changes...')).not.toBeInTheDocument()
     // MobileChatShell is React.lazy — wait for the trigger button to appear.
+    await openMobileOverflow()
     fireEvent.click(await screen.findByLabelText('Git changes'))
     // GitPanel mobile branch renders the file-list filter input (full-width).
     expect(await screen.findByPlaceholderText('Filter changes...')).toBeInTheDocument()
@@ -560,6 +580,7 @@ describe('WorkspaceLayout mobile branch', () => {
       </MemoryRouter>
     )
     // MobileChatShell is React.lazy — wait for the trigger to appear.
+    await openMobileOverflow()
     expect(await screen.findByLabelText('Git changes')).toBeDisabled()
   })
 
@@ -571,6 +592,7 @@ describe('WorkspaceLayout mobile branch', () => {
     )
 
     // MobileChatShell is React.lazy — wait for the trigger to appear.
+    await openMobileOverflow()
     fireEvent.click(await screen.findByLabelText('Git changes'))
     expect(await screen.findByPlaceholderText('Filter changes...')).toBeInTheDocument()
 

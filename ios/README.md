@@ -18,9 +18,11 @@ Requires Xcode 26 and iOS 26.
 2. Scan the QR, or paste the copied `https://…` link.
 3. After pairing, choose **Sessions** (independent chats) or **Projects** (desktop project terminals). The access URL fragment (`#access_token=…`) is the bearer credential.
 
-Deep link: `termul://open?url=<encoded-https-access-url>`.
+Deep link: `termul://open?url=<percent-encoded-access-url>`. Encode the `#access_token` fragment inside `url`, or pass `access_token` as a query item. A raw `#` on the `termul://` URL is recovered as the bearer.
 
-HTTP FRP origins are rejected. Put TLS in front of FRP, or use Cloudflare.
+Quick Tunnel (`*.trycloudflare.com`) still goes through Cloudflare even on the same Wi-Fi. After an iPhone restart the first open waits for the network and retries. RFC1918 / `.local` HTTP origins are allowed for a true LAN pair.
+
+ACP agents that are already running on the Mac, or whose CLI is on the Mac PATH (`cursor-agent`, Codex via npx), can be selected from the phone. Switching reuses the live host process instead of starting a second one. Agents that advertise sign-in open that flow on the computer.
 
 Terminal lists the host’s **already running** PTYs for the active desktop session (`list` by `conversationId`, then `watch`) and shows their scrollback. “New terminal” is optional and conversation-scoped. Phone resize does not change a desktop-owned PTY. The emulator is [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) (`ios/Vendor/SwiftTerm`, plugin stripped so Xcode 27 can compile it).
 

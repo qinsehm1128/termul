@@ -57,6 +57,19 @@ fn default_floor() -> LevelFilter {
     }
 }
 
+/// Third-party crates that dump huge payloads at debug during a normal run.
+/// Applied before `RUST_LOG` so an explicit override still wins.
+fn default_quiet_modules() -> Vec<(String, LevelFilter)> {
+    vec![
+        // The plugin logs the full updater JSON, including the entire release
+        // notes markdown, at DEBUG on every check.
+        (
+            "tauri_plugin_updater".to_string(),
+            LevelFilter::Info,
+        ),
+    ]
+}
+
 fn parse_level(token: &str) -> Option<LevelFilter> {
     match token.trim().to_ascii_lowercase().as_str() {
         "trace" => Some(LevelFilter::Trace),
@@ -153,6 +166,10 @@ pub fn build_log_plugin<R: Runtime>() -> tauri::plugin::TauriPlugin<R> {
         .max_file_size(MAX_LOG_FILE_SIZE)
         .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepOne);
 
+    // Quiet known-noisy crates first; RUST_LOG overrides still win after.
+    for (module, level) in default_quiet_modules() {
+        builder = builder.level_for(module, level);
+    }
     // Apply per-module RUST_LOG overrides so scoping survives instead of
     // flattening to one global level.
     for (module, level) in directives.per_module {
@@ -352,6 +369,16 @@ mod tests {
         let b = session_id();
         assert_eq!(a, b, "session id must be stable within a process");
         assert_eq!(a.len(), 8, "session id is the 8-char short form");
+    }
+
+    #[test]
+    fn default_quiet_modules_keep_updater_payloads_off_debug() {
+        assert!(
+            default_quiet_modules()
+                .iter()
+                .any(|(module, level)| module == "tauri_plugin_updater" && *level == LevelFilter::Info),
+            "updater changelog dumps must stay at info unless RUST_LOG overrides"
+        );
     }
 
     #[test]

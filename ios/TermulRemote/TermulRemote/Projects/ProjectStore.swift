@@ -35,19 +35,6 @@ final class ProjectStore {
 
     func select(_ project: HostProject) async {
         active = project
-        guard let socket else { return }
-        do {
-            let reply = try await socket.request(
-                "switch_project",
-                payload: ["projectId": project.id],
-                as: SwitchProjectReply.self
-            )
-            if var current = active, let cwd = reply.cwd, !cwd.isEmpty {
-                current.path = cwd
-                active = current
-            }
-        } catch {
-            errorMessage = error.localizedDescription
-        }
+        HostLog.session.info("Selected project workspace for terminal watch")
     }
 }

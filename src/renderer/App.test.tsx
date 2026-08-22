@@ -124,6 +124,10 @@ vi.mock('./hooks/use-terminal-exit-notification', () => ({
   useTerminalExitNotification: mockUseTerminalExitNotification
 }))
 
+vi.mock('./hooks/use-host-terminal-catalog', () => ({
+  useHostTerminalCatalog: () => undefined
+}))
+
 vi.mock('./hooks/use-remote-projects', () => ({
   useRemoteProjects: mockUseRemoteProjects
 }))

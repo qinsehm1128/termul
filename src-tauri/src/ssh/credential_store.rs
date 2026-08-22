@@ -109,6 +109,7 @@ pub fn delete_credentials(profile_id: &str) -> Result<(), String> {
 /// `get_password` returns `NoEntry`. This round-trips a throwaway entry and
 /// returns an error if the store is non-functional, so misconfiguration is
 /// caught at startup instead of silently losing every credential.
+#[allow(dead_code)]
 pub fn self_test() -> Result<(), String> {
     let key = format!("__selftest-{}", uuid::Uuid::new_v4());
     let probe = "ok";

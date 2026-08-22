@@ -44,6 +44,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::acp::config::{AgentConfig, PermissionPolicy};
 use crate::acp::{AcpManager, AgentId, FileProjectRegistry, SessionCreationContext, SessionId};
+use crate::cli_session::{
+    list_cli_sessions, resolve_cli_sessions, CliSessionListArgs, CliSessionResolveArgs,
+};
 use crate::pty::PtyManager;
 use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEventHub};
 use crate::web::auth::{
@@ -53,7 +56,6 @@ use crate::web::auth::{
 use crate::web::operation_policy;
 use crate::web::permissions::{TurnClaim, DEFAULT_PERMISSION_RECONNECT_GRACE};
 use crate::web::project_registry::{ProjectRegistry, ProjectSwitchContext};
-use crate::cli_session::{list_cli_sessions, CliSessionListArgs};
 use crate::web::sink::{
     broadcast_projects_changed, AcpEvent, ClientId, ReplayResult, WsRelaySink,
     CLIENT_OUTBOUND_BYTES, CLIENT_OUTBOUND_RECORDS, MAX_CONNECTION_SUBSCRIPTIONS,
@@ -1581,6 +1583,7 @@ async fn handle_request_with_conversation(
         "conversation_host_status"
         | "list_conversations"
         | "get_conversation"
+        | "get_conversation_binding"
         | "open_conversation"
         | "resolve_legacy_conversation_id"
         | "get_session_workspace"
@@ -1689,6 +1692,9 @@ async fn handle_request_with_conversation(
                 current_project,
             )
             .await
+        }
+        "get_composer_controls" => {
+            handle_get_composer_controls(id, &req.payload, acp).await
         }
         "detach_binding" => {
             handle_conversation_lifecycle_with_service(
@@ -1812,7 +1818,7 @@ async fn handle_request_with_conversation(
         // `@tauri-apps/plugin-os` or PATH locally — the host is the single
         // source of truth.
         "list_acp_catalog" => {
-            handle_list_acp_catalog(id, &req.payload, acp_catalog, acp_install).await
+            handle_list_acp_catalog(id, &req.payload, acp, acp_catalog, acp_install).await
         }
         "set_catalog_opt_in" => {
             if let Err(denial) = operation_policy::authorize_local_only(
@@ -1849,6 +1855,7 @@ async fn handle_request_with_conversation(
         "store_write" => handle_store_write(id, &req.payload, store).await,
         "store_delete" => handle_store_delete(id, &req.payload, store).await,
         "list_cli_sessions" => handle_list_cli_sessions(id, &req.payload, registry).await,
+        "resolve_cli_sessions" => handle_resolve_cli_sessions(id, &req.payload).await,
         "kill_agent" => {
             handle_kill_agent(
                 id,
@@ -2504,7 +2511,10 @@ fn acp_err_to_reply(id: String, err: String) -> WsReply {
     if let Some(code) = map_prompt_error_code(&err) {
         return WsReply::err(id, code, err);
     }
-    let code = if err.starts_with("unknown agent") || err.contains("unknown permission request") {
+    let code = if err.starts_with("unknown agent")
+        || err.contains("unknown permission request")
+        || err.contains("session does not belong")
+    {
         WsErrorCode::NotFound
     } else if err.contains("agent does not support") || err.contains("capability") {
         WsErrorCode::Unsupported
@@ -2533,6 +2543,7 @@ fn is_conversation_request(type_: &str) -> bool {
         "conversation_host_status"
             | "list_conversations"
             | "get_conversation"
+            | "get_conversation_binding"
             | "open_conversation"
             | "resolve_legacy_conversation_id"
             | "get_session_workspace"
@@ -2606,7 +2617,10 @@ async fn handle_conversation_application(
             Err(error) => WsReply::err_with_code(id, error.code, error.detail),
         },
         "list_conversations" => ok_with_payload(id, &service.list_conversations()),
-        "get_conversation" | "open_conversation" | "get_session_workspace" => {
+        "get_conversation"
+        | "get_conversation_binding"
+        | "open_conversation"
+        | "get_session_workspace" => {
             let parsed: ConversationIdWsPayload = match serde_json::from_value(payload.clone()) {
                 Ok(value) => value,
                 Err(error) => {
@@ -2629,6 +2643,11 @@ async fn handle_conversation_application(
                 "get_conversation" => service
                     .get_conversation(conversation_id)
                     .map(|value| serde_json::to_value(value).expect("Conversation serializes")),
+                "get_conversation_binding" => {
+                    service.current_binding(conversation_id).map(|value| {
+                        serde_json::to_value(value).expect("Conversation binding serializes")
+                    })
+                }
                 "open_conversation" => {
                     service
                         .open_conversation(conversation_id)
@@ -3233,6 +3252,7 @@ struct ListAcpCatalogPayload {
 async fn handle_list_acp_catalog(
     id: String,
     payload: &Value,
+    acp: &Arc<AcpManager>,
     acp_catalog: Option<&Arc<crate::acp::AcpCatalogService>>,
     acp_install: Option<&Arc<crate::acp::install::AcpInstallService>>,
 ) -> WsReply {
@@ -3262,10 +3282,11 @@ async fn handle_list_acp_catalog(
             // Overlay host-installed state so installed agents report `ready`
             // with their resolved command/args — the host is the single
             // source of truth (web has no renderer persistence).
-            if let Some(install) = acp_install {
-                let installed = install.installed_agents();
-                crate::acp::overlay_installed(&mut catalog, &installed);
-            }
+            let installed = acp_install
+                .map(|install| install.installed_agents())
+                .unwrap_or_default();
+            let running = acp.list_running_namespaces();
+            crate::acp::apply_host_catalog_overlays(&mut catalog, &installed, &running);
             ok_with_payload(id, &catalog)
         }
         Err(error) => WsReply::err_with_code(
@@ -3561,6 +3582,35 @@ async fn handle_list_cli_sessions(
             id,
             "SCAN_FAILED",
             format!("cli session scan join failed: {error}"),
+        ),
+    }
+}
+
+async fn handle_resolve_cli_sessions(id: String, payload: &Value) -> WsReply {
+    let args: CliSessionResolveArgs = match serde_json::from_value(payload.clone()) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return WsReply::err_with_code(
+                id,
+                "VALIDATION_ERROR",
+                format!("malformed resolve_cli_sessions payload: {error}"),
+            )
+        }
+    };
+    match tokio::task::spawn_blocking(move || resolve_cli_sessions(args)).await {
+        Ok(result) => {
+            info!(
+                target: "termul::web::ws",
+                "operation=resolve_cli_sessions sessions={} issues={}",
+                result.sessions.len(),
+                result.issues.len()
+            );
+            ok_with_payload(id, &result)
+        }
+        Err(error) => WsReply::err_with_code(
+            id,
+            "RESOLVE_FAILED",
+            format!("cli session resolve join failed: {error}"),
         ),
     }
 }
@@ -4472,6 +4522,38 @@ async fn handle_resume_session(
     }
 }
 
+/// Live composer snapshot (modes / models / thinking) without reopening the session.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GetComposerControlsPayload {
+    agent_id: crate::acp::AgentId,
+    session_id: crate::acp::SessionId,
+}
+
+async fn handle_get_composer_controls(
+    id: String,
+    payload: &Value,
+    acp: &Arc<AcpManager>,
+) -> WsReply {
+    let parsed: GetComposerControlsPayload = match serde_json::from_value(payload.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            return WsReply::err(
+                id,
+                WsErrorCode::Unsupported,
+                format!("malformed get_composer_controls payload (want agentId, sessionId): {e}"),
+            )
+        }
+    };
+    match acp
+        .composer_controls(&parsed.agent_id, parsed.session_id)
+        .await
+    {
+        Ok(outcome) => ok_with_payload(id, &outcome),
+        Err(e) => acp_err_to_reply(id, e),
+    }
+}
+
 /// `close_session` → `AcpManager::close_session(agent_id, session_id)`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -4819,20 +4901,13 @@ async fn accept_send_prompt(
         }
     };
 
-    match acp
-        .owns_session(&parsed.agent_id, parsed.session_id.clone())
+    let agent_id = match acp
+        .ensure_session_on_live_agent(&parsed.agent_id, &parsed.session_id)
         .await
     {
-        Ok(true) => {}
-        Ok(false) => {
-            return Err(WsReply::err(
-                id,
-                WsErrorCode::NotFound,
-                "session does not belong to the supplied live agent",
-            ))
-        }
+        Ok(agent_id) => agent_id,
         Err(error) => return Err(acp_err_to_reply(id, error)),
-    }
+    };
 
     match relay
         .turn_watermark()
@@ -4862,33 +4937,33 @@ async fn accept_send_prompt(
     };
 
     let ephemeral = acp
-        .is_ephemeral_session(&parsed.agent_id, parsed.session_id.clone())
+        .is_ephemeral_session(&agent_id, parsed.session_id.clone())
         .await
         .map_err(|error| acp_err_to_reply(id.clone(), error))?;
     let prompt_payload = json!({
-        "agentId": parsed.agent_id.clone(),
+        "agentId": agent_id.clone(),
         "sessionId": parsed.session_id.clone(),
         "turnId": parsed.turn_id.clone(),
         "content": content.clone(),
     });
     if !ephemeral {
-        // Unbound legacy sessions have no durable home; dispatch without
-        // history instead of surfacing a red persistence error.
+        // Conversation-bound prompts must persist or the send is rejected.
+        // Legacy SessionPersistence rows still persist when the relay has a
+        // store; only a missing durable home is skipped.
         let bound = acp
             .conversation_id_for_current_session(&parsed.session_id.0)
             .is_some();
-        if bound {
-            relay
-                .persist_user_prompt(parsed.session_id.0.as_str(), prompt_payload)
-                .await
-                .map_err(|error| {
-                    WsReply::err(
-                        id.clone(),
-                        WsErrorCode::NotImplemented,
-                        format!("failed to persist accepted prompt: {error}"),
-                    )
-                })?;
-        } else {
+        if let Err(error) = relay
+            .persist_user_prompt(parsed.session_id.0.as_str(), prompt_payload)
+            .await
+        {
+            if bound {
+                return Err(WsReply::err(
+                    id.clone(),
+                    WsErrorCode::NotImplemented,
+                    format!("failed to persist accepted prompt: {error}"),
+                ));
+            }
             warn!(
                 "[ws] accepted prompt not persisted: session {} has no Conversation binding",
                 parsed.session_id.0
@@ -4897,7 +4972,7 @@ async fn accept_send_prompt(
     }
 
     let started = acp
-        .start_prompt(&parsed.agent_id, parsed.session_id, content, parsed.turn_id)
+        .start_prompt(&agent_id, parsed.session_id, content, parsed.turn_id)
         .await
         .map_err(|error| acp_err_to_reply(id.clone(), error))?;
     Ok(AcceptedSendPrompt { id, started, claim })
@@ -7085,6 +7160,7 @@ mod tests {
             "create_session",
             "load_session",
             "resume_session",
+            "get_composer_controls",
             "close_session",
             "list_sessions",
             "cancel_prompt",
@@ -7373,6 +7449,11 @@ mod tests {
         assert_eq!(r.err.unwrap().code, "rate_limited");
         // Unknown agent → not_found.
         let r = acp_err_to_reply("r2".to_string(), "unknown agent: a1".to_string());
+        assert_eq!(r.err.unwrap().code, "not_found");
+        let r = acp_err_to_reply(
+            "r2b".to_string(),
+            "session does not belong to the supplied live agent".to_string(),
+        );
         assert_eq!(r.err.unwrap().code, "not_found");
         // Capability gate → unsupported.
         let r = acp_err_to_reply(
