@@ -77,7 +77,7 @@ vi.mock('@/lib/worktree-context', () => ({
   ensureWorktreeSymlinks: mockEnsureWorktreeSymlinks
 }))
 
-import { launchAgentInPane } from '@/lib/agent-launch'
+import { launchAgentInPane, launchAgentResumeInPane } from '@/lib/agent-launch'
 import { getBuiltInAgent } from '@/lib/agents/agent-registry'
 
 const claude = getBuiltInAgent('claude-code')!
@@ -215,5 +215,37 @@ describe('launchAgentInPane', () => {
     expect(result.success).toBe(false)
     expect(result.error).toBe('no binary')
     expect(mockSetTerminals).not.toHaveBeenCalled()
+  })
+
+  it('resumes with extras before --resume and without a seed prompt', async () => {
+    const result = await launchAgentResumeInPane(
+      'pane-1',
+      'proj-1',
+      '/test',
+      claude,
+      {
+        schemaVersion: 1,
+        id: 'claude-code:abc:/tmp/a.jsonl',
+        agentId: 'claude-code',
+        sessionId: 'abc',
+        cwd: '/test',
+        title: 'Hello',
+        createdAt: null,
+        updatedAt: null,
+        messageCount: 1,
+        filePath: '/tmp/a.jsonl',
+        resumable: true
+      },
+      '--dangerously-skip-permissions',
+      ''
+    )
+    expect(result.success).toBe(true)
+    expect(mockTerminalApiSpawn).toHaveBeenCalledWith(
+      expect.objectContaining({
+        program: 'claude',
+        args: ['--dangerously-skip-permissions', '--resume', 'abc'],
+        kind: 'agent'
+      })
+    )
   })
 })

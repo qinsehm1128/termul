@@ -53,6 +53,7 @@ use crate::web::auth::{
 use crate::web::operation_policy;
 use crate::web::permissions::{TurnClaim, DEFAULT_PERMISSION_RECONNECT_GRACE};
 use crate::web::project_registry::{ProjectRegistry, ProjectSwitchContext};
+use crate::cli_session::{list_cli_sessions, CliSessionListArgs};
 use crate::web::sink::{
     broadcast_projects_changed, AcpEvent, ClientId, ReplayResult, WsRelaySink,
     CLIENT_OUTBOUND_BYTES, CLIENT_OUTBOUND_RECORDS, MAX_CONNECTION_SUBSCRIPTIONS,
@@ -1847,6 +1848,7 @@ async fn handle_request_with_conversation(
         "store_read" => handle_store_read(id, &req.payload, store).await,
         "store_write" => handle_store_write(id, &req.payload, store).await,
         "store_delete" => handle_store_delete(id, &req.payload, store).await,
+        "list_cli_sessions" => handle_list_cli_sessions(id, &req.payload, registry).await,
         "kill_agent" => {
             handle_kill_agent(
                 id,
@@ -3509,6 +3511,57 @@ async fn handle_store_delete(
                 format!("task failed: {join_err}"),
             )
         }
+    }
+}
+
+async fn handle_list_cli_sessions(
+    id: String,
+    payload: &Value,
+    registry: &Arc<ProjectRegistry>,
+) -> WsReply {
+    let args: CliSessionListArgs = if payload.is_null() {
+        CliSessionListArgs::default()
+    } else {
+        match serde_json::from_value(payload.clone()) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return WsReply::err_with_code(
+                    id,
+                    "VALIDATION_ERROR",
+                    format!("malformed list_cli_sessions payload: {error}"),
+                )
+            }
+        }
+    };
+    let mut allowed = Vec::new();
+    if let Some(path) = registry.default_project_path() {
+        if !path.trim().is_empty() {
+            allowed.push(PathBuf::from(path));
+        }
+    }
+    for project in registry.snapshot().projects {
+        if project.is_archived {
+            continue;
+        }
+        if let Some(path) = project.path.filter(|value| !value.trim().is_empty()) {
+            allowed.push(PathBuf::from(path));
+        }
+    }
+    match tokio::task::spawn_blocking(move || list_cli_sessions(args, Some(&allowed))).await {
+        Ok(result) => {
+            info!(
+                target: "termul::web::ws",
+                "operation=list_cli_sessions sessions={} issues={}",
+                result.sessions.len(),
+                result.issues.len()
+            );
+            ok_with_payload(id, &result)
+        }
+        Err(error) => WsReply::err_with_code(
+            id,
+            "SCAN_FAILED",
+            format!("cli session scan join failed: {error}"),
+        ),
     }
 }
 

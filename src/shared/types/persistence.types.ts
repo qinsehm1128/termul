@@ -85,6 +85,8 @@ export const PersistenceKeys = {
   // last run, not the global last pick for the agent.
   conversationComposer: (conversationId: string): string =>
     `conversations/composer-options/${conversationId}`,
+  // Per-agent default extra argv used when resuming a scanned CLI session.
+  cliResumeDefaults: 'agents/cli-resume-defaults',
   // Mobile file explorer: last folder the user navigated into, per project.
   // Restored on drawer reopen across close/reopen and page reloads (web only).
   mobileFileExplorerFolder: (projectId: string): string => `mobile-file-explorer/${projectId}`

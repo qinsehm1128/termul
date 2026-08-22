@@ -3,6 +3,7 @@ import { runtimeT } from '@/i18n/runtime'
 import { acpApi, persistenceApi, terminalApi } from '@/lib/api'
 import { getSystemAppearance, normalizeThemeFamilyId } from '@/lib/themes/theme-appearance'
 import { useAppSettingsStore } from '@/stores/app-settings-store'
+import { useCliSessionPanelStore } from '@/stores/cli-session-panel-store'
 import { useFileExplorerStore } from '@/stores/file-explorer-store'
 import { useSidebarStore } from '@/stores/sidebar-store'
 import { useSSHPanelStore } from '@/stores/ssh-panel-store'
@@ -22,7 +23,8 @@ let panelWriteChain: Promise<void> = Promise.resolve()
 const panelWriteRequestIds: Record<PanelSettingKey, number> = {
   sidebarVisible: 0,
   fileExplorerVisible: 0,
-  sshPanelVisible: 0
+  sshPanelVisible: 0,
+  cliSessionPanelVisible: 0
 }
 let panelWriteRevision = 0
 let lastSuccessfulPanelWriteRevision = 0
@@ -52,6 +54,7 @@ function buildPanelWriteSnapshot(request: PanelWriteRequest): AppSettings {
     sidebarVisible: persistedPanelSettingsSnapshot.sidebarVisible,
     fileExplorerVisible: persistedPanelSettingsSnapshot.fileExplorerVisible,
     sshPanelVisible: persistedPanelSettingsSnapshot.sshPanelVisible,
+    cliSessionPanelVisible: persistedPanelSettingsSnapshot.cliSessionPanelVisible,
     [request.panel]: request.visible
   }
 }
@@ -108,6 +111,7 @@ export function resetAppSettingsPersistenceQueueForTests(): void {
   panelWriteRequestIds.sidebarVisible = 0
   panelWriteRequestIds.fileExplorerVisible = 0
   panelWriteRequestIds.sshPanelVisible = 0
+  panelWriteRequestIds.cliSessionPanelVisible = 0
   panelWriteRevision = 0
   lastSuccessfulPanelWriteRevision = 0
   persistedPanelSettingsSnapshot = { ...DEFAULT_APP_SETTINGS }
@@ -123,6 +127,11 @@ function applyPanelVisibilityToUi(panel: PanelSettingKey, visible: boolean): voi
 
   if (panel === 'sshPanelVisible') {
     useSSHPanelStore.getState().setVisible(visible)
+    return
+  }
+
+  if (panel === 'cliSessionPanelVisible') {
+    useCliSessionPanelStore.getState().setVisible(visible)
     return
   }
 
@@ -192,6 +201,7 @@ export function useAppSettingsLoader(): void {
       useSidebarStore.getState().setVisible(settings.sidebarVisible)
       useFileExplorerStore.getState().setVisible(settings.fileExplorerVisible)
       useSSHPanelStore.getState().setVisible(settings.sshPanelVisible)
+      useCliSessionPanelStore.getState().setVisible(settings.cliSessionPanelVisible)
 
       // Apply orphan detection settings to PtyManager after settings load
       try {
@@ -305,6 +315,7 @@ export function useResetAppSettings(): () => Promise<void> {
     useSidebarStore.getState().setVisible(DEFAULT_APP_SETTINGS.sidebarVisible)
     useFileExplorerStore.getState().setVisible(DEFAULT_APP_SETTINGS.fileExplorerVisible)
     useSSHPanelStore.getState().setVisible(DEFAULT_APP_SETTINGS.sshPanelVisible)
+    useCliSessionPanelStore.getState().setVisible(DEFAULT_APP_SETTINGS.cliSessionPanelVisible)
 
     const result = await persistenceApi.write(APP_SETTINGS_KEY, DEFAULT_APP_SETTINGS)
     if (result.success) {

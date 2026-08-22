@@ -4,6 +4,7 @@ mod acp_binary_install;
 mod acp_registry_snapshot;
 mod agent_registry;
 mod browser_tab_manager;
+mod cli_session;
 mod commands;
 pub mod conversation;
 mod host_admission;
@@ -2174,6 +2175,7 @@ pub fn run() {
             scheduled_tasks::commands::scheduled_task_retry_run,
             scheduled_tasks::commands::scheduled_task_list_runs,
             scheduled_tasks::commands::scheduled_task_list_audit,
+            cli_session::commands::list_cli_sessions_cmd,
             // Remote server commands
             commands::remote_server_start,
             commands::remote_server_stop,

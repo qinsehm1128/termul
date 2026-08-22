@@ -11,6 +11,7 @@
 export { acpApi } from './acp-api'
 export { acpCatalogApi } from './acp-catalog-api'
 export { acpInstallApi } from './acp-install-api'
+export { cliSessionApi } from './cli-session-api'
 export { clipboardApi } from './clipboard-api'
 export { conversationApi } from './conversation-api'
 export { dialogApi } from './dialog-api'

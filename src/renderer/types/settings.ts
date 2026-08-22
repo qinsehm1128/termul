@@ -66,6 +66,7 @@ export interface AppSettings {
   sidebarVisible: boolean
   fileExplorerVisible: boolean
   sshPanelVisible: boolean
+  cliSessionPanelVisible: boolean
   /** Remote server bind: localhost (127.0.0.1) or all interfaces (0.0.0.0). */
   remoteBindMode: RemoteBindMode
   /** App-wide color theme family id (without `-light` suffix). */
@@ -115,6 +116,7 @@ export type AppPanelVisibilitySettingKey =
   | 'sidebarVisible'
   | 'fileExplorerVisible'
   | 'sshPanelVisible'
+  | 'cliSessionPanelVisible'
 
 export type AppSettingsUpdate = Partial<Omit<AppSettings, AppPanelVisibilitySettingKey>>
 
@@ -306,6 +308,7 @@ export const DEFAULT_APP_SETTINGS: AppSettings = {
   sidebarVisible: true,
   fileExplorerVisible: true,
   sshPanelVisible: true,
+  cliSessionPanelVisible: false,
   remoteBindMode: 'localhost',
   colorTheme: 'termul',
   appearanceMode: 'dark',
@@ -433,6 +436,12 @@ export const DEFAULT_KEYBOARD_SHORTCUTS: KeyboardShortcutsConfig = {
     label: 'Toggle File Explorer',
     description: 'Show or hide the file explorer panel',
     defaultKey: 'ctrl+b'
+  },
+  toggleCliSessionPanel: {
+    id: 'toggleCliSessionPanel',
+    label: 'Toggle CLI Sessions',
+    description: 'Show or hide the CLI session vault panel',
+    defaultKey: 'ctrl+shift+h'
   },
   fileExplorerRename: {
     id: 'fileExplorerRename',

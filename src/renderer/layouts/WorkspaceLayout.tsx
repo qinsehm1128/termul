@@ -17,6 +17,7 @@ import { ResizeEdges } from '@/components/ResizeEdges'
 import { StatusBar } from '@/components/StatusBar'
 import { TitleBar } from '@/components/TitleBar'
 import {
+  CliSessionPanelToggleButton,
   FileExplorerToggleButton,
   SidebarToggleButton,
   titlebarNoDragStyle
@@ -95,6 +96,7 @@ import {
   useUiZoomLevel
 } from '@/stores/app-settings-store'
 import { useBrowserSessionStore } from '@/stores/browser-session-store'
+import { useCliSessionPanelVisible } from '@/stores/cli-session-panel-store'
 import { useCommandHistoryStore } from '@/stores/command-history-store'
 import { useConversationStore } from '@/stores/conversation-store'
 import { useEditorStore } from '@/stores/editor-store'
@@ -157,6 +159,9 @@ const ThemePicker = lazy(() =>
 )
 const FileExplorer = lazy(() =>
   import('@/components/file-explorer/FileExplorer').then((m) => ({ default: m.FileExplorer }))
+)
+const CliSessionPanel = lazy(() =>
+  import('@/components/cli-sessions/CliSessionPanel').then((m) => ({ default: m.CliSessionPanel }))
 )
 const MobileChatShell = lazy(() =>
   import('@/components/mobile/MobileChatShell').then((m) => ({ default: m.MobileChatShell }))
@@ -229,6 +234,7 @@ function MacOsTitlebarStrip(): React.JSX.Element | null {
 
       {/* Right-sidebar (file explorer) toggle — top-right. */}
       <div className="flex items-center h-full" style={titlebarNoDragStyle}>
+        <CliSessionPanelToggleButton />
         <FileExplorerToggleButton />
       </div>
     </div>
@@ -331,6 +337,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
 
   // File explorer & editor state
   const isExplorerVisible = useFileExplorerVisible()
+  const isCliSessionPanelVisible = useCliSessionPanelVisible()
   const isSidebarVisible = useSidebarVisible()
   const isMobileWebShell = useMobileWebShell()
 
@@ -1574,6 +1581,26 @@ export default function WorkspaceLayout(): React.JSX.Element {
         return
       }
 
+      if (matchesShortcut(e, getActiveKey('toggleCliSessionPanel'))) {
+        if (!isInEditor && !isInInput && !isInTerminal) {
+          e.preventDefault()
+          void updatePanelVisibility('cliSessionPanelVisible', !isCliSessionPanelVisible).catch(
+            (error) => {
+              toast.error(
+                error instanceof Error
+                  ? error.message
+                  : runtimeT(
+                      'shell',
+                      'titleBar.failedCliSessions',
+                      'Failed to update CLI sessions visibility'
+                    )
+              )
+            }
+          )
+        }
+        return
+      }
+
       if (matchesShortcut(e, getActiveKey('sidebarToggle'))) {
         if (!isInEditor && !isInInput) {
           e.preventDefault()
@@ -1748,6 +1775,7 @@ export default function WorkspaceLayout(): React.JSX.Element {
     handleNewBrowserTab,
     updatePanelVisibility,
     isExplorerVisible,
+    isCliSessionPanelVisible,
     isSidebarVisible,
     handleOpenThemePicker,
     closeActiveTab,
@@ -2256,6 +2284,21 @@ export default function WorkspaceLayout(): React.JSX.Element {
             onOpenCommandHistory={activeProjectId ? handleOpenCommandHistory : undefined}
             onOpenShortcutMenu={handleOpenShortcutMenu}
             onOpenThemePicker={handleOpenThemePicker}
+            onToggleCliSessionPanel={() => {
+              void updatePanelVisibility('cliSessionPanelVisible', !isCliSessionPanelVisible).catch(
+                (error) => {
+                  toast.error(
+                    error instanceof Error
+                      ? error.message
+                      : runtimeT(
+                          'shell',
+                          'titleBar.failedCliSessions',
+                          'Failed to update CLI sessions visibility'
+                        )
+                  )
+                }
+              )
+            }}
             onSSHConnect={handleSSHConnect}
             sshProfiles={sshProfiles.map((p) => ({
               id: p.id,
@@ -2560,16 +2603,35 @@ export default function WorkspaceLayout(): React.JSX.Element {
                     ) : null}
                   </main>
 
-                  {/* File Explorer - integrated right rail */}
+                  {/* File Explorer / CLI sessions / SSH - integrated right rail */}
                   <PanelFade
-                    open={Boolean((isExplorerVisible && explorerRootVisible) || activeSSHProfile)}
+                    open={Boolean(
+                      (isExplorerVisible && explorerRootVisible) ||
+                        isCliSessionPanelVisible ||
+                        activeSSHProfile
+                    )}
                     data-testid="explorer-rail-fade"
                     className="flex h-full flex-shrink-0 flex-col border-l border-border/70"
                   >
                     <PanelFade
+                      open={isCliSessionPanelVisible}
+                      data-testid="cli-session-panel-fade"
+                      className={
+                        (isExplorerVisible && explorerRootVisible) || activeSSHProfile
+                          ? 'min-h-0 flex-1'
+                          : 'h-full'
+                      }
+                    >
+                      <Suspense fallback={<ShellSkeleton />}>
+                        <CliSessionPanel />
+                      </Suspense>
+                    </PanelFade>
+                    <PanelFade
                       open={Boolean(isExplorerVisible && explorerRootVisible)}
                       data-testid="file-explorer-panel-fade"
-                      className={activeSSHProfile ? 'min-h-0 flex-1' : 'h-full'}
+                      className={
+                        activeSSHProfile || isCliSessionPanelVisible ? 'min-h-0 flex-1' : 'h-full'
+                      }
                     >
                       <Suspense fallback={<ShellSkeleton />}>
                         <FileExplorer side="right" />
@@ -2579,7 +2641,9 @@ export default function WorkspaceLayout(): React.JSX.Element {
                       <div
                         className={cn(
                           'flex min-h-0 flex-1 flex-col overflow-hidden border-t border-border/70 bg-background',
-                          !(isExplorerVisible && explorerRootVisible) && 'w-64'
+                          !(
+                            (isExplorerVisible && explorerRootVisible) || isCliSessionPanelVisible
+                          ) && 'w-64'
                         )}
                       >
                         <Suspense fallback={<ShellSkeleton />}>

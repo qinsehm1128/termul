@@ -137,6 +137,7 @@ describe('built-in agent definitions', () => {
     const ids = BUILT_IN_AGENTS.map((a) => a.id)
     expect(new Set(ids).size).toBe(ids.length)
     expect(BUILT_IN_AGENTS.every((a) => a.isBuiltIn)).toBe(true)
+    expect(BUILT_IN_AGENTS.every((a) => a.resumeMode != null)).toBe(true)
   })
 
   it('produces the exact documented argv for each built-in', () => {

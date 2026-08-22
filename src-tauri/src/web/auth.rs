@@ -137,6 +137,7 @@ pub enum RemoteRouteClass {
     Git,
     Search,
     Skill,
+    CliSession,
     FrontendLog,
     Workspace,
     Conversation,
@@ -160,6 +161,7 @@ impl RemoteRouteClass {
             Self::Git => "git",
             Self::Search => "search",
             Self::Skill => "skill",
+            Self::CliSession => "cli_session",
             Self::FrontendLog => "frontend_log",
             Self::Workspace => "workspace",
             Self::Conversation => "conversation",
@@ -207,6 +209,8 @@ impl RemoteRouteClass {
             Some(Self::Search)
         } else if path == "/skills" || path.starts_with("/skills/") {
             Some(Self::Skill)
+        } else if path == "/cli-sessions" || path.starts_with("/cli-sessions/") {
+            Some(Self::CliSession)
         } else if path.starts_with("/log/") {
             Some(Self::FrontendLog)
         } else if path.starts_with("/workspace/") {
@@ -2243,6 +2247,7 @@ mod tests {
             ),
             ("/projects/default", RemoteRouteClass::Project),
             ("/worktree/remove", RemoteRouteClass::Worktree),
+            ("/cli-sessions", RemoteRouteClass::CliSession),
             ("/conversation-recovery/resolve", RemoteRouteClass::Recovery),
             ("/ws", RemoteRouteClass::AcpWebSocket),
             ("/terminal/ws", RemoteRouteClass::TerminalWebSocket),

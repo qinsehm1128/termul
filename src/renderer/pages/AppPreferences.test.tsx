@@ -98,6 +98,10 @@ vi.mock('@/components/settings/McpServersSettings', () => ({
   McpServersSettings: () => null
 }))
 
+vi.mock('@/components/settings/CliResumeDefaultsSettings', () => ({
+  CliResumeDefaultsSettings: () => null
+}))
+
 function renderPage(): ReturnType<typeof render> {
   return render(
     <MemoryRouter>

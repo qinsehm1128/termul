@@ -12,8 +12,10 @@
  * command-line quoting on Windows) guarantees this.
  */
 
+import type { DiscoveredCliSession } from '@shared/types/cli-session.types'
 import { runtimeT } from '@/i18n/runtime'
 import { buildAgentArgv, type TerminalAgentDefinition } from '@/lib/agents/agent-registry'
+import { buildCliResumeArgv } from '@/lib/agents/cli-session-resume-argv'
 import { terminalApi } from '@/lib/api'
 import { resolveEnvForSpawn } from '@/lib/env-parser'
 import { ensureWorktreeSymlinks } from '@/lib/worktree-context'
@@ -28,6 +30,10 @@ export interface LaunchAgentOptions {
   envVars?: Array<{ key: string; value: string; enabled?: boolean }>
   /** Per-project terminal limit. Spawns are blocked at this count. */
   maxTerminalsPerProject?: number
+  /** When set, skip prompt-mode argv and spawn this exact args list. */
+  argvOverride?: string[]
+  /** Extra env merged after project + agent env (e.g. CODEX_HOME). */
+  extraEnv?: Record<string, string>
 }
 
 export interface LaunchAgentResult {
@@ -139,11 +145,15 @@ export async function launchAgentInPane(
     // Merge any agent-declared env on top of project env. Values may reference
     // an existing var with a leading `$` (resolved against the project env).
     const agentEnv = resolveAgentEnv(def.env, projectEnv)
-    const mergedEnv = { ...projectEnv, ...agentEnv }
-    const hasEnv = hasProjectEnv || Object.keys(agentEnv).length > 0
+    const mergedEnv = { ...projectEnv, ...agentEnv, ...(options?.extraEnv ?? {}) }
+    const hasEnv =
+      hasProjectEnv ||
+      Object.keys(agentEnv).length > 0 ||
+      Object.keys(options?.extraEnv ?? {}).length > 0
 
-    // Build argv from the registry definition + prompt (pure, injection-safe).
-    const { program, args } = buildAgentArgv(def, prompt)
+    const { program, args } = options?.argvOverride
+      ? { program: def.command, args: options.argvOverride }
+      : buildAgentArgv(def, prompt)
 
     const spawnResult = await terminalApi.spawn({
       conversationId,
@@ -175,7 +185,7 @@ export async function launchAgentInPane(
     // "orphaned" to syncTerminalTabs, which removed the tab and cascaded into
     // a MOUNT/UNMOUNT storm.
     const terminalId = Date.now().toString()
-    const agentArgsCopy = [...def.baseArgs]
+    const agentArgsCopy = options?.argvOverride ? [...args] : [...def.baseArgs]
 
     const latestTerminals = useTerminalStore.getState().terminals
     terminalStore.setTerminals([
@@ -245,5 +255,30 @@ export async function launchAgentInActivePane(
   return launchAgentInPane(paneId, projectId, cwd, def, prompt, {
     envVars: project?.envVars,
     maxTerminalsPerProject
+  })
+}
+
+export async function launchAgentResumeInPane(
+  paneId: string,
+  projectId: string,
+  cwd: string,
+  def: TerminalAgentDefinition,
+  session: DiscoveredCliSession,
+  defaultExtraArgs: string,
+  onceExtraArgs: string,
+  options?: LaunchAgentOptions
+): Promise<LaunchAgentResult> {
+  const built = buildCliResumeArgv(def, session, defaultExtraArgs, onceExtraArgs)
+  if ('error' in built) {
+    return { success: false, error: built.error }
+  }
+
+  const extraEnv =
+    session.agentId === 'codex' && session.codexHome ? { CODEX_HOME: session.codexHome } : undefined
+
+  return launchAgentInPane(paneId, projectId, cwd, def, undefined, {
+    ...options,
+    argvOverride: built.args,
+    extraEnv: { ...options?.extraEnv, ...extraEnv }
   })
 }

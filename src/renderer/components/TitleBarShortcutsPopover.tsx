@@ -14,6 +14,7 @@ const QUICK_SHORTCUT_IDS = [
   'newTerminal',
   'newBrowserTab',
   'toggleFileExplorer',
+  'toggleCliSessionPanel',
   'sidebarToggle',
   'zoomIn',
   'zoomOut',
