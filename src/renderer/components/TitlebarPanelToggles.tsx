@@ -1,7 +1,8 @@
-import { PanelLeft, PanelRight } from 'lucide-react'
+import { History, PanelLeft, PanelRight } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { useUpdatePanelVisibility } from '@/hooks/use-app-settings'
+import { useCliSessionPanelVisible } from '@/stores/cli-session-panel-store'
 import { useFileExplorerVisible } from '@/stores/file-explorer-store'
 import { useSidebarVisible } from '@/stores/sidebar-store'
 
@@ -101,6 +102,38 @@ export function FileExplorerToggleButton({
       aria-pressed={isVisible}
     >
       <PanelRight size={16} className="text-current" />
+    </button>
+  )
+}
+
+export function CliSessionPanelToggleButton({
+  className = titlebarToggleButtonClass
+}: ToggleButtonProps): React.JSX.Element {
+  const { t } = useTranslation('shell')
+  const isVisible = useCliSessionPanelVisible()
+  const updatePanelVisibility = useUpdatePanelVisibility()
+
+  const handleClick = async (e: React.MouseEvent<HTMLButtonElement>): Promise<void> => {
+    e.stopPropagation()
+    try {
+      await updatePanelVisibility('cliSessionPanelVisible', !isVisible)
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : t('titleBar.failedCliSessions'))
+    }
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        void handleClick(e)
+      }}
+      className={className}
+      title={t('titleBar.toggleCliSessions')}
+      aria-label={isVisible ? t('titleBar.hideCliSessions') : t('titleBar.showCliSessions')}
+      aria-pressed={isVisible}
+    >
+      <History size={16} className="text-current" />
     </button>
   )
 }

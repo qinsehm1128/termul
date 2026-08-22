@@ -387,6 +387,15 @@ const P1_DOMAINS: DomainCheck[] = [
     ],
     apiBridgeExport: 'scheduledTaskApi',
     testFile: '../tauri-scheduled-task-api.test.ts'
+  },
+  {
+    domain: 'CliSession',
+    priority: 'P1',
+    tauriAdapterFile: 'tauri-cli-session-api.ts',
+    adapterExportName: 'createTauriCliSessionApi',
+    methods: ['listSessions'],
+    apiBridgeExport: 'cliSessionApi',
+    testFile: 'cli-session-api.web.test.ts'
   }
 ]
 
@@ -1094,6 +1103,60 @@ describe('Parity Checklist Automation', () => {
       const protoPath = join(LIB_DIR, '..', '..', 'shared', 'types', 'web-protocol.types.ts')
       const content = readFileSync(protoPath, 'utf-8')
       expect(content).toMatch(/'install_acp_agent'/)
+    })
+  })
+
+  describe('CLI session vault parity', () => {
+    const TauriAdapter = join(LIB_DIR, 'tauri-cli-session-api.ts')
+    const WebAdapter = join(LIB_DIR, 'web-cli-session-api.ts')
+
+    it('tauri-cli-session-api.ts exists and exports the factory', () => {
+      expect(existsSync(TauriAdapter)).toBe(true)
+      expect(
+        fileContains(
+          'tauri-cli-session-api.ts',
+          /export\s+(const|function)\s+\bcreateTauriCliSessionApi\b/
+        )
+      ).toBe(true)
+    })
+
+    it('web adapter and HTTP helper hit POST /cli-sessions', () => {
+      expect(existsSync(WebAdapter)).toBe(true)
+      const web = readFileSync(WebAdapter, 'utf-8')
+      const server = readFileSync(join(LIB_DIR, 'web-server-api.ts'), 'utf-8')
+      expect(web).toMatch(/webServerCliSessions/)
+      expect(server).toMatch(/\/cli-sessions/)
+    })
+
+    it('facade branches Tauri vs web by isTauriContext()', () => {
+      const facade = readFileSync(join(LIB_DIR, 'cli-session-api.ts'), 'utf-8')
+      expect(facade).toMatch(/isTauriContext\(\)/)
+      expect(facade).toMatch(/createTauriCliSessionApi/)
+      expect(facade).toMatch(/webCliSessionApi/)
+    })
+
+    it('api.ts exports the cliSessionApi singleton', () => {
+      const content = readFileSync(join(LIB_DIR, 'api.ts'), 'utf-8')
+      expect(content).toMatch(/export\s*\{[^}]*\bcliSessionApi\b[^}]*\}/)
+    })
+
+    it('web-protocol.types.ts declares the WS request type', () => {
+      const protoPath = join(LIB_DIR, '..', '..', 'shared', 'types', 'web-protocol.types.ts')
+      const content = readFileSync(protoPath, 'utf-8')
+      expect(content).toMatch(/'list_cli_sessions'/)
+    })
+
+    it('host router and ws.rs register the third transport', () => {
+      const router = readFileSync(
+        join(LIB_DIR, '..', '..', '..', 'src-tauri', 'src', 'web', 'router.rs'),
+        'utf-8'
+      )
+      const ws = readFileSync(
+        join(LIB_DIR, '..', '..', '..', 'src-tauri', 'src', 'web', 'ws.rs'),
+        'utf-8'
+      )
+      expect(router).toMatch(/\/cli-sessions/)
+      expect(ws).toMatch(/"list_cli_sessions"/)
     })
   })
 

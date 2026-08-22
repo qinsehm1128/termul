@@ -34,6 +34,15 @@ import piIcon from '@/assets/agent-icons/pi.svg?raw'
  */
 export type AgentPromptMode = 'positional' | 'flag' | 'none'
 
+/** How a scanned vendor session is resumed on the CLI TUI. */
+export type AgentResumeKind = 'flag' | 'subcommand' | 'file-flag'
+
+export interface AgentResumeMode {
+  kind: AgentResumeKind
+  /** `--resume`, `resume`, or `--session`. */
+  token: string
+}
+
 export interface TerminalAgentDefinition {
   /** Stable launch-table id, e.g. 'claude-code'. */
   id: string
@@ -59,6 +68,8 @@ export interface TerminalAgentDefinition {
   registryId?: string
   /** True for app-shipped definitions; false for user-defined agents. */
   isBuiltIn: boolean
+  /** Present on built-ins that can resume a scanned vendor session. */
+  resumeMode?: AgentResumeMode
 }
 
 /**
@@ -107,7 +118,8 @@ export const BUILT_IN_AGENTS: readonly TerminalAgentDefinition[] = [
     promptMode: 'positional',
     registryId: 'claude-acp',
     icon: claudeCodeIcon as string,
-    isBuiltIn: true
+    isBuiltIn: true,
+    resumeMode: { kind: 'flag', token: '--resume' }
   },
   {
     id: 'codex',
@@ -117,7 +129,8 @@ export const BUILT_IN_AGENTS: readonly TerminalAgentDefinition[] = [
     promptMode: 'positional',
     registryId: 'codex-acp',
     icon: codexIcon as string,
-    isBuiltIn: true
+    isBuiltIn: true,
+    resumeMode: { kind: 'subcommand', token: 'resume' }
   },
   {
     id: 'cursor',
@@ -127,7 +140,8 @@ export const BUILT_IN_AGENTS: readonly TerminalAgentDefinition[] = [
     promptMode: 'positional',
     registryId: 'cursor',
     icon: cursorIcon as string,
-    isBuiltIn: true
+    isBuiltIn: true,
+    resumeMode: { kind: 'flag', token: '--resume' }
   },
   {
     id: 'gemini-cli',
@@ -138,7 +152,8 @@ export const BUILT_IN_AGENTS: readonly TerminalAgentDefinition[] = [
     promptFlag: '-i',
     registryId: 'gemini',
     icon: geminiIcon as string,
-    isBuiltIn: true
+    isBuiltIn: true,
+    resumeMode: { kind: 'flag', token: '--resume' }
   },
   {
     id: 'opencode',
@@ -149,7 +164,8 @@ export const BUILT_IN_AGENTS: readonly TerminalAgentDefinition[] = [
     promptFlag: '--prompt',
     registryId: 'opencode',
     icon: opencodeIcon as string,
-    isBuiltIn: true
+    isBuiltIn: true,
+    resumeMode: { kind: 'flag', token: '--session' }
   },
   {
     id: 'pi',
@@ -162,7 +178,8 @@ export const BUILT_IN_AGENTS: readonly TerminalAgentDefinition[] = [
     promptMode: 'positional',
     registryId: 'pi-acp',
     icon: piIcon as string,
-    isBuiltIn: true
+    isBuiltIn: true,
+    resumeMode: { kind: 'file-flag', token: '--session' }
   }
 ] as const
 

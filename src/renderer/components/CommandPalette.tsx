@@ -31,7 +31,12 @@ import { isTauriContext } from '@/lib/tauri-runtime'
 import { cn } from '@/lib/utils'
 import type { Project, ProjectColor } from '@/types/project'
 
-type CommandShortcutId = 'newTerminal' | 'newBrowserTab' | 'commandHistory' | 'colorThemePicker'
+type CommandShortcutId =
+  | 'newTerminal'
+  | 'newBrowserTab'
+  | 'commandHistory'
+  | 'colorThemePicker'
+  | 'toggleCliSessionPanel'
 
 interface CommandPaletteProps {
   isOpen: boolean
@@ -48,6 +53,7 @@ interface CommandPaletteProps {
   onOpenCommandHistory?: () => void
   onOpenShortcutMenu?: () => void
   onOpenThemePicker?: () => void
+  onToggleCliSessionPanel?: () => void
   onSSHConnect?: (profileId: string) => void
   sshProfiles?: Array<{ id: string; name: string; host: string; username: string }>
   getShortcutLabel?: (id: CommandShortcutId) => string | undefined
@@ -91,6 +97,7 @@ export function CommandPalette({
   onOpenCommandHistory,
   onOpenShortcutMenu,
   onOpenThemePicker,
+  onToggleCliSessionPanel,
   onSSHConnect,
   sshProfiles,
   getShortcutLabel,
@@ -228,6 +235,20 @@ export function CommandPalette({
             }
           ]
         : []),
+      ...(onToggleCliSessionPanel
+        ? [
+            {
+              id: 'toggle-cli-session-panel',
+              category: 'workspace' as const,
+              icon: <History aria-hidden="true" size={16} />,
+              label: t('commandPalette.toggleCliSessions'),
+              description: t('commandPalette.toggleCliSessionsDescription'),
+              keywords: ['cli', 'session', 'vault', 'resume', 'claude', 'codex', 'history'],
+              shortcut: getShortcutLabel?.('toggleCliSessionPanel'),
+              execute: onToggleCliSessionPanel
+            }
+          ]
+        : []),
       ...(onOpenThemePicker
         ? [
             {
@@ -283,6 +304,7 @@ export function CommandPalette({
       onOpenCommandHistory,
       onOpenShortcutMenu,
       onOpenThemePicker,
+      onToggleCliSessionPanel,
       onSSHConnect,
       sshProfiles,
       getShortcutLabel,

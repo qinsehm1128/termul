@@ -31,6 +31,7 @@ vi.mock('@/stores/project-store', () => ({
 vi.mock('@/components/TitlebarPanelToggles', () => ({
   SidebarToggleButton: () => <button type="button">toggle-sidebar</button>,
   FileExplorerToggleButton: () => <button type="button">toggle-explorer</button>,
+  CliSessionPanelToggleButton: () => <button type="button">toggle-cli-sessions</button>,
   titlebarNoDragStyle: { WebkitAppRegion: 'no-drag' }
 }))
 
