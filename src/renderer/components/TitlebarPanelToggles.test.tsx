@@ -1,8 +1,13 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { useCliSessionPanelStore } from '@/stores/cli-session-panel-store'
 import { useFileExplorerStore } from '@/stores/file-explorer-store'
 import { useSidebarStore } from '@/stores/sidebar-store'
-import { FileExplorerToggleButton, SidebarToggleButton } from './TitlebarPanelToggles'
+import {
+  CliSessionPanelToggleButton,
+  FileExplorerToggleButton,
+  SidebarToggleButton
+} from './TitlebarPanelToggles'
 
 const { mockUpdatePanelVisibility, mockToastError } = vi.hoisted(() => ({
   mockUpdatePanelVisibility: vi.fn(() => Promise.resolve()),
@@ -24,6 +29,7 @@ describe('TitlebarPanelToggles', () => {
     vi.clearAllMocks()
     useSidebarStore.setState({ isVisible: true })
     useFileExplorerStore.setState({ isVisible: true })
+    useCliSessionPanelStore.setState({ isVisible: false })
   })
 
   it('toggles sidebar via persistence-aware updater on click', async () => {
@@ -55,6 +61,16 @@ describe('TitlebarPanelToggles', () => {
 
     await waitFor(() => {
       expect(mockToastError).toHaveBeenCalledWith('persist failed')
+    })
+  })
+
+  it('toggles CLI sessions via persistence-aware updater on click', async () => {
+    render(<CliSessionPanelToggleButton />)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Show CLI sessions' }))
+
+    await waitFor(() => {
+      expect(mockUpdatePanelVisibility).toHaveBeenCalledWith('cliSessionPanelVisible', true)
     })
   })
 

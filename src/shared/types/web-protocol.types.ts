@@ -182,7 +182,10 @@ export const WS_REQUEST_TYPES = [
   'resolve_recovery_item',
   'attach_project',
   'detach_project',
-  'update_execution_target'
+  'update_execution_target',
+  // Host-scanned vendor CLI transcripts (cwd-scoped). Distinct from ACP
+  // `list_sessions` / Conversation history.
+  'list_cli_sessions'
 ] as const
 
 /** Union of all WS request `type` strings. */

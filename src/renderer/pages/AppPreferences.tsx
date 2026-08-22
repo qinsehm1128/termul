@@ -23,6 +23,7 @@ import { useNavigate } from 'react-router-dom'
 import { ConfirmDialog } from '@/components/ConfirmDialog'
 import { ShortcutRecorder } from '@/components/ShortcutRecorder'
 import { AcpAgentsSettings } from '@/components/settings/AcpAgentsSettings'
+import { CliResumeDefaultsSettings } from '@/components/settings/CliResumeDefaultsSettings'
 import { McpServersSettings } from '@/components/settings/McpServersSettings'
 import { RemoteAccessSettings } from '@/components/settings/RemoteAccessSettings'
 import {
@@ -1108,6 +1109,7 @@ export default function AppPreferences(): React.JSX.Element {
               </div>
               <div className="w-2/3 space-y-4">
                 <AcpAgentsSettings />
+                <CliResumeDefaultsSettings />
                 <div>
                   <label className="block text-sm font-medium text-secondary-foreground mb-2">
                     {tSettings('aiAgents.preferLocalNpmInstall')}

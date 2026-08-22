@@ -23,6 +23,7 @@ import { useShallow } from 'zustand/shallow'
 import { ConversationLifecycleActions } from '@/components/chat/ChatHistoryEntryRow'
 import { ChatHistoryTab } from '@/components/chat/ChatHistoryTab'
 import { ProjectSwitcherDrawer } from '@/components/chat/ProjectSwitcherDrawer'
+import { CliSessionPanel } from '@/components/cli-sessions/CliSessionPanel'
 import { ExecutionTargetPicker } from '@/components/conversation/ExecutionTargetPicker'
 import { TermulMark } from '@/components/TermulMark'
 import { Button } from '@/components/ui/button'
@@ -84,6 +85,7 @@ export function MobileChatShell({
   const [projectsOpen, setProjectsOpen] = useState(false)
   const [filesOpen, setFilesOpen] = useState(false)
   const [targetOpen, setTargetOpen] = useState(false)
+  const [sessionsOpen, setSessionsOpen] = useState(false)
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const navigate = useNavigate()
@@ -256,6 +258,20 @@ export function MobileChatShell({
             onClick={() => setFilesOpen(true)}
           >
             <FolderTree size={20} />
+          </Button>
+        )}
+
+        {!isTauriContext() && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-10 shrink-0"
+            aria-label={t('chatShell.cliSessions')}
+            aria-expanded={sessionsOpen}
+            onClick={() => setSessionsOpen(true)}
+          >
+            <History size={20} />
           </Button>
         )}
 
@@ -566,6 +582,21 @@ export function MobileChatShell({
       )}
 
       {!isTauriContext() && <MobileFileExplorer open={filesOpen} onOpenChange={setFilesOpen} />}
+
+      {!isTauriContext() && (
+        <Sheet open={sessionsOpen} onOpenChange={setSessionsOpen}>
+          <SheetContent
+            side="right"
+            className="flex w-[min(100vw-2rem,22rem)] flex-col gap-0 p-0 sm:max-w-sm"
+          >
+            <SheetHeader className="sr-only">
+              <SheetTitle>{t('chatShell.cliSessions')}</SheetTitle>
+              <SheetDescription>{t('chatShell.cliSessionsDescription')}</SheetDescription>
+            </SheetHeader>
+            <CliSessionPanel forceVisible className="h-full w-full rounded-none" />
+          </SheetContent>
+        </Sheet>
+      )}
     </div>
   )
 }

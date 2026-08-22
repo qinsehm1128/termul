@@ -19,8 +19,12 @@
     "toggleFileExplorer": "Toggle file explorer",
     "hideFileExplorer": "Hide file explorer",
     "showFileExplorer": "Show file explorer",
+    "toggleCliSessions": "Toggle CLI sessions",
+    "hideCliSessions": "Hide CLI sessions",
+    "showCliSessions": "Show CLI sessions",
     "failedSidebar": "Failed to update sidebar visibility",
-    "failedFileExplorer": "Failed to update file explorer visibility"
+    "failedFileExplorer": "Failed to update file explorer visibility",
+    "failedCliSessions": "Failed to update CLI sessions visibility"
   },
   "activityRail": {
     "globalActions": "Global actions",
@@ -96,6 +100,8 @@
     "switchProject": "Switch active workspace project",
     "commandHistory": "Command History",
     "commandHistoryDescription": "Review and reuse recent terminal commands",
+    "toggleCliSessions": "Toggle CLI Sessions",
+    "toggleCliSessionsDescription": "Show or hide scanned CLI agent sessions",
     "colorTheme": "Change Color Theme",
     "colorThemeDescription": "Preview and apply a UI color theme",
     "shortcutMenu": "Open Shortcut Menu",
@@ -179,6 +185,10 @@
       "toggleFileExplorer": {
         "label": "Toggle File Explorer",
         "description": "Show or hide the file explorer panel"
+      },
+      "toggleCliSessionPanel": {
+        "label": "Toggle CLI Sessions",
+        "description": "Show or hide the CLI session vault panel"
       },
       "fileExplorerRename": { "label": "Rename File", "description": "Rename selected file" },
       "fileExplorerDelete": { "label": "Delete Files", "description": "Delete selected files" },

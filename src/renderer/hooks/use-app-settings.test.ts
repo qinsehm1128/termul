@@ -2,6 +2,7 @@ import type { IpcResult } from '@shared/types/ipc.types'
 import { renderHook, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { useAppSettingsStore } from '@/stores/app-settings-store'
+import { useCliSessionPanelStore } from '@/stores/cli-session-panel-store'
 import { useFileExplorerStore } from '@/stores/file-explorer-store'
 import { useSidebarStore } from '@/stores/sidebar-store'
 import { APP_SETTINGS_KEY, DEFAULT_APP_SETTINGS } from '@/types/settings'
@@ -358,6 +359,7 @@ describe('use-app-settings', () => {
   it('resets panel stores when app settings are reset', async () => {
     useSidebarStore.setState({ isVisible: false })
     useFileExplorerStore.setState({ isVisible: false })
+    useCliSessionPanelStore.setState({ isVisible: true })
 
     const { result } = renderHook(() => useResetAppSettings())
 
@@ -365,6 +367,9 @@ describe('use-app-settings', () => {
 
     expect(useSidebarStore.getState().isVisible).toBe(DEFAULT_APP_SETTINGS.sidebarVisible)
     expect(useFileExplorerStore.getState().isVisible).toBe(DEFAULT_APP_SETTINGS.fileExplorerVisible)
+    expect(useCliSessionPanelStore.getState().isVisible).toBe(
+      DEFAULT_APP_SETTINGS.cliSessionPanelVisible
+    )
     expect(mockPersistenceWrite).toHaveBeenCalledWith(APP_SETTINGS_KEY, DEFAULT_APP_SETTINGS)
   })
 

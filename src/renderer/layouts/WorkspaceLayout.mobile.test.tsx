@@ -269,6 +269,9 @@ vi.mock('@/components/chat/ChatHistoryTab', () => ({
 vi.mock('@/components/chat/ProjectSwitcherDrawer', () => ({
   ProjectSwitcherDrawer: () => null
 }))
+vi.mock('@/components/cli-sessions/CliSessionPanel', () => ({
+  CliSessionPanel: () => <div>cli-session-panel</div>
+}))
 vi.mock('@/components/mobile/MobileFileExplorer', () => ({
   MobileFileExplorer: () => null
 }))

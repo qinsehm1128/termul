@@ -2,6 +2,7 @@ import { Copy, Minus, Square, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
+  CliSessionPanelToggleButton,
   FileExplorerToggleButton,
   SidebarToggleButton,
   titlebarNoDragStyle
@@ -62,6 +63,7 @@ export function TitleBar(): React.JSX.Element | null {
 
       {/* Right-sidebar toggle + window controls — top-right. */}
       <div className="relative z-10 flex h-full items-center" style={titlebarNoDragStyle}>
+        <CliSessionPanelToggleButton />
         <FileExplorerToggleButton />
 
         <button

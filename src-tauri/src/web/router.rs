@@ -28,6 +28,7 @@ use crate::web::auth::{
     RemoteRouteClass,
 };
 use crate::web::catalog_api;
+use crate::web::cli_session_api;
 use crate::web::conversation_api;
 use crate::web::conversation_lifecycle_api;
 use crate::web::fs_api;
@@ -141,6 +142,13 @@ fn api_routes(provenance: IngressProvenance) -> Router<AppState> {
             .route("/skills", get(skills_api::list))
             .route("/skills/{name}", get(skills_api::read)),
         RemoteRouteClass::Skill,
+    ))
+    .merge(classified_routes(
+        Router::<AppState>::new().route(
+            "/cli-sessions",
+            get(cli_session_api::list_get).post(cli_session_api::list_post),
+        ),
+        RemoteRouteClass::CliSession,
     ))
     .merge(classified_routes(
         Router::<AppState>::new().route("/log/frontend-error", post(log_api::frontend_error)),

@@ -11,6 +11,8 @@
     "openMenu": "Open menu",
     "switchProject": "Switch project",
     "browseFiles": "Browse files",
+    "cliSessions": "CLI sessions",
+    "cliSessionsDescription": "Resume scanned CLI agent sessions",
     "commandPalette": "Command palette",
     "gitChanges": "Git changes",
     "executionTarget": "Execution target and project context",

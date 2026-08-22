@@ -127,6 +127,10 @@ vi.mock('@/components/chat/ProjectSwitcherDrawer', () => ({
 // wiring (button → filesOpen → drawer `open` prop → onOpenChange close).
 // The drawer's own open/close + file-management is covered in
 // MobileFileExplorer.test.tsx.
+vi.mock('@/components/cli-sessions/CliSessionPanel', () => ({
+  CliSessionPanel: () => <div>cli-session-panel</div>
+}))
+
 vi.mock('./MobileFileExplorer', () => ({
   MobileFileExplorer: ({
     open,
@@ -339,6 +343,20 @@ describe('MobileChatShell', () => {
     expect(screen.queryByText('project-drawer')).not.toBeInTheDocument()
   })
 
+  it('mounts the CLI sessions sheet in web mode', async () => {
+    tauriRef.current = false
+    render(
+      <MemoryRouter>
+        <MobileChatShell onNewChat={vi.fn()} canNewChat>
+          <div>chat body</div>
+        </MobileChatShell>
+      </MemoryRouter>
+    )
+
+    fireEvent.click(screen.getByLabelText('CLI sessions'))
+    expect(await screen.findByText('cli-session-panel')).toBeInTheDocument()
+  })
+
   it('mounts the files drawer trigger in web mode and toggles it open/closed', async () => {
     tauriRef.current = false
     render(
@@ -374,6 +392,7 @@ describe('MobileChatShell', () => {
     // Desktop never mounts the web/remote file explorer — the right-sidebar
     // FileExplorer owns file browsing there.
     expect(screen.queryByLabelText('Browse files')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('CLI sessions')).not.toBeInTheDocument()
   })
 
   it('hides the Command palette button in Tauri (desktop) mode', () => {

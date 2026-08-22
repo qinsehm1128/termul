@@ -14,6 +14,9 @@
  * `IpcResult { success: false, code: 'NETWORK_ERROR' }` so the renderer never
  * sees a thrown exception from the network layer.
  */
+
+import type { CliSessionListArgs, CliSessionListResult } from '@shared/types/cli-session.types'
+import { parseCliSessionListResult } from '@shared/types/cli-session.types'
 import type {
   BranchInfo,
   DetectedShells,
@@ -354,6 +357,16 @@ export const webServerMcpServers = {
  * data, throwing on `!res.success` so the renderer facade (`skills-api.ts`)
  * can branch `isTauriContext()` between `invoke(...)` and these HTTP impls.
  */
+export const webServerCliSessions = {
+  async list(args?: CliSessionListArgs): Promise<CliSessionListResult> {
+    const res = await postJson<unknown>('/cli-sessions', args ?? {})
+    if (!res.success) throw new Error(res.error)
+    const parsed = parseCliSessionListResult(res.data)
+    if (!parsed) throw new Error('CLI session scan returned an invalid payload')
+    return parsed
+  }
+}
+
 export const webServerSkills = {
   async list(projectRoot?: string): Promise<AgentSkillSummary[]> {
     const params = projectRoot ? `?projectRoot=${encodeURIComponent(projectRoot)}` : ''

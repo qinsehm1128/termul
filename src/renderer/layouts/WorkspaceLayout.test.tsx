@@ -197,6 +197,7 @@ vi.mock('@/stores/keyboard-shortcuts-store', async () => {
     closeTab: { customKey: 'ctrl+w', defaultKey: 'ctrl+w' },
     saveFile: { customKey: 'ctrl+s', defaultKey: 'ctrl+s' },
     toggleFileExplorer: { customKey: 'ctrl+b', defaultKey: 'ctrl+b' },
+    toggleCliSessionPanel: { customKey: 'ctrl+shift+h', defaultKey: 'ctrl+shift+h' },
     newBrowserTab: { customKey: 'ctrl+shift+n', defaultKey: 'ctrl+shift+n' },
     colorThemePicker: { customKey: 'ctrl+alt+t', defaultKey: 'ctrl+alt+t' }
   }
@@ -294,6 +295,9 @@ vi.mock('@/hooks/useTerminalAutoSave', () => ({
   serializeTerminalsForProject: vi.fn()
 }))
 
+vi.mock('@/components/cli-sessions/CliSessionPanel', () => ({
+  CliSessionPanel: () => <div>cli-session-panel</div>
+}))
 vi.mock('@/components/file-explorer/FileExplorer', () => ({
   FileExplorer: () => <div data-testid="file-explorer" />
 }))

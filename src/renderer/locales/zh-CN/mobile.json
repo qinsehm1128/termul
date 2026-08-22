@@ -11,6 +11,8 @@
     "openMenu": "打开菜单",
     "switchProject": "切换项目",
     "browseFiles": "浏览文件",
+    "cliSessions": "CLI 会话",
+    "cliSessionsDescription": "恢复扫描到的 CLI 代理会话",
     "commandPalette": "命令面板",
     "gitChanges": "Git 更改",
     "executionTarget": "执行目标与项目上下文",
