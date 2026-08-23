@@ -7,6 +7,10 @@ import type {
   TerminalAttachResult,
   TerminalCwdChangedCallback,
   TerminalDataCallback,
+  TerminalDisplayMode,
+  TerminalDisplayModeChangedEvent,
+  TerminalDisplayModeOptions,
+  TerminalDisplayModeState,
   TerminalExitCallback,
   TerminalExitCodeChangedCallback,
   TerminalGitBranchChangedCallback,
@@ -32,7 +36,8 @@ const IPC_EVENTS = {
   TERMINAL_GIT_BRANCH_CHANGED: 'terminal-git-branch-changed',
   TERMINAL_GIT_STATUS_CHANGED: 'terminal-git-status-changed',
   TERMINAL_EXIT_CODE_CHANGED: 'terminal-exit-code-changed',
-  TERMINAL_SPAWNED: 'terminal-spawned'
+  TERMINAL_SPAWNED: 'terminal-spawned',
+  TERMINAL_DISPLAY_MODE_CHANGED: 'terminal-display-mode-changed'
 } as const
 
 type EventPayloadMap = {
@@ -43,6 +48,7 @@ type EventPayloadMap = {
   [IPC_EVENTS.TERMINAL_GIT_STATUS_CHANGED]: { terminalId: string; status: GitStatus | null }
   [IPC_EVENTS.TERMINAL_EXIT_CODE_CHANGED]: { terminalId: string; exitCode: number }
   [IPC_EVENTS.TERMINAL_SPAWNED]: TerminalSpawnedEvent
+  [IPC_EVENTS.TERMINAL_DISPLAY_MODE_CHANGED]: TerminalDisplayModeChangedEvent
 }
 
 type SharedListenerEntry<T> = {
@@ -63,6 +69,7 @@ const IPC_COMMANDS = {
   REVOKE_CLAIM: 'terminal_revoke_claim',
   WRITE: 'terminal_write',
   RESIZE: 'terminal_resize',
+  SET_DISPLAY_MODE: 'terminal_set_display_mode',
   CLOSE_VIEW: 'terminal_close_view',
   TERMINATE: 'terminal_terminate',
   KILL: 'terminal_kill',
@@ -526,6 +533,27 @@ export function createTauriTerminalApi(): TerminalApi {
      */
     async resize(terminalId: string, cols: number, rows: number): Promise<IpcResult<void>> {
       return invokeIpc<void>(IPC_COMMANDS.RESIZE, { terminalId, cols, rows })
+    },
+
+    async setDisplayMode(
+      terminalId: string,
+      mode: TerminalDisplayMode,
+      options: TerminalDisplayModeOptions = {}
+    ): Promise<IpcResult<TerminalDisplayModeState>> {
+      return invokeIpc<TerminalDisplayModeState>(IPC_COMMANDS.SET_DISPLAY_MODE, {
+        terminalId,
+        mode,
+        cols: options.cols,
+        rows: options.rows
+      })
+    },
+
+    onDisplayModeChanged(callback: (event: TerminalDisplayModeChangedEvent) => void): () => void {
+      return subscribeSharedEvent(
+        IPC_EVENTS.TERMINAL_DISPLAY_MODE_CHANGED,
+        callback,
+        'terminal-display-mode-changed'
+      )
     },
 
     /** Close one renderer view; the PTY and claim survive. */

@@ -1,3 +1,4 @@
+import type { TerminalDisplayMode } from '@shared/types/ipc.types'
 import {
   Camera,
   FolderGit2,
@@ -37,6 +38,8 @@ import {
   SheetHeader,
   SheetTitle
 } from '@/components/ui/sheet'
+import { CompanionTerminalGeometryContext } from '@/hooks/use-companion-terminal-geometry'
+import { useOskViewport } from '@/hooks/use-osk-viewport'
 import { logFrontendError } from '@/lib/log-api'
 import { isTauriContext } from '@/lib/tauri-runtime'
 import { cn } from '@/lib/utils'
@@ -122,6 +125,8 @@ export function MobileChatShell({
   const [targetOpen, setTargetOpen] = useState(false)
   const [sessionsOpen, setSessionsOpen] = useState(false)
   const [surface, setSurface] = useState<MobileWorkspaceTab>('chat')
+  const [preferredMode, setPreferredMode] = useState<TerminalDisplayMode>('phone')
+  const osk = useOskViewport()
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const navigate = useNavigate()
@@ -290,485 +295,503 @@ export function MobileChatShell({
   const showPaneChildren = surface === 'chat' || (surface === 'terminal' && terminalTabs.length > 0)
   const showTerminalEmpty = surface === 'terminal' && terminalTabs.length === 0
   const showFiles = surface === 'files'
+  const companionGeometry = useMemo(
+    () => ({
+      surfaceActive: surface === 'terminal',
+      preferredMode,
+      keyboardOpen: osk.isOskOpen,
+      setPreferredMode
+    }),
+    [surface, preferredMode, osk.isOskOpen]
+  )
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-background" data-mobile-chat-shell="">
-      <header className="flex min-h-11 shrink-0 items-center gap-1 border-b border-border/70 bg-sidebar px-1.5 py-1">
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          className="size-11 shrink-0"
-          aria-label={t('chatShell.openMenu')}
-          aria-expanded={drawerOpen}
-          aria-controls={drawerOpen ? 'mobile-chat-drawer' : undefined}
-          onClick={() => setDrawerOpen(true)}
-        >
-          <Menu size={20} />
-        </Button>
-
-        <div className="min-w-0 flex-1 text-center">
-          <h1 className="truncate text-sm font-medium text-foreground">{headerTitle}</h1>
-          {headerSubtitle && headerSubtitle !== headerTitle ? (
-            <p className="truncate font-mono text-[11px] text-muted-foreground">{headerSubtitle}</p>
-          ) : null}
-        </div>
-
-        <Button
-          type="button"
-          variant="ghost"
-          size="icon"
-          className="size-11 shrink-0"
-          aria-label={t('chatShell.more')}
-          aria-expanded={overflowOpen}
-          onClick={() => setOverflowOpen(true)}
-        >
-          <MoreHorizontal size={20} />
-        </Button>
-      </header>
-
-      <div
-        className={cn('min-h-0 flex-1 overflow-hidden', !showPaneChildren && 'hidden')}
-        data-mobile-workspace-surface="pane"
-      >
-        {children}
-      </div>
-
-      {showTerminalEmpty ? (
-        <div
-          className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 px-6 text-center"
-          data-mobile-workspace-surface="terminal-empty"
-        >
-          <p className="text-sm text-muted-foreground">{t('chatShell.noOpenTerminals')}</p>
-          <p className="text-xs text-muted-foreground">{t('chatShell.noOpenTerminalsHint')}</p>
-          <Button type="button" className="h-11 min-h-11 px-4" onClick={() => onNewTerminal?.()}>
-            {t('chatShell.newTerminal')}
+    <CompanionTerminalGeometryContext.Provider value={companionGeometry}>
+      <div className="flex h-full min-h-0 flex-col bg-background" data-mobile-chat-shell="">
+        <header className="flex min-h-11 shrink-0 items-center gap-1 border-b border-border/70 bg-sidebar px-1.5 py-1">
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-11 shrink-0"
+            aria-label={t('chatShell.openMenu')}
+            aria-expanded={drawerOpen}
+            aria-controls={drawerOpen ? 'mobile-chat-drawer' : undefined}
+            onClick={() => setDrawerOpen(true)}
+          >
+            <Menu size={20} />
           </Button>
-        </div>
-      ) : null}
 
-      {isWeb ? (
-        <div
-          className={cn('min-h-0 flex-1 overflow-hidden', !showFiles && 'hidden')}
-          data-mobile-workspace-surface="files"
-        >
-          <MobileFileExplorer
-            variant="page"
-            open={surface === 'files'}
-            onFileOpened={() => selectSurface('chat')}
-          />
-        </div>
-      ) : showFiles ? (
-        <div
-          className="flex min-h-0 flex-1 items-center justify-center px-6 text-center"
-          data-mobile-workspace-surface="files"
-        >
-          <p className="text-sm text-muted-foreground">
-            {activeProject?.path ? t('files.useDesktopExplorer') : t('files.noProject')}
-          </p>
-        </div>
-      ) : null}
-
-      {surface === 'terminal' && activeTerminal?.ptyId ? (
-        <MobileTerminalControls terminalId={activeTerminal.ptyId} />
-      ) : null}
-
-      <div
-        role="tablist"
-        aria-label={t('chatShell.workspaceTabs')}
-        data-od-id="workspace-tabs"
-        data-mobile-workspace-tabs=""
-        className="flex shrink-0 border-t border-border/70 bg-card/95 pb-[max(0.25rem,env(safe-area-inset-bottom))] backdrop-blur"
-      >
-        {(
-          [
-            ['chat', MessageSquare, t('chatShell.tabChat')],
-            ['terminal', TerminalSquare, t('chatShell.tabTerminal')],
-            ['files', FolderTree, t('chatShell.tabFiles')]
-          ] as const
-        ).map(([id, Icon, label]) => {
-          const selected = surface === id
-          return (
-            <button
-              key={id}
-              type="button"
-              role="tab"
-              aria-selected={selected}
-              aria-label={label}
-              className={cn(
-                'relative flex min-h-11 flex-1 flex-col items-center justify-center gap-0.5 text-[11px]',
-                selected ? 'text-primary' : 'text-muted-foreground'
-              )}
-              onClick={() => selectSurface(id)}
-            >
-              <Icon size={18} />
-              {id === 'terminal' && hasLiveTerminal ? (
-                <span
-                  className="absolute right-1/2 top-1.5 size-1.5 translate-x-2.5 rounded-full bg-connection"
-                  aria-hidden
-                />
-              ) : null}
-              <span>{label}</span>
-            </button>
-          )
-        })}
-      </div>
-
-      <Sheet open={overflowOpen} onOpenChange={setOverflowOpen}>
-        <SheetContent side="bottom" className="flex max-h-[85dvh] flex-col gap-0 rounded-t-xl p-2">
-          <SheetHeader className="px-3 py-2 text-left">
-            <SheetTitle>{t('chatShell.more')}</SheetTitle>
-            <SheetDescription className="sr-only">{t('chatShell.more')}</SheetDescription>
-          </SheetHeader>
-          <div className="overflow-y-auto pb-2">
-            <OverflowItem
-              label={t('chatShell.newChat')}
-              disabled={!canNewChat}
-              onSelect={() => {
-                closeOverflow()
-                onNewChat()
-              }}
-            >
-              <MessageSquarePlus size={16} />
-            </OverflowItem>
-            {activeConversationId && activeConversation ? (
-              <>
-                <OverflowItem
-                  label={t('chatShell.executionTarget')}
-                  onSelect={() => {
-                    closeOverflow()
-                    setTargetOpen(true)
-                  }}
-                >
-                  <SlidersHorizontal size={16} />
-                </OverflowItem>
-                <div className="flex h-11 min-h-11 items-center px-1">
-                  <ConversationLifecycleActions
-                    conversationId={activeConversationId}
-                    title={sessionTitle ?? t('chatShell.chats')}
-                    className="size-11 w-full justify-start opacity-100 after:inset-0"
-                  />
-                </div>
-              </>
+          <div className="min-w-0 flex-1 text-center">
+            <h1 className="truncate text-sm font-medium text-foreground">{headerTitle}</h1>
+            {headerSubtitle && headerSubtitle !== headerTitle ? (
+              <p className="truncate font-mono text-[11px] text-muted-foreground">
+                {headerSubtitle}
+              </p>
             ) : null}
-            {surface === 'terminal' && activeTab?.type === 'terminal' && onRestartTerminal ? (
+          </div>
+
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon"
+            className="size-11 shrink-0"
+            aria-label={t('chatShell.more')}
+            aria-expanded={overflowOpen}
+            onClick={() => setOverflowOpen(true)}
+          >
+            <MoreHorizontal size={20} />
+          </Button>
+        </header>
+
+        <div
+          className={cn('min-h-0 flex-1 overflow-hidden', !showPaneChildren && 'hidden')}
+          data-mobile-workspace-surface="pane"
+        >
+          {children}
+        </div>
+
+        {showTerminalEmpty ? (
+          <div
+            className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 px-6 text-center"
+            data-mobile-workspace-surface="terminal-empty"
+          >
+            <p className="text-sm text-muted-foreground">{t('chatShell.noOpenTerminals')}</p>
+            <p className="text-xs text-muted-foreground">{t('chatShell.noOpenTerminalsHint')}</p>
+            <Button type="button" className="h-11 min-h-11 px-4" onClick={() => onNewTerminal?.()}>
+              {t('chatShell.newTerminal')}
+            </Button>
+          </div>
+        ) : null}
+
+        {isWeb ? (
+          <div
+            className={cn('min-h-0 flex-1 overflow-hidden', !showFiles && 'hidden')}
+            data-mobile-workspace-surface="files"
+          >
+            <MobileFileExplorer
+              variant="page"
+              open={surface === 'files'}
+              onFileOpened={() => selectSurface('chat')}
+            />
+          </div>
+        ) : showFiles ? (
+          <div
+            className="flex min-h-0 flex-1 items-center justify-center px-6 text-center"
+            data-mobile-workspace-surface="files"
+          >
+            <p className="text-sm text-muted-foreground">
+              {activeProject?.path ? t('files.useDesktopExplorer') : t('files.noProject')}
+            </p>
+          </div>
+        ) : null}
+
+        {surface === 'terminal' && activeTerminal?.ptyId ? (
+          <MobileTerminalControls terminalId={activeTerminal.ptyId} />
+        ) : null}
+
+        <div
+          role="tablist"
+          aria-label={t('chatShell.workspaceTabs')}
+          data-od-id="workspace-tabs"
+          data-mobile-workspace-tabs=""
+          className="flex shrink-0 border-t border-border/70 bg-card/95 pb-[max(0.25rem,env(safe-area-inset-bottom))] backdrop-blur"
+        >
+          {(
+            [
+              ['chat', MessageSquare, t('chatShell.tabChat')],
+              ['terminal', TerminalSquare, t('chatShell.tabTerminal')],
+              ['files', FolderTree, t('chatShell.tabFiles')]
+            ] as const
+          ).map(([id, Icon, label]) => {
+            const selected = surface === id
+            return (
+              <button
+                key={id}
+                type="button"
+                role="tab"
+                aria-selected={selected}
+                aria-label={label}
+                className={cn(
+                  'relative flex min-h-11 flex-1 flex-col items-center justify-center gap-0.5 text-[11px]',
+                  selected ? 'text-primary' : 'text-muted-foreground'
+                )}
+                onClick={() => selectSurface(id)}
+              >
+                <Icon size={18} />
+                {id === 'terminal' && hasLiveTerminal ? (
+                  <span
+                    className="absolute right-1/2 top-1.5 size-1.5 translate-x-2.5 rounded-full bg-connection"
+                    aria-hidden
+                  />
+                ) : null}
+                <span>{label}</span>
+              </button>
+            )
+          })}
+        </div>
+
+        <Sheet open={overflowOpen} onOpenChange={setOverflowOpen}>
+          <SheetContent
+            side="bottom"
+            className="flex max-h-[85dvh] flex-col gap-0 rounded-t-xl p-2"
+          >
+            <SheetHeader className="px-3 py-2 text-left">
+              <SheetTitle>{t('chatShell.more')}</SheetTitle>
+              <SheetDescription className="sr-only">{t('chatShell.more')}</SheetDescription>
+            </SheetHeader>
+            <div className="overflow-y-auto pb-2">
               <OverflowItem
-                label={t('chatShell.restartTerminal')}
+                label={t('chatShell.newChat')}
+                disabled={!canNewChat}
                 onSelect={() => {
                   closeOverflow()
-                  onRestartTerminal(activeTab.terminalId)
+                  onNewChat()
                 }}
               >
-                <RotateCcw size={16} />
+                <MessageSquarePlus size={16} />
               </OverflowItem>
-            ) : null}
-            <OverflowItem
-              label={t('chatShell.settings')}
-              onSelect={() => {
-                closeOverflow()
-                navigate('/preferences')
-              }}
-            >
-              <Settings size={16} />
-            </OverflowItem>
-            <OverflowItem
-              label={t('chatShell.snapshots')}
-              onSelect={() => {
-                closeOverflow()
-                navigate('/snapshots')
-              }}
-            >
-              <Camera size={16} />
-            </OverflowItem>
-            {isWeb ? (
-              <>
-                <OverflowItem
-                  label={t('chatShell.switchProject')}
-                  onSelect={() => {
-                    closeOverflow()
-                    setProjectsOpen(true)
-                  }}
-                >
-                  <FolderGit2 size={16} />
-                </OverflowItem>
-                <OverflowItem
-                  label={t('chatShell.cliSessions')}
-                  onSelect={() => {
-                    closeOverflow()
-                    setSessionsOpen(true)
-                  }}
-                >
-                  <History size={16} />
-                </OverflowItem>
-                {onOpenCommandPalette ? (
+              {activeConversationId && activeConversation ? (
+                <>
                   <OverflowItem
-                    label={t('chatShell.commandPalette')}
+                    label={t('chatShell.executionTarget')}
                     onSelect={() => {
                       closeOverflow()
-                      onOpenCommandPalette()
+                      setTargetOpen(true)
                     }}
                   >
-                    <Search size={16} />
+                    <SlidersHorizontal size={16} />
                   </OverflowItem>
-                ) : null}
-                {onOpenGitChanges ? (
+                  <div className="flex h-11 min-h-11 items-center px-1">
+                    <ConversationLifecycleActions
+                      conversationId={activeConversationId}
+                      title={sessionTitle ?? t('chatShell.chats')}
+                      className="size-11 w-full justify-start opacity-100 after:inset-0"
+                    />
+                  </div>
+                </>
+              ) : null}
+              {surface === 'terminal' && activeTab?.type === 'terminal' && onRestartTerminal ? (
+                <OverflowItem
+                  label={t('chatShell.restartTerminal')}
+                  onSelect={() => {
+                    closeOverflow()
+                    onRestartTerminal(activeTab.terminalId)
+                  }}
+                >
+                  <RotateCcw size={16} />
+                </OverflowItem>
+              ) : null}
+              <OverflowItem
+                label={t('chatShell.settings')}
+                onSelect={() => {
+                  closeOverflow()
+                  navigate('/preferences')
+                }}
+              >
+                <Settings size={16} />
+              </OverflowItem>
+              <OverflowItem
+                label={t('chatShell.snapshots')}
+                onSelect={() => {
+                  closeOverflow()
+                  navigate('/snapshots')
+                }}
+              >
+                <Camera size={16} />
+              </OverflowItem>
+              {isWeb ? (
+                <>
                   <OverflowItem
-                    label={t('chatShell.gitChanges')}
-                    disabled={!activeProject?.path}
+                    label={t('chatShell.switchProject')}
                     onSelect={() => {
                       closeOverflow()
-                      onOpenGitChanges()
+                      setProjectsOpen(true)
                     }}
                   >
-                    <GitBranch size={16} />
+                    <FolderGit2 size={16} />
                   </OverflowItem>
-                ) : null}
-                {onOpenGitHistory ? (
                   <OverflowItem
-                    label={t('chatShell.gitHistory')}
-                    disabled={!activeProject?.path}
+                    label={t('chatShell.cliSessions')}
                     onSelect={() => {
                       closeOverflow()
-                      onOpenGitHistory()
+                      setSessionsOpen(true)
                     }}
                   >
                     <History size={16} />
                   </OverflowItem>
-                ) : null}
-              </>
-            ) : null}
-          </div>
-        </SheetContent>
-      </Sheet>
-
-      <Sheet open={drawerOpen} onOpenChange={setDrawerOpen}>
-        <SheetContent
-          side="left"
-          id="mobile-chat-drawer"
-          className="flex w-[min(100vw-3rem,20rem)] flex-col gap-0 p-0 sm:max-w-sm"
-        >
-          <SheetHeader className="space-y-0 border-b border-border/60 px-4 py-3 text-left">
-            <div className="flex items-center gap-2 pr-8">
-              <TermulMark size={20} />
-              <SheetTitle className="text-base">{t('chatShell.chats')}</SheetTitle>
+                  {onOpenCommandPalette ? (
+                    <OverflowItem
+                      label={t('chatShell.commandPalette')}
+                      onSelect={() => {
+                        closeOverflow()
+                        onOpenCommandPalette()
+                      }}
+                    >
+                      <Search size={16} />
+                    </OverflowItem>
+                  ) : null}
+                  {onOpenGitChanges ? (
+                    <OverflowItem
+                      label={t('chatShell.gitChanges')}
+                      disabled={!activeProject?.path}
+                      onSelect={() => {
+                        closeOverflow()
+                        onOpenGitChanges()
+                      }}
+                    >
+                      <GitBranch size={16} />
+                    </OverflowItem>
+                  ) : null}
+                  {onOpenGitHistory ? (
+                    <OverflowItem
+                      label={t('chatShell.gitHistory')}
+                      disabled={!activeProject?.path}
+                      onSelect={() => {
+                        closeOverflow()
+                        onOpenGitHistory()
+                      }}
+                    >
+                      <History size={16} />
+                    </OverflowItem>
+                  ) : null}
+                </>
+              ) : null}
             </div>
-            <SheetDescription className="sr-only">
-              {t('chatShell.chatDescription')}
-            </SheetDescription>
-          </SheetHeader>
+          </SheetContent>
+        </Sheet>
 
-          <div className="flex shrink-0 border-b border-border/60 p-2">
-            <Button
-              type="button"
-              variant="secondary"
-              className="h-11 min-h-11 flex-1 justify-start gap-2"
-              disabled={!canNewChat}
-              onClick={() => {
-                closeDrawer()
-                onNewChat()
-              }}
-            >
-              <MessageSquarePlus size={16} />
-              {t('chatShell.newChat')}
-            </Button>
-          </div>
+        <Sheet open={drawerOpen} onOpenChange={setDrawerOpen}>
+          <SheetContent
+            side="left"
+            id="mobile-chat-drawer"
+            className="flex w-[min(100vw-3rem,20rem)] flex-col gap-0 p-0 sm:max-w-sm"
+          >
+            <SheetHeader className="space-y-0 border-b border-border/60 px-4 py-3 text-left">
+              <div className="flex items-center gap-2 pr-8">
+                <TermulMark size={20} />
+                <SheetTitle className="text-base">{t('chatShell.chats')}</SheetTitle>
+              </div>
+              <SheetDescription className="sr-only">
+                {t('chatShell.chatDescription')}
+              </SheetDescription>
+            </SheetHeader>
 
-          {isWeb ? (
-            <div
-              className="flex shrink-0 gap-1 border-b border-border/60 p-1"
-              role="tablist"
-              aria-label={t('chatShell.deskSessions')}
-            >
-              <button
-                type="button"
-                role="tab"
-                aria-selected
-                className="flex h-11 min-h-11 flex-1 items-center justify-center rounded-md bg-secondary text-xs font-medium text-foreground"
-              >
-                {t('chatShell.deskSessions')}
-              </button>
-              <button
-                type="button"
-                role="tab"
-                aria-label={t('chatShell.switchProject')}
-                className="flex h-11 min-h-11 flex-1 items-center justify-center rounded-md text-xs font-medium text-muted-foreground"
-                onClick={() => {
-                  closeDrawer()
-                  setProjectsOpen(true)
-                }}
-              >
-                {t('chatShell.deskProjects')}
-              </button>
-            </div>
-          ) : null}
-
-          <div className="border-b border-border/60 p-2">
-            <div className="mb-1 flex items-center justify-between px-2 text-xs font-medium text-muted-foreground">
-              <span>{t('chatShell.terminals')}</span>
+            <div className="flex shrink-0 border-b border-border/60 p-2">
               <Button
                 type="button"
-                variant="ghost"
-                size="icon"
-                className="size-11"
-                aria-label={t('chatShell.newTerminal')}
+                variant="secondary"
+                className="h-11 min-h-11 flex-1 justify-start gap-2"
+                disabled={!canNewChat}
                 onClick={() => {
                   closeDrawer()
-                  onNewTerminal?.()
+                  onNewChat()
                 }}
               >
-                <Plus size={16} />
+                <MessageSquarePlus size={16} />
+                {t('chatShell.newChat')}
               </Button>
             </div>
-            {conversationTerminals.length === 0 ? (
-              <ListEmptyState message={t('chatShell.noOpenTerminals')} />
-            ) : (
-              conversationTerminals.map((terminal) => {
-                const tabEntry = terminalTabs.find((entry) => entry.tab.terminalId === terminal.id)
-                const isActive = tabEntry?.tab.id === activeTab?.id
-                const isRenaming = renamingId === terminal.id
-                const isHidden = terminal.viewState !== 'visible' || !tabEntry
-                const folder = pathBasename(terminal.cwd)
-                return (
-                  <ListRow
-                    key={terminal.id}
-                    density="compact"
-                    active={isActive}
-                    buttonClassName="h-11"
-                    title={
-                      <span className="flex min-w-0 items-center gap-2">
-                        <TerminalSquare size={16} />
-                        <span className="truncate">{terminal.name}</span>
-                      </span>
-                    }
-                    titleAttr={terminal.name}
-                    preview={isHidden ? t('chatShell.reopenTerminal') : folder || undefined}
-                    meta={
-                      <ListRowMeta
-                        items={[
-                          isHidden ? t('chatShell.hidden') : t('chatShell.running'),
-                          terminal.agentName ?? terminal.shell
-                        ]}
-                      />
-                    }
-                    trailing={
-                      <>
-                        {isRenaming ? (
-                          <input
-                            type="text"
-                            value={renameValue}
-                            onChange={(event) => setRenameValue(event.target.value)}
-                            onBlur={confirmRename}
-                            onKeyDown={(event) => {
-                              if (event.key === 'Enter') confirmRename()
-                              if (event.key === 'Escape') setRenamingId(null)
-                            }}
-                            className="h-11 w-24 rounded border border-border bg-background px-2 text-xs"
-                            autoFocus
-                          />
-                        ) : (
-                          onRenameTerminal && (
+
+            {isWeb ? (
+              <div
+                className="flex shrink-0 gap-1 border-b border-border/60 p-1"
+                role="tablist"
+                aria-label={t('chatShell.deskSessions')}
+              >
+                <button
+                  type="button"
+                  role="tab"
+                  aria-selected
+                  className="flex h-11 min-h-11 flex-1 items-center justify-center rounded-md bg-secondary text-xs font-medium text-foreground"
+                >
+                  {t('chatShell.deskSessions')}
+                </button>
+                <button
+                  type="button"
+                  role="tab"
+                  aria-label={t('chatShell.switchProject')}
+                  className="flex h-11 min-h-11 flex-1 items-center justify-center rounded-md text-xs font-medium text-muted-foreground"
+                  onClick={() => {
+                    closeDrawer()
+                    setProjectsOpen(true)
+                  }}
+                >
+                  {t('chatShell.deskProjects')}
+                </button>
+              </div>
+            ) : null}
+
+            <div className="border-b border-border/60 p-2">
+              <div className="mb-1 flex items-center justify-between px-2 text-xs font-medium text-muted-foreground">
+                <span>{t('chatShell.terminals')}</span>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  className="size-11"
+                  aria-label={t('chatShell.newTerminal')}
+                  onClick={() => {
+                    closeDrawer()
+                    onNewTerminal?.()
+                  }}
+                >
+                  <Plus size={16} />
+                </Button>
+              </div>
+              {conversationTerminals.length === 0 ? (
+                <ListEmptyState message={t('chatShell.noOpenTerminals')} />
+              ) : (
+                conversationTerminals.map((terminal) => {
+                  const tabEntry = terminalTabs.find(
+                    (entry) => entry.tab.terminalId === terminal.id
+                  )
+                  const isActive = tabEntry?.tab.id === activeTab?.id
+                  const isRenaming = renamingId === terminal.id
+                  const isHidden = terminal.viewState !== 'visible' || !tabEntry
+                  const folder = pathBasename(terminal.cwd)
+                  return (
+                    <ListRow
+                      key={terminal.id}
+                      density="compact"
+                      active={isActive}
+                      buttonClassName="h-11"
+                      title={
+                        <span className="flex min-w-0 items-center gap-2">
+                          <TerminalSquare size={16} />
+                          <span className="truncate">{terminal.name}</span>
+                        </span>
+                      }
+                      titleAttr={terminal.name}
+                      preview={isHidden ? t('chatShell.reopenTerminal') : folder || undefined}
+                      meta={
+                        <ListRowMeta
+                          items={[
+                            isHidden ? t('chatShell.hidden') : t('chatShell.running'),
+                            terminal.agentName ?? terminal.shell
+                          ]}
+                        />
+                      }
+                      trailing={
+                        <>
+                          {isRenaming ? (
+                            <input
+                              type="text"
+                              value={renameValue}
+                              onChange={(event) => setRenameValue(event.target.value)}
+                              onBlur={confirmRename}
+                              onKeyDown={(event) => {
+                                if (event.key === 'Enter') confirmRename()
+                                if (event.key === 'Escape') setRenamingId(null)
+                              }}
+                              className="h-11 w-24 rounded border border-border bg-background px-2 text-xs"
+                              autoFocus
+                            />
+                          ) : (
+                            onRenameTerminal && (
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon"
+                                className="size-11 shrink-0"
+                                aria-label={t('chatShell.renameTerminal')}
+                                onClick={() => startRename(terminal.id, terminal.name)}
+                              >
+                                <Pencil size={14} />
+                              </Button>
+                            )
+                          )}
+                          {!isHidden && tabEntry && onCloseTerminal && (
                             <Button
                               type="button"
                               variant="ghost"
                               size="icon"
                               className="size-11 shrink-0"
-                              aria-label={t('chatShell.renameTerminal')}
-                              onClick={() => startRename(terminal.id, terminal.name)}
+                              aria-label={t('chatShell.closeTerminalView')}
+                              onClick={() => onCloseTerminal(terminal.id, tabEntry.tab.id)}
                             >
-                              <Pencil size={14} />
+                              <X size={14} />
                             </Button>
-                          )
-                        )}
-                        {!isHidden && tabEntry && onCloseTerminal && (
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="icon"
-                            className="size-11 shrink-0"
-                            aria-label={t('chatShell.closeTerminalView')}
-                            onClick={() => onCloseTerminal(terminal.id, tabEntry.tab.id)}
-                          >
-                            <X size={14} />
-                          </Button>
-                        )}
-                        {onTerminateTerminal && (
-                          <Button
-                            type="button"
-                            variant="ghost"
-                            size="icon"
-                            className="size-11 shrink-0 text-destructive hover:text-destructive"
-                            aria-label={t('chatShell.terminateTerminal')}
-                            onClick={() => onTerminateTerminal(terminal.id, tabEntry?.tab.id)}
-                          >
-                            <Trash2 size={14} />
-                          </Button>
-                        )}
-                      </>
-                    }
-                    onClick={() => {
-                      if (tabEntry) selectTerminal(tabEntry.paneId, tabEntry.tab.id)
-                      else {
-                        useWorkspaceStore.getState().reopenTerminalView(terminal.id)
-                        setSurface('terminal')
-                        closeDrawer()
+                          )}
+                          {onTerminateTerminal && (
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              className="size-11 shrink-0 text-destructive hover:text-destructive"
+                              aria-label={t('chatShell.terminateTerminal')}
+                              onClick={() => onTerminateTerminal(terminal.id, tabEntry?.tab.id)}
+                            >
+                              <Trash2 size={14} />
+                            </Button>
+                          )}
+                        </>
                       }
-                    }}
-                  />
-                )
-              })
-            )}
-          </div>
+                      onClick={() => {
+                        if (tabEntry) selectTerminal(tabEntry.paneId, tabEntry.tab.id)
+                        else {
+                          useWorkspaceStore.getState().reopenTerminalView(terminal.id)
+                          setSurface('terminal')
+                          closeDrawer()
+                        }
+                      }}
+                    />
+                  )
+                })
+              )}
+            </div>
 
-          <div className="min-h-0 flex-1 overflow-hidden">
-            <ChatHistoryTab
-              onSessionOpened={() => {
-                setSurface('chat')
-                closeDrawer()
-              }}
-            />
-          </div>
-        </SheetContent>
-      </Sheet>
-
-      <Sheet open={targetOpen} onOpenChange={setTargetOpen}>
-        <SheetContent side="bottom" className="max-h-[85dvh] overflow-y-auto">
-          <SheetHeader className="text-left">
-            <SheetTitle>{t('chatShell.executionTarget')}</SheetTitle>
-            <SheetDescription>{t('chatShell.executionTargetDescription')}</SheetDescription>
-          </SheetHeader>
-          {activeConversation ? (
-            <div className="mt-4">
-              <ExecutionTargetPicker
-                projects={projects}
-                value={mobileTarget}
-                attachment={mobileAttachment}
-                conversation={activeConversation}
-                workspaceCwd={activeConversation.workspaceCwd}
-                onChange={setMobileTarget}
-                onAttachmentChange={setMobileAttachment}
+            <div className="min-h-0 flex-1 overflow-hidden">
+              <ChatHistoryTab
+                onSessionOpened={() => {
+                  setSurface('chat')
+                  closeDrawer()
+                }}
               />
             </div>
-          ) : null}
-        </SheetContent>
-      </Sheet>
-
-      {isWeb && <ProjectSwitcherDrawer open={projectsOpen} onOpenChange={setProjectsOpen} />}
-
-      {isWeb && (
-        <Sheet open={sessionsOpen} onOpenChange={setSessionsOpen}>
-          <SheetContent
-            side="right"
-            className="flex w-[min(100vw-2rem,22rem)] flex-col gap-0 p-0 sm:max-w-sm"
-          >
-            <SheetHeader className="sr-only">
-              <SheetTitle>{t('chatShell.cliSessions')}</SheetTitle>
-              <SheetDescription>{t('chatShell.cliSessionsDescription')}</SheetDescription>
-            </SheetHeader>
-            <CliSessionPanel forceVisible className="h-full w-full rounded-none" />
           </SheetContent>
         </Sheet>
-      )}
-    </div>
+
+        <Sheet open={targetOpen} onOpenChange={setTargetOpen}>
+          <SheetContent side="bottom" className="max-h-[85dvh] overflow-y-auto">
+            <SheetHeader className="text-left">
+              <SheetTitle>{t('chatShell.executionTarget')}</SheetTitle>
+              <SheetDescription>{t('chatShell.executionTargetDescription')}</SheetDescription>
+            </SheetHeader>
+            {activeConversation ? (
+              <div className="mt-4">
+                <ExecutionTargetPicker
+                  projects={projects}
+                  value={mobileTarget}
+                  attachment={mobileAttachment}
+                  conversation={activeConversation}
+                  workspaceCwd={activeConversation.workspaceCwd}
+                  onChange={setMobileTarget}
+                  onAttachmentChange={setMobileAttachment}
+                />
+              </div>
+            ) : null}
+          </SheetContent>
+        </Sheet>
+
+        {isWeb && <ProjectSwitcherDrawer open={projectsOpen} onOpenChange={setProjectsOpen} />}
+
+        {isWeb && (
+          <Sheet open={sessionsOpen} onOpenChange={setSessionsOpen}>
+            <SheetContent
+              side="right"
+              className="flex w-[min(100vw-2rem,22rem)] flex-col gap-0 p-0 sm:max-w-sm"
+            >
+              <SheetHeader className="sr-only">
+                <SheetTitle>{t('chatShell.cliSessions')}</SheetTitle>
+                <SheetDescription>{t('chatShell.cliSessionsDescription')}</SheetDescription>
+              </SheetHeader>
+              <CliSessionPanel forceVisible className="h-full w-full rounded-none" />
+            </SheetContent>
+          </Sheet>
+        )}
+      </div>
+    </CompanionTerminalGeometryContext.Provider>
   )
 }
 

@@ -5,7 +5,12 @@
     "pasteFailed": "粘贴失败：{{message}}",
     "hideKeys": "隐藏终端按键",
     "showKeys": "显示终端按键",
-    "paste": "粘贴"
+    "paste": "粘贴",
+    "smallerText": "缩小终端文字",
+    "largerText": "放大终端文字",
+    "textSize": "终端文字大小 {{percent}}%",
+    "phoneLayout": "适配手机",
+    "desktopLayout": "使用电脑尺寸"
   },
   "chatShell": {
     "openMenu": "打开菜单",

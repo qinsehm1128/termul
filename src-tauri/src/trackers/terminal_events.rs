@@ -1,5 +1,5 @@
 use parking_lot::RwLock;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
@@ -8,6 +8,23 @@ use tokio::sync::broadcast;
 use super::git_tracker::GitStatus;
 
 const EVENT_CAPACITY: usize = 256;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalDisplayMode {
+    Phone,
+    Desktop,
+}
+
+impl TerminalDisplayMode {
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "phone" => Ok(Self::Phone),
+            "desktop" => Ok(Self::Desktop),
+            other => Err(format!("invalid display mode: {other}")),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -42,6 +59,12 @@ pub enum TerminalEvent {
         rows: u16,
         shell: String,
     },
+    DisplayModeChanged {
+        terminal_id: String,
+        mode: TerminalDisplayMode,
+        cols: u16,
+        rows: u16,
+    },
 }
 
 impl TerminalEvent {
@@ -52,7 +75,8 @@ impl TerminalEvent {
             | Self::GitBranchChanged { terminal_id, .. }
             | Self::GitStatusChanged { terminal_id, .. }
             | Self::ExitCodeChanged { terminal_id, .. }
-            | Self::Spawned { terminal_id, .. } => terminal_id,
+            | Self::Spawned { terminal_id, .. }
+            | Self::DisplayModeChanged { terminal_id, .. } => terminal_id,
         }
     }
 }
@@ -116,7 +140,8 @@ impl TerminalEventHub {
                 | TerminalEvent::GitBranchChanged { terminal_id, .. }
                 | TerminalEvent::GitStatusChanged { terminal_id, .. }
                 | TerminalEvent::ExitCodeChanged { terminal_id, .. }
-                | TerminalEvent::Spawned { terminal_id, .. } => terminal_id.clone(),
+                | TerminalEvent::Spawned { terminal_id, .. }
+                | TerminalEvent::DisplayModeChanged { terminal_id, .. } => terminal_id.clone(),
             };
             let snapshot = snapshots.entry(terminal_id).or_default();
             match &event {
@@ -135,6 +160,7 @@ impl TerminalEventHub {
                     snapshot.exit_code = Some(*exit_code)
                 }
                 TerminalEvent::Spawned { cwd, .. } => snapshot.cwd = Some(cwd.clone()),
+                TerminalEvent::DisplayModeChanged { .. } => {}
             }
         }
         let _ = self.tx.send(event.clone());
@@ -193,6 +219,20 @@ impl TerminalEventHub {
                     "cols": cols,
                     "rows": rows,
                     "shell": shell
+                }),
+            ),
+            TerminalEvent::DisplayModeChanged {
+                terminal_id,
+                mode,
+                cols,
+                rows,
+            } => app.emit(
+                "terminal-display-mode-changed",
+                serde_json::json!({
+                    "terminalId": terminal_id,
+                    "mode": mode,
+                    "cols": cols,
+                    "rows": rows
                 }),
             ),
         };

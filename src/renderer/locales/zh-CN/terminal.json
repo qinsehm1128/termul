@@ -28,6 +28,11 @@
     "next": "下一个匹配项（Enter）",
     "close": "关闭（Escape）"
   },
+  "parkedByPhone": {
+    "title": "手机正在使用此终端",
+    "description": "已暂停电脑端适配，方便手机操作当前会话。",
+    "resume": "在此电脑继续"
+  },
   "contextMenu": {
     "copy": "复制",
     "paste": "粘贴",

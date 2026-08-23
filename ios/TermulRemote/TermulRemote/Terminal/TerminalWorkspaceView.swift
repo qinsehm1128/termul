@@ -3,31 +3,54 @@ import SwiftUI
 struct TerminalWorkspaceView: View {
     @Bindable var session: WorkspaceSession
     @State private var focusToken: UInt64 = 0
+    @State private var textScale = TerminalTextScale.current
+    @State private var scaleHud: String?
 
     var body: some View {
         VStack(spacing: 0) {
             if let id = session.terminals.activeId {
-                TerminalScreen(
-                    terminalId: id,
-                    buffered: session.terminals.pendingOutput[id] ?? Data(),
-                    onSend: { text in
-                        Task { await session.terminals.write(text) }
-                    },
-                    onResize: { cols, rows in
-                        Task { await session.terminals.resize(cols: cols, rows: rows) }
-                    },
-                    onReady: { feed in
-                        session.terminals.onFeed = { incomingId, data in
-                            if incomingId == id {
-                                feed(data)
+                ZStack {
+                    TerminalScreen(
+                        terminalId: id,
+                        buffered: session.terminals.pendingOutput[id] ?? Data(),
+                        hostCols: activeTerminal?.cols ?? 80,
+                        lockToHostCols: session.terminals.displayMode == .desktop,
+                        textScale: textScale,
+                        onSend: { text in
+                            Task { await session.terminals.write(text) }
+                        },
+                        onResize: { cols, rows in
+                            Task { await session.terminals.resize(cols: cols, rows: rows) }
+                        },
+                        onReady: { feed in
+                            session.terminals.onFeed = { incomingId, data in
+                                if incomingId == id {
+                                    feed(data)
+                                }
                             }
-                        }
-                    },
-                    focusToken: focusToken
-                )
-                .id(id)
-                .onAppear {
-                    session.terminals.pendingOutput[id] = nil
+                        },
+                        onTextScaleChange: { scale, settled in
+                            textScale = scale
+                            showScaleHud(scale)
+                            if settled {
+                                TerminalTextScale.current = scale
+                            }
+                        },
+                        focusToken: focusToken,
+                        blurToken: session.terminalBlurToken
+                    )
+                    .id(id)
+                    .onAppear {
+                        session.terminals.pendingOutput[id] = nil
+                    }
+                    if let scaleHud {
+                        Text(scaleHud)
+                            .font(.subheadline.weight(.semibold).monospaced())
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(.ultraThinMaterial, in: Capsule())
+                            .allowsHitTesting(false)
+                    }
                 }
             } else {
                 ContentUnavailableView(
@@ -49,13 +72,49 @@ struct TerminalWorkspaceView: View {
             }
             TerminalInputDock(
                 isEnabled: session.terminals.activeId != nil,
+                isKeyboardVisible: session.terminalKeyboardVisible,
+                displayMode: session.terminals.displayMode,
+                textScale: textScale,
                 onSend: { text in
                     Task { await session.terminals.write(text) }
                 },
                 onFocusTerminal: {
                     focusToken &+= 1
+                },
+                onDismissKeyboard: {
+                    session.dismissTerminalKeyboard()
+                },
+                onToggleDisplayMode: {
+                    Task {
+                        let next: TerminalDisplayMode =
+                            session.terminals.displayMode == .phone ? .desktop : .phone
+                        await session.terminals.setDisplayMode(next)
+                    }
+                },
+                onNudgeTextScale: { direction in
+                    let next = TerminalTextScale.nudge(textScale, by: direction)
+                    textScale = next
+                    TerminalTextScale.current = next
+                    showScaleHud(next)
+                    HostLog.session.info("Terminal text scale \(next, privacy: .public)")
                 }
             )
+            .offset(y: session.terminalKeyboardVisible ? -session.terminalKeyboardHeight : 0)
+            .zIndex(1)
+        }
+    }
+
+    private var activeTerminal: LiveTerminal? {
+        session.terminals.terminals.first(where: { $0.id == session.terminals.activeId })
+    }
+
+    private func showScaleHud(_ scale: CGFloat) {
+        scaleHud = "\(Int((scale * 100).rounded()))%"
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(900))
+            if scaleHud == "\(Int((scale * 100).rounded()))%" {
+                scaleHud = nil
+            }
         }
     }
 

@@ -4,6 +4,9 @@
     "/" : {
 
     },
+    "%lld percent" : {
+
+    },
     "%lld turns" : {
       "localizations" : {
         "zh-Hans" : {
@@ -199,6 +202,9 @@
         }
       }
     },
+    "Desktop" : {
+
+    },
     "Disconnected from the host." : {
       "localizations" : {
         "zh-Hans" : {
@@ -244,6 +250,12 @@
           }
         }
       }
+    },
+    "Fit the phone" : {
+
+    },
+    "Hide keyboard" : {
+
     },
     "Host received" : {
 
@@ -314,6 +326,9 @@
           }
         }
       }
+    },
+    "Larger terminal text" : {
+
     },
     "Light" : {
       "localizations" : {
@@ -554,6 +569,9 @@
         }
       }
     },
+    "Phone" : {
+
+    },
     "Project" : {
 
     },
@@ -752,10 +770,16 @@
         }
       }
     },
+    "Smaller terminal text" : {
+
+    },
     "Starting the agent" : {
 
     },
     "Starting the agent on the Mac. First launch can take a few minutes." : {
+
+    },
+    "Switch to desktop size" : {
 
     },
     "System" : {
@@ -767,6 +791,9 @@
           }
         }
       }
+    },
+    "Tap to hide keyboard" : {
+
     },
     "Tap to show keyboard" : {
 

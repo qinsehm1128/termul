@@ -79,6 +79,7 @@ export type WebTerminalRequestType =
   | 'resume'
   | 'write'
   | 'resize'
+  | 'set_display_mode'
   | 'terminate'
   | 'kill'
   | 'attach'
@@ -244,6 +245,13 @@ export type WebTerminalEventPayload =
       rows: number
       shell: string
     }
+  | {
+      type: 'display_mode_changed'
+      terminal_id: string
+      mode: 'phone' | 'desktop'
+      cols: number
+      rows: number
+    }
 
 export interface WebTerminalEventFrame {
   type: 'event'
@@ -275,6 +283,7 @@ export interface LiveTerminalSummary {
   projectId?: string | null
   title: string
   gitBranch?: string | null
+  displayMode?: 'phone' | 'desktop'
 }
 
 export interface WebTerminalListResult {

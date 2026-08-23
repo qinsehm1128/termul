@@ -5,7 +5,9 @@
 
 use crate::conversation::{ConversationId, ConversationRecordV2, ExecutionTarget};
 use crate::pty::claims::ClaimError;
-use crate::trackers::{CwdTracker, ExitCodeTracker, GitTracker, TerminalEvent, TerminalEventHub};
+use crate::trackers::{
+    CwdTracker, ExitCodeTracker, GitTracker, TerminalDisplayMode, TerminalEvent, TerminalEventHub,
+};
 use parking_lot::RwLock;
 use portable_pty::{Child, MasterPty, PtySize};
 
@@ -1092,6 +1094,31 @@ struct TerminalCleanupProgress {
     child_reaped: bool,
 }
 
+#[derive(Debug, Clone)]
+struct PhoneFitPark {
+    desktop_cols: u16,
+    desktop_rows: u16,
+}
+
+#[derive(Debug, Default)]
+struct PhoneFitLease {
+    park: Option<PhoneFitPark>,
+    owners: HashSet<String>,
+}
+
+fn empty_phone_fit() -> Arc<RwLock<PhoneFitLease>> {
+    Arc::new(RwLock::new(PhoneFitLease::default()))
+}
+
+/// Current phone/desktop geometry owner for a live PTY.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DisplayModeState {
+    pub mode: TerminalDisplayMode,
+    pub cols: u16,
+    pub rows: u16,
+}
+
 /// A running terminal instance
 pub struct TerminalInstance {
     pub id: String,
@@ -1124,6 +1151,8 @@ pub struct TerminalInstance {
     pub protected: Arc<AtomicBool>,
     pub cols: Arc<RwLock<u16>>,
     pub rows: Arc<RwLock<u16>>,
+    /// Phone takeover: parked desktop size plus the connections that own geometry.
+    phone_fit: Arc<RwLock<PhoneFitLease>>,
     /// Broadcast channel for fan-out of raw PTY output to remote WebSocket clients.
     /// Each flusher batch is sent as a `Vec<u8>` message. Tauri frontend keeps using
     /// its dedicated Channel — this field is only consumed by the remote module.
@@ -1154,6 +1183,54 @@ impl TerminalInstance {
         } else {
             Err("Terminal resource is not active".to_string())
         }
+    }
+
+    #[must_use]
+    pub fn is_phone_fit(&self) -> bool {
+        self.phone_fit.read().park.is_some()
+    }
+
+    #[must_use]
+    pub fn display_mode(&self) -> TerminalDisplayMode {
+        if self.is_phone_fit() {
+            TerminalDisplayMode::Phone
+        } else {
+            TerminalDisplayMode::Desktop
+        }
+    }
+
+    fn adopt_phone_owner(&self, owner: &str, cols: u16, rows: u16) -> (u16, u16) {
+        let mut lease = self.phone_fit.write();
+        if lease.park.is_none() {
+            lease.park = Some(PhoneFitPark {
+                desktop_cols: *self.cols.read(),
+                desktop_rows: *self.rows.read(),
+            });
+        }
+        lease.owners.insert(owner.to_string());
+        (cols, rows)
+    }
+
+    fn drop_phone_owner(&self, owner: &str) -> Option<(u16, u16)> {
+        let mut lease = self.phone_fit.write();
+        lease.owners.remove(owner);
+        if lease.owners.is_empty() {
+            lease
+                .park
+                .take()
+                .map(|park| (park.desktop_cols, park.desktop_rows))
+        } else {
+            None
+        }
+    }
+
+    fn force_desktop_display(&self) -> Option<(u16, u16)> {
+        let mut lease = self.phone_fit.write();
+        lease.owners.clear();
+        lease
+            .park
+            .take()
+            .map(|park| (park.desktop_cols, park.desktop_rows))
     }
 
     /// Update the last activity timestamp
@@ -1407,7 +1484,10 @@ impl PtyManager {
     }
 
     fn resume_view_tracking(&self, terminal_id: &str) {
-        let Some(instance) = self.get(terminal_id).filter(|instance| instance.is_active()) else {
+        let Some(instance) = self
+            .get(terminal_id)
+            .filter(|instance| instance.is_active())
+        else {
             return;
         };
         let cwd = self
@@ -1415,7 +1495,8 @@ impl PtyManager {
             .get_cwd(terminal_id)
             .unwrap_or_else(|| instance.cwd.clone());
         if self.cwd_tracker.get_cwd(terminal_id).is_none() {
-            self.cwd_tracker.start_tracking(terminal_id, instance.pid, &cwd);
+            self.cwd_tracker
+                .start_tracking(terminal_id, instance.pid, &cwd);
         }
         if !self.git_tracker.is_tracking(terminal_id) {
             self.git_tracker.initialize_terminal(terminal_id, &cwd);
@@ -1437,13 +1518,7 @@ impl PtyManager {
     /// Hide a tab that never attached on this surface. Pause polling only
     /// when no other desktop/remote view is still watching.
     pub fn pause_tracking_if_unwatched(&self, terminal_id: &str) {
-        let watched = self
-            .view_refs
-            .lock()
-            .get(terminal_id)
-            .copied()
-            .unwrap_or(0)
-            > 0;
+        let watched = self.view_refs.lock().get(terminal_id).copied().unwrap_or(0) > 0;
         if watched {
             return;
         }
@@ -1476,9 +1551,7 @@ impl PtyManager {
                 "[pty-view] last view closed; pausing cwd/git tracking terminal_id={terminal_id} pty_still_running=true"
             );
         } else {
-            log::info!(
-                "[pty-view] closed terminal_id={terminal_id} remaining_views={remaining}"
-            );
+            log::info!("[pty-view] closed terminal_id={terminal_id} remaining_views={remaining}");
         }
     }
 
@@ -1946,6 +2019,7 @@ impl PtyManager {
                 protected: Arc::new(AtomicBool::new(true)),
                 cols: Arc::new(RwLock::new(cols)),
                 rows: Arc::new(RwLock::new(rows)),
+                phone_fit: empty_phone_fit(),
                 broadcast_tx: Arc::new(tokio::sync::broadcast::channel(TERM_BROADCAST_CAPACITY).0),
                 output_log: Arc::new(RwLock::new(std::collections::VecDeque::new())),
                 output_log_bytes: Arc::new(AtomicUsize::new(0)),
@@ -2104,6 +2178,7 @@ impl PtyManager {
                 protected: Arc::new(AtomicBool::new(true)),
                 cols: Arc::new(RwLock::new(cols)),
                 rows: Arc::new(RwLock::new(rows)),
+                phone_fit: empty_phone_fit(),
                 broadcast_tx: Arc::new(tokio::sync::broadcast::channel(TERM_BROADCAST_CAPACITY).0),
                 output_log: Arc::new(RwLock::new(std::collections::VecDeque::new())),
                 output_log_bytes: Arc::new(AtomicUsize::new(0)),
@@ -2410,8 +2485,20 @@ impl PtyManager {
         Ok(())
     }
 
-    /// Resize an active terminal.
+    /// Resize an active terminal. Ignored while a phone owns the live geometry.
     pub async fn resize(&self, id: &str, cols: u16, rows: u16) -> Result<(), String> {
+        let instance = self
+            .get(id)
+            .ok_or_else(|| format!("Terminal not found: {id}"))?;
+        instance.require_active()?;
+        if instance.is_phone_fit() {
+            log::info!("[pty] ignore resize while phone-fit terminal_id={id}");
+            return Ok(());
+        }
+        self.resize_ioctl(id, cols, rows).await
+    }
+
+    async fn resize_ioctl(&self, id: &str, cols: u16, rows: u16) -> Result<(), String> {
         let instance = self
             .get(id)
             .ok_or_else(|| format!("Terminal not found: {id}"))?;
@@ -2449,6 +2536,85 @@ impl PtyManager {
         *instance.rows.write() = rows;
         instance.update_activity();
         Ok(())
+    }
+
+    /// Phone takeover parks the desktop size; desktop mode restores it.
+    pub async fn set_display_mode(
+        &self,
+        id: &str,
+        mode: TerminalDisplayMode,
+        phone_cols: Option<u16>,
+        phone_rows: Option<u16>,
+        owner: &str,
+        force: bool,
+    ) -> Result<DisplayModeState, String> {
+        let instance = self
+            .get(id)
+            .ok_or_else(|| format!("Terminal not found: {id}"))?;
+        instance.require_active()?;
+
+        match mode {
+            TerminalDisplayMode::Phone => {
+                let cols = phone_cols
+                    .filter(|value| *value >= 2)
+                    .ok_or_else(|| "phone display mode requires cols >= 2".to_string())?;
+                let rows = phone_rows
+                    .filter(|value| *value >= 2)
+                    .ok_or_else(|| "phone display mode requires rows >= 2".to_string())?;
+                let was_parked = instance.is_phone_fit();
+                let (target_cols, target_rows) = instance.adopt_phone_owner(owner, cols, rows);
+                let size_changed =
+                    *instance.cols.read() != target_cols || *instance.rows.read() != target_rows;
+                if size_changed {
+                    self.resize_ioctl(id, target_cols, target_rows).await?;
+                }
+                if !was_parked || size_changed {
+                    self.emit_display_mode(
+                        id,
+                        TerminalDisplayMode::Phone,
+                        target_cols,
+                        target_rows,
+                    );
+                }
+                Ok(DisplayModeState {
+                    mode: TerminalDisplayMode::Phone,
+                    cols: target_cols,
+                    rows: target_rows,
+                })
+            }
+            TerminalDisplayMode::Desktop => {
+                let restore = if force {
+                    instance.force_desktop_display()
+                } else {
+                    instance.drop_phone_owner(owner)
+                };
+                if let Some((cols, rows)) = restore {
+                    self.resize_ioctl(id, cols, rows).await?;
+                    self.emit_display_mode(id, TerminalDisplayMode::Desktop, cols, rows);
+                    return Ok(DisplayModeState {
+                        mode: TerminalDisplayMode::Desktop,
+                        cols,
+                        rows,
+                    });
+                }
+                Ok(DisplayModeState {
+                    mode: instance.display_mode(),
+                    cols: *instance.cols.read(),
+                    rows: *instance.rows.read(),
+                })
+            }
+        }
+    }
+
+    fn emit_display_mode(&self, id: &str, mode: TerminalDisplayMode, cols: u16, rows: u16) {
+        log::info!("[pty] display-mode terminal_id={id} mode={mode:?} cols={cols} rows={rows}");
+        self.terminal_events
+            .emit(TerminalEvent::DisplayModeChanged {
+                terminal_id: id.to_string(),
+                mode,
+                cols,
+                rows,
+            });
     }
 
     /// Explicitly terminate a terminal resource under one absolute five-second deadline.
@@ -3688,6 +3854,7 @@ mod tests {
             protected: Arc::new(AtomicBool::new(true)),
             cols: Arc::new(RwLock::new(80)),
             rows: Arc::new(RwLock::new(24)),
+            phone_fit: empty_phone_fit(),
             broadcast_tx: Arc::new(broadcast_tx),
             output_log: Arc::new(RwLock::new(std::collections::VecDeque::new())),
             output_log_bytes: Arc::new(AtomicUsize::new(0)),
@@ -3702,6 +3869,72 @@ mod tests {
         manager.active_terminal_slots.fetch_add(1, Ordering::SeqCst);
         manager.claims.issue(terminal_id, conversation_id, None);
         instance
+    }
+
+    #[test]
+    fn phone_fit_parks_desktop_size_until_last_owner_leaves() {
+        let manager = crate::web::test_pty_manager();
+        let instance = install_cleanup_fixture(&manager, "term-phone-fit");
+        *instance.cols.write() = 120;
+        *instance.rows.write() = 40;
+
+        instance.adopt_phone_owner("phone-1", 40, 18);
+        assert!(instance.is_phone_fit());
+        assert_eq!(instance.display_mode(), TerminalDisplayMode::Phone);
+        assert_eq!(
+            instance
+                .phone_fit
+                .read()
+                .park
+                .as_ref()
+                .map(|park| (park.desktop_cols, park.desktop_rows)),
+            Some((120, 40))
+        );
+
+        instance.adopt_phone_owner("phone-2", 38, 16);
+        assert_eq!(
+            instance
+                .phone_fit
+                .read()
+                .park
+                .as_ref()
+                .map(|park| (park.desktop_cols, park.desktop_rows)),
+            Some((120, 40))
+        );
+        assert_eq!(instance.drop_phone_owner("phone-1"), None);
+        assert!(instance.is_phone_fit());
+        assert_eq!(instance.drop_phone_owner("phone-2"), Some((120, 40)));
+        assert!(!instance.is_phone_fit());
+        assert_eq!(instance.display_mode(), TerminalDisplayMode::Desktop);
+    }
+
+    #[tokio::test]
+    async fn resize_is_ignored_while_phone_fit() {
+        let manager = crate::web::test_pty_manager();
+        let instance = install_cleanup_fixture(&manager, "term-phone-ignore");
+        *instance.cols.write() = 100;
+        *instance.rows.write() = 30;
+        instance.adopt_phone_owner("phone-1", 40, 18);
+
+        manager
+            .resize("term-phone-ignore", 80, 24)
+            .await
+            .expect("parked resize is a no-op");
+        assert_eq!(*instance.cols.read(), 100);
+        assert_eq!(*instance.rows.read(), 30);
+    }
+
+    #[test]
+    fn force_desktop_clears_every_phone_owner() {
+        let manager = crate::web::test_pty_manager();
+        let instance = install_cleanup_fixture(&manager, "term-phone-force");
+        *instance.cols.write() = 132;
+        *instance.rows.write() = 43;
+        instance.adopt_phone_owner("phone-1", 40, 18);
+        instance.adopt_phone_owner("phone-2", 36, 16);
+        assert_eq!(instance.force_desktop_display(), Some((132, 43)));
+        assert!(!instance.is_phone_fit());
+        assert_eq!(instance.drop_phone_owner("phone-1"), None);
     }
 
     #[tokio::test]
@@ -4744,6 +4977,7 @@ mod tests {
             protected: Arc::new(AtomicBool::new(true)),
             cols: Arc::new(RwLock::new(80)),
             rows: Arc::new(RwLock::new(24)),
+            phone_fit: empty_phone_fit(),
             broadcast_tx: Arc::new(broadcast_tx),
             output_log: Arc::new(RwLock::new(chunks)),
             output_log_bytes: Arc::new(AtomicUsize::new(6)),

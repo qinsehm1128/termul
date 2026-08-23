@@ -5,7 +5,12 @@
     "pasteFailed": "Paste failed: {{message}}",
     "hideKeys": "Hide terminal keys",
     "showKeys": "Show terminal keys",
-    "paste": "Paste"
+    "paste": "Paste",
+    "smallerText": "Smaller terminal text",
+    "largerText": "Larger terminal text",
+    "textSize": "Terminal text size {{percent}} percent",
+    "phoneLayout": "Fit phone",
+    "desktopLayout": "Use desktop size"
   },
   "chatShell": {
     "openMenu": "Open menu",

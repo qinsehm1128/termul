@@ -7,6 +7,10 @@ import type {
   TerminalAttachResult,
   TerminalCwdChangedCallback,
   TerminalDataCallback,
+  TerminalDisplayMode,
+  TerminalDisplayModeChangedEvent,
+  TerminalDisplayModeOptions,
+  TerminalDisplayModeState,
   TerminalExitCallback,
   TerminalExitCodeChangedCallback,
   TerminalGitBranchChangedCallback,
@@ -110,6 +114,9 @@ export class WebTerminalClient {
   private readonly statusCallbacks = new Set<TerminalGitStatusChangedCallback>()
   private readonly exitCodeCallbacks = new Set<TerminalExitCodeChangedCallback>()
   private readonly spawnedCallbacks = new Set<(event: TerminalSpawnedEvent) => void>()
+  private readonly displayModeCallbacks = new Set<
+    (event: TerminalDisplayModeChangedEvent) => void
+  >()
   private invalidBinaryFrameLogged = false
 
   constructor(
@@ -521,6 +528,10 @@ export class WebTerminalClient {
     this.spawnedCallbacks.add(callback)
     return () => this.spawnedCallbacks.delete(callback)
   }
+  onDisplayModeChanged(callback: (event: TerminalDisplayModeChangedEvent) => void): () => void {
+    this.displayModeCallbacks.add(callback)
+    return () => this.displayModeCallbacks.delete(callback)
+  }
   onCwd(callback: TerminalCwdChangedCallback): () => void {
     this.cwdCallbacks.add(callback)
     return () => this.cwdCallbacks.delete(callback)
@@ -698,6 +709,16 @@ export class WebTerminalClient {
             cols: event.cols,
             rows: event.rows,
             shell: event.shell
+          })
+        }
+        break
+      case 'display_mode_changed':
+        for (const callback of this.displayModeCallbacks) {
+          callback({
+            terminalId: event.terminal_id,
+            mode: event.mode,
+            cols: event.cols,
+            rows: event.rows
           })
         }
         break
@@ -887,6 +908,7 @@ export function createWebTerminalApi(): TerminalApi {
     attach: (terminalId, claim, lastSeq) => client.attachWithCursor(terminalId, claim, lastSeq),
     watch: (terminalId, lastSeq) => client.watch(terminalId, lastSeq),
     onSpawned: (callback) => client.onSpawned(callback),
+    onDisplayModeChanged: (callback) => client.onDisplayModeChanged(callback),
     async rotateClaim(terminalId: string, claim: string): Promise<IpcResult<RotatedClaim>> {
       const result = await client.request<RotatedClaim>('rotate_claim', { terminalId, claim })
       if (result.success) {
@@ -907,6 +929,18 @@ export function createWebTerminalApi(): TerminalApi {
     },
     write: (terminalId, data) => client.request('write', { terminalId, data }),
     resize: (terminalId, cols, rows) => client.request('resize', { terminalId, cols, rows }),
+    setDisplayMode: (
+      terminalId,
+      mode: TerminalDisplayMode,
+      options: TerminalDisplayModeOptions = {}
+    ) =>
+      client.request<TerminalDisplayModeState>('set_display_mode', {
+        terminalId,
+        mode,
+        cols: options.cols,
+        rows: options.rows,
+        force: options.force
+      }),
     closeView: (terminalId) => client.closeView(terminalId),
     async terminate(terminalId): Promise<IpcResult<void>> {
       const result = await client.request<void>('terminate', { terminalId })

@@ -1,6 +1,11 @@
 import Foundation
 import Observation
 
+enum TerminalDisplayMode: String {
+    case phone
+    case desktop
+}
+
 struct LiveTerminal: Identifiable, Hashable, Sendable {
     let id: String
     var claim: String?
@@ -10,8 +15,7 @@ struct LiveTerminal: Identifiable, Hashable, Sendable {
     var title: String
     var cwd: String?
     var gitBranch: String?
-    /// True only for PTYs this phone spawned. Desktop-owned tabs are watch-only
-    /// for geometry so a phone resize does not reflow the desktop.
+    /// True only for PTYs this phone spawned.
     var owned: Bool
 }
 
@@ -24,6 +28,12 @@ final class TerminalStore {
     var errorMessage: String?
     var isConnecting = false
     var onFeed: (@MainActor (String, Data) -> Void)?
+    /// Keyboard is covering the grid. Keep local geometry; do not reflow the host PTY.
+    var suppressHostResize = false
+    /// Phone-fit takeover when viewing; desktop restores the parked host size.
+    var displayMode: TerminalDisplayMode = .phone
+    /// True only while the terminal tab is the visible workspace surface.
+    var geometryActive = false
 
     private var coalesceBuffers: [String: Data] = [:]
     private var coalesceTask: Task<Void, Never>?
@@ -44,6 +54,16 @@ final class TerminalStore {
         socket.onCatalogChanged = { [weak self] in
             guard let self else { return }
             Task { await self.refresh(conversationId: self.lastConversationId, projectId: self.lastProjectId) }
+        }
+        socket.onDisplayModeChanged = { [weak self] terminalId, mode in
+            guard let self else { return }
+            guard terminalId == self.activeId,
+                  mode == TerminalDisplayMode.desktop.rawValue,
+                  self.geometryActive,
+                  self.displayMode == .phone
+            else { return }
+            self.displayMode = .desktop
+            HostLog.session.info("Host restored desktop display mode")
         }
         socket.onExit = { [weak self] terminalId in
             guard let self else { return }
@@ -112,6 +132,7 @@ final class TerminalStore {
         do {
             try await ensureConnected()
             if let watchedId, watchedId != terminalId {
+                await releaseDisplayMode(for: watchedId)
                 await socket.detach(terminalId: watchedId)
             }
             _ = try await socket.watch(terminalId: terminalId, lastSeq: 0)
@@ -170,8 +191,43 @@ final class TerminalStore {
         guard let index = terminals.firstIndex(where: { $0.id == activeId }) else { return }
         terminals[index].cols = cols
         terminals[index].rows = rows
-        guard terminals[index].owned else { return }
-        _ = try? await socket.resize(terminalId: activeId, cols: cols, rows: rows)
+        guard displayMode == .phone, geometryActive, !suppressHostResize else { return }
+        _ = try? await socket.setDisplayMode(
+            terminalId: activeId,
+            mode: TerminalDisplayMode.phone.rawValue,
+            cols: cols,
+            rows: rows
+        )
+    }
+
+    func setDisplayMode(_ mode: TerminalDisplayMode) async {
+        displayMode = mode
+        guard let socket, let activeId else { return }
+        if mode == .desktop {
+            _ = try? await socket.setDisplayMode(
+                terminalId: activeId,
+                mode: TerminalDisplayMode.desktop.rawValue
+            )
+            HostLog.session.info("Terminal display mode desktop")
+            return
+        }
+        guard geometryActive, !suppressHostResize else { return }
+        guard let index = terminals.firstIndex(where: { $0.id == activeId }) else { return }
+        _ = try? await socket.setDisplayMode(
+            terminalId: activeId,
+            mode: TerminalDisplayMode.phone.rawValue,
+            cols: terminals[index].cols,
+            rows: terminals[index].rows
+        )
+        HostLog.session.info("Terminal display mode phone")
+    }
+
+    func releaseDisplayMode(for terminalId: String?) async {
+        guard let socket, let terminalId else { return }
+        _ = try? await socket.setDisplayMode(
+            terminalId: terminalId,
+            mode: TerminalDisplayMode.desktop.rawValue
+        )
     }
 
     private func enqueueOutput(terminalId: String, data: Data) {

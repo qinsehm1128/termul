@@ -1963,6 +1963,7 @@ pub fn run() {
             commands::terminal_revoke_claim,
             commands::terminal_write,
             commands::terminal_resize,
+            commands::terminal_set_display_mode,
             commands::terminal_close_view,
             commands::terminal_terminate,
             commands::terminal_kill,

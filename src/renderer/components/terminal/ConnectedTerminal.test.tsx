@@ -253,6 +253,8 @@ vi.mock('@/lib/api', () => ({
     spawn: vi.fn(),
     write: vi.fn(),
     resize: vi.fn(),
+    setDisplayMode: vi.fn(),
+    onDisplayModeChanged: vi.fn(() => vi.fn()),
     closeView: vi.fn(),
     terminate: vi.fn(),
     kill: vi.fn(),

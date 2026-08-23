@@ -15,4 +15,4 @@ pub use exit_code_tracker::ExitCodeTracker;
 pub use git_tracker::{GitCommit, GitStatus, GitStatusDetail, GitTracker};
 #[allow(unused_imports)]
 pub use terminal_events::TerminalStateSnapshot;
-pub use terminal_events::{TerminalEvent, TerminalEventHub};
+pub use terminal_events::{TerminalDisplayMode, TerminalEvent, TerminalEventHub};

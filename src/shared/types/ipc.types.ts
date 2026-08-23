@@ -132,6 +132,28 @@ export interface TerminalSpawnedEvent {
   shell: string
 }
 
+/** Live PTY geometry owner. Phone parks the desktop size until restore. */
+export type TerminalDisplayMode = 'phone' | 'desktop'
+
+export interface TerminalDisplayModeState {
+  mode: TerminalDisplayMode
+  cols: number
+  rows: number
+}
+
+export interface TerminalDisplayModeChangedEvent {
+  terminalId: string
+  mode: TerminalDisplayMode
+  cols: number
+  rows: number
+}
+
+export interface TerminalDisplayModeOptions {
+  cols?: number
+  rows?: number
+  force?: boolean
+}
+
 /**
  * CAP-3 attach response — byte-identical camelCase shape on both transports
  * (desktop `terminal_attach` IpcResult data; web `attach` reply data).
@@ -416,6 +438,17 @@ export interface TerminalApi {
   revokeClaim: (terminalId: string, claim: string) => Promise<IpcResult<void>>
   write: (terminalId: string, data: string) => Promise<IpcResult<void>>
   resize: (terminalId: string, cols: number, rows: number) => Promise<IpcResult<void>>
+  /**
+   * Phone takeover resizes the live PTY and parks desktop FitAddon.
+   * Desktop mode restores the parked size. Optional on test doubles.
+   */
+  setDisplayMode?: (
+    terminalId: string,
+    mode: TerminalDisplayMode,
+    options?: TerminalDisplayModeOptions
+  ) => Promise<IpcResult<TerminalDisplayModeState>>
+  /** Host event when phone/desktop geometry ownership changes. */
+  onDisplayModeChanged?: (callback: (event: TerminalDisplayModeChangedEvent) => void) => () => void
   /** Close/detach the renderer view without destroying the PTY or claim. */
   closeView: (terminalId: string) => Promise<IpcResult<void>>
   /** The sole user-facing destructive terminal resource operation. */

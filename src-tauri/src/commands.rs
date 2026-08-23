@@ -703,7 +703,10 @@ pub async fn terminal_watch(
     if let Err(error) = require_host_admission() {
         return Ok(error);
     }
-    let Some(instance) = pty_manager.get(&terminal_id).filter(|item| item.is_active()) else {
+    let Some(instance) = pty_manager
+        .get(&terminal_id)
+        .filter(|item| item.is_active())
+    else {
         return Ok(IpcResult::error("Terminal not found", "TERMINAL_NOT_FOUND"));
     };
     let generation = pty_manager.claim_generation(&terminal_id);
@@ -893,6 +896,29 @@ pub async fn terminal_resize(
     match pty_manager.resize(&terminal_id, cols, rows).await {
         Ok(()) => Ok(IpcResult::success(())),
         Err(e) => Ok(IpcResult::error(e, "RESIZE_FAILED")),
+    }
+}
+
+/// Phone takeover parks desktop geometry; desktop mode restores it.
+#[tauri::command]
+pub async fn terminal_set_display_mode(
+    terminal_id: String,
+    mode: String,
+    cols: Option<u16>,
+    rows: Option<u16>,
+    pty_manager: State<'_, Arc<PtyManager>>,
+) -> Result<IpcResult<crate::pty::manager::DisplayModeState>, String> {
+    let parsed = match crate::trackers::TerminalDisplayMode::parse(&mode) {
+        Ok(mode) => mode,
+        Err(error) => return Ok(IpcResult::error(error, "VALIDATION_ERROR")),
+    };
+    let force = parsed == crate::trackers::TerminalDisplayMode::Desktop;
+    match pty_manager
+        .set_display_mode(&terminal_id, parsed, cols, rows, "desktop-host", force)
+        .await
+    {
+        Ok(state) => Ok(IpcResult::success(state)),
+        Err(error) => Ok(IpcResult::error(error, "RESIZE_FAILED")),
     }
 }
 
@@ -3879,9 +3905,10 @@ pub async fn remote_server_start(
     let (bind_mode, publish_mode) = match bind_mode.as_deref() {
         None => match stored_intent.publish_mode {
             remote::PublishMode::Lan => (remote::RemoteBindMode::All, remote::PublishMode::Lan),
-            remote::PublishMode::Tunnel => {
-                (remote::RemoteBindMode::Localhost, remote::PublishMode::Tunnel)
-            }
+            remote::PublishMode::Tunnel => (
+                remote::RemoteBindMode::Localhost,
+                remote::PublishMode::Tunnel,
+            ),
         },
         Some(s) => {
             let bind = remote::RemoteBindMode::parse(s)
@@ -4140,10 +4167,7 @@ pub async fn remote_server_rotate_credential(
                 );
                 Ok(IpcResult::success(remote_state.status()))
             }
-            Err(error) => Ok(IpcResult::error(
-                error.to_string(),
-                "REMOTE_ROTATE_FAILED",
-            )),
+            Err(error) => Ok(IpcResult::error(error.to_string(), "REMOTE_ROTATE_FAILED")),
         }
     }
 }

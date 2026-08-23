@@ -1,5 +1,10 @@
 import { fireEvent, render, screen } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { CompanionTerminalGeometryContext } from '@/hooks/use-companion-terminal-geometry'
+import {
+  DEFAULT_COMPANION_TERMINAL_TEXT_SCALE,
+  setCompanionTerminalTextScale
+} from '@/lib/companion-terminal-text-scale'
 import { MobileTerminalControls } from './MobileTerminalControls'
 
 const { write, readText } = vi.hoisted(() => ({
@@ -19,6 +24,7 @@ describe('MobileTerminalControls', () => {
     write.mockReset()
     readText.mockReset()
     write.mockResolvedValue({ success: true, data: undefined })
+    setCompanionTerminalTextScale(DEFAULT_COMPANION_TERMINAL_TEXT_SCALE)
   })
 
   it('writes terminal escape/control sequences', () => {
@@ -29,6 +35,33 @@ describe('MobileTerminalControls', () => {
     expect(write).toHaveBeenNthCalledWith(1, 'pty-1', '\u001b')
     expect(write).toHaveBeenNthCalledWith(2, 'pty-1', '\u0003')
     expect(write).toHaveBeenNthCalledWith(3, 'pty-1', '\u001b[A')
+  })
+
+  it('nudges the companion text scale', () => {
+    render(<MobileTerminalControls terminalId="pty-1" />)
+    fireEvent.click(screen.getByLabelText('Smaller terminal text'))
+    expect(screen.getByLabelText('Terminal text size 100 percent')).toBeInTheDocument()
+    fireEvent.click(screen.getByLabelText('Larger terminal text'))
+    fireEvent.click(screen.getByLabelText('Larger terminal text'))
+    expect(screen.getByLabelText('Terminal text size 150 percent')).toBeInTheDocument()
+  })
+
+  it('toggles phone and desktop layout', () => {
+    const setPreferredMode = vi.fn()
+    render(
+      <CompanionTerminalGeometryContext.Provider
+        value={{
+          surfaceActive: true,
+          preferredMode: 'phone',
+          keyboardOpen: false,
+          setPreferredMode
+        }}
+      >
+        <MobileTerminalControls terminalId="pty-1" />
+      </CompanionTerminalGeometryContext.Provider>
+    )
+    fireEvent.click(screen.getByLabelText('Use desktop size'))
+    expect(setPreferredMode).toHaveBeenCalledWith('desktop')
   })
 
   it('pastes browser clipboard text', async () => {

@@ -17,6 +17,9 @@ import {
   ContextMenuShortcut,
   ContextMenuTrigger
 } from '@/components/ui/context-menu'
+import { useCompanionTerminalGeometry } from '@/hooks/use-companion-terminal-geometry'
+import { useCompanionTerminalTextScale } from '@/hooks/use-companion-terminal-text-scale'
+import { useMobileWebShell } from '@/hooks/use-mobile-web-shell'
 import { useTerminalClipboard } from '@/hooks/use-terminal-clipboard'
 import { useTerminalColorTheme } from '@/hooks/use-terminal-color-theme'
 import { useTerminalResizeV2 } from '@/hooks/use-terminal-resize-v2'
@@ -328,7 +331,14 @@ function ConnectedTerminalComponent({
   )
 
   const fontFamily = buildTerminalFontChain(useTerminalFontFamily(), useTerminalSymbolFontFamily())
-  const fontSize = useTerminalFontSize()
+  const isMobileWebShell = useMobileWebShell()
+  const companionGeometry = useCompanionTerminalGeometry()
+  const companionTextScale = useCompanionTerminalTextScale()
+  const [parkedByPhone, setParkedByPhone] = useState(false)
+  const fontSize = Math.max(
+    6,
+    Math.round(useTerminalFontSize() * (isMobileWebShell ? companionTextScale.scale : 1))
+  )
   const bufferSize = useTerminalBufferSize()
   const rendererPreference = useTerminalRenderer()
   const screenReaderMode = useTerminalScreenReaderMode()
@@ -421,15 +431,34 @@ function ConnectedTerminalComponent({
   }, [targetId])
 
   // Two-stage resize pipeline: 8ms fit debounce + 256ms PTY resize debounce
-  const handlePtyResize = useCallback(async (cols: number, rows: number): Promise<void> => {
-    const ptyId = ptyIdRef.current
-    if (!ptyId) return
-    try {
-      await terminalApi.resize(ptyId, cols, rows)
-    } catch {
-      // Ignore resize errors during rapid resize
-    }
-  }, [])
+  const companionGeometryRef = useRef(companionGeometry)
+  companionGeometryRef.current = companionGeometry
+  const parkedByPhoneRef = useRef(false)
+  parkedByPhoneRef.current = parkedByPhone
+
+  const handlePtyResize = useCallback(
+    async (cols: number, rows: number): Promise<void> => {
+      const ptyId = ptyIdRef.current
+      if (!ptyId) return
+      const geometry = companionGeometryRef.current
+      if (geometry?.surfaceActive && geometry.preferredMode === 'phone' && isVisibleRef.current) {
+        if (geometry.keyboardOpen || !terminalApi.setDisplayMode) return
+        try {
+          await terminalApi.setDisplayMode(ptyId, 'phone', { cols, rows })
+        } catch {
+          // Ignore takeover errors during rapid resize
+        }
+        return
+      }
+      if (parkedByPhoneRef.current || isMobileWebShell) return
+      try {
+        await terminalApi.resize(ptyId, cols, rows)
+      } catch {
+        // Ignore resize errors during rapid resize
+      }
+    },
+    [isMobileWebShell]
+  )
 
   const { forceFit: forceResizeFit } = useTerminalResizeV2({
     onPtyResize: handlePtyResize,
@@ -438,6 +467,39 @@ function ConnectedTerminalComponent({
     containerRef,
     isVisible
   })
+
+  useEffect(() => {
+    if (!companionGeometry || !terminalApi.setDisplayMode) return
+    const ptyId = ptyIdRef.current
+    if (!ptyId) return
+    const shouldOwn =
+      companionGeometry.surfaceActive && companionGeometry.preferredMode === 'phone' && isVisible
+    if (!shouldOwn) {
+      void terminalApi.setDisplayMode(ptyId, 'desktop')
+    }
+  }, [companionGeometry, isVisible])
+
+  useEffect(() => {
+    if (!terminalApi.onDisplayModeChanged) return
+    return terminalApi.onDisplayModeChanged((event) => {
+      if (event.terminalId !== ptyIdRef.current) return
+      const parked = event.mode === 'phone'
+      parkedByPhoneRef.current = parked
+      setParkedByPhone(parked)
+      if (!parked) {
+        const geometry = companionGeometryRef.current
+        if (geometry?.surfaceActive && isVisibleRef.current) {
+          geometry.setPreferredMode('desktop')
+        }
+        forceResizeFit()
+      }
+      void logFrontendError({
+        level: 'warn',
+        source: 'terminal.display-mode',
+        message: `mode=${event.mode} ${event.cols}x${event.rows}`
+      })
+    })
+  }, [forceResizeFit])
 
   const [terminalInstance, setTerminalInstance] = useState<Terminal | null>(null)
   useTerminalColorTheme(terminalInstance)
@@ -1094,7 +1156,20 @@ function ConnectedTerminalComponent({
             if (needsResizeOnReadyRef.current) {
               needsResizeOnReadyRef.current = false
               performFit(true)
-              terminalApi.resize(result.data.id, terminal.cols, terminal.rows).catch(() => {})
+              if (
+                companionGeometryRef.current?.surfaceActive &&
+                companionGeometryRef.current.preferredMode === 'phone' &&
+                terminalApi.setDisplayMode
+              ) {
+                terminalApi
+                  .setDisplayMode(result.data.id, 'phone', {
+                    cols: terminal.cols,
+                    rows: terminal.rows
+                  })
+                  .catch(() => {})
+              } else if (!isMobileWebShell) {
+                terminalApi.resize(result.data.id, terminal.cols, terminal.rows).catch(() => {})
+              }
             }
             // Register terminal for scrollback persistence
             registerTerminal(result.data.id, terminal)
@@ -1772,6 +1847,34 @@ function ConnectedTerminalComponent({
           >
             <div ref={containerRef} className="w-full h-full" />
           </div>
+          {parkedByPhone && !isMobileWebShell ? (
+            <div
+              className="absolute inset-0 z-40 flex items-center justify-center bg-background/80 p-4 backdrop-blur-[2px]"
+              role="status"
+              aria-live="polite"
+            >
+              <div className="w-full max-w-sm rounded-md border border-border bg-card p-4 text-foreground shadow-lg">
+                <h3 className="text-sm font-semibold tracking-[-0.01em]">
+                  {t('parkedByPhone.title')}
+                </h3>
+                <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">
+                  {t('parkedByPhone.description')}
+                </p>
+                <button
+                  type="button"
+                  className="mt-3 inline-flex h-8 items-center justify-center rounded-md bg-foreground px-3 text-xs font-medium text-background transition-colors hover:bg-foreground/88"
+                  onClick={(event) => {
+                    event.stopPropagation()
+                    const ptyId = ptyIdRef.current
+                    if (!ptyId || !terminalApi.setDisplayMode) return
+                    void terminalApi.setDisplayMode(ptyId, 'desktop', { force: true })
+                  }}
+                >
+                  {t('parkedByPhone.resume')}
+                </button>
+              </div>
+            </div>
+          ) : null}
           {cleanupRecovery && (
             <div className="absolute inset-x-3 top-3 z-[60]" role="alert" aria-live="polite">
               <div className="flex items-start gap-3 rounded-md border border-destructive/35 bg-card p-3 text-foreground shadow-[0_12px_36px_hsl(var(--background)/0.55),inset_0_1px_0_0_hsl(var(--foreground)/0.05)]">

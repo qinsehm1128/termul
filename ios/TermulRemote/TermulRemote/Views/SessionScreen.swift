@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct SessionScreen: View {
     @Bindable var session: WorkspaceSession
@@ -12,9 +13,19 @@ struct SessionScreen: View {
                 TerminalTabStrip(session: session)
             }
             content
-            tabBar
+            if !session.terminalKeyboardVisible {
+                tabBar
+            }
         }
         .background(TermulTheme.canvas.ignoresSafeArea())
+        .modifier(TerminalKeyboardAvoidance(enabled: session.workspaceTab == .terminal))
+        .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillChangeFrameNotification)) { notification in
+            guard session.workspaceTab == .terminal else { return }
+            let duration = (notification.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
+            withAnimation(.easeOut(duration: duration)) {
+                session.noteTerminalKeyboard(height: KeyboardGuard.overlapHeight(from: notification))
+            }
+        }
         .sheet(isPresented: $chat.showAgentSheet) {
             AgentConfigSheet(session: session)
         }
@@ -48,6 +59,11 @@ struct SessionScreen: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                session.dismissTerminalKeyboard()
             }
             Spacer(minLength: 8)
             if session.workspace == .conversation {
@@ -180,6 +196,18 @@ struct SessionScreen: View {
             "project:\(session.projects.active?.id ?? "")"
         case .home:
             "home"
+        }
+    }
+}
+
+private struct TerminalKeyboardAvoidance: ViewModifier {
+    var enabled: Bool
+
+    func body(content: Content) -> some View {
+        if enabled {
+            content.ignoresSafeArea(.keyboard, edges: .bottom)
+        } else {
+            content
         }
     }
 }

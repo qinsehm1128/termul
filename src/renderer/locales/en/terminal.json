@@ -28,6 +28,11 @@
     "next": "Next match (Enter)",
     "close": "Close (Escape)"
   },
+  "parkedByPhone": {
+    "title": "Phone is using this terminal",
+    "description": "The computer view is paused so the phone can drive the live session.",
+    "resume": "Use this computer"
+  },
   "contextMenu": {
     "copy": "Copy",
     "paste": "Paste",

@@ -1,8 +1,10 @@
-import { ClipboardPaste, Keyboard } from 'lucide-react'
+import { ClipboardPaste, Keyboard, Monitor, Smartphone, ZoomIn, ZoomOut } from 'lucide-react'
 import { useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
+import { useCompanionTerminalGeometry } from '@/hooks/use-companion-terminal-geometry'
+import { useCompanionTerminalTextScale } from '@/hooks/use-companion-terminal-text-scale'
 import { clipboardApi } from '@/lib/clipboard-api'
 import { terminalApi } from '@/lib/terminal-api'
 import { cn } from '@/lib/utils'
@@ -28,6 +30,8 @@ export function MobileTerminalControls({
 }: MobileTerminalControlsProps): React.JSX.Element {
   const { t } = useTranslation('mobile')
   const [expanded, setExpanded] = useState(true)
+  const textScale = useCompanionTerminalTextScale()
+  const geometry = useCompanionTerminalGeometry()
 
   const write = async (data: string): Promise<void> => {
     const result = await terminalApi.write(terminalId, data)
@@ -53,6 +57,27 @@ export function MobileTerminalControls({
   return (
     <div className="shrink-0 border-t border-border/60 bg-card/95 px-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] pt-1 backdrop-blur">
       <div className="flex items-center gap-1 overflow-x-auto scrollbar-hide">
+        {geometry ? (
+          <Button
+            type="button"
+            variant={geometry.preferredMode === 'phone' ? 'secondary' : 'ghost'}
+            size="sm"
+            className="h-10 shrink-0 gap-1 px-3"
+            aria-label={
+              geometry.preferredMode === 'phone'
+                ? t('terminalControls.desktopLayout')
+                : t('terminalControls.phoneLayout')
+            }
+            onClick={() =>
+              geometry.setPreferredMode(geometry.preferredMode === 'phone' ? 'desktop' : 'phone')
+            }
+          >
+            {geometry.preferredMode === 'phone' ? <Smartphone size={15} /> : <Monitor size={15} />}
+            {geometry.preferredMode === 'phone'
+              ? t('terminalControls.phoneLayout')
+              : t('terminalControls.desktopLayout')}
+          </Button>
+        ) : null}
         <Button
           type="button"
           variant="ghost"
@@ -63,6 +88,34 @@ export function MobileTerminalControls({
           onClick={() => setExpanded((value) => !value)}
         >
           <Keyboard size={16} />
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="h-10 shrink-0 px-3"
+          aria-label={t('terminalControls.smallerText')}
+          onClick={() => textScale.nudge(-1)}
+        >
+          <ZoomOut size={15} />
+        </Button>
+        <span
+          role="status"
+          className="inline-flex h-10 shrink-0 items-center px-2 text-xs tabular-nums text-muted-foreground"
+          aria-live="polite"
+          aria-label={t('terminalControls.textSize', { percent: textScale.percent })}
+        >
+          {textScale.percent}%
+        </span>
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          className="h-10 shrink-0 px-3"
+          aria-label={t('terminalControls.largerText')}
+          onClick={() => textScale.nudge(1)}
+        >
+          <ZoomIn size={15} />
         </Button>
         <Button
           type="button"

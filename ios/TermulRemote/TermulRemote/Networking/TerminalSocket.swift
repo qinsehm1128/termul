@@ -46,6 +46,7 @@ final class TerminalSocket {
     var onBytes: (@MainActor (String, Data) -> Void)?
     var onExit: (@MainActor (String) -> Void)?
     var onCatalogChanged: (@MainActor () -> Void)?
+    var onDisplayModeChanged: (@MainActor (String, String) -> Void)?
 
     private var session: URLSession?
     private var task: URLSessionWebSocketTask?
@@ -171,6 +172,20 @@ final class TerminalSocket {
         )
     }
 
+    func setDisplayMode(terminalId: String, mode: String, cols: Int? = nil, rows: Int? = nil) async throws {
+        var payload: [String: Any] = [
+            "terminalId": terminalId,
+            "mode": mode
+        ]
+        if let cols {
+            payload["cols"] = cols
+        }
+        if let rows {
+            payload["rows"] = rows
+        }
+        _ = try await request("set_display_mode", payload: payload, as: EmptyPayload.self)
+    }
+
     func stop() {
         receiveTask?.cancel()
         receiveTask = nil
@@ -257,6 +272,11 @@ final class TerminalSocket {
                let eventType = payload["type"] as? String {
                 if eventType == "exit", let terminalId = payload["terminal_id"] as? String {
                     onExit?(terminalId)
+                }
+                if eventType == "display_mode_changed",
+                   let terminalId = payload["terminal_id"] as? String,
+                   let mode = payload["mode"] as? String {
+                    onDisplayModeChanged?(terminalId, mode)
                 }
                 if eventType == "spawned" || eventType == "exit" {
                     HostLog.session.info("Host terminal catalog changed")

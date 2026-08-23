@@ -13,8 +13,9 @@
 //! generation still fence passive output.
 
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use std::net::{IpAddr, SocketAddr};
@@ -34,6 +35,7 @@ use crate::conversation::ConversationId;
 #[cfg(test)]
 use crate::pty::manager::SpawnOptions;
 use crate::pty::manager::{TerminalReplay, TerminalResumeRequest, TerminalSpawnIntentV1};
+use crate::trackers::TerminalDisplayMode;
 use crate::web::auth::{
     auth_error_response, RemoteAccessAuthority, RemoteAuthError, RemoteCapability, RemotePrincipal,
 };
@@ -43,6 +45,7 @@ const MAX_RECONNECT_FRAMES: usize = 64;
 const ATTACH_GENERATION_CHECK_MS: u64 = 250;
 const BINARY_SUBPROTOCOL: &str = "termul-terminal-v2.binary";
 const BINARY_FRAME_MAGIC: &[u8; 4] = b"TML2";
+static CONNECTION_SERIAL: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
@@ -255,9 +258,6 @@ async fn run(
     // derived write/query/event capability here, not only the output stream.
     // Shared with the event-forwarding task so it sees rotations immediately.
     let authorized: AuthorizedTerminals = Arc::new(RwLock::new(HashMap::new()));
-    // Per-terminal output forwarding tasks.
-    let attachments: HashMap<String, tokio::task::JoinHandle<()>> = HashMap::new();
-
     info!(
         handshake_bearer = principal.is_some(),
         "[terminal-ws] client connected after Origin admission"
@@ -274,11 +274,7 @@ async fn run(
         )
     });
 
-    let mut ctx = ConnectionContext {
-        authorized: authorized.clone(),
-        attachments,
-        binary_output,
-    };
+    let mut ctx = ConnectionContext::new(authorized.clone(), binary_output);
 
     loop {
         if principal_generation_mismatch(&authority, principal.as_ref()) {
@@ -357,6 +353,7 @@ async fn run(
     }
 
     // Cleanup: abort and join event/attachment tasks. PTYs are preserved.
+    release_phone_fits(&state, &mut ctx).await;
     let attached_ids: Vec<String> = ctx.attachments.keys().cloned().collect();
     let attachments = std::mem::take(&mut ctx.attachments);
     for terminal_id in &attached_ids {
@@ -379,6 +376,7 @@ async fn run(
 }
 
 struct ConnectionContext {
+    id: String,
     /// Exact terminal → Conversation + claim-generation scopes authorized on
     /// this connection.
     authorized: AuthorizedTerminals,
@@ -386,9 +384,24 @@ struct ConnectionContext {
     attachments: HashMap<String, tokio::task::JoinHandle<()>>,
     /// True only when the client requested and negotiated the v2 binary output subprotocol.
     binary_output: bool,
+    /// Terminals this connection currently owns in phone-fit mode.
+    phone_fit: HashSet<String>,
 }
 
 impl ConnectionContext {
+    fn new(authorized: AuthorizedTerminals, binary_output: bool) -> Self {
+        Self {
+            id: format!(
+                "termws-{}",
+                CONNECTION_SERIAL.fetch_add(1, Ordering::Relaxed)
+            ),
+            authorized,
+            attachments: HashMap::new(),
+            binary_output,
+            phone_fit: HashSet::new(),
+        }
+    }
+
     fn authorize(
         &mut self,
         terminal_id: &str,
@@ -470,6 +483,50 @@ fn release_connection_view(
     };
     if released {
         state.pty.note_view_closed(terminal_id);
+    }
+}
+
+async fn release_connection_phone_fit(
+    state: &AppState,
+    ctx: &mut ConnectionContext,
+    terminal_id: &str,
+) {
+    if !ctx.phone_fit.remove(terminal_id) {
+        return;
+    }
+    if let Err(error) = state
+        .pty
+        .set_display_mode(
+            terminal_id,
+            TerminalDisplayMode::Desktop,
+            None,
+            None,
+            &ctx.id,
+            false,
+        )
+        .await
+    {
+        info!("[terminal-ws] phone-fit release failed terminal_id={terminal_id} error={error}");
+    }
+}
+
+async fn release_phone_fits(state: &AppState, ctx: &mut ConnectionContext) {
+    let owned: Vec<String> = ctx.phone_fit.drain().collect();
+    for terminal_id in owned {
+        if let Err(error) = state
+            .pty
+            .set_display_mode(
+                &terminal_id,
+                TerminalDisplayMode::Desktop,
+                None,
+                None,
+                &ctx.id,
+                false,
+            )
+            .await
+        {
+            info!("[terminal-ws] phone-fit release failed terminal_id={terminal_id} error={error}");
+        }
     }
 }
 
@@ -714,6 +771,29 @@ async fn handle(
                 .map(|_| Value::Null)
                 .map_err(|error| ("RESIZE_FAILED", error))
         }
+        "set_display_mode" => {
+            let terminal_id = string_field(&request.payload, "terminalId")?.to_string();
+            authorized_terminal_scope(state, ctx, &terminal_id)?;
+            let mode = TerminalDisplayMode::parse(string_field(&request.payload, "mode")?)
+                .map_err(|error| ("VALIDATION_ERROR", error))?;
+            let cols = optional_u16_field(&request.payload, "cols")?;
+            let rows = optional_u16_field(&request.payload, "rows")?;
+            let force = request.payload["force"].as_bool().unwrap_or(false);
+            let state_value = state
+                .pty
+                .set_display_mode(&terminal_id, mode, cols, rows, &ctx.id, force)
+                .await
+                .map_err(|error| ("RESIZE_FAILED", error))?;
+            match mode {
+                TerminalDisplayMode::Phone => {
+                    ctx.phone_fit.insert(terminal_id);
+                }
+                TerminalDisplayMode::Desktop => {
+                    ctx.phone_fit.remove(&terminal_id);
+                }
+            }
+            serde_json::to_value(state_value).map_err(|error| ("NETWORK_ERROR", error.to_string()))
+        }
         "terminate" | "kill" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
             let scope = authorized_terminal_cleanup_scope(state, ctx, terminal_id)?;
@@ -730,6 +810,7 @@ async fn handle(
                 ));
             }
             debug_assert!(state.pty.get(terminal_id).is_none(), "scope={scope}");
+            release_connection_phone_fit(state, ctx, terminal_id).await;
             release_connection_view(state, ctx, terminal_id, true);
             Ok(Value::Null)
         }
@@ -808,6 +889,7 @@ async fn handle(
             // (removed from the authorized set). Holders on OTHER connections
             // are severed by the claim-generation check inside their
             // attachment tasks. The PTY keeps running.
+            release_connection_phone_fit(state, ctx, &terminal_id).await;
             release_connection_view(state, ctx, &terminal_id, true);
             info!("[terminal-ws] claim rotated terminal_id={terminal_id}");
             serde_json::to_value(crate::pty::RotatedClaim { claim: rotated })
@@ -829,12 +911,14 @@ async fn handle(
             // metadata or output; other connections are severed by the
             // generation check in their attachment tasks. The PTY keeps
             // running.
+            release_connection_phone_fit(state, ctx, &terminal_id).await;
             release_connection_view(state, ctx, &terminal_id, true);
             info!("[terminal-ws] claim revoked terminal_id={terminal_id}");
             Ok(Value::Null)
         }
         "detach" => {
             let terminal_id = string_field(&request.payload, "terminalId")?;
+            release_connection_phone_fit(state, ctx, terminal_id).await;
             release_connection_view(state, ctx, terminal_id, true);
             info!("[terminal-ws] detached terminal_id={terminal_id}");
             Ok(Value::Null)
@@ -845,6 +929,7 @@ async fn handle(
             // Abort output first but retain authorization long enough for the
             // renderer component's unmount cleanup to remove its backend ref.
             // That cleanup then sends `detach`, which drops authorization.
+            release_connection_phone_fit(state, ctx, terminal_id).await;
             release_connection_view(state, ctx, terminal_id, false);
             info!("[terminal-ws] close-view terminal_id={terminal_id}");
             Ok(Value::Null)
@@ -1240,8 +1325,8 @@ async fn spawn_project_terminal(
     state: &AppState,
     ctx: &mut ConnectionContext,
 ) -> Result<Value, (&'static str, String)> {
-    let intent: TerminalProjectSpawnIntent = serde_json::from_value(payload)
-        .map_err(|error| ("VALIDATION_ERROR", error.to_string()))?;
+    let intent: TerminalProjectSpawnIntent =
+        serde_json::from_value(payload).map_err(|error| ("VALIDATION_ERROR", error.to_string()))?;
     if intent.project_id.trim().is_empty() {
         return Err(("VALIDATION_ERROR", "missing projectId".to_string()));
     }
@@ -1254,7 +1339,12 @@ async fn spawn_project_terminal(
     let project = state
         .registry
         .switch_context(&intent.project_id)
-        .ok_or_else(|| ("NOT_FOUND", "project not found or not switchable".to_string()))?;
+        .ok_or_else(|| {
+            (
+                "NOT_FOUND",
+                "project not found or not switchable".to_string(),
+            )
+        })?;
     info!(
         "[terminal-ws] spawn requested project_id={} conversation_id=none cwd_source=project",
         project.project_id
@@ -1273,13 +1363,9 @@ async fn spawn_project_terminal(
     };
     let spawned = match terminal_workspace_service(state) {
         Ok(workspace) => {
-            let result = crate::commands::terminal_spawn_resource(
-                options,
-                None,
-                &state.pty,
-                &workspace,
-            )
-            .await;
+            let result =
+                crate::commands::terminal_spawn_resource(options, None, &state.pty, &workspace)
+                    .await;
             if !result.success {
                 let code = terminal_resource_code(result.code.as_deref());
                 let error = result
@@ -1354,6 +1440,7 @@ fn live_terminal_summary(
         "projectId": instance.project_id,
         "title": terminal_display_title(&cwd, &instance.shell),
         "gitBranch": git_branch,
+        "displayMode": instance.display_mode(),
     })
 }
 
@@ -1420,6 +1507,13 @@ fn u16_field(value: &Value, key: &str) -> Result<u16, (&'static str, String)> {
         .and_then(|value| u16::try_from(value).ok())
         .filter(|value| *value > 0)
         .ok_or_else(|| ("VALIDATION_ERROR", format!("invalid {key}")))
+}
+
+fn optional_u16_field(value: &Value, key: &str) -> Result<Option<u16>, (&'static str, String)> {
+    if value.get(key).is_none() || value[key].is_null() {
+        return Ok(None);
+    }
+    Ok(Some(u16_field(value, key)?))
 }
 
 fn encode_binary_output_frame(
@@ -1599,11 +1693,7 @@ mod tests {
 
         let mut state = terminal_test_state();
         state.pty = Arc::clone(&pty);
-        let mut ctx = ConnectionContext {
-            authorized: Arc::new(RwLock::new(HashMap::new())),
-            attachments: HashMap::new(),
-            binary_output: false,
-        };
+        let mut ctx = ConnectionContext::new(Arc::new(RwLock::new(HashMap::new())), false);
         retain_compound_cleanup_authorization(
             &state,
             &mut ctx,
@@ -1633,7 +1723,10 @@ mod tests {
         assert_eq!(intent.project_id, "project-1");
 
         for (field, value) in [
-            ("conversationId", json!("018f7a1c-1b4d-7c8a-9f01-0123456789ab")),
+            (
+                "conversationId",
+                json!("018f7a1c-1b4d-7c8a-9f01-0123456789ab"),
+            ),
             ("cwd", json!("/caller/path")),
             ("shell", json!("caller-shell")),
             ("program", json!("/bin/sh")),
@@ -1667,11 +1760,7 @@ mod tests {
             }],
             Some("project-1".into()),
         );
-        let mut ctx = ConnectionContext {
-            authorized: Arc::new(RwLock::new(HashMap::new())),
-            attachments: HashMap::new(),
-            binary_output: false,
-        };
+        let mut ctx = ConnectionContext::new(Arc::new(RwLock::new(HashMap::new())), false);
         let spawned = spawn_project_terminal(
             json!({
                 "projectId": "project-1",
@@ -1931,6 +2020,11 @@ mod tests {
     fn u16_rejects_negative_and_overflow() {
         assert!(u16_field(&json!({ "rows": -1 }), "rows").is_err());
         assert!(u16_field(&json!({ "rows": 70000 }), "rows").is_err());
+        assert_eq!(optional_u16_field(&json!({}), "cols"), Ok(None));
+        assert_eq!(
+            optional_u16_field(&json!({ "cols": 40 }), "cols"),
+            Ok(Some(40))
+        );
     }
 
     #[test]
@@ -1945,11 +2039,7 @@ mod tests {
 
     #[test]
     fn context_close_view_preserves_authorization_until_detach() {
-        let mut ctx = ConnectionContext {
-            authorized: Arc::new(RwLock::new(HashMap::new())),
-            attachments: HashMap::new(),
-            binary_output: false,
-        };
+        let mut ctx = ConnectionContext::new(Arc::new(RwLock::new(HashMap::new())), false);
         ctx.authorize("t1", conversation_id(), 7);
         assert!(ctx.is_authorized("t1"));
         assert!(!ctx.is_authorized("t2"));
@@ -1981,11 +2071,7 @@ mod tests {
             .unwrap();
         let terminal_id = spawned.info.id.clone();
         let generation = state.pty.claim_generation(&terminal_id).unwrap();
-        let mut ctx = ConnectionContext {
-            authorized: Arc::new(RwLock::new(HashMap::new())),
-            attachments: HashMap::new(),
-            binary_output: false,
-        };
+        let mut ctx = ConnectionContext::new(Arc::new(RwLock::new(HashMap::new())), false);
         ctx.authorize(&terminal_id, conversation_id, generation);
 
         assert_eq!(
@@ -2064,11 +2150,7 @@ mod tests {
     async fn connection_detach_aborts_attachment_and_clears_authorization() {
         // This test pins the ConnectionContext::detach PRIMITIVE the teardown
         // relies on: aborting the attachment task and clearing authorization.
-        let mut ctx = ConnectionContext {
-            authorized: Arc::new(RwLock::new(HashMap::new())),
-            attachments: HashMap::new(),
-            binary_output: false,
-        };
+        let mut ctx = ConnectionContext::new(Arc::new(RwLock::new(HashMap::new())), false);
         ctx.authorize("t1", conversation_id(), 7);
 
         // A live attachment task mimicking the output forwarder.
@@ -2203,5 +2285,320 @@ mod tests {
             .map(|line| line.split("//").next().unwrap_or_default())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn parse_marked_window(buffer: &str) -> Option<(u16, u16)> {
+        for line in buffer.lines() {
+            let Some(rest) = line.trim().strip_prefix("TERMUL_WIN:") else {
+                continue;
+            };
+            let mut parts = rest.split_whitespace();
+            let rows = parts.next()?.parse().ok()?;
+            let cols = parts.next()?.parse().ok()?;
+            return Some((rows, cols));
+        }
+        None
+    }
+
+    async fn collect_output_until(
+        receiver: &mut tokio::sync::broadcast::Receiver<crate::pty::manager::TerminalOutputChunk>,
+        predicate: impl Fn(&str) -> bool,
+    ) -> String {
+        let mut buffer = String::new();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, receiver.recv()).await {
+                Ok(Ok(chunk)) => {
+                    buffer.push_str(&String::from_utf8_lossy(&chunk.data));
+                    if predicate(&buffer) {
+                        return buffer;
+                    }
+                }
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+        buffer
+    }
+
+    async fn read_live_window(
+        pty: &crate::pty::manager::PtyManager,
+        terminal_id: &str,
+        receiver: &mut tokio::sync::broadcast::Receiver<crate::pty::manager::TerminalOutputChunk>,
+    ) -> (u16, u16) {
+        while receiver.try_recv().is_ok() {}
+        pty.write(terminal_id, "echo TERMUL_WIN:$(stty size)\n")
+            .await
+            .expect("write stty probe");
+        let buffer =
+            collect_output_until(receiver, |text| parse_marked_window(text).is_some()).await;
+        parse_marked_window(&buffer)
+            .unwrap_or_else(|| panic!("stty size marker missing in PTY output: {buffer:?}"))
+    }
+
+    fn has_output_line(buffer: &str, marker: &str) -> bool {
+        buffer.lines().any(|line| line.trim() == marker)
+    }
+
+    async fn count_full_screen_cells(
+        pty: &crate::pty::manager::PtyManager,
+        terminal_id: &str,
+        receiver: &mut tokio::sync::broadcast::Receiver<crate::pty::manager::TerminalOutputChunk>,
+        script_path: &std::path::Path,
+    ) -> usize {
+        std::fs::write(
+            script_path,
+            "printf '%s\\n' TERMUL_PAINT_START\nawk 'BEGIN{ \"stty size\" | getline s; split(s,a); for(i=1;i<=a[1];i++){ for(j=1;j<=a[2];j++) printf \"A\"; print \"\" } }'\nprintf '%s\\n' TERMUL_PAINT_END\n",
+        )
+        .expect("write paint script");
+        while receiver.try_recv().is_ok() {}
+        pty.write(terminal_id, &format!("sh '{}'\n", script_path.display()))
+            .await
+            .expect("run paint script");
+        let buffer = collect_output_until(receiver, |text| {
+            has_output_line(text, "TERMUL_PAINT_START") && has_output_line(text, "TERMUL_PAINT_END")
+        })
+        .await;
+        let start = buffer
+            .lines()
+            .position(|line| line.trim() == "TERMUL_PAINT_START");
+        let end = buffer
+            .lines()
+            .position(|line| line.trim() == "TERMUL_PAINT_END");
+        let (Some(start), Some(end)) = (start, end) else {
+            panic!("paint markers missing in PTY output: {buffer:?}");
+        };
+        buffer
+            .lines()
+            .skip(start + 1)
+            .take(end.saturating_sub(start + 1))
+            .flat_map(str::chars)
+            .filter(|ch| *ch == 'A')
+            .count()
+    }
+
+    async fn companion_request(
+        state: &AppState,
+        authority: &Arc<RemoteAccessAuthority>,
+        principal: &RemotePrincipal,
+        ctx: &mut ConnectionContext,
+        type_: &str,
+        payload: Value,
+    ) -> Value {
+        let (tx, _rx) = mpsc::channel(8);
+        handle(
+            Request {
+                id: format!("mobile-{type_}"),
+                type_: type_.to_string(),
+                payload,
+            },
+            state,
+            authority,
+            principal,
+            &tx,
+            ctx,
+        )
+        .await
+        .unwrap_or_else(|(code, message)| panic!("{type_} failed: {code} {message}"))
+    }
+
+    #[tokio::test]
+    async fn mobile_set_display_mode_changes_live_pty_window_then_restores() {
+        let state = terminal_test_state();
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let conversation_id = conversation_id();
+        let spawned = state
+            .pty
+            .spawn(
+                SpawnOptions {
+                    conversation_id: Some(conversation_id),
+                    cwd: Some(cwd.to_string_lossy().into_owned()),
+                    cols: Some(120),
+                    rows: Some(40),
+                    shell: Some("/bin/sh".into()),
+                    env: Some(HashMap::from([
+                        ("PS1".into(), "$ ".into()),
+                        ("TERM".into(), "xterm-256color".into()),
+                    ])),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("spawn desktop-sized PTY");
+        let terminal_id = spawned.info.id.clone();
+        let instance = state.pty.get(&terminal_id).expect("live instance");
+        let mut output = instance.broadcast_tx.subscribe();
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        let desktop = read_live_window(&state.pty, &terminal_id, &mut output).await;
+        assert_eq!(desktop, (40, 120), "desktop PTY must start at 120x40");
+
+        let authority = terminal_authority();
+        let principal = RemotePrincipal::for_tests(1);
+        let generation = state.pty.claim_generation(&terminal_id).unwrap();
+        let mut ctx = ConnectionContext::new(Arc::new(RwLock::new(HashMap::new())), false);
+        ctx.authorize(&terminal_id, conversation_id, generation);
+
+        let phone_reply = companion_request(
+            &state,
+            &authority,
+            &principal,
+            &mut ctx,
+            "set_display_mode",
+            json!({
+                "terminalId": terminal_id,
+                "mode": "phone",
+                "cols": 40,
+                "rows": 18
+            }),
+        )
+        .await;
+        assert_eq!(phone_reply["mode"], "phone");
+        assert_eq!(phone_reply["cols"], 40);
+        assert_eq!(phone_reply["rows"], 18);
+        assert!(ctx.phone_fit.contains(&terminal_id));
+
+        let phone = read_live_window(&state.pty, &terminal_id, &mut output).await;
+        assert_eq!(
+            phone,
+            (18, 40),
+            "mobile takeover must ioctl the live window"
+        );
+
+        let _ = companion_request(
+            &state,
+            &authority,
+            &principal,
+            &mut ctx,
+            "resize",
+            json!({
+                "terminalId": terminal_id,
+                "cols": 100,
+                "rows": 30
+            }),
+        )
+        .await;
+        let still_phone = read_live_window(&state.pty, &terminal_id, &mut output).await;
+        assert_eq!(
+            still_phone,
+            (18, 40),
+            "desktop-style resize must be ignored while the phone owns geometry"
+        );
+
+        let listed = live_terminal_summary(&instance, instance.cwd.clone(), None);
+        assert_eq!(listed["displayMode"], "phone");
+        assert_eq!(listed["cols"], 40);
+        assert_eq!(listed["rows"], 18);
+
+        let paint_script = cwd.join("paint.sh");
+        let phone_cells =
+            count_full_screen_cells(&state.pty, &terminal_id, &mut output, &paint_script).await;
+
+        let desktop_reply = companion_request(
+            &state,
+            &authority,
+            &principal,
+            &mut ctx,
+            "set_display_mode",
+            json!({
+                "terminalId": terminal_id,
+                "mode": "desktop"
+            }),
+        )
+        .await;
+        assert_eq!(desktop_reply["mode"], "desktop");
+        assert_eq!(desktop_reply["cols"], 120);
+        assert_eq!(desktop_reply["rows"], 40);
+        assert!(!ctx.phone_fit.contains(&terminal_id));
+
+        let restored = read_live_window(&state.pty, &terminal_id, &mut output).await;
+        assert_eq!(
+            restored,
+            (40, 120),
+            "desktop mode must restore the parked window"
+        );
+
+        let desktop_cells =
+            count_full_screen_cells(&state.pty, &terminal_id, &mut output, &paint_script).await;
+        println!(
+            "full-screen paint cells phone={phone_cells} desktop={desktop_cells} ratio={:.2}",
+            desktop_cells as f64 / phone_cells.max(1) as f64
+        );
+        assert!(
+            phone_cells < desktop_cells,
+            "a full-screen paint must emit fewer cells on the phone window ({phone_cells} < {desktop_cells})"
+        );
+        assert!(
+            desktop_cells >= 120 * 40,
+            "desktop paint should cover the parked 120x40 grid, got {desktop_cells}"
+        );
+
+        state.pty.terminate(&terminal_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mobile_disconnect_restores_parked_desktop_window() {
+        let state = terminal_test_state();
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().canonicalize().unwrap();
+        let conversation_id = conversation_id();
+        let spawned = state
+            .pty
+            .spawn(
+                SpawnOptions {
+                    conversation_id: Some(conversation_id),
+                    cwd: Some(cwd.to_string_lossy().into_owned()),
+                    cols: Some(120),
+                    rows: Some(40),
+                    shell: Some("/bin/sh".into()),
+                    env: Some(HashMap::from([
+                        ("PS1".into(), "$ ".into()),
+                        ("TERM".into(), "xterm-256color".into()),
+                    ])),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("spawn desktop-sized PTY");
+        let terminal_id = spawned.info.id.clone();
+        let instance = state.pty.get(&terminal_id).expect("live instance");
+        let mut output = instance.broadcast_tx.subscribe();
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+
+        let authority = terminal_authority();
+        let principal = RemotePrincipal::for_tests(1);
+        let generation = state.pty.claim_generation(&terminal_id).unwrap();
+        let mut ctx = ConnectionContext::new(Arc::new(RwLock::new(HashMap::new())), false);
+        ctx.authorize(&terminal_id, conversation_id, generation);
+        companion_request(
+            &state,
+            &authority,
+            &principal,
+            &mut ctx,
+            "set_display_mode",
+            json!({
+                "terminalId": terminal_id,
+                "mode": "phone",
+                "cols": 42,
+                "rows": 16
+            }),
+        )
+        .await;
+        assert_eq!(
+            read_live_window(&state.pty, &terminal_id, &mut output).await,
+            (16, 42)
+        );
+
+        release_phone_fits(&state, &mut ctx).await;
+        assert_eq!(
+            read_live_window(&state.pty, &terminal_id, &mut output).await,
+            (40, 120),
+            "dropping the mobile websocket must restore the parked desktop window"
+        );
+
+        state.pty.terminate(&terminal_id).await.unwrap();
     }
 }

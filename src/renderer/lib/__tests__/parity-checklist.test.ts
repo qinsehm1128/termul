@@ -321,6 +321,8 @@ const P1_DOMAINS: DomainCheck[] = [
       'spawn',
       'write',
       'resize',
+      'setDisplayMode',
+      'onDisplayModeChanged',
       'kill',
       'onData',
       'onDataForTerminal',

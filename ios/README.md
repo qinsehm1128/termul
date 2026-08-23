@@ -24,7 +24,7 @@ Quick Tunnel (`*.trycloudflare.com`) still goes through Cloudflare even on the s
 
 ACP agents that are already running on the Mac, or whose CLI is on the Mac PATH (`cursor-agent`, Codex via npx), can be selected from the phone. Switching reuses the live host process instead of starting a second one. Agents that advertise sign-in open that flow on the computer.
 
-Terminal lists the host’s **already running** PTYs for the active desktop session (`list` by `conversationId`, then `watch`) and shows their scrollback. “New terminal” is optional and conversation-scoped. Phone resize does not change a desktop-owned PTY. The emulator is [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) (`ios/Vendor/SwiftTerm`, plugin stripped so Xcode 27 can compile it).
+Terminal lists the host’s **already running** PTYs for the active desktop session (`list` by `conversationId`, then `watch`) and shows their scrollback. “New terminal” is optional and conversation-scoped. Opening the terminal tab on the phone takes the live PTY size, parks the desktop FitAddon, and restores that parked size when the phone leaves, disconnects, or switches back to Desktop. Pinch or A-/A+ still scales local text (50%–200%). Opening the keyboard lifts the input dock and leaves host geometry alone. The emulator is [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) (`ios/Vendor/SwiftTerm`, plugin stripped so Xcode 27 can compile it).
 
 ## Language
 

@@ -7,6 +7,19 @@ enum KeyboardGuard {
     static func resign() {
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
     }
+
+    static func overlapHeight(from notification: Notification) -> CGFloat {
+        guard let frame = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect else {
+            return 0
+        }
+        let window = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap(\.windows)
+            .first(where: \.isKeyWindow)
+        guard let window else { return frame.height }
+        let end = window.convert(frame, from: nil)
+        return max(0, window.bounds.maxY - end.minY)
+    }
 }
 
 enum SessionPhase: Equatable {
@@ -41,6 +54,10 @@ final class WorkspaceSession {
     var workspaceTab: WorkspaceTab = .chat
     var workspace: WorkspaceKind = .home
     var phase: SessionPhase = .idle
+    /// Software keyboard is covering the terminal tab. Chrome hides; host PTY stays put.
+    var terminalKeyboardVisible = false
+    var terminalKeyboardHeight: CGFloat = 0
+    var terminalBlurToken: UInt64 = 0
     private var isStarting = false
     private var startEpoch = 0
 
@@ -156,6 +173,11 @@ final class WorkspaceSession {
     }
 
     func leaveWorkspace() {
+        dismissTerminalKeyboard()
+        terminals.geometryActive = false
+        let terminalId = terminals.activeId
+        Task { await terminals.releaseDisplayMode(for: terminalId) }
+        terminals.displayMode = .phone
         workspace = .home
         conversations.clearSelection()
         projects.clearSelection()
@@ -178,14 +200,37 @@ final class WorkspaceSession {
         setWorkspaceTab(.chat)
     }
 
+    func dismissTerminalKeyboard() {
+        let wasVisible = terminalKeyboardVisible
+        terminalBlurToken &+= 1
+        noteTerminalKeyboard(height: 0)
+        KeyboardGuard.resign()
+        if wasVisible {
+            HostLog.session.info("Terminal keyboard dismissed")
+        }
+    }
+
+    func noteTerminalKeyboard(height: CGFloat) {
+        let visible = workspaceTab == .terminal && height > 40
+        terminalKeyboardHeight = visible ? height : 0
+        terminalKeyboardVisible = visible
+        terminals.suppressHostResize = visible
+    }
+
     func setWorkspaceTab(_ tab: WorkspaceTab) {
         guard workspaceTab != tab else { return }
-        KeyboardGuard.resign()
+        dismissTerminalKeyboard()
+        if tab != .terminal {
+            terminals.geometryActive = false
+            let terminalId = terminals.activeId
+            Task { await terminals.releaseDisplayMode(for: terminalId) }
+        }
         HostLog.session.info("Workspace tab \(tab.rawValue, privacy: .public)")
         Task { @MainActor in
             try? await Task.sleep(for: .milliseconds(80))
             workspaceTab = tab
             showChat = tab == .chat
+            terminals.geometryActive = tab == .terminal
         }
     }
 
