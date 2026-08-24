@@ -11,6 +11,7 @@ import { AgentLauncher } from '@/components/agents/AgentLauncher'
 import { ConfirmDialog } from '@/components/ConfirmDialog'
 import { CreateSnapshotModal } from '@/components/CreateSnapshotModal'
 import { ConversationSidebar } from '@/components/conversation/ConversationSidebar'
+import { ImportEditorWorkspacesDialog } from '@/components/ImportEditorWorkspacesDialog'
 import { NewProjectModal } from '@/components/NewProjectModal'
 import { ProjectSidebar } from '@/components/ProjectSidebar'
 import { ResizeEdges } from '@/components/ResizeEdges'
@@ -254,6 +255,8 @@ export default function WorkspaceLayout(): React.JSX.Element {
   const location = useLocation()
   const navigate = useNavigate()
   const [isNewProjectModalOpen, setIsNewProjectModalOpen] = useState(false)
+  const [isImportEditorOpen, setIsImportEditorOpen] = useState(false)
+  const [importEditorGroupId, setImportEditorGroupId] = useState<string | null>(null)
 
   useEffect(() => {
     setRouterNavigate(navigate)
@@ -2181,7 +2184,20 @@ export default function WorkspaceLayout(): React.JSX.Element {
       <NewProjectModal
         isOpen={isNewProjectModalOpen}
         onClose={() => setIsNewProjectModalOpen(false)}
+        onImportFromEditor={() => {
+          setIsNewProjectModalOpen(false)
+          setImportEditorGroupId(null)
+          setIsImportEditorOpen(true)
+        }}
         onCreateProject={addProject}
+      />
+      <ImportEditorWorkspacesDialog
+        isOpen={isImportEditorOpen}
+        targetGroupId={importEditorGroupId}
+        onClose={() => {
+          setIsImportEditorOpen(false)
+          setImportEditorGroupId(null)
+        }}
       />
 
       <Dialog
@@ -2558,6 +2574,10 @@ export default function WorkspaceLayout(): React.JSX.Element {
                       onSelectProject={handleSelectProject}
                       onSelectGroup={handleSelectGroup}
                       onNewProject={() => setIsNewProjectModalOpen(true)}
+                      onImportFromEditor={(groupId) => {
+                        setImportEditorGroupId(groupId ?? null)
+                        setIsImportEditorOpen(true)
+                      }}
                       onUpdateProject={updateProject}
                       onDeleteProject={deleteProject}
                       onArchiveProject={archiveProject}

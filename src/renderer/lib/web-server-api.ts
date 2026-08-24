@@ -25,6 +25,7 @@ import {
   parseCliSessionListResult,
   parseCliSessionResolveResult
 } from '@shared/types/cli-session.types'
+import type { EditorWorkspaceList } from '@shared/types/editor-workspace.types'
 import type {
   BranchInfo,
   DetectedShells,
@@ -320,6 +321,16 @@ export const webServerGit = {
 export const webServerShell = {
   async getAvailableShells(): Promise<IpcResult<DetectedShells>> {
     return getJson<DetectedShells>('/shells')
+  }
+}
+
+/** Host editor recents + `.code-workspace` parse (`GET/POST /editor-workspaces`). */
+export const webServerEditorWorkspaces = {
+  async list(): Promise<IpcResult<EditorWorkspaceList>> {
+    return getJson<EditorWorkspaceList>('/editor-workspaces')
+  },
+  async parse(path: string): Promise<IpcResult<EditorWorkspaceList>> {
+    return postJson<EditorWorkspaceList>('/editor-workspaces/parse', { path })
   }
 }
 

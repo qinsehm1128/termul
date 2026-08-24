@@ -1834,4 +1834,50 @@ describe('Parity Checklist Automation', () => {
       expect(handler).toMatch(/stopPropagation/)
     })
   })
+
+  describe('Editor workspace import parity', () => {
+    it('shared types declare editor workspace candidates', () => {
+      const types = readFileSync(
+        join(LIB_DIR, '..', '..', 'shared', 'types', 'editor-workspace.types.ts'),
+        'utf-8'
+      )
+      expect(types).toMatch(/export\s+interface\s+EditorWorkspaceCandidate\b/)
+      expect(types).toMatch(/export\s+interface\s+EditorWorkspaceList\b/)
+    })
+
+    it('tauri adapter invokes list_editor_workspaces and parse_code_workspace_file', () => {
+      const content = readFileSync(join(LIB_DIR, 'tauri-editor-workspace-api.ts'), 'utf-8')
+      expect(content).toMatch(/list_editor_workspaces/)
+      expect(content).toMatch(/parse_code_workspace_file/)
+    })
+
+    it('web adapter hits GET /editor-workspaces and POST /editor-workspaces/parse', () => {
+      const web = readFileSync(join(LIB_DIR, 'web-editor-workspace-api.ts'), 'utf-8')
+      const server = readFileSync(join(LIB_DIR, 'web-server-api.ts'), 'utf-8')
+      expect(web).toMatch(/webServerEditorWorkspaces/)
+      expect(server).toMatch(/\/editor-workspaces/)
+      expect(server).toMatch(/\/editor-workspaces\/parse/)
+    })
+
+    it('facade branches Tauri vs web by isTauriContext()', () => {
+      const facade = readFileSync(join(LIB_DIR, 'editor-workspace-api.ts'), 'utf-8')
+      expect(facade).toMatch(/isTauriContext\(\)/)
+      expect(facade).toMatch(/createTauriEditorWorkspaceApi/)
+      expect(facade).toMatch(/webEditorWorkspaceApi/)
+    })
+
+    it('api.ts exports the editorWorkspaceApi singleton', () => {
+      const content = readFileSync(join(LIB_DIR, 'api.ts'), 'utf-8')
+      expect(content).toMatch(/export\s*\{[^}]*\beditorWorkspaceApi\b[^}]*\}/)
+    })
+
+    it('host router registers editor-workspace HTTP routes', () => {
+      const router = readFileSync(
+        join(LIB_DIR, '..', '..', '..', 'src-tauri', 'src', 'web', 'router.rs'),
+        'utf-8'
+      )
+      expect(router).toMatch(/\/editor-workspaces/)
+      expect(router).toMatch(/\/editor-workspaces\/parse/)
+    })
+  })
 })

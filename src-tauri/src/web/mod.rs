@@ -21,6 +21,7 @@ pub mod cli_session_api;
 pub mod config;
 pub mod conversation_api;
 pub mod conversation_lifecycle_api;
+pub mod editor_workspaces_api;
 pub mod fs_api;
 // Rust 1.95 diagnoses three legacy callback adapters inside this pre-existing
 // module. TASK-004 cannot rewrite that non-owned file, so keep the allowance

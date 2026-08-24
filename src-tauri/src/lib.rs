@@ -7,6 +7,7 @@ mod browser_tab_manager;
 mod cli_session;
 mod commands;
 pub mod conversation;
+mod editor_workspaces;
 mod host_admission;
 mod logging;
 mod migrations;
@@ -2149,6 +2150,8 @@ pub fn run() {
             remote::tunnel::commands::tunnel_config_get,
             remote::tunnel::commands::tunnel_config_set,
             commands::remote_sync_projects,
+            commands::list_editor_workspaces,
+            commands::parse_code_workspace_file,
             commands::set_host_default_project,
             commands::remote_sync_chat_history,
             commands::remote_sync_mcp_registry,

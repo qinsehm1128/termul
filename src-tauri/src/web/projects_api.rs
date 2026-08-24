@@ -36,7 +36,7 @@ pub struct IpcBody<T> {
 }
 
 impl<T> IpcBody<T> {
-    fn ok(data: T) -> Self {
+    pub fn ok(data: T) -> Self {
         Self {
             success: true,
             data: Some(data),
@@ -45,7 +45,7 @@ impl<T> IpcBody<T> {
         }
     }
 
-    fn err(error: impl Into<String>, code: impl Into<String>) -> Self {
+    pub fn err(error: impl Into<String>, code: impl Into<String>) -> Self {
         Self {
             success: false,
             data: None,

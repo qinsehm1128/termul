@@ -1156,4 +1156,11 @@ describe('ProjectSidebar compact rail', () => {
     expect(screen.getByTestId('header-new-project')).toHaveClass('size-7')
     expect(screen.getByLabelText('New Group Folder')).toHaveClass('size-7')
   })
+
+  it('exposes the editor-import header action when a handler is provided', () => {
+    const onImportFromEditor = vi.fn()
+    renderWithRouter({ onImportFromEditor })
+    fireEvent.click(screen.getByTestId('header-import-editors'))
+    expect(onImportFromEditor).toHaveBeenCalledTimes(1)
+  })
 })

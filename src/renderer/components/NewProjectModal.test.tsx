@@ -284,4 +284,18 @@ describe('NewProjectModal (web-mode create flow — Patch G)', () => {
       screen.queryByText(/On the web client, this project is saved for this session only/i)
     ).not.toBeInTheDocument()
   })
+
+  it('exposes the editor-import entry when a handler is provided', () => {
+    const onImportFromEditor = vi.fn()
+    render(
+      <NewProjectModal
+        isOpen
+        onClose={vi.fn()}
+        onCreateProject={vi.fn()}
+        onImportFromEditor={onImportFromEditor}
+      />
+    )
+    fireEvent.click(screen.getByTestId('new-project-import-editors'))
+    expect(onImportFromEditor).toHaveBeenCalledTimes(1)
+  })
 })

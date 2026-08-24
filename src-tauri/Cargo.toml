@@ -139,6 +139,9 @@ keyring = "3.6"
 # Logging
 log = "0.4"
 
+# Read-only Zed workspace DB (`workspaces.paths` in db.sqlite).
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 # Kernel-backed cross-platform migration lock. The permanent lock file is diagnostic metadata;
 # ownership is released by the OS when the process/handle terminates.
 fs2 = "0.4"
