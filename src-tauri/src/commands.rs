@@ -4193,6 +4193,40 @@ pub struct SyncProjectsPayload {
     pub default_project_id: Option<String>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ParseCodeWorkspacePayload {
+    pub path: String,
+}
+
+#[tauri::command]
+pub fn list_editor_workspaces() -> IpcResult<crate::editor_workspaces::EditorWorkspaceList> {
+    if let Err(error) = require_host_admission() {
+        return error;
+    }
+    IpcResult::success(crate::editor_workspaces::discover_editor_workspaces())
+}
+
+#[tauri::command]
+pub fn parse_code_workspace_file(
+    payload: ParseCodeWorkspacePayload,
+) -> IpcResult<crate::editor_workspaces::EditorWorkspaceList> {
+    if let Err(error) = require_host_admission() {
+        return error;
+    }
+    match crate::editor_workspaces::parse_code_workspace_file(std::path::Path::new(&payload.path)) {
+        Ok(list) => {
+            log::info!(
+                target: "termul::editor_workspaces",
+                "operation=parse_workspace count={} stable_code=OK",
+                list.candidates.len()
+            );
+            IpcResult::success(list)
+        }
+        Err(error) => IpcResult::error(error, "WORKSPACE_PARSE_FAILED"),
+    }
+}
+
 #[tauri::command]
 pub async fn remote_sync_projects(
     payload: SyncProjectsPayload,

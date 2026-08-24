@@ -17,6 +17,7 @@ import { Fragment, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useNavigate } from 'react-router-dom'
 import { ConfirmDialog } from '@/components/ConfirmDialog'
+import { ImportEditorWorkspacesDialog } from '@/components/ImportEditorWorkspacesDialog'
 import { NewProjectModal } from '@/components/NewProjectModal'
 import {
   type SettingsCategory,
@@ -116,6 +117,7 @@ export default function ProjectSettings() {
   const { t } = useTranslation('projects')
   const navigate = useNavigate()
   const [isNewProjectModalOpen, setIsNewProjectModalOpen] = useState(false)
+  const [isImportEditorOpen, setIsImportEditorOpen] = useState(false)
   const [isCloseConfirmOpen, setIsCloseConfirmOpen] = useState(false)
   const activeProject = useActiveProject()
   const activeProjectId = useActiveProjectId()
@@ -824,7 +826,15 @@ export default function ProjectSettings() {
       <NewProjectModal
         isOpen={isNewProjectModalOpen}
         onClose={() => setIsNewProjectModalOpen(false)}
+        onImportFromEditor={() => {
+          setIsNewProjectModalOpen(false)
+          setIsImportEditorOpen(true)
+        }}
         onCreateProject={addProject}
+      />
+      <ImportEditorWorkspacesDialog
+        isOpen={isImportEditorOpen}
+        onClose={() => setIsImportEditorOpen(false)}
       />
 
       <ConfirmDialog

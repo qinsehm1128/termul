@@ -17,6 +17,7 @@ import type { EnvVariable, ProjectColor } from '@/types/project'
 interface NewProjectModalProps {
   isOpen: boolean
   onClose: () => void
+  onImportFromEditor?: () => void
   onCreateProject: (
     name: string,
     color: ProjectColor,
@@ -49,7 +50,12 @@ function getTemplateTranslationKeys(id: string) {
   }
 }
 
-export function NewProjectModal({ isOpen, onClose, onCreateProject }: NewProjectModalProps) {
+export function NewProjectModal({
+  isOpen,
+  onClose,
+  onImportFromEditor,
+  onCreateProject
+}: NewProjectModalProps) {
   const { t } = useTranslation('projects')
   const reducedMotion = useReducedMotion() ?? false
   const defaultColor = useDefaultProjectColor() as ProjectColor
@@ -446,20 +452,34 @@ export function NewProjectModal({ isOpen, onClose, onCreateProject }: NewProject
             </div>
 
             {/* Footer */}
-            <div className="flex h-10 shrink-0 items-center justify-end gap-2 border-t border-border/70 bg-secondary/20 px-4">
-              <button
-                onClick={onClose}
-                className="inline-flex h-8 items-center rounded-md px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary/60 hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-              >
-                {t('cancel')}
-              </button>
-              <button
-                onClick={handleCreate}
-                disabled={!name.trim() || !path.trim()}
-                className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {t('create')}
-              </button>
+            <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-t border-border/70 bg-secondary/20 px-4">
+              {onImportFromEditor ? (
+                <button
+                  type="button"
+                  onClick={onImportFromEditor}
+                  className="inline-flex h-8 items-center rounded-md px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary/60 hover:text-foreground"
+                  data-testid="new-project-import-editors"
+                >
+                  {t('editorImport.title')}
+                </button>
+              ) : (
+                <span />
+              )}
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={onClose}
+                  className="inline-flex h-8 items-center rounded-md px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-secondary/60 hover:text-foreground focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                >
+                  {t('cancel')}
+                </button>
+                <button
+                  onClick={handleCreate}
+                  disabled={!name.trim() || !path.trim()}
+                  className="inline-flex h-8 items-center rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {t('create')}
+                </button>
+              </div>
             </div>
           </motion.div>
         </motion.div>

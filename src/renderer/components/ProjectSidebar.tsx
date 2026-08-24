@@ -7,6 +7,7 @@ import {
   ChevronRight,
   Edit2,
   Folder,
+  FolderInput,
   FolderOpen,
   FolderPlus,
   GitBranch,
@@ -85,6 +86,7 @@ interface ProjectSidebarProps {
   onSelectProject: (id: string) => void
   onSelectGroup?: (id: string) => void
   onNewProject: () => void
+  onImportFromEditor?: (groupId?: string) => void
   onUpdateProject: (id: string, updates: Partial<Project>) => void
   onDeleteProject: (id: string) => void
   onArchiveProject: (id: string) => void
@@ -101,6 +103,7 @@ export function ProjectSidebar({
   onSelectProject,
   onSelectGroup,
   onNewProject,
+  onImportFromEditor,
   onUpdateProject,
   onDeleteProject,
   onArchiveProject,
@@ -389,6 +392,11 @@ export function ProjectSidebar({
               <ContextMenuItem onSelect={() => void handleAddNewProjectToGroup(groupId)}>
                 <FolderPlus className="mr-2 h-4 w-4" /> {t('importProject')}
               </ContextMenuItem>
+              {onImportFromEditor ? (
+                <ContextMenuItem onSelect={() => onImportFromEditor(groupId)}>
+                  <FolderInput className="mr-2 h-4 w-4" /> {t('editorImport.title')}
+                </ContextMenuItem>
+              ) : null}
             </ContextMenuSubContent>
           </ContextMenuSub>
           <ContextMenuSeparator />
@@ -412,6 +420,7 @@ export function ProjectSidebar({
       moveProjectToGroup,
       handleAddNewProjectToGroup,
       handleOpenColorPicker,
+      onImportFromEditor,
       t
     ]
   )
@@ -787,6 +796,17 @@ export function ProjectSidebar({
           >
             <FolderPlus size={14} />
           </button>
+          {onImportFromEditor ? (
+            <button
+              onClick={() => onImportFromEditor()}
+              className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 ease-[var(--ease-out)] hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              title={t('editorImport.title')}
+              aria-label={t('editorImport.title')}
+              data-testid="header-import-editors"
+            >
+              <FolderInput size={14} />
+            </button>
+          ) : null}
           <button
             onClick={onNewProject}
             className="inline-flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors duration-150 ease-[var(--ease-out)] hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"

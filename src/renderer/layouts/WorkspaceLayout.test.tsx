@@ -420,7 +420,24 @@ vi.mock('@/lib/api', () => ({
   hasActiveTerminalSessions: mockApi.hasActiveTerminalSessions,
   sshApi: { onConnectionStatusChanged: vi.fn(() => vi.fn()) },
   tauriUpdaterApi: {},
-  tauriVersionSkipService: {}
+  tauriVersionSkipService: {},
+  remoteServerApi: {
+    start: vi.fn(),
+    stop: vi.fn(),
+    status: vi.fn(),
+    intent: vi.fn(() =>
+      Promise.resolve({ success: true, data: { wanted: false, publishMode: 'tunnel' } })
+    ),
+    setIntent: vi.fn(),
+    rotateCredential: vi.fn()
+  },
+  openerApi: {
+    openUrlWithSystemBrowser: vi.fn(() => Promise.resolve({ success: true, data: undefined }))
+  },
+  editorWorkspaceApi: {
+    list: vi.fn(() => Promise.resolve({ success: true, data: { candidates: [] } })),
+    parseFile: vi.fn(() => Promise.resolve({ success: true, data: { candidates: [] } }))
+  }
 }))
 
 beforeEach(() => {

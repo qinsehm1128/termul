@@ -30,6 +30,7 @@ use crate::web::catalog_api;
 use crate::web::cli_session_api;
 use crate::web::conversation_api;
 use crate::web::conversation_lifecycle_api;
+use crate::web::editor_workspaces_api;
 use crate::web::fs_api;
 use crate::web::git_api;
 use crate::web::install_api;
@@ -87,7 +88,12 @@ fn api_routes(provenance: IngressProvenance) -> Router<AppState> {
     .merge(classified_routes(
         Router::<AppState>::new()
             .route("/projects", get(projects_api::list))
-            .route("/projects/default", post(projects_api::set_default_project)),
+            .route("/projects/default", post(projects_api::set_default_project))
+            .route("/editor-workspaces", get(editor_workspaces_api::list))
+            .route(
+                "/editor-workspaces/parse",
+                post(editor_workspaces_api::parse),
+            ),
         RemoteRouteClass::Project,
     ))
     .merge(classified_routes(mcp_routes, RemoteRouteClass::Mcp))
